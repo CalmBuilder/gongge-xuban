@@ -166,6 +166,15 @@ BUILTIN_PERMISSIONS = (
         "允许创建角色并向其他成员授予可解释的治理或业务职责。",
     ),
     BuiltinPermissionDefinition(
+        "execution.manage",
+        "管理执行任务",
+        "governance",
+        "execution",
+        "manage",
+        None,
+        "允许取消或调整当前租户 Execution，不授予 Attention 办理或工具执行资格。",
+    ),
+    BuiltinPermissionDefinition(
         "agent.read",
         "查看数字员工治理信息",
         "governance",

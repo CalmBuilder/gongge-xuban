@@ -11,7 +11,7 @@ import hashlib
 import json
 from pathlib import Path
 
-from sqlalchemy import Engine, inspect, text
+from sqlalchemy import Engine, MetaData, Table, inspect, text
 from sqlmodel import SQLModel
 
 _DEFAULT_MODEL_OUTPUT_LIMIT_MIGRATION_ID = "20260712_default_model_output_tokens_8192"
@@ -103,6 +103,7 @@ def migrate_sqlite_skill_schema(engine: Engine) -> None:
         _migrate_execution_reliability_fields(conn, tables)
         _migrate_dynamic_capability_fields(conn, tables)
         _migrate_execution_plan_fields(conn, tables)
+        _migrate_execution_control_fields(conn, tables)
 
         if "messages" in tables:
             message_columns = {column["name"] for column in inspector.get_columns("messages")}
@@ -581,6 +582,147 @@ def _migrate_execution_plan_fields(conn, tables: set[str]) -> None:
                     f"ON sop_node_executions ({column_name})"
                 )
             )
+
+
+def _migrate_execution_control_fields(conn, tables: set[str]) -> None:
+    """为桌面 SQLite 旧库补齐 B0.5 控制字段，并重建可承载通用 Attention 的主表。"""
+
+    if "sop_instances" in tables:
+        instance_columns = {
+            column["name"] for column in inspect(conn).get_columns("sop_instances")
+        }
+        if "current_result_id" not in instance_columns:
+            conn.execute(
+                text("ALTER TABLE sop_instances ADD COLUMN current_result_id VARCHAR(512)")
+            )
+        conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_sop_instances_current_result_id "
+                "ON sop_instances (current_result_id)"
+            )
+        )
+
+    if "sop_work_items" in tables:
+        columns = inspect(conn).get_columns("sop_work_items")
+        column_names = {column["name"] for column in columns}
+        node_nullable = next(
+            (
+                bool(column["nullable"])
+                for column in columns
+                if column["name"] == "node_execution_id"
+            ),
+            False,
+        )
+        if "attention_kind" not in column_names or not node_nullable:
+            _rebuild_sqlite_attention_table(conn)
+
+    if "agent_events" in tables:
+        event_columns = {
+            column["name"] for column in inspect(conn).get_columns("agent_events")
+        }
+        required_event_columns = {
+            "schema_version",
+            "aggregate_type",
+            "aggregate_id",
+            "aggregate_revision",
+            "correlation_id",
+            "causation_id",
+            "payload_checksum",
+        }
+        event_constraints = {
+            str(item.get("name") or "")
+            for item in inspect(conn).get_check_constraints("agent_events")
+        }
+        if not required_event_columns <= event_columns or not {
+            "ck_agent_event_schema_version",
+            "ck_agent_event_aggregate_revision",
+        } <= event_constraints:
+            _rebuild_sqlite_agent_events(conn)
+
+
+def _rebuild_sqlite_attention_table(conn) -> None:
+    """原子重建工作项表，使节点身份可空且历史行获得确定性 Attention 字段。"""
+
+    from app.db.models import SopWorkItem
+
+    old_table = SQLModel.metadata.tables["sop_work_items"]
+    reflected = Table("sop_work_items", MetaData(), autoload_with=conn)
+    rows = conn.execute(reflected.select()).mappings().all()
+    preparer = conn.dialect.identifier_preparer
+    for index in inspect(conn).get_indexes("sop_work_items"):
+        index_name = str(index.get("name") or "")
+        if index_name:
+            conn.execute(text(f"DROP INDEX {preparer.quote(index_name)}"))
+    backup_name = "_legacy_b05_sop_work_items"
+    if inspect(conn).has_table(backup_name):
+        raise RuntimeError("legacy Attention table rebuild was interrupted")
+    conn.execute(text(f"ALTER TABLE sop_work_items RENAME TO {backup_name}"))
+    SopWorkItem.__table__.create(conn)
+    now_defaults = {
+        "attention_kind": "sop_human_task",
+        "source_type": "formal_sop",
+        "payload_json": {},
+        "allowed_commands_json": ["claim", "unclaim", "complete"],
+        "resolution_json": {},
+        "required": True,
+    }
+    for row in rows:
+        values = {
+            column.name: row[column.name]
+            for column in old_table.columns
+            if column.name in row
+        }
+        node_execution_id = str(row.get("node_execution_id") or "")
+        attention_key = f"sop-node:{node_execution_id}"
+        raw_identity = json.dumps(
+            {
+                "tenant_id": str(row["tenant_id"]),
+                "execution_id": str(row["instance_id"]),
+                "attention_key": attention_key,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        values.update(now_defaults)
+        values.update(
+            {
+                "attention_key": attention_key,
+                "attention_identity": hashlib.sha256(
+                    raw_identity.encode("utf-8")
+                ).hexdigest(),
+            }
+        )
+        conn.execute(SopWorkItem.__table__.insert().values(**values))
+    conn.execute(text(f"DROP TABLE {backup_name}"))
+
+
+def _rebuild_sqlite_agent_events(conn) -> None:
+    """重建历史事件表，为版本和聚合 revision 加入数据库级契约。"""
+
+    from app.db.models import AgentEvent
+
+    reflected = Table("agent_events", MetaData(), autoload_with=conn)
+    rows = conn.execute(reflected.select()).mappings().all()
+    preparer = conn.dialect.identifier_preparer
+    for index in inspect(conn).get_indexes("agent_events"):
+        index_name = str(index.get("name") or "")
+        if index_name:
+            conn.execute(text(f"DROP INDEX {preparer.quote(index_name)}"))
+    backup_name = "_legacy_b05_agent_events"
+    if inspect(conn).has_table(backup_name):
+        raise RuntimeError("legacy AgentEvent table rebuild was interrupted")
+    conn.execute(text(f"ALTER TABLE agent_events RENAME TO {backup_name}"))
+    AgentEvent.__table__.create(conn)
+    for row in rows:
+        values = {
+            column.name: row[column.name]
+            for column in AgentEvent.__table__.columns
+            if column.name in row
+        }
+        values["schema_version"] = int(row.get("schema_version") or 1)
+        conn.execute(AgentEvent.__table__.insert().values(**values))
+    conn.execute(text(f"DROP TABLE {backup_name}"))
 
 
 def _migrate_execution_reliability_fields(conn, tables: set[str]) -> None:

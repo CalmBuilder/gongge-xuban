@@ -22,8 +22,10 @@ from sqlmodel import Session, select
 
 from app.db.models import (
     ActionProposalRecord,
+    ExecutionCommand,
     ExecutionPlanRevision,
     ExecutionMutationRejection,
+    ExecutionSignal,
     InputResourceSnapshot,
     ManagedInputResource,
     Message,
@@ -32,6 +34,7 @@ from app.db.models import (
     SopOperation,
     SopOperationAttempt,
     SopOperationEffect,
+    SopWorkItem,
     utc_now,
 )
 from app.dynamic_tasks.capability_catalog import capability_checksum
@@ -117,6 +120,16 @@ class SopExecutionStore:
 
         self.db = db
         self._lease: ExecutionLease | None = None
+
+    def authorize_mutation(self, instance: SopInstance, action: str) -> None:
+        """供同一 Runtime 的扩展聚合复用 execution revision、租约和 fencing 写屏障。"""
+
+        self._guard_mutation(instance, action)
+
+    def database_now(self) -> datetime:
+        """向信号和投递 worker 暴露数据库权威时间，不允许调用方使用本机时钟裁决。"""
+
+        return self._database_now()
 
     @contextmanager
     def owned(
@@ -1269,6 +1282,52 @@ class SopExecutionStore:
                     )
                 else:
                     self._cancel_running_read(operation)
+        active_attentions = self.db.exec(
+            select(SopWorkItem).where(
+                SopWorkItem.tenant_id == instance.tenant_id,
+                SopWorkItem.instance_id == instance.id,
+                SopWorkItem.status.in_(("offered", "claimed")),
+            )
+        ).all()
+        for attention in active_attentions:
+            attention.status = "cancelled"
+            attention.assignee_user_id = None
+            attention.resolution_json = {
+                "command": "cancel_execution",
+                "actor_user_id": actor_user_id,
+                "reason": reason,
+            }
+            attention.revision += 1
+            attention.updated_at = now
+            self.db.add(attention)
+        active_signals = self.db.exec(
+            select(ExecutionSignal).where(
+                ExecutionSignal.tenant_id == instance.tenant_id,
+                ExecutionSignal.execution_id == instance.id,
+                ExecutionSignal.status.in_(("pending", "claimed")),
+            )
+        ).all()
+        for signal in active_signals:
+            signal.status = "discarded"
+            signal.lease_owner = None
+            signal.lease_expires_at = None
+            signal.consumed_at = now
+            signal.updated_at = now
+            self.db.add(signal)
+        pending_commands = self.db.exec(
+            select(ExecutionCommand).where(
+                ExecutionCommand.tenant_id == instance.tenant_id,
+                ExecutionCommand.execution_id == instance.id,
+                ExecutionCommand.status.in_(("pending", "claimed")),
+            )
+        ).all()
+        for pending_command in pending_commands:
+            pending_command.status = "rejected"
+            pending_command.reason_code = "EXECUTION_CANCELLED"
+            pending_command.result_json = {"execution_status": "cancelling"}
+            pending_command.consumed_at = now
+            pending_command.updated_at = now
+            self.db.add(pending_command)
         instance.cancellation_disposition = "awaiting_reconciliation"
         self.db.add(instance)
         self.aggregate_effect_state(instance)
@@ -1308,6 +1367,17 @@ class SopExecutionStore:
         """成功结束 SOP 实例并保留最终槽位快照和结束时间。"""
 
         self._guard_mutation(instance, "instance.complete")
+        from app.sop_runtime.execution_control import ExecutionControlService
+
+        control = ExecutionControlService(self.db, self)
+        control.ensure_terminal_result(
+            instance,
+            target_status="succeeded",
+            result={"status": "succeeded", "slots": dict(slots or instance.slots_json or {})},
+            verification={"passed": True, "source": "formal_sop_runtime"},
+        )
+        control.assert_terminal_closure(instance, "succeeded")
+        self._guard_mutation(instance, "instance.complete")
         transition = transition_instance(
             SopInstanceStatus(instance.status),
             SopInstanceStatus.SUCCEEDED,
@@ -1329,6 +1399,17 @@ class SopExecutionStore:
     ) -> None:
         """失败结束 SOP 实例，并把确定性失败上下文合并到实例快照。"""
 
+        self._guard_mutation(instance, "instance.fail")
+        from app.sop_runtime.execution_control import ExecutionControlService
+
+        control = ExecutionControlService(self.db, self)
+        control.ensure_terminal_result(
+            instance,
+            target_status="failed",
+            result={"status": "failed", "context": dict(context_patch or {})},
+            verification={"passed": True, "source": "runtime_failure"},
+        )
+        control.assert_terminal_closure(instance, "failed")
         self._guard_mutation(instance, "instance.fail")
         transition = transition_instance(
             SopInstanceStatus(instance.status),
@@ -1354,6 +1435,17 @@ class SopExecutionStore:
     ) -> None:
         """把活动 SOP 实例推进为 timed_out，并冻结超时上下文。"""
 
+        self._guard_mutation(instance, "instance.timeout")
+        from app.sop_runtime.execution_control import ExecutionControlService
+
+        control = ExecutionControlService(self.db, self)
+        control.ensure_terminal_result(
+            instance,
+            target_status="timed_out",
+            result={"status": "timed_out", "context": dict(context_patch or {})},
+            verification={"passed": True, "source": "runtime_timeout"},
+        )
+        control.assert_terminal_closure(instance, "timed_out")
         self._guard_mutation(instance, "instance.timeout")
         transition = transition_instance(
             SopInstanceStatus(instance.status),
@@ -1663,6 +1755,20 @@ class SopExecutionStore:
             return False
         if instance.status not in ACTIVE_INSTANCE_STATUSES:
             return instance.status == SopInstanceStatus.CANCELLED.value
+        from app.sop_runtime.execution_control import ExecutionControlService
+
+        control = ExecutionControlService(self.db, self)
+        control.ensure_terminal_result(
+            instance,
+            target_status="cancelled",
+            result={
+                "status": "cancelled",
+                "reason": instance.cancellation_reason,
+                "effect_state": instance.effect_state,
+            },
+            verification={"passed": True, "source": "runtime_cancellation"},
+        )
+        control.assert_terminal_closure(instance, "cancelled")
         self._guard_mutation(instance, "instance.cancel")
         transition = transition_instance(
             SopInstanceStatus(instance.status),

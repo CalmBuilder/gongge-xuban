@@ -21,7 +21,13 @@ from sqlmodel import Session, create_engine, select
 from app.api.model_configs import set_default_model_config
 from app.db.models import (
     ActionProposalRecord,
+    AgentEvent,
     AgentProfile,
+    EventOutbox,
+    ExecutionCommand,
+    ExecutionPublication,
+    ExecutionResult,
+    ExecutionSignal,
     ExecutionPlanRevision,
     ExecutionMutationRejection,
     Message,
@@ -63,6 +69,7 @@ from app.sop_runtime.execution_store import (
     SopExecutionFencedError,
     SopExecutionStore,
 )
+from app.sop_runtime.execution_control import ExecutionControlService
 
 
 pytestmark = pytest.mark.mysql
@@ -142,6 +149,13 @@ def test_alembic_upgrades_empty_mysql_database(mysql_database_url: str) -> None:
     assert "action_proposal_records" in tables
     assert "managed_input_resources" in tables
     assert "input_resource_snapshots" in tables
+    assert {
+        "execution_commands",
+        "execution_signals",
+        "execution_results",
+        "execution_publications",
+        "event_outbox",
+    }.issubset(tables)
     assert "ix_org_unit_tenant_parent_status_sort" in {
         item["name"] for item in inspector.get_indexes("organization_units")
     }
@@ -295,7 +309,7 @@ def test_alembic_upgrades_empty_mysql_database(mysql_database_url: str) -> None:
     with engine.connect() as connection:
         assert (
             connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-            == "20260803_0039"
+            == "20260803_0040"
         )
 
 
@@ -684,6 +698,82 @@ def test_execution_ownership_migration_backfills_and_reverses_mysql(
                     "JSON_OBJECT(), 0, 'none', 0, UTC_TIMESTAMP(), UTC_TIMESTAMP())"
                 )
             )
+
+
+def test_mysql_execution_control_signal_result_and_outbox_round_trip(
+    mysql_database_url: str,
+) -> None:
+    """验证 MySQL 8.4 上 signal/Execution 双租约、取消结果和 outbox 事实真实可写。"""
+
+    upgrade(mysql_database_url)
+    engine = create_engine(mysql_database_url, pool_pre_ping=True)
+    with Session(engine, expire_on_commit=False) as db:
+        instance = SopInstance(
+            id="execution_b05_mysql",
+            tenant_id="tenant_b05",
+            session_id="session_b05",
+            kind="dynamic_task",
+            active_slot_key="dynamic:b05",
+            initiator_user_id="user_b05",
+            agent_id="agent_b05",
+            goal_snapshot_json={"goal": "verify control"},
+            current_plan_revision_id="plan_b05",
+            current_plan_checksum="a" * 64,
+            capability_snapshot_json={"capabilities": []},
+            status="running",
+        )
+        db.add(instance)
+        db.commit()
+        store = SopExecutionStore(db)
+        control = ExecutionControlService(db, store)
+        command_row, created = control.issue_command(
+            instance,
+            command_id="cancel_b05",
+            command_type="cancel",
+            actor_user_id="user_b05",
+            expected_execution_revision=instance.revision,
+            payload={"reason": "mysql_contract"},
+        )
+        assert created is True
+        signal = db.exec(select(ExecutionSignal)).one()
+        control.claim_signal(signal, worker_id="signal_worker")
+        with pytest.raises(SopExecutionConflictError):
+            control.consume_signal(instance, signal, worker_id="signal_worker")
+        db.commit()
+
+        with store.owned(instance, worker_id="execution_worker"):
+            control.apply_cancel_command(
+                instance,
+                command_row,
+                worker_id="execution_worker",
+            )
+        db.commit()
+        db.refresh(instance)
+        db.refresh(command_row)
+        assert instance.status == "cancelled"
+        assert command_row.status == "applied"
+        result = db.get(ExecutionResult, instance.current_result_id)
+        assert result is not None and result.result_json["status"] == "cancelled"
+        publication = db.exec(select(ExecutionPublication)).one()
+        assert publication.status == "settled"
+        assert db.exec(select(ExecutionSignal)).one().status == "discarded"
+        assert db.exec(select(ExecutionCommand)).one().id == command_row.id
+        events = db.exec(
+            select(AgentEvent).where(
+                AgentEvent.tenant_id == instance.tenant_id,
+                AgentEvent.aggregate_id == instance.id,
+            )
+        ).all()
+        for event in events:
+            control.enqueue_event_delivery(
+                event,
+                destination="webhook",
+                destination_ref="configured:webhook:mysql-contract",
+            )
+        db.flush()
+        outboxes = db.exec(select(EventOutbox)).all()
+        assert len(outboxes) >= 2
+        assert len({item.publication_key for item in outboxes}) == len(outboxes)
 
 
 def test_mysql_execution_active_slot_and_fencing_are_cross_worker_safe(

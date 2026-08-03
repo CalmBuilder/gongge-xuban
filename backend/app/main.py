@@ -17,8 +17,10 @@ from sqlmodel import Session
 
 from app.api import (
     agents,
+    attention_items,
     auth,
     chat,
+    executions,
     feedback,
     expert_taxonomy,
     general_skills,
@@ -101,6 +103,8 @@ app.include_router(organization_leaders.router)
 app.include_router(organization_units.router)
 app.include_router(reference_data.router)
 app.include_router(work_items.router)
+app.include_router(attention_items.router)
+app.include_router(executions.router)
 app.include_router(agents.scope_router)
 app.include_router(agents.enterprise_router)
 app.include_router(expert_taxonomy.router)

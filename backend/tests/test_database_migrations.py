@@ -6,13 +6,14 @@
 @Description: 验证迁移版本守卫、连接错误脱敏以及关键升降级数据兼容性。
 """
 
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import create_engine, inspect, make_url, text
+from sqlalchemy import Column, MetaData, Table, create_engine, inspect, make_url, text
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlmodel import Session, SQLModel, select
 
@@ -24,7 +25,7 @@ from app.db.migrations import (
     assert_schema_current,
     current_revision,
 )
-from app.db.models import Skill, SkillVersion
+from app.db.models import ExecutionCommand, Skill, SkillVersion
 from app.db.seed import (
     EXCHANGE_SKILL,
     PRICE_COMPARE_SKILL,
@@ -35,6 +36,7 @@ from app.db.seed import (
 from app.db.sqlite_legacy import initialize_sqlite_database, migrate_sqlite_skill_schema
 from app.db.sqlite_legacy import (
     _migrate_dynamic_capability_fields,
+    _migrate_execution_control_fields,
     _migrate_execution_plan_fields,
     _migrate_execution_reliability_fields,
 )
@@ -2509,3 +2511,265 @@ def test_execution_plan_resource_migration_rejects_legacy_dynamic_and_managed_do
         )
     with pytest.raises(RuntimeError, match="managed history"):
         command.downgrade(managed_config, "20260803_0038")
+
+
+def test_execution_control_migration_backfills_attention_and_round_trips_sqlite(
+    tmp_path,
+) -> None:
+    """验证 0040 回填正式 SOP Attention、扩展事件并在无新事实时安全回退。"""
+
+    database_url = f"sqlite:///{tmp_path / 'execution-control.db'}"
+    config = Config(str(BACKEND_DIR / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
+    config.attributes["database_url"] = database_url
+    engine = create_engine(database_url)
+    _prepare_0039_execution_control_database(engine, config)
+    with engine.begin() as connection:
+        metadata = MetaData()
+        work_items = Table("sop_work_items", metadata, autoload_with=connection)
+        connection.execute(
+            work_items.insert().values(
+                id="work_0040",
+                tenant_id="tenant_a",
+                instance_id="instance_a",
+                node_execution_id="node_a",
+                skill_version_id="version_a",
+                node_id="approve",
+                status="offered",
+                completion_mode="single",
+                claim_required=False,
+                required_count=None,
+                exclude_initiator=True,
+                allowed_outcomes_json=["approved", "rejected"],
+                outcome_options_json=[],
+                action_permissions_json={},
+                candidate_snapshot_json=[],
+                participant_scope_snapshot_json={},
+                revision=0,
+                timeout_action="fail",
+                created_at=datetime.now(),
+                updated_at=datetime.now(),
+            )
+        )
+        events = Table("agent_events", metadata, autoload_with=connection)
+        connection.execute(
+            events.insert().values(
+                id="event_0040",
+                tenant_id="tenant_a",
+                session_id="session_a",
+                event_type="legacy_event",
+                payload_json={},
+                created_at=datetime.now(),
+            )
+        )
+
+    command.upgrade(config, "20260803_0040")
+    command.upgrade(config, "20260803_0040")
+    with engine.connect() as connection:
+        inspector = inspect(connection)
+        assert set(
+            (
+                "execution_commands",
+                "execution_signals",
+                "execution_results",
+                "execution_publications",
+                "event_outbox",
+            )
+        ).issubset(inspector.get_table_names())
+        attention = connection.execute(
+            text(
+                "SELECT attention_kind, attention_key, LENGTH(attention_identity), required "
+                "FROM sop_work_items WHERE id='work_0040'"
+            )
+        ).one()
+        assert attention == ("sop_human_task", "sop-node:node_a", 64, 1)
+        assert connection.execute(
+            text("SELECT schema_version FROM agent_events WHERE id='event_0040'")
+        ).scalar_one() == 1
+        nullable = {
+            column["name"]: column["nullable"]
+            for column in inspector.get_columns("sop_work_items")
+        }
+        assert nullable["node_execution_id"] is True
+
+    command.downgrade(config, "20260803_0039")
+    with engine.connect() as connection:
+        inspector = inspect(connection)
+        assert "execution_commands" not in inspector.get_table_names()
+        assert "attention_kind" not in {
+            column["name"] for column in inspector.get_columns("sop_work_items")
+        }
+
+
+def test_execution_control_migration_guards_new_facts_on_downgrade(tmp_path) -> None:
+    """验证已有持久命令时 0040 拒绝降级丢失控制事实。"""
+
+    database_url = f"sqlite:///{tmp_path / 'execution-control-managed.db'}"
+    config = Config(str(BACKEND_DIR / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
+    config.attributes["database_url"] = database_url
+    engine = create_engine(database_url)
+    _prepare_0039_execution_control_database(engine, config)
+    command.upgrade(config, "20260803_0040")
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO execution_commands ("
+                "id, tenant_id, execution_id, command_id, command_type, source_type, "
+                "expected_execution_revision, payload_json, payload_checksum, status, "
+                "result_json, issued_at, created_at, updated_at"
+                ") VALUES ("
+                "'cmd_row', 'tenant_a', 'execution_a', 'cmd_a', 'steer', 'api', 0, '{}', "
+                ":checksum, 'pending', '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
+                "CURRENT_TIMESTAMP)"
+            ),
+            {"checksum": "a" * 64},
+        )
+    with pytest.raises(RuntimeError, match="execution_commands facts"):
+        command.downgrade(config, "20260803_0039")
+
+
+def test_execution_control_migration_rejects_full_columns_without_constraints(tmp_path) -> None:
+    """验证 0040 不把仅有同名列、却缺少幂等和状态约束的半成品控制表当成成功。"""
+
+    database_url = f"sqlite:///{tmp_path / 'execution-control-partial.db'}"
+    config = Config(str(BACKEND_DIR / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
+    config.attributes["database_url"] = database_url
+    engine = create_engine(database_url)
+    _prepare_0039_execution_control_database(engine, config)
+    metadata = MetaData()
+    Table(
+        "execution_commands",
+        metadata,
+        *(
+            Column(
+                column.name,
+                column.type,
+                primary_key=column.primary_key,
+                nullable=column.nullable,
+            )
+            for column in ExecutionCommand.__table__.columns
+        ),
+    )
+    metadata.create_all(engine)
+
+    with pytest.raises(RuntimeError, match="missing constraints"):
+        command.upgrade(config, "20260803_0040")
+
+
+def test_desktop_sqlite_rebuilds_legacy_work_item_as_typed_attention(tmp_path) -> None:
+    """验证桌面旧库重建工作项后可插入无正式 SOP 节点身份的通用 Attention。"""
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'desktop-attention.db'}")
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE TABLE sop_instances (id VARCHAR(512) PRIMARY KEY, "
+                "tenant_id VARCHAR(128) NOT NULL)"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE TABLE sop_work_items ("
+                "id VARCHAR(512) PRIMARY KEY, tenant_id VARCHAR(128) NOT NULL, "
+                "instance_id VARCHAR(128) NOT NULL, node_execution_id VARCHAR(128) NOT NULL, "
+                "skill_version_id VARCHAR(128) NOT NULL, node_id VARCHAR(128) NOT NULL, "
+                "status VARCHAR(64) NOT NULL, completion_mode VARCHAR(64) NOT NULL, "
+                "claim_required BOOLEAN NOT NULL, exclude_initiator BOOLEAN NOT NULL, "
+                "allowed_outcomes_json JSON NOT NULL, candidate_snapshot_json JSON NOT NULL, "
+                "revision INTEGER NOT NULL, timeout_action VARCHAR(64) NOT NULL, "
+                "created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL)"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE TABLE agent_events (id VARCHAR(512) PRIMARY KEY, "
+                "tenant_id VARCHAR(128) NOT NULL, session_id VARCHAR(128) NOT NULL, "
+                "event_type VARCHAR(64) NOT NULL, payload_json JSON NOT NULL, "
+                "created_at DATETIME NOT NULL)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO sop_work_items ("
+                "id, tenant_id, instance_id, node_execution_id, skill_version_id, node_id, "
+                "status, completion_mode, claim_required, exclude_initiator, "
+                "allowed_outcomes_json, candidate_snapshot_json, revision, timeout_action, "
+                "created_at, updated_at) VALUES ("
+                "'work_old', 'tenant_a', 'instance_a', 'node_a', 'version_a', 'approve', "
+                "'offered', 'single', 0, 1, '[]', '[]', 0, 'fail', CURRENT_TIMESTAMP, "
+                "CURRENT_TIMESTAMP)"
+            )
+        )
+    tables = set(inspect(engine).get_table_names())
+    with engine.begin() as connection:
+        _migrate_execution_control_fields(connection, tables)
+        _migrate_execution_control_fields(connection, tables)
+        connection.execute(
+            text(
+                "INSERT INTO sop_work_items ("
+                "id, tenant_id, instance_id, attention_kind, attention_key, "
+                "attention_identity, source_type, payload_json, allowed_commands_json, "
+                "resolution_json, required, status, completion_mode, claim_required, "
+                "exclude_initiator, allowed_outcomes_json, outcome_options_json, "
+                "action_permissions_json, candidate_snapshot_json, "
+                "participant_scope_snapshot_json, revision, timeout_action, created_at, "
+                "updated_at) VALUES ("
+                "'work_generic', 'tenant_a', 'instance_a', 'clarification', 'step:question', "
+                ":identity, 'runtime', '{}', '[\"answer\"]', '{}', 1, 'offered', 'single', "
+                "0, 0, '[\"answer\"]', '[]', '{}', '[]', '{}', 0, 'fail', "
+                "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            ),
+            {"identity": "b" * 64},
+        )
+    with engine.connect() as connection:
+        inspector = inspect(connection)
+        nullable = {
+            column["name"]: column["nullable"]
+            for column in inspector.get_columns("sop_work_items")
+        }
+        assert nullable["node_execution_id"] is True
+        assert connection.execute(
+            text("SELECT attention_kind FROM sop_work_items WHERE id='work_old'")
+        ).scalar_one() == "sop_human_task"
+        assert connection.execute(
+            text("SELECT node_execution_id FROM sop_work_items WHERE id='work_generic'")
+        ).scalar_one_or_none() is None
+
+
+def _prepare_0039_execution_control_database(engine, config: Config) -> None:
+    """建立避开早期 SQLite 方言缺陷、但字段与 0039 一致的控制迁移基线。"""
+
+    _prepare_0038_execution_plan_database(engine, config)
+    command.upgrade(config, "20260803_0039")
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE TABLE sop_work_items ("
+                "id VARCHAR(512) PRIMARY KEY, tenant_id VARCHAR(128) NOT NULL, "
+                "instance_id VARCHAR(128) NOT NULL, node_execution_id VARCHAR(128) NOT NULL, "
+                "skill_version_id VARCHAR(128) NOT NULL, node_id VARCHAR(128) NOT NULL, "
+                "status VARCHAR(64) NOT NULL, owner_user_id VARCHAR(128), "
+                "assignee_user_id VARCHAR(128), initiator_user_id VARCHAR(128), "
+                "subject_employee_profile_id VARCHAR(128), completion_mode VARCHAR(64) NOT NULL, "
+                "claim_required BOOLEAN NOT NULL, required_count INTEGER, "
+                "exclude_initiator BOOLEAN NOT NULL, allowed_outcomes_json JSON NOT NULL, "
+                "outcome_options_json JSON NOT NULL, action_permissions_json JSON NOT NULL, "
+                "candidate_snapshot_json JSON NOT NULL, "
+                "participant_scope_snapshot_json JSON NOT NULL, outcome VARCHAR(64), "
+                "comment TEXT, revision INTEGER NOT NULL, expires_at DATETIME, "
+                "timeout_action VARCHAR(64) NOT NULL, claimed_at DATETIME, completed_at DATETIME, "
+                "expired_at DATETIME, created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL, "
+                "CONSTRAINT uq_sop_work_item_node_execution UNIQUE "
+                "(tenant_id, node_execution_id))"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE TABLE agent_events ("
+                "id VARCHAR(512) PRIMARY KEY, tenant_id VARCHAR(128) NOT NULL, "
+                "session_id VARCHAR(128) NOT NULL, event_type VARCHAR(64) NOT NULL, "
+                "payload_json JSON NOT NULL, created_at DATETIME NOT NULL)"
+            )
+        )
