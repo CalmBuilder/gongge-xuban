@@ -20,6 +20,7 @@ from app.db.models import (
     AgentEvent,
     EventOutbox,
     ExecutionCommand,
+    ExecutionPlanRevision,
     ExecutionPublication,
     ExecutionResult,
     ExecutionSignal,
@@ -811,6 +812,28 @@ class ExecutionControlService:
             ]
             if incomplete_steps:
                 blockers.append("required_steps")
+            if instance.kind == "dynamic_task":
+                revision = self.db.get(ExecutionPlanRevision, instance.current_plan_revision_id)
+                plan_steps = (
+                    revision.plan_json.get("steps")
+                    if revision is not None and isinstance(revision.plan_json, dict)
+                    else None
+                )
+                required_keys = {
+                    str(item.get("step_key"))
+                    for item in plan_steps or []
+                    if isinstance(item, dict) and item.get("required", True) is True
+                }
+                completed_keys = {
+                    item.step_key
+                    for item in steps
+                    if item.status
+                    in {NodeExecutionStatus.SUCCEEDED.value, NodeExecutionStatus.SKIPPED.value}
+                }
+                if revision is None or not isinstance(plan_steps, list) or not (
+                    required_keys <= completed_keys
+                ):
+                    blockers.append("missing_required_steps")
         active_operation = self.db.exec(
             select(SopOperation.id).where(
                 SopOperation.tenant_id == instance.tenant_id,

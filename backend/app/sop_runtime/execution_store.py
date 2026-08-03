@@ -671,6 +671,28 @@ class SopExecutionStore:
         self.db.flush()
         return True
 
+    def consume_result_proposal(
+        self,
+        instance: SopInstance,
+        proposal: ActionProposalRecord,
+    ) -> bool:
+        """将 answer/complete 提案标记为最终结果已消费，不伪造 Operation 或 PlanRevision。"""
+
+        if proposal.tenant_id != instance.tenant_id or proposal.execution_id != instance.id:
+            raise SopExecutionConflictError("结果提案与 Execution 归属不一致。")
+        if proposal.status == "consumed":
+            return False
+        if proposal.status != "validated" or proposal.normalized_proposal_json.get(
+            "action_kind"
+        ) not in {"answer", "complete"}:
+            raise SopExecutionConflictError("只有 validated answer/complete 提案可消费为结果。")
+        self._guard_mutation(instance, "proposal.consume_result")
+        proposal.status = "consumed"
+        proposal.consumed_at = utc_now()
+        self.db.add(proposal)
+        self.db.flush()
+        return True
+
     def snapshot_input_resource(
         self,
         instance: SopInstance,

@@ -13,12 +13,31 @@ from typing import Protocol
 
 from sqlmodel import Session, select
 
-from app.db.models import ModelConfig, SopInstance, SopNodeExecution, SopOperation
+from app.db.models import (
+    ExecutionPlanRevision,
+    Message,
+    ModelConfig,
+    SopInstance,
+    SopNodeExecution,
+    SopOperation,
+)
+from app.dynamic_tasks.action_proposer import DynamicActionProposer
 from app.dynamic_tasks.capability_catalog import CapabilitySnapshot, DynamicCapabilityCatalog
 from app.dynamic_tasks.planner_service import DynamicTaskPlanner
-from app.dynamic_tasks.planning import CompletedProviderProposal, SuccessCriterion
-from app.dynamic_tasks.provider_view import require_dynamic_preflight
+from app.dynamic_tasks.execution_context import build_execution_context_projection
+from app.dynamic_tasks.planning import (
+    CompletedProviderProposal,
+    NormalizedPlan,
+    PlanStep,
+    SuccessCriterion,
+)
+from app.dynamic_tasks.provider_view import (
+    build_provider_execution_view,
+    require_dynamic_preflight,
+)
+from app.dynamic_tasks.result_verifier import DynamicTaskResult, verify_dynamic_result
 from app.llm.client import LLMClient
+from app.sop_runtime.execution_control import ExecutionControlService
 from app.sop_runtime.execution_store import SopExecutionStore
 from app.tools.tool_executor import ToolExecutor
 from app.tools.tool_schema import ToolCall, ToolResult
@@ -54,6 +73,7 @@ class DynamicTaskAgent:
         catalog: DynamicCapabilityCatalog | None = None,
         tool_executor: DynamicToolExecutor | None = None,
         planner: DynamicTaskPlanner | None = None,
+        action_proposer: DynamicActionProposer | None = None,
     ) -> None:
         """绑定统一事务、能力目录和既有工具执行器，禁止创建第二套 Runtime。"""
 
@@ -62,6 +82,76 @@ class DynamicTaskAgent:
         self.catalog = catalog or DynamicCapabilityCatalog(db)
         self.tool_executor = tool_executor or ToolExecutor(db)
         self.planner = planner
+        self.action_proposer = action_proposer
+
+    def advance_next_read_step(
+        self,
+        *,
+        execution_id: str,
+        model_config: ModelConfig,
+        worker_id: str,
+        actor_user_id: str,
+        organization_unit_id: str | None = None,
+    ) -> tuple[PlanStep, ToolResult]:
+        """在同一 Execution lease 内选择唯一就绪 read 步骤、取得完整提案并执行。"""
+
+        instance = self.db.get(SopInstance, execution_id)
+        if instance is None or instance.kind != "dynamic_task":
+            raise DynamicTaskAgentError("DYNAMIC_EXECUTION_NOT_FOUND")
+        verified_model = self.catalog.require_dynamic_model(instance.tenant_id, model_config.id)
+        frozen_model = (instance.capability_snapshot_json or {}).get("model", {})
+        if (
+            not isinstance(frozen_model, dict)
+            or frozen_model.get("model_config_id") != verified_model.id
+            or frozen_model.get("checksum") != verified_model.capability_checksum
+        ):
+            raise DynamicTaskAgentError("DYNAMIC_MODEL_SNAPSHOT_CHANGED")
+        with self.store.owned(instance, worker_id=worker_id):
+            plan = self._current_plan(instance)
+            completed_keys = self._completed_step_keys(instance)
+            step = next(
+                (
+                    item
+                    for item in plan.steps
+                    if item.step_key not in completed_keys
+                    and set(item.depends_on) <= completed_keys
+                ),
+                None,
+            )
+            if step is None:
+                raise DynamicTaskAgentError("DYNAMIC_NO_READY_STEP")
+            if step.kind != "tool.read":
+                raise DynamicTaskAgentError("DYNAMIC_NEXT_STEP_NOT_READ")
+            projection = build_execution_context_projection(
+                self.db,
+                tenant_id=instance.tenant_id,
+                execution_id=instance.id,
+            )
+            capabilities = dict(verified_model.capability_snapshot_json or {})
+            view = build_provider_execution_view(
+                execution_context=projection.model_dump(mode="json"),
+                canonical_messages=[
+                    {
+                        "role": "user",
+                        "content": "请仅为当前计划步骤生成一个受控动作。",
+                    }
+                ],
+                model_capabilities=capabilities,
+            )
+            proposer = self.action_proposer or DynamicActionProposer(LLMClient(verified_model))
+            completed_response = proposer.propose(view=view, step=step)
+            result = self.execute_read_proposal(
+                execution_id=instance.id,
+                step_key=step.step_key,
+                completed_response=completed_response,
+                provider=verified_model.provider,
+                model=verified_model.model,
+                model_capabilities=capabilities,
+                worker_id=worker_id,
+                actor_user_id=actor_user_id,
+                organization_unit_id=organization_unit_id,
+            )
+            return step, result
 
     def start_task(
         self,
@@ -236,6 +326,102 @@ class DynamicTaskAgent:
             self.db.commit()
             return result
 
+    def complete_with_result_proposal(
+        self,
+        *,
+        execution_id: str,
+        step_key: str,
+        completed_response: CompletedProviderProposal,
+        provider: str,
+        model: str,
+        model_capabilities: dict[str, object],
+        worker_id: str,
+    ) -> Message:
+        """逐项验证最终结果，并原子写消息、publication 与 Execution 成功终态。"""
+
+        instance = self.db.get(SopInstance, execution_id)
+        if instance is None or instance.kind != "dynamic_task":
+            raise DynamicTaskAgentError("DYNAMIC_EXECUTION_NOT_FOUND")
+        require_dynamic_preflight(model_capabilities)
+        if completed_response.proposal.action_kind.value not in {"answer", "complete"}:
+            raise DynamicTaskAgentError("DYNAMIC_RESULT_ACTION_REQUIRED")
+        with self.store.owned(instance, worker_id=worker_id):
+            plan = self._current_plan(instance)
+            step_definition = next(
+                (item for item in plan.steps if item.step_key == step_key),
+                None,
+            )
+            if step_definition is None or step_definition.kind != "answer":
+                raise DynamicTaskAgentError("DYNAMIC_RESULT_STEP_INVALID")
+            step = self._step(instance, step_key)
+            if step is None:
+                if not set(step_definition.depends_on) <= self._completed_step_keys(instance):
+                    raise DynamicTaskAgentError("DYNAMIC_RESULT_DEPENDENCY_INCOMPLETE")
+                step = self.store.enter_node(
+                    instance,
+                    step_key,
+                    step_key=step_key,
+                    plan_revision_id=instance.current_plan_revision_id,
+                    step_kind="answer",
+                    title=step_definition.title,
+                    required=step_definition.required,
+                )
+            proposal, _ = self.store.record_action_proposal(
+                instance,
+                step,
+                provider=provider,
+                model=model,
+                model_capability_snapshot=model_capabilities,
+                completed_response=completed_response,
+            )
+            result = DynamicTaskResult.model_validate(completed_response.proposal.arguments)
+            completed_keys = self._completed_step_keys(instance)
+            verification = verify_dynamic_result(
+                result,
+                plan=plan,
+                completed_step_keys=completed_keys,
+            )
+            if verification.get("passed") is not True:
+                proposal.status = "superseded"
+                proposal.superseded_at = self.store.database_now()
+                self.db.add(proposal)
+                self.db.flush()
+                raise DynamicTaskAgentError("DYNAMIC_RESULT_VERIFICATION_FAILED")
+            self.store.complete_node(
+                instance,
+                step,
+                output={"result_checksum": canonical_result_checksum(result)},
+            )
+            control = ExecutionControlService(self.db, self.store)
+            result_row, publication, _ = control.freeze_result(
+                instance,
+                result=result.model_dump(mode="json"),
+                verification=verification,
+                created_by_step_key=step_key,
+            )
+            message = Message(
+                tenant_id=instance.tenant_id,
+                session_id=instance.session_id,
+                role="assistant",
+                content=result.markdown,
+                metadata_json={
+                    "execution_id": instance.id,
+                    "result_id": result_row.id,
+                    "result_checksum": result_row.checksum,
+                },
+            )
+            self.db.add(message)
+            self.db.flush()
+            control.settle_application_publication(
+                instance,
+                publication,
+                message_id=message.id,
+            )
+            self.store.consume_result_proposal(instance, proposal)
+            self.store.complete_instance(instance)
+            self.db.commit()
+            return message
+
     def _frozen_read_snapshot(
         self,
         instance: SopInstance,
@@ -264,8 +450,6 @@ class DynamicTaskAgent:
     def _step_definition(self, instance: SopInstance, step_key: str) -> dict[str, object]:
         """从活动 PlanRevision 读取服务端稳定步骤，不接受调用方临时定义。"""
 
-        from app.db.models import ExecutionPlanRevision
-
         revision = self.db.get(ExecutionPlanRevision, instance.current_plan_revision_id)
         steps = revision.plan_json.get("steps") if revision is not None else None
         if not isinstance(steps, list):
@@ -274,6 +458,33 @@ class DynamicTaskAgent:
             if isinstance(step, dict) and step.get("step_key") == step_key:
                 return dict(step)
         raise DynamicTaskAgentError("DYNAMIC_STEP_NOT_DECLARED")
+
+    def _current_plan(self, instance: SopInstance) -> NormalizedPlan:
+        """读取并严格解析当前活动计划，拒绝损坏或错绑 revision。"""
+
+        revision = self.db.get(ExecutionPlanRevision, instance.current_plan_revision_id)
+        if (
+            revision is None
+            or revision.execution_id != instance.id
+            or revision.status != "active"
+        ):
+            raise DynamicTaskAgentError("DYNAMIC_PLAN_INVALID")
+        try:
+            return NormalizedPlan.model_validate(revision.plan_json)
+        except ValueError as exc:
+            raise DynamicTaskAgentError("DYNAMIC_PLAN_INVALID") from exc
+
+    def _completed_step_keys(self, instance: SopInstance) -> set[str]:
+        """从权威 Step 行机械计算已完成依赖，不相信模型摘要。"""
+
+        rows = self.db.exec(
+            select(SopNodeExecution).where(
+                SopNodeExecution.tenant_id == instance.tenant_id,
+                SopNodeExecution.instance_id == instance.id,
+                SopNodeExecution.status == "succeeded",
+            )
+        ).all()
+        return {row.step_key for row in rows}
 
     def _step(self, instance: SopInstance, step_key: str) -> SopNodeExecution | None:
         """返回当前计划步骤的最新 attempt，供崩溃恢复复用。"""
@@ -311,3 +522,11 @@ class DynamicTaskAgent:
             data=operation.result_json.get("data"),
             error=None,
         )
+
+
+def canonical_result_checksum(result: DynamicTaskResult) -> str:
+    """复用规划严格 JSON checksum 记录 answer Step 的结果引用。"""
+
+    from app.dynamic_tasks.planning import canonical_checksum
+
+    return canonical_checksum(result)

@@ -20,6 +20,7 @@ from app.db.models import (
     AgentEvent,
     EventOutbox,
     ExecutionCommand,
+    ExecutionPlanRevision,
     ExecutionSignal,
     SopInstance,
     SopNodeExecution,
@@ -237,6 +238,20 @@ def test_terminal_guard_requires_closed_children_result_and_publication(db: Sess
         status="running",
     )
     db.add(step)
+    db.add(
+        ExecutionPlanRevision(
+            id="plan_1",
+            tenant_id=instance.tenant_id,
+            execution_id=instance.id,
+            revision_number=1,
+            reason="initial",
+            status="active",
+            plan_json={"steps": [{"step_key": "step_1", "required": True}]},
+            checksum="a" * 64,
+            capability_snapshot_json={"capabilities": []},
+            capability_checksum="b" * 64,
+        )
+    )
     db.commit()
     store = SopExecutionStore(db)
     service = ExecutionControlService(db, store)
@@ -391,6 +406,47 @@ def test_failed_verification_freezes_rejected_result_and_blocks_success(db: Sess
         with pytest.raises(ExecutionControlError) as blocked:
             service.assert_terminal_closure(instance, "succeeded")
         assert "verified_result" in str(blocked.value)
+
+
+def test_dynamic_terminal_guard_rejects_required_plan_step_never_created(db: Session) -> None:
+    """验证动态计划声明的 required Step 即使从未建行，也不能被顶层结果绕过。"""
+
+    instance = _instance(db, suffix="missing_step")
+    revision = ExecutionPlanRevision(
+        id="plan_1",
+        tenant_id=instance.tenant_id,
+        execution_id=instance.id,
+        revision_number=1,
+        reason="initial",
+        status="active",
+        plan_json={
+            "steps": [
+                {"step_key": "required_missing", "required": True},
+            ]
+        },
+        checksum="a" * 64,
+        capability_snapshot_json={"capabilities": []},
+        capability_checksum="b" * 64,
+    )
+    db.add(revision)
+    db.flush()
+    store = SopExecutionStore(db)
+    control = ExecutionControlService(db, store)
+    with store.owned(instance, worker_id="worker_missing_step"):
+        _result, publication, _ = control.freeze_result(
+            instance,
+            result={"summary": "不能跳步"},
+            verification={"passed": True},
+        )
+        control.settle_application_publication(
+            instance,
+            publication,
+            message_id="message_missing_step",
+        )
+        with pytest.raises(ExecutionControlError) as blocked:
+            control.assert_terminal_closure(instance, "succeeded")
+
+    assert "missing_required_steps" in str(blocked.value)
 
 
 def test_signal_and_outbox_exhaust_attempt_budget_into_dead_letter(db: Session) -> None:

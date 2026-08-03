@@ -11,7 +11,7 @@ from __future__ import annotations
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from app.db.models import ModelConfig, SopOperation
+from app.db.models import ExecutionPublication, ExecutionResult, Message, ModelConfig, SopOperation
 from app.dynamic_tasks.agent import DynamicTaskAgent, DynamicTaskAgentError
 from app.dynamic_tasks.capability_catalog import CapabilitySnapshot, capability_checksum
 from app.dynamic_tasks.planning import (
@@ -101,9 +101,30 @@ class _Planner:
                     kind="tool.read",
                     capability_refs=("contract.query",),
                 ),
+                PlanStep(
+                    step_key="answer",
+                    title="形成风险简报",
+                    kind="answer",
+                    depends_on=("query_contract",),
+                ),
             ),
             budget={"max_steps": 4},
         )
+
+
+class _Proposer:
+    """返回当前 read 步骤的完整 provider proposal。"""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def propose(self, *, view, step):
+        """记录机械执行视图存在，并返回固定只读动作。"""
+
+        assert view.execution_context["plan_checksum"]
+        assert step.step_key == "query_contract"
+        self.calls += 1
+        return _response()
 
 
 def _snapshot(*, risk_class: str = "read") -> CapabilitySnapshot:
@@ -336,3 +357,133 @@ def test_start_task_uses_preflight_catalog_and_reuses_same_active_execution() ->
         assert repeated_created is False
         assert second.id == first.id
         assert first.goal_snapshot_json["success_criteria"][0]["id"] == "criterion_01"
+
+
+def test_advance_connects_plan_provider_view_proposal_and_read_operation() -> None:
+    """验证 B1 主链从权威计划机械选步，经唯一 provider view 后落提案并执行 read。"""
+
+    engine = create_engine("sqlite://", poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as db:
+        capabilities = _model_capabilities()
+        model = ModelConfig(
+            id="model_advance",
+            tenant_id="tenant_demo",
+            name="动态模型",
+            api_key_encrypted="encrypted",
+            model="model-demo",
+            capability_snapshot_json=capabilities,
+            capability_checksum=capability_checksum(capabilities),
+            preflight_status="ready",
+        )
+        db.add(model)
+        db.flush()
+        snapshot = _snapshot()
+        catalog = _StartCatalog(model, snapshot)
+        executor = _Executor()
+        proposer = _Proposer()
+        agent = DynamicTaskAgent(
+            db,
+            catalog=catalog,
+            tool_executor=executor,
+            planner=_Planner(),
+            action_proposer=proposer,
+        )
+        instance, _ = agent.start_task(
+            tenant_id="tenant_demo",
+            session_id="session_advance",
+            agent_id="agent_demo",
+            initiator_user_id="user_demo",
+            goal="生成续约风险简报",
+            success_criteria=("覆盖合同证据",),
+            model_config=model,
+        )
+
+        step, result = agent.advance_next_read_step(
+            execution_id=instance.id,
+            model_config=model,
+            worker_id="worker_advance",
+            actor_user_id="user_demo",
+        )
+        db.commit()
+
+        assert step.step_key == "query_contract"
+        assert result.success is True
+        assert proposer.calls == 1
+        assert executor.calls == 1
+
+
+def test_verified_result_message_publication_and_terminal_state_commit_together() -> None:
+    """验证成功标准证据通过后，最终消息、publication 和终态形成一个真实闭环。"""
+
+    engine = create_engine("sqlite://", poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as db:
+        capabilities = _model_capabilities()
+        model = ModelConfig(
+            id="model_result",
+            tenant_id="tenant_demo",
+            name="动态模型",
+            api_key_encrypted="encrypted",
+            model="model-demo",
+            capability_snapshot_json=capabilities,
+            capability_checksum=capability_checksum(capabilities),
+            preflight_status="ready",
+        )
+        db.add(model)
+        db.flush()
+        snapshot = _snapshot()
+        agent = DynamicTaskAgent(
+            db,
+            catalog=_StartCatalog(model, snapshot),
+            tool_executor=_Executor(),
+            planner=_Planner(),
+            action_proposer=_Proposer(),
+        )
+        instance, _ = agent.start_task(
+            tenant_id="tenant_demo",
+            session_id="session_result",
+            agent_id="agent_demo",
+            initiator_user_id="user_demo",
+            goal="生成续约风险简报",
+            success_criteria=("覆盖合同证据",),
+            model_config=model,
+        )
+        agent.advance_next_read_step(
+            execution_id=instance.id,
+            model_config=model,
+            worker_id="worker_read",
+            actor_user_id="user_demo",
+        )
+        response = CompletedProviderProposal(
+            response_id="provider_result_1",
+            finish_reason="stop",
+            proposal=RuntimeActionProposal(
+                action_kind=ActionKind.ANSWER,
+                arguments={
+                    "markdown": "# 续约风险简报\n\n合同 C-001 已核验。",
+                    "criterion_evidence": {"criterion_01": ["query_contract"]},
+                    "pending_questions": [],
+                },
+                rationale="证据已足够形成结果",
+            ),
+        )
+
+        message = agent.complete_with_result_proposal(
+            execution_id=instance.id,
+            step_key="answer",
+            completed_response=response,
+            provider="openai_compatible",
+            model="model-demo",
+            model_capabilities=capabilities,
+            worker_id="worker_result",
+        )
+
+        db.refresh(instance)
+        result = db.exec(select(ExecutionResult)).one()
+        publication = db.exec(select(ExecutionPublication)).one()
+        assert db.exec(select(Message)).one().id == message.id
+        assert result.status == "verified"
+        assert publication.status == "settled"
+        assert publication.receipt_json["message_id"] == message.id
+        assert instance.status == "succeeded"
