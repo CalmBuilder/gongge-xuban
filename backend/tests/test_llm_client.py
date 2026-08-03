@@ -912,6 +912,34 @@ def test_generate_json_requests_json_object_mode():
     assert client.client.chat.completions.calls[0]["response_format"] == {"type": "json_object"}
 
 
+def test_generate_json_with_metadata_preserves_provider_action_identity():
+    """验证动态提案取得真实 response id、finish reason 和用量，而非用正文猜造身份。"""
+
+    client = object.__new__(LLMClient)
+    client.client = _FakeOpenAIClient()
+    client.model = "demo-model"
+    client.temperature = 0.2
+    client.max_output_tokens = 256
+    completion = _completion_with_content('{"ok": true}')
+    completion.id = "response-provider-123"
+    completion.choices[0].finish_reason = "stop"
+    completion.usage = type(
+        "Usage",
+        (),
+        {"prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15},
+    )()
+    client.client.chat.completions.create = lambda **kwargs: completion  # noqa: ARG005
+
+    payload, metadata = client.generate_json_with_metadata("prompt", {})
+
+    assert payload == {"ok": True}
+    assert metadata == {
+        "response_id": "response-provider-123",
+        "finish_reason": "stop",
+        "usage": {"input_tokens": 12, "output_tokens": 3, "total_tokens": 15},
+    }
+
+
 def test_internal_json_operation_caps_output_without_mutating_system_prompt():
     client = object.__new__(LLMClient)
     client.client = _FakeOpenAIClient()

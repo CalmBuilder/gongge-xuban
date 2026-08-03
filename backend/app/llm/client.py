@@ -154,6 +154,9 @@ class LLMClient:
                 content = _completion_message_content(completion)
                 metrics = _completion_span_metrics(completion)
                 if content.strip():
+                    self._last_completed_response_metadata = _completion_identity_metadata(
+                        completion
+                    )
                     span.finish(
                         ttft_ms=span.elapsed_ms(),
                         output_chars=len(content),
@@ -417,6 +420,22 @@ class LLMClient:
         raise LLMError(
             f"Model did not return valid JSON after {JSON_REPAIR_ATTEMPTS} repair attempts; {previews}"
         ) from last_error
+
+    def generate_json_with_metadata(
+        self,
+        system_prompt: str,
+        user_payload: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """返回完整 JSON 及其真实 provider response 身份，供动作提案持久化防重。"""
+
+        self._last_completed_response_metadata = None
+        payload = self.generate_json(system_prompt, user_payload)
+        metadata = getattr(self, "_last_completed_response_metadata", None)
+        if not isinstance(metadata, dict) or not metadata.get("response_id"):
+            raise LLMError("Provider completed JSON response is missing a stable response id")
+        if metadata.get("finish_reason") not in {"stop", "tool_calls"}:
+            raise LLMError("Provider completed JSON response has an unsupported finish reason")
+        return payload, dict(metadata)
 
     def preflight_dynamic_capabilities(self) -> dict[str, bool | str]:
         """使用原生 JSON mode 与强制 tool call 探针验证动态计划必需协议。"""
@@ -799,6 +818,21 @@ def _completion_span_metrics(completion: Any) -> dict[str, Any]:
         "finish_reason": finish_reason,
         "reasoning_chars": len(_reasoning_text(message)),
         **_usage_span_metrics(usage),
+    }
+
+
+def _completion_identity_metadata(completion: Any) -> dict[str, Any]:
+    """提取持久提案需要的未截断响应身份、结束原因和 token 用量。"""
+
+    choices = getattr(completion, "choices", None) or []
+    finish_reason = None
+    if choices:
+        finish_reason = _safe_fragment(getattr(choices[0], "finish_reason", None), 32) or None
+    response_id = _safe_fragment(getattr(completion, "id", None), 512) or None
+    return {
+        "response_id": response_id,
+        "finish_reason": finish_reason,
+        "usage": _usage_span_metrics(getattr(completion, "usage", None)),
     }
 
 
