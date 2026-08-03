@@ -16,6 +16,8 @@ from typing import Protocol
 from sqlmodel import Session, select
 
 from app.db.models import (
+    ActionProposalRecord,
+    ExecutionCommand,
     ExecutionPlanRevision,
     ExecutionSignal,
     AgentEvent,
@@ -41,6 +43,7 @@ from app.dynamic_tasks.execution_context import build_execution_context_projecti
 from app.dynamic_tasks.planning import (
     CompletedProviderProposal,
     NormalizedPlan,
+    PlanReason,
     PlanStep,
     SuccessCriterion,
 )
@@ -53,6 +56,7 @@ from app.knowledge.access import accessible_knowledge_base_versions, resolve_kno
 from app.knowledge.schema import KnowledgeSearchRequest
 from app.knowledge.service import KnowledgeService
 from app.llm.client import LLMClient
+from app.organization.permissions import user_permission_codes
 from app.session.managed_resources import ManagedInputResourceService
 from app.sop_runtime.execution_control import ExecutionControlService
 from app.sop_runtime.execution_store import SopExecutionStore
@@ -393,7 +397,7 @@ class DynamicTaskAgent:
                 execution_id=instance.id,
                 model_config=model_config,
                 worker_id=worker_id,
-                actor_user_id=actor_user_id,
+                actor_user_id=instance.initiator_user_id,
             )
         control.claim_signal(signal, worker_id=worker_id, ttl_seconds=300)
         self.db.commit()
@@ -461,6 +465,248 @@ class DynamicTaskAgent:
             actor_user_id=actor_user_id,
             resume_signal_id=signal.id,
             signal_worker_id=worker_id,
+        )
+
+    def resume_steer_signal(
+        self,
+        *,
+        signal_id: str,
+        model_config: ModelConfig,
+        worker_id: str,
+        actor_user_id: str,
+        steering_enabled: bool,
+    ) -> DynamicRunOutcome:
+        """在安全动作边界追加用户约束，并以同一持久 signal 恢复原 Execution。"""
+
+        signal = self.db.get(ExecutionSignal, signal_id)
+        if signal is None or signal.signal_type != "command":
+            raise DynamicTaskAgentError("DYNAMIC_STEER_SIGNAL_INVALID")
+        command = self.db.get(ExecutionCommand, signal.causation_id)
+        instance = self.db.get(SopInstance, signal.execution_id)
+        if (
+            command is None
+            or command.command_type != "steer"
+            or command.execution_id != signal.execution_id
+            or instance is None
+            or instance.kind != "dynamic_task"
+        ):
+            raise DynamicTaskAgentError("DYNAMIC_STEER_COMMAND_INVALID")
+        if command.actor_user_id != actor_user_id or command.tenant_id != instance.tenant_id:
+            raise DynamicTaskAgentError("DYNAMIC_STEER_ACTOR_DENIED")
+        control = ExecutionControlService(self.db, self.store)
+        if signal.status == "consumed":
+            return self.run_until_blocked_or_complete(
+                execution_id=instance.id,
+                model_config=model_config,
+                worker_id=worker_id,
+                actor_user_id=instance.initiator_user_id,
+            )
+        control.claim_signal(signal, worker_id=worker_id, ttl_seconds=300)
+        self.db.commit()
+        with self.store.owned(instance, worker_id=worker_id):
+            self.db.refresh(command)
+            self.db.refresh(instance)
+            if command.status == "applied":
+                pass
+            elif command.status in {"conflicted", "rejected"}:
+                control.consume_signal(instance, signal, worker_id=worker_id)
+                self.db.commit()
+                return DynamicRunOutcome(command.status, instance.id)
+            elif command.status != "pending":
+                raise DynamicTaskAgentError("DYNAMIC_STEER_COMMAND_NOT_PENDING")
+            elif not self._steer_actor_authorized(instance, actor_user_id):
+                self._settle_steer_command(
+                    instance,
+                    command,
+                    status="rejected",
+                    reason_code="DYNAMIC_STEER_ACTOR_DENIED",
+                    worker_id=worker_id,
+                )
+                control.consume_signal(instance, signal, worker_id=worker_id)
+                self.db.commit()
+                return DynamicRunOutcome("rejected", instance.id)
+            elif not steering_enabled:
+                self._settle_steer_command(
+                    instance,
+                    command,
+                    status="rejected",
+                    reason_code="DYNAMIC_STEERING_DISABLED",
+                    worker_id=worker_id,
+                )
+                control.consume_signal(instance, signal, worker_id=worker_id)
+                self.db.commit()
+                return DynamicRunOutcome("rejected", instance.id)
+            else:
+                base_revision_id = str(
+                    (command.result_json or {}).get("base_plan_revision_id") or ""
+                )
+                if not base_revision_id or instance.current_plan_revision_id != base_revision_id:
+                    self._settle_steer_command(
+                        instance,
+                        command,
+                        status="conflicted",
+                        reason_code="STEER_PLAN_REVISION_CONFLICT",
+                        worker_id=worker_id,
+                    )
+                    control.consume_signal(instance, signal, worker_id=worker_id)
+                    self.db.commit()
+                    return DynamicRunOutcome("conflicted", instance.id)
+                self._assert_steer_safe_boundary(instance)
+                with self.db.begin_nested():
+                    self._supersede_prepared_dynamic_actions(instance)
+                    current_revision = self.db.get(ExecutionPlanRevision, base_revision_id)
+                    if current_revision is None:
+                        raise DynamicTaskAgentError("DYNAMIC_PLAN_NOT_FOUND")
+                    current_plan = NormalizedPlan.model_validate(current_revision.plan_json)
+                    instruction = str(command.payload_json.get("instruction") or "").strip()
+                    constraints = tuple(dict.fromkeys((*current_plan.constraints, instruction)))
+                    revised_plan = current_plan.model_copy(update={"constraints": constraints})
+                    revision, _ = self.store.append_plan_revision(
+                        instance,
+                        plan=revised_plan,
+                        reason=PlanReason.USER_CONSTRAINT,
+                        capability_snapshot=dict(current_revision.capability_snapshot_json or {}),
+                    )
+                    self._settle_steer_command(
+                        instance,
+                        command,
+                        status="applied",
+                        reason_code=None,
+                        worker_id=worker_id,
+                        plan_revision_id=revision.id,
+                    )
+        self.db.commit()
+        return self.run_until_blocked_or_complete(
+            execution_id=instance.id,
+            model_config=model_config,
+            worker_id=worker_id,
+            actor_user_id=instance.initiator_user_id,
+            resume_signal_id=signal.id,
+            signal_worker_id=worker_id,
+        )
+
+    def _steer_actor_authorized(self, instance: SopInstance, actor_user_id: str) -> bool:
+        """处理命令时重新验证成员状态和 Execution 管理资格，防止排队期间撤权失效。"""
+
+        actor = self.db.get(User, actor_user_id)
+        if (
+            actor is None
+            or actor.tenant_id != instance.tenant_id
+            or actor.membership_status != "active"
+        ):
+            return False
+        return actor.id == instance.initiator_user_id or "execution.manage" in set(
+            user_permission_codes(
+                self.db,
+                tenant_id=instance.tenant_id,
+                user_id=actor.id,
+            )
+        )
+
+    def _assert_steer_safe_boundary(self, instance: SopInstance) -> None:
+        """只允许在无已派发动作和无活动人工等待的边界修改后续计划。"""
+
+        dispatched = self.db.exec(
+            select(SopOperation).where(
+                SopOperation.tenant_id == instance.tenant_id,
+                SopOperation.instance_id == instance.id,
+                SopOperation.status.in_(("running", "unknown")),
+            )
+        ).first()
+        if dispatched is not None:
+            raise DynamicTaskAgentError("DYNAMIC_STEER_OPERATION_UNSETTLED")
+        attention = self.db.exec(
+            select(SopWorkItem).where(
+                SopWorkItem.tenant_id == instance.tenant_id,
+                SopWorkItem.instance_id == instance.id,
+                SopWorkItem.status.in_(("offered", "claimed")),
+            )
+        ).first()
+        if attention is not None:
+            raise DynamicTaskAgentError("DYNAMIC_STEER_ATTENTION_UNSETTLED")
+
+    def _supersede_prepared_dynamic_actions(self, instance: SopInstance) -> None:
+        """撤销尚未 dispatch 的动作提案和 Operation，并结束其旧计划节点 attempt。"""
+
+        prepared = self.db.exec(
+            select(SopOperation).where(
+                SopOperation.tenant_id == instance.tenant_id,
+                SopOperation.instance_id == instance.id,
+                SopOperation.status == "prepared",
+            )
+        ).all()
+        affected_node_ids: set[str] = set()
+        for operation in prepared:
+            self.store.cancel_prepared_operation(operation)
+            affected_node_ids.add(operation.node_execution_id)
+        proposals = self.db.exec(
+            select(ActionProposalRecord).where(
+                ActionProposalRecord.tenant_id == instance.tenant_id,
+                ActionProposalRecord.execution_id == instance.id,
+                ActionProposalRecord.status == "validated",
+            )
+        ).all()
+        now = self.store.database_now()
+        for proposal in proposals:
+            proposal.status = "superseded"
+            proposal.superseded_at = now
+            self.db.add(proposal)
+            node = self.db.exec(
+                select(SopNodeExecution).where(
+                    SopNodeExecution.tenant_id == instance.tenant_id,
+                    SopNodeExecution.instance_id == instance.id,
+                    SopNodeExecution.plan_revision_id == proposal.plan_revision_id,
+                    SopNodeExecution.step_key == proposal.step_key,
+                    SopNodeExecution.attempt == proposal.step_attempt,
+                )
+            ).first()
+            if node is not None:
+                affected_node_ids.add(node.id)
+        for node_id in affected_node_ids:
+            node = self.db.get(SopNodeExecution, node_id)
+            if node is not None and node.status in {"scheduled", "running"}:
+                self.store.fail_node(
+                    instance,
+                    node,
+                    error={"code": "DYNAMIC_ACTION_SUPERSEDED_BY_STEERING"},
+                )
+
+    def _settle_steer_command(
+        self,
+        instance: SopInstance,
+        command: ExecutionCommand,
+        *,
+        status: str,
+        reason_code: str | None,
+        worker_id: str,
+        plan_revision_id: str | None = None,
+    ) -> None:
+        """以当前 fencing token 终结 steer 命令并追加可审计处置事件。"""
+
+        now = self.store.database_now()
+        command.status = status
+        command.reason_code = reason_code
+        command.claimed_by = worker_id
+        command.claimed_fencing_token = instance.fencing_token
+        command.claimed_at = command.claimed_at or now
+        command.consumed_at = now
+        command.result_plan_revision_id = plan_revision_id
+        command.result_json = {
+            **dict(command.result_json or {}),
+            "plan_revision_id": plan_revision_id,
+            "execution_revision": instance.revision,
+        }
+        command.updated_at = now
+        self.db.add(command)
+        ExecutionControlService(self.db, self.store).append_execution_event(
+            instance,
+            event_type=f"execution_steer_{status}",
+            causation_id=command.id,
+            payload={
+                "command_id": command.command_id,
+                "reason_code": reason_code,
+                "plan_revision_id": plan_revision_id,
+            },
         )
 
     def advance_next_knowledge_step(

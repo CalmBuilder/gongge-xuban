@@ -13,7 +13,8 @@ from collections.abc import Callable
 from sqlalchemy import or_
 from sqlmodel import Session, select
 
-from app.db.models import ExecutionSignal, ModelConfig, SopInstance, SopWorkItem
+from app.config import get_settings
+from app.db.models import ExecutionCommand, ExecutionSignal, ModelConfig, SopInstance, SopWorkItem
 from app.dynamic_tasks.agent import DynamicRunOutcome, DynamicTaskAgent
 from app.sop_runtime.execution_control import ExecutionControlService
 from app.sop_runtime.execution_store import SopExecutionStore
@@ -23,7 +24,7 @@ DynamicAgentFactory = Callable[[Session], DynamicTaskAgent]
 
 
 def due_dynamic_task_signals(db: Session, *, limit: int = 50) -> list[ExecutionSignal]:
-    """按数据库时间返回可认领的动态 Attention signal，不在扫描阶段取得执行权。"""
+    """按数据库时间返回可认领的动态恢复 signal，不在扫描阶段取得执行权。"""
 
     if limit < 1 or limit > 500:
         raise ValueError("动态 signal 扫描批量必须位于 1..500。")
@@ -31,7 +32,7 @@ def due_dynamic_task_signals(db: Session, *, limit: int = 50) -> list[ExecutionS
     candidates = db.exec(
         select(ExecutionSignal)
         .where(
-            ExecutionSignal.signal_type == "attention_decided",
+            ExecutionSignal.signal_type.in_(("attention_decided", "command")),
             ExecutionSignal.available_at <= now,
             or_(
                 ExecutionSignal.status == "pending",
@@ -66,7 +67,7 @@ def process_dynamic_task_signal(
     *,
     agent_factory: DynamicAgentFactory = DynamicTaskAgent,
 ) -> DynamicRunOutcome | None:
-    """从持久 Attention 决定解析模型与 actor，失败时退避原 signal 而不丢失唤醒。"""
+    """解析持久信号的模型与 actor，失败时退避原 signal 而不丢失唤醒。"""
 
     instance = db.get(SopInstance, signal.execution_id)
     if instance is None or instance.kind != "dynamic_task":
@@ -76,13 +77,17 @@ def process_dynamic_task_signal(
         model_snapshot, dict
     ) else ""
     model = db.get(ModelConfig, model_id) if model_id else None
-    attention_id = str(signal.payload_json.get("attention_id") or "")
-    attention = db.get(SopWorkItem, attention_id) if attention_id else None
-    actor_user_id = (
-        str(attention.resolution_json.get("actor_user_id") or "")
-        if attention is not None
-        else ""
-    )
+    if signal.signal_type == "command":
+        command = db.get(ExecutionCommand, signal.causation_id)
+        actor_user_id = str(command.actor_user_id or "") if command is not None else ""
+    else:
+        attention_id = str(signal.payload_json.get("attention_id") or "")
+        attention = db.get(SopWorkItem, attention_id) if attention_id else None
+        actor_user_id = (
+            str(attention.resolution_json.get("actor_user_id") or "")
+            if attention is not None
+            else ""
+        )
     worker_id = f"dynamic-signal:{signal.id}:{signal.attempt_count + 1}"
     if model is None or model.tenant_id != instance.tenant_id or not actor_user_id:
         return _retry_unprocessable_signal(
@@ -93,7 +98,16 @@ def process_dynamic_task_signal(
             code="DYNAMIC_SIGNAL_CONTEXT_INVALID",
         )
     try:
-        return agent_factory(db).resume_clarification_signal(
+        agent = agent_factory(db)
+        if signal.signal_type == "command":
+            return agent.resume_steer_signal(
+                signal_id=signal.id,
+                model_config=model,
+                worker_id=worker_id,
+                actor_user_id=actor_user_id,
+                steering_enabled=get_settings().dynamic_task_steering_enabled,
+            )
+        return agent.resume_clarification_signal(
             signal_id=signal.id,
             model_config=model,
             worker_id=worker_id,
@@ -124,7 +138,7 @@ def _retry_unprocessable_signal(
     worker_id: str,
     code: str,
 ) -> None:
-    """对缺少模型或 Attention 上下文的 signal 完成一次受租约保护的退避。"""
+    """对缺少模型或命令上下文的 signal 完成一次受租约保护的退避。"""
 
     control = ExecutionControlService(db)
     control.claim_signal(signal, worker_id=worker_id)

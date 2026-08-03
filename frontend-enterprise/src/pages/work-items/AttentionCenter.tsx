@@ -242,7 +242,7 @@ export default function AttentionCenter() {
                     <ol className="grid gap-[5px]">
                       {execution.steps.map((step, index) => (
                         <li key={step.step_key} className="grid grid-cols-[18px_minmax(0,1fr)_auto] items-center gap-[7px] text-[11px]">
-                          <span className={cn('grid size-[18px] place-items-center rounded-full font-semibold', step.status === 'completed' ? 'bg-[#e6f6ec] text-[#087a38]' : step.status === 'waiting' || step.status === 'running' ? 'bg-[#fff0d8] text-[#996000]' : 'bg-[#eef1f6] text-[#778097]')}>{index + 1}</span>
+                          <span className={cn('grid size-[18px] place-items-center rounded-full font-semibold', ['completed', 'succeeded'].includes(step.status) ? 'bg-[#e6f6ec] text-[#087a38]' : step.status === 'waiting' || step.status === 'running' ? 'bg-[#fff0d8] text-[#996000]' : 'bg-[#eef1f6] text-[#778097]')}>{index + 1}</span>
                           <span className="truncate text-[#4f576d]">{step.title}</span>
                           <span className="text-[#8991a5]">{stepStatusLabel(step.status)}</span>
                         </li>
@@ -318,5 +318,5 @@ function budgetSummary(execution: ExecutionState): string {
 }
 
 function stepStatusLabel(status: string): string {
-  return ({ completed: '已完成', running: '执行中', waiting: '等待处理', failed: '失败', scheduled: '待执行', pending: '待执行' } as Record<string, string>)[status] || status;
+  return ({ completed: '已完成', succeeded: '已完成', running: '执行中', waiting: '等待处理', failed: '失败', scheduled: '待执行', pending: '待执行' } as Record<string, string>)[status] || status;
 }

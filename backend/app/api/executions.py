@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlmodel import Session, select
 
+from app.config import get_settings
 from app.db import get_session
 from app.db.models import (
     ExecutionCommand,
@@ -52,6 +53,7 @@ class ExecutionCommandRead(BaseModel):
     expected_revision: int
     result: dict[str, object]
     reason_code: str | None
+    result_plan_revision_id: str | None
     issued_at: str
     consumed_at: str | None
 
@@ -112,9 +114,11 @@ def issue_execution_command(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_session),
 ) -> ExecutionCommandRead:
-    """持久登记命令；cancel 同事务收敛，steer 保持 pending 等待 B1.2 消费。"""
+    """持久登记命令；cancel 同事务收敛，steer 由持久 worker 异步消费。"""
 
     instance = _authorized_execution(db, request.tenant_id, execution_id, current_user)
+    if request.command_type == "steer" and not get_settings().dynamic_task_steering_enabled:
+        raise HTTPException(status_code=409, detail="DYNAMIC_STEERING_DISABLED")
     store = SopExecutionStore(db)
     control = ExecutionControlService(db, store)
     try:
@@ -243,13 +247,17 @@ def _execution_read(db: Session, instance: SopInstance) -> ExecutionRead:
         .where(
             SopNodeExecution.tenant_id == instance.tenant_id,
             SopNodeExecution.instance_id == instance.id,
-            SopNodeExecution.plan_revision_id == instance.current_plan_revision_id,
         )
-        .order_by(SopNodeExecution.step_key, SopNodeExecution.attempt.desc())
+        .order_by(SopNodeExecution.step_key, SopNodeExecution.created_at.desc())
     ).all()
     latest_nodes: dict[str, SopNodeExecution] = {}
     for node in node_rows:
-        latest_nodes.setdefault(node.step_key, node)
+        selected = latest_nodes.get(node.step_key)
+        if selected is None or (
+            selected.plan_revision_id != instance.current_plan_revision_id
+            and node.plan_revision_id == instance.current_plan_revision_id
+        ):
+            latest_nodes[node.step_key] = node
     steps: list[dict[str, object]] = []
     raw_steps = plan.get("steps")
     for raw_step in raw_steps if isinstance(raw_steps, list) else []:
@@ -328,6 +336,7 @@ def _command_read(command: ExecutionCommand) -> ExecutionCommandRead:
         expected_revision=command.expected_execution_revision,
         result=dict(command.result_json or {}),
         reason_code=command.reason_code,
+        result_plan_revision_id=command.result_plan_revision_id,
         issued_at=command.issued_at.isoformat(),
         consumed_at=command.consumed_at.isoformat() if command.consumed_at else None,
     )

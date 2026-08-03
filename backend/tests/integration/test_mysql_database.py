@@ -51,6 +51,7 @@ from app.dynamic_tasks.planning import (
     RuntimeActionProposal,
     SuccessCriterion,
 )
+from app.dynamic_tasks.agent import DynamicRunOutcome, DynamicTaskAgent
 from app.db.seed import (
     EXCHANGE_SKILL,
     PRICE_COMPARE_SKILL,
@@ -541,6 +542,96 @@ def test_mysql_dynamic_plan_proposal_and_operation_round_trip(mysql_database_url
     assert persisted_proposal.consumed_operation_id == operation_id
     assert persisted_operation is not None
     assert persisted_operation.node_execution_id == execution_id
+
+
+def test_mysql_dynamic_steer_command_appends_plan_revision_atomically(
+    mysql_database_url: str,
+) -> None:
+    """验证 MySQL 8.4 上 steer 命令、savepoint 和追加计划修订使用同一事务边界。"""
+
+    upgrade(mysql_database_url)
+    engine = create_engine(mysql_database_url, pool_pre_ping=True)
+    plan = NormalizedPlan(
+        goal="形成合同摘要",
+        success_criteria=(
+            SuccessCriterion(id="summary_ready", type="assertion", spec={"required": True}),
+        ),
+        steps=(PlanStep(step_key="answer", title="形成摘要", kind="answer"),),
+        budget={"max_steps": 2},
+    )
+    snapshot = {"model": {"id": "mysql-steer-model", "checksum": "f" * 64}}
+    with Session(engine, expire_on_commit=False) as db:
+        user = User(
+            id="user_steer_mysql",
+            tenant_id="tenant_steer_mysql",
+            username="steer-owner",
+            password_hash="x",
+        )
+        db.add(Tenant(id="tenant_steer_mysql", name="Steer MySQL"))
+        db.add(user)
+        db.add(
+            AgentProfile(
+                id="agent_steer_mysql",
+                tenant_id="tenant_steer_mysql",
+                name="MySQL Steering 员工",
+                owner_user_id=user.id,
+            )
+        )
+        db.flush()
+        store = SopExecutionStore(db)
+        instance, first_revision = store.start_dynamic_instance(
+            tenant_id="tenant_steer_mysql",
+            session_id="session_steer_mysql",
+            agent_id="agent_steer_mysql",
+            initiator_user_id=user.id,
+            plan=plan,
+            capability_snapshot=snapshot,
+        )
+        command_row, _ = ExecutionControlService(db).issue_command(
+            instance,
+            command_id="steer_mysql_1",
+            command_type="steer",
+            actor_user_id=user.id,
+            expected_execution_revision=instance.revision,
+            payload={"instruction": "只覆盖 2026 年内到期合同"},
+        )
+        db.commit()
+        signal = db.exec(
+            select(ExecutionSignal).where(ExecutionSignal.causation_id == command_row.id)
+        ).one()
+        agent = DynamicTaskAgent(db)
+        agent.run_until_blocked_or_complete = lambda **kwargs: DynamicRunOutcome(
+            "blocked", instance.id
+        )
+
+        outcome = agent.resume_steer_signal(
+            signal_id=signal.id,
+            model_config=ModelConfig(
+                id="model_steer_mysql",
+                tenant_id=instance.tenant_id,
+                name="Steer model",
+                model="mysql-model",
+                api_key_encrypted="x",
+            ),
+            worker_id="worker_steer_mysql",
+            actor_user_id=user.id,
+            steering_enabled=True,
+        )
+
+        db.refresh(command_row)
+        db.refresh(signal)
+        revisions = db.exec(
+            select(ExecutionPlanRevision)
+            .where(ExecutionPlanRevision.execution_id == instance.id)
+            .order_by(ExecutionPlanRevision.revision_number)
+        ).all()
+        assert outcome.status == "blocked"
+        assert [row.status for row in revisions] == ["superseded", "active"]
+        assert revisions[0].id == first_revision.id
+        assert revisions[1].plan_json["constraints"] == ["只覆盖 2026 年内到期合同"]
+        assert command_row.status == "applied"
+        assert command_row.result_plan_revision_id == revisions[1].id
+        assert signal.status == "claimed"
 
 
 def test_mysql_operation_unknown_reconcile_and_cancellation_are_consistent(

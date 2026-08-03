@@ -46,6 +46,7 @@ import {
 import type { TraceLine } from '../chatTypes';
 import type { UseChatSession } from '../useChatSession';
 import ExecutionRecord from './ExecutionRecord';
+import DynamicExecutionControl from './DynamicExecutionControl';
 import ScheduledDraftCard from './ScheduledDraftCard';
 
 export type MessageRender = {
@@ -121,6 +122,10 @@ export default function MessageBubble({ chat, item, render }: MessageBubbleProps
                 <span data-i18n-ignore>{visibleContent}</span>
               </div>
             )
+          ) : null}
+
+          {typeof item.metadata?.execution_id === 'string' ? (
+            <DynamicExecutionControl executionId={item.metadata.execution_id} />
           ) : null}
 
           {!statusOnly && attachments.length > 0 && (

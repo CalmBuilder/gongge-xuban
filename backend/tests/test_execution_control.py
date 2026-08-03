@@ -477,6 +477,7 @@ def test_signal_and_outbox_exhaust_attempt_budget_into_dead_letter(db: Session) 
         command_type="steer",
         actor_user_id="user_owner",
         expected_execution_revision=instance.revision,
+        payload={"instruction": "用于触发命令 outbox 的有效约束"},
     )
     event = db.exec(select(AgentEvent)).one()
     outbox, _ = service.enqueue_event_delivery(

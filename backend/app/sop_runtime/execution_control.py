@@ -223,6 +223,19 @@ class ExecutionControlService:
         if command_type not in {"cancel", "steer"}:
             raise ExecutionControlError("COMMAND_TYPE_INVALID", "仅支持 cancel 或 steer 命令。")
         body = dict(payload or {})
+        if command_type == "steer":
+            instruction = str(body.get("instruction") or body.get("message") or "").strip()
+            if not instruction or len(instruction) > 4000:
+                raise ExecutionControlError(
+                    "STEER_INSTRUCTION_INVALID",
+                    "steer 命令必须包含 1..4000 字的 instruction。",
+                )
+            if instance.kind != "dynamic_task" or instance.status not in {"running", "waiting"}:
+                raise ExecutionControlError(
+                    "STEER_EXECUTION_NOT_ACTIVE",
+                    "只有活动动态 Execution 可以接受追加约束。",
+                )
+            body = {"instruction": instruction}
         checksum = canonical_checksum(body)
         existing = self.db.exec(
             select(ExecutionCommand).where(
@@ -258,6 +271,11 @@ class ExecutionControlService:
             expected_execution_revision=expected_execution_revision,
             payload_json=body,
             payload_checksum=checksum,
+            result_json=(
+                {"base_plan_revision_id": instance.current_plan_revision_id}
+                if command_type == "steer"
+                else {}
+            ),
         )
         self.db.add(command)
         self.db.flush()
@@ -616,10 +634,10 @@ class ExecutionControlService:
         *,
         worker_id: str,
     ) -> bool:
-        """在 execution lease 内应用取消命令；steer 在 B1.2 前只保持 pending。"""
+        """在 execution lease 内应用取消命令；steer 由动态 signal worker 消费。"""
 
         if command.command_type != "cancel":
-            raise ExecutionControlError("COMMAND_NOT_CONSUMABLE", "steer 命令将在 B1.2 才消费。")
+            raise ExecutionControlError("COMMAND_NOT_CONSUMABLE", "steer 命令必须由动态 worker 消费。")
         if command.execution_id != instance.id or command.tenant_id != instance.tenant_id:
             raise ExecutionControlError("COMMAND_EXECUTION_MISMATCH", "命令不属于当前 Execution。")
         if command.status == "applied":
@@ -816,20 +834,12 @@ class ExecutionControlService:
             SopNodeExecution.required.is_(True),
             SopNodeExecution.superseded_by_step_key.is_(None),
         )
-        if instance.current_plan_revision_id is not None:
+        if instance.current_plan_revision_id is not None and instance.kind != "dynamic_task":
             step_query = step_query.where(
                 SopNodeExecution.plan_revision_id == instance.current_plan_revision_id
             )
         steps = self.db.exec(step_query).all()
         if target_status == "succeeded":
-            incomplete_steps = [
-                item.id
-                for item in steps
-                if item.status
-                not in {NodeExecutionStatus.SUCCEEDED.value, NodeExecutionStatus.SKIPPED.value}
-            ]
-            if incomplete_steps:
-                blockers.append("required_steps")
             if instance.kind == "dynamic_task":
                 revision = self.db.get(ExecutionPlanRevision, instance.current_plan_revision_id)
                 plan_steps = (
@@ -852,6 +862,15 @@ class ExecutionControlService:
                     required_keys <= completed_keys
                 ):
                     blockers.append("missing_required_steps")
+            else:
+                incomplete_steps = [
+                    item.id
+                    for item in steps
+                    if item.status
+                    not in {NodeExecutionStatus.SUCCEEDED.value, NodeExecutionStatus.SKIPPED.value}
+                ]
+                if incomplete_steps:
+                    blockers.append("required_steps")
         active_operation = self.db.exec(
             select(SopOperation.id).where(
                 SopOperation.tenant_id == instance.tenant_id,

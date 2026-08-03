@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 from fastapi import HTTPException
 from sqlalchemy.pool import StaticPool
@@ -187,8 +189,76 @@ def test_execution_card_projects_plan_progress_budget_and_attention(db: Session)
     assert card.pending_attention_count == 1
 
 
-def test_steer_stays_pending_and_idempotency_conflict_is_rejected(db: Session) -> None:
-    """验证 B1.2 前 steer 明确保持 pending，且同 command id 不得改写 payload。"""
+def test_execution_card_preserves_completed_step_across_plan_revision(db: Session) -> None:
+    """验证 steering 后执行卡沿用同 step_key 的历史成功事实，而不是把证据显示为待执行。"""
+
+    owner, _, instance = _seed_execution(db, suffix="card_revision")
+    assert owner is not None
+    old_plan = ExecutionPlanRevision(
+        id="plan_card_old",
+        tenant_id=instance.tenant_id,
+        execution_id=instance.id,
+        revision_number=1,
+        status="superseded",
+        plan_json={"goal": "核验合同", "success_criteria": [], "steps": []},
+        checksum="b" * 64,
+        capability_snapshot_json={"model": {"id": "model"}},
+        capability_checksum="c" * 64,
+    )
+    new_plan = ExecutionPlanRevision(
+        id="plan_card_new",
+        tenant_id=instance.tenant_id,
+        execution_id=instance.id,
+        revision_number=2,
+        parent_revision_id=old_plan.id,
+        reason="user_constraint",
+        status="active",
+        plan_json={
+            "goal": "核验合同",
+            "success_criteria": [],
+            "steps": [
+                {"step_key": "read_contract", "title": "读取合同", "kind": "tool.read"},
+                {"step_key": "answer", "title": "形成答复", "kind": "answer"},
+            ],
+        },
+        checksum="d" * 64,
+        capability_snapshot_json={"model": {"id": "model"}},
+        capability_checksum="e" * 64,
+    )
+    instance.current_plan_revision_id = new_plan.id
+    db.add(old_plan)
+    db.add(new_plan)
+    db.add(instance)
+    db.add(
+        SopNodeExecution(
+            tenant_id=instance.tenant_id,
+            instance_id=instance.id,
+            node_id="read_contract",
+            step_key="read_contract",
+            plan_revision_id=old_plan.id,
+            step_kind="tool.read",
+            title="读取合同",
+            status="succeeded",
+        )
+    )
+    db.commit()
+
+    card = get_execution(instance.id, instance.tenant_id, owner, db)
+
+    assert card.steps[0]["status"] == "succeeded"
+    assert card.steps[1]["status"] == "pending"
+
+
+def test_steer_stays_pending_and_idempotency_conflict_is_rejected(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证开关开启后 steer 持久等待 worker，且同 command id 不得改写 payload。"""
+
+    monkeypatch.setattr(
+        "app.api.executions.get_settings",
+        lambda: SimpleNamespace(dynamic_task_steering_enabled=True),
+    )
 
     owner, _, instance = _seed_execution(db, suffix="steer")
     assert owner is not None
@@ -234,9 +304,16 @@ def test_unrelated_user_cannot_cancel_execution(db: Session) -> None:
     assert caught.value.status_code == 403
 
 
-def test_cancel_disposes_pending_steer_before_terminal(db: Session) -> None:
+def test_cancel_disposes_pending_steer_before_terminal(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """验证取消会明确拒绝尚未消费的 steer，不会被旧约束永久阻塞或在终态后应用。"""
 
+    monkeypatch.setattr(
+        "app.api.executions.get_settings",
+        lambda: SimpleNamespace(dynamic_task_steering_enabled=True),
+    )
     owner, _, instance = _seed_execution(db, suffix="steer_then_cancel")
     assert owner is not None
     issue_execution_command(
@@ -271,3 +348,26 @@ def test_cancel_disposes_pending_steer_before_terminal(db: Session) -> None:
     ).one()
     assert steer.status == "rejected"
     assert steer.reason_code == "EXECUTION_CANCELLED"
+
+
+def test_steer_api_rejects_new_command_when_kill_switch_is_off(db: Session) -> None:
+    """验证默认关闭 steering 时不写命令或 signal，避免半开启能力。"""
+
+    owner, _, instance = _seed_execution(db, suffix="steer_disabled")
+    assert owner is not None
+    with pytest.raises(HTTPException) as caught:
+        issue_execution_command(
+            instance.id,
+            ExecutionCommandRequest(
+                tenant_id="tenant_demo",
+                command_id="steer_disabled_1",
+                command_type="steer",
+                expected_revision=instance.revision,
+                payload={"instruction": "仅看今年"},
+            ),
+            owner,
+            db,
+        )
+    assert caught.value.status_code == 409
+    assert caught.value.detail == "DYNAMIC_STEERING_DISABLED"
+    assert db.exec(select(ExecutionCommand)).first() is None

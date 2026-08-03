@@ -14,6 +14,7 @@ from io import BytesIO
 from pathlib import Path
 import sys
 
+import pytest
 from pypdf import PdfWriter
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
@@ -21,6 +22,7 @@ from sqlmodel import Session, SQLModel, create_engine, select
 from app.agents.branching import ensure_agent_private_knowledge_branch, ensure_private_resource_binding
 from app.db.models import (
     AgentProfile,
+    ExecutionPlanRevision,
     ExecutionSignal,
     ExecutionPublication,
     ExecutionResult,
@@ -35,7 +37,7 @@ from app.db.models import (
     Tool,
     User,
 )
-from app.dynamic_tasks.agent import DynamicTaskAgent, DynamicTaskAgentError
+from app.dynamic_tasks.agent import DynamicRunOutcome, DynamicTaskAgent, DynamicTaskAgentError
 from app.dynamic_tasks.capability_catalog import (
     CapabilitySnapshot,
     DynamicCapabilityCatalog,
@@ -1938,3 +1940,500 @@ def test_clarification_attention_resumes_same_execution_after_restart_style_sign
         assert signal.status == "consumed"
         assert executor.calls == 1
         assert proposer.calls == 3
+
+
+def _steering_execution(db: Session):
+    """创建已完成首个只读步骤、可接受运行中约束的动态 Execution。"""
+
+    capabilities = _model_capabilities()
+    user = User(
+        id="user_steering",
+        tenant_id="tenant_demo",
+        username="steering",
+        password_hash="x",
+    )
+    profile = AgentProfile(
+        id="agent_demo",
+        tenant_id="tenant_demo",
+        name="合同数字员工",
+        owner_user_id=user.id,
+    )
+    model = ModelConfig(
+        id="model_steering",
+        tenant_id="tenant_demo",
+        name="动态模型",
+        api_key_encrypted="encrypted",
+        model="model-demo",
+        capability_snapshot_json=capabilities,
+        capability_checksum=capability_checksum(capabilities),
+        preflight_status="ready",
+    )
+    snapshot = _snapshot()
+    db.add(user)
+    db.add(profile)
+    db.add(model)
+    db.flush()
+    executor = _Executor()
+    proposer = _RunProposer()
+    agent = DynamicTaskAgent(
+        db,
+        catalog=_StartCatalog(model, snapshot),
+        tool_executor=executor,
+        planner=_Planner(),
+        action_proposer=proposer,
+    )
+    instance, _ = agent.start_task(
+        tenant_id="tenant_demo",
+        session_id="session_steering",
+        agent_id=profile.id,
+        initiator_user_id=user.id,
+        goal="生成合作方合同风险简报",
+        success_criteria=("覆盖合同证据",),
+        model_config=model,
+    )
+    agent.advance_next_read_step(
+        execution_id=instance.id,
+        model_config=model,
+        worker_id="worker_initial_read",
+        actor_user_id=user.id,
+    )
+    db.commit()
+    return agent, instance, model, user, executor, proposer
+
+
+def test_steer_appends_constraint_revision_and_preserves_completed_step() -> None:
+    """验证追加约束形成不可变计划修订，已完成证据不重跑且 signal 最终消费。"""
+
+    engine = create_engine("sqlite://", poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as db:
+        agent, instance, model, user, executor, proposer = _steering_execution(db)
+        old_plan_id = instance.current_plan_revision_id
+        control = ExecutionControlService(db)
+        command, _ = control.issue_command(
+            instance,
+            command_id="steer_scope_1",
+            command_type="steer",
+            actor_user_id=user.id,
+            expected_execution_revision=instance.revision,
+            payload={"instruction": "仅分析 2026 年内到期合同"},
+        )
+        db.commit()
+        signal = db.exec(
+            select(ExecutionSignal).where(ExecutionSignal.causation_id == command.id)
+        ).one()
+
+        outcome = agent.resume_steer_signal(
+            signal_id=signal.id,
+            model_config=model,
+            worker_id="worker_steer",
+            actor_user_id=user.id,
+            steering_enabled=True,
+        )
+
+        db.refresh(instance)
+        db.refresh(command)
+        db.refresh(signal)
+        revisions = db.exec(
+            select(ExecutionPlanRevision)
+            .where(ExecutionPlanRevision.execution_id == instance.id)
+            .order_by(ExecutionPlanRevision.revision_number)
+        ).all()
+        assert outcome.status == "succeeded"
+        assert [row.status for row in revisions] == ["superseded", "active"]
+        assert revisions[0].id == old_plan_id
+        assert revisions[1].reason == "user_constraint"
+        assert revisions[1].plan_json["constraints"] == ["仅分析 2026 年内到期合同"]
+        assert command.status == "applied"
+        assert command.result_plan_revision_id == revisions[1].id
+        assert signal.status == "consumed"
+        assert executor.calls == 1
+        assert proposer.calls == 2
+
+
+def test_steer_crash_after_apply_replays_without_duplicate_plan_revision() -> None:
+    """验证计划已提交但进程退出后，过期 signal 恢复不会重复追加同一修订。"""
+
+    engine = create_engine("sqlite://", poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as db:
+        agent, instance, model, user, executor, proposer = _steering_execution(db)
+        command, _ = ExecutionControlService(db).issue_command(
+            instance,
+            command_id="steer_crash_1",
+            command_type="steer",
+            actor_user_id=user.id,
+            expected_execution_revision=instance.revision,
+            payload={"instruction": "排除已终止合同"},
+        )
+        db.commit()
+        signal = db.exec(
+            select(ExecutionSignal).where(ExecutionSignal.causation_id == command.id)
+        ).one()
+
+        def crash_after_apply(**kwargs):
+            """在计划和命令均已提交后模拟 worker 退出。"""
+
+            assert kwargs["resume_signal_id"] == signal.id
+            raise RuntimeError("simulated steer crash")
+
+        agent.run_until_blocked_or_complete = crash_after_apply
+        with pytest.raises(RuntimeError, match="simulated steer crash"):
+            agent.resume_steer_signal(
+                signal_id=signal.id,
+                model_config=model,
+                worker_id="worker_steer_crash",
+                actor_user_id=user.id,
+                steering_enabled=True,
+            )
+        db.refresh(command)
+        db.refresh(signal)
+        assert command.status == "applied"
+        assert signal.status == "claimed"
+        signal.lease_expires_at = datetime(2000, 1, 1)
+        db.add(signal)
+        db.commit()
+
+        recovered = DynamicTaskAgent(
+            db,
+            catalog=agent.catalog,
+            tool_executor=executor,
+            planner=_Planner(),
+            action_proposer=proposer,
+        )
+        outcome = recovered.resume_steer_signal(
+            signal_id=signal.id,
+            model_config=model,
+            worker_id="worker_steer_recovered",
+            actor_user_id=user.id,
+            steering_enabled=False,
+        )
+
+        assert outcome.status == "succeeded"
+        assert len(
+            db.exec(
+                select(ExecutionPlanRevision).where(
+                    ExecutionPlanRevision.execution_id == instance.id
+                )
+            ).all()
+        ) == 2
+        assert executor.calls == 1
+
+
+def test_second_steer_on_same_plan_conflicts_after_first_revision() -> None:
+    """验证并发追加约束以基础 plan revision CAS 收敛，后到命令不会覆盖先到结果。"""
+
+    engine = create_engine("sqlite://", poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as db:
+        agent, instance, model, user, _, _ = _steering_execution(db)
+        control = ExecutionControlService(db)
+        first, _ = control.issue_command(
+            instance,
+            command_id="steer_first",
+            command_type="steer",
+            actor_user_id=user.id,
+            expected_execution_revision=instance.revision,
+            payload={"instruction": "先处理高风险合同"},
+        )
+        second, _ = control.issue_command(
+            instance,
+            command_id="steer_second",
+            command_type="steer",
+            actor_user_id=user.id,
+            expected_execution_revision=instance.revision,
+            payload={"instruction": "改为先处理低风险合同"},
+        )
+        db.commit()
+        first_signal = db.exec(
+            select(ExecutionSignal).where(ExecutionSignal.causation_id == first.id)
+        ).one()
+        second_signal = db.exec(
+            select(ExecutionSignal).where(ExecutionSignal.causation_id == second.id)
+        ).one()
+        original_run = agent.run_until_blocked_or_complete
+        agent.run_until_blocked_or_complete = lambda **kwargs: DynamicRunOutcome(
+            "blocked", instance.id
+        )
+        agent.resume_steer_signal(
+            signal_id=first_signal.id,
+            model_config=model,
+            worker_id="worker_first",
+            actor_user_id=user.id,
+            steering_enabled=True,
+        )
+        agent.run_until_blocked_or_complete = original_run
+        outcome = agent.resume_steer_signal(
+            signal_id=second_signal.id,
+            model_config=model,
+            worker_id="worker_second",
+            actor_user_id=user.id,
+            steering_enabled=True,
+        )
+
+        db.refresh(first)
+        db.refresh(second)
+        db.refresh(second_signal)
+        assert first.status == "applied"
+        assert second.status == "conflicted"
+        assert second.reason_code == "STEER_PLAN_REVISION_CONFLICT"
+        assert second_signal.status == "consumed"
+        assert outcome.status == "conflicted"
+
+
+def test_pending_steer_is_rejected_and_consumed_when_switch_turns_off() -> None:
+    """验证发布后关闭开关会终结存量 pending 命令，而不是留下永久阻塞事实。"""
+
+    engine = create_engine("sqlite://", poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as db:
+        agent, instance, model, user, _, _ = _steering_execution(db)
+        command, _ = ExecutionControlService(db).issue_command(
+            instance,
+            command_id="steer_disabled_after_issue",
+            command_type="steer",
+            actor_user_id=user.id,
+            expected_execution_revision=instance.revision,
+            payload={"instruction": "仅处理高风险合同"},
+        )
+        db.commit()
+        signal = db.exec(
+            select(ExecutionSignal).where(ExecutionSignal.causation_id == command.id)
+        ).one()
+
+        outcome = agent.resume_steer_signal(
+            signal_id=signal.id,
+            model_config=model,
+            worker_id="worker_disabled",
+            actor_user_id=user.id,
+            steering_enabled=False,
+        )
+
+        db.refresh(command)
+        db.refresh(signal)
+        assert outcome.status == "rejected"
+        assert command.status == "rejected"
+        assert command.reason_code == "DYNAMIC_STEERING_DISABLED"
+        assert signal.status == "consumed"
+
+
+def test_pending_steer_is_rejected_when_issuer_membership_is_revoked() -> None:
+    """验证命令排队期间发起人被停用后重新鉴权，旧授权不能继续修改计划。"""
+
+    engine = create_engine("sqlite://", poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as db:
+        agent, instance, model, user, _, _ = _steering_execution(db)
+        command, _ = ExecutionControlService(db).issue_command(
+            instance,
+            command_id="steer_revoked_actor",
+            command_type="steer",
+            actor_user_id=user.id,
+            expected_execution_revision=instance.revision,
+            payload={"instruction": "只保留有效合同"},
+        )
+        user.membership_status = "suspended"
+        db.add(user)
+        db.commit()
+        signal = db.exec(
+            select(ExecutionSignal).where(ExecutionSignal.causation_id == command.id)
+        ).one()
+
+        outcome = agent.resume_steer_signal(
+            signal_id=signal.id,
+            model_config=model,
+            worker_id="worker_revoked_actor",
+            actor_user_id=user.id,
+            steering_enabled=True,
+        )
+
+        db.refresh(command)
+        db.refresh(signal)
+        assert outcome.status == "rejected"
+        assert command.status == "rejected"
+        assert command.reason_code == "DYNAMIC_STEER_ACTOR_DENIED"
+        assert signal.status == "consumed"
+
+
+def test_steer_cancels_prepared_unsent_operation_before_plan_revision() -> None:
+    """验证未 dispatch 的 prepared 动作可证明撤销，旧节点结束后才激活新约束。"""
+
+    engine = create_engine("sqlite://", poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as db:
+        agent, instance, model, user, _, _ = _steering_execution(db)
+        with agent.store.owned(instance, worker_id="prepare_old_action"):
+            node = agent.store.enter_node(
+                instance,
+                "answer",
+                step_key="answer",
+                plan_revision_id=instance.current_plan_revision_id,
+                step_kind="answer",
+                title="形成风险简报",
+            )
+            operation = SopOperation(
+                tenant_id=instance.tenant_id,
+                instance_id=instance.id,
+                node_execution_id=node.id,
+                operation_name="artifact.prepare",
+                idempotency_key="prepared-steer-operation",
+                logical_action_id="prepared-steer-action",
+                request_fingerprint="f" * 64,
+                effect_kind="read",
+                status="prepared",
+            )
+            db.add(operation)
+            db.flush()
+        command, _ = ExecutionControlService(db).issue_command(
+            instance,
+            command_id="steer_prepared",
+            command_type="steer",
+            actor_user_id=user.id,
+            expected_execution_revision=instance.revision,
+            payload={"instruction": "不要生成附件，只返回文本"},
+        )
+        db.commit()
+        signal = db.exec(
+            select(ExecutionSignal).where(ExecutionSignal.causation_id == command.id)
+        ).one()
+        agent.run_until_blocked_or_complete = lambda **kwargs: DynamicRunOutcome(
+            "blocked", instance.id
+        )
+
+        outcome = agent.resume_steer_signal(
+            signal_id=signal.id,
+            model_config=model,
+            worker_id="worker_prepared",
+            actor_user_id=user.id,
+            steering_enabled=True,
+        )
+
+        db.refresh(operation)
+        db.refresh(node)
+        assert outcome.status == "blocked"
+        assert operation.status == "cancelled"
+        assert operation.cancellation_disposition == "not_dispatched"
+        assert node.status == "failed"
+        assert node.error_json["code"] == "DYNAMIC_ACTION_SUPERSEDED_BY_STEERING"
+
+
+def test_steer_retries_while_dispatched_operation_is_unsettled(monkeypatch) -> None:
+    """验证 running 外呼不会被伪撤回，worker 保留 pending 命令并退避 signal。"""
+
+    engine = create_engine("sqlite://", poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as db:
+        agent, instance, model, user, _, _ = _steering_execution(db)
+        completed_node = db.exec(
+            select(SopOperation).where(SopOperation.instance_id == instance.id)
+        ).one().node_execution_id
+        operation = SopOperation(
+            tenant_id=instance.tenant_id,
+            instance_id=instance.id,
+            node_execution_id=completed_node,
+            operation_name="remote.read.pending",
+            idempotency_key="running-steer-operation",
+            logical_action_id="running-steer-action",
+            request_fingerprint="e" * 64,
+            effect_kind="read",
+            status="running",
+        )
+        db.add(operation)
+        command, _ = ExecutionControlService(db).issue_command(
+            instance,
+            command_id="steer_running",
+            command_type="steer",
+            actor_user_id=user.id,
+            expected_execution_revision=instance.revision,
+            payload={"instruction": "排除过期数据"},
+        )
+        db.commit()
+        signal = db.exec(
+            select(ExecutionSignal).where(ExecutionSignal.causation_id == command.id)
+        ).one()
+        monkeypatch.setattr(
+            "app.dynamic_tasks.worker.get_settings",
+            lambda: type("Settings", (), {"dynamic_task_steering_enabled": True})(),
+        )
+
+        outcome = process_dynamic_task_signal(
+            db,
+            signal,
+            agent_factory=lambda _db: agent,
+        )
+
+        db.refresh(command)
+        db.refresh(signal)
+        assert outcome is None
+        assert command.status == "pending"
+        assert signal.status == "pending"
+        assert signal.last_error_json["code"] == "DynamicTaskAgentError"
+
+
+def test_steer_rolls_back_prepared_cancellation_when_plan_append_fails(monkeypatch) -> None:
+    """验证安全边界处置与计划/命令同成同败，worker 只提交 signal 退避事实。"""
+
+    engine = create_engine("sqlite://", poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as db:
+        agent, instance, model, user, _, _ = _steering_execution(db)
+        with agent.store.owned(instance, worker_id="prepare_rollback_action"):
+            node = agent.store.enter_node(
+                instance,
+                "answer",
+                step_key="answer",
+                plan_revision_id=instance.current_plan_revision_id,
+                step_kind="answer",
+                title="形成风险简报",
+            )
+            operation = SopOperation(
+                tenant_id=instance.tenant_id,
+                instance_id=instance.id,
+                node_execution_id=node.id,
+                operation_name="artifact.prepare.rollback",
+                idempotency_key="prepared-steer-rollback-operation",
+                logical_action_id="prepared-steer-rollback-action",
+                request_fingerprint="a" * 64,
+                effect_kind="read",
+                status="prepared",
+            )
+            db.add(operation)
+            db.flush()
+        command, _ = ExecutionControlService(db).issue_command(
+            instance,
+            command_id="steer_append_failure",
+            command_type="steer",
+            actor_user_id=user.id,
+            expected_execution_revision=instance.revision,
+            payload={"instruction": "只返回文本"},
+        )
+        db.commit()
+        signal = db.exec(
+            select(ExecutionSignal).where(ExecutionSignal.causation_id == command.id)
+        ).one()
+        monkeypatch.setattr(
+            "app.dynamic_tasks.worker.get_settings",
+            lambda: type("Settings", (), {"dynamic_task_steering_enabled": True})(),
+        )
+
+        def fail_plan_append(*args, **kwargs):
+            """在 prepared Operation 已进入撤销逻辑后模拟计划写入失败。"""
+
+            raise RuntimeError("simulated plan append failure")
+
+        monkeypatch.setattr(agent.store, "append_plan_revision", fail_plan_append)
+        outcome = process_dynamic_task_signal(
+            db,
+            signal,
+            agent_factory=lambda _db: agent,
+        )
+
+        db.refresh(operation)
+        db.refresh(node)
+        db.refresh(command)
+        db.refresh(signal)
+        assert outcome is None
+        assert operation.status == "prepared"
+        assert node.status == "running"
+        assert command.status == "pending"
+        assert signal.status == "pending"
