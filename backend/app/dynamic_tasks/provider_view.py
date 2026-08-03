@@ -60,7 +60,7 @@ def build_provider_execution_view(
 ) -> ProviderExecutionView:
     """验证 canonical 历史并生成 provider view，压缩仅替换对话而不替换执行事实。"""
 
-    _require_dynamic_preflight(model_capabilities)
+    require_dynamic_preflight(model_capabilities)
     context = dict(execution_context)
     if _contains_sensitive_key(context):
         raise ProviderExecutionViewError("ExecutionContextProjection 含禁止的敏感 sidecar。")
@@ -166,7 +166,7 @@ def _normalize_messages(
     return tuple(normalized)
 
 
-def _require_dynamic_preflight(capabilities: Mapping[str, object]) -> None:
+def require_dynamic_preflight(capabilities: Mapping[str, object]) -> None:
     """只接受已验证的 dynamic-v1 必需能力，不按 provider 或模型名称推断。"""
 
     required = (

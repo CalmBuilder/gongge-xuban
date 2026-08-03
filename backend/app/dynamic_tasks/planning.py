@@ -117,6 +117,108 @@ class NormalizedPlan(PlanningContract):
         return self
 
 
+class DynamicPlanDraftStep(PlanningContract):
+    """表示模型可提议的步骤语义，禁止模型直接决定持久 step key。"""
+
+    draft_id: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+    title: str = Field(min_length=1, max_length=256)
+    kind: str = Field(pattern=r"^(tool\.read|knowledge|answer|clarification)$")
+    required: bool = True
+    depends_on: tuple[str, ...] = ()
+    capability_refs: tuple[str, ...] = ()
+    expected_output_schema: dict[str, Any] = Field(default_factory=dict)
+
+
+class DynamicPlanDraft(PlanningContract):
+    """保存 provider 完整结构化响应中的有界计划草案。"""
+
+    goal: str = Field(min_length=1, max_length=4000)
+    success_criteria: tuple[SuccessCriterion, ...] = Field(min_length=1)
+    constraints: tuple[str, ...] = ()
+    assumptions: tuple[str, ...] = ()
+    steps: tuple[DynamicPlanDraftStep, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_draft_graph(self) -> "DynamicPlanDraft":
+        """拒绝重复草案身份、未知依赖和循环依赖。"""
+
+        identities = [step.draft_id for step in self.steps]
+        if len(identities) != len(set(identities)):
+            raise ValueError("计划草案 draft_id 不得重复")
+        known = set(identities)
+        dependencies = {step.draft_id: set(step.depends_on) for step in self.steps}
+        if any(step_id in values or values - known for step_id, values in dependencies.items()):
+            raise ValueError("计划草案依赖不存在或引用自身")
+        resolved: set[str] = set()
+        while dependencies:
+            ready = {key for key, values in dependencies.items() if values <= resolved}
+            if not ready:
+                raise ValueError("计划草案依赖必须构成无环图")
+            resolved.update(ready)
+            dependencies = {key: values for key, values in dependencies.items() if key not in ready}
+        return self
+
+
+def normalize_plan_draft(
+    draft: DynamicPlanDraft,
+    *,
+    max_steps: int,
+    max_tool_calls: int,
+    max_model_calls: int,
+) -> NormalizedPlan:
+    """为草案生成稳定服务端 step key，并以服务端预算覆盖任何模型暗示。"""
+
+    if max_steps < 1 or max_tool_calls < 0 or max_model_calls < 1:
+        raise ValueError("动态计划预算无效")
+    if len(draft.steps) > max_steps:
+        raise ValueError("动态计划步骤超过服务端预算")
+    tool_steps = sum(step.kind == "tool.read" for step in draft.steps)
+    if tool_steps > max_tool_calls:
+        raise ValueError("动态计划工具步骤超过服务端预算")
+    key_by_draft_id = {
+        step.draft_id: _stable_step_key(index, step)
+        for index, step in enumerate(draft.steps, start=1)
+    }
+    return NormalizedPlan(
+        goal=draft.goal,
+        success_criteria=draft.success_criteria,
+        constraints=draft.constraints,
+        assumptions=draft.assumptions,
+        steps=tuple(
+            PlanStep(
+                step_key=key_by_draft_id[step.draft_id],
+                title=step.title,
+                kind=step.kind,
+                required=step.required,
+                depends_on=tuple(key_by_draft_id[value] for value in step.depends_on),
+                capability_refs=step.capability_refs,
+                expected_output_schema=step.expected_output_schema,
+            )
+            for step in draft.steps
+        ),
+        budget={
+            "max_steps": max_steps,
+            "max_tool_calls": max_tool_calls,
+            "max_model_calls": max_model_calls,
+        },
+    )
+
+
+def _stable_step_key(index: int, step: DynamicPlanDraftStep) -> str:
+    """从步骤位置与规范语义生成跨重试稳定、不可由模型指定的持久 key。"""
+
+    digest = canonical_checksum(
+        {
+            "draft_id": step.draft_id,
+            "title": step.title,
+            "kind": step.kind,
+            "depends_on": list(step.depends_on),
+            "capability_refs": list(step.capability_refs),
+        }
+    )[:10]
+    return f"step_{index:02d}_{digest}"
+
+
 class RuntimeActionProposal(PlanningContract):
     """保存服务端校验后的单步动作，不接受 tenant、agent、risk 或授权结论。"""
 
