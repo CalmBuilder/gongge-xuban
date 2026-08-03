@@ -9,6 +9,8 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextlib import AbstractContextManager
+from uuid import uuid4
 
 from sqlmodel import Session, select
 
@@ -27,7 +29,11 @@ from app.db.models import (
 from app.session.session_schema import KnowledgeQuery, StepAgentResult
 from app.sop_runtime.capabilities import DEFAULT_CAPABILITY_REGISTRY
 from app.sop_runtime.definition import CollectInputNode, HumanTaskNode
-from app.sop_runtime.execution_store import ACTIVE_INSTANCE_STATUSES, SopExecutionStore
+from app.sop_runtime.execution_store import (
+    ACTIVE_INSTANCE_STATUSES,
+    ExecutionLease,
+    SopExecutionStore,
+)
 from app.sop_runtime.explicit_confirmation import resolve_explicit_confirmation_slots
 from app.sop_runtime.identity_context import (
     SopIdentityContextError,
@@ -112,6 +118,12 @@ class DeterministicSopCoordinator:
         self.db = db
         self.store = SopExecutionStore(db)
         self.work_items = SopWorkItemService(db)
+        self.worker_id = f"sop-coordinator:{uuid4().hex}"
+
+    def _owned(self, instance: SopInstance) -> AbstractContextManager[ExecutionLease]:
+        """为一次 Runtime 命令取得并在结束时释放 execution 推进所有权。"""
+
+        return self.store.owned(instance, worker_id=self.worker_id)
 
     @staticmethod
     def is_enabled(skill: Skill | None) -> bool:
@@ -356,26 +368,36 @@ class DeterministicSopCoordinator:
             if identity_resolution.audit_context
             else None,
         )
-        instance.slots_json = dict(identity_resolution.slots)
-        if identity_resolution.audit_context:
-            instance.context_json = {
-                **(instance.context_json or {}),
-                "identity": identity_resolution.audit_context,
-            }
-        current_node_id = instance.current_node_id or chat_session.active_step_id
-        if not current_node_id:
-            current_node_id = definition.start_node_id
-        execution = self._current_execution(instance, current_node_id)
-        if execution is None:
-            execution = self.store.enter_node(
+        with self._owned(instance):
+            instance.slots_json = dict(identity_resolution.slots)
+            if identity_resolution.audit_context:
+                instance.context_json = {
+                    **(instance.context_json or {}),
+                    "identity": identity_resolution.audit_context,
+                }
+            current_node_id = instance.current_node_id or chat_session.active_step_id
+            if not current_node_id:
+                current_node_id = definition.start_node_id
+            execution = self._current_execution(instance, current_node_id)
+            if execution is None:
+                execution = self.store.enter_node(
+                    instance,
+                    current_node_id,
+                    input_snapshot=self._node_input_snapshot(instance),
+                )
+            elif execution.status == "waiting":
+                self.store.resume_waiting_node(
+                    instance,
+                    execution,
+                    slots=chat_session.slots_json or {},
+                )
+            plan = self._advance_until_external_action(
+                chat_session,
                 instance,
-                current_node_id,
-                input_snapshot=self._node_input_snapshot(instance),
+                execution,
+                definition,
             )
-        elif execution.status == "waiting":
-            self.store.resume_waiting_node(instance, execution, slots=chat_session.slots_json or {})
-        plan = self._advance_until_external_action(chat_session, instance, execution, definition)
-        return self.merge_plan(model_result, plan)
+            return self.merge_plan(model_result, plan)
 
     def record_tool_result(
         self,
@@ -404,40 +426,44 @@ class DeterministicSopCoordinator:
         ).first()
         if operation is None:
             return None
-        if operation.status == "prepared":
-            self.store.start_operation(operation)
-        error_payload = tool_result.error.model_dump(mode="json") if tool_result.error else {}
-        self.store.finish_operation(
-            operation,
-            succeeded=tool_result.success,
-            result=tool_result.data or {},
-            error=error_payload,
-        )
-        result_key = self._operation_result_key(instance, execution.node_id)
-        if not result_key:
-            return None
-        tool_results = self._tool_results(instance)
-        tool_results[result_key] = {
-            "status": "succeeded" if tool_result.success else "failed",
-            "data": tool_result.data or {},
-            "error": error_payload or None,
-            "operation_id": operation.id,
-        }
-        instance.context_json = {**(instance.context_json or {}), "tool_results": tool_results}
-        self.store.complete_node(
-            instance,
-            execution,
-            output={"tool_result": tool_results[result_key]},
-        )
-        _, definition = self._definition_for_instance(instance)
-        plan = self._advance_until_external_action(
-            chat_session,
-            instance,
-            execution,
-            definition,
-            current_already_completed=True,
-        )
-        return plan
+        with self._owned(instance):
+            if operation.status == "prepared":
+                self.store.start_operation(operation)
+            error_payload = tool_result.error.model_dump(mode="json") if tool_result.error else {}
+            self.store.finish_operation(
+                operation,
+                succeeded=tool_result.success,
+                result=tool_result.data or {},
+                error=error_payload,
+            )
+            result_key = self._operation_result_key(instance, execution.node_id)
+            if not result_key:
+                return None
+            tool_results = self._tool_results(instance)
+            tool_results[result_key] = {
+                "status": "succeeded" if tool_result.success else "failed",
+                "data": tool_result.data or {},
+                "error": error_payload or None,
+                "operation_id": operation.id,
+            }
+            instance.context_json = {
+                **(instance.context_json or {}),
+                "tool_results": tool_results,
+            }
+            self.store.complete_node(
+                instance,
+                execution,
+                output={"tool_result": tool_results[result_key]},
+            )
+            _, definition = self._definition_for_instance(instance)
+            plan = self._advance_until_external_action(
+                chat_session,
+                instance,
+                execution,
+                definition,
+                current_already_completed=True,
+            )
+            return plan
 
     def record_knowledge_result(
         self,
@@ -469,44 +495,45 @@ class DeterministicSopCoordinator:
         ).first()
         if operation is None:
             return None
-        if operation.status == "prepared":
-            self.store.start_operation(operation)
-        error_payload = dict(error or {})
-        persisted_result = _compact_knowledge_receipt(result)
-        self.store.finish_operation(
-            operation,
-            succeeded=succeeded,
-            result=persisted_result,
-            error=error_payload,
-        )
-        result_key = self._operation_result_key(instance, execution.node_id)
-        if not result_key:
-            return None
-        node_outputs = self._node_outputs(instance)
-        node_outputs[result_key] = {
-            "status": "succeeded" if succeeded else "failed",
-            "query": knowledge_query.model_dump(mode="json"),
-            "data": persisted_result,
-            "error": error_payload or None,
-            "operation_id": operation.id,
-        }
-        instance.context_json = {
-            **(instance.context_json or {}),
-            "node_outputs": node_outputs,
-        }
-        self.store.complete_node(
-            instance,
-            execution,
-            output={"node_output": node_outputs[result_key]},
-        )
-        _, definition = self._definition_for_instance(instance)
-        return self._advance_until_external_action(
-            chat_session,
-            instance,
-            execution,
-            definition,
-            current_already_completed=True,
-        )
+        with self._owned(instance):
+            if operation.status == "prepared":
+                self.store.start_operation(operation)
+            error_payload = dict(error or {})
+            persisted_result = _compact_knowledge_receipt(result)
+            self.store.finish_operation(
+                operation,
+                succeeded=succeeded,
+                result=persisted_result,
+                error=error_payload,
+            )
+            result_key = self._operation_result_key(instance, execution.node_id)
+            if not result_key:
+                return None
+            node_outputs = self._node_outputs(instance)
+            node_outputs[result_key] = {
+                "status": "succeeded" if succeeded else "failed",
+                "query": knowledge_query.model_dump(mode="json"),
+                "data": persisted_result,
+                "error": error_payload or None,
+                "operation_id": operation.id,
+            }
+            instance.context_json = {
+                **(instance.context_json or {}),
+                "node_outputs": node_outputs,
+            }
+            self.store.complete_node(
+                instance,
+                execution,
+                output={"node_output": node_outputs[result_key]},
+            )
+            _, definition = self._definition_for_instance(instance)
+            return self._advance_until_external_action(
+                chat_session,
+                instance,
+                execution,
+                definition,
+                current_already_completed=True,
+            )
 
     def resume_completed_work_item(self, work_item: SopWorkItem) -> RuntimePlan:
         """消费已完成工作项回执，恢复等待节点并按结构化 outcome 继续唯一分支。"""
@@ -547,6 +574,17 @@ class DeterministicSopCoordinator:
                     None if instance.status == "succeeded" else "RUNTIME_INSTANCE_ALREADY_TERMINAL"
                 ),
             )
+        with self._owned(instance):
+            return self._resume_completed_work_item_owned(work_item, instance, execution)
+
+    def _resume_completed_work_item_owned(
+        self,
+        work_item: SopWorkItem,
+        instance: SopInstance,
+        execution: SopNodeExecution,
+    ) -> RuntimePlan:
+        """在已取得 execution 所有权后消费人工任务结果并完成后继推进。"""
+
         chat_session = self.db.get(ChatSession, instance.session_id)
         if chat_session is None or chat_session.tenant_id != instance.tenant_id:
             raise WorkItemError("WORK_ITEM_SESSION_NOT_FOUND", "工作项所属会话不存在。")
@@ -728,49 +766,50 @@ class DeterministicSopCoordinator:
             raise WorkItemError("WORK_ITEM_EXECUTION_NOT_FOUND", "工作项所属节点执行不存在。")
         if instance.status in {"succeeded", "failed", "cancelled", "timed_out"}:
             return
-        timeout_error = {
-            "code": "WORK_ITEM_TIMED_OUT",
-            "work_item_id": work_item.id,
-            "timeout_action": work_item.timeout_action,
-        }
-        self.store.timeout_node(instance, execution, error=timeout_error)
-        self.store.timeout_instance(
-            instance,
-            context_patch={"work_item_timeout": timeout_error},
-        )
-        expired_request_ids = ApprovalRequestService(
-            self.db
-        ).expire_pending_for_work_item(work_item)
-        self.db.add(
-            AgentEvent(
-                tenant_id=instance.tenant_id,
-                session_id=instance.session_id,
-                event_type="sop_work_item_timed_out",
-                payload_json={
-                    "instance_id": instance.id,
-                    "node_execution_id": execution.id,
-                    "work_item_id": work_item.id,
-                    "timeout_action": work_item.timeout_action,
-                    "expired_approval_request_ids": expired_request_ids,
-                },
+        with self._owned(instance):
+            timeout_error = {
+                "code": "WORK_ITEM_TIMED_OUT",
+                "work_item_id": work_item.id,
+                "timeout_action": work_item.timeout_action,
+            }
+            self.store.timeout_node(instance, execution, error=timeout_error)
+            self.store.timeout_instance(
+                instance,
+                context_patch={"work_item_timeout": timeout_error},
             )
-        )
-        self.db.add(
-            Message(
-                tenant_id=instance.tenant_id,
-                session_id=instance.session_id,
-                role="assistant",
-                content="您的申请因超过处理时限未完成，流程已终止，请重新发起或联系负责人。",
-                metadata_json={
-                    "source": "runtime_control",
-                    "render_policy": "verbatim",
-                    "event_type": "sop_work_item_timed_out",
-                    "instance_id": instance.id,
-                    "work_item_id": work_item.id,
-                    "error_code": "WORK_ITEM_TIMED_OUT",
-                },
+            expired_request_ids = ApprovalRequestService(
+                self.db
+            ).expire_pending_for_work_item(work_item)
+            self.db.add(
+                AgentEvent(
+                    tenant_id=instance.tenant_id,
+                    session_id=instance.session_id,
+                    event_type="sop_work_item_timed_out",
+                    payload_json={
+                        "instance_id": instance.id,
+                        "node_execution_id": execution.id,
+                        "work_item_id": work_item.id,
+                        "timeout_action": work_item.timeout_action,
+                        "expired_approval_request_ids": expired_request_ids,
+                    },
+                )
             )
-        )
+            self.db.add(
+                Message(
+                    tenant_id=instance.tenant_id,
+                    session_id=instance.session_id,
+                    role="assistant",
+                    content="您的申请因超过处理时限未完成，流程已终止，请重新发起或联系负责人。",
+                    metadata_json={
+                        "source": "runtime_control",
+                        "render_policy": "verbatim",
+                        "event_type": "sop_work_item_timed_out",
+                        "instance_id": instance.id,
+                        "work_item_id": work_item.id,
+                        "error_code": "WORK_ITEM_TIMED_OUT",
+                    },
+                )
+            )
 
     def _work_item_was_resumed(self, session_id: str, work_item_id: str) -> bool:
         """按会话事件确认完成信号是否已消费，防止重复命令再次推进和重复通知。"""
@@ -1149,28 +1188,30 @@ class DeterministicSopCoordinator:
             slots=sanitized_slots,
             context={"identity": identity_error},
         )
-        instance.context_json = {
-            **(instance.context_json or {}),
-            "identity": identity_error,
-        }
-        execution = self._current_execution(
-            instance, instance.current_node_id or definition.start_node_id
-        )
-        if execution is None:
-            execution = self.store.enter_node(
+        with self._owned(instance):
+            instance.context_json = {
+                **(instance.context_json or {}),
+                "identity": identity_error,
+            }
+            execution = self._current_execution(
                 instance,
                 instance.current_node_id or definition.start_node_id,
-                input_snapshot=self._node_input_snapshot(instance),
             )
-        self.store.fail_node(
-            instance,
-            execution,
-            error={"code": error.code, "context": error.audit_context},
-        )
-        self.store.fail_instance(
-            instance,
-            context_patch={"identity": identity_error},
-        )
+            if execution is None:
+                execution = self.store.enter_node(
+                    instance,
+                    instance.current_node_id or definition.start_node_id,
+                    input_snapshot=self._node_input_snapshot(instance),
+                )
+            self.store.fail_node(
+                instance,
+                execution,
+                error={"code": error.code, "context": error.audit_context},
+            )
+            self.store.fail_instance(
+                instance,
+                context_patch={"identity": identity_error},
+            )
         result = model_result.model_copy(
             update={
                 "action": "reply",

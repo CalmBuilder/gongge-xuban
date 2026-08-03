@@ -418,6 +418,7 @@ def _seed_representative_runtime(engine: object) -> None:
             skill_version=version.version,
             definition_checksum=definition.checksum,
             status="waiting",
+            active_slot_key=f"foreground:{chat_session.id}",
             current_node_id="department_special_approval",
             context_json={
                 "tool_results": {

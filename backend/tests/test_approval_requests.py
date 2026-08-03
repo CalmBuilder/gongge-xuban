@@ -136,6 +136,7 @@ def test_decision_requires_matching_completed_work_item_and_persists_audit() -> 
             skill_version=version.version,
             definition_checksum="checksum",
             status="waiting",
+            active_slot_key="foreground:session_seal",
             current_node_id="normal_seal_approval",
         )
         execution = SopNodeExecution(
@@ -254,6 +255,7 @@ def test_expired_work_item_expires_linked_pending_request() -> None:
             skill_version=version.version,
             definition_checksum="checksum",
             status="waiting",
+            active_slot_key="foreground:session_expired",
             current_node_id="normal_seal_approval",
         )
         execution = SopNodeExecution(

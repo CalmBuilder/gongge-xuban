@@ -248,6 +248,7 @@ def _seed_work_item(db: Session) -> tuple[User, User, User, str]:
         skill_version="1.0.0",
         definition_checksum="a" * 64,
         status="running",
+        active_slot_key="foreground:session_test",
         current_node_id="human_review",
     )
     execution = SopNodeExecution(

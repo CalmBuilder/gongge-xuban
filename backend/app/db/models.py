@@ -12,7 +12,17 @@ from datetime import UTC, datetime
 from typing import Any, Optional
 from uuid import uuid4
 
-from sqlalchemy import Boolean, Column, Computed, Index, Integer, JSON, String, UniqueConstraint
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    Column,
+    Computed,
+    Index,
+    Integer,
+    JSON,
+    String,
+    UniqueConstraint,
+)
 from sqlmodel import Field, SQLModel
 
 from app.db.sql_types import (
@@ -592,21 +602,77 @@ class SopInstance(SQLModel, table=True):
             "run_number",
             name="uq_sop_instance_session_version_run",
         ),
+        UniqueConstraint(
+            "tenant_id",
+            "active_slot_key",
+            name="uq_execution_tenant_active_slot",
+        ),
+        CheckConstraint(
+            "kind IN ('sop', 'dynamic_task')",
+            name="ck_execution_kind",
+        ),
+        CheckConstraint(
+            "((status IN ('created', 'running', 'waiting') AND active_slot_key IS NOT NULL) OR "
+            "(status IN ('succeeded', 'failed', 'cancelled', 'timed_out') "
+            "AND active_slot_key IS NULL))",
+            name="ck_execution_active_slot",
+        ),
+        CheckConstraint(
+            "kind <> 'sop' OR (skill_id IS NOT NULL AND skill_version_id IS NOT NULL "
+            "AND skill_version IS NOT NULL AND definition_checksum IS NOT NULL)",
+            name="ck_execution_sop_identity",
+        ),
+        CheckConstraint(
+            "((lease_owner IS NULL AND lease_expires_at IS NULL) OR "
+            "(lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL))",
+            name="ck_execution_lease_pair",
+        ),
+        CheckConstraint("fencing_token >= 0", name="ck_execution_fencing_nonnegative"),
+        CheckConstraint(
+            "((cancellation_requested_at IS NULL AND cancellation_disposition = 'none') OR "
+            "(cancellation_requested_at IS NOT NULL AND cancellation_disposition <> 'none'))",
+            name="ck_execution_cancellation_request",
+        ),
+        Index(
+            "ix_sop_instances_tenant_lease_expiry",
+            "tenant_id",
+            "lease_expires_at",
+        ),
     )
 
     id: PrimaryKeyString = Field(default_factory=lambda: new_id("sopinst"), primary_key=True)
     tenant_id: IdentifierString = Field(index=True)
     session_id: IdentifierString = Field(index=True)
-    skill_id: IdentifierString = Field(index=True)
-    skill_version_id: IdentifierString = Field(index=True)
-    skill_version: VersionString
-    definition_checksum: VersionString
+    skill_id: OptionalIdentifierString = Field(default=None, index=True)
+    skill_version_id: OptionalIdentifierString = Field(default=None, index=True)
+    skill_version: OptionalVersionString = None
+    definition_checksum: OptionalVersionString = None
     run_number: int = Field(default=1, ge=1)
+    kind: LabelString = Field(default="sop")
+    active_slot_key: str | None = Field(
+        default=None,
+        sa_column=Column(String(512), nullable=True),
+    )
+    initiator_user_id: OptionalIdentifierString = None
+    source_kind: LabelString = Field(default="chat")
+    source_ref: str | None = Field(
+        default=None,
+        sa_column=Column(String(512), nullable=True),
+    )
     status: LabelString = Field(default="created", index=True)
     current_node_id: OptionalIdentifierString = Field(default=None, index=True)
     slots_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     context_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     revision: int = Field(default=0, ge=0)
+    cancellation_requested_at: datetime | None = None
+    cancellation_requested_by: OptionalIdentifierString = None
+    cancellation_reason: OptionalMediumTextString = None
+    cancellation_disposition: LabelString = Field(default="none")
+    lease_owner: OptionalIdentifierString = Field(default=None, index=True)
+    lease_expires_at: datetime | None = None
+    lease_acquired_at: datetime | None = None
+    lease_heartbeat_at: datetime | None = None
+    fencing_token: int = Field(default=0, ge=0)
     started_at: datetime | None = None
     completed_at: datetime | None = None
     created_at: datetime = Field(default_factory=utc_now)
@@ -669,6 +735,31 @@ class SopOperation(SQLModel, table=True):
     completed_at: datetime | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
+
+
+class ExecutionMutationRejection(SQLModel, table=True):
+    """隔离保存 fencing 拒绝元数据，不记录可能敏感的业务输入输出。"""
+
+    __tablename__ = "execution_mutation_rejections"
+    __table_args__ = (
+        Index(
+            "ix_execution_mutation_rejection_lookup",
+            "tenant_id",
+            "instance_id",
+            "created_at",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("execreject"), primary_key=True)
+    tenant_id: IdentifierString
+    instance_id: IdentifierString
+    worker_id: IdentifierString
+    rejected_fencing_token: int = Field(ge=0)
+    current_lease_owner: OptionalIdentifierString = None
+    current_fencing_token: int = Field(ge=0)
+    action: IdentifierString
+    reason: LabelString = Field(default="lease_or_fence_mismatch")
+    created_at: datetime = Field(default_factory=utc_now)
 
 
 class ApprovalRequest(SQLModel, table=True):

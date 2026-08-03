@@ -13,12 +13,22 @@ import threading
 import pytest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy import inspect, text
 from sqlmodel import Session, create_engine, select
 
 from app.api.model_configs import set_default_model_config
-from app.db.models import Message, ModelConfig, Skill, SkillVersion, SopInstance, SopWorkItem, Tenant
+from app.db.models import (
+    ExecutionMutationRejection,
+    Message,
+    ModelConfig,
+    Skill,
+    SkillVersion,
+    SopInstance,
+    SopOperation,
+    SopWorkItem,
+    Tenant,
+)
 from app.db.seed import (
     EXCHANGE_SKILL,
     PRICE_COMPARE_SKILL,
@@ -32,6 +42,11 @@ from app.sop_runtime.bulk_migration import (
     apply_m55_published_head_upgrade,
 )
 from app.sop_runtime.migration_inventory import build_sop_migration_inventory
+from app.sop_runtime.execution_store import (
+    SopExecutionConflictError,
+    SopExecutionFencedError,
+    SopExecutionStore,
+)
 
 
 pytestmark = pytest.mark.mysql
@@ -106,6 +121,7 @@ def test_alembic_upgrades_empty_mysql_database(mysql_database_url: str) -> None:
     assert "organization_leader_assignments" in tables
     assert "knowledge_base_org_access" in tables
     assert "management_audit_logs" in tables
+    assert "execution_mutation_rejections" in tables
     assert "ix_org_unit_tenant_parent_status_sort" in {
         item["name"] for item in inspector.get_indexes("organization_units")
     }
@@ -126,6 +142,7 @@ def test_alembic_upgrades_empty_mysql_database(mysql_database_url: str) -> None:
     user_columns = {item["name"]: item for item in inspector.get_columns("users")}
     employee_columns = {item["name"]: item for item in inspector.get_columns("employee_profiles")}
     work_item_columns = {item["name"]: item for item in inspector.get_columns("sop_work_items")}
+    execution_columns = {item["name"]: item for item in inspector.get_columns("sop_instances")}
     agent_columns = {item["name"]: item for item in inspector.get_columns("agent_profiles")}
     session_columns = {item["name"]: item for item in inspector.get_columns("sessions")}
     knowledge_columns = {
@@ -155,6 +172,22 @@ def test_alembic_upgrades_empty_mysql_database(mysql_database_url: str) -> None:
     assert {"join_date", "leave_date"}.issubset(employee_columns)
     assert "participant_scope_snapshot_json" in work_item_columns
     assert {
+        "kind",
+        "active_slot_key",
+        "initiator_user_id",
+        "source_kind",
+        "source_ref",
+        "cancellation_requested_at",
+        "cancellation_requested_by",
+        "cancellation_reason",
+        "cancellation_disposition",
+        "lease_owner",
+        "lease_expires_at",
+        "lease_acquired_at",
+        "lease_heartbeat_at",
+        "fencing_token",
+    }.issubset(execution_columns)
+    assert {
         "owner_user_id",
         "responsible_org_unit_id",
         "source_agent_id",
@@ -181,8 +214,181 @@ def test_alembic_upgrades_empty_mysql_database(mysql_database_url: str) -> None:
     with engine.connect() as connection:
         assert (
             connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-            == "20260802_0035"
+            == "20260803_0036"
         )
+
+
+def test_execution_ownership_migration_backfills_and_reverses_mysql(
+    mysql_database_url: str,
+) -> None:
+    """验证 MySQL 0036 对真实 0035 表完成回填、约束和可重复升降级。"""
+
+    upgrade(mysql_database_url, "20260802_0035")
+    engine = create_engine(mysql_database_url, pool_pre_ping=True)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO sop_instances "
+                "(id, tenant_id, session_id, skill_id, skill_version_id, skill_version, "
+                "definition_checksum, run_number, status, current_node_id, slots_json, "
+                "context_json, revision, started_at, completed_at, created_at, updated_at) VALUES "
+                "('mysql_active', 'tenant_b01', 'session_active', 'skill_a', 'version_a', "
+                "'1.0.0', :checksum, 1, 'running', 'node_a', JSON_OBJECT(), JSON_OBJECT(), "
+                "1, UTC_TIMESTAMP(), NULL, UTC_TIMESTAMP(), UTC_TIMESTAMP()), "
+                "('mysql_done', 'tenant_b01', 'session_done', 'skill_b', 'version_b', "
+                "'1.0.0', :checksum, 1, 'succeeded', 'node_b', JSON_OBJECT(), JSON_OBJECT(), "
+                "3, UTC_TIMESTAMP(), UTC_TIMESTAMP(), UTC_TIMESTAMP(), UTC_TIMESTAMP())"
+            ),
+            {"checksum": "a" * 64},
+        )
+
+    upgrade(mysql_database_url, "20260803_0036")
+    inspector = inspect(engine)
+    with engine.connect() as connection:
+        rows = connection.execute(
+            text(
+                "SELECT id, kind, active_slot_key, source_kind, source_ref, fencing_token "
+                "FROM sop_instances ORDER BY id"
+            )
+        ).mappings().all()
+    assert rows[0]["active_slot_key"] == "foreground:session_active"
+    assert rows[1]["active_slot_key"] is None
+    assert all(row["kind"] == "sop" for row in rows)
+    assert all(row["source_kind"] == "legacy" for row in rows)
+    assert all(row["fencing_token"] == 0 for row in rows)
+    assert "uq_execution_tenant_active_slot" in {
+        item["name"] for item in inspector.get_unique_constraints("sop_instances")
+    }
+    assert inspector.has_table("execution_mutation_rejections")
+
+    downgrade(mysql_database_url, "20260802_0035")
+    inspector = inspect(engine)
+    assert "kind" not in {
+        item["name"] for item in inspector.get_columns("sop_instances")
+    }
+    assert not inspector.has_table("execution_mutation_rejections")
+    upgrade(mysql_database_url, "20260803_0036")
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT COUNT(*) FROM sop_instances")).scalar_one() == 2
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO sop_instances "
+                "(id, tenant_id, session_id, run_number, kind, active_slot_key, source_kind, "
+                "status, slots_json, context_json, revision, cancellation_disposition, "
+                "fencing_token, created_at, updated_at) VALUES "
+                "('mysql_dynamic', 'tenant_b01', 'session_dynamic', 1, 'dynamic_task', "
+                "'foreground:session_dynamic', 'api', 'running', JSON_OBJECT(), JSON_OBJECT(), "
+                "0, 'none', 0, UTC_TIMESTAMP(), UTC_TIMESTAMP())"
+            )
+        )
+    with engine.begin() as connection:
+        with pytest.raises((IntegrityError, OperationalError)):
+            connection.execute(
+                text(
+                    "INSERT INTO sop_instances "
+                    "(id, tenant_id, session_id, run_number, kind, active_slot_key, "
+                    "source_kind, status, slots_json, context_json, revision, "
+                    "cancellation_disposition, fencing_token, created_at, updated_at) VALUES "
+                    "('mysql_invalid_sop', 'tenant_b01', 'session_invalid', 1, 'sop', "
+                    "'foreground:session_invalid', 'api', 'running', JSON_OBJECT(), "
+                    "JSON_OBJECT(), 0, 'none', 0, UTC_TIMESTAMP(), UTC_TIMESTAMP())"
+                )
+            )
+
+
+def test_mysql_execution_active_slot_and_fencing_are_cross_worker_safe(
+    mysql_database_url: str,
+) -> None:
+    """验证 MySQL 并发活动槽仲裁及租约过期后的旧 Operation 写拒绝与审计。"""
+
+    upgrade(mysql_database_url)
+    engine = create_engine(mysql_database_url, pool_pre_ping=True)
+    barrier = threading.Barrier(2)
+
+    def start_execution(version_id: str) -> tuple[str, bool] | str:
+        """从独立 MySQL 事务同时申请同一 tenant/session 的活动槽。"""
+
+        with Session(engine) as session:
+            barrier.wait()
+            try:
+                instance, created = SopExecutionStore(session).start_instance(
+                    tenant_id="tenant_b01",
+                    session_id="session_race",
+                    skill_id="skill_b01",
+                    skill_version_id=version_id,
+                    skill_version="1.0.0",
+                    definition_checksum="b" * 64,
+                    start_node_id="start",
+                )
+                session.commit()
+                return instance.id, created
+            except (IntegrityError, SopExecutionConflictError) as error:
+                session.rollback()
+                return type(error).__name__
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(start_execution, ("version-a", "version-b")))
+
+    with Session(engine) as verify_session:
+        active = verify_session.exec(
+            select(SopInstance).where(
+                SopInstance.tenant_id == "tenant_b01",
+                SopInstance.active_slot_key == "foreground:session_race",
+            )
+        ).all()
+        assert len(active) == 1
+        instance_id = active[0].id
+    assert sum(isinstance(outcome, tuple) for outcome in outcomes) == 1
+
+    with Session(engine) as worker_a_session:
+        instance_a = worker_a_session.get(SopInstance, instance_id)
+        assert instance_a is not None
+        store_a = SopExecutionStore(worker_a_session)
+        with store_a.owned(instance_a, worker_id="mysql-worker-a") as lease_a:
+            execution_a = store_a.enter_node(instance_a, "tool", input_snapshot={})
+            operation_a, _ = store_a.prepare_operation(
+                instance_a,
+                execution_a,
+                operation_name="demo.read",
+                request={"record_id": "R-1"},
+            )
+            operation_id = operation_a.id
+            worker_a_session.commit()
+
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "UPDATE sop_instances SET lease_expires_at = "
+                        "UTC_TIMESTAMP() - INTERVAL 1 SECOND WHERE id = :instance_id"
+                    ),
+                    {"instance_id": instance_id},
+                )
+
+            with Session(engine) as worker_b_session:
+                instance_b = worker_b_session.get(SopInstance, instance_id)
+                assert instance_b is not None
+                with SopExecutionStore(worker_b_session).owned(
+                    instance_b,
+                    worker_id="mysql-worker-b",
+                ) as lease_b:
+                    assert lease_b.fencing_token > lease_a.fencing_token
+                worker_b_session.commit()
+
+            with pytest.raises(SopExecutionFencedError):
+                store_a.start_operation(operation_a)
+            worker_a_session.commit()
+
+    with Session(engine) as verify_session:
+        operation = verify_session.get(SopOperation, operation_id)
+        rejection = verify_session.exec(
+            select(ExecutionMutationRejection).where(
+                ExecutionMutationRejection.instance_id == instance_id
+            )
+        ).one()
+    assert operation is not None and operation.status == "prepared"
+    assert rejection.action == "operation.start"
+    assert rejection.rejected_fencing_token < rejection.current_fencing_token
 
 
 def test_mysql_effective_interval_precision_migration_is_reversible(

@@ -48,6 +48,7 @@ def test_inventory_is_deterministic_and_does_not_mutate_runtime_rows() -> None:
             skill_version=version.version,
             definition_checksum=version.compiled_definition_checksum or "a" * 64,
             status="waiting",
+            active_slot_key="foreground:session_1",
         )
         db.add(instance)
         db.flush()
@@ -172,6 +173,7 @@ def test_active_historical_instances_are_counted_but_never_retargeted() -> None:
             skill_version=old_version.version,
             definition_checksum=old_version.compiled_definition_checksum or "a" * 64,
             status="running",
+            active_slot_key="foreground:session_old",
         )
         db.add(instance)
         db.commit()

@@ -232,6 +232,7 @@ def test_completion_template_does_not_describe_pending_or_failure_as_granted() -
             skill_version_id="version_pending",
             skill_version="2.0.0",
             definition_checksum="checksum",
+            active_slot_key="foreground:session_pending",
             context_json={
                 "tool_results": {
                     "grant": {
@@ -248,6 +249,7 @@ def test_completion_template_does_not_describe_pending_or_failure_as_granted() -
             skill_version_id="version_failed",
             skill_version="2.0.0",
             definition_checksum="checksum",
+            active_slot_key="foreground:session_failed",
             context_json={
                 "tool_results": {
                     "grant": {"status": "failed", "data": {}, "error": {"code": "TIMEOUT"}}

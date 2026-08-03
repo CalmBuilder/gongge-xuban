@@ -1656,3 +1656,246 @@ def test_role_binding_effective_intervals_migration_is_reversible(tmp_path) -> N
         assert connection.execute(
             text("SELECT COUNT(*) FROM agent_role_bindings")
         ).scalar_one() == 1
+
+
+def _create_legacy_sop_instances_table(connection) -> None:  # noqa: ANN001
+    """创建 0035 时点的最小 SOP 实例表，供 B0.1 独立迁移测试使用。"""
+
+    connection.execute(
+        text(
+            "CREATE TABLE sop_instances ("
+            "id VARCHAR(512) PRIMARY KEY, tenant_id VARCHAR(128) NOT NULL, "
+            "session_id VARCHAR(128) NOT NULL, skill_id VARCHAR(128) NOT NULL, "
+            "skill_version_id VARCHAR(128) NOT NULL, skill_version VARCHAR(64) NOT NULL, "
+            "definition_checksum VARCHAR(64) NOT NULL, run_number INTEGER NOT NULL, "
+            "status VARCHAR(64) NOT NULL, current_node_id VARCHAR(128), "
+            "slots_json JSON NOT NULL, context_json JSON NOT NULL, revision INTEGER NOT NULL, "
+            "started_at DATETIME, completed_at DATETIME, created_at DATETIME NOT NULL, "
+            "updated_at DATETIME NOT NULL, "
+            "CONSTRAINT uq_sop_instance_session_version_run UNIQUE "
+            "(tenant_id, session_id, skill_version_id, run_number))"
+        )
+    )
+
+
+def test_execution_ownership_migration_backfills_and_is_reversible(tmp_path) -> None:
+    """验证 0036 回填 SOP kind/活动槽/来源/租约字段并能保留数据降级。"""
+
+    database_url = f"sqlite:///{tmp_path / 'execution-ownership.db'}"
+    config = Config(str(BACKEND_DIR / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
+    config.attributes["database_url"] = database_url
+    engine = create_engine(database_url)
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)"))
+        connection.execute(text("INSERT INTO alembic_version VALUES ('20260802_0035')"))
+        _create_legacy_sop_instances_table(connection)
+        connection.execute(
+            text(
+                "INSERT INTO sop_instances VALUES "
+                "('inst_active', 'tenant_demo', 'session_active', 'skill_a', 'version_a', "
+                "'1.0.0', :checksum, 1, 'running', 'node_a', '{}', '{}', 1, "
+                "'2026-08-01 10:00:00', NULL, '2026-08-01 10:00:00', "
+                "'2026-08-01 10:00:00'), "
+                "('inst_done', 'tenant_demo', 'session_done', 'skill_b', 'version_b', "
+                "'1.0.0', :checksum, 1, 'succeeded', 'node_b', '{}', '{}', 4, "
+                "'2026-08-01 11:00:00', '2026-08-01 11:10:00', "
+                "'2026-08-01 11:00:00', '2026-08-01 11:10:00')"
+            ),
+            {"checksum": "a" * 64},
+        )
+
+    command.upgrade(config, "20260803_0036")
+    with engine.connect() as connection:
+        inspector = inspect(connection)
+        columns = {column["name"] for column in inspector.get_columns("sop_instances")}
+        assert {
+            "kind",
+            "active_slot_key",
+            "initiator_user_id",
+            "source_kind",
+            "source_ref",
+            "cancellation_requested_at",
+            "cancellation_requested_by",
+            "cancellation_reason",
+            "cancellation_disposition",
+            "lease_owner",
+            "lease_expires_at",
+            "lease_acquired_at",
+            "lease_heartbeat_at",
+            "fencing_token",
+        }.issubset(columns)
+        rows = connection.execute(
+            text(
+                "SELECT id, kind, active_slot_key, source_kind, source_ref, "
+                "cancellation_disposition, fencing_token FROM sop_instances ORDER BY id"
+            )
+        ).mappings().all()
+        assert rows[0]["active_slot_key"] == "foreground:session_active"
+        assert rows[1]["active_slot_key"] is None
+        assert all(row["kind"] == "sop" for row in rows)
+        assert all(row["source_kind"] == "legacy" for row in rows)
+        assert all(row["cancellation_disposition"] == "none" for row in rows)
+        assert all(row["fencing_token"] == 0 for row in rows)
+        assert "uq_execution_tenant_active_slot" in {
+            item["name"] for item in inspector.get_unique_constraints("sop_instances")
+        }
+        assert "ix_sop_instances_tenant_lease_expiry" in {
+            item["name"] for item in inspector.get_indexes("sop_instances")
+        }
+        assert inspector.has_table("execution_mutation_rejections")
+
+    command.downgrade(config, "20260802_0035")
+    with engine.connect() as connection:
+        columns = {
+            column["name"] for column in inspect(connection).get_columns("sop_instances")
+        }
+        assert "kind" not in columns
+        assert "fencing_token" not in columns
+        assert not inspect(connection).has_table("execution_mutation_rejections")
+        assert connection.execute(text("SELECT COUNT(*) FROM sop_instances")).scalar_one() == 2
+
+
+def test_execution_ownership_migration_rejects_duplicate_active_rows(tmp_path) -> None:
+    """验证同 tenant/session 的历史双活动实例会中止迁移且不会被静默裁决。"""
+
+    database_url = f"sqlite:///{tmp_path / 'execution-ownership-dirty.db'}"
+    config = Config(str(BACKEND_DIR / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
+    config.attributes["database_url"] = database_url
+    engine = create_engine(database_url)
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)"))
+        connection.execute(text("INSERT INTO alembic_version VALUES ('20260802_0035')"))
+        _create_legacy_sop_instances_table(connection)
+        for instance_id, version_id in (("inst_a", "version_a"), ("inst_b", "version_b")):
+            connection.execute(
+                text(
+                    "INSERT INTO sop_instances VALUES "
+                    "(:id, 'tenant_demo', 'session_shared', 'skill_a', :version_id, '1.0.0', "
+                    ":checksum, 1, 'running', 'node_a', '{}', '{}', 1, "
+                    "'2026-08-01 10:00:00', NULL, '2026-08-01 10:00:00', "
+                    "'2026-08-01 10:00:00')"
+                ),
+                {"id": instance_id, "version_id": version_id, "checksum": "a" * 64},
+            )
+
+    with pytest.raises(RuntimeError, match="duplicate active executions") as caught:
+        command.upgrade(config, "20260803_0036")
+
+    assert "inst_a" in str(caught.value)
+    assert "inst_b" in str(caught.value)
+
+
+def test_execution_ownership_migration_resumes_after_partial_expand(tmp_path) -> None:
+    """验证 SQLite 模拟非事务 DDL 中断后可从部分列状态继续完成 0036。"""
+
+    database_url = f"sqlite:///{tmp_path / 'execution-ownership-partial.db'}"
+    config = Config(str(BACKEND_DIR / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
+    config.attributes["database_url"] = database_url
+    engine = create_engine(database_url)
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)"))
+        connection.execute(text("INSERT INTO alembic_version VALUES ('20260802_0035')"))
+        _create_legacy_sop_instances_table(connection)
+        connection.execute(text("ALTER TABLE sop_instances ADD COLUMN kind VARCHAR(64)"))
+        connection.execute(
+            text("ALTER TABLE sop_instances ADD COLUMN active_slot_key VARCHAR(512)")
+        )
+        connection.execute(
+            text(
+                "INSERT INTO sop_instances "
+                "(id, tenant_id, session_id, skill_id, skill_version_id, skill_version, "
+                "definition_checksum, run_number, status, current_node_id, slots_json, "
+                "context_json, revision, started_at, completed_at, created_at, updated_at, "
+                "kind, active_slot_key) VALUES "
+                "('inst_partial', 'tenant_demo', 'session_partial', 'skill_a', 'version_a', "
+                "'1.0.0', :checksum, 1, 'running', 'node_a', '{}', '{}', 1, NULL, NULL, "
+                "'2026-08-01 10:00:00', '2026-08-01 10:00:00', NULL, NULL)"
+            ),
+            {"checksum": "a" * 64},
+        )
+
+    command.upgrade(config, "20260803_0036")
+    command.upgrade(config, "20260803_0036")
+    with engine.connect() as connection:
+        row = connection.execute(
+            text(
+                "SELECT kind, active_slot_key, source_kind, fencing_token "
+                "FROM sop_instances WHERE id = 'inst_partial'"
+            )
+        ).one()
+        assert tuple(row) == ("sop", "foreground:session_partial", "legacy", 0)
+
+
+def test_execution_ownership_downgrade_rejects_dynamic_rows(tmp_path) -> None:
+    """验证 0035 无法表达的动态执行会阻止降级，避免身份数据被静默丢弃。"""
+
+    database_url = f"sqlite:///{tmp_path / 'execution-dynamic-downgrade.db'}"
+    config = Config(str(BACKEND_DIR / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
+    config.attributes["database_url"] = database_url
+    engine = create_engine(database_url)
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)"))
+        connection.execute(text("INSERT INTO alembic_version VALUES ('20260802_0035')"))
+        _create_legacy_sop_instances_table(connection)
+    command.upgrade(config, "20260803_0036")
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO sop_instances "
+                "(id, tenant_id, session_id, run_number, kind, active_slot_key, source_kind, "
+                "status, slots_json, context_json, revision, cancellation_disposition, "
+                "fencing_token, created_at, updated_at) VALUES "
+                "('dynamic_1', 'tenant_demo', 'session_dynamic', 1, 'dynamic_task', "
+                "'foreground:session_dynamic', 'api', 'running', '{}', '{}', 0, 'none', 0, "
+                "'2026-08-01 10:00:00', '2026-08-01 10:00:00')"
+            )
+        )
+
+    with pytest.raises(RuntimeError, match="downgrade requires SOP-only rows"):
+        command.downgrade(config, "20260802_0035")
+
+
+@pytest.mark.parametrize(
+    ("status", "skill_id", "expected_message"),
+    (
+        ("mystery", "skill_a", "unknown execution statuses"),
+        ("running", "", "invalid SOP execution identities"),
+    ),
+)
+def test_execution_ownership_migration_rejects_unmappable_history(
+    tmp_path,
+    status: str,
+    skill_id: str,
+    expected_message: str,
+) -> None:
+    """验证未知状态和空 SOP 身份均中止迁移，避免用猜测值污染历史。"""
+
+    database_url = f"sqlite:///{tmp_path / f'execution-unmappable-{status}.db'}"
+    config = Config(str(BACKEND_DIR / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
+    config.attributes["database_url"] = database_url
+    engine = create_engine(database_url)
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)"))
+        connection.execute(text("INSERT INTO alembic_version VALUES ('20260802_0035')"))
+        _create_legacy_sop_instances_table(connection)
+        connection.execute(
+            text(
+                "INSERT INTO sop_instances VALUES "
+                "('inst_invalid', 'tenant_demo', 'session_invalid', :skill_id, 'version_a', "
+                "'1.0.0', :checksum, 1, :status, 'node_a', '{}', '{}', 1, NULL, NULL, "
+                "'2026-08-01 10:00:00', '2026-08-01 10:00:00')"
+            ),
+            {"skill_id": skill_id, "status": status, "checksum": "a" * 64},
+        )
+
+    with pytest.raises(RuntimeError, match=expected_message):
+        command.upgrade(config, "20260803_0036")
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
+            "20260802_0035"
+        )

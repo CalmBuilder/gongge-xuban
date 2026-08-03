@@ -6,12 +6,25 @@
 @Description: 验证 SOP 实例恢复、节点等待和工具操作幂等回执的通用持久化语义。
 """
 
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from threading import Barrier
+
+import pytest
+from sqlalchemy import update
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from app.db.models import SopInstance, SopNodeExecution, SopOperation
+from app.db.models import (
+    ExecutionMutationRejection,
+    SopInstance,
+    SopNodeExecution,
+    SopOperation,
+)
 from app.sop_runtime.execution_store import (
     SopExecutionConflictError,
+    SopExecutionFencedError,
     SopExecutionStore,
 )
 
@@ -50,12 +63,14 @@ def test_instance_and_waiting_node_can_resume_without_losing_attempt() -> None:
     with _test_session() as db:
         store = SopExecutionStore(db)
         instance = _start(store)
-        execution = store.enter_node(instance, "collect_employee", input_snapshot={})
-        store.wait_for_input(instance, execution, expected_inputs=("employee_id",))
+        with store.owned(instance, worker_id="worker-test"):
+            execution = store.enter_node(instance, "collect_employee", input_snapshot={})
+            store.wait_for_input(instance, execution, expected_inputs=("employee_id",))
         db.commit()
 
-        store.resume_waiting_node(instance, execution, slots={"employee_id": "E001"})
-        store.complete_node(instance, execution, output={"employee_id": "E001"})
+        with store.owned(instance, worker_id="worker-test"):
+            store.resume_waiting_node(instance, execution, slots={"employee_id": "E001"})
+            store.complete_node(instance, execution, output={"employee_id": "E001"})
         db.commit()
         executions = db.exec(select(SopNodeExecution)).all()
         instance_status = instance.status
@@ -111,31 +126,32 @@ def test_operation_receipt_is_idempotent_and_can_complete_instance() -> None:
     with _test_session() as db:
         store = SopExecutionStore(db)
         instance = _start(store)
-        execution = store.enter_node(
-            instance,
-            "query_quota",
-            input_snapshot={"employee_id": "E001", "month": "2026-07"},
-        )
-        operation, created = store.prepare_operation(
-            instance,
-            execution,
-            operation_name="expense.quota_query",
-            request={"employee_id": "E001", "month": "2026-07"},
-        )
-        repeated, repeated_created = store.prepare_operation(
-            instance,
-            execution,
-            operation_name="expense.quota_query",
-            request={"month": "2026-07", "employee_id": "E001"},
-        )
-        store.start_operation(operation)
-        store.finish_operation(
-            operation,
-            succeeded=True,
-            result={"remaining": 20000.0, "currency": "CNY"},
-        )
-        store.complete_node(instance, execution, output={"operation_id": operation.id})
-        store.complete_instance(instance, slots={"employee_id": "E001"})
+        with store.owned(instance, worker_id="worker-test"):
+            execution = store.enter_node(
+                instance,
+                "query_quota",
+                input_snapshot={"employee_id": "E001", "month": "2026-07"},
+            )
+            operation, created = store.prepare_operation(
+                instance,
+                execution,
+                operation_name="expense.quota_query",
+                request={"employee_id": "E001", "month": "2026-07"},
+            )
+            repeated, repeated_created = store.prepare_operation(
+                instance,
+                execution,
+                operation_name="expense.quota_query",
+                request={"month": "2026-07", "employee_id": "E001"},
+            )
+            store.start_operation(operation)
+            store.finish_operation(
+                operation,
+                succeeded=True,
+                result={"remaining": 20000.0, "currency": "CNY"},
+            )
+            store.complete_node(instance, execution, output={"operation_id": operation.id})
+            store.complete_instance(instance, slots={"employee_id": "E001"})
         db.commit()
         operations = db.exec(select(SopOperation)).all()
         operation_id = operation.id
@@ -151,3 +167,230 @@ def test_operation_receipt_is_idempotent_and_can_complete_instance() -> None:
     assert operation_result["remaining"] == 20000.0
     assert instance_status == "succeeded"
     assert len(operations) == 1
+
+
+def test_authoritative_mutations_require_execution_lease() -> None:
+    """验证节点、Operation 和终态写不能绕过统一 execution 所有权。"""
+
+    with _test_session() as db:
+        store = SopExecutionStore(db)
+        instance = _start(store)
+
+        with pytest.raises(SopExecutionConflictError, match="execution lease"):
+            store.enter_node(instance, "collect_employee", input_snapshot={})
+
+
+def test_expired_lease_fences_late_node_operation_and_terminal_writes(tmp_path) -> None:
+    """验证新 worker 抢占后旧 token 的节点、Operation 与终态迟到写均被隔离审计。"""
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'execution-fencing.db'}",
+        connect_args={"check_same_thread": False, "timeout": 5},
+    )
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as seed_db:
+        instance = _start(SopExecutionStore(seed_db))
+        seed_db.commit()
+        instance_id = instance.id
+
+    with Session(engine) as worker_a_db:
+        instance_a = worker_a_db.get(SopInstance, instance_id)
+        assert instance_a is not None
+        store_a = SopExecutionStore(worker_a_db)
+        with store_a.owned(instance_a, worker_id="worker-a", ttl_seconds=30) as lease_a:
+            execution_a = store_a.enter_node(instance_a, "query_quota", input_snapshot={})
+            operation_a, _ = store_a.prepare_operation(
+                instance_a,
+                execution_a,
+                operation_name="expense.quota_query",
+                request={"employee_id": "E001"},
+            )
+            operation_id = operation_a.id
+            execution_id = execution_a.id
+            worker_a_db.commit()
+
+            with Session(engine) as expiry_db:
+                expiry_db.exec(
+                    update(SopInstance)
+                    .where(SopInstance.id == instance_id)
+                    .values(lease_expires_at=datetime(2000, 1, 1))
+                )
+                expiry_db.commit()
+
+            with Session(engine) as worker_b_db:
+                instance_b = worker_b_db.get(SopInstance, instance_id)
+                assert instance_b is not None
+                store_b = SopExecutionStore(worker_b_db)
+                with store_b.owned(instance_b, worker_id="worker-b") as lease_b:
+                    assert lease_b.fencing_token > lease_a.fencing_token
+                worker_b_db.commit()
+
+            rejected_actions: list[str] = []
+            instance_a.context_json = {"late_worker_payload": True}
+            for action, mutation in (
+                ("lease.renew", lambda: store_a.renew(lease_a)),
+                (
+                    "node.complete",
+                    lambda: store_a.complete_node(
+                        instance_a,
+                        execution_a,
+                        output={"late": True},
+                    ),
+                ),
+                ("operation.start", lambda: store_a.start_operation(operation_a)),
+                ("instance.complete", lambda: store_a.complete_instance(instance_a)),
+            ):
+                with pytest.raises(SopExecutionFencedError) as caught:
+                    mutation()
+                assert caught.value.action == action
+                rejected_actions.append(action)
+            worker_a_db.rollback()
+
+    with Session(engine) as verify_db:
+        persisted_operation = verify_db.get(SopOperation, operation_id)
+        persisted_execution = verify_db.get(SopNodeExecution, execution_id)
+        persisted_instance = verify_db.get(SopInstance, instance_id)
+        rejections = verify_db.exec(
+            select(ExecutionMutationRejection).order_by(ExecutionMutationRejection.created_at)
+        ).all()
+
+    assert rejected_actions == [
+        "lease.renew",
+        "node.complete",
+        "operation.start",
+        "instance.complete",
+    ]
+    assert persisted_operation is not None and persisted_operation.status == "prepared"
+    assert persisted_execution is not None and persisted_execution.status == "running"
+    assert persisted_instance is not None and persisted_instance.status == "running"
+    assert persisted_instance.context_json == {}
+    assert [item.action for item in rejections] == rejected_actions
+    assert all(item.rejected_fencing_token < item.current_fencing_token for item in rejections)
+
+
+def test_execution_kind_condition_allows_dynamic_identity_but_rejects_invalid_sop() -> None:
+    """验证通用 Execution 可无 SOP 身份，而 kind=sop 仍由数据库强制完整绑定。"""
+
+    with _test_session() as db:
+        dynamic = SopInstance(
+            tenant_id="tenant_demo",
+            session_id="session_dynamic",
+            kind="dynamic_task",
+            active_slot_key="foreground:session_dynamic",
+            source_kind="api",
+            source_ref="request-1",
+            status="running",
+            current_node_id="planning",
+        )
+        db.add(dynamic)
+        db.commit()
+        assert db.get(SopInstance, dynamic.id) is not None
+
+        invalid_sop = SopInstance(
+            tenant_id="tenant_demo",
+            session_id="session_invalid_sop",
+            kind="sop",
+            active_slot_key="foreground:session_invalid_sop",
+            status="running",
+        )
+        db.add(invalid_sop)
+        with pytest.raises(IntegrityError):
+            db.commit()
+        db.rollback()
+
+
+def test_renew_and_release_require_current_fencing_token() -> None:
+    """验证续租保持 token，释放只影响当前 owner/token，伪造旧 token 无法解锁。"""
+
+    with _test_session() as db:
+        store = SopExecutionStore(db)
+        instance = _start(store)
+        lease = store.claim(instance, worker_id="worker-a", ttl_seconds=10)
+        renewed = store.renew(lease, ttl_seconds=60)
+
+        assert renewed.fencing_token == lease.fencing_token
+        assert renewed.expires_at > lease.expires_at
+        assert store.release(renewed) is True
+        assert store.release(renewed) is False
+
+
+def test_unexpired_lease_blocks_competing_worker_and_ignores_worker_clock(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """验证未过期 owner 排他，且极端进程时钟偏移不能改变数据库租约裁决。"""
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'database-time.db'}")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as seed_db:
+        instance = _start(SopExecutionStore(seed_db))
+        seed_db.commit()
+        instance_id = instance.id
+
+    monkeypatch.setattr(
+        "app.sop_runtime.execution_store.utc_now",
+        lambda: datetime(2200, 1, 1),
+    )
+    with Session(engine) as worker_a_db:
+        instance_a = worker_a_db.get(SopInstance, instance_id)
+        assert instance_a is not None
+        store_a = SopExecutionStore(worker_a_db)
+        lease_a = store_a.claim(instance_a, worker_id="clock-skewed-a", ttl_seconds=30)
+        worker_a_db.commit()
+        assert lease_a.expires_at.year < 2200
+
+        with Session(engine) as worker_b_db:
+            instance_b = worker_b_db.get(SopInstance, instance_id)
+            assert instance_b is not None
+            with pytest.raises(SopExecutionConflictError, match="其他 worker"):
+                SopExecutionStore(worker_b_db).claim(
+                    instance_b,
+                    worker_id="worker-b",
+                    ttl_seconds=30,
+                )
+
+        assert store_a.release(lease_a) is True
+        worker_a_db.commit()
+
+
+def test_concurrent_active_slot_creation_keeps_one_execution(tmp_path) -> None:
+    """验证 SQLite 双 worker 并发启动时数据库活动槽最多保留一个实例。"""
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'active-slot.db'}",
+        connect_args={"check_same_thread": False, "timeout": 5},
+    )
+    SQLModel.metadata.create_all(engine)
+    barrier = Barrier(2)
+
+    def start_from_worker(version_id: str) -> tuple[str, bool] | None:
+        """让独立事务同时尝试占用同一 tenant/session 活动槽。"""
+
+        with Session(engine) as db:
+            barrier.wait()
+            try:
+                instance, created = SopExecutionStore(db).start_instance(
+                    tenant_id="tenant_demo",
+                    session_id="session_shared",
+                    skill_id="skill_demo",
+                    skill_version_id=version_id,
+                    skill_version="1.0.0",
+                    definition_checksum="a" * 64,
+                    start_node_id="start",
+                )
+                db.commit()
+                return instance.id, created
+            except (IntegrityError, OperationalError, SopExecutionConflictError):
+                db.rollback()
+                return None
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(start_from_worker, ("version-a", "version-b")))
+
+    with Session(engine) as verify_db:
+        active = verify_db.exec(
+            select(SopInstance).where(SopInstance.active_slot_key.is_not(None))
+        ).all()
+
+    assert len(active) == 1
+    assert sum(result is not None for result in results) >= 1

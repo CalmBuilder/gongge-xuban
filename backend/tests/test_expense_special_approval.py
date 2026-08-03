@@ -131,6 +131,7 @@ def _seed_runtime(
         skill_version=version.version,
         definition_checksum="checksum",
         status="waiting",
+        active_slot_key="foreground:session_special",
         current_node_id="department_special_approval",
     )
     execution = SopNodeExecution(
