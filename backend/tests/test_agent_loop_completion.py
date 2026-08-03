@@ -502,6 +502,68 @@ def test_tool_call_start_event_is_committed_before_external_execute() -> None:
     ]
 
 
+def test_deterministic_tool_call_passes_remote_idempotency_key_to_executor() -> None:
+    """验证 Agent Loop 从确定性 Runtime 取键并传到适配器，而不写入工具业务参数。"""
+
+    captured: dict[str, object] = {}
+
+    class RecordingExecutor:
+        """记录 Agent Loop 交给工具适配器的可靠执行上下文。"""
+
+        def execute(
+            self,
+            tenant_id: str,
+            tool_call: ToolCall,
+            active_skill_id: str | None = None,
+            agent_id: str | None = None,
+            actor_user_id: str | None = None,
+            remote_idempotency_key: str | None = None,
+        ) -> ToolResult:
+            """记录 Agent Loop 传入的远端键和原始业务参数。"""
+
+            captured["remote_idempotency_key"] = remote_idempotency_key
+            captured["arguments"] = dict(tool_call.arguments)
+            return ToolResult(tool_name=tool_call.name, success=True, data={"ok": True})
+
+    class RecordingRuntime:
+        """模拟已准备好远端幂等键的确定性 Runtime。"""
+
+        def remote_idempotency_key_for(
+            self,
+            chat_session: ChatSession,
+            operation_name: str,
+        ) -> str:
+            """返回当前逻辑动作冻结的测试远端键。"""
+
+            assert chat_session.id == "session_test"
+            assert operation_name == "product.purchase"
+            return "remote-command-key"
+
+    db = FakeDb()
+    loop = object.__new__(AgentLoop)
+    loop.db = db
+    loop.events = FakeEvents()
+    loop.tool_executor = RecordingExecutor()
+    loop.deterministic_runtime = RecordingRuntime()
+    session = ChatSession(
+        id="session_test",
+        tenant_id="tenant_demo",
+        active_skill_id="purchase",
+    )
+
+    result = loop._execute_tool_call(
+        _request("下单"),
+        session,
+        ToolCall(name="product.purchase", arguments={"product_id": "A1"}),
+    )
+
+    assert result.success is True
+    assert captured == {
+        "remote_idempotency_key": "remote-command-key",
+        "arguments": {"product_id": "A1"},
+    }
+
+
 def test_side_effect_tool_call_reuses_previous_successful_result() -> None:
     tool = Tool(
         tenant_id="tenant_demo",

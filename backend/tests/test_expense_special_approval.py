@@ -147,6 +147,12 @@ def _seed_runtime(
         node_execution_id=execution.id,
         operation_name="expense.special_approval_create",
         idempotency_key="special-create",
+        logical_action_id="action-special-create",
+        request_fingerprint=(
+            "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+        ),
+        effect_kind="external_write",
+        effect_state="complete",
         status="succeeded",
         result_json={"approval_request_id": request_number},
     )

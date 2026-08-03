@@ -34,6 +34,7 @@ class RuntimeAction(StrEnum):
 
     WAIT_INPUT = "wait_input"
     WAIT_WORK_ITEM = "wait_work_item"
+    WAIT_OPERATION = "wait_operation"
     ADVANCE = "advance"
     CALL_TOOL = "call_tool"
     QUERY_KNOWLEDGE = "query_knowledge"

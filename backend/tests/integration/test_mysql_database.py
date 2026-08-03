@@ -26,6 +26,8 @@ from app.db.models import (
     SkillVersion,
     SopInstance,
     SopOperation,
+    SopOperationAttempt,
+    SopOperationEffect,
     SopWorkItem,
     Tenant,
 )
@@ -143,6 +145,7 @@ def test_alembic_upgrades_empty_mysql_database(mysql_database_url: str) -> None:
     employee_columns = {item["name"]: item for item in inspector.get_columns("employee_profiles")}
     work_item_columns = {item["name"]: item for item in inspector.get_columns("sop_work_items")}
     execution_columns = {item["name"]: item for item in inspector.get_columns("sop_instances")}
+    operation_columns = {item["name"]: item for item in inspector.get_columns("sop_operations")}
     agent_columns = {item["name"]: item for item in inspector.get_columns("agent_profiles")}
     session_columns = {item["name"]: item for item in inspector.get_columns("sessions")}
     knowledge_columns = {
@@ -186,7 +189,27 @@ def test_alembic_upgrades_empty_mysql_database(mysql_database_url: str) -> None:
         "lease_acquired_at",
         "lease_heartbeat_at",
         "fencing_token",
+        "effect_state",
     }.issubset(execution_columns)
+    assert {
+        "logical_action_id",
+        "request_fingerprint",
+        "remote_idempotency_key",
+        "idempotency_required",
+        "effect_kind",
+        "effect_state",
+        "reconciled_at",
+    }.issubset(operation_columns)
+    assert "sop_operation_attempts" in tables
+    assert "sop_operation_effects" in tables
+    attempt_columns = {
+        item["name"]: item for item in inspector.get_columns("sop_operation_attempts")
+    }
+    effect_columns = {
+        item["name"]: item for item in inspector.get_columns("sop_operation_effects")
+    }
+    assert attempt_columns["operation_id"]["type"].length == 512
+    assert effect_columns["operation_id"]["type"].length == 512
     assert {
         "owner_user_id",
         "responsible_org_unit_id",
@@ -214,8 +237,86 @@ def test_alembic_upgrades_empty_mysql_database(mysql_database_url: str) -> None:
     with engine.connect() as connection:
         assert (
             connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-            == "20260803_0036"
+            == "20260803_0037"
         )
+
+
+def test_mysql_operation_unknown_reconcile_and_cancellation_are_consistent(
+    mysql_database_url: str,
+) -> None:
+    """验证 MySQL 上外部写取消先进入 unknown，对账后才释放活动槽并保留双账本。"""
+
+    upgrade(mysql_database_url)
+    engine = create_engine(mysql_database_url, pool_pre_ping=True)
+    with Session(engine) as session:
+        store = SopExecutionStore(session)
+        instance, _ = store.start_instance(
+            tenant_id="tenant_b02",
+            session_id="session_b02",
+            skill_id="skill_b02",
+            skill_version_id="version_b02",
+            skill_version="1.0.0",
+            definition_checksum="c" * 64,
+            start_node_id="submit",
+        )
+        with store.owned(instance, worker_id="mysql-b02-a"):
+            execution = store.enter_node(instance, "submit", input_snapshot={})
+            operation, _ = store.prepare_operation(
+                instance,
+                execution,
+                operation_name="expense.submit",
+                request={"request_id": "REQ-MYSQL-1"},
+                logical_action_id="action-mysql-submit",
+                effect_kind="external_write",
+            )
+            store.start_operation(operation)
+            settled = store.request_cancellation(
+                instance,
+                actor_user_id="user_b02",
+                reason="集成测试取消",
+            )
+            assert settled is False
+        session.commit()
+        instance_id = instance.id
+        operation_id = operation.id
+
+    with Session(engine) as session:
+        store = SopExecutionStore(session)
+        instance = session.get(SopInstance, instance_id)
+        operation = session.get(SopOperation, operation_id)
+        assert instance is not None and operation is not None
+        with store.owned(instance, worker_id="mysql-b02-b"):
+            settled = store.reconcile_operation(
+                instance,
+                operation,
+                succeeded=False,
+                error={"code": "REMOTE_NOT_APPLIED"},
+                effect_confirmed=False,
+            )
+        session.commit()
+        assert settled is True
+
+    with Session(engine) as session:
+        instance = session.get(SopInstance, instance_id)
+        operation = session.get(SopOperation, operation_id)
+        attempts = session.exec(
+            select(SopOperationAttempt).where(
+                SopOperationAttempt.operation_id == operation_id
+            )
+        ).all()
+        effects = session.exec(
+            select(SopOperationEffect)
+            .where(SopOperationEffect.operation_id == operation_id)
+            .order_by(SopOperationEffect.sequence)
+        ).all()
+
+    assert instance is not None and instance.status == "cancelled"
+    assert instance.active_slot_key is None
+    assert instance.effect_state == "none"
+    assert operation is not None and operation.status == "failed"
+    assert operation.effect_state == "none"
+    assert [attempt.status for attempt in attempts] == ["failed"]
+    assert [effect.effect_state for effect in effects] == ["unknown", "none"]
 
 
 def test_execution_ownership_migration_backfills_and_reverses_mysql(

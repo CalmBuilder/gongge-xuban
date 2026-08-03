@@ -108,13 +108,21 @@ WORK_ITEM_TRANSITIONS: dict[WorkItemStatus, frozenset[WorkItemStatus]] = {
 }
 
 OPERATION_TRANSITIONS: dict[OperationStatus, frozenset[OperationStatus]] = {
-    OperationStatus.PREPARED: frozenset({OperationStatus.RUNNING, OperationStatus.FAILED}),
+    OperationStatus.PREPARED: frozenset(
+        {OperationStatus.RUNNING, OperationStatus.FAILED, OperationStatus.CANCELLED}
+    ),
     OperationStatus.RUNNING: frozenset(
-        {OperationStatus.SUCCEEDED, OperationStatus.FAILED, OperationStatus.UNKNOWN}
+        {
+            OperationStatus.SUCCEEDED,
+            OperationStatus.FAILED,
+            OperationStatus.UNKNOWN,
+            OperationStatus.CANCELLED,
+        }
     ),
     OperationStatus.UNKNOWN: frozenset({OperationStatus.SUCCEEDED, OperationStatus.FAILED}),
     OperationStatus.SUCCEEDED: frozenset(),
     OperationStatus.FAILED: frozenset(),
+    OperationStatus.CANCELLED: frozenset(),
 }
 
 DELIVERY_TRANSITIONS: dict[DeliveryStatus, frozenset[DeliveryStatus]] = {

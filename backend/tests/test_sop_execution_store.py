@@ -3,7 +3,7 @@
 @Author     : zhanglp8181
 @File       : test_sop_execution_store.py
 @CallChain  : pytest → SopExecutionStore → SQLite 执行聚合
-@Description: 验证 SOP 实例恢复、节点等待和工具操作幂等回执的通用持久化语义。
+@Description: 验证执行租约、逻辑动作幂等、unknown 对账、两阶段取消及效果/补偿账本。
 """
 
 from concurrent.futures import ThreadPoolExecutor
@@ -21,7 +21,10 @@ from app.db.models import (
     SopInstance,
     SopNodeExecution,
     SopOperation,
+    SopOperationAttempt,
+    SopOperationEffect,
 )
+from app.sop_runtime.contracts import IdempotencyPolicy, IdempotencyScope
 from app.sop_runtime.execution_store import (
     SopExecutionConflictError,
     SopExecutionFencedError,
@@ -394,3 +397,338 @@ def test_concurrent_active_slot_creation_keeps_one_execution(tmp_path) -> None:
 
     assert len(active) == 1
     assert sum(result is not None for result in results) >= 1
+
+
+def test_new_step_attempt_reuses_logical_action_and_remote_key() -> None:
+    """验证节点重试只新增本地 attempt，不产生第二个 Operation 或远端幂等键。"""
+
+    with _test_session() as db:
+        store = SopExecutionStore(db)
+        instance = _start(store)
+        with store.owned(instance, worker_id="worker-test"):
+            first_execution = store.enter_node(instance, "submit", input_snapshot={})
+            first, created = store.prepare_operation(
+                instance,
+                first_execution,
+                operation_name="expense.submit",
+                request={"request_id": "REQ-1", "amount": 100},
+                logical_action_id="action-submit-expense",
+                effect_kind="external_write",
+            )
+            store.fail_node(instance, first_execution, error={"code": "RETRY"})
+            second_execution = store.enter_node(instance, "submit", input_snapshot={})
+            second, second_created = store.prepare_operation(
+                instance,
+                second_execution,
+                operation_name="expense.submit",
+                request={"amount": 100, "request_id": "REQ-1"},
+                logical_action_id="action-submit-expense",
+                effect_kind="external_write",
+            )
+        db.commit()
+        attempts = db.exec(
+            select(SopOperationAttempt).where(SopOperationAttempt.operation_id == first.id)
+        ).all()
+
+    assert created is True
+    assert second_created is False
+    assert second.id == first.id
+    assert second.remote_idempotency_key == first.remote_idempotency_key
+    assert len(attempts) == 2
+
+
+def test_same_logical_action_with_changed_request_is_rejected() -> None:
+    """验证同一 logical action 的规范请求变化会在任何工具调用前形成冲突。"""
+
+    with _test_session() as db:
+        store = SopExecutionStore(db)
+        instance = _start(store)
+        with store.owned(instance, worker_id="worker-test"):
+            execution = store.enter_node(instance, "submit", input_snapshot={})
+            store.prepare_operation(
+                instance,
+                execution,
+                operation_name="expense.submit",
+                request={"request_id": "REQ-1", "amount": 100},
+                logical_action_id="action-submit-expense",
+                effect_kind="external_write",
+            )
+            with pytest.raises(SopExecutionConflictError, match="fingerprint"):
+                store.prepare_operation(
+                    instance,
+                    execution,
+                    operation_name="expense.submit",
+                    request={"request_id": "REQ-1", "amount": 101},
+                    logical_action_id="action-submit-expense",
+                    effect_kind="external_write",
+                )
+
+
+def test_business_idempotency_policy_uses_only_declared_fields() -> None:
+    """验证业务级远端键忽略非声明字段，同时完整请求 fingerprint 仍各自可审计。"""
+
+    policy = IdempotencyPolicy(
+        scope=IdempotencyScope.BUSINESS,
+        key_fields=("request_id",),
+    )
+    first = SopExecutionStore.remote_idempotency_key(
+        tenant_id="tenant_demo",
+        instance_id="instance-a",
+        logical_action_id="action-a",
+        operation_name="expense.submit",
+        request={"request_id": "REQ-1", "trace": "first"},
+        policy=policy,
+    )
+    second = SopExecutionStore.remote_idempotency_key(
+        tenant_id="tenant_demo",
+        instance_id="instance-b",
+        logical_action_id="action-b",
+        operation_name="expense.submit",
+        request={"request_id": "REQ-1", "trace": "second"},
+        policy=policy,
+    )
+
+    assert first == second
+
+
+def test_same_logical_action_rejects_idempotency_required_policy_drift() -> None:
+    """验证同一逻辑动作不能从可选远端幂等静默漂移为必需策略。"""
+
+    with _test_session() as db:
+        store = SopExecutionStore(db)
+        instance = _start(store)
+        with store.owned(instance, worker_id="worker-test"):
+            execution = store.enter_node(instance, "submit", input_snapshot={})
+            store.prepare_operation(
+                instance,
+                execution,
+                operation_name="expense.submit",
+                request={"request_id": "REQ-1"},
+                logical_action_id="action-policy-drift",
+                idempotency_policy=IdempotencyPolicy(required=False),
+                effect_kind="external_write",
+            )
+            with pytest.raises(SopExecutionConflictError, match="策略"):
+                store.prepare_operation(
+                    instance,
+                    execution,
+                    operation_name="expense.submit",
+                    request={"request_id": "REQ-1"},
+                    logical_action_id="action-policy-drift",
+                    idempotency_policy=IdempotencyPolicy(required=True),
+                    effect_kind="external_write",
+                )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {"value": float("nan")},
+        {"value": float("inf")},
+        {"value": {"not", "json"}},
+        {1: "non-string-key"},
+    ),
+)
+def test_non_json_values_are_rejected_before_fingerprint(payload) -> None:  # noqa: ANN001
+    """验证 NaN、Infinity、set 和非字符串键不会被隐式字符串化进命令摘要。"""
+
+    with pytest.raises(ValueError, match="JSON"):
+        SopExecutionStore.request_fingerprint(payload)
+
+
+def test_cancel_prepared_operation_and_reconcile_running_write() -> None:
+    """验证 prepared 零调用取消，running 外部写进入 unknown 并在对账后才取消实例。"""
+
+    with _test_session() as db:
+        store = SopExecutionStore(db)
+        instance = _start(store)
+        with store.owned(instance, worker_id="worker-test"):
+            execution = store.enter_node(instance, "submit", input_snapshot={})
+            prepared, _ = store.prepare_operation(
+                instance,
+                execution,
+                operation_name="expense.draft",
+                request={"request_id": "REQ-DRAFT"},
+                logical_action_id="action-draft",
+                effect_kind="external_write",
+            )
+            store.cancel_prepared_operation(prepared)
+            running, _ = store.prepare_operation(
+                instance,
+                execution,
+                operation_name="expense.submit",
+                request={"request_id": "REQ-1"},
+                logical_action_id="action-submit",
+                effect_kind="external_write",
+            )
+            store.start_operation(running)
+            settled = store.request_cancellation(
+                instance,
+                actor_user_id="user_demo",
+                reason="用户撤回",
+            )
+            assert settled is False
+            assert instance.status == "running"
+            assert instance.cancellation_disposition == "awaiting_reconciliation"
+            assert running.status == "unknown"
+            with pytest.raises(SopExecutionConflictError, match="running"):
+                store.finish_operation(
+                    running,
+                    succeeded=False,
+                    error={"code": "LATE_FAILURE"},
+                )
+            with pytest.raises(SopExecutionConflictError, match="效果证据"):
+                store.reconcile_operation(
+                    instance,
+                    running,
+                    succeeded=True,
+                    result={"id": "unexpected"},
+                    effect_confirmed=False,
+                )
+            settled = store.reconcile_operation(
+                instance,
+                running,
+                succeeded=False,
+                result={},
+                error={"code": "REMOTE_NOT_APPLIED"},
+                effect_confirmed=False,
+            )
+        db.commit()
+        prepared_status = prepared.status
+        instance_status = instance.status
+        active_slot_key = instance.active_slot_key
+
+    assert prepared_status == "cancelled"
+    assert settled is True
+    assert instance_status == "cancelled"
+    assert active_slot_key is None
+
+
+def test_effect_state_reports_partial_and_unknown_external_effects() -> None:
+    """验证多个外部动作的成功、失败与未知结果形成正交 execution effect_state。"""
+
+    with _test_session() as db:
+        store = SopExecutionStore(db)
+        instance = _start(store)
+        with store.owned(instance, worker_id="worker-test"):
+            execution = store.enter_node(instance, "multi_write", input_snapshot={})
+            succeeded, _ = store.prepare_operation(
+                instance,
+                execution,
+                operation_name="system_a.create",
+                request={"id": "A"},
+                logical_action_id="action-a",
+                effect_kind="external_write",
+            )
+            store.start_operation(succeeded)
+            store.finish_operation(succeeded, succeeded=True, result={"id": "A-1"})
+            failed, _ = store.prepare_operation(
+                instance,
+                execution,
+                operation_name="system_b.notify",
+                request={"id": "B"},
+                logical_action_id="action-b",
+                effect_kind="external_write",
+            )
+            store.start_operation(failed)
+            store.finish_operation(
+                failed,
+                succeeded=False,
+                error={"code": "HTTP_ERROR"},
+            )
+            assert store.aggregate_effect_state(instance) == "partial"
+            unknown, _ = store.prepare_operation(
+                instance,
+                execution,
+                operation_name="system_c.update",
+                request={"id": "C"},
+                logical_action_id="action-c",
+                effect_kind="external_write",
+            )
+            store.start_operation(unknown)
+            store.mark_operation_unknown(unknown, error={"code": "TIMEOUT"})
+
+    assert instance.effect_state == "unknown"
+
+
+def test_stale_running_external_write_becomes_unknown_after_worker_crash() -> None:
+    """验证同步 worker 超时失联后由数据库时间判定 unknown，原逻辑动作不再允许重发。"""
+
+    with _test_session() as db:
+        store = SopExecutionStore(db)
+        instance = _start(store)
+        with store.owned(instance, worker_id="worker-test"):
+            execution = store.enter_node(instance, "submit", input_snapshot={})
+            operation, _ = store.prepare_operation(
+                instance,
+                execution,
+                operation_name="expense.submit",
+                request={"request_id": "REQ-STALE"},
+                logical_action_id="action-stale",
+                effect_kind="external_write",
+            )
+            store.start_operation(operation)
+            operation.started_at = datetime(2000, 1, 1)
+            assert store.mark_stale_running_operation_unknown(
+                operation,
+                timeout_seconds=30,
+            ) is True
+            assert store.mark_stale_running_operation_unknown(
+                operation,
+                timeout_seconds=30,
+            ) is False
+
+    assert operation.status == "unknown"
+    assert operation.effect_state == "unknown"
+
+
+def test_compensation_is_a_new_managed_action_with_auditable_lineage() -> None:
+    """验证补偿不是回滚原记录，而是新的受管逻辑动作并在双方效果账本保留 lineage。"""
+
+    with _test_session() as db:
+        store = SopExecutionStore(db)
+        instance = _start(store)
+        with store.owned(instance, worker_id="worker-test"):
+            execution = store.enter_node(instance, "submit", input_snapshot={})
+            original, _ = store.prepare_operation(
+                instance,
+                execution,
+                operation_name="expense.submit",
+                request={"request_id": "REQ-COMP"},
+                logical_action_id="action-original",
+                effect_kind="external_write",
+            )
+            store.start_operation(original)
+            store.finish_operation(original, succeeded=True, result={"id": "REMOTE-1"})
+            compensation, _ = store.prepare_operation(
+                instance,
+                execution,
+                operation_name="expense.cancel",
+                request={"remote_id": "REMOTE-1"},
+                logical_action_id="action-compensation",
+                effect_kind="external_write",
+                compensates_operation_id=original.id,
+            )
+            store.start_operation(compensation)
+            store.finish_operation(compensation, succeeded=True, result={"cancelled": True})
+        db.commit()
+        effects = db.exec(
+            select(SopOperationEffect).order_by(
+                SopOperationEffect.operation_id,
+                SopOperationEffect.sequence,
+            )
+        ).all()
+        original_state = original.effect_state
+        compensation_state = compensation.effect_state
+        aggregate = instance.effect_state
+
+    assert original.id != compensation.id
+    assert original_state == "compensated"
+    assert compensation_state == "complete"
+    assert aggregate == "complete"
+    assert any(
+        effect.operation_id == original.id
+        and effect.event_type == "compensated"
+        and effect.compensation_operation_id == compensation.id
+        for effect in effects
+    )

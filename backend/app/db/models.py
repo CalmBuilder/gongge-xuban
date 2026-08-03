@@ -633,6 +633,10 @@ class SopInstance(SQLModel, table=True):
             "(cancellation_requested_at IS NOT NULL AND cancellation_disposition <> 'none'))",
             name="ck_execution_cancellation_request",
         ),
+        CheckConstraint(
+            "effect_state IN ('none', 'partial', 'complete', 'unknown')",
+            name="ck_execution_effect_state",
+        ),
         Index(
             "ix_sop_instances_tenant_lease_expiry",
             "tenant_id",
@@ -673,6 +677,7 @@ class SopInstance(SQLModel, table=True):
     lease_acquired_at: datetime | None = None
     lease_heartbeat_at: datetime | None = None
     fencing_token: int = Field(default=0, ge=0)
+    effect_state: LabelString = Field(default="none")
     started_at: datetime | None = None
     completed_at: datetime | None = None
     created_at: datetime = Field(default_factory=utc_now)
@@ -717,6 +722,23 @@ class SopOperation(SQLModel, table=True):
         UniqueConstraint(
             "tenant_id", "idempotency_key", name="uq_sop_operation_tenant_idempotency"
         ),
+        UniqueConstraint(
+            "tenant_id",
+            "logical_action_id",
+            name="uq_sop_operation_tenant_logical_action",
+        ),
+        CheckConstraint(
+            "status IN ('prepared', 'running', 'succeeded', 'failed', 'unknown', 'cancelled')",
+            name="ck_sop_operation_status",
+        ),
+        CheckConstraint(
+            "effect_kind IN ('read', 'external_write', 'legacy_unknown')",
+            name="ck_sop_operation_effect_kind",
+        ),
+        CheckConstraint(
+            "effect_state IN ('none', 'complete', 'unknown', 'compensated')",
+            name="ck_sop_operation_effect_state",
+        ),
     )
 
     id: PrimaryKeyString = Field(default_factory=lambda: new_id("sopop"), primary_key=True)
@@ -725,16 +747,102 @@ class SopOperation(SQLModel, table=True):
     node_execution_id: IdentifierString = Field(index=True)
     operation_name: NameString = Field(index=True)
     idempotency_key: VersionString
+    logical_action_id: IdentifierString = Field(index=True)
+    request_fingerprint: VersionString
+    remote_idempotency_key: OptionalIdentifierString = Field(default=None, index=True)
+    idempotency_required: bool = Field(default=True)
+    idempotency_scope: LabelString = Field(default="instance")
+    idempotency_key_fields_json: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    effect_kind: LabelString = Field(default="read")
+    effect_state: LabelString = Field(default="none")
+    cancellation_disposition: LabelString = Field(default="none")
+    compensates_operation_id: str | None = Field(
+        default=None,
+        sa_column=Column(String(512), nullable=True, index=True),
+    )
     status: LabelString = Field(default="prepared", index=True)
     request_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     result_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     error_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     external_reference: OptionalIdentifierString = Field(default=None, index=True)
+    reconciled_at: datetime | None = None
     revision: int = Field(default=0, ge=0)
     started_at: datetime | None = None
     completed_at: datetime | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
+
+
+class SopOperationAttempt(SQLModel, table=True):
+    """追加保存逻辑动作每次本地 dispatch attempt，不改变远端命令身份。"""
+
+    __tablename__ = "sop_operation_attempts"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "operation_id",
+            "node_execution_id",
+            name="uq_sop_operation_attempt_execution",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "operation_id",
+            "attempt_number",
+            name="uq_sop_operation_attempt_number",
+        ),
+        CheckConstraint(
+            "status IN ('prepared', 'running', 'succeeded', 'failed', 'unknown', "
+            "'cancelled', 'reused')",
+            name="ck_sop_operation_attempt_status",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("sopattempt"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    instance_id: IdentifierString = Field(index=True)
+    operation_id: str = Field(sa_column=Column(String(512), nullable=False, index=True))
+    node_execution_id: IdentifierString = Field(index=True)
+    attempt_number: int = Field(ge=1)
+    status: LabelString = Field(default="prepared", index=True)
+    error_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class SopOperationEffect(SQLModel, table=True):
+    """追加保存外部效果事实及对账/补偿 lineage，不覆盖原 Operation 历史。"""
+
+    __tablename__ = "sop_operation_effects"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "operation_id",
+            "sequence",
+            name="uq_sop_operation_effect_sequence",
+        ),
+        CheckConstraint(
+            "effect_state IN ('none', 'complete', 'unknown', 'compensated')",
+            name="ck_sop_operation_effect_record_state",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("sopeffect"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    instance_id: IdentifierString = Field(index=True)
+    operation_id: str = Field(sa_column=Column(String(512), nullable=False, index=True))
+    logical_action_id: IdentifierString = Field(index=True)
+    sequence: int = Field(ge=1)
+    event_type: LabelString = Field(index=True)
+    effect_state: LabelString
+    external_reference: OptionalIdentifierString = None
+    evidence_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    compensation_operation_id: str | None = Field(
+        default=None,
+        sa_column=Column(String(512), nullable=True),
+    )
+    created_at: datetime = Field(default_factory=utc_now)
 
 
 class ExecutionMutationRejection(SQLModel, table=True):

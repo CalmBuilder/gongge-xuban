@@ -3,7 +3,7 @@
 @Author     : zhanglp8181
 @File       : coordinator.py
 @CallChain  : Agent Loop → DeterministicSopCoordinator → Scheduler/ExecutionStore/服务执行器
-@Description: 将确定性调度计划与会话、不可变版本和服务任务回执连接为可恢复运行链。
+@Description: 连接确定性计划、不可变版本和可靠 Operation 回执，形成可恢复且不重复副作用的运行链。
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from uuid import uuid4
 from sqlmodel import Session, select
 
 from app.approvals import ApprovalRequestService
+from app.config import get_settings
 from app.db.models import (
     AgentEvent,
     ChatSession,
@@ -24,7 +25,9 @@ from app.db.models import (
     SopInstance,
     SopNodeExecution,
     SopOperation,
+    SopOperationAttempt,
     SopWorkItem,
+    Tool,
 )
 from app.session.session_schema import KnowledgeQuery, StepAgentResult
 from app.sop_runtime.capabilities import DEFAULT_CAPABILITY_REGISTRY
@@ -405,7 +408,7 @@ class DeterministicSopCoordinator:
         tool_call: ToolCall,
         tool_result: ToolResult,
     ) -> RuntimePlan | None:
-        """完成运行中的工具操作，并用统一回执驱动 DSL 路由和终态收口。"""
+        """记录工具回执；外部写超时进入 unknown 对账，确定结果才驱动后续路由。"""
 
         instance = self._active_instance(chat_session)
         if instance is None:
@@ -415,10 +418,15 @@ class DeterministicSopCoordinator:
             return None
         operation = self.db.exec(
             select(SopOperation)
+            .join(
+                SopOperationAttempt,
+                SopOperationAttempt.operation_id == SopOperation.id,
+            )
             .where(
                 SopOperation.tenant_id == instance.tenant_id,
                 SopOperation.instance_id == instance.id,
-                SopOperation.node_execution_id == execution.id,
+                SopOperationAttempt.tenant_id == instance.tenant_id,
+                SopOperationAttempt.node_execution_id == execution.id,
                 SopOperation.operation_name == tool_call.name,
                 SopOperation.status.in_(("prepared", "running")),
             )
@@ -430,6 +438,23 @@ class DeterministicSopCoordinator:
             if operation.status == "prepared":
                 self.store.start_operation(operation)
             error_payload = tool_result.error.model_dump(mode="json") if tool_result.error else {}
+            if (
+                not tool_result.success
+                and operation.effect_kind == "external_write"
+                and tool_result.error is not None
+                and self._is_ambiguous_external_failure(
+                    tool_result.error.code,
+                    tool_result.error.message,
+                )
+            ):
+                self.store.mark_operation_unknown(operation, error=error_payload)
+                return RuntimePlan(
+                    action=RuntimeAction.WAIT_OPERATION,
+                    node_id=execution.node_id,
+                    operation_name=operation.operation_name,
+                    error_code="RUNTIME_OPERATION_RECONCILIATION_REQUIRED",
+                    control_reply="外部操作结果尚未确认，系统已停止重复提交并等待对账。",
+                )
             self.store.finish_operation(
                 operation,
                 succeeded=tool_result.success,
@@ -484,10 +509,15 @@ class DeterministicSopCoordinator:
             return None
         operation = self.db.exec(
             select(SopOperation)
+            .join(
+                SopOperationAttempt,
+                SopOperationAttempt.operation_id == SopOperation.id,
+            )
             .where(
                 SopOperation.tenant_id == instance.tenant_id,
                 SopOperation.instance_id == instance.id,
-                SopOperation.node_execution_id == execution.id,
+                SopOperationAttempt.tenant_id == instance.tenant_id,
+                SopOperationAttempt.node_execution_id == execution.id,
                 SopOperation.operation_name == "knowledge.search",
                 SopOperation.status.in_(("prepared", "running")),
             )
@@ -695,6 +725,9 @@ class DeterministicSopCoordinator:
                 chat_session.agent_id,
                 chat_session.user_id,
                 execution_org_unit_id=execution_org_unit_id,
+                remote_idempotency_key=(
+                    operation.remote_idempotency_key if operation is not None else None
+                ),
             )
             finished_payload = tool_result.model_dump(mode="json")
             finished_payload["tool_call"] = tool_call.model_dump(mode="json")
@@ -730,11 +763,20 @@ class DeterministicSopCoordinator:
     ) -> SopOperation | None:
         """读取当前恢复链已准备的工具操作，用于关联事件和稳定幂等键。"""
 
+        execution = self._current_execution(instance, instance.current_node_id or "")
+        if execution is None:
+            return None
         return self.db.exec(
             select(SopOperation)
+            .join(
+                SopOperationAttempt,
+                SopOperationAttempt.operation_id == SopOperation.id,
+            )
             .where(
                 SopOperation.tenant_id == instance.tenant_id,
                 SopOperation.instance_id == instance.id,
+                SopOperationAttempt.tenant_id == instance.tenant_id,
+                SopOperationAttempt.node_execution_id == execution.id,
                 SopOperation.operation_name == operation_name,
                 SopOperation.status.in_(("prepared", "running")),
             )
@@ -1011,25 +1053,69 @@ class DeterministicSopCoordinator:
                     )
                 return plan
             if plan.action is RuntimeAction.CALL_TOOL and plan.operation_name:
-                operation, created = self.store.prepare_operation(
+                operation, _created = self.store.prepare_operation(
                     instance,
                     current_execution,
                     operation_name=plan.operation_name,
                     request=plan.operation_arguments,
+                    effect_kind=self._operation_effect_kind(
+                        instance.tenant_id,
+                        plan.operation_name,
+                    ),
                 )
-                if created:
+                if operation.status == "prepared":
                     self.store.start_operation(operation)
-                return plan
+                    return plan
+                if operation.status in {"running", "unknown"}:
+                    if operation.status == "running":
+                        self.store.mark_stale_running_operation_unknown(
+                            operation,
+                            timeout_seconds=float(get_settings().tool_timeout_seconds),
+                        )
+                    return self._wait_for_operation_plan(plan, operation)
+                if operation.status in {"succeeded", "failed"}:
+                    self._restore_operation_receipt(instance, current_execution, operation)
+                    if current_execution.status == "running":
+                        self.store.complete_node(
+                            instance,
+                            current_execution,
+                            output={"operation_id": operation.id, "restored": True},
+                        )
+                    already_completed = True
+                    continue
+                return RuntimePlan(
+                    action=RuntimeAction.FAIL,
+                    node_id=current_execution.node_id,
+                    error_code="RUNTIME_OPERATION_CANCELLED",
+                )
             if plan.action is RuntimeAction.QUERY_KNOWLEDGE and plan.operation_name:
-                operation, created = self.store.prepare_operation(
+                operation, _created = self.store.prepare_operation(
                     instance,
                     current_execution,
                     operation_name=plan.operation_name,
                     request=plan.operation_arguments,
+                    effect_kind="read",
                 )
-                if created:
+                if operation.status == "prepared":
                     self.store.start_operation(operation)
-                return plan
+                    return plan
+                if operation.status in {"running", "unknown"}:
+                    return self._wait_for_operation_plan(plan, operation)
+                if operation.status in {"succeeded", "failed"}:
+                    self._restore_operation_receipt(instance, current_execution, operation)
+                    if current_execution.status == "running":
+                        self.store.complete_node(
+                            instance,
+                            current_execution,
+                            output={"operation_id": operation.id, "restored": True},
+                        )
+                    already_completed = True
+                    continue
+                return RuntimePlan(
+                    action=RuntimeAction.FAIL,
+                    node_id=current_execution.node_id,
+                    error_code="RUNTIME_OPERATION_CANCELLED",
+                )
             if plan.action is RuntimeAction.COMPLETE:
                 if not already_completed and current_execution.status == "running":
                     self.store.complete_node(
@@ -1104,6 +1190,18 @@ class DeterministicSopCoordinator:
                 }
             )
             return result.mark_runtime_control_reply("WORK_ITEM_WAITING")
+        if plan.action is RuntimeAction.WAIT_OPERATION:
+            result = model_result.model_copy(
+                update={
+                    "action": "reply",
+                    "reply": plan.control_reply or "外部操作仍在处理中，请勿重复提交。",
+                    "tool_call": None,
+                    "knowledge_query": None,
+                    "next_step_id": None,
+                    "is_step_completed": False,
+                }
+            )
+            return result.mark_runtime_control_reply("OPERATION_RECONCILIATION_REQUIRED")
         if plan.action is RuntimeAction.COMPLETE:
             return model_result.model_copy(
                 update={
@@ -1124,6 +1222,95 @@ class DeterministicSopCoordinator:
                 }
             )
         return model_result
+
+    def remote_idempotency_key_for(
+        self,
+        chat_session: ChatSession,
+        operation_name: str,
+    ) -> str | None:
+        """读取当前确定性执行的远端幂等键，供 HTTP 适配器发送而不污染业务参数。"""
+
+        instance = self._active_instance(chat_session)
+        if instance is None:
+            return None
+        operation = self._running_operation(instance, operation_name)
+        return operation.remote_idempotency_key if operation is not None else None
+
+    def _operation_effect_kind(self, tenant_id: str, operation_name: str) -> str:
+        """仅把知识检索和明确 HTTP GET 视为读取，其余工具保守归类为外部写。"""
+
+        if operation_name == "knowledge.search":
+            return "read"
+        tool = self.db.exec(
+            select(Tool).where(Tool.tenant_id == tenant_id, Tool.name == operation_name)
+        ).first()
+        if tool is not None and (tool.tool_type or "http") == "http" and tool.method.upper() == "GET":
+            return "read"
+        return "external_write"
+
+    @staticmethod
+    def _is_ambiguous_external_failure(code: str, message: str) -> bool:
+        """保守识别请求可能已到达远端但回执不确定的传输错误。"""
+
+        if code in {"TIMEOUT", "EXECUTION_ERROR", "MCP_ERROR", "MCP_EXECUTION_ERROR"}:
+            return True
+        if code != "HTTP_ERROR":
+            return False
+        return any(f"{status}" in message for status in range(500, 600))
+
+    @staticmethod
+    def _wait_for_operation_plan(plan: RuntimePlan, operation: SopOperation) -> RuntimePlan:
+        """把 running/unknown 逻辑动作转换为禁止重复 dispatch 的显式等待计划。"""
+
+        unknown = operation.status == "unknown"
+        return RuntimePlan(
+            action=RuntimeAction.WAIT_OPERATION,
+            node_id=plan.node_id,
+            operation_name=operation.operation_name,
+            error_code=(
+                "RUNTIME_OPERATION_RECONCILIATION_REQUIRED"
+                if unknown
+                else "RUNTIME_OPERATION_IN_PROGRESS"
+            ),
+            control_reply=(
+                "外部操作结果尚未确认，系统已停止重复提交并等待对账。"
+                if unknown
+                else "外部操作仍在处理中，系统不会重复提交。"
+            ),
+        )
+
+    def _restore_operation_receipt(
+        self,
+        instance: SopInstance,
+        execution: SopNodeExecution,
+        operation: SopOperation,
+    ) -> None:
+        """从终态 Operation 重建崩溃前未写入上下文的回执，禁止再次调用适配器。"""
+
+        result_key = self._operation_result_key(instance, execution.node_id)
+        if not result_key:
+            raise ValueError("终态 Operation 所在节点缺少 result_key，无法恢复。")
+        receipt = {
+            "status": operation.status,
+            "data": dict(operation.result_json or {}),
+            "error": dict(operation.error_json or {}) or None,
+            "operation_id": operation.id,
+        }
+        if operation.operation_name == "knowledge.search":
+            node_outputs = self._node_outputs(instance)
+            node_outputs[result_key] = receipt
+            instance.context_json = {
+                **(instance.context_json or {}),
+                "node_outputs": node_outputs,
+            }
+        else:
+            tool_results = self._tool_results(instance)
+            tool_results[result_key] = receipt
+            instance.context_json = {
+                **(instance.context_json or {}),
+                "tool_results": tool_results,
+            }
+        self.db.add(instance)
 
     def _published_definition(self, skill: Skill):
         """读取技能当前不可变发布版本并重新校验其规范定义 checksum。"""

@@ -1899,3 +1899,237 @@ def test_execution_ownership_migration_rejects_unmappable_history(
         assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
             "20260802_0035"
         )
+
+
+def _seed_0036_operation_history(connection, *, invalid_request: bool = False) -> None:  # noqa: ANN001
+    """在 0036 schema 写入读成功、写成功和写运行中的代表性历史操作。"""
+
+    connection.execute(
+        text(
+            "INSERT INTO sop_instances "
+            "(id, tenant_id, session_id, skill_id, skill_version_id, skill_version, "
+            "definition_checksum, run_number, kind, active_slot_key, source_kind, status, "
+            "current_node_id, slots_json, context_json, revision, cancellation_disposition, "
+            "fencing_token, created_at, updated_at) VALUES "
+            "('inst_reliable', 'tenant_demo', 'session_reliable', 'skill_a', 'version_a', "
+            "'1.0.0', :checksum, 1, 'sop', 'foreground:session_reliable', 'legacy', "
+            "'running', 'write_running', '{}', '{}', 1, 'none', 0, "
+            "'2026-08-03 10:00:00', '2026-08-03 10:00:00')"
+        ),
+        {"checksum": "a" * 64},
+    )
+    for execution_id, node_id, status in (
+        ("node_read", "read", "succeeded"),
+        ("node_write", "write", "succeeded"),
+        ("node_running", "write_running", "running"),
+    ):
+        connection.execute(
+            text(
+                "INSERT INTO sop_node_executions "
+                "(id, tenant_id, instance_id, node_id, attempt, status, input_json, "
+                "output_json, error_json, revision, created_at, updated_at) VALUES "
+                "(:id, 'tenant_demo', 'inst_reliable', :node_id, 1, :status, '{}', '{}', "
+                "'{}', 0, '2026-08-03 10:00:00', '2026-08-03 10:00:00')"
+            ),
+            {"id": execution_id, "node_id": node_id, "status": status},
+        )
+    requests = (
+        ("op_read", "node_read", "knowledge.search", "succeeded", '{"query":"制度"}'),
+        ("op_write", "node_write", "expense.submit", "succeeded", '{"request_id":"R1"}'),
+        (
+            "op_running",
+            "node_running",
+            "expense.submit",
+            "running",
+            '{"value":NaN}' if invalid_request else '{"request_id":"R2"}',
+        ),
+    )
+    for operation_id, execution_id, operation_name, status, request_json in requests:
+        connection.execute(
+            text(
+                "INSERT INTO sop_operations "
+                "(id, tenant_id, instance_id, node_execution_id, operation_name, "
+                "idempotency_key, status, request_json, result_json, error_json, revision, "
+                "created_at, updated_at) VALUES "
+                "(:id, 'tenant_demo', 'inst_reliable', :execution_id, :operation_name, "
+                ":idempotency_key, :status, :request_json, '{}', '{}', 0, "
+                "'2026-08-03 10:00:00', '2026-08-03 10:00:00')"
+            ),
+            {
+                "id": operation_id,
+                "execution_id": execution_id,
+                "operation_name": operation_name,
+                "idempotency_key": f"key-{operation_id}",
+                "status": status,
+                "request_json": request_json,
+            },
+        )
+
+
+def _prepare_0036_operation_database(engine, config) -> None:  # noqa: ANN001
+    """从最小 0035 表结构执行 0036，避开与本批无关的历史 SQLite DDL 限制。"""
+
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)"))
+        connection.execute(text("INSERT INTO alembic_version VALUES ('20260802_0035')"))
+        _create_legacy_sop_instances_table(connection)
+        connection.execute(
+            text(
+                "CREATE TABLE sop_node_executions ("
+                "id VARCHAR(512) PRIMARY KEY, tenant_id VARCHAR(128) NOT NULL, "
+                "instance_id VARCHAR(128) NOT NULL, node_id VARCHAR(128) NOT NULL, "
+                "attempt INTEGER NOT NULL, status VARCHAR(64) NOT NULL, input_json JSON NOT NULL, "
+                "output_json JSON NOT NULL, error_json JSON NOT NULL, revision INTEGER NOT NULL, "
+                "started_at DATETIME, completed_at DATETIME, created_at DATETIME NOT NULL, "
+                "updated_at DATETIME NOT NULL, CONSTRAINT uq_sop_node_execution_attempt UNIQUE "
+                "(tenant_id, instance_id, node_id, attempt))"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE TABLE sop_operations ("
+                "id VARCHAR(512) PRIMARY KEY, tenant_id VARCHAR(128) NOT NULL, "
+                "instance_id VARCHAR(128) NOT NULL, node_execution_id VARCHAR(128) NOT NULL, "
+                "operation_name VARCHAR(191) NOT NULL, idempotency_key VARCHAR(64) NOT NULL, "
+                "status VARCHAR(64) NOT NULL, request_json JSON NOT NULL, "
+                "result_json JSON NOT NULL, error_json JSON NOT NULL, "
+                "external_reference VARCHAR(128), revision INTEGER NOT NULL, started_at DATETIME, "
+                "completed_at DATETIME, created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL, "
+                "CONSTRAINT uq_sop_operation_tenant_idempotency UNIQUE "
+                "(tenant_id, idempotency_key))"
+            )
+        )
+    command.upgrade(config, "20260803_0036")
+
+
+def test_operation_reliability_migration_backfills_ledgers_and_is_reversible(tmp_path) -> None:
+    """验证 0037 保守分类旧效果、生成单 attempt/事实账本，并能无损回退纯历史数据。"""
+
+    database_url = f"sqlite:///{tmp_path / 'operation-reliability.db'}"
+    config = Config(str(BACKEND_DIR / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
+    config.attributes["database_url"] = database_url
+    engine = create_engine(database_url)
+    _prepare_0036_operation_database(engine, config)
+    with engine.begin() as connection:
+        _seed_0036_operation_history(connection)
+
+    command.upgrade(config, "20260803_0037")
+    with engine.connect() as connection:
+        inspector = inspect(connection)
+        operation_columns = {
+            column["name"] for column in inspector.get_columns("sop_operations")
+        }
+        assert {
+            "logical_action_id",
+            "request_fingerprint",
+            "remote_idempotency_key",
+            "idempotency_required",
+            "effect_kind",
+            "effect_state",
+            "reconciled_at",
+        }.issubset(operation_columns)
+        rows = connection.execute(
+            text(
+                "SELECT id, logical_action_id, request_fingerprint, remote_idempotency_key, "
+                "effect_kind, effect_state FROM sop_operations ORDER BY id"
+            )
+        ).mappings().all()
+        by_id = {row["id"]: row for row in rows}
+        assert by_id["op_read"]["effect_kind"] == "read"
+        assert by_id["op_read"]["effect_state"] == "none"
+        assert by_id["op_write"]["effect_state"] == "complete"
+        assert by_id["op_running"]["effect_state"] == "unknown"
+        assert all(str(row["logical_action_id"]).startswith("legacy:") for row in rows)
+        assert all(len(str(row["request_fingerprint"])) == 64 for row in rows)
+        assert all(row["remote_idempotency_key"] is None for row in rows)
+        assert connection.execute(
+            text("SELECT COUNT(*) FROM sop_operation_attempts")
+        ).scalar_one() == 3
+        assert connection.execute(
+            text("SELECT COUNT(*) FROM sop_operation_effects")
+        ).scalar_one() == 2
+        assert connection.execute(
+            text("SELECT effect_state FROM sop_instances WHERE id='inst_reliable'")
+        ).scalar_one() == "unknown"
+
+    command.downgrade(config, "20260803_0036")
+    with engine.connect() as connection:
+        inspector = inspect(connection)
+        assert not inspector.has_table("sop_operation_attempts")
+        assert not inspector.has_table("sop_operation_effects")
+        assert "logical_action_id" not in {
+            column["name"] for column in inspector.get_columns("sop_operations")
+        }
+        assert connection.execute(text("SELECT COUNT(*) FROM sop_operations")).scalar_one() == 3
+
+
+def test_operation_reliability_migration_rejects_invalid_json_and_managed_downgrade(
+    tmp_path,
+) -> None:
+    """验证严格 JSON 预检中止脏迁移，且真实新逻辑动作会阻止破坏性降级。"""
+
+    invalid_url = f"sqlite:///{tmp_path / 'operation-invalid-json.db'}"
+    invalid_config = Config(str(BACKEND_DIR / "alembic.ini"))
+    invalid_config.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
+    invalid_config.attributes["database_url"] = invalid_url
+    invalid_engine = create_engine(invalid_url)
+    _prepare_0036_operation_database(invalid_engine, invalid_config)
+    with invalid_engine.begin() as connection:
+        _seed_0036_operation_history(connection, invalid_request=True)
+    with pytest.raises(RuntimeError, match="unmappable legacy operations"):
+        command.upgrade(invalid_config, "20260803_0037")
+
+    managed_url = f"sqlite:///{tmp_path / 'operation-managed-downgrade.db'}"
+    managed_config = Config(str(BACKEND_DIR / "alembic.ini"))
+    managed_config.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
+    managed_config.attributes["database_url"] = managed_url
+    managed_engine = create_engine(managed_url)
+    _prepare_0036_operation_database(managed_engine, managed_config)
+    with managed_engine.begin() as connection:
+        _seed_0036_operation_history(connection)
+    command.upgrade(managed_config, "20260803_0037")
+    with managed_engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE sop_operations SET logical_action_id='managed-action' "
+                "WHERE id='op_write'"
+            )
+        )
+    with pytest.raises(RuntimeError, match="would discard managed history"):
+        command.downgrade(managed_config, "20260803_0036")
+
+
+def test_operation_reliability_migration_resumes_after_partial_expand(tmp_path) -> None:
+    """验证模拟 MySQL 非事务 DDL 中断后的部分 0037 列可继续回填并建立完整账本。"""
+
+    database_url = f"sqlite:///{tmp_path / 'operation-partial-expand.db'}"
+    config = Config(str(BACKEND_DIR / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
+    config.attributes["database_url"] = database_url
+    engine = create_engine(database_url)
+    _prepare_0036_operation_database(engine, config)
+    with engine.begin() as connection:
+        connection.execute(
+            text("ALTER TABLE sop_instances ADD COLUMN effect_state VARCHAR(64)")
+        )
+        connection.execute(
+            text("ALTER TABLE sop_operations ADD COLUMN logical_action_id VARCHAR(128)")
+        )
+        connection.execute(
+            text("ALTER TABLE sop_operations ADD COLUMN request_fingerprint VARCHAR(64)")
+        )
+        _seed_0036_operation_history(connection)
+
+    command.upgrade(config, "20260803_0037")
+    command.upgrade(config, "20260803_0037")
+    with engine.connect() as connection:
+        inspector = inspect(connection)
+        columns = {column["name"] for column in inspector.get_columns("sop_operations")}
+        assert {"idempotency_required", "effect_kind", "effect_state"}.issubset(columns)
+        assert connection.execute(
+            text("SELECT COUNT(*) FROM sop_operation_attempts")
+        ).scalar_one() == 3
+        assert connection.execute(
+            text("SELECT effect_state FROM sop_instances WHERE id='inst_reliable'")
+        ).scalar_one() == "unknown"

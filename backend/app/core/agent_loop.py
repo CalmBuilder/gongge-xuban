@@ -4005,6 +4005,7 @@ class AgentLoop:
                 if runtime_plan.action in {
                     RuntimeAction.WAIT_INPUT,
                     RuntimeAction.WAIT_WORK_ITEM,
+                    RuntimeAction.WAIT_OPERATION,
                     RuntimeAction.FAIL,
                 }:
                     payload = self._tool_loop_decision_payload(
@@ -5576,6 +5577,8 @@ class AgentLoop:
         conversation_context: dict[str, object] | None = None,
         memory_context: list[dict[str, object]] | None = None,
     ) -> ToolResult:
+        """记录工具调用边界并执行适配器；确定性外部写额外传递账本生成的远端幂等键。"""
+
         if (
             not tool_call.name.startswith(GENERAL_SKILL_TOOL_PREFIX)
             and chat_session.agent_id
@@ -5692,12 +5695,27 @@ class AgentLoop:
                 memory_context=memory_context,
             )
         else:
+            deterministic_runtime = getattr(self, "deterministic_runtime", None)
+            remote_idempotency_key = (
+                deterministic_runtime.remote_idempotency_key_for(
+                    chat_session,
+                    tool_call.name,
+                )
+                if deterministic_runtime is not None
+                else None
+            )
+            execution_options = (
+                {"remote_idempotency_key": remote_idempotency_key}
+                if remote_idempotency_key
+                else {}
+            )
             tool_result = self.tool_executor.execute(
                 request.tenant_id,
                 tool_call,
                 chat_session.active_skill_id,
                 chat_session.agent_id,
                 request.user_id,
+                **execution_options,
             )
         finished_payload = tool_result.model_dump(mode="json")
         if tool_call_id:

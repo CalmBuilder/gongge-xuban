@@ -3,7 +3,7 @@
 @Author     : zhanglp8181
 @File       : tool_executor.py
 @CallChain  : Agent Loop/Tool API → ToolExecutor → 授权边界 → HTTP/MCP
-@Description: 在外部工具调用前执行可见性、SOP 和数字员工受控授权校验。
+@Description: 在外部调用前执行受控授权，并向 HTTP 写适配器传递 Runtime 冻结的远端幂等键。
 """
 
 from __future__ import annotations
@@ -50,8 +50,9 @@ class ToolExecutor:
         agent_id: str | None = None,
         actor_user_id: str | None = None,
         execution_org_unit_id: str | None = None,
+        remote_idempotency_key: str | None = None,
     ) -> ToolResult:
-        """按当前 SOP、真人、数字员工和可选组织上下文鉴权后执行工具。"""
+        """鉴权后执行工具，并仅向 HTTP 非 GET 写请求发送服务端远端幂等键。"""
 
         with self.db.no_autoflush:
             tool = self.db.exec(
@@ -122,6 +123,13 @@ class ToolExecutor:
             tool.url,
             self._resolve_headers(tool.headers_json or {}, tool.auth_json or {}),
         )
+        if remote_idempotency_key and tool.method.upper() != "GET":
+            headers = {
+                key: value
+                for key, value in headers.items()
+                if key.lower() != "idempotency-key"
+            }
+            headers["Idempotency-Key"] = remote_idempotency_key
         try:
             with httpx.Client(timeout=self.settings.tool_timeout_seconds) as client:
                 if tool.method.upper() == "GET":

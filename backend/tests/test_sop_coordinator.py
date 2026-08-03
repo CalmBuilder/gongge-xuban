@@ -3,9 +3,12 @@
 @Author     : zhanglp8181
 @File       : test_sop_coordinator.py
 @CallChain  : pytest → DeterministicSopCoordinator → Scheduler/ExecutionStore
-@Description: 验证统一 Runtime 可跨轮等待，并连续执行工具、知识任务和确定性终态。
+@Description: 验证 Runtime 跨轮等待、可靠工具/知识回执、崩溃恢复和确定性终态。
 """
 
+from datetime import datetime
+
+import pytest
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
@@ -374,7 +377,11 @@ def test_coordinator_persists_knowledge_receipt_and_routes_without_model_control
         assert querying.knowledge_query is not None
         assert querying.next_step_id is None
         assert querying.is_step_completed is False
-        assert repeated.knowledge_query == querying.knowledge_query
+        assert repeated.knowledge_query is None
+        assert repeated.is_runtime_control_reply() is True
+        assert repeated.runtime_reply_metadata()["runtime_error_code"] == (
+            "OPERATION_RECONCILIATION_REQUIRED"
+        )
         assert len(operations_before_result) == 1
 
         plan = coordinator.record_knowledge_result(
@@ -425,6 +432,122 @@ def test_coordinator_persists_knowledge_receipt_and_routes_without_model_control
     ]
     assert "evidence_pack" not in operation.result_json
     assert "content" not in str(operation.result_json)
+
+
+@pytest.mark.parametrize(
+    ("error_code", "error_message"),
+    (
+        ("TIMEOUT", "远端响应超时"),
+        ("EXECUTION_ERROR", "连接在发送后断开"),
+        ("HTTP_ERROR", "工具返回异常状态码：502"),
+    ),
+)
+def test_ambiguous_external_write_failure_waits_without_redispatch(
+    error_code: str,
+    error_message: str,
+) -> None:
+    """验证外部写传输结果不确定时保持节点活动并标记 unknown，下一轮不会重发。"""
+
+    with _test_session() as db:
+        skill, chat_session = _seed(db)
+        coordinator = DeterministicSopCoordinator(db)
+        coordinator.prepare_step(chat_session, skill, StepAgentResult(reply="请提供员工号"))
+        chat_session.slots_json = {"employee_id": "E001"}
+        calling = coordinator.prepare_step(
+            chat_session,
+            skill,
+            StepAgentResult(slot_updates={"employee_id": "E001"}),
+        )
+        assert calling.tool_call is not None
+
+        plan = coordinator.record_tool_result(
+            chat_session,
+            calling.tool_call,
+            ToolResult(
+                tool_name=calling.tool_call.name,
+                success=False,
+                error={"code": error_code, "message": error_message},
+            ),
+        )
+        replay = coordinator.prepare_step(chat_session, skill, StepAgentResult())
+        operation = db.exec(select(SopOperation)).one()
+        execution = db.exec(
+            select(SopNodeExecution).where(SopNodeExecution.node_id == "query_quota")
+        ).one()
+        instance = db.exec(select(SopInstance)).one()
+
+    assert plan is not None and plan.action is RuntimeAction.WAIT_OPERATION
+    assert operation.status == "unknown"
+    assert operation.effect_state == "unknown"
+    assert execution.status == "running"
+    assert instance.status == "running"
+    assert instance.effect_state == "unknown"
+    assert replay.tool_call is None
+    assert replay.is_runtime_control_reply() is True
+
+
+def test_terminal_operation_receipt_is_restored_after_crash_without_adapter_call() -> None:
+    """验证 Operation 已终态而上下文未落盘时从账本恢复回执并完成流程，不重复 dispatch。"""
+
+    with _test_session() as db:
+        skill, chat_session = _seed(db)
+        coordinator = DeterministicSopCoordinator(db)
+        coordinator.prepare_step(chat_session, skill, StepAgentResult(reply="请提供员工号"))
+        chat_session.slots_json = {"employee_id": "E001"}
+        calling = coordinator.prepare_step(
+            chat_session,
+            skill,
+            StepAgentResult(slot_updates={"employee_id": "E001"}),
+        )
+        assert calling.tool_call is not None
+        instance = db.exec(select(SopInstance)).one()
+        operation = db.exec(select(SopOperation)).one()
+        with coordinator.store.owned(instance, worker_id="crash-recovery-test"):
+            coordinator.store.finish_operation(
+                operation,
+                succeeded=True,
+                result={"remaining": 20000},
+            )
+        db.commit()
+
+        recovered = coordinator.prepare_step(chat_session, skill, StepAgentResult())
+        db.commit()
+        db.refresh(instance)
+        db.refresh(operation)
+        operation_status = operation.status
+        instance_status = instance.status
+
+    assert recovered.tool_call is None
+    assert recovered.is_step_completed is True
+    assert operation_status == "succeeded"
+    assert instance_status == "succeeded"
+
+
+def test_stale_running_operation_is_recovered_as_unknown_on_next_turn() -> None:
+    """验证进程丢失工具回执后，下一轮把超时 running 收敛为 unknown 而非永久等待或重发。"""
+
+    with _test_session() as db:
+        skill, chat_session = _seed(db)
+        coordinator = DeterministicSopCoordinator(db)
+        coordinator.prepare_step(chat_session, skill, StepAgentResult(reply="请提供员工号"))
+        chat_session.slots_json = {"employee_id": "E001"}
+        calling = coordinator.prepare_step(
+            chat_session,
+            skill,
+            StepAgentResult(slot_updates={"employee_id": "E001"}),
+        )
+        assert calling.tool_call is not None
+        operation = db.exec(select(SopOperation)).one()
+        operation.started_at = datetime(2000, 1, 1)
+        db.add(operation)
+        db.flush()
+
+        recovered = coordinator.prepare_step(chat_session, skill, StepAgentResult())
+
+    assert recovered.tool_call is None
+    assert recovered.is_runtime_control_reply() is True
+    assert operation.status == "unknown"
+    assert operation.effect_state == "unknown"
 
 
 def test_agent_loop_executes_deterministic_knowledge_without_model_continuation(
