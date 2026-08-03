@@ -35,6 +35,7 @@ from app.db.seed import (
 from app.db.sqlite_legacy import initialize_sqlite_database, migrate_sqlite_skill_schema
 from app.db.sqlite_legacy import (
     _migrate_dynamic_capability_fields,
+    _migrate_execution_plan_fields,
     _migrate_execution_reliability_fields,
 )
 
@@ -2240,6 +2241,16 @@ def test_desktop_sqlite_legacy_path_backfills_execution_and_capability_contracts
                 "completed_at DATETIME, created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL)"
             )
         )
+        connection.execute(
+            text(
+                "CREATE TABLE sop_node_executions ("
+                "id VARCHAR(512) PRIMARY KEY, tenant_id VARCHAR(128) NOT NULL, "
+                "instance_id VARCHAR(128) NOT NULL, node_id VARCHAR(128) NOT NULL, "
+                "attempt INTEGER NOT NULL, status VARCHAR(64) NOT NULL, input_json JSON NOT NULL, "
+                "output_json JSON NOT NULL, error_json JSON NOT NULL, revision INTEGER NOT NULL, "
+                "created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL)"
+            )
+        )
         connection.execute(text("CREATE TABLE tools (id VARCHAR(512) PRIMARY KEY)"))
         connection.execute(text("CREATE TABLE general_skills (id VARCHAR(512) PRIMARY KEY)"))
         connection.execute(text("CREATE TABLE model_configs (id VARCHAR(512) PRIMARY KEY)"))
@@ -2268,6 +2279,16 @@ def test_desktop_sqlite_legacy_path_backfills_execution_and_capability_contracts
                 "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
             )
         )
+        connection.execute(
+            text(
+                "INSERT INTO sop_node_executions ("
+                "id, tenant_id, instance_id, node_id, attempt, status, input_json, output_json, "
+                "error_json, revision, created_at, updated_at"
+                ") VALUES ("
+                "'node_legacy', 'tenant_a', 'inst_legacy', 'submit', 1, 'running', '{}', '{}', "
+                "'{}', 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+        )
         for table_name in ("tools", "general_skills", "model_configs"):
             connection.execute(text(f"INSERT INTO {table_name} (id) VALUES ('legacy')"))
     SQLModel.metadata.create_all(engine)
@@ -2275,8 +2296,10 @@ def test_desktop_sqlite_legacy_path_backfills_execution_and_capability_contracts
     with engine.begin() as connection:
         _migrate_execution_reliability_fields(connection, tables)
         _migrate_dynamic_capability_fields(connection, tables)
+        _migrate_execution_plan_fields(connection, tables)
         _migrate_execution_reliability_fields(connection, tables)
         _migrate_dynamic_capability_fields(connection, tables)
+        _migrate_execution_plan_fields(connection, tables)
 
     with engine.connect() as connection:
         instance = connection.execute(
@@ -2305,6 +2328,13 @@ def test_desktop_sqlite_legacy_path_backfills_execution_and_capability_contracts
         assert connection.execute(
             text("SELECT preflight_status FROM model_configs WHERE id='legacy'")
         ).scalar_one() == "unverified"
+        assert connection.execute(
+            text(
+                "SELECT step_key, step_kind, required FROM sop_node_executions "
+                "WHERE id='node_legacy'"
+            )
+        ).one() == ("submit", "sop_node", 1)
+        assert "execution_plan_revisions" in inspect(connection).get_table_names()
 
 
 def test_desktop_sqlite_legacy_path_rejects_invalid_operation_request(tmp_path) -> None:
@@ -2343,3 +2373,139 @@ def test_desktop_sqlite_legacy_path_rejects_invalid_operation_request(tmp_path) 
         match=r"sop_operations\[op_invalid\]\.request_json",
     ):
         _migrate_execution_reliability_fields(connection, tables)
+
+
+def _prepare_0038_execution_plan_database(engine, config) -> None:  # noqa: ANN001
+    """从 0036 最小 Runtime 表构造 0038 时点数据库，隔离无关历史 SQLite DDL。"""
+
+    _prepare_0036_operation_database(engine, config)
+    command.upgrade(config, "20260803_0037")
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE tools (id VARCHAR(512) PRIMARY KEY)"))
+        connection.execute(text("CREATE TABLE general_skills (id VARCHAR(512) PRIMARY KEY)"))
+        connection.execute(text("CREATE TABLE model_configs (id VARCHAR(512) PRIMARY KEY)"))
+    command.upgrade(config, "20260803_0038")
+
+
+def test_execution_plan_resource_migration_backfills_steps_and_round_trips_sqlite(
+    tmp_path,
+) -> None:
+    """验证 0039 为正式 SOP 回填稳定 step key、创建新账本并可在无新事实时回退。"""
+
+    database_url = f"sqlite:///{tmp_path / 'execution-plan-resources.db'}"
+    config = Config(str(BACKEND_DIR / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
+    config.attributes["database_url"] = database_url
+    engine = create_engine(database_url)
+    _prepare_0038_execution_plan_database(engine, config)
+    with engine.begin() as connection:
+        connection.execute(text("ALTER TABLE sop_instances ADD COLUMN agent_id VARCHAR(128)"))
+        connection.execute(
+            text("ALTER TABLE sop_node_executions ADD COLUMN step_key VARCHAR(128)")
+        )
+        connection.execute(
+            text(
+                "INSERT INTO sop_instances ("
+                "id, tenant_id, session_id, skill_id, skill_version_id, skill_version, "
+                "definition_checksum, run_number, kind, active_slot_key, source_kind, status, "
+                "current_node_id, slots_json, context_json, revision, cancellation_disposition, "
+                "fencing_token, effect_state, created_at, updated_at"
+                ") VALUES ("
+                "'instance_0039', 'tenant_a', 'session_a', 'skill_a', 'version_a', '1.0.0', "
+                ":checksum, 1, 'sop', 'foreground:session_a', 'chat', 'running', 'collect', "
+                "'{}', '{}', 0, 'none', 0, 'none', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            ),
+            {"checksum": "a" * 64},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO sop_node_executions ("
+                "id, tenant_id, instance_id, node_id, attempt, status, input_json, output_json, "
+                "error_json, revision, created_at, updated_at"
+                ") VALUES ("
+                "'node_0039', 'tenant_a', 'instance_0039', 'collect', 1, 'running', '{}', '{}', "
+                "'{}', 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+        )
+
+    command.upgrade(config, "20260803_0039")
+    command.upgrade(config, "20260803_0039")
+    with engine.connect() as connection:
+        inspector = inspect(connection)
+        assert set(
+            (
+                "execution_plan_revisions",
+                "action_proposal_records",
+                "managed_input_resources",
+                "input_resource_snapshots",
+            )
+        ).issubset(inspector.get_table_names())
+        assert connection.execute(
+            text(
+                "SELECT step_key, step_kind, required FROM sop_node_executions "
+                "WHERE id='node_0039'"
+            )
+        ).one() == ("collect", "sop_node", 1)
+
+    command.downgrade(config, "20260803_0038")
+    with engine.connect() as connection:
+        inspector = inspect(connection)
+        assert "execution_plan_revisions" not in inspector.get_table_names()
+        assert "step_key" not in {
+            column["name"] for column in inspector.get_columns("sop_node_executions")
+        }
+
+
+def test_execution_plan_resource_migration_rejects_legacy_dynamic_and_managed_downgrade(
+    tmp_path,
+) -> None:
+    """验证 0039 无法推断旧动态身份时中止，已有动态历史时也禁止降级丢失。"""
+
+    legacy_url = f"sqlite:///{tmp_path / 'legacy-dynamic-0039.db'}"
+    legacy_config = Config(str(BACKEND_DIR / "alembic.ini"))
+    legacy_config.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
+    legacy_config.attributes["database_url"] = legacy_url
+    legacy_engine = create_engine(legacy_url)
+    _prepare_0038_execution_plan_database(legacy_engine, legacy_config)
+    with legacy_engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO sop_instances ("
+                "id, tenant_id, session_id, run_number, kind, active_slot_key, source_kind, status, "
+                "slots_json, context_json, revision, cancellation_disposition, fencing_token, "
+                "effect_state, created_at, updated_at"
+                ") VALUES ("
+                "'legacy_dynamic', 'tenant_a', 'session_a', 1, 'dynamic_task', "
+                "'foreground:session_a', 'api', 'running', '{}', '{}', 0, 'none', 0, 'none', "
+                "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+        )
+    with pytest.raises(RuntimeError, match="cannot infer identity"):
+        command.upgrade(legacy_config, "20260803_0039")
+
+    managed_url = f"sqlite:///{tmp_path / 'managed-dynamic-0039.db'}"
+    managed_config = Config(str(BACKEND_DIR / "alembic.ini"))
+    managed_config.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
+    managed_config.attributes["database_url"] = managed_url
+    managed_engine = create_engine(managed_url)
+    _prepare_0038_execution_plan_database(managed_engine, managed_config)
+    command.upgrade(managed_config, "20260803_0039")
+    with managed_engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO sop_instances ("
+                "id, tenant_id, session_id, run_number, kind, active_slot_key, initiator_user_id, "
+                "source_kind, agent_id, goal_snapshot_json, current_plan_revision_id, "
+                "current_plan_checksum, capability_snapshot_json, budget_snapshot_json, "
+                "terminal_reason_json, status, slots_json, context_json, revision, "
+                "cancellation_disposition, fencing_token, effect_state, created_at, updated_at"
+                ") VALUES ("
+                "'managed_dynamic', 'tenant_a', 'session_a', 1, 'dynamic_task', "
+                "'foreground:session_a', 'user_a', 'chat', 'agent_a', '{\"goal\":\"demo\"}', "
+                "'plan_a', :checksum, '{}', '{}', '{}', 'running', '{}', '{}', 0, 'none', 0, "
+                "'none', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            ),
+            {"checksum": "a" * 64},
+        )
+    with pytest.raises(RuntimeError, match="managed history"):
+        command.downgrade(managed_config, "20260803_0038")

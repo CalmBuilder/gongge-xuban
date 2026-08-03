@@ -21,7 +21,12 @@ from sqlalchemy.orm.attributes import set_committed_value
 from sqlmodel import Session, select
 
 from app.db.models import (
+    ActionProposalRecord,
+    ExecutionPlanRevision,
     ExecutionMutationRejection,
+    InputResourceSnapshot,
+    ManagedInputResource,
+    Message,
     SopInstance,
     SopNodeExecution,
     SopOperation,
@@ -30,6 +35,16 @@ from app.db.models import (
     utc_now,
 )
 from app.dynamic_tasks.capability_catalog import capability_checksum
+from app.dynamic_tasks.planning import (
+    CompletedProviderProposal,
+    NormalizedPlan,
+    PlanReason,
+    canonical_checksum,
+)
+from app.session.managed_resources import (
+    InputResourceAccessDenied,
+    assert_input_resource_access,
+)
 from app.sop_runtime.contracts import (
     IdempotencyPolicy,
     IdempotencyScope,
@@ -290,22 +305,206 @@ class SopExecutionStore:
         self.db.flush()
         return instance, True
 
+    def start_dynamic_instance(
+        self,
+        *,
+        tenant_id: str,
+        session_id: str,
+        agent_id: str,
+        initiator_user_id: str,
+        plan: NormalizedPlan,
+        capability_snapshot: Mapping[str, object],
+        source_kind: str = "chat",
+        source_ref: str | None = None,
+    ) -> tuple[SopInstance, ExecutionPlanRevision]:
+        """原子创建动态 Execution 与首个活动计划，不伪造 SkillVersion 身份。"""
+
+        if not agent_id.strip() or not initiator_user_id.strip():
+            raise SopExecutionConflictError("动态 Execution 必须绑定 Agent 和发起人。")
+        capability_payload = dict(capability_snapshot)
+        if not capability_payload:
+            raise SopExecutionConflictError("动态 Execution 必须冻结非空能力快照。")
+        self._assert_plan_capabilities_available(plan, capability_payload)
+        plan_payload = plan.model_dump(mode="json")
+        plan_checksum = canonical_checksum(plan)
+        capability_digest = capability_checksum(capability_payload)
+        resolved_source_ref = source_ref or session_id
+        active = self._active_instance(tenant_id, session_id)
+        if active is not None:
+            if (
+                active.kind == "dynamic_task"
+                and active.agent_id == agent_id
+                and active.initiator_user_id == initiator_user_id
+                and active.current_plan_checksum == plan_checksum
+                and active.capability_checksum == capability_digest
+                and active.source_kind == source_kind
+                and active.source_ref == resolved_source_ref
+            ):
+                revision = self.db.get(ExecutionPlanRevision, active.current_plan_revision_id)
+                if (
+                    revision is not None
+                    and revision.execution_id == active.id
+                    and revision.status == "active"
+                ):
+                    return active, revision
+            raise SopExecutionConflictError("同一会话已存在语义不同的活动 Execution。")
+        instance = SopInstance(
+            tenant_id=tenant_id,
+            session_id=session_id,
+            run_number=self._next_execution_run_number(tenant_id, session_id),
+            kind="dynamic_task",
+            active_slot_key=f"foreground:{session_id}",
+            initiator_user_id=initiator_user_id,
+            source_kind=source_kind,
+            source_ref=resolved_source_ref,
+            agent_id=agent_id,
+            goal_snapshot_json={
+                "goal": plan.goal,
+                "success_criteria": [
+                    criterion.model_dump(mode="json") for criterion in plan.success_criteria
+                ],
+            },
+            current_node_id=plan.steps[0].step_key,
+            current_plan_checksum=plan_checksum,
+            capability_snapshot_json=capability_payload,
+            capability_checksum=capability_digest,
+            budget_snapshot_json=dict(plan.budget),
+        )
+        revision = ExecutionPlanRevision(
+            tenant_id=tenant_id,
+            execution_id=instance.id,
+            revision_number=1,
+            reason=PlanReason.INITIAL.value,
+            status="active",
+            plan_json=plan_payload,
+            checksum=plan_checksum,
+            capability_snapshot_json=capability_payload,
+            capability_checksum=capability_digest,
+            activated_at=utc_now(),
+        )
+        instance.current_plan_revision_id = revision.id
+        transition = transition_instance(
+            SopInstanceStatus.CREATED,
+            SopInstanceStatus.RUNNING,
+            actual_revision=instance.revision,
+        )
+        self._apply_instance_transition(instance, transition)
+        instance.started_at = utc_now()
+        self.db.add(instance)
+        self.db.add(revision)
+        self.db.flush()
+        return instance, revision
+
+    def append_plan_revision(
+        self,
+        instance: SopInstance,
+        *,
+        plan: NormalizedPlan,
+        reason: PlanReason,
+        capability_snapshot: Mapping[str, object],
+        created_by_proposal_id: str | None = None,
+    ) -> tuple[ExecutionPlanRevision, bool]:
+        """追加并激活动态计划；历史 step key 的语义及已完成步骤均不可改写。"""
+
+        self._assert_dynamic_instance(instance)
+        plan_payload = plan.model_dump(mode="json")
+        checksum = canonical_checksum(plan)
+        current = self.db.get(ExecutionPlanRevision, instance.current_plan_revision_id)
+        if current is None or current.execution_id != instance.id:
+            raise SopExecutionConflictError("动态 Execution 当前计划不存在或归属错误。")
+        if current.checksum == checksum:
+            return current, False
+        capability_payload = dict(capability_snapshot)
+        if not capability_payload:
+            raise SopExecutionConflictError("计划修订必须冻结非空能力快照。")
+        self._assert_plan_capabilities_available(plan, capability_payload)
+        causal_proposal = None
+        if created_by_proposal_id is not None:
+            causal_proposal = self.db.get(ActionProposalRecord, created_by_proposal_id)
+            if (
+                causal_proposal is None
+                or causal_proposal.tenant_id != instance.tenant_id
+                or causal_proposal.execution_id != instance.id
+                or causal_proposal.status != "validated"
+                or causal_proposal.normalized_proposal_json.get("action_kind") != "replan"
+            ):
+                raise SopExecutionConflictError("计划修订的因果提案不存在或不属于当前 Execution。")
+        self._guard_mutation(instance, "plan.append")
+        self._assert_plan_preserves_step_identity(instance, plan_payload)
+        next_number = int(
+            self.db.exec(
+                select(func.max(ExecutionPlanRevision.revision_number)).where(
+                    ExecutionPlanRevision.tenant_id == instance.tenant_id,
+                    ExecutionPlanRevision.execution_id == instance.id,
+                )
+            ).one()
+            or 0
+        ) + 1
+        revision = ExecutionPlanRevision(
+            tenant_id=instance.tenant_id,
+            execution_id=instance.id,
+            revision_number=next_number,
+            parent_revision_id=current.id,
+            reason=reason.value,
+            status="active",
+            plan_json=plan_payload,
+            checksum=checksum,
+            capability_snapshot_json=capability_payload,
+            capability_checksum=capability_checksum(capability_payload),
+            created_by_proposal_id=created_by_proposal_id,
+            activated_at=utc_now(),
+        )
+        current.status = "superseded"
+        current.superseded_at = utc_now()
+        instance.current_plan_revision_id = revision.id
+        instance.current_plan_checksum = revision.checksum
+        instance.capability_snapshot_json = capability_payload
+        instance.capability_checksum = revision.capability_checksum
+        instance.budget_snapshot_json = dict(plan.budget)
+        if causal_proposal is not None:
+            causal_proposal.status = "consumed"
+            causal_proposal.consumed_plan_revision_id = revision.id
+            causal_proposal.consumed_at = utc_now()
+            self.db.add(causal_proposal)
+        self.db.add(current)
+        self.db.add(revision)
+        self.db.add(instance)
+        self.db.flush()
+        return revision, True
+
     def enter_node(
         self,
         instance: SopInstance,
         node_id: str,
         *,
         input_snapshot: Mapping[str, object] | None = None,
+        step_key: str | None = None,
+        plan_revision_id: str | None = None,
+        step_kind: str = "sop_node",
+        title: str | None = None,
+        required: bool = True,
     ) -> SopNodeExecution:
-        """为节点创建新的 attempt 并从 scheduled 确定性推进到 running。"""
+        """为统一步骤创建新 attempt；SOP 默认以 node id 作为稳定 step key。"""
 
         self._assert_instance_tenant(instance)
         self._guard_mutation(instance, "node.enter")
-        attempt = self._next_node_attempt(instance.tenant_id, instance.id, node_id)
+        stable_step_key = step_key or node_id
+        if instance.kind == "dynamic_task":
+            if plan_revision_id != instance.current_plan_revision_id:
+                raise SopExecutionConflictError("动态步骤必须绑定当前活动 PlanRevision。")
+            self._assert_step_declared(instance, stable_step_key)
+        elif plan_revision_id is not None:
+            raise SopExecutionConflictError("正式 SOP 节点不得绑定动态 PlanRevision。")
+        attempt = self._next_node_attempt(instance.tenant_id, instance.id, stable_step_key)
         execution = SopNodeExecution(
             tenant_id=instance.tenant_id,
             instance_id=instance.id,
             node_id=node_id,
+            step_key=stable_step_key,
+            plan_revision_id=plan_revision_id,
+            step_kind=step_kind,
+            title=title,
+            required=required,
             attempt=attempt,
             input_json=dict(input_snapshot or {}),
         )
@@ -323,6 +522,211 @@ class SopExecutionStore:
         self.db.add(instance)
         self.db.flush()
         return execution
+
+    def record_action_proposal(
+        self,
+        instance: SopInstance,
+        execution: SopNodeExecution,
+        *,
+        provider: str,
+        model: str,
+        model_capability_snapshot: Mapping[str, object],
+        completed_response: CompletedProviderProposal,
+        causation_id: str | None = None,
+    ) -> tuple[ActionProposalRecord, bool]:
+        """仅将完整 provider 响应中的已解析规范提案写入不可变决策账本。"""
+
+        self._assert_dynamic_instance(instance)
+        self._assert_execution_owner(instance, execution)
+        if execution.plan_revision_id != instance.current_plan_revision_id:
+            raise SopExecutionConflictError("只能为当前活动计划的步骤记录动作提案。")
+        self._assert_proposal_declared_by_step(instance, execution, completed_response)
+        if not provider.strip() or len(provider) > 64 or not model.strip() or len(model) > 191:
+            raise SopExecutionConflictError("动作提案的 provider/model 身份无效。")
+        capability_payload = dict(model_capability_snapshot)
+        if not capability_payload:
+            raise SopExecutionConflictError("动作提案必须冻结模型能力快照。")
+        normalized = completed_response.proposal.model_dump(mode="json")
+        identity = {
+            "execution_id": instance.id,
+            "plan_revision_id": execution.plan_revision_id,
+            "step_key": execution.step_key,
+            "step_attempt": execution.attempt,
+            "provider": provider,
+            "model": model,
+            "model_capability_snapshot": capability_payload,
+            "response_id": completed_response.response_id,
+            "finish_reason": completed_response.finish_reason,
+            "proposal": normalized,
+        }
+        checksum = canonical_checksum(identity)
+        response_identity = capability_checksum(
+            {"provider": provider, "response_id": completed_response.response_id}
+        )
+        existing = self.db.exec(
+            select(ActionProposalRecord).where(
+                ActionProposalRecord.tenant_id == instance.tenant_id,
+                ActionProposalRecord.execution_id == instance.id,
+                ActionProposalRecord.proposal_checksum == checksum,
+            )
+        ).first()
+        if existing is not None:
+            return existing, False
+        response_record = self.db.exec(
+            select(ActionProposalRecord).where(
+                ActionProposalRecord.tenant_id == instance.tenant_id,
+                ActionProposalRecord.execution_id == instance.id,
+                ActionProposalRecord.provider_response_identity == response_identity,
+            )
+        ).first()
+        if response_record is not None:
+            raise SopExecutionConflictError("同一 provider response 不得映射为不同动作提案。")
+        self._guard_mutation(instance, "proposal.record")
+        proposal = ActionProposalRecord(
+            tenant_id=instance.tenant_id,
+            execution_id=instance.id,
+            plan_revision_id=execution.plan_revision_id or "",
+            step_key=execution.step_key,
+            step_attempt=execution.attempt,
+            provider=provider,
+            model=model,
+            provider_response_id=completed_response.response_id,
+            provider_response_identity=response_identity,
+            finish_reason=completed_response.finish_reason,
+            model_capability_snapshot_json=capability_payload,
+            normalized_proposal_json=normalized,
+            validation_json={
+                "provider_response_complete": True,
+                "schema_validated": True,
+                "current_plan_step_validated": True,
+                "capability_scope_validated": True,
+            },
+            proposal_checksum=checksum,
+            usage_json=dict(completed_response.usage),
+            causation_id=causation_id,
+        )
+        self.db.add(proposal)
+        self.db.flush()
+        return proposal, True
+
+    def consume_action_proposal(
+        self,
+        instance: SopInstance,
+        proposal: ActionProposalRecord,
+        *,
+        operation_id: str,
+    ) -> bool:
+        """幂等消费 validated proposal；已消费记录不得改绑另一 Operation。"""
+
+        self._assert_dynamic_instance(instance)
+        if proposal.execution_id != instance.id or proposal.tenant_id != instance.tenant_id:
+            raise SopExecutionConflictError("动作提案与 Execution 归属不一致。")
+        step_execution = self.db.exec(
+            select(SopNodeExecution).where(
+                SopNodeExecution.tenant_id == instance.tenant_id,
+                SopNodeExecution.instance_id == instance.id,
+                SopNodeExecution.plan_revision_id == proposal.plan_revision_id,
+                SopNodeExecution.step_key == proposal.step_key,
+                SopNodeExecution.attempt == proposal.step_attempt,
+            )
+        ).first()
+        operation = self.db.get(SopOperation, operation_id)
+        if (
+            step_execution is None
+            or operation is None
+            or operation.tenant_id != instance.tenant_id
+            or operation.instance_id != instance.id
+            or operation.node_execution_id != step_execution.id
+        ):
+            raise SopExecutionConflictError("动作提案只能绑定同一 Execution 的已准备 Operation。")
+        if proposal.status == "consumed":
+            if proposal.consumed_operation_id != operation_id:
+                raise SopExecutionConflictError("已消费提案不得改绑另一 Operation。")
+            return False
+        if proposal.status != "validated":
+            raise SopExecutionConflictError("只有 validated 动作提案可以消费。")
+        self._guard_mutation(instance, "proposal.consume")
+        proposal.status = "consumed"
+        proposal.consumed_operation_id = operation_id
+        proposal.consumed_at = utc_now()
+        self.db.add(proposal)
+        self.db.flush()
+        return True
+
+    def snapshot_input_resource(
+        self,
+        instance: SopInstance,
+        resource: ManagedInputResource,
+        *,
+        source_message_id: str | None = None,
+    ) -> tuple[InputResourceSnapshot, bool]:
+        """在当前所有权下追加冻结 ready 输入身份；ACL 证据由服务端事实机械生成。"""
+
+        self._assert_dynamic_instance(instance)
+        try:
+            assert_input_resource_access(self.db, resource, instance=instance)
+        except InputResourceAccessDenied as exc:
+            raise SopExecutionConflictError("输入资源不可用。") from exc
+        if resource.ingestion_status != "ready" or resource.revoked_at is not None:
+            raise SopExecutionConflictError("只有当前 ready 输入可以形成 Execution snapshot。")
+        message_id = source_message_id or resource.source_message_id
+        if resource.source_type == "chat_upload":
+            message = self.db.get(Message, message_id) if message_id else None
+            if (
+                message is None
+                or message.tenant_id != instance.tenant_id
+                or message.session_id != instance.session_id
+                or message.role != "user"
+                or not self._message_references_resource(message, resource)
+            ):
+                raise SopExecutionConflictError("聊天输入必须绑定同会话的权威用户消息引用。")
+        existing = self.db.exec(
+            select(InputResourceSnapshot).where(
+                InputResourceSnapshot.tenant_id == instance.tenant_id,
+                InputResourceSnapshot.execution_id == instance.id,
+                InputResourceSnapshot.source_resource_id == resource.id,
+                InputResourceSnapshot.source_version == resource.version,
+                InputResourceSnapshot.content_checksum == resource.content_checksum,
+            )
+        ).first()
+        if existing is not None:
+            return existing, False
+        self._guard_mutation(instance, "input.snapshot")
+        identity_checksum = capability_checksum(
+            {
+                "source_type": resource.source_type,
+                "source_resource_id": resource.id,
+                "source_version": resource.version,
+                "content_checksum": resource.content_checksum,
+            }
+        )
+        snapshot = InputResourceSnapshot(
+            tenant_id=instance.tenant_id,
+            execution_id=instance.id,
+            source_type=resource.source_type,
+            source_resource_id=resource.id,
+            source_version=resource.version,
+            source_message_id=message_id,
+            filename=resource.filename,
+            mime_type=resource.mime_type,
+            size_bytes=resource.size_bytes,
+            content_checksum=resource.content_checksum,
+            extraction_checksum=resource.extraction_checksum,
+            ingestion_status=resource.ingestion_status,
+            identity_checksum=identity_checksum,
+            storage_locator_digest=hashlib.sha256(
+                resource.storage_locator.encode("utf-8")
+            ).hexdigest(),
+            captured_acl_json={
+                "owner_user_id": resource.owner_user_id,
+                "agent_id": resource.agent_id,
+                "acl_revision": resource.acl_revision,
+                "captured_for_initiator": instance.initiator_user_id,
+            },
+        )
+        self.db.add(snapshot)
+        self.db.flush()
+        return snapshot, True
 
     def wait_for_input(
         self,
@@ -577,6 +981,59 @@ class SopExecutionStore:
         self.db.flush()
         self._ensure_operation_attempt(operation, execution)
         return operation, True
+
+    def prepare_operation_from_proposal(
+        self,
+        instance: SopInstance,
+        execution: SopNodeExecution,
+        proposal: ActionProposalRecord,
+        *,
+        operation_name: str,
+        request: Mapping[str, object],
+        idempotency_policy: IdempotencyPolicy | None = None,
+        effect_kind: str = "read",
+        capability_snapshot: Mapping[str, object] | None = None,
+        capability_snapshot_checksum: str | None = None,
+    ) -> tuple[SopOperation, bool]:
+        """在同一事务把 validated proposal 冻结为稳定 Operation 并标记已消费。"""
+
+        if (
+            proposal.tenant_id != instance.tenant_id
+            or proposal.execution_id != instance.id
+            or proposal.plan_revision_id != execution.plan_revision_id
+            or proposal.step_key != execution.step_key
+            or proposal.step_attempt != execution.attempt
+        ):
+            raise SopExecutionConflictError("动作提案与当前 Execution/Step 归属不一致。")
+        if proposal.status == "consumed":
+            operation = self.db.get(SopOperation, proposal.consumed_operation_id)
+            if operation is None or operation.node_execution_id != execution.id:
+                raise SopExecutionConflictError("已消费提案的 Operation 归属已损坏。")
+        elif proposal.status != "validated":
+            raise SopExecutionConflictError("只有 validated 动作提案可以准备 Operation。")
+        normalized = proposal.normalized_proposal_json
+        if normalized.get("action_kind") not in {"call_tool", "query_knowledge"}:
+            raise SopExecutionConflictError("只有能力调用提案可以准备 Operation。")
+        if normalized.get("capability_ref") != operation_name:
+            raise SopExecutionConflictError("Operation 能力与已验证提案不一致。")
+        arguments = normalized.get("arguments")
+        if not isinstance(arguments, dict) or self.request_fingerprint(arguments) != self.request_fingerprint(
+            request
+        ):
+            raise SopExecutionConflictError("Operation 参数与已验证提案不一致。")
+        operation, created = self.prepare_operation(
+            instance,
+            execution,
+            operation_name=operation_name,
+            request=request,
+            logical_action_id=f"proposal:{proposal.id}",
+            idempotency_policy=idempotency_policy,
+            effect_kind=effect_kind,
+            capability_snapshot=capability_snapshot,
+            capability_snapshot_checksum=capability_snapshot_checksum,
+        )
+        self.consume_action_proposal(instance, proposal, operation_id=operation.id)
+        return operation, created
 
     def start_operation(self, operation: SopOperation) -> None:
         """在真正调用外部工具前把 prepared 操作推进为 running。"""
@@ -1243,17 +1700,175 @@ class SopExecutionStore:
         ).one()
         return int(latest or 0) + 1
 
-    def _next_node_attempt(self, tenant_id: str, instance_id: str, node_id: str) -> int:
-        """计算节点重试的新 attempt 序号，历史执行记录不会被覆盖。"""
+    def _next_execution_run_number(self, tenant_id: str, session_id: str) -> int:
+        """计算统一会话中下一 Execution 序号，动态任务不依赖虚假的 SkillVersion。"""
+
+        latest = self.db.exec(
+            select(func.max(SopInstance.run_number)).where(
+                SopInstance.tenant_id == tenant_id,
+                SopInstance.session_id == session_id,
+            )
+        ).one()
+        return int(latest or 0) + 1
+
+    def _next_node_attempt(self, tenant_id: str, instance_id: str, step_key: str) -> int:
+        """按 execution 内稳定 step key 计算新 attempt，历史执行记录不会被覆盖。"""
 
         latest = self.db.exec(
             select(func.max(SopNodeExecution.attempt)).where(
                 SopNodeExecution.tenant_id == tenant_id,
                 SopNodeExecution.instance_id == instance_id,
-                SopNodeExecution.node_id == node_id,
+                SopNodeExecution.step_key == step_key,
             )
         ).one()
         return int(latest or 0) + 1
+
+    def _assert_dynamic_instance(self, instance: SopInstance) -> None:
+        """拒绝把动态计划或提案写入正式 SOP 或其他租户的 Execution。"""
+
+        self._assert_instance_tenant(instance)
+        if instance.kind != "dynamic_task" or not instance.current_plan_revision_id:
+            raise SopExecutionConflictError("该写入仅适用于已绑定活动计划的动态 Execution。")
+
+    def _assert_step_declared(self, instance: SopInstance, step_key: str) -> None:
+        """确认动态步骤由当前活动计划声明，而不是模型临时伪造数据库身份。"""
+
+        revision = self.db.get(ExecutionPlanRevision, instance.current_plan_revision_id)
+        if revision is None or revision.execution_id != instance.id:
+            raise SopExecutionConflictError("动态 Execution 当前计划不存在或归属错误。")
+        steps = revision.plan_json.get("steps") if isinstance(revision.plan_json, dict) else None
+        if not isinstance(steps, list) or not any(
+            isinstance(step, dict) and step.get("step_key") == step_key for step in steps
+        ):
+            raise SopExecutionConflictError("动态步骤未由当前活动计划声明。")
+
+    def _assert_proposal_declared_by_step(
+        self,
+        instance: SopInstance,
+        execution: SopNodeExecution,
+        response: CompletedProviderProposal,
+    ) -> None:
+        """确认模型提案使用的能力已由当前计划步骤冻结，不能临时扩大目录。"""
+
+        revision = self.db.get(ExecutionPlanRevision, instance.current_plan_revision_id)
+        steps = revision.plan_json.get("steps") if revision and isinstance(revision.plan_json, dict) else []
+        step = next(
+            (
+                item
+                for item in steps
+                if isinstance(item, dict) and item.get("step_key") == execution.step_key
+            ),
+            None,
+        )
+        if step is None:
+            raise SopExecutionConflictError("动作提案步骤未由当前计划声明。")
+        capability_ref = response.proposal.capability_ref
+        declared = step.get("capability_refs")
+        if capability_ref is not None and (
+            not isinstance(declared, list) or capability_ref not in declared
+        ):
+            raise SopExecutionConflictError("动作提案能力未由当前计划步骤冻结。")
+
+    @staticmethod
+    def _assert_plan_capabilities_available(
+        plan: NormalizedPlan,
+        capability_snapshot: Mapping[str, object],
+    ) -> None:
+        """拒绝计划引用不在冻结目录中的 Tool/GeneralSkill/Knowledge 能力。"""
+
+        available: set[str] = set()
+        for value in capability_snapshot.values():
+            items = value if isinstance(value, list) else [value]
+            for item in items:
+                if not isinstance(item, Mapping):
+                    continue
+                for key in ("name", "slug", "id", "capability_id"):
+                    identity = item.get(key)
+                    if isinstance(identity, str) and identity.strip():
+                        available.add(identity)
+        missing = sorted(
+            {
+                capability_ref
+                for step in plan.steps
+                for capability_ref in step.capability_refs
+                if capability_ref not in available
+            }
+        )
+        if missing:
+            raise SopExecutionConflictError(
+                "计划引用了未冻结的动态能力：" + ",".join(missing)
+            )
+
+    @staticmethod
+    def _message_references_resource(
+        message: Message,
+        resource: ManagedInputResource,
+    ) -> bool:
+        """核对用户消息 metadata 中由上传 API 生成的资源身份、版本和内容摘要。"""
+
+        attachments = message.metadata_json.get("attachments")
+        if not isinstance(attachments, list):
+            return False
+        return any(
+            isinstance(item, dict)
+            and item.get("resource_id") == resource.id
+            and item.get("resource_version") == resource.version
+            and item.get("content_checksum") == resource.content_checksum
+            for item in attachments
+        )
+
+    def _assert_plan_preserves_step_identity(
+        self,
+        instance: SopInstance,
+        next_plan: Mapping[str, object],
+    ) -> None:
+        """禁止任何 PlanRevision 复用历史 step key 表达不同语义或移除已完成步骤。"""
+
+        raw_steps = next_plan.get("steps")
+        if not isinstance(raw_steps, list):
+            raise SopExecutionConflictError("计划 steps 必须是完整数组。")
+        next_steps = {
+            str(step.get("step_key")): step
+            for step in raw_steps
+            if isinstance(step, dict) and step.get("step_key")
+        }
+        historical = self.db.exec(
+            select(ExecutionPlanRevision)
+            .where(
+                ExecutionPlanRevision.tenant_id == instance.tenant_id,
+                ExecutionPlanRevision.execution_id == instance.id,
+            )
+            .order_by(ExecutionPlanRevision.revision_number)
+        ).all()
+        historical_steps: dict[str, dict[str, object]] = {}
+        for revision in historical:
+            steps = revision.plan_json.get("steps") if isinstance(revision.plan_json, dict) else []
+            if not isinstance(steps, list):
+                raise SopExecutionConflictError("历史计划 steps 已损坏。")
+            for step in steps:
+                if not isinstance(step, dict) or not step.get("step_key"):
+                    raise SopExecutionConflictError("历史计划包含非法 step identity。")
+                key = str(step["step_key"])
+                previous = historical_steps.get(key)
+                if previous is not None and previous != step:
+                    raise SopExecutionConflictError("历史计划已存在 step key 语义漂移。")
+                historical_steps[key] = step
+        for key, step in next_steps.items():
+            previous = historical_steps.get(key)
+            if previous is not None and previous != step:
+                raise SopExecutionConflictError("修改步骤必须分配新的 step key。")
+        completed = self.db.exec(
+            select(SopNodeExecution).where(
+                SopNodeExecution.tenant_id == instance.tenant_id,
+                SopNodeExecution.instance_id == instance.id,
+                SopNodeExecution.status == NodeExecutionStatus.SUCCEEDED.value,
+            )
+        ).all()
+        for execution in completed:
+            if execution.step_key not in next_steps:
+                raise SopExecutionConflictError("PlanRevision 不得移除已完成步骤。")
+            if historical_steps.get(execution.step_key) != next_steps[execution.step_key]:
+                raise SopExecutionConflictError("PlanRevision 不得改写已完成步骤。")
 
     def _guard_operation_mutation(self, operation: SopOperation, action: str) -> None:
         """解析 Operation 的父实例并应用同一 execution mutation guard。"""

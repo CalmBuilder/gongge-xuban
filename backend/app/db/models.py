@@ -623,6 +623,16 @@ class SopInstance(SQLModel, table=True):
             name="ck_execution_sop_identity",
         ),
         CheckConstraint(
+            "kind <> 'sop' OR current_plan_revision_id IS NULL",
+            name="ck_execution_sop_without_dynamic_plan",
+        ),
+        CheckConstraint(
+            "kind <> 'dynamic_task' OR (agent_id IS NOT NULL AND initiator_user_id IS NOT NULL "
+            "AND goal_snapshot_json IS NOT NULL AND current_plan_revision_id IS NOT NULL "
+            "AND current_plan_checksum IS NOT NULL AND capability_snapshot_json IS NOT NULL)",
+            name="ck_execution_dynamic_identity",
+        ),
+        CheckConstraint(
             "((lease_owner IS NULL AND lease_expires_at IS NULL) OR "
             "(lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL))",
             name="ck_execution_lease_pair",
@@ -663,6 +673,20 @@ class SopInstance(SQLModel, table=True):
         default=None,
         sa_column=Column(String(512), nullable=True),
     )
+    agent_id: str | None = Field(
+        default=None,
+        sa_column=Column(String(512), nullable=True, index=True),
+    )
+    goal_snapshot_json: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
+    current_plan_revision_id: str | None = Field(
+        default=None,
+        sa_column=Column(String(512), nullable=True, index=True),
+    )
+    current_plan_checksum: OptionalVersionString = Field(default=None, index=True)
+    capability_snapshot_json: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
+    capability_checksum: OptionalVersionString = Field(default=None, index=True)
+    budget_snapshot_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    terminal_reason_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     status: LabelString = Field(default="created", index=True)
     current_node_id: OptionalIdentifierString = Field(default=None, index=True)
     slots_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
@@ -696,12 +720,28 @@ class SopNodeExecution(SQLModel, table=True):
             "attempt",
             name="uq_sop_node_execution_attempt",
         ),
+        UniqueConstraint(
+            "tenant_id",
+            "instance_id",
+            "step_key",
+            "attempt",
+            name="uq_execution_step_attempt",
+        ),
     )
 
     id: PrimaryKeyString = Field(default_factory=lambda: new_id("sopnode"), primary_key=True)
     tenant_id: IdentifierString = Field(index=True)
     instance_id: IdentifierString = Field(index=True)
     node_id: IdentifierString = Field(index=True)
+    step_key: IdentifierString = Field(index=True)
+    plan_revision_id: str | None = Field(
+        default=None,
+        sa_column=Column(String(512), nullable=True, index=True),
+    )
+    step_kind: LabelString = Field(default="sop_node", index=True)
+    title: OptionalNameString = None
+    required: bool = Field(default=True)
+    superseded_by_step_key: OptionalIdentifierString = Field(default=None, index=True)
     attempt: int = Field(default=1, ge=1)
     status: LabelString = Field(default="scheduled", index=True)
     input_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
@@ -712,6 +752,194 @@ class SopNodeExecution(SQLModel, table=True):
     completed_at: datetime | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
+
+
+class ExecutionPlanRevision(SQLModel, table=True):
+    """追加保存动态任务计划修订及其完整能力快照，不覆盖历史计划。"""
+
+    __tablename__ = "execution_plan_revisions"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "execution_id",
+            "revision_number",
+            name="uq_execution_plan_revision_number",
+        ),
+        CheckConstraint(
+            "status IN ('validated', 'active', 'superseded', 'rejected')",
+            name="ck_execution_plan_revision_status",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("execplan"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    execution_id: str = Field(sa_column=Column(String(512), nullable=False, index=True))
+    revision_number: int = Field(ge=1)
+    parent_revision_id: str | None = Field(
+        default=None,
+        sa_column=Column(String(512), nullable=True, index=True),
+    )
+    reason: LabelString = Field(default="initial")
+    status: LabelString = Field(default="validated", index=True)
+    plan_json: dict[str, Any] = Field(sa_column=Column(JSON, nullable=False))
+    checksum: VersionString = Field(index=True)
+    capability_snapshot_json: dict[str, Any] = Field(sa_column=Column(JSON, nullable=False))
+    capability_checksum: VersionString = Field(index=True)
+    created_by_proposal_id: str | None = Field(
+        default=None,
+        sa_column=Column(String(512), nullable=True, index=True),
+    )
+    activated_at: datetime | None = None
+    superseded_at: datetime | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class ActionProposalRecord(SQLModel, table=True):
+    """持久保存完整 provider 响应经服务端验证后的规范动作提案。"""
+
+    __tablename__ = "action_proposal_records"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "execution_id",
+            "proposal_checksum",
+            name="uq_action_proposal_checksum",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "execution_id",
+            "provider_response_identity",
+            name="uq_action_proposal_provider_response",
+        ),
+        CheckConstraint(
+            "status IN ('validated', 'consumed', 'superseded')",
+            name="ck_action_proposal_status",
+        ),
+        CheckConstraint(
+            "NOT (consumed_operation_id IS NOT NULL AND consumed_plan_revision_id IS NOT NULL)",
+            name="ck_action_proposal_single_consumption_target",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("proposal"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    execution_id: str = Field(sa_column=Column(String(512), nullable=False, index=True))
+    plan_revision_id: str = Field(sa_column=Column(String(512), nullable=False, index=True))
+    step_key: IdentifierString = Field(index=True)
+    step_attempt: int = Field(ge=1)
+    provider: LabelString
+    model: NameString
+    provider_response_id: str = Field(
+        sa_column=Column(String(512), nullable=False),
+    )
+    provider_response_identity: VersionString = Field(index=True)
+    finish_reason: LabelString
+    model_capability_snapshot_json: dict[str, Any] = Field(sa_column=Column(JSON, nullable=False))
+    normalized_proposal_json: dict[str, Any] = Field(sa_column=Column(JSON, nullable=False))
+    validation_json: dict[str, Any] = Field(sa_column=Column(JSON, nullable=False))
+    proposal_checksum: VersionString = Field(index=True)
+    usage_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    status: LabelString = Field(default="validated", index=True)
+    consumed_operation_id: str | None = Field(
+        default=None,
+        sa_column=Column(String(512), nullable=True, index=True),
+    )
+    consumed_plan_revision_id: str | None = Field(
+        default=None,
+        sa_column=Column(String(512), nullable=True, index=True),
+    )
+    consumed_at: datetime | None = None
+    superseded_at: datetime | None = None
+    causation_id: str | None = Field(
+        default=None,
+        sa_column=Column(String(512), nullable=True),
+    )
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class ManagedInputResource(SQLModel, table=True):
+    """保存聊天上传资源的服务端身份、内容摘要、提取状态和当前访问边界。"""
+
+    __tablename__ = "managed_input_resources"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "id",
+            "version",
+            name="uq_managed_input_resource_version",
+        ),
+        CheckConstraint(
+            "ingestion_status IN ('uploaded', 'scanning', 'extracting', 'ready', "
+            "'quarantined', 'failed', 'revoked')",
+            name="ck_managed_input_resource_status",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("input"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    owner_user_id: str = Field(sa_column=Column(String(512), nullable=False, index=True))
+    agent_id: str | None = Field(
+        default=None,
+        sa_column=Column(String(512), nullable=True, index=True),
+    )
+    source_type: LabelString = Field(default="chat_upload")
+    source_message_id: str | None = Field(
+        default=None,
+        sa_column=Column(String(512), nullable=True, index=True),
+    )
+    version: VersionString
+    filename: NameString
+    mime_type: NameString
+    size_bytes: int = Field(ge=0)
+    content_checksum: VersionString = Field(index=True)
+    extraction_checksum: OptionalVersionString = Field(default=None, index=True)
+    ingestion_status: LabelString = Field(default="uploaded", index=True)
+    storage_locator: str = Field(sa_column=Column(String(1000), nullable=False))
+    extracted_text: OptionalLongTextString = None
+    extraction_metadata_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    acl_revision: int = Field(default=0, ge=0)
+    revoked_at: datetime | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class InputResourceSnapshot(SQLModel, table=True):
+    """追加冻结 Execution 输入资源版本和 ACL 证据，正文仍由当前权限解析。"""
+
+    __tablename__ = "input_resource_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "execution_id",
+            "identity_checksum",
+            name="uq_execution_input_resource_identity",
+        ),
+        CheckConstraint(
+            "ingestion_status IN ('ready', 'quarantined', 'failed', 'revoked')",
+            name="ck_input_resource_snapshot_status",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("inputsnap"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    execution_id: str = Field(sa_column=Column(String(512), nullable=False, index=True))
+    source_type: LabelString
+    source_resource_id: str = Field(sa_column=Column(String(512), nullable=False, index=True))
+    source_version: VersionString
+    source_message_id: str | None = Field(
+        default=None,
+        sa_column=Column(String(512), nullable=True, index=True),
+    )
+    filename: NameString
+    mime_type: NameString
+    size_bytes: int = Field(ge=0)
+    content_checksum: VersionString = Field(index=True)
+    extraction_checksum: OptionalVersionString = Field(default=None, index=True)
+    ingestion_status: LabelString = Field(index=True)
+    identity_checksum: VersionString = Field(index=True)
+    storage_locator_digest: VersionString
+    captured_acl_json: dict[str, Any] = Field(sa_column=Column(JSON, nullable=False))
+    created_at: datetime = Field(default_factory=utc_now)
 
 
 class SopOperation(SQLModel, table=True):

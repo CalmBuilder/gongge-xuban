@@ -144,6 +144,7 @@ def test_decision_requires_matching_completed_work_item_and_persists_audit() -> 
             tenant_id="tenant_demo",
             instance_id=instance.id,
             node_id="normal_seal_approval",
+            step_key="normal_seal_approval",
             status="waiting",
         )
         operation = SopOperation(
@@ -269,6 +270,7 @@ def test_expired_work_item_expires_linked_pending_request() -> None:
             tenant_id="tenant_demo",
             instance_id=instance.id,
             node_id="normal_seal_approval",
+            step_key="normal_seal_approval",
             status="waiting",
         )
         work_item = SopWorkItem(

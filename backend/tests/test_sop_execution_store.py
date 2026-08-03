@@ -271,8 +271,8 @@ def test_expired_lease_fences_late_node_operation_and_terminal_writes(tmp_path) 
     assert all(item.rejected_fencing_token < item.current_fencing_token for item in rejections)
 
 
-def test_execution_kind_condition_allows_dynamic_identity_but_rejects_invalid_sop() -> None:
-    """验证通用 Execution 可无 SOP 身份，而 kind=sop 仍由数据库强制完整绑定。"""
+def test_execution_kind_condition_requires_dynamic_identity_and_rejects_invalid_sop() -> None:
+    """验证动态 Execution 必须绑定计划身份，而 kind=sop 仍强制完整 SkillVersion。"""
 
     with _test_session() as db:
         dynamic = SopInstance(
@@ -282,6 +282,12 @@ def test_execution_kind_condition_allows_dynamic_identity_but_rejects_invalid_so
             active_slot_key="foreground:session_dynamic",
             source_kind="api",
             source_ref="request-1",
+            agent_id="agent_demo",
+            initiator_user_id="user_demo",
+            goal_snapshot_json={"goal": "demo"},
+            current_plan_revision_id="plan_demo",
+            current_plan_checksum="a" * 64,
+            capability_snapshot_json={"tools": []},
             status="running",
             current_node_id="planning",
         )

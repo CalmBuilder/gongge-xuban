@@ -256,6 +256,7 @@ def _seed_work_item(db: Session) -> tuple[User, User, User, str]:
         tenant_id="tenant_demo",
         instance_id=instance.id,
         node_id="human_review",
+        step_key="human_review",
         status="running",
     )
     db.add(instance)

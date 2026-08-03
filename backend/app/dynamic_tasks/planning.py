@@ -1,0 +1,223 @@
+"""
+@Time       : 2026/08/03 22:18
+@Author     : zhanglp8181
+@File       : planning.py
+@CallChain  : DynamicTaskAgent/FormalSopPlanner → normalized plan/proposal → SopExecutionStore
+@Description: 定义统一计划、步骤、完整模型提案及正式 SOP 计划投影契约。
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from enum import StrEnum
+from typing import Any, Protocol
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from app.sop_runtime.definition import CompiledSopDefinition
+
+
+class PlanReason(StrEnum):
+    """计划首建和追加修订允许使用的稳定原因。"""
+
+    INITIAL = "initial"
+    TOOL_UNAVAILABLE = "tool_unavailable"
+    USER_CONSTRAINT = "user_constraint"
+    EVIDENCE_MISSING = "evidence_missing"
+    EXTERNAL_CHANGE = "external_change"
+
+
+class ActionKind(StrEnum):
+    """Runtime 首批能够验证但尚不代表已授权执行的动作类别。"""
+
+    ANSWER = "answer"
+    QUERY_KNOWLEDGE = "query_knowledge"
+    CALL_TOOL = "call_tool"
+    CREATE_ARTIFACT = "create_artifact"
+    WAIT_INPUT = "wait_input"
+    WAIT_ATTENTION = "wait_attention"
+    WAIT_EVENT = "wait_event"
+    REPLAN = "replan"
+    COMPLETE = "complete"
+    FAIL = "fail"
+
+
+class PlanningContract(BaseModel):
+    """禁止额外字段和就地修改的规划持久契约基类。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class SuccessCriterion(PlanningContract):
+    """声明可由 Runtime 或后续验证器核验的稳定成功标准。"""
+
+    id: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,127}$")
+    type: str = Field(pattern=r"^(schema|artifact|assertion)$")
+    spec: dict[str, Any]
+
+
+class PlanStep(PlanningContract):
+    """保存服务端稳定 step key 和展示/执行所需的规范步骤事实。"""
+
+    step_key: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,127}$")
+    title: str = Field(min_length=1, max_length=256)
+    kind: str = Field(pattern=r"^[a-z][a-z0-9_.-]{0,127}$")
+    required: bool = True
+    depends_on: tuple[str, ...] = ()
+    capability_refs: tuple[str, ...] = ()
+    expected_output_schema: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_dependencies(self) -> "PlanStep":
+        """拒绝步骤依赖自己或重复声明同一前置步骤。"""
+
+        if self.step_key in self.depends_on:
+            raise ValueError("步骤不能依赖自身")
+        if len(set(self.depends_on)) != len(self.depends_on):
+            raise ValueError("depends_on 不得重复")
+        return self
+
+
+class NormalizedPlan(PlanningContract):
+    """表示可计算 checksum、可追加修订的完整动态计划。"""
+
+    goal: str = Field(min_length=1, max_length=4000)
+    success_criteria: tuple[SuccessCriterion, ...] = Field(min_length=1)
+    constraints: tuple[str, ...] = ()
+    assumptions: tuple[str, ...] = ()
+    steps: tuple[PlanStep, ...] = Field(min_length=1)
+    expected_artifacts: tuple[dict[str, Any], ...] = ()
+    budget: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_graph(self) -> "NormalizedPlan":
+        """验证 step/criterion 身份唯一且所有依赖只指向当前计划中的步骤。"""
+
+        step_keys = [step.step_key for step in self.steps]
+        if len(set(step_keys)) != len(step_keys):
+            raise ValueError("step_key 在 execution 计划内必须唯一")
+        criterion_ids = [criterion.id for criterion in self.success_criteria]
+        if len(set(criterion_ids)) != len(criterion_ids):
+            raise ValueError("成功标准 id 不得重复")
+        known = set(step_keys)
+        dependencies: dict[str, set[str]] = {}
+        for step in self.steps:
+            missing = set(step.depends_on) - known
+            if missing:
+                raise ValueError(f"步骤 {step.step_key} 引用了不存在的依赖")
+            dependencies[step.step_key] = set(step.depends_on)
+        resolved: set[str] = set()
+        while dependencies:
+            ready = {key for key, values in dependencies.items() if values <= resolved}
+            if not ready:
+                raise ValueError("计划步骤依赖必须构成无环图")
+            resolved.update(ready)
+            dependencies = {key: values for key, values in dependencies.items() if key not in ready}
+        return self
+
+
+class RuntimeActionProposal(PlanningContract):
+    """保存服务端校验后的单步动作，不接受 tenant、agent、risk 或授权结论。"""
+
+    action_kind: ActionKind
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    capability_ref: str | None = Field(default=None, max_length=512)
+    expected_output_schema: dict[str, Any] = Field(default_factory=dict)
+    rationale: str = Field(min_length=1, max_length=4000)
+
+    @model_validator(mode="after")
+    def validate_capability_reference(self) -> "RuntimeActionProposal":
+        """只有实际查询或调用能力的提案可以携带能力引用。"""
+
+        requires_capability = self.action_kind in {
+            ActionKind.QUERY_KNOWLEDGE,
+            ActionKind.CALL_TOOL,
+        }
+        if requires_capability != bool((self.capability_ref or "").strip()):
+            raise ValueError("能力型动作必须且只能声明 capability_ref")
+        forbidden = {"tenant_id", "agent_id", "risk_class", "authorized", "permission"}
+        if _contains_forbidden_key(self.arguments, forbidden):
+            raise ValueError("模型提案不得覆盖服务端身份、风险或授权")
+        return self
+
+
+class CompletedProviderProposal(PlanningContract):
+    """表示 provider 已完整结束且结构解析成功的提案边界。"""
+
+    response_id: str = Field(min_length=1, max_length=512)
+    finish_reason: str = Field(pattern=r"^(stop|tool_calls)$")
+    proposal: RuntimeActionProposal
+    usage: dict[str, Any] = Field(default_factory=dict)
+
+
+class Planner(Protocol):
+    """约束 Formal SOP 与未来动态 Planner 都输出规范计划，而不直接写 Runtime。"""
+
+    def create_plan(self) -> NormalizedPlan:
+        """生成完整且可验证的规范计划。"""
+
+
+class FormalSopPlanner:
+    """把冻结 SOP 定义机械投影为规划只读视图，不创建动态 PlanRevision。"""
+
+    def __init__(self, definition: CompiledSopDefinition) -> None:
+        """绑定已经发布并校验 checksum 的不可变 SOP 定义。"""
+
+        self.definition = definition
+
+    def create_plan(self) -> NormalizedPlan:
+        """按定义节点顺序生成稳定 step key，保持 SOP Runtime 的确定性路由权威。"""
+
+        dependencies: dict[str, list[str]] = {}
+        for edge in self.definition.edges:
+            dependencies.setdefault(edge.target_node_id, []).append(edge.source_node_id)
+        steps = tuple(
+            PlanStep(
+                step_key=node.node_id,
+                title=node.name,
+                kind=f"sop.{node.type.value}",
+                required=not node.optional,
+                depends_on=tuple(dependencies.get(node.node_id, ())),
+            )
+            for node in self.definition.nodes
+        )
+        return NormalizedPlan(
+            goal=f"执行已发布 SOP：{self.definition.name}",
+            success_criteria=(
+                SuccessCriterion(
+                    id="sop_terminal",
+                    type="assertion",
+                    spec={"terminal_node_ids": list(self.definition.terminal_node_ids)},
+                ),
+            ),
+            steps=steps,
+            budget={"definition_checksum": self.definition.checksum},
+        )
+
+
+def canonical_checksum(value: BaseModel | dict[str, Any]) -> str:
+    """对严格 JSON 值生成跨进程稳定 SHA-256，并拒绝 NaN/Infinity。"""
+
+    payload = value.model_dump(mode="json") if isinstance(value, BaseModel) else value
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _contains_forbidden_key(value: object, forbidden: set[str]) -> bool:
+    """递归发现嵌套参数中试图覆盖服务端身份、风险或授权的键。"""
+
+    if isinstance(value, dict):
+        return any(
+            str(key).lower() in forbidden or _contains_forbidden_key(item, forbidden)
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return any(_contains_forbidden_key(item, forbidden) for item in value)
+    return False

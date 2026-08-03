@@ -139,6 +139,7 @@ def _seed_runtime(
         tenant_id="tenant_demo",
         instance_id=instance.id,
         node_id="create_special_approval",
+        step_key="create_special_approval",
         status="succeeded",
     )
     operation = SopOperation(
@@ -181,6 +182,7 @@ def _complete_step(
         tenant_id="tenant_demo",
         instance_id=instance.id,
         node_id=node_id,
+        step_key=node_id,
         status="succeeded",
     )
     work_item = SopWorkItem(

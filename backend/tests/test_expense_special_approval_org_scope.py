@@ -439,6 +439,7 @@ def _seed_representative_runtime(engine: object) -> None:
             tenant_id="tenant_demo",
             instance_id=instance.id,
             node_id="department_special_approval",
+            step_key="department_special_approval",
             status="waiting",
         )
         db.add(chat_session)

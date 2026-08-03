@@ -102,6 +102,7 @@ def migrate_sqlite_skill_schema(engine: Engine) -> None:
         _migrate_agent_identity_fields(conn, tables)
         _migrate_execution_reliability_fields(conn, tables)
         _migrate_dynamic_capability_fields(conn, tables)
+        _migrate_execution_plan_fields(conn, tables)
 
         if "messages" in tables:
             message_columns = {column["name"] for column in inspector.get_columns("messages")}
@@ -447,6 +448,137 @@ def _migrate_dynamic_capability_fields(conn, tables: set[str]) -> None:
                 text(
                     f"CREATE INDEX IF NOT EXISTS {index_name} "
                     f"ON {table_name} ({column_name})"
+                )
+            )
+
+
+def _migrate_execution_plan_fields(conn, tables: set[str]) -> None:
+    """为桌面 SQLite 旧库补齐 B0.4 Execution/Step 字段并回填稳定 step key。"""
+
+    if "sop_instances" in tables:
+        existing_instance_columns = {
+            column["name"] for column in inspect(conn).get_columns("sop_instances")
+        }
+        legacy_dynamic_count = conn.execute(
+            text("SELECT COUNT(*) FROM sop_instances WHERE kind = 'dynamic_task'")
+        ).scalar_one()
+        if legacy_dynamic_count:
+            required_identity_columns = {
+                "agent_id",
+                "goal_snapshot_json",
+                "current_plan_revision_id",
+                "current_plan_checksum",
+                "capability_snapshot_json",
+            }
+            if not required_identity_columns <= existing_instance_columns:
+                raise RuntimeError("cannot infer identity for legacy dynamic executions")
+            missing_identity_count = conn.execute(
+                text(
+                    "SELECT COUNT(*) FROM sop_instances WHERE kind = 'dynamic_task' AND "
+                    "(agent_id IS NULL OR initiator_user_id IS NULL OR "
+                    "goal_snapshot_json IS NULL OR current_plan_revision_id IS NULL OR "
+                    "current_plan_checksum IS NULL OR capability_snapshot_json IS NULL)"
+                )
+            ).scalar_one()
+            if missing_identity_count:
+                raise RuntimeError("cannot infer identity for legacy dynamic executions")
+        instance_additions = {
+            "agent_id": "ALTER TABLE sop_instances ADD COLUMN agent_id VARCHAR(512)",
+            "goal_snapshot_json": (
+                "ALTER TABLE sop_instances ADD COLUMN goal_snapshot_json JSON"
+            ),
+            "current_plan_revision_id": (
+                "ALTER TABLE sop_instances ADD COLUMN current_plan_revision_id VARCHAR(512)"
+            ),
+            "current_plan_checksum": (
+                "ALTER TABLE sop_instances ADD COLUMN current_plan_checksum VARCHAR(64)"
+            ),
+            "capability_snapshot_json": (
+                "ALTER TABLE sop_instances ADD COLUMN capability_snapshot_json JSON"
+            ),
+            "capability_checksum": (
+                "ALTER TABLE sop_instances ADD COLUMN capability_checksum VARCHAR(64)"
+            ),
+            "budget_snapshot_json": (
+                "ALTER TABLE sop_instances ADD COLUMN budget_snapshot_json "
+                "JSON NOT NULL DEFAULT '{}'"
+            ),
+            "terminal_reason_json": (
+                "ALTER TABLE sop_instances ADD COLUMN terminal_reason_json "
+                "JSON NOT NULL DEFAULT '{}'"
+            ),
+        }
+        for column_name, ddl in instance_additions.items():
+            if column_name not in existing_instance_columns:
+                conn.execute(text(ddl))
+        for column_name in (
+            "agent_id",
+            "current_plan_revision_id",
+            "current_plan_checksum",
+            "capability_checksum",
+        ):
+            conn.execute(
+                text(
+                    f"CREATE INDEX IF NOT EXISTS ix_sop_instances_{column_name} "
+                    f"ON sop_instances ({column_name})"
+                )
+            )
+
+    if "sop_node_executions" in tables:
+        existing_step_columns = {
+            column["name"] for column in inspect(conn).get_columns("sop_node_executions")
+        }
+        step_additions = {
+            "step_key": (
+                "ALTER TABLE sop_node_executions ADD COLUMN step_key VARCHAR(128)"
+            ),
+            "plan_revision_id": (
+                "ALTER TABLE sop_node_executions ADD COLUMN plan_revision_id VARCHAR(512)"
+            ),
+            "step_kind": (
+                "ALTER TABLE sop_node_executions ADD COLUMN step_kind "
+                "VARCHAR(64) NOT NULL DEFAULT 'sop_node'"
+            ),
+            "title": "ALTER TABLE sop_node_executions ADD COLUMN title VARCHAR(191)",
+            "required": (
+                "ALTER TABLE sop_node_executions ADD COLUMN required "
+                "BOOLEAN NOT NULL DEFAULT 1"
+            ),
+            "superseded_by_step_key": (
+                "ALTER TABLE sop_node_executions ADD COLUMN "
+                "superseded_by_step_key VARCHAR(128)"
+            ),
+        }
+        for column_name, ddl in step_additions.items():
+            if column_name not in existing_step_columns:
+                conn.execute(text(ddl))
+        conn.execute(
+            text(
+                "UPDATE sop_node_executions SET step_key = node_id "
+                "WHERE step_key IS NULL OR step_key = ''"
+            )
+        )
+        null_step_count = conn.execute(
+            text("SELECT COUNT(*) FROM sop_node_executions WHERE step_key IS NULL OR step_key = ''")
+        ).scalar_one()
+        if null_step_count:
+            raise RuntimeError("cannot infer stable step key for legacy node executions")
+        conn.execute(
+            text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_execution_step_attempt "
+                "ON sop_node_executions (tenant_id, instance_id, step_key, attempt)"
+            )
+        )
+        for column_name in (
+            "step_key",
+            "plan_revision_id",
+            "step_kind",
+            "superseded_by_step_key",
+        ):
+            conn.execute(
+                text(
+                    f"CREATE INDEX IF NOT EXISTS ix_sop_node_executions_{column_name} "
+                    f"ON sop_node_executions ({column_name})"
                 )
             )
 

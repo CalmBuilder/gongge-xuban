@@ -978,6 +978,7 @@ def _seed_runtime(
         tenant_id="tenant_demo",
         instance_id=instance.id,
         node_id="human_review",
+        step_key="human_review",
         status="running",
     )
     db.add(instance)

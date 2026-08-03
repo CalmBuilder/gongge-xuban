@@ -205,6 +205,12 @@ class ChatAttachmentRead(BaseModel):
     data_url: Optional[str] = None
     python_summary: Optional[str] = None
     error: Optional[str] = None
+    resource_id: Optional[str] = None
+    resource_version: Optional[str] = None
+    content_checksum: Optional[str] = None
+    ingestion_status: Optional[
+        Literal["uploaded", "scanning", "extracting", "ready", "quarantined", "failed", "revoked"]
+    ] = None
 
 
 class ChatTurnResponse(BaseModel):
