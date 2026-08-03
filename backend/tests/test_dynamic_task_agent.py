@@ -127,6 +127,30 @@ class _Proposer:
         return _response()
 
 
+class _RunProposer(_Proposer):
+    """按当前步骤返回 read 或最终 answer 提案。"""
+
+    def propose(self, *, view, step):
+        """为完整推进循环模拟两次独立 provider 完成响应。"""
+
+        self.calls += 1
+        if step.kind == "tool.read":
+            return _response()
+        return CompletedProviderProposal(
+            response_id="provider_final_run",
+            finish_reason="stop",
+            proposal=RuntimeActionProposal(
+                action_kind=ActionKind.ANSWER,
+                arguments={
+                    "markdown": "# 风险简报\n\n合同证据已核验。",
+                    "criterion_evidence": {"criterion_01": ["query_contract"]},
+                    "pending_questions": [],
+                },
+                rationale="形成最终结果",
+            ),
+        )
+
+
 def _snapshot(*, risk_class: str = "read") -> CapabilitySnapshot:
     """构造与 B0.3 checksum 规则一致的冻结能力快照。"""
 
@@ -487,3 +511,55 @@ def test_verified_result_message_publication_and_terminal_state_commit_together(
         assert publication.status == "settled"
         assert publication.receipt_json["message_id"] == message.id
         assert instance.status == "succeeded"
+
+
+def test_run_loop_serially_reaches_verified_terminal_result() -> None:
+    """验证真实多步循环按 read→answer 串行推进，不需要 Agent Loop 复制 Runtime 状态。"""
+
+    engine = create_engine("sqlite://", poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as db:
+        capabilities = _model_capabilities()
+        model = ModelConfig(
+            id="model_loop",
+            tenant_id="tenant_demo",
+            name="动态模型",
+            api_key_encrypted="encrypted",
+            model="model-demo",
+            capability_snapshot_json=capabilities,
+            capability_checksum=capability_checksum(capabilities),
+            preflight_status="ready",
+        )
+        db.add(model)
+        db.flush()
+        snapshot = _snapshot()
+        executor = _Executor()
+        proposer = _RunProposer()
+        agent = DynamicTaskAgent(
+            db,
+            catalog=_StartCatalog(model, snapshot),
+            tool_executor=executor,
+            planner=_Planner(),
+            action_proposer=proposer,
+        )
+        instance, _ = agent.start_task(
+            tenant_id="tenant_demo",
+            session_id="session_loop",
+            agent_id="agent_demo",
+            initiator_user_id="user_demo",
+            goal="生成续约风险简报",
+            success_criteria=("覆盖合同证据",),
+            model_config=model,
+        )
+
+        outcome = agent.run_until_blocked_or_complete(
+            execution_id=instance.id,
+            model_config=model,
+            worker_id="worker_loop",
+            actor_user_id="user_demo",
+        )
+
+        assert outcome.status == "succeeded"
+        assert outcome.message is not None
+        assert executor.calls == 1
+        assert proposer.calls == 2

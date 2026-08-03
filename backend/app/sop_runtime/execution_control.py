@@ -187,6 +187,24 @@ class ExecutionControlService:
         self.db.flush()
         return attention, True
 
+    def append_execution_event(
+        self,
+        instance: SopInstance,
+        *,
+        event_type: str,
+        causation_id: str,
+        payload: Mapping[str, object],
+    ) -> AgentEvent:
+        """在调用方当前事务公开追加统一 Execution 事件，不隐式创建外部通知。"""
+
+        self.store.authorize_mutation(instance, f"event.append.{event_type}")
+        return self._append_event(
+            instance,
+            event_type=event_type,
+            causation_id=causation_id,
+            payload=payload,
+        )
+
     def issue_command(
         self,
         instance: SopInstance,

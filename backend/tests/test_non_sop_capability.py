@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 from app.core.agent_loop import AgentLoop
@@ -16,6 +17,7 @@ from app.core.non_sop_capability import (
     NonSopCapabilityRouter,
 )
 from app.db.models import ChatSession, GeneralSkill, Skill
+from app.dynamic_tasks.agent import DynamicRunOutcome
 from app.general_skills.schema import GeneralSkillSelection
 from app.session.session_schema import ChatTurnRequest, RouterDecision
 
@@ -186,6 +188,75 @@ def test_dynamic_task_becomes_effective_only_with_separate_execution_kill_switch
     assert result.effective_decision.mode == "dynamic_task"
     assert result.shadow_decision is not None
     assert result.execution_created is False
+
+
+def test_agent_loop_delegates_effective_dynamic_route_without_copying_loop(monkeypatch) -> None:
+    """验证 Agent Loop 只做入口委托，最终回复来自独立 DynamicTaskAgent 的闭环结果。"""
+
+    route = _route(
+        NonSopCapabilityRouter(
+            shadow_enabled=False,
+            execution_enabled=True,
+            shadow_selector=_ShadowSelector(
+                NonSopCapabilityDecision(
+                    mode="dynamic_task",
+                    goal="生成风险简报",
+                    success_criteria=["覆盖合同证据"],
+                    confidence=0.95,
+                )
+            ),
+        ),
+        _GeneralSelector(GeneralSkillSelection()),
+    )
+    calls: list[str] = []
+
+    class _DynamicAgent:
+        """模拟已经完成统一 Runtime 闭环的独立 Agent。"""
+
+        def __init__(self, db) -> None:
+            calls.append("init")
+
+        def start_task(self, **kwargs):
+            calls.append("start")
+            return SimpleNamespace(id="execution_1"), True
+
+        def run_until_blocked_or_complete(self, **kwargs):
+            calls.append("run")
+            return DynamicRunOutcome(
+                status="succeeded",
+                execution_id="execution_1",
+                message=SimpleNamespace(content="# 风险简报"),
+            )
+
+    monkeypatch.setattr("app.core.agent_loop.DynamicTaskAgent", _DynamicAgent)
+    loop = object.__new__(AgentLoop)
+    loop.db = SimpleNamespace(
+        refresh=lambda _row: None,
+        begin_nested=lambda: nullcontext(),
+    )
+    loop.events = SimpleNamespace(record=lambda *_args, **_kwargs: None)
+    session = ChatSession(
+        id="session_dynamic",
+        tenant_id="tenant_demo",
+        agent_id="agent_demo",
+    )
+
+    response = loop._try_handle_dynamic_task(
+        ChatTurnRequest(
+            tenant_id="tenant_demo",
+            user_id="user_demo",
+            agent_id="agent_demo",
+            message="生成风险简报",
+        ),
+        session,
+        SimpleNamespace(id="model_1"),
+        route,
+        "message_1",
+    )
+
+    assert response is not None
+    assert response.reply == "# 风险简报"
+    assert calls == ["init", "start", "run"]
 
 
 def test_low_confidence_dynamic_shadow_degrades_to_answer() -> None:

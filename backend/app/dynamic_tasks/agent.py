@@ -9,12 +9,15 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Protocol
 
 from sqlmodel import Session, select
 
 from app.db.models import (
     ExecutionPlanRevision,
+    AgentEvent,
+    ChatSession,
     Message,
     ModelConfig,
     SopInstance,
@@ -45,6 +48,16 @@ from app.tools.tool_schema import ToolCall, ToolResult
 
 class DynamicTaskAgentError(RuntimeError):
     """表示只读动态推进在 provider、能力或状态边界被确定性拒绝。"""
+
+
+@dataclass(frozen=True)
+class DynamicRunOutcome:
+    """表达同步推进到终态或明确阻塞点的最小结果。"""
+
+    status: str
+    execution_id: str
+    message: Message | None = None
+    blocking_step_key: str | None = None
 
 
 class DynamicToolExecutor(Protocol):
@@ -153,6 +166,82 @@ class DynamicTaskAgent:
             )
             return step, result
 
+    def run_until_blocked_or_complete(
+        self,
+        *,
+        execution_id: str,
+        model_config: ModelConfig,
+        worker_id: str,
+        actor_user_id: str,
+        organization_unit_id: str | None = None,
+    ) -> DynamicRunOutcome:
+        """按服务端预算串行推进 read 步骤，并在 answer、等待或无就绪步骤处确定收敛。"""
+
+        instance = self.db.get(SopInstance, execution_id)
+        if instance is None or instance.kind != "dynamic_task":
+            raise DynamicTaskAgentError("DYNAMIC_EXECUTION_NOT_FOUND")
+        plan = self._current_plan(instance)
+        max_steps = int(plan.budget.get("max_steps", len(plan.steps)))
+        if max_steps < 1 or max_steps > 100:
+            raise DynamicTaskAgentError("DYNAMIC_BUDGET_INVALID")
+        for _iteration in range(max_steps + 1):
+            self.db.refresh(instance)
+            if instance.status == "succeeded":
+                message = self.db.exec(
+                    select(Message)
+                    .where(
+                        Message.tenant_id == instance.tenant_id,
+                        Message.session_id == instance.session_id,
+                    )
+                    .order_by(Message.created_at.desc(), Message.id.desc())
+                ).first()
+                return DynamicRunOutcome("succeeded", instance.id, message=message)
+            plan = self._current_plan(instance)
+            completed_keys = self._completed_step_keys(instance)
+            step = next(
+                (
+                    item
+                    for item in plan.steps
+                    if item.step_key not in completed_keys
+                    and set(item.depends_on) <= completed_keys
+                ),
+                None,
+            )
+            if step is None:
+                return DynamicRunOutcome("blocked", instance.id)
+            if step.kind == "tool.read":
+                self.advance_next_read_step(
+                    execution_id=instance.id,
+                    model_config=model_config,
+                    worker_id=worker_id,
+                    actor_user_id=actor_user_id,
+                    organization_unit_id=organization_unit_id,
+                )
+                continue
+            if step.kind == "answer":
+                completed = self._propose_action(
+                    instance=instance,
+                    step=step,
+                    model_config=model_config,
+                    worker_id=worker_id,
+                )
+                message = self.complete_with_result_proposal(
+                    execution_id=instance.id,
+                    step_key=step.step_key,
+                    completed_response=completed,
+                    provider=model_config.provider,
+                    model=model_config.model,
+                    model_capabilities=dict(model_config.capability_snapshot_json or {}),
+                    worker_id=worker_id,
+                )
+                return DynamicRunOutcome("succeeded", instance.id, message=message)
+            return DynamicRunOutcome(
+                "waiting",
+                instance.id,
+                blocking_step_key=step.step_key,
+            )
+        raise DynamicTaskAgentError("DYNAMIC_STEP_BUDGET_EXHAUSTED")
+
     def start_task(
         self,
         *,
@@ -191,6 +280,8 @@ class DynamicTaskAgent:
             success_criteria=criteria,
             capabilities=capabilities,
         )
+        if any(step.kind not in {"tool.read", "answer"} for step in plan.steps):
+            raise DynamicTaskAgentError("DYNAMIC_PLAN_UNSUPPORTED_STEP")
         snapshot = {
             "tools": [
                 item.model_dump(mode="json")
@@ -418,6 +509,35 @@ class DynamicTaskAgent:
                 message_id=message.id,
             )
             self.store.consume_result_proposal(instance, proposal)
+            session = self.db.get(ChatSession, instance.session_id)
+            if session is not None and session.tenant_id == instance.tenant_id:
+                session.status = "active"
+                session.summary = f"最近回复：{result.markdown[:120]}"
+                self.db.add(session)
+            self.db.add(
+                AgentEvent(
+                    tenant_id=instance.tenant_id,
+                    session_id=instance.session_id,
+                    event_type="assistant_message_created",
+                    payload_json={
+                        "message_id": message.id,
+                        "assistant_message_id": message.id,
+                        "reply": result.markdown,
+                        "execution_id": instance.id,
+                        "result_id": result_row.id,
+                    },
+                )
+            )
+            control.append_execution_event(
+                instance,
+                event_type="execution_succeeded",
+                causation_id=result_row.id,
+                payload={
+                    "result_id": result_row.id,
+                    "publication_id": publication.id,
+                    "message_id": message.id,
+                },
+            )
             self.store.complete_instance(instance)
             self.db.commit()
             return message
@@ -446,6 +566,37 @@ class DynamicTaskAgent:
                 raise DynamicTaskAgentError("DYNAMIC_READ_ONLY_VIOLATION")
             return snapshot
         raise DynamicTaskAgentError("DYNAMIC_CAPABILITY_NOT_FROZEN")
+
+    def _propose_action(
+        self,
+        *,
+        instance: SopInstance,
+        step: PlanStep,
+        model_config: ModelConfig,
+        worker_id: str,
+    ) -> CompletedProviderProposal:
+        """在 Execution lease 内从机械事实构建 view 并取得当前步骤完整提案。"""
+
+        verified_model = self.catalog.require_dynamic_model(instance.tenant_id, model_config.id)
+        with self.store.owned(instance, worker_id=worker_id):
+            projection = build_execution_context_projection(
+                self.db,
+                tenant_id=instance.tenant_id,
+                execution_id=instance.id,
+            )
+            capabilities = dict(verified_model.capability_snapshot_json or {})
+            view = build_provider_execution_view(
+                execution_context=projection.model_dump(mode="json"),
+                canonical_messages=[
+                    {
+                        "role": "user",
+                        "content": "请仅为当前计划步骤生成一个受控动作。",
+                    }
+                ],
+                model_capabilities=capabilities,
+            )
+            proposer = self.action_proposer or DynamicActionProposer(LLMClient(verified_model))
+            return proposer.propose(view=view, step=step)
 
     def _step_definition(self, instance: SopInstance, step_key: str) -> dict[str, object]:
         """从活动 PlanRevision 读取服务端稳定步骤，不接受调用方临时定义。"""

@@ -36,6 +36,7 @@ from app.core.cancellation import clear_chat_turn_cancelled, is_chat_turn_cancel
 from app.core.conversation_context import build_conversation_context
 from app.core.non_sop_capability import (
     LlmDynamicTaskShadowSelector,
+    NonSopCapabilityRouteResult,
     NonSopCapabilityRouter,
 )
 from app.core.reflection_agent import ReflectionAgent, ReflectionDecision, action_needs_reflection
@@ -66,6 +67,7 @@ from app.db.models import (
     new_id,
     utc_now,
 )
+from app.dynamic_tasks.agent import DynamicTaskAgent, DynamicTaskAgentError
 from app.general_skills import GeneralSkillRunner, GeneralSkillSelector
 from app.general_skills.schema import GeneralSkillRunResponse, GeneralSkillSelection
 from app.knowledge import KnowledgeService
@@ -1686,7 +1688,7 @@ class AgentLoop:
                 yield self._stream_status(
                     chat_session, "routing", "正在判断用户意图", user_message_id=user_message_id
                 )
-                capability = self._route_non_sop_capability(
+                capability_route = self._decide_non_sop_capability(
                     request.message,
                     model_config,
                     chat_session,
@@ -1695,6 +1697,45 @@ class AgentLoop:
                     [],
                     user_id=request.user_id,
                     user_message_id=user_message_id,
+                )
+                dynamic_response = self._try_handle_dynamic_task(
+                    request,
+                    chat_session,
+                    model_config,
+                    capability_route,
+                    user_message.id,
+                )
+                if dynamic_response is not None:
+                    yield self._stream_status(
+                        chat_session,
+                        "completed",
+                        "动态任务已完成",
+                        {"execution_mode": "dynamic_task"},
+                        user_message_id,
+                    )
+                    yield self._stream_event(
+                        "stream_delta",
+                        chat_session,
+                        self._turn_payload(
+                            {"content": dynamic_response.reply}, user_message_id
+                        ),
+                    )
+                    yield self._stream_event(
+                        "stream_end",
+                        chat_session,
+                        self._turn_payload({}, user_message_id),
+                    )
+                    yield self._stream_event(
+                        "complete",
+                        chat_session,
+                        self._turn_payload(
+                            dynamic_response.model_dump(mode="json"), user_message_id
+                        ),
+                    )
+                    return
+                capability = (
+                    capability_route.selected_general_skill,
+                    capability_route.general_selection,
                 )
                 if capability[0] is not None:
                     yield from self._stream_general_skill_response(
@@ -1852,7 +1893,7 @@ class AgentLoop:
             )
             capability_selection: GeneralSkillSelection | None = None
             if self._scene_router_deferred_to_general(router_decision):
-                capability = self._route_non_sop_capability(
+                capability_route = self._decide_non_sop_capability(
                     request.message,
                     model_config,
                     chat_session,
@@ -1861,6 +1902,43 @@ class AgentLoop:
                     memory_context,
                     user_id=request.user_id,
                     user_message_id=user_message_id,
+                )
+                dynamic_response = self._try_handle_dynamic_task(
+                    request,
+                    chat_session,
+                    model_config,
+                    capability_route,
+                    user_message.id,
+                )
+                if dynamic_response is not None:
+                    yield self._stream_status(
+                        chat_session,
+                        "completed",
+                        "动态任务已完成",
+                        {"execution_mode": "dynamic_task"},
+                        user_message_id,
+                    )
+                    yield self._stream_event(
+                        "stream_delta",
+                        chat_session,
+                        self._turn_payload(
+                            {"content": dynamic_response.reply}, user_message_id
+                        ),
+                    )
+                    yield self._stream_event(
+                        "stream_end", chat_session, self._turn_payload({}, user_message_id)
+                    )
+                    yield self._stream_event(
+                        "complete",
+                        chat_session,
+                        self._turn_payload(
+                            dynamic_response.model_dump(mode="json"), user_message_id
+                        ),
+                    )
+                    return
+                capability = (
+                    capability_route.selected_general_skill,
+                    capability_route.general_selection,
                 )
                 capability_selection = capability[1]
                 if capability[0] is not None:
@@ -2462,7 +2540,7 @@ class AgentLoop:
             )
             if self._context_compacted_now(no_skill_context):
                 status("preparing", {"compacted_now": True})
-            capability = self._route_non_sop_capability(
+            capability_route = self._decide_non_sop_capability(
                 request.message,
                 model_config,
                 chat_session,
@@ -2471,6 +2549,30 @@ class AgentLoop:
                 [],
                 user_id=request.user_id,
                 user_message_id=user_message.id,
+            )
+            dynamic_response = self._try_handle_dynamic_task(
+                request,
+                chat_session,
+                model_config,
+                capability_route,
+                user_message.id,
+            )
+            if dynamic_response is not None:
+                return PreparedTurn(
+                    chat_session=chat_session,
+                    model_config=model_config,
+                    active_skill=None,
+                    router_decision=dynamic_response.router_decision or RouterDecision(),
+                    step_result=dynamic_response.step_result or StepAgentResult(),
+                    tool_result=dynamic_response.tool_result,
+                    memory_context=[],
+                    conversation_context=no_skill_context,
+                    general_response=dynamic_response,
+                    user_message_id=user_message.id,
+                )
+            capability = (
+                capability_route.selected_general_skill,
+                capability_route.general_selection,
             )
             router_decision = RouterDecision(
                 decision="answer_only",
@@ -2572,7 +2674,7 @@ class AgentLoop:
         )
         capability: tuple[GeneralSkill | None, GeneralSkillSelection] | None = None
         if self._scene_router_deferred_to_general(router_decision):
-            capability = self._route_non_sop_capability(
+            capability_route = self._decide_non_sop_capability(
                 request.message,
                 model_config,
                 chat_session,
@@ -2581,6 +2683,30 @@ class AgentLoop:
                 memory_context,
                 user_id=request.user_id,
                 user_message_id=user_message.id,
+            )
+            dynamic_response = self._try_handle_dynamic_task(
+                request,
+                chat_session,
+                model_config,
+                capability_route,
+                user_message.id,
+            )
+            if dynamic_response is not None:
+                return PreparedTurn(
+                    chat_session=chat_session,
+                    model_config=model_config,
+                    active_skill=None,
+                    router_decision=dynamic_response.router_decision or router_decision,
+                    step_result=dynamic_response.step_result or StepAgentResult(),
+                    tool_result=dynamic_response.tool_result,
+                    memory_context=memory_context,
+                    conversation_context=conversation_context,
+                    general_response=dynamic_response,
+                    user_message_id=user_message.id,
+                )
+            capability = (
+                capability_route.selected_general_skill,
+                capability_route.general_selection,
             )
         general_response = self._try_handle_general_skill_after_scene_router(
             request,
@@ -6570,6 +6696,32 @@ class AgentLoop:
     ) -> tuple[GeneralSkill | None, GeneralSkillSelection]:
         """统一非 SOP 权威选择与脱敏 shadow；A 批只返回旧 GeneralSkill 行为。"""
 
+        route = self._decide_non_sop_capability(
+            message,
+            model_config,
+            chat_session,
+            agent_id,
+            conversation_context,
+            memory_context,
+            user_id=user_id,
+            user_message_id=user_message_id,
+        )
+        return route.selected_general_skill, route.general_selection
+
+    def _decide_non_sop_capability(
+        self,
+        message: str,
+        model_config: ModelConfig,
+        chat_session: ChatSession,
+        agent_id: str | None = None,
+        conversation_context: dict[str, object] | None = None,
+        memory_context: list[dict[str, object]] | None = None,
+        *,
+        user_id: str | None = None,
+        user_message_id: str | None = None,
+    ) -> NonSopCapabilityRouteResult:
+        """返回完整非 SOP 路由结果，供 B1 委托动态 Agent 且保持旧 tuple 兼容。"""
+
         general_skills = self._list_published_general_skills(model_config.tenant_id, agent_id)
         knowledge_capability = self._knowledge_capability_payload(
             model_config.tenant_id,
@@ -6592,7 +6744,76 @@ class AgentLoop:
                 "non_sop_capability_shadow_decided",
                 self._turn_payload(route.audit_payload(), user_message_id),
             )
-        return route.selected_general_skill, route.general_selection
+        return route
+
+    def _try_handle_dynamic_task(
+        self,
+        request: ChatTurnRequest,
+        chat_session: ChatSession,
+        model_config: ModelConfig,
+        route: NonSopCapabilityRouteResult,
+        user_message_id: str,
+    ) -> ChatTurnResponse | None:
+        """只在独立 kill switch 生效且路由通过时委托 DynamicTaskAgent 完整执行。"""
+
+        decision = route.effective_decision
+        if decision.mode != "dynamic_task":
+            return None
+        if not chat_session.agent_id or not request.user_id:
+            return None
+        dynamic_agent = DynamicTaskAgent(self.db)
+        try:
+            with self.db.begin_nested():
+                instance, created = dynamic_agent.start_task(
+                    tenant_id=request.tenant_id,
+                    session_id=chat_session.id,
+                    agent_id=chat_session.agent_id,
+                    initiator_user_id=request.user_id,
+                    goal=str(decision.goal or ""),
+                    success_criteria=tuple(decision.success_criteria),
+                    model_config=model_config,
+                    source_ref=user_message_id,
+                )
+        except Exception as exc:
+            failure_code = str(getattr(exc, "code", "") or type(exc).__name__)
+            self.events.record(
+                request.tenant_id,
+                chat_session.id,
+                "dynamic_task_delegation_failed",
+                self._turn_payload({"code": failure_code[:128]}, user_message_id),
+            )
+            return None
+        outcome = dynamic_agent.run_until_blocked_or_complete(
+            execution_id=instance.id,
+            model_config=model_config,
+            worker_id=f"chat:{user_message_id}",
+            actor_user_id=request.user_id,
+        )
+        if outcome.status != "succeeded" or outcome.message is None:
+            raise DynamicTaskAgentError("DYNAMIC_TASK_DID_NOT_CLOSE")
+        self.events.record(
+            request.tenant_id,
+            chat_session.id,
+            "dynamic_task_delegated",
+            self._turn_payload(
+                {"execution_id": instance.id, "execution_created": created},
+                user_message_id,
+            ),
+        )
+        self.db.refresh(chat_session)
+        return ChatTurnResponse(
+            reply=outcome.message.content,
+            session_id=chat_session.id,
+            router_decision=RouterDecision(
+                decision="answer_only",
+                reason="DynamicTaskAgent completed a governed read-only execution.",
+            ),
+            step_result=StepAgentResult(
+                reply=outcome.message.content,
+                is_step_completed=True,
+            ),
+            session_state=public_session(chat_session),
+        )
 
     def _select_general_capability(
         self,
