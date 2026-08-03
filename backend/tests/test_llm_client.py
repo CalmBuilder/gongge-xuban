@@ -8,7 +8,13 @@
 
 import pytest
 
-from app.llm.client import LLMClient, LLMError, _thinking_mode_for_model
+from app.llm.client import (
+    PROVIDER_CONTENT_PARTS_KEY,
+    LLMClient,
+    LLMError,
+    _prepare_user_input,
+    _thinking_mode_for_model,
+)
 from app.llm.output_policy import operation_output_tokens
 from app.llm.stage_protocol import TURN_STAGE_MESSAGES_KEY, stage_payload
 from app.llm.schemas import ModelConfigCreateRequest
@@ -40,6 +46,39 @@ class _FakeOpenAIClient:
     def __init__(self) -> None:
         self.responses = _ForbiddenResponses()
         self.chat = _FakeChat()
+
+
+def test_provider_native_parts_are_separated_from_json_and_reject_remote_urls() -> None:
+    """验证动态原生附件成为 user content parts，且远程 URL 不会绕过受管资源边界。"""
+
+    context, content = _prepare_user_input(
+        {
+            "task": {"step": "inspect"},
+            PROVIDER_CONTENT_PARTS_KEY: [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,aGVsbG8="},
+                }
+            ],
+        }
+    )
+    assert context == []
+    assert content[0]["type"] == "text"
+    assert PROVIDER_CONTENT_PARTS_KEY not in content[0]["text"]
+    assert content[1]["image_url"]["url"] == "data:image/png;base64,aGVsbG8="
+
+    with pytest.raises(LLMError, match="native input"):
+        _prepare_user_input(
+            {
+                "task": {},
+                PROVIDER_CONTENT_PARTS_KEY: [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "https://example.test/private.png"},
+                    }
+                ],
+            }
+        )
 
 
 def test_llm_client_uses_600_second_timeout(monkeypatch):
@@ -154,11 +193,56 @@ def test_dynamic_preflight_requires_native_structured_output_and_tool_call() -> 
 
     assert result["structured_output"] is True
     assert result["tool_calling"] is True
+    assert result["vision"] is False
+    assert result["pdf_input"] is False
     assert calls[0]["response_format"] == {"type": "json_object"}
     assert calls[1]["tool_choice"] == {
         "type": "function",
         "function": {"name": "dynamic_capability_probe"},
     }
+
+
+def test_dynamic_preflight_freezes_successful_optional_image_and_pdf_probes() -> None:
+    """验证原生图片/PDF 能力来自真实内容探针结果，而不是按模型名称猜测。"""
+
+    client = object.__new__(LLMClient)
+    client.model = "opaque-model-name"
+    calls = 0
+
+    class Completions:
+        """按四个探针顺序返回核心协议与两种原生输入证据。"""
+
+        def create(self, **kwargs):  # noqa: ANN003, ANN201
+            """根据请求形态返回对应能力探针结果。"""
+
+            nonlocal calls
+            calls += 1
+            if "response_format" in kwargs:
+                return _completion_with_content('{"probe":"ready"}')
+            if "tools" in kwargs:
+                function = type(
+                    "Function", (), {"name": "dynamic_capability_probe", "arguments": "{}"}
+                )()
+                tool_call = type("ToolCall", (), {"function": function})()
+                message = type("Message", (), {"content": None, "tool_calls": [tool_call]})()
+                choice = type("Choice", (), {"message": message})()
+                return type("Completion", (), {"choices": [choice]})()
+            content = kwargs["messages"][0]["content"]
+            if any(part.get("type") == "image_url" for part in content):
+                return _completion_with_content("red")
+            return _completion_with_content("PDFCAP7")
+
+    client.client = type(
+        "Client",
+        (),
+        {"chat": type("Chat", (), {"completions": Completions()})()},
+    )()
+
+    result = client.preflight_dynamic_capabilities()
+
+    assert calls == 4
+    assert result["vision"] is True
+    assert result["pdf_input"] is True
 
 
 def test_dynamic_preflight_rejects_text_instead_of_required_tool_call() -> None:

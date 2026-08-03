@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import ast
+import base64
 from collections.abc import Iterator
 import copy
 import hashlib
@@ -43,6 +44,7 @@ DEFAULT_MODEL_API_TIMEOUT_SECONDS = 600.0
 DEFAULT_INPUT_TOKEN_BUDGET = 32_000
 TURN_STAGE_MESSAGE_MARKER = "_agent_turn_message"
 REASONING_TOKEN_ESCALATION_CEILING = 32_768
+PROVIDER_CONTENT_PARTS_KEY = "_provider_content_parts"
 
 
 def _escalate_reasoning_token_budget(current_max_tokens: int) -> int:
@@ -491,13 +493,82 @@ class LLMClient:
             if isinstance(exc, LLMError):
                 raise
             raise LLMError(_provider_failure_detail(self, exc)) from exc
+        vision, pdf_input = self._probe_optional_dynamic_inputs()
         return {
             "protocol_version": "dynamic-v1",
             "sdk_available": True,
             "credentials_verified": True,
             "structured_output": True,
             "tool_calling": True,
+            "vision": vision,
+            "pdf_input": pdf_input,
         }
+
+    def _probe_optional_dynamic_inputs(self) -> tuple[bool, bool]:
+        """分别实测原生图片与 PDF 输入；可选能力失败只冻结为 false，不影响文本动态协议。"""
+
+        vision = False
+        pdf_input = False
+        vision_request = {
+            "model": self.model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Identify the dominant color in this image with one word.",
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": (
+                                    "data:image/png;base64,"
+                                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwC"
+                                    "AAAAC0lEQVR42mP8/x8AAusB9Y9Z1pAAAAAASUVORK5CYII="
+                                )
+                            },
+                        },
+                    ],
+                }
+            ],
+            "temperature": 0,
+            "max_tokens": 32,
+        }
+        pdf_request = {
+            "model": self.model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Return only the unique token written in this PDF.",
+                        },
+                        {
+                            "type": "file",
+                            "file": {
+                                "filename": "capability-probe.pdf",
+                                "file_data": _dynamic_pdf_probe_data_url(),
+                            },
+                        },
+                    ],
+                }
+            ],
+            "temperature": 0,
+            "max_tokens": 32,
+        }
+        try:
+            completion = self.client.chat.completions.create(**vision_request)
+            vision = "red" in _completion_message_content(completion).lower()
+        except Exception:  # noqa: BLE001 - optional capability failure is a frozen false fact.
+            vision = False
+        try:
+            completion = self.client.chat.completions.create(**pdf_request)
+            pdf_input = "PDFCAP7" in _completion_message_content(completion).upper()
+        except Exception:  # noqa: BLE001 - optional capability failure is a frozen false fact.
+            pdf_input = False
+        return vision, pdf_input
 
     def _generate_json_candidate(
         self,
@@ -532,6 +603,41 @@ def _completion_message_content(completion: Any) -> str:
     except (IndexError, TypeError, AttributeError):
         return ""
     return _content_text(content)
+
+
+def _dynamic_pdf_probe_data_url() -> str:
+    """构造只含随机固定 token 的最小 PDF data URL，供真实 PDF 输入能力探针读取。"""
+
+    stream = b"BT /F1 12 Tf 72 720 Td (PDFCAP7) Tj ET"
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        b"<< /Length "
+        + str(len(stream)).encode("ascii")
+        + b" >>\nstream\n"
+        + stream
+        + b"\nendstream",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ]
+    pdf = bytearray(b"%PDF-1.4\n")
+    offsets = [0]
+    for object_number, body in enumerate(objects, start=1):
+        offsets.append(len(pdf))
+        pdf.extend(f"{object_number} 0 obj\n".encode("ascii"))
+        pdf.extend(body)
+        pdf.extend(b"\nendobj\n")
+    xref_offset = len(pdf)
+    pdf.extend(f"xref\n0 {len(objects) + 1}\n".encode("ascii"))
+    pdf.extend(b"0000000000 65535 f \n")
+    for offset in offsets[1:]:
+        pdf.extend(f"{offset:010d} 00000 n \n".encode("ascii"))
+    pdf.extend(
+        f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n"
+        f"startxref\n{xref_offset}\n%%EOF\n".encode("ascii")
+    )
+    return "data:application/pdf;base64," + base64.b64encode(pdf).decode("ascii")
 
 
 def _request_shape_metrics(
@@ -1243,8 +1349,60 @@ def _prepare_user_input(
         return [], user_payload.strip()
     if isinstance(user_payload.get(STAGE_PROTOCOL_KEY), dict):
         return _prepare_stage_user_input(user_payload)
+    native_parts = user_payload.get(PROVIDER_CONTENT_PARTS_KEY)
+    if native_parts is not None:
+        if not isinstance(native_parts, list) or any(
+            not _valid_provider_native_part(item)
+            for item in native_parts
+        ):
+            raise LLMError("Provider native input parts are invalid")
+        projected_payload = {
+            key: value
+            for key, value in user_payload.items()
+            if key != PROVIDER_CONTENT_PARTS_KEY
+        }
+        serialized = json.dumps(projected_payload, ensure_ascii=False)
+        if not native_parts:
+            return [], serialized
+        return [], [{"type": "text", "text": serialized}, *copy.deepcopy(native_parts)]
     context_messages, projected_payload = _project_context_messages(user_payload)
     return context_messages, json.dumps(projected_payload, ensure_ascii=False)
+
+
+def _valid_provider_native_part(value: object) -> bool:
+    """只允许有界 data URL 图片或 PDF 进入原生 provider part，拒绝远程 URL 与任意块。"""
+
+    if not isinstance(value, dict):
+        return False
+    if value.get("type") == "image_url" and set(value) == {"type", "image_url"}:
+        image = value.get("image_url")
+        if not isinstance(image, dict) or set(image) != {"url"}:
+            return False
+        url = image.get("url")
+        prefixes = (
+            "data:image/png;base64,",
+            "data:image/jpeg;base64,",
+            "data:image/gif;base64,",
+            "data:image/webp;base64,",
+            "data:image/bmp;base64,",
+        )
+        return isinstance(url, str) and url.startswith(prefixes) and len(url) <= 12_000_000
+    if value.get("type") == "file" and set(value) == {"type", "file"}:
+        file_part = value.get("file")
+        if not isinstance(file_part, dict) or set(file_part) != {"filename", "file_data"}:
+            return False
+        filename = file_part.get("filename")
+        data = file_part.get("file_data")
+        return (
+            isinstance(filename, str)
+            and 0 < len(filename) <= 255
+            and "/" not in filename
+            and "\\" not in filename
+            and isinstance(data, str)
+            and data.startswith("data:application/pdf;base64,")
+            and len(data) <= 15_000_000
+        )
+    return False
 
 
 def _prepare_stage_user_input(

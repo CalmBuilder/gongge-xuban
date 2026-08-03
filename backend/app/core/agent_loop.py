@@ -6773,6 +6773,16 @@ class AgentLoop:
                     success_criteria=tuple(decision.success_criteria),
                     model_config=model_config,
                     source_ref=user_message_id,
+                    input_resource_ids=tuple(
+                        item.resource_id
+                        for item in request.attachments
+                        if item.resource_id is not None
+                    ),
+                    knowledge_capability=self._knowledge_capability_payload(
+                        request.tenant_id,
+                        request.user_id,
+                        chat_session.agent_id,
+                    ),
                 )
         except Exception as exc:
             failure_code = str(getattr(exc, "code", "") or type(exc).__name__)
@@ -6800,6 +6810,7 @@ class AgentLoop:
                 user_message_id,
             ),
         )
+        self.db.commit()
         self.db.refresh(chat_session)
         return ChatTurnResponse(
             reply=outcome.message.content,

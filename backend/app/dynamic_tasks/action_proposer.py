@@ -17,6 +17,7 @@ from app.dynamic_tasks.planning import (
     RuntimeActionProposal,
 )
 from app.dynamic_tasks.provider_view import ProviderExecutionView
+from app.llm.client import PROVIDER_CONTENT_PARTS_KEY
 
 
 class CompletedJsonClient(Protocol):
@@ -49,8 +50,11 @@ class DynamicActionProposer:
         raw, metadata = self.client.generate_json_with_metadata(
             _ACTION_SYSTEM_PROMPT,
             {
-                "provider_execution_view": view.model_dump(mode="json"),
+                "provider_execution_view": view.model_dump(
+                    mode="json", exclude={"native_input_parts"}
+                ),
                 "current_step": step.model_dump(mode="json"),
+                PROVIDER_CONTENT_PARTS_KEY: list(view.native_input_parts),
             },
         )
         proposal = RuntimeActionProposal.model_validate(raw)

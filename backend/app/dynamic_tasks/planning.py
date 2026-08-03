@@ -165,10 +165,22 @@ def normalize_plan_draft(
     max_steps: int,
     max_tool_calls: int,
     max_model_calls: int,
+    max_input_tokens: int = 120_000,
+    max_output_tokens: int = 24_000,
+    max_total_tokens: int = 144_000,
+    max_runtime_seconds: int = 900,
 ) -> NormalizedPlan:
     """为草案生成稳定服务端 step key，并以服务端预算覆盖任何模型暗示。"""
 
-    if max_steps < 1 or max_tool_calls < 0 or max_model_calls < 1:
+    if (
+        max_steps < 1
+        or max_tool_calls < 0
+        or max_model_calls < 1
+        or max_input_tokens < 1
+        or max_output_tokens < 1
+        or max_total_tokens < max(max_input_tokens, max_output_tokens)
+        or max_runtime_seconds < 1
+    ):
         raise ValueError("动态计划预算无效")
     if len(draft.steps) > max_steps:
         raise ValueError("动态计划步骤超过服务端预算")
@@ -200,6 +212,10 @@ def normalize_plan_draft(
             "max_steps": max_steps,
             "max_tool_calls": max_tool_calls,
             "max_model_calls": max_model_calls,
+            "max_input_tokens": max_input_tokens,
+            "max_output_tokens": max_output_tokens,
+            "max_total_tokens": max_total_tokens,
+            "max_runtime_seconds": max_runtime_seconds,
         },
     )
 

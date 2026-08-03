@@ -186,7 +186,7 @@ class CapabilityViews(BaseModel):
 class CapabilitySnapshot(BaseModel):
     """保存计划/操作引用的不可变能力事实，不承载持续授权。"""
 
-    capability_type: Literal["tool", "general_skill"]
+    capability_type: Literal["tool", "general_skill", "knowledge"]
     capability_id: str
     tenant_id: str
     agent_id: str

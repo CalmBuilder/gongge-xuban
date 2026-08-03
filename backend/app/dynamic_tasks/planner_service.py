@@ -36,6 +36,10 @@ class DynamicTaskPlanner:
         max_steps: int = 8,
         max_tool_calls: int = 6,
         max_model_calls: int = 12,
+        max_input_tokens: int = 120_000,
+        max_output_tokens: int = 24_000,
+        max_total_tokens: int = 144_000,
+        max_runtime_seconds: int = 900,
     ) -> None:
         """冻结服务端预算；任何 provider 输出都不能扩大这些上限。"""
 
@@ -43,6 +47,10 @@ class DynamicTaskPlanner:
         self.max_steps = max_steps
         self.max_tool_calls = max_tool_calls
         self.max_model_calls = max_model_calls
+        self.max_input_tokens = max_input_tokens
+        self.max_output_tokens = max_output_tokens
+        self.max_total_tokens = max_total_tokens
+        self.max_runtime_seconds = max_runtime_seconds
 
     def create_plan(
         self,
@@ -68,6 +76,10 @@ class DynamicTaskPlanner:
                 "max_steps": self.max_steps,
                 "max_tool_calls": self.max_tool_calls,
                 "max_model_calls": self.max_model_calls,
+                "max_input_tokens": self.max_input_tokens,
+                "max_output_tokens": self.max_output_tokens,
+                "max_total_tokens": self.max_total_tokens,
+                "max_runtime_seconds": self.max_runtime_seconds,
                 "allowed_step_kinds": ["tool.read", "knowledge", "answer", "clarification"],
             },
         }
@@ -83,6 +95,10 @@ class DynamicTaskPlanner:
             max_steps=self.max_steps,
             max_tool_calls=self.max_tool_calls,
             max_model_calls=self.max_model_calls,
+            max_input_tokens=self.max_input_tokens,
+            max_output_tokens=self.max_output_tokens,
+            max_total_tokens=self.max_total_tokens,
+            max_runtime_seconds=self.max_runtime_seconds,
         )
 
 

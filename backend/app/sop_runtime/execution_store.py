@@ -693,6 +693,40 @@ class SopExecutionStore:
         self.db.flush()
         return True
 
+    def consume_attention_proposal(
+        self,
+        instance: SopInstance,
+        proposal: ActionProposalRecord,
+        *,
+        attention_id: str,
+    ) -> bool:
+        """将等待输入提案绑定到同 Execution 的 Attention，不伪造工具 Operation。"""
+
+        if proposal.tenant_id != instance.tenant_id or proposal.execution_id != instance.id:
+            raise SopExecutionConflictError("等待提案与 Execution 归属不一致。")
+        attention = self.db.get(SopWorkItem, attention_id)
+        if (
+            attention is None
+            or attention.tenant_id != instance.tenant_id
+            or attention.instance_id != instance.id
+        ):
+            raise SopExecutionConflictError("等待提案只能绑定同一 Execution 的 Attention。")
+        if proposal.status == "consumed":
+            if proposal.causation_id != attention_id:
+                raise SopExecutionConflictError("已消费等待提案不得改绑另一 Attention。")
+            return False
+        if proposal.status != "validated" or proposal.normalized_proposal_json.get(
+            "action_kind"
+        ) not in {"wait_input", "wait_attention"}:
+            raise SopExecutionConflictError("只有 validated 等待提案可消费为 Attention。")
+        self._guard_mutation(instance, "proposal.consume_attention")
+        proposal.status = "consumed"
+        proposal.causation_id = attention_id
+        proposal.consumed_at = utc_now()
+        self.db.add(proposal)
+        self.db.flush()
+        return True
+
     def snapshot_input_resource(
         self,
         instance: SopInstance,

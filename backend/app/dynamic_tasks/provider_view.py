@@ -48,6 +48,7 @@ class ProviderExecutionView(BaseModel):
     protocol_version: Literal["dynamic-v1"] = "dynamic-v1"
     execution_context: dict[str, Any]
     messages: tuple[ProviderMessage, ...]
+    native_input_parts: tuple[dict[str, Any], ...] = ()
 
 
 def build_provider_execution_view(
@@ -57,6 +58,7 @@ def build_provider_execution_view(
     model_capabilities: Mapping[str, object],
     compacted_messages: Sequence[Mapping[str, object]] | None = None,
     interrupted_action_ids: Set[str] | None = None,
+    native_input_parts: Sequence[Mapping[str, object]] = (),
 ) -> ProviderExecutionView:
     """验证 canonical 历史并生成 provider view，压缩仅替换对话而不替换执行事实。"""
 
@@ -80,6 +82,7 @@ def build_provider_execution_view(
     return ProviderExecutionView(
         execution_context=context,
         messages=(context_message, *outbound),
+        native_input_parts=tuple(dict(item) for item in native_input_parts),
     )
 
 

@@ -232,9 +232,11 @@ def test_agent_loop_delegates_effective_dynamic_route_without_copying_loop(monke
     loop = object.__new__(AgentLoop)
     loop.db = SimpleNamespace(
         refresh=lambda _row: None,
+        commit=lambda: None,
         begin_nested=lambda: nullcontext(),
     )
     loop.events = SimpleNamespace(record=lambda *_args, **_kwargs: None)
+    loop._knowledge_capability_payload = lambda *_args: {"available": False}
     session = ChatSession(
         id="session_dynamic",
         tenant_id="tenant_demo",

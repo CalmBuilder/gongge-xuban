@@ -93,5 +93,13 @@ def test_planner_only_discloses_model_view_and_freezes_server_contract() -> None
     assert "authorization" not in str(client.payload)
     assert plan.goal == "生成续约风险简报"
     assert plan.success_criteria == (criterion,)
-    assert plan.budget == {"max_steps": 4, "max_tool_calls": 2, "max_model_calls": 5}
+    assert plan.budget == {
+        "max_steps": 4,
+        "max_tool_calls": 2,
+        "max_model_calls": 5,
+        "max_input_tokens": 120_000,
+        "max_output_tokens": 24_000,
+        "max_total_tokens": 144_000,
+        "max_runtime_seconds": 900,
+    }
     assert plan.steps[0].step_key.startswith("step_01_")

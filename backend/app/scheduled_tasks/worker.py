@@ -17,6 +17,7 @@ from sqlmodel import Session
 
 from app.db import engine, init_db
 from app.db.seed import seed_demo_data
+from app.dynamic_tasks.worker import due_dynamic_task_signals, process_dynamic_task_signal
 from app.scheduled_tasks.service import (
     WORKER_SLEEP_SECONDS,
     due_scheduled_tasks,
@@ -48,6 +49,8 @@ def run_worker(*, once: bool = False, poll_seconds: float = WORKER_SLEEP_SECONDS
             due = due_scheduled_tasks(db)
             for task in due:
                 execute_scheduled_task(db, task)
+            for dynamic_signal in due_dynamic_task_signals(db):
+                process_dynamic_task_signal(db, dynamic_signal)
             expired_work_items = SopWorkItemService(db).expire_due()
             coordinator = DeterministicSopCoordinator(db)
             for work_item in expired_work_items:
