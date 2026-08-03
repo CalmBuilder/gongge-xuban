@@ -186,12 +186,14 @@ class NonSopCapabilityRouter:
         self,
         *,
         shadow_enabled: bool,
+        execution_enabled: bool = False,
         shadow_selector: DynamicTaskShadowSelector,
         minimum_confidence: float = 0.7,
     ) -> None:
-        """冻结进程级开关、shadow 选择器和最低采信置信度。"""
+        """冻结 shadow/执行 kill switch、选择器和最低采信置信度。"""
 
         self.shadow_enabled = bool(shadow_enabled)
+        self.execution_enabled = bool(execution_enabled)
         self.shadow_selector = shadow_selector
         self.minimum_confidence = min(1.0, max(0.0, float(minimum_confidence)))
 
@@ -232,7 +234,7 @@ class NonSopCapabilityRouter:
                 update={"use_general_skill": False, "selected_slug": None}
             )
         effective = self._effective_decision(selection, selected_skill)
-        if not self.shadow_enabled:
+        if not self.shadow_enabled and not self.execution_enabled:
             return NonSopCapabilityRouteResult(
                 selected_general_skill=selected_skill,
                 general_selection=selection,
@@ -273,6 +275,11 @@ class NonSopCapabilityRouter:
                 failure_code="dynamic_shadow_failed",
             )
         duration_ms = (perf_counter() - started) * 1000
+        effective = (
+            shadow
+            if self.execution_enabled and shadow.mode == "dynamic_task"
+            else effective
+        )
         return NonSopCapabilityRouteResult(
             selected_general_skill=None,
             general_selection=selection,

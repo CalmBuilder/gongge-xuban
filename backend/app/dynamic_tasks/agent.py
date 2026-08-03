@@ -8,14 +8,17 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Protocol
 
 from sqlmodel import Session, select
 
-from app.db.models import SopInstance, SopNodeExecution, SopOperation
+from app.db.models import ModelConfig, SopInstance, SopNodeExecution, SopOperation
 from app.dynamic_tasks.capability_catalog import CapabilitySnapshot, DynamicCapabilityCatalog
-from app.dynamic_tasks.planning import CompletedProviderProposal
+from app.dynamic_tasks.planner_service import DynamicTaskPlanner
+from app.dynamic_tasks.planning import CompletedProviderProposal, SuccessCriterion
 from app.dynamic_tasks.provider_view import require_dynamic_preflight
+from app.llm.client import LLMClient
 from app.sop_runtime.execution_store import SopExecutionStore
 from app.tools.tool_executor import ToolExecutor
 from app.tools.tool_schema import ToolCall, ToolResult
@@ -50,6 +53,7 @@ class DynamicTaskAgent:
         *,
         catalog: DynamicCapabilityCatalog | None = None,
         tool_executor: DynamicToolExecutor | None = None,
+        planner: DynamicTaskPlanner | None = None,
     ) -> None:
         """绑定统一事务、能力目录和既有工具执行器，禁止创建第二套 Runtime。"""
 
@@ -57,6 +61,76 @@ class DynamicTaskAgent:
         self.store = SopExecutionStore(db)
         self.catalog = catalog or DynamicCapabilityCatalog(db)
         self.tool_executor = tool_executor or ToolExecutor(db)
+        self.planner = planner
+
+    def start_task(
+        self,
+        *,
+        tenant_id: str,
+        session_id: str,
+        agent_id: str,
+        initiator_user_id: str,
+        goal: str,
+        success_criteria: Sequence[str],
+        model_config: ModelConfig,
+        source_ref: str | None = None,
+    ) -> tuple[SopInstance, bool]:
+        """经模型 preflight、实时能力目录和有界规划创建或复用统一动态 Execution。"""
+
+        verified_model = self.catalog.require_dynamic_model(tenant_id, model_config.id)
+        capabilities = [
+            *self.catalog.list_tools(tenant_id, agent_id),
+            *self.catalog.list_general_skills(tenant_id, agent_id),
+        ]
+        if not capabilities:
+            raise DynamicTaskAgentError("DYNAMIC_CAPABILITY_EMPTY")
+        criteria = tuple(
+            SuccessCriterion(
+                id=f"criterion_{index:02d}",
+                type="assertion",
+                spec={"description": value, "required": True},
+            )
+            for index, value in enumerate(success_criteria, start=1)
+            if str(value).strip()
+        )
+        if not goal.strip() or not criteria:
+            raise DynamicTaskAgentError("DYNAMIC_TASK_CONTRACT_INCOMPLETE")
+        planner = self.planner or DynamicTaskPlanner(LLMClient(verified_model))
+        plan = planner.create_plan(
+            goal=goal.strip(),
+            success_criteria=criteria,
+            capabilities=capabilities,
+        )
+        snapshot = {
+            "tools": [
+                item.model_dump(mode="json")
+                for item in capabilities
+                if item.capability_type == "tool"
+            ],
+            "general_skills": [
+                item.model_dump(mode="json")
+                for item in capabilities
+                if item.capability_type == "general_skill"
+            ],
+            "model": {
+                "model_config_id": verified_model.id,
+                "capabilities": dict(verified_model.capability_snapshot_json or {}),
+                "checksum": verified_model.capability_checksum,
+            },
+        }
+        existing = self.store.active_instance(tenant_id, session_id)
+        instance, _revision = self.store.start_dynamic_instance(
+            tenant_id=tenant_id,
+            session_id=session_id,
+            agent_id=agent_id,
+            initiator_user_id=initiator_user_id,
+            plan=plan,
+            capability_snapshot=snapshot,
+            source_kind="chat",
+            source_ref=source_ref or session_id,
+        )
+        self.db.flush()
+        return instance, existing is None
 
     def execute_read_proposal(
         self,

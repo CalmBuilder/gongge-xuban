@@ -104,6 +104,7 @@ def test_dynamic_task_router_shadow_is_safe_by_default(monkeypatch) -> None:
     settings = Settings(_env_file=None, public_mock_api_key="test-key")
 
     assert settings.dynamic_task_router_shadow_enabled is False
+    assert settings.dynamic_task_execution_enabled is False
     assert settings.dynamic_task_router_shadow_timeout_seconds == 2.0
     assert settings.dynamic_task_router_shadow_min_confidence == 0.7
 

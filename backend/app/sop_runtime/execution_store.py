@@ -131,6 +131,11 @@ class SopExecutionStore:
 
         return self._database_now()
 
+    def active_instance(self, tenant_id: str, session_id: str) -> SopInstance | None:
+        """按 tenant/session 返回统一活动槽中的 Execution，供入口做幂等结果标记。"""
+
+        return self._active_instance(tenant_id, session_id)
+
     @contextmanager
     def owned(
         self,

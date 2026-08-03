@@ -11,7 +11,7 @@ from __future__ import annotations
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from app.db.models import SopOperation
+from app.db.models import ModelConfig, SopOperation
 from app.dynamic_tasks.agent import DynamicTaskAgent, DynamicTaskAgentError
 from app.dynamic_tasks.capability_catalog import CapabilitySnapshot, capability_checksum
 from app.dynamic_tasks.planning import (
@@ -56,6 +56,53 @@ class _Executor:
             tool_name=tool_call.name,
             success=True,
             data={"contracts": ["C-001"]},
+        )
+
+
+class _StartCatalog(_Catalog):
+    """为创建入口提供冻结模型和只读能力目录。"""
+
+    def __init__(self, model: ModelConfig, snapshot: CapabilitySnapshot) -> None:
+        super().__init__()
+        self.model = model
+        self.snapshot = snapshot
+
+    def require_dynamic_model(self, tenant_id: str, model_config_id: str) -> ModelConfig:
+        """返回测试中已通过 preflight 的同租户模型。"""
+
+        assert tenant_id == self.model.tenant_id
+        assert model_config_id == self.model.id
+        return self.model
+
+    def list_tools(self, tenant_id: str, agent_id: str) -> list[CapabilitySnapshot]:
+        """返回一个已发布 read 工具。"""
+
+        return [self.snapshot]
+
+    def list_general_skills(self, tenant_id: str, agent_id: str) -> list[CapabilitySnapshot]:
+        """本测试不提供规划指南。"""
+
+        return []
+
+
+class _Planner:
+    """记录服务端任务契约并返回固定有界计划。"""
+
+    def create_plan(self, *, goal, success_criteria, capabilities, input_resources=()):
+        """按入口传入的目标和成功标准构造规范计划。"""
+
+        return NormalizedPlan(
+            goal=goal,
+            success_criteria=tuple(success_criteria),
+            steps=(
+                PlanStep(
+                    step_key="query_contract",
+                    title="读取合同",
+                    kind="tool.read",
+                    capability_refs=("contract.query",),
+                ),
+            ),
+            budget={"max_steps": 4},
         )
 
 
@@ -238,3 +285,54 @@ def test_plan_draft_receives_stable_server_keys_and_bounded_budget() -> None:
     assert first.steps[0].step_key.startswith("step_01_")
     assert first.steps[1].depends_on == (first.steps[0].step_key,)
     assert first.budget == {"max_steps": 4, "max_tool_calls": 2, "max_model_calls": 4}
+
+
+def test_start_task_uses_preflight_catalog_and_reuses_same_active_execution() -> None:
+    """验证动态入口只从已验证模型/实时目录建计划，相同请求不会产生第二个活动实例。"""
+
+    engine = create_engine("sqlite://", poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as db:
+        capabilities = _model_capabilities()
+        model = ModelConfig(
+            id="model_demo",
+            tenant_id="tenant_demo",
+            name="动态模型",
+            api_key_encrypted="encrypted",
+            model="model-demo",
+            capability_snapshot_json=capabilities,
+            capability_checksum=capability_checksum(capabilities),
+            preflight_status="ready",
+        )
+        db.add(model)
+        db.flush()
+        snapshot = _snapshot()
+        agent = DynamicTaskAgent(
+            db,
+            catalog=_StartCatalog(model, snapshot),
+            tool_executor=_Executor(),
+            planner=_Planner(),
+        )
+        first, created = agent.start_task(
+            tenant_id="tenant_demo",
+            session_id="session_start",
+            agent_id="agent_demo",
+            initiator_user_id="user_demo",
+            goal="生成续约风险简报",
+            success_criteria=("覆盖合同证据",),
+            model_config=model,
+        )
+        second, repeated_created = agent.start_task(
+            tenant_id="tenant_demo",
+            session_id="session_start",
+            agent_id="agent_demo",
+            initiator_user_id="user_demo",
+            goal="生成续约风险简报",
+            success_criteria=("覆盖合同证据",),
+            model_config=model,
+        )
+
+        assert created is True
+        assert repeated_created is False
+        assert second.id == first.id
+        assert first.goal_snapshot_json["success_criteria"][0]["id"] == "criterion_01"

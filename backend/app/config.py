@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     model_thinking_mode: str = ""
     model_thinking_models: str = ""
     dynamic_task_router_shadow_enabled: bool = False
+    dynamic_task_execution_enabled: bool = False
     dynamic_task_router_shadow_timeout_seconds: float = Field(default=2.0, ge=0.1, le=30.0)
     dynamic_task_router_shadow_min_confidence: float = Field(default=0.7, ge=0.0, le=1.0)
     tool_timeout_seconds: float = 8.0

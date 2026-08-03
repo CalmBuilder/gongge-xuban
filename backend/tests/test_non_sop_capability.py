@@ -162,6 +162,32 @@ def test_dynamic_task_is_shadow_only_in_batch_a() -> None:
     assert result.execution_created is False
 
 
+def test_dynamic_task_becomes_effective_only_with_separate_execution_kill_switch() -> None:
+    """验证 B1 执行开关与 shadow 开关分离，只有高置信完整任务可成为权威选择。"""
+
+    result = _route(
+        NonSopCapabilityRouter(
+            shadow_enabled=False,
+            execution_enabled=True,
+            shadow_selector=_ShadowSelector(
+                NonSopCapabilityDecision(
+                    mode="dynamic_task",
+                    goal="生成风险简报",
+                    success_criteria=["覆盖合同证据"],
+                    requires_durable_execution=True,
+                    confidence=0.93,
+                )
+            ),
+            minimum_confidence=0.7,
+        ),
+        _GeneralSelector(GeneralSkillSelection()),
+    )
+
+    assert result.effective_decision.mode == "dynamic_task"
+    assert result.shadow_decision is not None
+    assert result.execution_created is False
+
+
 def test_low_confidence_dynamic_shadow_degrades_to_answer() -> None:
     """低置信度动态提案必须收敛为 answer 并留下结构化失败码。"""
 

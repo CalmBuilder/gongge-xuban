@@ -283,6 +283,7 @@ class AgentLoop:
         self.general_skill_selector = GeneralSkillSelector()
         self.non_sop_capability_router = NonSopCapabilityRouter(
             shadow_enabled=settings.dynamic_task_router_shadow_enabled,
+            execution_enabled=settings.dynamic_task_execution_enabled,
             shadow_selector=LlmDynamicTaskShadowSelector(
                 settings.dynamic_task_router_shadow_timeout_seconds
             ),
