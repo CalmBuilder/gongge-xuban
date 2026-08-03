@@ -29,6 +29,10 @@ from app.db.models import (
     SopWorkItem,
     Tool,
 )
+from app.dynamic_tasks.capability_catalog import (
+    ToolReliabilityContract,
+    published_tool_snapshot,
+)
 from app.session.session_schema import KnowledgeQuery, StepAgentResult
 from app.sop_runtime.capabilities import DEFAULT_CAPABILITY_REGISTRY
 from app.sop_runtime.definition import CollectInputNode, HumanTaskNode
@@ -37,6 +41,7 @@ from app.sop_runtime.execution_store import (
     ExecutionLease,
     SopExecutionStore,
 )
+from app.sop_runtime.contracts import IdempotencyPolicy, IdempotencyScope
 from app.sop_runtime.explicit_confirmation import resolve_explicit_confirmation_slots
 from app.sop_runtime.identity_context import (
     SopIdentityContextError,
@@ -1053,6 +1058,13 @@ class DeterministicSopCoordinator:
                     )
                 return plan
             if plan.action is RuntimeAction.CALL_TOOL and plan.operation_name:
+                capability_snapshot, capability_snapshot_checksum, idempotency_policy = (
+                    self._operation_capability_contract(
+                        instance.tenant_id,
+                        plan.operation_name,
+                        chat_session.agent_id,
+                    )
+                )
                 operation, _created = self.store.prepare_operation(
                     instance,
                     current_execution,
@@ -1062,6 +1074,9 @@ class DeterministicSopCoordinator:
                         instance.tenant_id,
                         plan.operation_name,
                     ),
+                    idempotency_policy=idempotency_policy,
+                    capability_snapshot=capability_snapshot,
+                    capability_snapshot_checksum=capability_snapshot_checksum,
                 )
                 if operation.status == "prepared":
                     self.store.start_operation(operation)
@@ -1237,16 +1252,57 @@ class DeterministicSopCoordinator:
         return operation.remote_idempotency_key if operation is not None else None
 
     def _operation_effect_kind(self, tenant_id: str, operation_name: str) -> str:
-        """仅把知识检索和明确 HTTP GET 视为读取，其余工具保守归类为外部写。"""
+        """优先采用已发布风险契约，无契约 SOP 仍保持旧 GET/保守写兼容。"""
 
         if operation_name == "knowledge.search":
             return "read"
         tool = self.db.exec(
             select(Tool).where(Tool.tenant_id == tenant_id, Tool.name == operation_name)
         ).first()
+        if tool is not None and tool.reliability_contract_json:
+            try:
+                contract = ToolReliabilityContract.model_validate(
+                    tool.reliability_contract_json
+                )
+                return "read" if contract.risk_class == "read" else "external_write"
+            except (TypeError, ValueError):
+                return "external_write"
         if tool is not None and (tool.tool_type or "http") == "http" and tool.method.upper() == "GET":
             return "read"
         return "external_write"
+
+    def _operation_capability_contract(
+        self,
+        tenant_id: str,
+        operation_name: str,
+        agent_id: str | None,
+    ) -> tuple[dict[str, object], str | None, IdempotencyPolicy | None]:
+        """冻结已发布工具契约，并将其远端幂等语义映射到可靠 Operation。"""
+
+        tool = self.db.exec(
+            select(Tool).where(Tool.tenant_id == tenant_id, Tool.name == operation_name)
+        ).first()
+        if tool is None:
+            return {}, None, None
+        snapshot = published_tool_snapshot(tool, agent_id or "")
+        if snapshot is None:
+            return {}, None, None
+        contract = ToolReliabilityContract.model_validate(tool.reliability_contract_json)
+        snapshot_payload = snapshot.model_dump(
+            mode="json", exclude={"checksum", "agent_id"}
+        )
+        mode = contract.idempotency.mode
+        if mode == "none":
+            policy = IdempotencyPolicy(required=False)
+        elif mode == "business_key":
+            policy = IdempotencyPolicy(
+                required=True,
+                scope=IdempotencyScope.BUSINESS,
+                key_fields=(str(contract.idempotency.argument),),
+            )
+        else:
+            policy = IdempotencyPolicy(required=True, scope=IdempotencyScope.INSTANCE)
+        return snapshot_payload, snapshot.checksum, policy
 
     @staticmethod
     def _is_ambiguous_external_failure(code: str, message: str) -> bool:

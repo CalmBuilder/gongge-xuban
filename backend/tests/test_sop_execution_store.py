@@ -520,6 +520,49 @@ def test_same_logical_action_rejects_idempotency_required_policy_drift() -> None
                 )
 
 
+def test_operation_freezes_capability_snapshot_and_rejects_revision_drift() -> None:
+    """验证 Operation 保存规范能力快照/checksum，同一逻辑动作不得换契约。"""
+
+    with _test_session() as db:
+        store = SopExecutionStore(db)
+        instance = _start(store)
+        first_snapshot = {
+            "capability_type": "tool",
+            "capability_id": "tool_submit",
+            "contract": {"risk_class": "external_write", "timeout_policy": "unknown"},
+        }
+        with store.owned(instance, worker_id="worker-test"):
+            execution = store.enter_node(instance, "submit", input_snapshot={})
+            operation, _ = store.prepare_operation(
+                instance,
+                execution,
+                operation_name="expense.submit",
+                request={"request_id": "REQ-1"},
+                logical_action_id="action-capability-snapshot",
+                effect_kind="external_write",
+                capability_snapshot=first_snapshot,
+            )
+            assert operation.capability_snapshot_json == first_snapshot
+            assert operation.capability_checksum is not None
+
+            with pytest.raises(SopExecutionConflictError, match="策略或效果契约"):
+                store.prepare_operation(
+                    instance,
+                    execution,
+                    operation_name="expense.submit",
+                    request={"request_id": "REQ-1"},
+                    logical_action_id="action-capability-snapshot",
+                    effect_kind="external_write",
+                    capability_snapshot={
+                        **first_snapshot,
+                        "contract": {
+                            "risk_class": "external_write",
+                            "timeout_policy": "failed",
+                        },
+                    },
+                )
+
+
 @pytest.mark.parametrize(
     "payload",
     (

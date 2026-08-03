@@ -35,6 +35,7 @@ from app.agents.branching import (
 )
 from app.db import get_session
 from app.db.models import AgentResourceBinding, GeneralSkill, ModelConfig, User, utc_now
+from app.dynamic_tasks.capability_catalog import capability_checksum
 from app.general_skills import (
     GeneralSkillClawHubImportRequest,
     GeneralSkillImportRequest,
@@ -92,6 +93,13 @@ def general_skill_read(row: GeneralSkill, status_override: str | None = None) ->
         status=status_override or row.status,
         permissions=row.permissions_json or {},
         runtime_config=row.runtime_config_json or {},
+        usage_mode=row.usage_mode,
+        capability_checksum=row.planning_guidance_checksum,
+        capability_published_at=(
+            row.planning_guidance_published_at.isoformat()
+            if row.planning_guidance_published_at
+            else None
+        ),
         created_at=row.created_at.isoformat(),
         updated_at=row.updated_at.isoformat(),
     )
@@ -191,7 +199,11 @@ def import_general_skill(
         row.skill_markdown = markdown
         row.skill_files_json = [file.model_dump(mode="json") for file in files]
         row.metadata_json = metadata
-        row.status = request.status
+        row.usage_mode = request.usage_mode
+        row.status = (
+            "draft" if request.usage_mode == "planning_guidance" else request.status
+        )
+        _clear_general_skill_snapshot(row)
         row.updated_at = now
     else:
         row = GeneralSkill(
@@ -203,7 +215,10 @@ def import_general_skill(
             skill_markdown=markdown,
             skill_files_json=[file.model_dump(mode="json") for file in files],
             metadata_json=metadata,
-            status=request.status,
+            status=(
+                "draft" if request.usage_mode == "planning_guidance" else request.status
+            ),
+            usage_mode=request.usage_mode,
             permissions_json={"network": True, "python": True},
             runtime_config_json={"runtime": "python", "timeout_seconds": 12},
             created_at=now,
@@ -215,6 +230,8 @@ def import_general_skill(
         mark_resource_open_gallery(row, metadata)
     db.add(row)
     db.flush()
+    if row.usage_mode == "atomic_execution" and row.status == "published":
+        _publish_general_skill_snapshot(row)
     if is_private_agent_scope:
         ensure_private_resource_binding(
             db,
@@ -222,7 +239,7 @@ def import_general_skill(
             agent.id,
             "general_skill",
             row.id,
-            "active" if request.status == "published" else "inactive",
+            "active" if row.status == "published" else "inactive",
             metadata_json=metadata,
         )
     else:
@@ -231,7 +248,7 @@ def import_general_skill(
             request.tenant_id,
             "general_skill",
             row.id,
-            "active" if request.status == "published" else "inactive",
+            "active" if row.status == "published" else "inactive",
             metadata_json=metadata,
         )
     db.commit()
@@ -379,6 +396,8 @@ def _create_imported_general_skill(
         mark_resource_open_gallery(row, row.metadata_json or {})
     db.add(row)
     db.flush()
+    if row.status == "published":
+        _publish_general_skill_snapshot(row)
     if agent and not agent.is_overall:
         ensure_private_resource_binding(
             db,
@@ -490,6 +509,11 @@ def publish_general_skill(
     agent_id = _agent_id_or_none(agent_id)
     agent = ensure_agent_scope_manager(db, tenant_id, agent_id, current_user)
     if agent and not agent.is_overall:
+        if not is_open_gallery_resource(db, tenant_id, "general_skill", row):
+            _publish_general_skill_snapshot(row)
+            row.status = "published"
+            row.updated_at = utc_now()
+            db.add(row)
         binding = _ensure_general_skill_binding(
             db,
             tenant_id,
@@ -503,6 +527,7 @@ def publish_general_skill(
         db.commit()
         return general_skill_read(row, status_override="published")
     ensure_open_gallery_admin(tenant_id, current_user)
+    _publish_general_skill_snapshot(row)
     row.status = "published"
     mark_resource_open_gallery(row, row.metadata_json or {})
     row.updated_at = utc_now()
@@ -519,6 +544,41 @@ def publish_general_skill(
     db.commit()
     db.refresh(row)
     return general_skill_read(row)
+
+
+def _general_skill_capability_snapshot(row: GeneralSkill) -> dict[str, object]:
+    """生成不含运行时授权的通用技能规范快照，供 PlanRevision 冻结。"""
+
+    return {
+        "schema_version": "1",
+        "id": row.id,
+        "tenant_id": row.tenant_id,
+        "slug": row.slug,
+        "name": row.name,
+        "description": row.description,
+        "usage_mode": row.usage_mode,
+        "skill_markdown": row.skill_markdown,
+        "skill_files": list(row.skill_files_json or []),
+        "permissions": dict(row.permissions_json or {}),
+        "runtime_config": dict(row.runtime_config_json or {}),
+    }
+
+
+def _publish_general_skill_snapshot(row: GeneralSkill) -> None:
+    """发布当前技能规范并生成稳定 checksum，不把 enabled/binding 冻结成授权。"""
+
+    snapshot = _general_skill_capability_snapshot(row)
+    row.planning_guidance_json = snapshot
+    row.planning_guidance_checksum = capability_checksum(snapshot)
+    row.planning_guidance_published_at = utc_now()
+
+
+def _clear_general_skill_snapshot(row: GeneralSkill) -> None:
+    """内容或使用模式变更时撤销旧发布快照，避免 checksum 与当前内容错配。"""
+
+    row.planning_guidance_json = {}
+    row.planning_guidance_checksum = None
+    row.planning_guidance_published_at = None
 
 
 @router.post("/{slug}/archive", response_model=GeneralSkillRead)

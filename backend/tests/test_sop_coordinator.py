@@ -22,10 +22,13 @@ from app.db.models import (
     SopInstance,
     SopNodeExecution,
     SopOperation,
+    Tool,
 )
+from app.dynamic_tasks.capability_catalog import ToolReliabilityContract, publish_tool_contract
 from app.knowledge.schema import KnowledgeSearchResponse
 from app.session.session_schema import ChatTurnRequest, RouterDecision, StepAgentResult
 from app.sop_runtime.coordinator import DeterministicSopCoordinator
+from app.sop_runtime.contracts import IdempotencyScope
 from app.sop_runtime.legacy_skill_card_adapter import compile_legacy_skill_card
 from app.sop_runtime.scheduler import RuntimeAction
 from app.tools.tool_schema import ToolCall, ToolResult
@@ -98,6 +101,59 @@ def _content() -> dict[str, object]:
         "start_node_id": "collect_employee",
         "terminal_node_ids": ["reply_result"],
     }
+
+
+def test_coordinator_prefers_published_contract_over_http_method_inference() -> None:
+    """验证已发布契约会冻结到 Operation，且 GET 字面不能覆盖显式外部写语义。"""
+
+    with _test_session() as db:
+        tool = Tool(
+            id="tool_external",
+            tenant_id="tenant_demo",
+            name="external.submit",
+            method="GET",
+            url="https://example.invalid/submit",
+        )
+        contract = ToolReliabilityContract.model_validate(
+            {
+                "risk_class": "external_write",
+                "side_effect": "external",
+                "confirmation_policy": "once",
+                "idempotency": {
+                    "mode": "request_key",
+                    "argument": None,
+                    "remote_scope": "tenant/external.submit",
+                },
+                "reconcile": {
+                    "supported": False,
+                    "tool_name": None,
+                    "reference_source": None,
+                    "terminal_status_mapping": {},
+                },
+                "model_visibility": {
+                    "allowed_paths": [],
+                    "user_display_paths": [],
+                    "audit_only_paths": [],
+                },
+                "timeout_policy": "unknown",
+                "dynamic_task_enabled": False,
+            }
+        )
+        publish_tool_contract(tool, contract)
+        db.add(tool)
+        db.commit()
+        coordinator = DeterministicSopCoordinator(db)
+
+        snapshot, checksum, policy = coordinator._operation_capability_contract(
+            "tenant_demo", "external.submit", "agent_demo"
+        )
+
+        assert coordinator._operation_effect_kind("tenant_demo", "external.submit") == (
+            "external_write"
+        )
+        assert snapshot["contract"]["risk_class"] == "external_write"
+        assert checksum == tool.reliability_checksum
+        assert policy is not None and policy.scope is IdempotencyScope.INSTANCE
 
 
 def _knowledge_content() -> dict[str, object]:

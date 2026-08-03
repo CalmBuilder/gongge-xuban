@@ -120,6 +120,70 @@ def test_model_config_create_defaults_to_8192_output_tokens():
     assert request.extra_body == {}
 
 
+def test_dynamic_preflight_requires_native_structured_output_and_tool_call() -> None:
+    """验证动态预检分别发送 JSON mode 和强制工具调用探针。"""
+
+    client = object.__new__(LLMClient)
+    client.model = "demo-model"
+    calls: list[dict[str, object]] = []
+
+    class Completions:
+        """按调用顺序返回结构化对象与工具调用。"""
+
+        def create(self, **kwargs):  # noqa: ANN003, ANN201
+            """记录探针请求并返回最小 OpenAI 兼容回复。"""
+
+            calls.append(kwargs)
+            if "response_format" in kwargs:
+                return _completion_with_content('{"probe":"ready"}')
+            function = type(
+                "Function", (), {"name": "dynamic_capability_probe", "arguments": "{}"}
+            )()
+            tool_call = type("ToolCall", (), {"function": function})()
+            message = type("Message", (), {"content": None, "tool_calls": [tool_call]})()
+            choice = type("Choice", (), {"message": message})()
+            return type("Completion", (), {"choices": [choice]})()
+
+    client.client = type(
+        "Client",
+        (),
+        {"chat": type("Chat", (), {"completions": Completions()})()},
+    )()
+
+    result = client.preflight_dynamic_capabilities()
+
+    assert result["structured_output"] is True
+    assert result["tool_calling"] is True
+    assert calls[0]["response_format"] == {"type": "json_object"}
+    assert calls[1]["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "dynamic_capability_probe"},
+    }
+
+
+def test_dynamic_preflight_rejects_text_instead_of_required_tool_call() -> None:
+    """验证 provider 即使支持 JSON，未返回强制工具调用仍不可用。"""
+
+    client = object.__new__(LLMClient)
+    client.model = "demo-model"
+    responses = iter(
+        [_completion_with_content('{"probe":"ready"}'), _completion_with_content("done")]
+    )
+    completions = type(
+        "Completions",
+        (),
+        {"create": lambda self, **kwargs: next(responses)},  # noqa: ARG005
+    )()
+    client.client = type(
+        "Client",
+        (),
+        {"chat": type("Chat", (), {"completions": completions})()},
+    )()
+
+    with pytest.raises(LLMError, match="no required tool call"):
+        client.preflight_dynamic_capabilities()
+
+
 def _completion_with_content(content):  # noqa: ANN001
     return type(
         "Completion",

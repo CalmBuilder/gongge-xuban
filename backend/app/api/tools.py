@@ -29,6 +29,11 @@ from app.agents.branching import (
 from app.config import get_settings
 from app.db import get_session
 from app.db.models import AgentProfile, AgentResourceBinding, MCPServer, Tool, User, utc_now
+from app.dynamic_tasks.capability_catalog import (
+    ToolReliabilityContract,
+    publish_tool_contract,
+    schema_path_exists,
+)
 from app.security.auth import ensure_current_user_tenant, get_current_user
 from app.security.permissions import (
     ensure_agent_scope_manager,
@@ -90,6 +95,15 @@ def tool_read(row: Tool, metadata: dict[str, Any] | None = None) -> ToolRead:
         allowed_skills=row.allowed_skills_json or [],
         required_permission_code=row.required_permission_code,
         permission_authorization_mode=row.permission_authorization_mode,
+        reliability_contract=(
+            ToolReliabilityContract.model_validate(row.reliability_contract_json)
+            if row.reliability_contract_json
+            else None
+        ),
+        reliability_checksum=row.reliability_checksum,
+        reliability_published_at=(
+            row.reliability_published_at.isoformat() if row.reliability_published_at else None
+        ),
         mcp_server_id=row.mcp_server_id,
         enabled=row.enabled,
         metadata=dict(metadata or {}),
@@ -178,6 +192,8 @@ def create_tool(
     )
     db.add(row)
     db.flush()
+    _validate_reliability_contract(db, row, request.reliability_contract)
+    publish_tool_contract(row, request.reliability_contract)
     creator_metadata = user_creator_metadata(current_user)
     if agent and not agent.is_overall:
         ensure_private_resource_binding(
@@ -341,6 +357,17 @@ def update_tool(
     row.permission_authorization_mode = request.permission_authorization_mode
     row.enabled = request.enabled
     row.updated_at = utc_now()
+    requested_contract = (
+        request.reliability_contract
+        if "reliability_contract" in request.model_fields_set
+        else (
+            ToolReliabilityContract.model_validate(row.reliability_contract_json)
+            if row.reliability_contract_json
+            else None
+        )
+    )
+    _validate_reliability_contract(db, row, requested_contract)
+    publish_tool_contract(row, requested_contract)
     db.add(row)
     db.flush()
     creator_metadata = user_creator_metadata(current_user)
@@ -456,6 +483,63 @@ def _validate_required_permission(
     request.required_permission_code = permission_code
 
 
+def _validate_reliability_contract(
+    db: Session,
+    row: Tool,
+    contract: ToolReliabilityContract | None,
+) -> None:
+    """校验对账工具存在于同租户且已以纯读契约发布。"""
+
+    if contract is None or not contract.reconcile.supported:
+        _validate_reliability_schema_paths(row, contract)
+        return
+    _validate_reliability_schema_paths(row, contract)
+    reconcile_name = str(contract.reconcile.tool_name or "")
+    reconcile_tool = db.exec(
+        select(Tool).where(
+            Tool.tenant_id == row.tenant_id,
+            Tool.name == reconcile_name,
+            Tool.id != row.id,
+        )
+    ).first()
+    if reconcile_tool is None or not reconcile_tool.enabled:
+        raise HTTPException(status_code=422, detail="RECONCILE_TOOL_NOT_AVAILABLE")
+    try:
+        reconcile_contract = ToolReliabilityContract.model_validate(
+            reconcile_tool.reliability_contract_json
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="RECONCILE_TOOL_NOT_PUBLISHED") from exc
+    if not reconcile_contract.dynamic_task_enabled or reconcile_contract.risk_class != "read":
+        raise HTTPException(status_code=422, detail="RECONCILE_TOOL_MUST_BE_PUBLISHED_READ")
+
+
+def _validate_reliability_schema_paths(
+    row: Tool,
+    contract: ToolReliabilityContract | None,
+) -> None:
+    """校验三视图与业务幂等字段都能在当前 input/output schema 中精确解析。"""
+
+    if contract is None:
+        return
+    for path in (
+        *contract.model_visibility.allowed_paths,
+        *contract.model_visibility.user_display_paths,
+        *contract.model_visibility.audit_only_paths,
+    ):
+        root, *relative = path.split(".")
+        schema = row.input_schema if root == "input" else row.output_schema
+        if not schema_path_exists(schema or {}, relative):
+            raise HTTPException(status_code=422, detail=f"CAPABILITY_PATH_NOT_FOUND:{path}")
+    if contract.idempotency.mode == "business_key":
+        argument = str(contract.idempotency.argument or "")
+        if not schema_path_exists(row.input_schema or {}, argument.split(".")):
+            raise HTTPException(
+                status_code=422,
+                detail=f"IDEMPOTENCY_ARGUMENT_NOT_FOUND:{argument}",
+            )
+
+
 def _get_tool(db: Session, tenant_id: str, tool_id: str) -> Tool:
     ensure_tenant(db, tenant_id)
     row = db.get(Tool, tool_id)
@@ -530,6 +614,9 @@ def _ensure_private_tool_for_agent(
         allowed_skills_json=list(row.allowed_skills_json or []),
         required_permission_code=row.required_permission_code,
         permission_authorization_mode=row.permission_authorization_mode,
+        reliability_contract_json={},
+        reliability_checksum=None,
+        reliability_published_at=None,
         mcp_server_id=row.mcp_server_id,
         enabled=row.enabled,
         created_at=now,

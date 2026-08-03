@@ -33,6 +33,10 @@ from app.db.seed import (
     _skill_content_graph,
 )
 from app.db.sqlite_legacy import initialize_sqlite_database, migrate_sqlite_skill_schema
+from app.db.sqlite_legacy import (
+    _migrate_dynamic_capability_fields,
+    _migrate_execution_reliability_fields,
+)
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 
@@ -2133,3 +2137,209 @@ def test_operation_reliability_migration_resumes_after_partial_expand(tmp_path) 
         assert connection.execute(
             text("SELECT effect_state FROM sop_instances WHERE id='inst_reliable'")
         ).scalar_one() == "unknown"
+
+
+def _prepare_0037_capability_database(engine) -> None:  # noqa: ANN001
+    """创建 B0.3 所需的最小 0037 表，避免把无关历史 DDL 引入迁移单测。"""
+
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)"))
+        connection.execute(text("INSERT INTO alembic_version VALUES ('20260803_0037')"))
+        connection.execute(text("CREATE TABLE tools (id VARCHAR(512) PRIMARY KEY)"))
+        connection.execute(text("CREATE TABLE general_skills (id VARCHAR(512) PRIMARY KEY)"))
+        connection.execute(text("CREATE TABLE model_configs (id VARCHAR(512) PRIMARY KEY)"))
+        connection.execute(text("CREATE TABLE sop_operations (id VARCHAR(512) PRIMARY KEY)"))
+        for table_name in ("tools", "general_skills", "model_configs", "sop_operations"):
+            connection.execute(text(f"INSERT INTO {table_name} (id) VALUES ('legacy')"))
+
+
+def test_dynamic_capability_migration_is_fail_closed_resumable_and_reversible(tmp_path) -> None:
+    """验证 0038 默认关闭动态能力、保留旧原子技能语义，并可从部分 DDL 续跑。"""
+
+    database_url = f"sqlite:///{tmp_path / 'capability-catalog.db'}"
+    config = Config(str(BACKEND_DIR / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
+    config.attributes["database_url"] = database_url
+    engine = create_engine(database_url)
+    _prepare_0037_capability_database(engine)
+    with engine.begin() as connection:
+        connection.execute(
+            text("ALTER TABLE tools ADD COLUMN reliability_contract_json JSON")
+        )
+
+    command.upgrade(config, "20260803_0038")
+    command.upgrade(config, "20260803_0038")
+    with engine.connect() as connection:
+        inspector = inspect(connection)
+        assert {
+            "reliability_contract_json",
+            "reliability_checksum",
+            "reliability_published_at",
+        }.issubset({item["name"] for item in inspector.get_columns("tools")})
+        assert connection.execute(
+            text("SELECT reliability_contract_json FROM tools WHERE id='legacy'")
+        ).scalar_one() == "{}"
+        assert connection.execute(
+            text("SELECT usage_mode FROM general_skills WHERE id='legacy'")
+        ).scalar_one() == "atomic_execution"
+        assert connection.execute(
+            text("SELECT preflight_status FROM model_configs WHERE id='legacy'")
+        ).scalar_one() == "unverified"
+
+    command.downgrade(config, "20260803_0037")
+    with engine.connect() as connection:
+        inspector = inspect(connection)
+        assert "reliability_contract_json" not in {
+            item["name"] for item in inspector.get_columns("tools")
+        }
+        assert "capability_snapshot_json" not in {
+            item["name"] for item in inspector.get_columns("sop_operations")
+        }
+
+
+def test_dynamic_capability_migration_refuses_to_discard_published_history(tmp_path) -> None:
+    """验证工具契约一旦发布，0038 拒绝回退为无法表达该事实的 0037。"""
+
+    database_url = f"sqlite:///{tmp_path / 'capability-managed.db'}"
+    config = Config(str(BACKEND_DIR / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
+    config.attributes["database_url"] = database_url
+    engine = create_engine(database_url)
+    _prepare_0037_capability_database(engine)
+    command.upgrade(config, "20260803_0038")
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE tools SET reliability_contract_json=:contract, "
+                "reliability_checksum='checksum' WHERE id='legacy'"
+            ),
+            {"contract": '{"dynamic_task_enabled":true}'},
+        )
+
+    with pytest.raises(RuntimeError, match="managed history"):
+        command.downgrade(config, "20260803_0037")
+
+
+def test_desktop_sqlite_legacy_path_backfills_execution_and_capability_contracts(
+    tmp_path,
+) -> None:
+    """验证不走 Alembic 的桌面旧库也获得 B0.1～B0.3 列、账本与 fail-closed 默认。"""
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'desktop-capabilities.db'}")
+    with engine.begin() as connection:
+        _create_legacy_sop_instances_table(connection)
+        connection.execute(
+            text(
+                "CREATE TABLE sop_operations ("
+                "id VARCHAR(512) PRIMARY KEY, tenant_id VARCHAR(128) NOT NULL, "
+                "instance_id VARCHAR(128) NOT NULL, node_execution_id VARCHAR(128) NOT NULL, "
+                "operation_name VARCHAR(191) NOT NULL, idempotency_key VARCHAR(64) NOT NULL, "
+                "status VARCHAR(64) NOT NULL, request_json JSON NOT NULL, "
+                "result_json JSON NOT NULL, error_json JSON NOT NULL, "
+                "external_reference VARCHAR(128), revision INTEGER NOT NULL, started_at DATETIME, "
+                "completed_at DATETIME, created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL)"
+            )
+        )
+        connection.execute(text("CREATE TABLE tools (id VARCHAR(512) PRIMARY KEY)"))
+        connection.execute(text("CREATE TABLE general_skills (id VARCHAR(512) PRIMARY KEY)"))
+        connection.execute(text("CREATE TABLE model_configs (id VARCHAR(512) PRIMARY KEY)"))
+        connection.execute(
+            text(
+                "INSERT INTO sop_instances ("
+                "id, tenant_id, session_id, skill_id, skill_version_id, skill_version, "
+                "definition_checksum, run_number, status, current_node_id, slots_json, "
+                "context_json, revision, created_at, updated_at"
+                ") VALUES ("
+                "'inst_legacy', 'tenant_a', 'session_a', 'skill_a', 'version_a', '1.0.0', "
+                ":checksum, 1, 'running', 'submit', '{}', '{}', 0, "
+                "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            ),
+            {"checksum": "a" * 64},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO sop_operations ("
+                "id, tenant_id, instance_id, node_execution_id, operation_name, "
+                "idempotency_key, status, request_json, result_json, error_json, revision, "
+                "created_at, updated_at"
+                ") VALUES ("
+                "'op_legacy', 'tenant_a', 'inst_legacy', 'node_legacy', 'message.send', "
+                "'key_legacy', 'running', '{\"recipient\":\"ops\"}', '{}', '{}', 0, "
+                "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+        )
+        for table_name in ("tools", "general_skills", "model_configs"):
+            connection.execute(text(f"INSERT INTO {table_name} (id) VALUES ('legacy')"))
+    SQLModel.metadata.create_all(engine)
+    tables = set(inspect(engine).get_table_names())
+    with engine.begin() as connection:
+        _migrate_execution_reliability_fields(connection, tables)
+        _migrate_dynamic_capability_fields(connection, tables)
+        _migrate_execution_reliability_fields(connection, tables)
+        _migrate_dynamic_capability_fields(connection, tables)
+
+    with engine.connect() as connection:
+        instance = connection.execute(
+            text(
+                "SELECT kind, active_slot_key, fencing_token, effect_state "
+                "FROM sop_instances WHERE id='inst_legacy'"
+            )
+        ).one()
+        operation = connection.execute(
+            text(
+                "SELECT logical_action_id, request_fingerprint, effect_kind, effect_state, "
+                "capability_snapshot_json FROM sop_operations WHERE id='op_legacy'"
+            )
+        ).one()
+        assert tuple(instance) == ("sop", "foreground:session_a", 0, "unknown")
+        assert str(operation[0]).startswith("legacy:")
+        assert len(str(operation[1])) == 64
+        assert tuple(operation[2:4]) == ("external_write", "unknown")
+        assert operation[4] == "{}"
+        assert connection.execute(
+            text("SELECT COUNT(*) FROM sop_operation_attempts")
+        ).scalar_one() == 1
+        assert connection.execute(
+            text("SELECT COUNT(*) FROM sop_operation_effects")
+        ).scalar_one() == 1
+        assert connection.execute(
+            text("SELECT preflight_status FROM model_configs WHERE id='legacy'")
+        ).scalar_one() == "unverified"
+
+
+def test_desktop_sqlite_legacy_path_rejects_invalid_operation_request(tmp_path) -> None:
+    """验证桌面兼容迁移不会把损坏请求静默降级为空对象后误判副作用。"""
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'desktop-invalid-operation.db'}")
+    with engine.begin() as connection:
+        _create_legacy_sop_instances_table(connection)
+        connection.execute(
+            text(
+                "CREATE TABLE sop_operations ("
+                "id VARCHAR(512) PRIMARY KEY, tenant_id VARCHAR(128) NOT NULL, "
+                "instance_id VARCHAR(128) NOT NULL, node_execution_id VARCHAR(128) NOT NULL, "
+                "operation_name VARCHAR(191) NOT NULL, idempotency_key VARCHAR(64) NOT NULL, "
+                "status VARCHAR(64) NOT NULL, request_json JSON NOT NULL, "
+                "result_json JSON NOT NULL, error_json JSON NOT NULL, "
+                "revision INTEGER NOT NULL, created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO sop_operations ("
+                "id, tenant_id, instance_id, node_execution_id, operation_name, idempotency_key, "
+                "status, request_json, result_json, error_json, revision, created_at, updated_at"
+                ") VALUES ("
+                "'op_invalid', 'tenant_a', 'inst_missing', 'node_invalid', 'message.send', "
+                "'key_invalid', 'running', :request_json, '{}', '{}', 0, "
+                "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            ),
+            {"request_json": '{"value":NaN}'},
+        )
+    tables = set(inspect(engine).get_table_names())
+
+    with engine.begin() as connection, pytest.raises(
+        RuntimeError,
+        match=r"sop_operations\[op_invalid\]\.request_json",
+    ):
+        _migrate_execution_reliability_fields(connection, tables)

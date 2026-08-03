@@ -8,6 +8,7 @@
 
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
+import json
 import threading
 
 import pytest
@@ -146,6 +147,10 @@ def test_alembic_upgrades_empty_mysql_database(mysql_database_url: str) -> None:
     work_item_columns = {item["name"]: item for item in inspector.get_columns("sop_work_items")}
     execution_columns = {item["name"]: item for item in inspector.get_columns("sop_instances")}
     operation_columns = {item["name"]: item for item in inspector.get_columns("sop_operations")}
+    tool_columns = {item["name"]: item for item in inspector.get_columns("tools")}
+    general_skill_columns = {
+        item["name"]: item for item in inspector.get_columns("general_skills")
+    }
     agent_columns = {item["name"]: item for item in inspector.get_columns("agent_profiles")}
     session_columns = {item["name"]: item for item in inspector.get_columns("sessions")}
     knowledge_columns = {
@@ -199,7 +204,25 @@ def test_alembic_upgrades_empty_mysql_database(mysql_database_url: str) -> None:
         "effect_kind",
         "effect_state",
         "reconciled_at",
+        "capability_snapshot_json",
+        "capability_checksum",
     }.issubset(operation_columns)
+    assert {
+        "reliability_contract_json",
+        "reliability_checksum",
+        "reliability_published_at",
+    }.issubset(tool_columns)
+    assert {
+        "usage_mode",
+        "planning_guidance_json",
+        "planning_guidance_checksum",
+    }.issubset(general_skill_columns)
+    assert {
+        "capability_snapshot_json",
+        "capability_checksum",
+        "preflight_status",
+        "capability_verified_at",
+    }.issubset(model_columns)
     assert "sop_operation_attempts" in tables
     assert "sop_operation_effects" in tables
     attempt_columns = {
@@ -237,8 +260,55 @@ def test_alembic_upgrades_empty_mysql_database(mysql_database_url: str) -> None:
     with engine.connect() as connection:
         assert (
             connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-            == "20260803_0037"
+            == "20260803_0038"
         )
+
+
+def test_mysql_capability_catalog_backfills_legacy_tools_and_guards_downgrade(
+    mysql_database_url: str,
+) -> None:
+    """验证 MySQL 8.4 上 0038 存量工具默认关闭动态执行，发布后拒绝丢历史回退。"""
+
+    upgrade(mysql_database_url)
+    downgrade(mysql_database_url, "20260803_0037")
+    engine = create_engine(mysql_database_url, pool_pre_ping=True)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO tools ("
+                "id, tenant_id, name, bucket, tool_type, method, url, headers_json, auth_json, "
+                "config_json, input_schema, output_schema, allowed_skills_json, "
+                "permission_authorization_mode, enabled, created_at, updated_at"
+                ") VALUES ("
+                "'tool_legacy_b03', 'tenant_b03', 'legacy.lookup', '未分桶', 'http', "
+                "'GET', 'https://example.invalid', '{}', '{}', '{}', '{}', '{}', '[]', "
+                "'caller_and_agent', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+        )
+
+    upgrade(mysql_database_url)
+    with engine.connect() as connection:
+        row = connection.execute(
+            text(
+                "SELECT reliability_contract_json, reliability_checksum "
+                "FROM tools WHERE id='tool_legacy_b03'"
+            )
+        ).one()
+        assert json.loads(row[0]) == {}
+        assert row[1] is None
+
+    downgrade(mysql_database_url, "20260803_0037")
+    upgrade(mysql_database_url)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE tools SET reliability_contract_json=:contract, "
+                "reliability_checksum='published' WHERE id='tool_legacy_b03'"
+            ),
+            {"contract": '{"dynamic_task_enabled": true}'},
+        )
+    with pytest.raises(RuntimeError, match="managed history"):
+        downgrade(mysql_database_url, "20260803_0037")
 
 
 def test_mysql_operation_unknown_reconcile_and_cancellation_are_consistent(

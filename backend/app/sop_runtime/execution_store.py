@@ -29,6 +29,7 @@ from app.db.models import (
     SopOperationEffect,
     utc_now,
 )
+from app.dynamic_tasks.capability_catalog import capability_checksum
 from app.sop_runtime.contracts import (
     IdempotencyPolicy,
     IdempotencyScope,
@@ -484,6 +485,8 @@ class SopExecutionStore:
         idempotency_policy: IdempotencyPolicy | None = None,
         effect_kind: str = "read",
         compensates_operation_id: str | None = None,
+        capability_snapshot: Mapping[str, object] | None = None,
+        capability_snapshot_checksum: str | None = None,
     ) -> tuple[SopOperation, bool]:
         """准备稳定逻辑动作；节点重试只追加 attempt，绝不生成第二次远端命令。"""
 
@@ -492,6 +495,10 @@ class SopExecutionStore:
         if effect_kind not in {"read", "external_write"}:
             raise ValueError("effect_kind 必须是 read 或 external_write。")
         policy = idempotency_policy or IdempotencyPolicy()
+        frozen_capability = dict(capability_snapshot or {})
+        frozen_checksum = capability_checksum(frozen_capability) if frozen_capability else None
+        if capability_snapshot_checksum is not None and capability_snapshot_checksum != frozen_checksum:
+            raise ValueError("capability snapshot checksum 与规范快照不一致。")
         fingerprint = self.request_fingerprint(request)
         action_id = logical_action_id or self._default_logical_action_id(
             tenant_id=instance.tenant_id,
@@ -522,6 +529,8 @@ class SopExecutionStore:
                 or existing.idempotency_scope != policy.scope.value
                 or tuple(existing.idempotency_key_fields_json or ()) != policy.key_fields
                 or existing.compensates_operation_id != compensates_operation_id
+                or dict(existing.capability_snapshot_json or {}) != frozen_capability
+                or existing.capability_checksum != frozen_checksum
             ):
                 raise SopExecutionConflictError(
                     "logical action 的 fingerprint、策略或效果契约与已持久化命令不一致。"
@@ -561,6 +570,8 @@ class SopExecutionStore:
             effect_kind=effect_kind,
             compensates_operation_id=compensates_operation_id,
             request_json=dict(request),
+            capability_snapshot_json=frozen_capability,
+            capability_checksum=frozen_checksum,
         )
         self.db.add(operation)
         self.db.flush()

@@ -764,6 +764,8 @@ class SopOperation(SQLModel, table=True):
     request_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     result_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     error_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    capability_snapshot_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    capability_checksum: OptionalVersionString = Field(default=None, index=True)
     external_reference: OptionalIdentifierString = Field(default=None, index=True)
     reconciled_at: datetime | None = None
     revision: int = Field(default=0, ge=0)
@@ -1118,7 +1120,13 @@ class AgentSkillBranchVersion(SQLModel, table=True):
 
 class GeneralSkill(SQLModel, table=True):
     __tablename__ = "general_skills"
-    __table_args__ = (UniqueConstraint("tenant_id", "slug", name="uq_general_skill_tenant_slug"),)
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "slug", name="uq_general_skill_tenant_slug"),
+        CheckConstraint(
+            "usage_mode IN ('atomic_execution', 'planning_guidance')",
+            name="ck_general_skill_usage_mode",
+        ),
+    )
 
     id: PrimaryKeyString = Field(default_factory=lambda: new_id("genskill"), primary_key=True)
     tenant_id: IdentifierString = Field(index=True)
@@ -1132,6 +1140,10 @@ class GeneralSkill(SQLModel, table=True):
     status: LabelString = Field(default="draft", index=True)
     permissions_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     runtime_config_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    usage_mode: LabelString = Field(default="atomic_execution", index=True)
+    planning_guidance_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    planning_guidance_checksum: OptionalVersionString = Field(default=None, index=True)
+    planning_guidance_published_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
@@ -1377,6 +1389,10 @@ class ModelConfig(SQLModel, table=True):
             "default_tenant_id",
             unique=True,
         ),
+        CheckConstraint(
+            "preflight_status IN ('unverified', 'ready', 'failed')",
+            name="ck_model_config_preflight_status",
+        ),
     )
 
     id: PrimaryKeyString = Field(default_factory=lambda: new_id("model"), primary_key=True)
@@ -1389,6 +1405,11 @@ class ModelConfig(SQLModel, table=True):
     temperature: float = 0.2
     max_output_tokens: int = 8192
     extra_body_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    capability_snapshot_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    capability_checksum: OptionalVersionString = Field(default=None, index=True)
+    preflight_status: LabelString = Field(default="unverified", index=True)
+    preflight_error: OptionalMediumTextString = None
+    capability_verified_at: Optional[datetime] = None
     is_default: bool = False
     default_tenant_id: str | None = Field(
         default=None,
@@ -1580,6 +1601,9 @@ class Tool(SQLModel, table=True):
     allowed_skills_json: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     required_permission_code: OptionalIdentifierString = Field(default=None, index=True)
     permission_authorization_mode: LabelString = Field(default="caller_and_agent", index=True)
+    reliability_contract_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    reliability_checksum: OptionalVersionString = Field(default=None, index=True)
+    reliability_published_at: Optional[datetime] = None
     mcp_server_id: OptionalIdentifierString = Field(default=None, index=True)
     enabled: bool = True
     created_at: datetime = Field(default_factory=utc_now)

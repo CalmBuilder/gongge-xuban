@@ -14,9 +14,14 @@ import threading
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from app.api.model_configs import set_default_model_config
+from app.api.model_configs import (
+    preflight_dynamic_model_config,
+    set_default_model_config,
+    update_model_config,
+)
 from app.db.models import ModelConfig, Tenant
 from app.security.encryption import encrypt_secret
+from app.llm.schemas import ModelConfigUpdateRequest
 
 
 def _engine(tmp_path):
@@ -139,3 +144,53 @@ def test_concurrent_default_switches_are_serialized_per_tenant(tmp_path) -> None
 
     assert switched == {"a_next", "b_next"}
     assert len(defaults) == 1
+
+
+def test_dynamic_preflight_persists_capabilities_and_config_change_invalidates(
+    tmp_path, monkeypatch
+) -> None:
+    """验证预检成功事实落库，且切换模型后必须重新验证。"""
+
+    engine = _engine(tmp_path)
+    _seed_models(engine)
+    monkeypatch.setattr(
+        "app.api.model_configs.LLMClient.preflight_dynamic_capabilities",
+        lambda self: {
+            "protocol_version": "dynamic-v1",
+            "sdk_available": True,
+            "credentials_verified": True,
+            "structured_output": True,
+            "tool_calling": True,
+        },
+    )
+    with Session(engine) as db:
+        response = preflight_dynamic_model_config("a_next", tenant_id="tenant_a", db=db)
+        persisted = db.get(ModelConfig, "a_next")
+        assert response.success is True
+        assert persisted is not None and persisted.preflight_status == "ready"
+        assert persisted.capability_checksum == response.checksum
+
+        update_model_config(
+            "a_next",
+            ModelConfigUpdateRequest(tenant_id="tenant_a", model="replacement-model"),
+            db,
+            _admin_user_for_model_test(),
+        )
+        db.refresh(persisted)
+        assert persisted.preflight_status == "unverified"
+        assert persisted.capability_snapshot_json == {}
+        assert persisted.capability_checksum is None
+
+
+def _admin_user_for_model_test():  # noqa: ANN201
+    """构造模型配置更新的租户管理员身份。"""
+
+    from app.db.models import User
+
+    return User(
+        id="admin_a",
+        tenant_id="tenant_a",
+        username="admin",
+        role="admin",
+        password_hash="test",
+    )

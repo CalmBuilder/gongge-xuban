@@ -100,6 +100,8 @@ def migrate_sqlite_skill_schema(engine: Engine) -> None:
                 conn.execute(text("UPDATE sessions SET context_state_json = '{}'"))
 
         _migrate_agent_identity_fields(conn, tables)
+        _migrate_execution_reliability_fields(conn, tables)
+        _migrate_dynamic_capability_fields(conn, tables)
 
         if "messages" in tables:
             message_columns = {column["name"] for column in inspector.get_columns("messages")}
@@ -335,6 +337,478 @@ def _migrate_agent_identity_fields(conn, tables: set[str]) -> None:
     )
     if {"sessions", "agent_usages", "users"} <= tables:
         _backfill_sqlite_session_usages(conn)
+
+
+def _migrate_dynamic_capability_fields(conn, tables: set[str]) -> None:
+    """为非 Alembic 桌面 SQLite 旧库补齐 B0.3 目录、快照和 provider 预检列。"""
+
+    additions = {
+        "tools": {
+            "reliability_contract_json": (
+                "ALTER TABLE tools ADD COLUMN reliability_contract_json "
+                "JSON NOT NULL DEFAULT '{}'"
+            ),
+            "reliability_checksum": (
+                "ALTER TABLE tools ADD COLUMN reliability_checksum VARCHAR(64)"
+            ),
+            "reliability_published_at": (
+                "ALTER TABLE tools ADD COLUMN reliability_published_at DATETIME"
+            ),
+        },
+        "general_skills": {
+            "usage_mode": (
+                "ALTER TABLE general_skills ADD COLUMN usage_mode "
+                "VARCHAR(64) NOT NULL DEFAULT 'atomic_execution'"
+            ),
+            "planning_guidance_json": (
+                "ALTER TABLE general_skills ADD COLUMN planning_guidance_json "
+                "JSON NOT NULL DEFAULT '{}'"
+            ),
+            "planning_guidance_checksum": (
+                "ALTER TABLE general_skills ADD COLUMN planning_guidance_checksum VARCHAR(64)"
+            ),
+            "planning_guidance_published_at": (
+                "ALTER TABLE general_skills ADD COLUMN planning_guidance_published_at DATETIME"
+            ),
+        },
+        "model_configs": {
+            "capability_snapshot_json": (
+                "ALTER TABLE model_configs ADD COLUMN capability_snapshot_json "
+                "JSON NOT NULL DEFAULT '{}'"
+            ),
+            "capability_checksum": (
+                "ALTER TABLE model_configs ADD COLUMN capability_checksum VARCHAR(64)"
+            ),
+            "preflight_status": (
+                "ALTER TABLE model_configs ADD COLUMN preflight_status "
+                "VARCHAR(64) NOT NULL DEFAULT 'unverified'"
+            ),
+            "preflight_error": (
+                "ALTER TABLE model_configs ADD COLUMN preflight_error VARCHAR(2000)"
+            ),
+            "capability_verified_at": (
+                "ALTER TABLE model_configs ADD COLUMN capability_verified_at DATETIME"
+            ),
+        },
+        "sop_operations": {
+            "capability_snapshot_json": (
+                "ALTER TABLE sop_operations ADD COLUMN capability_snapshot_json "
+                "JSON NOT NULL DEFAULT '{}'"
+            ),
+            "capability_checksum": (
+                "ALTER TABLE sop_operations ADD COLUMN capability_checksum VARCHAR(64)"
+            ),
+        },
+    }
+    for table_name, column_definitions in additions.items():
+        if table_name not in tables:
+            continue
+        existing = {
+            column["name"] for column in inspect(conn).get_columns(table_name)
+        }
+        for column_name, ddl in column_definitions.items():
+            if column_name not in existing:
+                conn.execute(text(ddl))
+    index_definitions = (
+        (
+            "tools",
+            "ix_tools_reliability_checksum",
+            "reliability_checksum",
+        ),
+        (
+            "general_skills",
+            "ix_general_skills_usage_mode",
+            "usage_mode",
+        ),
+        (
+            "general_skills",
+            "ix_general_skills_planning_guidance_checksum",
+            "planning_guidance_checksum",
+        ),
+        (
+            "model_configs",
+            "ix_model_configs_preflight_status",
+            "preflight_status",
+        ),
+        (
+            "model_configs",
+            "ix_model_configs_capability_checksum",
+            "capability_checksum",
+        ),
+        (
+            "sop_operations",
+            "ix_sop_operations_capability_checksum",
+            "capability_checksum",
+        ),
+    )
+    for table_name, index_name, column_name in index_definitions:
+        if table_name in tables:
+            conn.execute(
+                text(
+                    f"CREATE INDEX IF NOT EXISTS {index_name} "
+                    f"ON {table_name} ({column_name})"
+                )
+            )
+
+
+def _migrate_execution_reliability_fields(conn, tables: set[str]) -> None:
+    """为桌面 SQLite 旧库补齐 B0.1/B0.2 所有权、幂等、未知效果和追加账本。"""
+
+    if "sop_instances" not in tables or "sop_operations" not in tables:
+        return
+    initial_instance_columns = {
+        column["name"] for column in inspect(conn).get_columns("sop_instances")
+    }
+    initial_operation_columns = {
+        column["name"] for column in inspect(conn).get_columns("sop_operations")
+    }
+    instance_needs_migration = not {
+        "kind",
+        "active_slot_key",
+        "fencing_token",
+        "effect_state",
+    }.issubset(initial_instance_columns)
+    operation_needs_migration = not {
+        "logical_action_id",
+        "request_fingerprint",
+        "effect_kind",
+        "effect_state",
+    }.issubset(initial_operation_columns)
+    if not instance_needs_migration and not operation_needs_migration:
+        return
+    instance_rows = conn.execute(
+        text(
+            "SELECT id, tenant_id, session_id, status, skill_id, skill_version_id, "
+            "skill_version, definition_checksum FROM sop_instances ORDER BY id"
+        )
+    ).mappings().all()
+    active_statuses = {"created", "running", "waiting"}
+    terminal_statuses = {"succeeded", "failed", "cancelled", "timed_out"}
+    invalid = [
+        str(row["id"])
+        for row in instance_rows
+        if instance_needs_migration
+        and (
+            row["status"] not in active_statuses | terminal_statuses
+            or any(
+                not str(row[field] or "").strip()
+                for field in (
+                    "skill_id",
+                    "skill_version_id",
+                    "skill_version",
+                    "definition_checksum",
+                )
+            )
+        )
+    ]
+    active_keys = [
+        (str(row["tenant_id"]), str(row["session_id"]))
+        for row in instance_rows
+        if instance_needs_migration and row["status"] in active_statuses
+    ]
+    if invalid or len(active_keys) != len(set(active_keys)):
+        raise RuntimeError(
+            "legacy SQLite execution history cannot be mapped safely: "
+            + ",".join(invalid or ["duplicate-active-slot"])
+        )
+    instance_additions = {
+        "kind": "ALTER TABLE sop_instances ADD COLUMN kind VARCHAR(64) NOT NULL DEFAULT 'sop'",
+        "active_slot_key": "ALTER TABLE sop_instances ADD COLUMN active_slot_key VARCHAR(512)",
+        "initiator_user_id": "ALTER TABLE sop_instances ADD COLUMN initiator_user_id VARCHAR(128)",
+        "source_kind": (
+            "ALTER TABLE sop_instances ADD COLUMN source_kind "
+            "VARCHAR(64) NOT NULL DEFAULT 'legacy'"
+        ),
+        "source_ref": "ALTER TABLE sop_instances ADD COLUMN source_ref VARCHAR(512)",
+        "cancellation_requested_at": (
+            "ALTER TABLE sop_instances ADD COLUMN cancellation_requested_at DATETIME"
+        ),
+        "cancellation_requested_by": (
+            "ALTER TABLE sop_instances ADD COLUMN cancellation_requested_by VARCHAR(128)"
+        ),
+        "cancellation_reason": (
+            "ALTER TABLE sop_instances ADD COLUMN cancellation_reason VARCHAR(2000)"
+        ),
+        "cancellation_disposition": (
+            "ALTER TABLE sop_instances ADD COLUMN cancellation_disposition "
+            "VARCHAR(64) NOT NULL DEFAULT 'none'"
+        ),
+        "lease_owner": "ALTER TABLE sop_instances ADD COLUMN lease_owner VARCHAR(128)",
+        "lease_expires_at": "ALTER TABLE sop_instances ADD COLUMN lease_expires_at DATETIME",
+        "lease_acquired_at": "ALTER TABLE sop_instances ADD COLUMN lease_acquired_at DATETIME",
+        "lease_heartbeat_at": "ALTER TABLE sop_instances ADD COLUMN lease_heartbeat_at DATETIME",
+        "fencing_token": (
+            "ALTER TABLE sop_instances ADD COLUMN fencing_token INTEGER NOT NULL DEFAULT 0"
+        ),
+        "effect_state": (
+            "ALTER TABLE sop_instances ADD COLUMN effect_state "
+            "VARCHAR(64) NOT NULL DEFAULT 'none'"
+        ),
+    }
+    existing_instance_columns = {
+        column["name"] for column in inspect(conn).get_columns("sop_instances")
+    }
+    for column_name, ddl in instance_additions.items():
+        if column_name not in existing_instance_columns:
+            conn.execute(text(ddl))
+    if instance_needs_migration:
+        for row in instance_rows:
+            conn.execute(
+                text(
+                    "UPDATE sop_instances SET kind='sop', source_kind='legacy', "
+                    "source_ref=COALESCE(source_ref, :source_ref), "
+                    "active_slot_key=:active_slot, "
+                    "cancellation_disposition=COALESCE(cancellation_disposition, 'none'), "
+                    "fencing_token=COALESCE(fencing_token, 0), "
+                    "effect_state=COALESCE(effect_state, 'none') WHERE id=:id"
+                ),
+                {
+                    "id": row["id"],
+                    "source_ref": row["session_id"],
+                    "active_slot": (
+                        f"foreground:{row['session_id']}"
+                        if row["status"] in active_statuses
+                        else None
+                    ),
+                },
+            )
+    conn.execute(
+        text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_execution_tenant_active_slot "
+            "ON sop_instances (tenant_id, active_slot_key)"
+        )
+    )
+    conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_sop_instances_tenant_lease_expiry "
+            "ON sop_instances (tenant_id, lease_expires_at)"
+        )
+    )
+    conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_sop_instances_lease_owner "
+            "ON sop_instances (lease_owner)"
+        )
+    )
+
+    operation_additions = {
+        "logical_action_id": (
+            "ALTER TABLE sop_operations ADD COLUMN logical_action_id VARCHAR(128)"
+        ),
+        "request_fingerprint": (
+            "ALTER TABLE sop_operations ADD COLUMN request_fingerprint VARCHAR(64)"
+        ),
+        "remote_idempotency_key": (
+            "ALTER TABLE sop_operations ADD COLUMN remote_idempotency_key VARCHAR(128)"
+        ),
+        "idempotency_required": (
+            "ALTER TABLE sop_operations ADD COLUMN idempotency_required "
+            "BOOLEAN NOT NULL DEFAULT 1"
+        ),
+        "idempotency_scope": (
+            "ALTER TABLE sop_operations ADD COLUMN idempotency_scope "
+            "VARCHAR(64) NOT NULL DEFAULT 'instance'"
+        ),
+        "idempotency_key_fields_json": (
+            "ALTER TABLE sop_operations ADD COLUMN idempotency_key_fields_json "
+            "JSON NOT NULL DEFAULT '[]'"
+        ),
+        "effect_kind": (
+            "ALTER TABLE sop_operations ADD COLUMN effect_kind "
+            "VARCHAR(64) NOT NULL DEFAULT 'legacy_unknown'"
+        ),
+        "effect_state": (
+            "ALTER TABLE sop_operations ADD COLUMN effect_state "
+            "VARCHAR(64) NOT NULL DEFAULT 'none'"
+        ),
+        "cancellation_disposition": (
+            "ALTER TABLE sop_operations ADD COLUMN cancellation_disposition "
+            "VARCHAR(64) NOT NULL DEFAULT 'none'"
+        ),
+        "compensates_operation_id": (
+            "ALTER TABLE sop_operations ADD COLUMN compensates_operation_id VARCHAR(512)"
+        ),
+        "reconciled_at": "ALTER TABLE sop_operations ADD COLUMN reconciled_at DATETIME",
+    }
+    existing_operation_columns = {
+        column["name"] for column in inspect(conn).get_columns("sop_operations")
+    }
+    for column_name, ddl in operation_additions.items():
+        if column_name not in existing_operation_columns:
+            conn.execute(text(ddl))
+    operations = (
+        conn.execute(text("SELECT * FROM sop_operations ORDER BY id")).mappings().all()
+        if operation_needs_migration
+        else []
+    )
+    for row in operations:
+        request = _strict_json_object(
+            row["request_json"],
+            context=f"sop_operations[{row['id']}].request_json",
+        )
+        canonical = json.dumps(
+            request,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        fingerprint = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        logical_action_id = str(row.get("logical_action_id") or "").strip() or (
+            "legacy:" + hashlib.sha256(str(row["id"]).encode("utf-8")).hexdigest()
+        )
+        method = str(request.get("method") or "").upper()
+        effect_kind = (
+            "read"
+            if row["operation_name"] == "knowledge.search" or method == "GET"
+            else "external_write"
+        )
+        effect_state = (
+            "none"
+            if effect_kind == "read"
+            else "complete"
+            if row["status"] == "succeeded"
+            else "unknown"
+            if row["status"] in {"running", "unknown"}
+            else "none"
+        )
+        conn.execute(
+            text(
+                "UPDATE sop_operations SET logical_action_id=:logical_action_id, "
+                "request_fingerprint=:request_fingerprint, "
+                "idempotency_required=COALESCE(idempotency_required, 1), "
+                "idempotency_scope=COALESCE(idempotency_scope, 'instance'), "
+                "idempotency_key_fields_json=COALESCE(idempotency_key_fields_json, '[]'), "
+                "effect_kind=:effect_kind, effect_state=:effect_state, "
+                "cancellation_disposition=COALESCE(cancellation_disposition, 'none') "
+                "WHERE id=:id"
+            ),
+            {
+                "id": row["id"],
+                "logical_action_id": logical_action_id,
+                "request_fingerprint": fingerprint,
+                "effect_kind": effect_kind,
+                "effect_state": effect_state,
+            },
+        )
+        _backfill_sqlite_operation_ledgers(
+            conn,
+            row,
+            logical_action_id=logical_action_id,
+            effect_state=effect_state,
+        )
+    conn.execute(
+        text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_sop_operation_tenant_logical_action "
+            "ON sop_operations (tenant_id, logical_action_id)"
+        )
+    )
+    for column_name in (
+        "logical_action_id",
+        "remote_idempotency_key",
+        "compensates_operation_id",
+    ):
+        conn.execute(
+            text(
+                f"CREATE INDEX IF NOT EXISTS ix_sop_operations_{column_name} "
+                f"ON sop_operations ({column_name})"
+            )
+        )
+    if operation_needs_migration:
+        _backfill_sqlite_instance_effects(conn, instance_rows)
+
+
+def _backfill_sqlite_operation_ledgers(
+    conn,
+    row,
+    *,
+    logical_action_id: str,
+    effect_state: str,
+) -> None:
+    """为旧 Operation 幂等补一条 attempt，并为确定/未知外部效果补事实。"""
+
+    operation_id = str(row["id"])
+    digest = hashlib.sha256(operation_id.encode("utf-8")).hexdigest()
+    conn.execute(
+        text(
+            "INSERT OR IGNORE INTO sop_operation_attempts ("
+            "id, tenant_id, instance_id, operation_id, node_execution_id, attempt_number, "
+            "status, error_json, started_at, completed_at, created_at, updated_at"
+            ") VALUES ("
+            ":id, :tenant_id, :instance_id, :operation_id, :node_execution_id, 1, "
+            ":status, :error_json, :started_at, :completed_at, :created_at, :updated_at)"
+        ),
+        {
+            "id": f"legacyattempt:{digest}",
+            "tenant_id": row["tenant_id"],
+            "instance_id": row["instance_id"],
+            "operation_id": operation_id,
+            "node_execution_id": row["node_execution_id"],
+            "status": row["status"],
+            "error_json": row["error_json"],
+            "started_at": row["started_at"],
+            "completed_at": row["completed_at"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        },
+    )
+    if effect_state not in {"complete", "unknown"}:
+        return
+    conn.execute(
+        text(
+            "INSERT OR IGNORE INTO sop_operation_effects ("
+            "id, tenant_id, instance_id, operation_id, logical_action_id, sequence, "
+            "event_type, effect_state, external_reference, evidence_json, "
+            "compensation_operation_id, created_at"
+            ") VALUES ("
+            ":id, :tenant_id, :instance_id, :operation_id, :logical_action_id, 1, "
+            ":event_type, :effect_state, :external_reference, :evidence_json, NULL, :created_at)"
+        ),
+        {
+            "id": f"legacyeffect:{digest}",
+            "tenant_id": row["tenant_id"],
+            "instance_id": row["instance_id"],
+            "operation_id": operation_id,
+            "logical_action_id": logical_action_id,
+            "event_type": (
+                "legacy_effect_confirmed"
+                if effect_state == "complete"
+                else "legacy_effect_unknown"
+            ),
+            "effect_state": effect_state,
+            "external_reference": row["external_reference"],
+            "evidence_json": '{"migration":"sqlite_legacy_b02"}',
+            "created_at": row["updated_at"],
+        },
+    )
+
+
+def _backfill_sqlite_instance_effects(conn, instance_rows) -> None:
+    """从外部写操作聚合桌面旧库实例的 none/partial/complete/unknown 效果。"""
+
+    for instance in instance_rows:
+        states = conn.execute(
+            text(
+                "SELECT effect_state FROM sop_operations "
+                "WHERE instance_id=:instance_id AND effect_kind='external_write'"
+            ),
+            {"instance_id": instance["id"]},
+        ).scalars().all()
+        if "unknown" in states:
+            aggregate = "unknown"
+        else:
+            completed = sum(state in {"complete", "compensated"} for state in states)
+            aggregate = (
+                "none"
+                if completed == 0
+                else "complete"
+                if completed == len(states)
+                else "partial"
+            )
+        conn.execute(
+            text("UPDATE sop_instances SET effect_state=:state WHERE id=:id"),
+            {"state": aggregate, "id": instance["id"]},
+        )
 
 
 def _backfill_sqlite_agent_identity(conn) -> None:
@@ -1244,6 +1718,27 @@ def _json_object(value: object) -> dict[str, object]:
         if isinstance(parsed, dict):
             return dict(parsed)
     return {}
+
+
+def _strict_json_object(value: object, *, context: str) -> dict[str, object]:
+    """严格解析影响副作用判定的遗留 JSON；损坏或非对象数据必须中止迁移。"""
+    if isinstance(value, dict):
+        parsed = dict(value)
+    elif isinstance(value, str):
+        try:
+            parsed = json.loads(
+                value,
+                parse_constant=lambda constant: (_ for _ in ()).throw(
+                    ValueError(f"unsupported JSON constant: {constant}")
+                ),
+            )
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise RuntimeError(f"invalid JSON object in {context}") from exc
+    else:
+        raise RuntimeError(f"invalid JSON object in {context}")
+    if not isinstance(parsed, dict):
+        raise RuntimeError(f"invalid JSON object in {context}")
+    return parsed
 
 
 def _document_knowledge_base_id(document_id: str) -> str:

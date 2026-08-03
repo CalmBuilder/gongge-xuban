@@ -12,8 +12,12 @@ from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.dynamic_tasks.capability_catalog import ToolReliabilityContract
+
 
 class ToolCreateRequest(BaseModel):
+    """创建工具并可选发布经服务端校验的动态可靠性契约。"""
+
     tenant_id: str
     name: str
     display_name: Optional[str] = None
@@ -32,6 +36,7 @@ class ToolCreateRequest(BaseModel):
     permission_authorization_mode: Literal[
         "caller_and_agent", "workflow_delegated"
     ] = "caller_and_agent"
+    reliability_contract: Optional[ToolReliabilityContract] = None
     enabled: bool = True
 
 
@@ -55,6 +60,8 @@ class ToolCredentialState(BaseModel):
 
 
 class ToolRead(BaseModel):
+    """返回管理视图与脱敏发布契约，不返回凭据值。"""
+
     id: str
     tenant_id: str
     name: str
@@ -73,6 +80,9 @@ class ToolRead(BaseModel):
     allowed_skills: list[str]
     required_permission_code: Optional[str] = None
     permission_authorization_mode: str = "caller_and_agent"
+    reliability_contract: Optional[ToolReliabilityContract] = None
+    reliability_checksum: Optional[str] = None
+    reliability_published_at: Optional[str] = None
     mcp_server_id: Optional[str] = None
     enabled: bool
     metadata: dict[str, Any] = Field(default_factory=dict)

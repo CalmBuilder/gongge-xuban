@@ -349,6 +349,8 @@ class LLMClient:
             raise LLMError(_provider_failure_detail(self, exc)) from exc
 
     def generate_json(self, system_prompt: str, user_payload: dict[str, Any]) -> dict[str, Any]:
+        """生成 JSON object，并在输出不合法时通过有界修复重试校正。"""
+
         outputs: list[str] = []
         next_payload = user_payload
         last_error: json.JSONDecodeError | None = None
@@ -415,6 +417,68 @@ class LLMClient:
         raise LLMError(
             f"Model did not return valid JSON after {JSON_REPAIR_ATTEMPTS} repair attempts; {previews}"
         ) from last_error
+
+    def preflight_dynamic_capabilities(self) -> dict[str, bool | str]:
+        """使用原生 JSON mode 与强制 tool call 探针验证动态计划必需协议。"""
+
+        structured_request = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": "Return one JSON object only."},
+                {"role": "user", "content": 'Return {"probe":"ready"}.'},
+            ],
+            "temperature": 0,
+            "max_tokens": 64,
+            "response_format": {"type": "json_object"},
+        }
+        tool_schema = {
+            "type": "function",
+            "function": {
+                "name": "dynamic_capability_probe",
+                "description": "Return the supplied probe value.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"probe": {"type": "string"}},
+                    "required": ["probe"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+        tool_request = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": "Call the required probe tool."},
+                {"role": "user", "content": "Probe dynamic tool calling."},
+            ],
+            "temperature": 0,
+            "max_tokens": 128,
+            "tools": [tool_schema],
+            "tool_choice": {
+                "type": "function",
+                "function": {"name": "dynamic_capability_probe"},
+            },
+        }
+        try:
+            structured = self.client.chat.completions.create(**structured_request)
+            content = _completion_message_content(structured)
+            parsed = json.loads(content)
+            if parsed != {"probe": "ready"}:
+                raise LLMError("Structured-output capability probe returned an invalid payload")
+            tool_completion = self.client.chat.completions.create(**tool_request)
+            tool_calls = _completion_tool_calls(tool_completion)
+            if not any(call["name"] == "dynamic_capability_probe" for call in tool_calls):
+                raise LLMError("Tool-calling capability probe returned no required tool call")
+        except Exception as exc:
+            if isinstance(exc, LLMError):
+                raise
+            raise LLMError(_provider_failure_detail(self, exc)) from exc
+        return {
+            "protocol_version": "dynamic-v1",
+            "sdk_available": True,
+            "credentials_verified": True,
+            "structured_output": True,
+            "tool_calling": True,
+        }
 
     def _generate_json_candidate(
         self,
@@ -915,6 +979,27 @@ def _reasoning_text(value: Any) -> str:
         if text:
             return text
     return ""
+
+
+def _completion_tool_calls(completion: Any) -> list[dict[str, str]]:
+    """从 OpenAI 兼容回复中提取工具名与原始参数，缺失字段时安全返回空列表。"""
+
+    try:
+        calls = completion.choices[0].message.tool_calls or []
+    except (IndexError, TypeError, AttributeError):
+        return []
+    result: list[dict[str, str]] = []
+    for call in calls:
+        function = getattr(call, "function", None)
+        name = str(getattr(function, "name", "") or "")
+        if name:
+            result.append(
+                {
+                    "name": name,
+                    "arguments": str(getattr(function, "arguments", "") or ""),
+                }
+            )
+    return result
 
 
 def _safe_fragment(value: Any, limit: int) -> str:
