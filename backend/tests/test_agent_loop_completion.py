@@ -11,9 +11,14 @@ from types import SimpleNamespace
 import pytest
 
 from app.core.agent_loop import GRAPH_PENDING_STEPS_SLOT, AgentLoop, PreparedTurn
+from app.core.non_sop_capability import (
+    NonSopCapabilityDecision,
+    NonSopCapabilityRouter,
+)
 from app.core.skill_runtime import SkillRuntime
 from app.db.models import AgentEvent, ChatSession, Message, Skill, Tool
 from app.knowledge.schema import KnowledgeSearchResponse
+from app.general_skills.schema import GeneralSkillSelection
 from app.session.session_schema import (
     AwaitingInput,
     KnowledgeQuery,
@@ -268,6 +273,205 @@ class FakeToolExecutor:
     ) -> ToolResult:
         self.commits_seen_before_execute = self.db.commits
         return ToolResult(tool_name=tool_call.name, success=True, data={"ok": True})
+
+
+def _no_sop_stream_with_shadow(
+    shadow_enabled: bool,
+    *,
+    scheduled: bool = False,
+) -> tuple[list[dict], FakeEvents]:
+    """运行无 SOP 流式回答，并返回传输事件和持久领域事件供等价比较。"""
+
+    db = FakeDb()
+    events = FakeEvents()
+    loop = object.__new__(AgentLoop)
+    session = ChatSession(
+        id="session_no_sop_shadow",
+        tenant_id="tenant_demo",
+        user_id="user_demo",
+        agent_id="agent_demo",
+        slots_json={},
+        skill_stack_json=[],
+        pending_tasks_json=[],
+        knowledge_context_json=[],
+    )
+    user_message = Message(
+        id="message_no_sop_shadow",
+        tenant_id="tenant_demo",
+        session_id=session.id,
+        role="user",
+        content="整理两个系统并生成简报",
+    )
+    loop.db = db
+    loop.events = events
+    loop.general_skill_selector = SimpleNamespace(
+        decide=lambda *_args, **_kwargs: GeneralSkillSelection()
+    )
+    loop.non_sop_capability_router = NonSopCapabilityRouter(
+        shadow_enabled=shadow_enabled,
+        shadow_selector=SimpleNamespace(
+            decide=lambda *_args, **_kwargs: NonSopCapabilityDecision(
+                mode="dynamic_task",
+                goal="生成简报",
+                success_criteria=["包含两个系统的证据"],
+                requires_durable_execution=True,
+                confidence=0.92,
+            )
+        ),
+    )
+    loop._get_or_create_session = lambda _request: session
+    loop._mark_session_running = lambda *_args, **_kwargs: None
+    loop._append_message = lambda *_args, **_kwargs: user_message
+    loop._get_request_model = lambda *_args, **_kwargs: _model_config()
+    loop._list_published_skills = lambda *_args, **_kwargs: []
+    loop._list_enabled_tools = lambda *_args, **_kwargs: []
+    loop._tools_with_general_skills = lambda *_args, **_kwargs: []
+    loop._list_published_general_skills = lambda *_args, **_kwargs: []
+    loop._knowledge_capability_payload = lambda *_args, **_kwargs: {
+        "available": False,
+        "accessible_count": 0,
+    }
+    loop._get_persona_prompt = lambda *_args, **_kwargs: None
+    loop._drop_unavailable_skill_state = lambda *_args, **_kwargs: False
+    loop._conversation_context = lambda *_args, **_kwargs: {}
+    loop._auto_knowledge_step_result = lambda *_args, **_kwargs: StepAgentResult()
+    loop._generate_reply_stream_segment = lambda *_args, **_kwargs: iter(["固定回复"])
+    loop._finalize_turn = lambda *_args, **_kwargs: "固定回复"
+    loop._pace_stream = lambda: None
+    loop._enqueue_memory_capture = lambda *_args, **_kwargs: None
+
+    request = _request("整理两个系统并生成简报")
+    if scheduled:
+        request.channel = "scheduled_task"
+        request.interaction_mode = "scheduled_task"
+    streamed = list(loop.handle_turn_stream(request))
+    return streamed, events
+
+
+def _no_sop_prepared_turn_with_shadow(
+    shadow_enabled: bool,
+) -> tuple[PreparedTurn, FakeEvents]:
+    """运行同步无 SOP 准备阶段，返回权威结果和领域事件供兼容比较。"""
+
+    loop = object.__new__(AgentLoop)
+    events = FakeEvents()
+    session = ChatSession(
+        id="session_no_sop_sync_shadow",
+        tenant_id="tenant_demo",
+        user_id="user_demo",
+        agent_id="agent_demo",
+        slots_json={},
+        skill_stack_json=[],
+        pending_tasks_json=[],
+        knowledge_context_json=[],
+    )
+    user_message = Message(
+        id="message_no_sop_sync_shadow",
+        tenant_id="tenant_demo",
+        session_id=session.id,
+        role="user",
+        content="整理两个系统并生成简报",
+    )
+    loop.db = FakeDb()
+    loop.events = events
+    loop.general_skill_selector = SimpleNamespace(
+        decide=lambda *_args, **_kwargs: GeneralSkillSelection()
+    )
+    loop.non_sop_capability_router = NonSopCapabilityRouter(
+        shadow_enabled=shadow_enabled,
+        shadow_selector=SimpleNamespace(
+            decide=lambda *_args, **_kwargs: NonSopCapabilityDecision(
+                mode="dynamic_task",
+                goal="生成简报",
+                success_criteria=["包含两个系统的证据"],
+                confidence=0.92,
+            )
+        ),
+    )
+    loop._get_or_create_session = lambda _request: session
+    loop._mark_session_running = lambda *_args, **_kwargs: None
+    loop._append_message = lambda *_args, **_kwargs: user_message
+    loop._get_request_model = lambda *_args, **_kwargs: _model_config()
+    loop._list_published_skills = lambda *_args, **_kwargs: []
+    loop._list_enabled_tools = lambda *_args, **_kwargs: []
+    loop._tools_with_general_skills = lambda *_args, **_kwargs: []
+    loop._list_published_general_skills = lambda *_args, **_kwargs: []
+    loop._knowledge_capability_payload = lambda *_args, **_kwargs: {
+        "available": False,
+        "accessible_count": 0,
+    }
+    loop._drop_unavailable_skill_state = lambda *_args, **_kwargs: False
+    loop._conversation_context = lambda *_args, **_kwargs: {}
+    loop._auto_knowledge_step_result = lambda *_args, **_kwargs: StepAgentResult()
+
+    return loop._prepare_turn(_request("整理两个系统并生成简报")), events
+
+
+def test_no_sop_shadow_does_not_change_sse_frames() -> None:
+    """开关开启只增加脱敏领域审计，流式帧名称和 payload 必须与关闭时完全一致。"""
+
+    disabled_stream, disabled_events = _no_sop_stream_with_shadow(False)
+    enabled_stream, enabled_events = _no_sop_stream_with_shadow(True)
+
+    def without_transport_timestamps(items: list[dict]) -> list[dict]:
+        """移除每次发送必然变化的传输时间，保留其余 SSE 契约比较。"""
+
+        normalized: list[dict] = []
+        for item in items:
+            data = dict(item.get("data") or {})
+            data.pop("timestamp", None)
+            normalized.append({**item, "data": data})
+        return normalized
+
+    assert without_transport_timestamps(enabled_stream) == without_transport_timestamps(
+        disabled_stream
+    )
+    assert "non_sop_capability_shadow_decided" not in {
+        str(item.get("event")) for item in enabled_stream
+    }
+    assert "non_sop_capability_shadow_decided" not in {
+        row[2] for row in disabled_events.records
+    }
+    shadow_rows = [
+        row for row in enabled_events.records if row[2] == "non_sop_capability_shadow_decided"
+    ]
+    assert len(shadow_rows) == 1
+    assert shadow_rows[0][3]["shadow_mode"] == "dynamic_task"
+    assert "goal" not in shadow_rows[0][3]
+
+
+def test_no_sop_shadow_does_not_change_sync_prepared_turn() -> None:
+    """同步路径开启 shadow 后仍返回相同 Router、知识和 GeneralSkill 权威结果。"""
+
+    disabled, disabled_events = _no_sop_prepared_turn_with_shadow(False)
+    enabled, enabled_events = _no_sop_prepared_turn_with_shadow(True)
+
+    assert enabled.router_decision == disabled.router_decision
+    assert enabled.step_result == disabled.step_result
+    assert enabled.general_response == disabled.general_response
+    assert enabled.conversation_context == disabled.conversation_context
+    assert "non_sop_capability_shadow_decided" not in {
+        row[2] for row in disabled_events.records
+    }
+    assert [
+        row[2] for row in enabled_events.records if row[2] == "non_sop_capability_shadow_decided"
+    ] == ["non_sop_capability_shadow_decided"]
+
+
+def test_scheduled_stream_uses_same_non_sop_shadow_boundary() -> None:
+    """Schedule 经流式 Agent Loop 时复用相同 shadow，并保持传输事件数量与类型不变。"""
+
+    disabled_stream, _ = _no_sop_stream_with_shadow(False, scheduled=True)
+    enabled_stream, enabled_events = _no_sop_stream_with_shadow(True, scheduled=True)
+
+    assert [item["event"] for item in enabled_stream] == [
+        item["event"] for item in disabled_stream
+    ]
+    shadow_rows = [
+        row for row in enabled_events.records if row[2] == "non_sop_capability_shadow_decided"
+    ]
+    assert len(shadow_rows) == 1
+    assert shadow_rows[0][3]["shadow_mode"] == "dynamic_task"
 
 
 def test_tool_call_start_event_is_committed_before_external_execute() -> None:

@@ -31,8 +31,13 @@ from app.agents.branching import (
 )
 from app.agents.session_snapshot import anchor_chat_session
 from app.audit.service import append_user_management_audit
-from app.core.conversation_context import build_conversation_context
+from app.config import get_settings
 from app.core.cancellation import clear_chat_turn_cancelled, is_chat_turn_cancelled
+from app.core.conversation_context import build_conversation_context
+from app.core.non_sop_capability import (
+    LlmDynamicTaskShadowSelector,
+    NonSopCapabilityRouter,
+)
 from app.core.reflection_agent import ReflectionAgent, ReflectionDecision, action_needs_reflection
 from app.core.response_generator import (
     FALLBACK_REPLY,
@@ -265,6 +270,9 @@ class QueuedTaskContinuation:
 
 class AgentLoop:
     def __init__(self, db: Session):
+        """组装聊天、SOP、通用能力及默认关闭的动态任务 shadow 编排依赖。"""
+
+        settings = get_settings()
         self.db = db
         self.events = EventLog(db)
         self.router = Router()
@@ -273,6 +281,13 @@ class AgentLoop:
         self.reflection_agent = ReflectionAgent()
         self.response_generator = ResponseGenerator()
         self.general_skill_selector = GeneralSkillSelector()
+        self.non_sop_capability_router = NonSopCapabilityRouter(
+            shadow_enabled=settings.dynamic_task_router_shadow_enabled,
+            shadow_selector=LlmDynamicTaskShadowSelector(
+                settings.dynamic_task_router_shadow_timeout_seconds
+            ),
+            minimum_confidence=settings.dynamic_task_router_shadow_min_confidence,
+        )
         self.general_skill_runner = GeneralSkillRunner()
         self.tool_executor = ToolExecutor(db)
         self.deterministic_runtime = DeterministicSopCoordinator(db)
@@ -655,13 +670,15 @@ class AgentLoop:
     ) -> ChatTurnResponse | None:
         if not self._scene_router_deferred_to_general(router_decision):
             return None
-        capability = capability or self._select_general_capability(
+        capability = capability or self._route_non_sop_capability(
             request.message,
             model_config,
+            chat_session,
             chat_session.agent_id,
             conversation_context,
             memory_context,
             user_id=request.user_id,
+            user_message_id=user_message_id,
         )
         skill, selection = capability
         if skill is None:
@@ -1668,13 +1685,15 @@ class AgentLoop:
                 yield self._stream_status(
                     chat_session, "routing", "正在判断用户意图", user_message_id=user_message_id
                 )
-                capability = self._select_general_capability(
+                capability = self._route_non_sop_capability(
                     request.message,
                     model_config,
+                    chat_session,
                     chat_session.agent_id,
                     no_skill_context,
                     [],
                     user_id=request.user_id,
+                    user_message_id=user_message_id,
                 )
                 if capability[0] is not None:
                     yield from self._stream_general_skill_response(
@@ -1832,13 +1851,15 @@ class AgentLoop:
             )
             capability_selection: GeneralSkillSelection | None = None
             if self._scene_router_deferred_to_general(router_decision):
-                capability = self._select_general_capability(
+                capability = self._route_non_sop_capability(
                     request.message,
                     model_config,
+                    chat_session,
                     chat_session.agent_id,
                     conversation_context,
                     memory_context,
                     user_id=request.user_id,
+                    user_message_id=user_message_id,
                 )
                 capability_selection = capability[1]
                 if capability[0] is not None:
@@ -2440,13 +2461,15 @@ class AgentLoop:
             )
             if self._context_compacted_now(no_skill_context):
                 status("preparing", {"compacted_now": True})
-            capability = self._select_general_capability(
+            capability = self._route_non_sop_capability(
                 request.message,
                 model_config,
+                chat_session,
                 chat_session.agent_id,
                 no_skill_context,
                 [],
                 user_id=request.user_id,
+                user_message_id=user_message.id,
             )
             router_decision = RouterDecision(
                 decision="answer_only",
@@ -2548,13 +2571,15 @@ class AgentLoop:
         )
         capability: tuple[GeneralSkill | None, GeneralSkillSelection] | None = None
         if self._scene_router_deferred_to_general(router_decision):
-            capability = self._select_general_capability(
+            capability = self._route_non_sop_capability(
                 request.message,
                 model_config,
+                chat_session,
                 chat_session.agent_id,
                 conversation_context,
                 memory_context,
                 user_id=request.user_id,
+                user_message_id=user_message.id,
             )
         general_response = self._try_handle_general_skill_after_scene_router(
             request,
@@ -6511,6 +6536,44 @@ class AgentLoop:
         if skill is None:
             return None
         return skill, selection
+
+    def _route_non_sop_capability(
+        self,
+        message: str,
+        model_config: ModelConfig,
+        chat_session: ChatSession,
+        agent_id: str | None = None,
+        conversation_context: dict[str, object] | None = None,
+        memory_context: list[dict[str, object]] | None = None,
+        *,
+        user_id: str | None = None,
+        user_message_id: str | None = None,
+    ) -> tuple[GeneralSkill | None, GeneralSkillSelection]:
+        """统一非 SOP 权威选择与脱敏 shadow；A 批只返回旧 GeneralSkill 行为。"""
+
+        general_skills = self._list_published_general_skills(model_config.tenant_id, agent_id)
+        knowledge_capability = self._knowledge_capability_payload(
+            model_config.tenant_id,
+            user_id,
+            agent_id,
+        )
+        route = self.non_sop_capability_router.decide(
+            message=message,
+            general_skills=general_skills,
+            model_config=model_config,
+            general_skill_selector=self.general_skill_selector,
+            conversation_context=conversation_context,
+            memory_context=memory_context,
+            knowledge_capability=knowledge_capability,
+        )
+        if route.shadow_decision is not None:
+            self.events.record(
+                model_config.tenant_id,
+                chat_session.id,
+                "non_sop_capability_shadow_decided",
+                self._turn_payload(route.audit_payload(), user_message_id),
+            )
+        return route.selected_general_skill, route.general_selection
 
     def _select_general_capability(
         self,

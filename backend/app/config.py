@@ -9,7 +9,7 @@
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.brand import desktop_env_value
@@ -44,6 +44,9 @@ class Settings(BaseSettings):
     model_api_timeout_seconds: float = 600.0
     model_thinking_mode: str = ""
     model_thinking_models: str = ""
+    dynamic_task_router_shadow_enabled: bool = False
+    dynamic_task_router_shadow_timeout_seconds: float = Field(default=2.0, ge=0.1, le=30.0)
+    dynamic_task_router_shadow_min_confidence: float = Field(default=0.7, ge=0.0, le=1.0)
     tool_timeout_seconds: float = 8.0
     tool_base_url: str = "http://localhost:5137"
     public_mock_api_key: str
