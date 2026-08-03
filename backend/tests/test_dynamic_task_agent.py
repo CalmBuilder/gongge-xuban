@@ -1,9 +1,9 @@
 """
-@Time       : 2026/08/04 02:02
+@Time       : 2026/08/04 01:04
 @Author     : zhanglp8181
 @File       : test_dynamic_task_agent.py
 @CallChain  : pytest → DynamicTaskAgent → Execution Store/受控 ToolExecutor
-@Description: 验证首期只读动态动作的持久提案、实时再授权和崩溃恢复去重。
+@Description: 验证动态动作、可信 Artifact、实时再授权和崩溃恢复去重。
 """
 
 from __future__ import annotations
@@ -22,10 +22,13 @@ from sqlmodel import Session, SQLModel, create_engine, select
 from app.agents.branching import ensure_agent_private_knowledge_branch, ensure_private_resource_binding
 from app.db.models import (
     AgentProfile,
+    ArtifactInputLink,
+    ExecutionArtifact,
     ExecutionPlanRevision,
     ExecutionSignal,
     ExecutionPublication,
     ExecutionResult,
+    InputResourceSnapshot,
     KnowledgeBase,
     KnowledgeBaseVersion,
     MCPServer,
@@ -38,6 +41,7 @@ from app.db.models import (
     User,
 )
 from app.dynamic_tasks.agent import DynamicRunOutcome, DynamicTaskAgent, DynamicTaskAgentError
+from app.dynamic_tasks.artifacts import ArtifactAccessDenied, ArtifactService
 from app.dynamic_tasks.capability_catalog import (
     CapabilitySnapshot,
     DynamicCapabilityCatalog,
@@ -152,6 +156,42 @@ class _Planner:
             ),
             budget={"max_steps": 4},
         )
+
+
+class _ArtifactPlanner(_Planner):
+    """在基础只读计划上声明一个必需 Markdown 交付物。"""
+
+    def create_plan(self, *, goal, success_criteria, capabilities, input_resources=()):
+        """复用基础依赖图并加入终态必须满足的 Artifact 契约。"""
+
+        plan = super().create_plan(
+            goal=goal,
+            success_criteria=success_criteria,
+            capabilities=capabilities,
+            input_resources=input_resources,
+        )
+        return plan.model_copy(
+            update={
+                "expected_artifacts": (
+                    {
+                        "artifact_key": "risk_brief",
+                        "filename": "风险简报.md",
+                        "mime_type": "text/markdown",
+                        "content_source": "result.markdown",
+                        "required": True,
+                    },
+                )
+            }
+        )
+
+
+class _CorruptOnVerifyArtifactService(ArtifactService):
+    """模拟对象存储写入后、终态前内容损坏。"""
+
+    def resolve(self, artifact_id: str, *, tenant_id: str, actor_user_id: str):
+        """在登记后的强制完整性检查处返回稳定损坏错误。"""
+
+        raise ArtifactAccessDenied("ARTIFACT_INTEGRITY_FAILED")
 
 
 class _Proposer:
@@ -365,6 +405,15 @@ class _CombinedPlanner:
                     kind="answer",
                     depends_on=("query_risk",),
                 ),
+            ),
+            expected_artifacts=(
+                {
+                    "artifact_key": "renewal_risk_brief",
+                    "filename": "续约风险简报.md",
+                    "mime_type": "text/markdown",
+                    "content_source": "result.markdown",
+                    "required": True,
+                },
             ),
             budget={
                 "max_steps": 6,
@@ -933,6 +982,88 @@ def test_verified_result_message_publication_and_terminal_state_commit_together(
         assert publication.status == "settled"
         assert publication.receipt_json["message_id"] == message.id
         assert instance.status == "succeeded"
+
+
+def test_artifact_integrity_failure_rolls_back_result_message_and_terminal_state(tmp_path) -> None:
+    """验证交付物写后校验失败时成功结果、消息和终态必须整体回滚。"""
+
+    engine = create_engine("sqlite://", poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as db:
+        capabilities = _model_capabilities()
+        model = ModelConfig(
+            id="model_artifact_failure",
+            tenant_id="tenant_demo",
+            name="动态模型",
+            api_key_encrypted="encrypted",
+            model="model-demo",
+            capability_snapshot_json=capabilities,
+            capability_checksum=capability_checksum(capabilities),
+            preflight_status="ready",
+        )
+        user = User(
+            id="user_artifact_failure",
+            tenant_id="tenant_demo",
+            username="artifact-failure",
+            password_hash="x",
+        )
+        db.add(model)
+        db.add(user)
+        db.flush()
+        agent = DynamicTaskAgent(
+            db,
+            catalog=_StartCatalog(model, _snapshot()),
+            tool_executor=_Executor(),
+            planner=_ArtifactPlanner(),
+            action_proposer=_Proposer(),
+            artifact_service=_CorruptOnVerifyArtifactService(db, storage_root=tmp_path),
+        )
+        instance, _ = agent.start_task(
+            tenant_id="tenant_demo",
+            session_id="session_artifact_failure",
+            agent_id="agent_demo",
+            initiator_user_id=user.id,
+            goal="生成续约风险简报",
+            success_criteria=("覆盖合同证据",),
+            model_config=model,
+        )
+        agent.advance_next_read_step(
+            execution_id=instance.id,
+            model_config=model,
+            worker_id="worker_artifact_read",
+            actor_user_id=user.id,
+        )
+        response = CompletedProviderProposal(
+            response_id="provider_artifact_failure",
+            finish_reason="stop",
+            proposal=RuntimeActionProposal(
+                action_kind=ActionKind.ANSWER,
+                arguments={
+                    "markdown": "# 风险简报\n\n合同证据已核验。",
+                    "criterion_evidence": {"criterion_01": ["query_contract"]},
+                    "pending_questions": [],
+                },
+                rationale="证据已足够形成结果",
+            ),
+        )
+
+        with pytest.raises(DynamicTaskAgentError, match="DYNAMIC_ARTIFACT_REGISTRATION_FAILED"):
+            agent.complete_with_result_proposal(
+                execution_id=instance.id,
+                step_key="answer",
+                completed_response=response,
+                provider="openai_compatible",
+                model="model-demo",
+                model_capabilities=capabilities,
+                worker_id="worker_artifact_result",
+            )
+
+        db.refresh(instance)
+        assert instance.status == "running"
+        assert db.exec(select(ExecutionArtifact)).all() == []
+        assert db.exec(select(ExecutionResult)).all() == []
+        assert db.exec(select(ExecutionPublication)).all() == []
+        assert db.exec(select(Message)).all() == []
 
 
 def test_run_loop_serially_reaches_verified_terminal_result() -> None:
@@ -1633,6 +1764,7 @@ def test_combined_attachment_knowledge_two_tools_and_result_form_one_execution(
             action_proposer=proposer,
             resource_service=resource_service,
             knowledge_service=knowledge_service,
+            artifact_service=ArtifactService(db, storage_root=tmp_path / "artifacts"),
         )
         instance, created = agent.start_task(
             tenant_id="tenant_demo",
@@ -1684,6 +1816,12 @@ def test_combined_attachment_knowledge_two_tools_and_result_form_one_execution(
                 ExecutionPublication.execution_id == instance.id
             )
         ).one()
+        artifact = db.exec(
+            select(ExecutionArtifact).where(ExecutionArtifact.execution_id == instance.id)
+        ).one()
+        artifact_link = db.exec(
+            select(ArtifactInputLink).where(ArtifactInputLink.artifact_id == artifact.id)
+        ).one()
 
         assert created is True
         assert outcome.status == "succeeded"
@@ -1700,6 +1838,14 @@ def test_combined_attachment_knowledge_two_tools_and_result_form_one_execution(
         assert operations[2].result_json["data"]["total"] == 5
         assert result.status == "verified"
         assert publication.status == "settled"
+        assert artifact.filename == "续约风险简报.md"
+        assert artifact.content_checksum
+        assert artifact_link.input_snapshot_id == db.exec(
+            select(InputResourceSnapshot.id).where(
+                InputResourceSnapshot.execution_id == instance.id
+            )
+        ).one()
+        assert assistant_messages[0].metadata_json["artifact_ids"] == [artifact.id]
         assert len(assistant_messages) == 1
         assert assistant_messages[0].metadata_json["execution_id"] == instance.id
         assert instance.context_json["dynamic_budget_usage"] == {

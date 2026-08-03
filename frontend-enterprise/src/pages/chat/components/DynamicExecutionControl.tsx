@@ -7,7 +7,7 @@
  */
 
 import { useCallback, useEffect, useState } from 'react';
-import { CircleCheck, CircleX, LoaderCircle, Route, SlidersHorizontal } from 'lucide-react';
+import { CircleCheck, CircleX, Download, LoaderCircle, Route, SlidersHorizontal } from 'lucide-react';
 
 import { api, getRequestTenantId } from '@/api/client';
 import { notify } from '@/components/ui/app-toast';
@@ -22,6 +22,12 @@ type ExecutionState = {
   revision: number;
   goal?: string | null;
   current_step_key?: string | null;
+  artifacts?: Array<{
+    id: string;
+    filename: string;
+    mime_type: string;
+    size_bytes: number;
+  }>;
 };
 
 type CommandState = {
@@ -112,6 +118,24 @@ export default function DynamicExecutionControl({ executionId }: { executionId: 
     }
   }
 
+  async function downloadArtifact(artifactId: string, filename: string) {
+    try {
+      const blob = await api.blob(
+        `/api/artifacts/${artifactId}/download?tenant_id=${encodeURIComponent(getRequestTenantId())}`,
+      );
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = filename;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 0);
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '交付物下载失败');
+    }
+  }
+
   return (
     <div className="mt-[10px] rounded-[12px] border border-[#dfe5f2] bg-[linear-gradient(105deg,#f8faff,#f5fbf8)] px-[12px] py-[10px]" aria-label="动态任务控制">
       <div className="flex flex-wrap items-center justify-between gap-[8px]">
@@ -136,6 +160,21 @@ export default function DynamicExecutionControl({ executionId }: { executionId: 
         ) : null}
       </div>
       {command ? <CommandStatus command={command} /> : null}
+      {execution.artifacts?.length ? (
+        <div className="mt-[8px] grid gap-[5px]" aria-label="任务交付物">
+          {execution.artifacts.map((artifact) => (
+            <button
+              key={artifact.id}
+              type="button"
+              className="flex items-center justify-between gap-[8px] rounded-[8px] border border-[#dfe5f2] bg-white px-[9px] py-[7px] text-left text-[11px] text-[#4f576d] hover:border-[#b9c5ee] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#3157e8]"
+              onClick={() => void downloadArtifact(artifact.id, artifact.filename)}
+            >
+              <span className="truncate">{artifact.filename}</span>
+              <span className="flex shrink-0 items-center gap-[4px] text-[#3157e8]"><Download className="size-[12px]" />下载</span>
+            </button>
+          ))}
+        </div>
+      ) : null}
       <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
         <DialogContent aria-describedby={undefined} className="gap-[14px] rounded-[14px] sm:max-w-[500px]">
           <DialogTitle className="text-[15px]">追加当前任务约束</DialogTitle>

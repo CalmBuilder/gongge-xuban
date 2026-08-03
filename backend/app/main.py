@@ -1,5 +1,5 @@
 """
-@Time       : 2026/07/22 09:27
+@Time       : 2026/08/04 01:04
 @Author     : zhanglp8181
 @File       : main.py
 @CallChain  : ASGI Server → FastAPI lifespan/routers → application services
@@ -18,6 +18,7 @@ from sqlmodel import Session
 from app.api import (
     agents,
     attention_items,
+    artifacts,
     auth,
     chat,
     executions,
@@ -104,6 +105,7 @@ app.include_router(organization_units.router)
 app.include_router(reference_data.router)
 app.include_router(work_items.router)
 app.include_router(attention_items.router)
+app.include_router(artifacts.router)
 app.include_router(executions.router)
 app.include_router(agents.scope_router)
 app.include_router(agents.enterprise_router)

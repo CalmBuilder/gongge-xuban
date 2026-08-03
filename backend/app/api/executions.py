@@ -1,9 +1,9 @@
 """
-@Time       : 2026/08/03 22:20
+@Time       : 2026/08/04 01:04
 @Author     : zhanglp8181
 @File       : executions.py
 @CallChain  : 执行卡/Chat 控制 → FastAPI → ExecutionControlService/Execution Store
-@Description: 提供统一 Execution 查询、cancel/steer 命令和不可变结果读取接口。
+@Description: 提供统一 Execution 查询、cancel/steer 命令、Artifact 摘要和不可变结果读取接口。
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ from app.config import get_settings
 from app.db import get_session
 from app.db.models import (
     ExecutionCommand,
+    ExecutionArtifact,
     ExecutionPlanRevision,
     ExecutionPublication,
     ExecutionResult,
@@ -25,6 +26,7 @@ from app.db.models import (
     User,
 )
 from app.organization.permissions import user_permission_codes
+from app.dynamic_tasks.artifacts import ArtifactAccessDenied, ArtifactService
 from app.security.auth import ensure_current_user_tenant, get_current_user
 from app.sop_runtime.execution_control import ExecutionControlError, ExecutionControlService
 from app.sop_runtime.execution_store import SopExecutionConflictError, SopExecutionStore
@@ -58,6 +60,17 @@ class ExecutionCommandRead(BaseModel):
     consumed_at: str | None
 
 
+class ExecutionArtifactSummary(BaseModel):
+    """返回执行卡展示和鉴权下载所需的最小 Artifact 元数据。"""
+
+    id: str
+    filename: str
+    mime_type: str
+    size_bytes: int
+    content_checksum: str
+    source_step_key: str
+
+
 class ExecutionRead(BaseModel):
     """返回执行卡可直接使用、无需由聊天消息推导的权威状态。"""
 
@@ -79,6 +92,7 @@ class ExecutionRead(BaseModel):
     budget: dict[str, object]
     usage: dict[str, object]
     pending_attention_count: int
+    artifacts: list[ExecutionArtifactSummary]
 
 
 class ExecutionResultRead(BaseModel):
@@ -104,7 +118,7 @@ def get_execution(
     """按 tenant 和显式 Execution 管理资格读取执行卡状态。"""
 
     instance = _authorized_execution(db, tenant_id, execution_id, current_user)
-    return _execution_read(db, instance)
+    return _execution_read(db, instance, current_user)
 
 
 @router.post("/{execution_id}/commands", response_model=ExecutionCommandRead)
@@ -233,7 +247,7 @@ def _authorized_execution(
     return instance
 
 
-def _execution_read(db: Session, instance: SopInstance) -> ExecutionRead:
+def _execution_read(db: Session, instance: SopInstance, current_user: User) -> ExecutionRead:
     """把 Execution 聚合映射成稳定 API 契约。"""
 
     plan_revision = (
@@ -301,6 +315,33 @@ def _execution_read(db: Session, instance: SopInstance) -> ExecutionRead:
     )
     goal_snapshot = dict(instance.goal_snapshot_json or {})
     criteria = plan.get("success_criteria", goal_snapshot.get("success_criteria", []))
+    artifact_service = ArtifactService(db)
+    artifacts: list[ExecutionArtifactSummary] = []
+    for artifact in db.exec(
+        select(ExecutionArtifact).where(
+            ExecutionArtifact.tenant_id == instance.tenant_id,
+            ExecutionArtifact.execution_id == instance.id,
+            ExecutionArtifact.status == "ready",
+        ).order_by(ExecutionArtifact.created_at, ExecutionArtifact.id).limit(20)
+    ).all():
+        try:
+            artifact_service.authorize(
+                artifact.id,
+                tenant_id=instance.tenant_id,
+                actor_user_id=current_user.id,
+            )
+        except ArtifactAccessDenied:
+            continue
+        artifacts.append(
+            ExecutionArtifactSummary(
+                id=artifact.id,
+                filename=artifact.filename,
+                mime_type=artifact.mime_type,
+                size_bytes=artifact.size_bytes,
+                content_checksum=artifact.content_checksum,
+                source_step_key=artifact.source_step_key,
+            )
+        )
 
     return ExecutionRead(
         id=instance.id,
@@ -323,6 +364,7 @@ def _execution_read(db: Session, instance: SopInstance) -> ExecutionRead:
         budget=dict(instance.budget_snapshot_json or plan.get("budget") or {}),
         usage=dict((instance.context_json or {}).get("dynamic_budget_usage") or {}),
         pending_attention_count=pending_attention_count,
+        artifacts=artifacts,
     )
 
 

@@ -1,5 +1,5 @@
 """
-@Time       : 2026/08/03 22:18
+@Time       : 2026/08/04 01:04
 @Author     : zhanglp8181
 @File       : planning.py
 @CallChain  : DynamicTaskAgent/FormalSopPlanner → normalized plan/proposal → SopExecutionStore
@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from enum import StrEnum
 from typing import Any, Protocol
 
@@ -100,6 +101,32 @@ class NormalizedPlan(PlanningContract):
         criterion_ids = [criterion.id for criterion in self.success_criteria]
         if len(set(criterion_ids)) != len(criterion_ids):
             raise ValueError("成功标准 id 不得重复")
+        artifact_keys: list[str] = []
+        allowed_artifact_fields = {
+            "artifact_key",
+            "filename",
+            "mime_type",
+            "content_source",
+            "required",
+        }
+        if len(self.expected_artifacts) > 20:
+            raise ValueError("单次执行最多声明 20 个 Artifact")
+        for artifact in self.expected_artifacts:
+            if set(artifact) - allowed_artifact_fields:
+                raise ValueError("Artifact 声明包含未知字段")
+            artifact_key = str(artifact.get("artifact_key") or "")
+            filename = str(artifact.get("filename") or "")
+            if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,127}", artifact_key):
+                raise ValueError("Artifact key 无效")
+            if not filename or len(filename) > 191 or "/" in filename or "\\" in filename:
+                raise ValueError("Artifact filename 无效")
+            if artifact.get("mime_type") != "text/markdown":
+                raise ValueError("首期只允许声明 Markdown Artifact")
+            if artifact.get("content_source", "result.markdown") != "result.markdown":
+                raise ValueError("Artifact content source 无效")
+            artifact_keys.append(artifact_key)
+        if len(set(artifact_keys)) != len(artifact_keys):
+            raise ValueError("Artifact key 不得重复")
         known = set(step_keys)
         dependencies: dict[str, set[str]] = {}
         for step in self.steps:

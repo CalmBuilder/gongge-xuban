@@ -1,9 +1,9 @@
 """
-@Time       : 2026/08/03 19:20
+@Time       : 2026/08/04 01:04
 @Author     : zhanglp8181
 @File       : test_execution_control.py
 @CallChain  : pytest → ExecutionControlService → Execution Store/SQLite
-@Description: 验证 Attention、命令、signal、结果发布和终态闭合的并发与崩溃恢复契约。
+@Description: 验证 Attention、命令、signal、Artifact、结果发布和终态闭合契约。
 """
 
 from __future__ import annotations
@@ -422,7 +422,10 @@ def test_dynamic_terminal_guard_rejects_required_plan_step_never_created(db: Ses
         plan_json={
             "steps": [
                 {"step_key": "required_missing", "required": True},
-            ]
+            ],
+            "expected_artifacts": [
+                {"artifact_key": "required_brief", "required": True},
+            ],
         },
         checksum="a" * 64,
         capability_snapshot_json={"capabilities": []},
@@ -447,6 +450,7 @@ def test_dynamic_terminal_guard_rejects_required_plan_step_never_created(db: Ses
             control.assert_terminal_closure(instance, "succeeded")
 
     assert "missing_required_steps" in str(blocked.value)
+    assert "missing_required_artifacts" in str(blocked.value)
 
 
 def test_signal_and_outbox_exhaust_attempt_budget_into_dead_letter(db: Session) -> None:

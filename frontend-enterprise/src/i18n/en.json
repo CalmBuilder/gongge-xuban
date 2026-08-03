@@ -3349,5 +3349,10 @@
   "例如：只分析 2026 年内到期合同，并排除已终止记录": "For example: analyze only contracts expiring in 2026 and exclude terminated records",
   "约束已应用，任务已按新计划继续": "Constraint applied; the task is continuing with the revised plan",
   "约束未被应用": "Constraint was not applied",
-  "追加约束能力当前已关闭": "Adding constraints is currently disabled"
+  "追加约束能力当前已关闭": "Adding constraints is currently disabled",
+  "终态执行展示权威 Artifact 并通过鉴权 API 下载": "Terminal executions show authoritative artifacts and download them through the authenticated API",
+  "续约风险简报.md": "Renewal Risk Brief.md",
+  "交付物下载失败": "Failed to download artifact",
+  "任务交付物": "Task Artifacts",
+  "下载": "Download"
 }

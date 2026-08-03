@@ -1,9 +1,9 @@
 """
-@Time       : 2026/08/03 18:30
+@Time       : 2026/08/04 01:04
 @Author     : zhanglp8181
 @File       : execution_control.py
 @CallChain  : Attention/Execution API/Workers → ExecutionControlService → Execution Store/SQLModel
-@Description: 管理统一 Attention、命令、信号、事件、结果、发布和终态闭合契约。
+@Description: 管理统一 Attention、命令、信号、事件、结果、Artifact 门禁、发布和终态闭合契约。
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from app.db.models import (
     AgentEvent,
     EventOutbox,
     ExecutionCommand,
+    ExecutionArtifact,
     ExecutionPlanRevision,
     ExecutionPublication,
     ExecutionResult,
@@ -862,6 +863,30 @@ class ExecutionControlService:
                     required_keys <= completed_keys
                 ):
                     blockers.append("missing_required_steps")
+                expected_artifacts = (
+                    revision.plan_json.get("expected_artifacts")
+                    if revision is not None and isinstance(revision.plan_json, dict)
+                    else None
+                )
+                required_artifact_keys = {
+                    str(item.get("artifact_key"))
+                    for item in expected_artifacts or []
+                    if isinstance(item, dict)
+                    and item.get("required", True) is True
+                    and item.get("artifact_key")
+                }
+                ready_artifact_keys = {
+                    item.artifact_key
+                    for item in self.db.exec(
+                        select(ExecutionArtifact).where(
+                            ExecutionArtifact.tenant_id == instance.tenant_id,
+                            ExecutionArtifact.execution_id == instance.id,
+                            ExecutionArtifact.status == "ready",
+                        )
+                    ).all()
+                }
+                if not required_artifact_keys <= ready_artifact_keys:
+                    blockers.append("missing_required_artifacts")
             else:
                 incomplete_steps = [
                     item.id

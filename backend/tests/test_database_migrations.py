@@ -1,5 +1,5 @@
 """
-@Time       : 2026/07/28 12:12
+@Time       : 2026/08/04 01:04
 @Author     : zhanglp8181
 @File       : test_database_migrations.py
 @CallChain  : pytest → Alembic/数据库适配器 → SQLite/MySQL schema
@@ -2656,6 +2656,42 @@ def test_execution_control_migration_rejects_full_columns_without_constraints(tm
 
     with pytest.raises(RuntimeError, match="missing constraints"):
         command.upgrade(config, "20260803_0040")
+
+
+def test_execution_artifact_migration_is_repeatable_and_guards_facts(tmp_path) -> None:
+    """验证 0041 可重复升级并在 Artifact/lineage 已存在时 fail closed。"""
+
+    database_url = f"sqlite:///{tmp_path / 'execution-artifacts.db'}"
+    config = Config(str(BACKEND_DIR / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
+    config.attributes["database_url"] = database_url
+    engine = create_engine(database_url)
+    _prepare_0039_execution_control_database(engine, config)
+    command.upgrade(config, "20260804_0041")
+    command.upgrade(config, "20260804_0041")
+    with engine.connect() as connection:
+        inspector = inspect(connection)
+        assert {"execution_artifacts", "artifact_input_links"} <= set(
+            inspector.get_table_names()
+        )
+        artifact_indexes = {item["name"] for item in inspector.get_indexes("execution_artifacts")}
+        assert "ix_execution_artifacts_tenant_checksum" in artifact_indexes
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO execution_artifacts ("
+                "id, tenant_id, execution_id, source_node_execution_id, source_step_key, "
+                "artifact_key, filename, mime_type, size_bytes, content_checksum, "
+                "storage_locator, acl_json, lineage_json, status, created_at, updated_at"
+                ") VALUES ("
+                "'artifact_1', 'tenant_1', 'execution_1', 'node_1', 'answer', 'brief', "
+                "'brief.md', 'text/markdown', 5, :checksum, 'managed/locator', '{}', '{}', "
+                "'ready', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            ),
+            {"checksum": "a" * 64},
+        )
+    with pytest.raises(RuntimeError, match="cannot downgrade execution artifacts"):
+        command.downgrade(config, "20260803_0040")
 
 
 def test_desktop_sqlite_rebuilds_legacy_work_item_as_typed_attention(tmp_path) -> None:

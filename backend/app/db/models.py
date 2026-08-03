@@ -1,5 +1,5 @@
 """
-@Time       : 2026/07/18 09:22
+@Time       : 2026/08/04 01:04
 @Author     : zhanglp8181
 @File       : models.py
 @CallChain  : API/Seed/Workers → SQLModel Session → models.py → SQLAlchemy Engine
@@ -943,6 +943,64 @@ class InputResourceSnapshot(SQLModel, table=True):
     identity_checksum: VersionString = Field(index=True)
     storage_locator_digest: VersionString
     captured_acl_json: dict[str, Any] = Field(sa_column=Column(JSON, nullable=False))
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class ExecutionArtifact(SQLModel, table=True):
+    """登记由 Execution 产生、可校验下载且不以文件路径授权的交付物。"""
+
+    __tablename__ = "execution_artifacts"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "execution_id",
+            "artifact_key",
+            name="uq_execution_artifact_key",
+        ),
+        CheckConstraint(
+            "status IN ('ready', 'corrupt', 'revoked')",
+            name="ck_execution_artifact_status",
+        ),
+        CheckConstraint("size_bytes >= 0", name="ck_execution_artifact_size"),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("artifact"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    execution_id: str = Field(sa_column=Column(String(512), nullable=False, index=True))
+    source_node_execution_id: IdentifierString = Field(index=True)
+    source_step_key: IdentifierString = Field(index=True)
+    artifact_key: IdentifierString = Field(index=True)
+    filename: NameString
+    mime_type: NameString = Field(index=True)
+    size_bytes: int = Field(ge=0)
+    content_checksum: VersionString = Field(index=True)
+    storage_locator: str = Field(sa_column=Column(String(1000), nullable=False))
+    acl_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    lineage_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    status: LabelString = Field(default="ready", index=True)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+    revoked_at: datetime | None = None
+
+
+class ArtifactInputLink(SQLModel, table=True):
+    """保存输出 Artifact 到精确输入快照的有方向血缘边。"""
+
+    __tablename__ = "artifact_input_links"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "artifact_id",
+            "input_snapshot_id",
+            name="uq_artifact_input_link",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("artifactinput"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    execution_id: str = Field(sa_column=Column(String(512), nullable=False, index=True))
+    artifact_id: IdentifierString = Field(index=True)
+    input_snapshot_id: IdentifierString = Field(index=True)
     created_at: datetime = Field(default_factory=utc_now)
 
 

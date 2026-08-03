@@ -17,12 +17,13 @@ import DynamicExecutionControl from './DynamicExecutionControl';
 
 vi.mock('@/api/client', () => ({
   getRequestTenantId: () => 'tenant_demo',
-  api: { get: vi.fn(), post: vi.fn() },
+  api: { get: vi.fn(), post: vi.fn(), blob: vi.fn() },
 }));
 
 beforeEach(() => {
   vi.mocked(api.get).mockReset();
   vi.mocked(api.post).mockReset();
+  vi.mocked(api.blob).mockReset();
   vi.mocked(api.get).mockResolvedValue({
     id: 'execution_1',
     kind: 'dynamic_task',
@@ -31,6 +32,39 @@ beforeEach(() => {
     goal: '生成合同风险简报',
     current_step_key: 'read_contract',
   });
+});
+
+it('终态执行展示权威 Artifact 并通过鉴权 API 下载', async () => {
+  /** 下载只能使用 artifact id，不能把服务端存储路径暴露给浏览器。 */
+
+  vi.mocked(api.get).mockResolvedValue({
+    id: 'execution_1',
+    kind: 'dynamic_task',
+    status: 'succeeded',
+    revision: 20,
+    goal: '生成合同风险简报',
+    artifacts: [
+      { id: 'artifact_1', filename: '续约风险简报.md', mime_type: 'text/markdown', size_bytes: 128 },
+    ],
+  });
+  vi.mocked(api.blob).mockResolvedValue(new Blob(['brief'], { type: 'text/markdown' }));
+  const createObjectURL = vi.fn(() => 'blob:artifact');
+  const revokeObjectURL = vi.fn();
+  vi.stubGlobal('URL', { ...URL, createObjectURL, revokeObjectURL });
+  const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined);
+  const user = userEvent.setup();
+  renderControl();
+
+  await user.click(await screen.findByRole('button', { name: /续约风险简报.md/ }));
+
+  expect(api.blob).toHaveBeenCalledWith(
+    '/api/artifacts/artifact_1/download?tenant_id=tenant_demo',
+  );
+  expect(createObjectURL).toHaveBeenCalledTimes(1);
+  expect(click).toHaveBeenCalledTimes(1);
+  await waitFor(() => expect(revokeObjectURL).toHaveBeenCalledTimes(1));
+  click.mockRestore();
+  vi.unstubAllGlobals();
 });
 
 function renderControl() {

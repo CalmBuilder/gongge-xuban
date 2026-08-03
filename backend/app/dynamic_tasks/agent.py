@@ -1,9 +1,9 @@
 """
-@Time       : 2026/08/04 01:45
+@Time       : 2026/08/04 01:04
 @Author     : zhanglp8181
 @File       : agent.py
 @CallChain  : Agent Loop/signal worker → DynamicTaskAgent → Execution Store/ToolExecutor
-@Description: 以统一 Execution 账本串行推进只读动态动作，并支持崩溃后的安全恢复。
+@Description: 以统一 Execution 账本推进动态动作、可信 Artifact，并支持崩溃后的安全恢复。
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from sqlmodel import Session, select
 from app.db.models import (
     ActionProposalRecord,
     ExecutionCommand,
+    ExecutionArtifact,
     ExecutionPlanRevision,
     ExecutionSignal,
     AgentEvent,
@@ -33,6 +34,11 @@ from app.db.models import (
     User,
 )
 from app.dynamic_tasks.action_proposer import DynamicActionProposer
+from app.dynamic_tasks.artifacts import (
+    ArtifactAccessDenied,
+    ArtifactContractError,
+    ArtifactService,
+)
 from app.dynamic_tasks.capability_catalog import (
     CapabilitySnapshot,
     DynamicCapabilityCatalog,
@@ -107,6 +113,7 @@ class DynamicTaskAgent:
         action_proposer: DynamicActionProposer | None = None,
         resource_service: ManagedInputResourceService | None = None,
         knowledge_service: KnowledgeService | None = None,
+        artifact_service: ArtifactService | None = None,
     ) -> None:
         """绑定统一事务、能力目录和既有工具执行器，禁止创建第二套 Runtime。"""
 
@@ -118,6 +125,7 @@ class DynamicTaskAgent:
         self.action_proposer = action_proposer
         self.resource_service = resource_service or ManagedInputResourceService(db)
         self.knowledge_service = knowledge_service or KnowledgeService(db)
+        self.artifact_service = artifact_service or ArtifactService(db)
 
     def advance_next_read_step(
         self,
@@ -1152,7 +1160,7 @@ class DynamicTaskAgent:
         require_dynamic_preflight(model_capabilities)
         if completed_response.proposal.action_kind.value not in {"answer", "complete"}:
             raise DynamicTaskAgentError("DYNAMIC_RESULT_ACTION_REQUIRED")
-        with self.store.owned(instance, worker_id=worker_id):
+        with self.store.owned(instance, worker_id=worker_id), self.db.begin_nested():
             plan = self._current_plan(instance)
             step_definition = next(
                 (item for item in plan.steps if item.step_key == step_key),
@@ -1194,10 +1202,20 @@ class DynamicTaskAgent:
                 self.db.add(proposal)
                 self.db.flush()
                 raise DynamicTaskAgentError("DYNAMIC_RESULT_VERIFICATION_FAILED")
+            artifacts = self._register_expected_artifacts(
+                instance=instance,
+                step=step,
+                plan=plan,
+                result=result,
+            )
+            verification["artifact_ids"] = [item.id for item in artifacts]
             self.store.complete_node(
                 instance,
                 step,
-                output={"result_checksum": canonical_result_checksum(result)},
+                output={
+                    "result_checksum": canonical_result_checksum(result),
+                    "artifact_ids": [item.id for item in artifacts],
+                },
             )
             control = ExecutionControlService(self.db, self.store)
             result_row, publication, _ = control.freeze_result(
@@ -1215,6 +1233,7 @@ class DynamicTaskAgent:
                     "execution_id": instance.id,
                     "result_id": result_row.id,
                     "result_checksum": result_row.checksum,
+                    "artifact_ids": [item.id for item in artifacts],
                 },
             )
             self.db.add(message)
@@ -1241,6 +1260,7 @@ class DynamicTaskAgent:
                         "reply": result.markdown,
                         "execution_id": instance.id,
                         "result_id": result_row.id,
+                        "artifact_ids": [item.id for item in artifacts],
                     },
                 )
             )
@@ -1264,8 +1284,58 @@ class DynamicTaskAgent:
                     worker_id=signal_worker_id or worker_id,
                 )
             self.store.complete_instance(instance)
-            self.db.commit()
-            return message
+        self.db.commit()
+        return message
+
+    def _register_expected_artifacts(
+        self,
+        *,
+        instance: SopInstance,
+        step: SopNodeExecution,
+        plan: NormalizedPlan,
+        result: DynamicTaskResult,
+    ) -> list[ExecutionArtifact]:
+        """把计划声明的 Markdown 交付物登记到结果步骤并验证内容与输入 lineage。"""
+
+        snapshot_ids = tuple(
+            row.id
+            for row in self.db.exec(
+                select(InputResourceSnapshot).where(
+                    InputResourceSnapshot.tenant_id == instance.tenant_id,
+                    InputResourceSnapshot.execution_id == instance.id,
+                )
+            ).all()
+        )
+        artifacts: list[ExecutionArtifact] = []
+        for raw in plan.expected_artifacts:
+            artifact_key = str(raw.get("artifact_key") or "").strip()
+            filename = str(raw.get("filename") or "").strip()
+            mime_type = str(raw.get("mime_type") or "").strip()
+            content_source = str(raw.get("content_source") or "result.markdown")
+            required = raw.get("required", True) is True
+            if content_source != "result.markdown" or mime_type != "text/markdown":
+                if required:
+                    raise DynamicTaskAgentError("DYNAMIC_ARTIFACT_DECLARATION_UNSUPPORTED")
+                continue
+            try:
+                artifact, _ = self.artifact_service.register(
+                    instance=instance,
+                    source_node=step,
+                    artifact_key=artifact_key,
+                    filename=filename,
+                    mime_type=mime_type,
+                    data=result.markdown.encode("utf-8"),
+                    input_snapshot_ids=snapshot_ids,
+                )
+                self.artifact_service.resolve(
+                    artifact.id,
+                    tenant_id=instance.tenant_id,
+                    actor_user_id=instance.initiator_user_id,
+                )
+            except (ArtifactContractError, ArtifactAccessDenied) as exc:
+                raise DynamicTaskAgentError("DYNAMIC_ARTIFACT_REGISTRATION_FAILED") from exc
+            artifacts.append(artifact)
+        return artifacts
 
     def _frozen_read_snapshot(
         self,

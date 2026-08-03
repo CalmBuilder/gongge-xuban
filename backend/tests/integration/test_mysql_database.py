@@ -1,5 +1,5 @@
 """
-@Time       : 2026/07/27 16:10
+@Time       : 2026/08/04 01:04
 @Author     : zhanglp8181
 @File       : test_mysql_database.py
 @CallChain  : pytest mysql 标记 → Alembic/SQLModel → 临时 MySQL 8.4 数据库
@@ -23,18 +23,22 @@ from app.db.models import (
     ActionProposalRecord,
     AgentEvent,
     AgentProfile,
+    ArtifactInputLink,
     EventOutbox,
     ExecutionCommand,
     ExecutionPublication,
     ExecutionResult,
     ExecutionSignal,
+    ExecutionArtifact,
     ExecutionPlanRevision,
     ExecutionMutationRejection,
     Message,
     ModelConfig,
+    InputResourceSnapshot,
     Skill,
     SkillVersion,
     SopInstance,
+    SopNodeExecution,
     SopOperation,
     SopOperationAttempt,
     SopOperationEffect,
@@ -42,6 +46,7 @@ from app.db.models import (
     Tenant,
     User,
 )
+from app.dynamic_tasks.artifacts import ArtifactService
 from app.dynamic_tasks.planning import (
     ActionKind,
     CompletedProviderProposal,
@@ -134,6 +139,8 @@ def test_alembic_upgrades_empty_mysql_database(mysql_database_url: str) -> None:
     assert "alembic_version" in tables
     assert "messages" in tables
     assert "agent_resource_bindings" in tables
+    assert "execution_artifacts" in tables
+    assert "artifact_input_links" in tables
     assert "code_sets" in tables
     assert "code_items" in tables
     assert "organization_units" in tables
@@ -310,7 +317,7 @@ def test_alembic_upgrades_empty_mysql_database(mysql_database_url: str) -> None:
     with engine.connect() as connection:
         assert (
             connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-            == "20260803_0040"
+                == "20260804_0041"
         )
 
 
@@ -2058,6 +2065,111 @@ def test_mysql_engine_pool_survives_dispose(mysql_database_url: str) -> None:
     engine = runtime.engine
     with engine.connect() as connection:
         assert connection.execute(text("SELECT 1")).scalar_one() == 1
+    engine.dispose()
+
+
+def test_mysql_execution_artifact_and_exact_lineage_round_trip(
+    mysql_database_url: str,
+    tmp_path: Path,
+) -> None:
+    """验证 MySQL 8.4 上 Artifact JSON、Unicode、唯一血缘和内容校验完整往返。"""
+
+    upgrade(mysql_database_url)
+    engine = create_engine(mysql_database_url, pool_pre_ping=True)
+    with Session(engine, expire_on_commit=False) as db:
+        owner = User(
+            id="mysql_artifact_owner",
+            tenant_id="tenant_mysql_artifact",
+            username="mysql-artifact-owner",
+            password_hash="x",
+        )
+        instance = SopInstance(
+            id="mysql_execution_artifact",
+            tenant_id=owner.tenant_id,
+            session_id="mysql_session_artifact",
+            kind="dynamic_task",
+            active_slot_key="dynamic:mysql-artifact",
+            initiator_user_id=owner.id,
+            agent_id="mysql_agent_artifact",
+            goal_snapshot_json={"goal": "生成中文风险简报"},
+            current_plan_revision_id="mysql_plan_artifact",
+            current_plan_checksum="a" * 64,
+            capability_snapshot_json={"model": {"id": "mysql_model_artifact"}},
+            capability_checksum="b" * 64,
+            status="running",
+        )
+        node = SopNodeExecution(
+            id="mysql_node_artifact",
+            tenant_id=owner.tenant_id,
+            instance_id=instance.id,
+            node_id="answer",
+            step_key="answer",
+            step_kind="answer",
+            status="running",
+        )
+        snapshot = InputResourceSnapshot(
+            id="mysql_snapshot_artifact",
+            tenant_id=owner.tenant_id,
+            execution_id=instance.id,
+            source_type="managed_upload",
+            source_resource_id="mysql_resource_artifact",
+            source_version="v1",
+            filename="合同.pdf",
+            mime_type="application/pdf",
+            size_bytes=128,
+            content_checksum="c" * 64,
+            extraction_checksum="d" * 64,
+            ingestion_status="ready",
+            identity_checksum="e" * 64,
+            storage_locator_digest="f" * 64,
+            captured_acl_json={"owner": owner.id},
+        )
+        db.add(owner)
+        db.add(instance)
+        db.add(node)
+        db.add(snapshot)
+        db.commit()
+
+        service = ArtifactService(db, storage_root=tmp_path)
+        artifact, created = service.register(
+            instance=instance,
+            source_node=node,
+            artifact_key="risk_brief",
+            filename="续约风险简报.md",
+            mime_type="text/markdown",
+            data="# 续约风险简报\n\n证据已核验。".encode(),
+            input_snapshot_ids=(snapshot.id,),
+        )
+        db.commit()
+        artifact_id = artifact.id
+
+    with Session(engine, expire_on_commit=False) as db:
+        artifact = db.get(ExecutionArtifact, artifact_id)
+        assert artifact is not None
+        service = ArtifactService(db, storage_root=tmp_path)
+        resolved, data = service.resolve(
+            artifact.id,
+            tenant_id="tenant_mysql_artifact",
+            actor_user_id="mysql_artifact_owner",
+        )
+        links = db.exec(
+            select(ArtifactInputLink).where(ArtifactInputLink.artifact_id == artifact.id)
+        ).all()
+        assert created is True
+        assert resolved.filename == "续约风险简报.md"
+        assert data.decode().startswith("# 续约风险简报")
+        assert [item.input_snapshot_id for item in links] == ["mysql_snapshot_artifact"]
+        with pytest.raises(IntegrityError):
+            db.add(
+                ArtifactInputLink(
+                    tenant_id=artifact.tenant_id,
+                    execution_id=artifact.execution_id,
+                    artifact_id=artifact.id,
+                    input_snapshot_id="mysql_snapshot_artifact",
+                )
+            )
+            db.commit()
+        db.rollback()
     engine.dispose()
     with engine.connect() as connection:
         assert connection.execute(text("SELECT 1")).scalar_one() == 1
