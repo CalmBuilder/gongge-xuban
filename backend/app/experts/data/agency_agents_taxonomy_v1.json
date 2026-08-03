@@ -1,0 +1,1848 @@
+{
+  "version": 1,
+  "source_code": "agency-agents",
+  "source_commit": "459dce837db3bdfdc4763d3fefd1fd854e73c8f1",
+  "experts": [
+    {
+      "upstream_path": "academic/academic-anthropologist.md",
+      "category": "学术研究",
+      "subcategory": "人文社会",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "academic/academic-geographer.md",
+      "category": "学术研究",
+      "subcategory": "人文社会",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "academic/academic-historian.md",
+      "category": "学术研究",
+      "subcategory": "人文社会",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "academic/academic-narratologist.md",
+      "category": "学术研究",
+      "subcategory": "人文社会",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "academic/academic-psychologist.md",
+      "category": "学术研究",
+      "subcategory": "心理与行为",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "academic/academic-statistician.md",
+      "category": "学术研究",
+      "subcategory": "统计与方法",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "design/design-brand-guardian.md",
+      "category": "设计创意",
+      "subcategory": "品牌与视觉",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "design/design-image-prompt-engineer.md",
+      "category": "设计创意",
+      "subcategory": "品牌与视觉",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "design/design-inclusive-visuals-specialist.md",
+      "category": "设计创意",
+      "subcategory": "包容与无障碍",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "design/design-persona-walkthrough.md",
+      "category": "设计创意",
+      "subcategory": "用户体验",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "design/design-ui-designer.md",
+      "category": "设计创意",
+      "subcategory": "用户体验",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "design/design-ux-architect.md",
+      "category": "设计创意",
+      "subcategory": "用户体验",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "design/design-ux-researcher.md",
+      "category": "设计创意",
+      "subcategory": "用户体验",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "design/design-visual-storyteller.md",
+      "category": "设计创意",
+      "subcategory": "内容与叙事",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "design/design-whimsy-injector.md",
+      "category": "设计创意",
+      "subcategory": "内容与叙事",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-ai-data-remediation-engineer.md",
+      "category": "工程研发",
+      "subcategory": "AI 与智能体",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-ai-engineer.md",
+      "category": "工程研发",
+      "subcategory": "AI 与智能体",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-api-platform-engineer.md",
+      "category": "工程研发",
+      "subcategory": "后端与平台",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-autonomous-optimization-architect.md",
+      "category": "工程研发",
+      "subcategory": "AI 与智能体",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-backend-architect.md",
+      "category": "工程研发",
+      "subcategory": "后端与平台",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-cms-developer.md",
+      "category": "工程研发",
+      "subcategory": "行业应用工程",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-code-reviewer.md",
+      "category": "工程研发",
+      "subcategory": "开发效能",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-codebase-onboarding-engineer.md",
+      "category": "工程研发",
+      "subcategory": "开发效能",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-data-engineer.md",
+      "category": "工程研发",
+      "subcategory": "数据与数据库",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-database-optimizer.md",
+      "category": "工程研发",
+      "subcategory": "数据与数据库",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-database-reliability-engineer.md",
+      "category": "工程研发",
+      "subcategory": "数据与数据库",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-desktop-app-engineer.md",
+      "category": "工程研发",
+      "subcategory": "前端与客户端",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-developer-tooling-engineer.md",
+      "category": "工程研发",
+      "subcategory": "开发效能",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-devops-automator.md",
+      "category": "工程研发",
+      "subcategory": "云原生与可靠性",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-drupal-performance.md",
+      "category": "工程研发",
+      "subcategory": "行业应用工程",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-drupal-shopping-cart.md",
+      "category": "工程研发",
+      "subcategory": "行业应用工程",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-email-intelligence-engineer.md",
+      "category": "工程研发",
+      "subcategory": "集成与自动化",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-embedded-firmware-engineer.md",
+      "category": "工程研发",
+      "subcategory": "嵌入式与物联网",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-feishu-integration-developer.md",
+      "category": "工程研发",
+      "subcategory": "集成与自动化",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-filament-optimization-specialist.md",
+      "category": "工程研发",
+      "subcategory": "行业应用工程",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-finops-engineer.md",
+      "category": "工程研发",
+      "subcategory": "云原生与可靠性",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-frontend-developer.md",
+      "category": "工程研发",
+      "subcategory": "前端与客户端",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-gaussdb-expert.md",
+      "category": "工程研发",
+      "subcategory": "数据与数据库",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-git-workflow-master.md",
+      "category": "工程研发",
+      "subcategory": "开发效能",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-i18n-engineer.md",
+      "category": "工程研发",
+      "subcategory": "开发效能",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-identity-access-engineer.md",
+      "category": "工程研发",
+      "subcategory": "安全与身份",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-incident-response-commander.md",
+      "category": "工程研发",
+      "subcategory": "云原生与可靠性",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-iot-fleet-engineer.md",
+      "category": "工程研发",
+      "subcategory": "嵌入式与物联网",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-it-service-manager.md",
+      "category": "工程研发",
+      "subcategory": "后端与平台",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-minimal-change-engineer.md",
+      "category": "工程研发",
+      "subcategory": "开发效能",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-mobile-app-builder.md",
+      "category": "工程研发",
+      "subcategory": "前端与客户端",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-mobile-release-engineer.md",
+      "category": "工程研发",
+      "subcategory": "前端与客户端",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-multi-agent-systems-architect.md",
+      "category": "工程研发",
+      "subcategory": "AI 与智能体",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-network-engineer.md",
+      "category": "工程研发",
+      "subcategory": "云原生与可靠性",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-orgscript-engineer.md",
+      "category": "工程研发",
+      "subcategory": "行业应用工程",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-payments-billing-engineer.md",
+      "category": "工程研发",
+      "subcategory": "行业应用工程",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-prompt-engineer.md",
+      "category": "工程研发",
+      "subcategory": "AI 与智能体",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-rag-pipeline-engineer.md",
+      "category": "工程研发",
+      "subcategory": "AI 与智能体",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-rapid-prototyper.md",
+      "category": "工程研发",
+      "subcategory": "开发效能",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-realtime-collaboration-engineer.md",
+      "category": "工程研发",
+      "subcategory": "集成与自动化",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-search-relevance-engineer.md",
+      "category": "工程研发",
+      "subcategory": "数据与数据库",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-section-508-specialist.md",
+      "category": "工程研发",
+      "subcategory": "前端与客户端",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-senior-developer.md",
+      "category": "工程研发",
+      "subcategory": "后端与平台",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-software-architect.md",
+      "category": "工程研发",
+      "subcategory": "后端与平台",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-solidity-smart-contract-engineer.md",
+      "category": "工程研发",
+      "subcategory": "行业应用工程",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-sre.md",
+      "category": "工程研发",
+      "subcategory": "云原生与可靠性",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-technical-writer.md",
+      "category": "工程研发",
+      "subcategory": "开发效能",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-uswds-developer.md",
+      "category": "工程研发",
+      "subcategory": "前端与客户端",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-video-streaming-engineer.md",
+      "category": "工程研发",
+      "subcategory": "行业应用工程",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-voice-ai-integration-engineer.md",
+      "category": "工程研发",
+      "subcategory": "AI 与智能体",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-webassembly-engineer.md",
+      "category": "工程研发",
+      "subcategory": "前端与客户端",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-wechat-mini-program-developer.md",
+      "category": "工程研发",
+      "subcategory": "前端与客户端",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-wordpress-performance.md",
+      "category": "工程研发",
+      "subcategory": "行业应用工程",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-wordpress-shopping-cart.md",
+      "category": "工程研发",
+      "subcategory": "行业应用工程",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "finance/finance-bookkeeper-controller.md",
+      "category": "财务金融",
+      "subcategory": "财务运营",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "finance/finance-financial-analyst.md",
+      "category": "财务金融",
+      "subcategory": "财务分析与规划",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "finance/finance-fpa-analyst.md",
+      "category": "财务金融",
+      "subcategory": "财务分析与规划",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "finance/finance-investment-researcher.md",
+      "category": "财务金融",
+      "subcategory": "投资研究",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "finance/finance-tax-strategist.md",
+      "category": "财务金融",
+      "subcategory": "税务策略",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "game-development/blender/blender-addon-engineer.md",
+      "category": "游戏开发",
+      "subcategory": "Blender",
+      "subcategory_original": "blender",
+      "basis": "upstream_directory"
+    },
+    {
+      "upstream_path": "game-development/game-audio-engineer.md",
+      "category": "游戏开发",
+      "subcategory": "技术美术与音频",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "game-development/game-designer.md",
+      "category": "游戏开发",
+      "subcategory": "游戏设计与内容",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "game-development/godot/godot-gameplay-scripter.md",
+      "category": "游戏开发",
+      "subcategory": "Godot",
+      "subcategory_original": "godot",
+      "basis": "upstream_directory"
+    },
+    {
+      "upstream_path": "game-development/godot/godot-multiplayer-engineer.md",
+      "category": "游戏开发",
+      "subcategory": "Godot",
+      "subcategory_original": "godot",
+      "basis": "upstream_directory"
+    },
+    {
+      "upstream_path": "game-development/godot/godot-shader-developer.md",
+      "category": "游戏开发",
+      "subcategory": "Godot",
+      "subcategory_original": "godot",
+      "basis": "upstream_directory"
+    },
+    {
+      "upstream_path": "game-development/level-designer.md",
+      "category": "游戏开发",
+      "subcategory": "游戏设计与内容",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "game-development/narrative-designer.md",
+      "category": "游戏开发",
+      "subcategory": "游戏设计与内容",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "game-development/roblox-studio/roblox-avatar-creator.md",
+      "category": "游戏开发",
+      "subcategory": "Roblox",
+      "subcategory_original": "roblox-studio",
+      "basis": "upstream_directory"
+    },
+    {
+      "upstream_path": "game-development/roblox-studio/roblox-experience-designer.md",
+      "category": "游戏开发",
+      "subcategory": "Roblox",
+      "subcategory_original": "roblox-studio",
+      "basis": "upstream_directory"
+    },
+    {
+      "upstream_path": "game-development/roblox-studio/roblox-systems-scripter.md",
+      "category": "游戏开发",
+      "subcategory": "Roblox",
+      "subcategory_original": "roblox-studio",
+      "basis": "upstream_directory"
+    },
+    {
+      "upstream_path": "game-development/technical-artist.md",
+      "category": "游戏开发",
+      "subcategory": "技术美术与音频",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "game-development/unity/unity-architect.md",
+      "category": "游戏开发",
+      "subcategory": "Unity",
+      "subcategory_original": "unity",
+      "basis": "upstream_directory"
+    },
+    {
+      "upstream_path": "game-development/unity/unity-editor-tool-developer.md",
+      "category": "游戏开发",
+      "subcategory": "Unity",
+      "subcategory_original": "unity",
+      "basis": "upstream_directory"
+    },
+    {
+      "upstream_path": "game-development/unity/unity-multiplayer-engineer.md",
+      "category": "游戏开发",
+      "subcategory": "Unity",
+      "subcategory_original": "unity",
+      "basis": "upstream_directory"
+    },
+    {
+      "upstream_path": "game-development/unity/unity-shader-graph-artist.md",
+      "category": "游戏开发",
+      "subcategory": "Unity",
+      "subcategory_original": "unity",
+      "basis": "upstream_directory"
+    },
+    {
+      "upstream_path": "game-development/unreal-engine/unreal-multiplayer-architect.md",
+      "category": "游戏开发",
+      "subcategory": "Unreal Engine",
+      "subcategory_original": "unreal-engine",
+      "basis": "upstream_directory"
+    },
+    {
+      "upstream_path": "game-development/unreal-engine/unreal-systems-engineer.md",
+      "category": "游戏开发",
+      "subcategory": "Unreal Engine",
+      "subcategory_original": "unreal-engine",
+      "basis": "upstream_directory"
+    },
+    {
+      "upstream_path": "game-development/unreal-engine/unreal-technical-artist.md",
+      "category": "游戏开发",
+      "subcategory": "Unreal Engine",
+      "subcategory_original": "unreal-engine",
+      "basis": "upstream_directory"
+    },
+    {
+      "upstream_path": "game-development/unreal-engine/unreal-world-builder.md",
+      "category": "游戏开发",
+      "subcategory": "Unreal Engine",
+      "subcategory_original": "unreal-engine",
+      "basis": "upstream_directory"
+    },
+    {
+      "upstream_path": "gis/gis-3d-scene-developer.md",
+      "category": "地理信息",
+      "subcategory": "三维与实景",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "gis/gis-analyst.md",
+      "category": "地理信息",
+      "subcategory": "空间分析",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "gis/gis-bim-specialist.md",
+      "category": "地理信息",
+      "subcategory": "三维与实景",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "gis/gis-cartography-designer.md",
+      "category": "地理信息",
+      "subcategory": "地图与可视化",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "gis/gis-drone-reality-mapping.md",
+      "category": "地理信息",
+      "subcategory": "三维与实景",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "gis/gis-geoai-ml-engineer.md",
+      "category": "地理信息",
+      "subcategory": "GeoAI",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "gis/gis-geoprocessing-specialist.md",
+      "category": "地理信息",
+      "subcategory": "空间分析",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "gis/gis-qa-engineer.md",
+      "category": "地理信息",
+      "subcategory": "GIS 工程与咨询",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "gis/gis-solution-engineer.md",
+      "category": "地理信息",
+      "subcategory": "GIS 工程与咨询",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "gis/gis-spatial-data-engineer.md",
+      "category": "地理信息",
+      "subcategory": "空间数据",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "gis/gis-spatial-data-scientist.md",
+      "category": "地理信息",
+      "subcategory": "空间数据",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "gis/gis-technical-consultant.md",
+      "category": "地理信息",
+      "subcategory": "GIS 工程与咨询",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "gis/gis-web-gis-developer.md",
+      "category": "地理信息",
+      "subcategory": "GIS 工程与咨询",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "healthcare/healthcare-clinical-evidence-agent.md",
+      "category": "医疗健康",
+      "subcategory": "临床证据",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "healthcare/healthcare-innovation-strategist.md",
+      "category": "医疗健康",
+      "subcategory": "医疗创新",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "healthcare/healthcare-sovereign-health-systems-agent.md",
+      "category": "医疗健康",
+      "subcategory": "医疗系统",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "marketing/marketing-aeo-foundations.md",
+      "category": "市场营销",
+      "subcategory": "搜索与增长",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "marketing/marketing-agentic-search-optimizer.md",
+      "category": "市场营销",
+      "subcategory": "搜索与增长",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "marketing/marketing-ai-citation-strategist.md",
+      "category": "市场营销",
+      "subcategory": "搜索与增长",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "marketing/marketing-app-store-optimizer.md",
+      "category": "市场营销",
+      "subcategory": "搜索与增长",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "marketing/marketing-baidu-seo-specialist.md",
+      "category": "市场营销",
+      "subcategory": "搜索与增长",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "marketing/marketing-bilibili-content-strategist.md",
+      "category": "市场营销",
+      "subcategory": "内容与社交",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "marketing/marketing-book-co-author.md",
+      "category": "市场营销",
+      "subcategory": "内容与社交",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "marketing/marketing-carousel-growth-engine.md",
+      "category": "市场营销",
+      "subcategory": "搜索与增长",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "marketing/marketing-china-ecommerce-operator.md",
+      "category": "市场营销",
+      "subcategory": "电商与市场本地化",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "marketing/marketing-china-market-localization-strategist.md",
+      "category": "市场营销",
+      "subcategory": "电商与市场本地化",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "marketing/marketing-content-creator.md",
+      "category": "市场营销",
+      "subcategory": "内容与社交",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "marketing/marketing-cross-border-ecommerce.md",
+      "category": "市场营销",
+      "subcategory": "电商与市场本地化",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "marketing/marketing-douyin-strategist.md",
+      "category": "市场营销",
+      "subcategory": "内容与社交",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "marketing/marketing-email-strategist.md",
+      "category": "市场营销",
+      "subcategory": "生命周期营销",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "marketing/marketing-global-podcast-strategist.md",
+      "category": "市场营销",
+      "subcategory": "内容与社交",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "marketing/marketing-growth-hacker.md",
+      "category": "市场营销",
+      "subcategory": "搜索与增长",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "marketing/marketing-instagram-curator.md",
+      "category": "市场营销",
+      "subcategory": "内容与社交",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "marketing/marketing-kuaishou-strategist.md",
+      "category": "市场营销",
+      "subcategory": "内容与社交",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "marketing/marketing-linkedin-content-creator.md",
+      "category": "市场营销",
+      "subcategory": "内容与社交",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "marketing/marketing-livestream-commerce-coach.md",
+      "category": "市场营销",
+      "subcategory": "电商与市场本地化",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "marketing/marketing-multi-platform-publisher.md",
+      "category": "市场营销",
+      "subcategory": "营销技术与分析",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "marketing/marketing-podcast-strategist.md",
+      "category": "市场营销",
+      "subcategory": "内容与社交",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "marketing/marketing-pr-communications-manager.md",
+      "category": "市场营销",
+      "subcategory": "品牌与传播",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "marketing/marketing-private-domain-operator.md",
+      "category": "市场营销",
+      "subcategory": "生命周期营销",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "marketing/marketing-reddit-community-builder.md",
+      "category": "市场营销",
+      "subcategory": "内容与社交",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "marketing/marketing-seo-specialist.md",
+      "category": "市场营销",
+      "subcategory": "搜索与增长",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "marketing/marketing-short-video-editing-coach.md",
+      "category": "市场营销",
+      "subcategory": "内容与社交",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "marketing/marketing-social-media-strategist.md",
+      "category": "市场营销",
+      "subcategory": "内容与社交",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "marketing/marketing-tiktok-strategist.md",
+      "category": "市场营销",
+      "subcategory": "内容与社交",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "marketing/marketing-twitter-engager.md",
+      "category": "市场营销",
+      "subcategory": "内容与社交",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "marketing/marketing-video-optimization-specialist.md",
+      "category": "市场营销",
+      "subcategory": "营销技术与分析",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "marketing/marketing-wechat-official-account.md",
+      "category": "市场营销",
+      "subcategory": "内容与社交",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "marketing/marketing-weibo-strategist.md",
+      "category": "市场营销",
+      "subcategory": "内容与社交",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "marketing/marketing-x-twitter-intelligence-analyst.md",
+      "category": "市场营销",
+      "subcategory": "营销技术与分析",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "marketing/marketing-xiaohongshu-specialist.md",
+      "category": "市场营销",
+      "subcategory": "内容与社交",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "marketing/marketing-zhihu-strategist.md",
+      "category": "市场营销",
+      "subcategory": "内容与社交",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "paid-media/paid-media-auditor.md",
+      "category": "付费媒体",
+      "subcategory": "投放策略",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "paid-media/paid-media-creative-strategist.md",
+      "category": "付费媒体",
+      "subcategory": "广告创意",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "paid-media/paid-media-paid-social-strategist.md",
+      "category": "付费媒体",
+      "subcategory": "投放策略",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "paid-media/paid-media-ppc-strategist.md",
+      "category": "付费媒体",
+      "subcategory": "投放策略",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "paid-media/paid-media-programmatic-buyer.md",
+      "category": "付费媒体",
+      "subcategory": "投放策略",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "paid-media/paid-media-search-query-analyst.md",
+      "category": "付费媒体",
+      "subcategory": "测量与优化",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "paid-media/paid-media-tracking-specialist.md",
+      "category": "付费媒体",
+      "subcategory": "投放策略",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "product/product-behavioral-nudge-engine.md",
+      "category": "产品管理",
+      "subcategory": "产品战略",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "product/product-feedback-synthesizer.md",
+      "category": "产品管理",
+      "subcategory": "产品战略",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "product/product-manager.md",
+      "category": "产品管理",
+      "subcategory": "产品战略",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "product/product-sprint-prioritizer.md",
+      "category": "产品管理",
+      "subcategory": "产品战略",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "product/product-trend-researcher.md",
+      "category": "产品管理",
+      "subcategory": "产品发现",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "project-management/project-management-experiment-tracker.md",
+      "category": "项目管理",
+      "subcategory": "项目交付",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "project-management/project-management-jira-workflow-steward.md",
+      "category": "项目管理",
+      "subcategory": "敏捷与流程",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "project-management/project-management-meeting-notes-specialist.md",
+      "category": "项目管理",
+      "subcategory": "项目交付",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "project-management/project-management-project-shepherd.md",
+      "category": "项目管理",
+      "subcategory": "项目交付",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "project-management/project-management-studio-operations.md",
+      "category": "项目管理",
+      "subcategory": "项目交付",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "project-management/project-management-studio-producer.md",
+      "category": "项目管理",
+      "subcategory": "项目交付",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "project-management/project-manager-senior.md",
+      "category": "项目管理",
+      "subcategory": "项目交付",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "sales/sales-account-strategist.md",
+      "category": "销售",
+      "subcategory": "销售策略",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "sales/sales-coach.md",
+      "category": "销售",
+      "subcategory": "销售策略",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "sales/sales-deal-strategist.md",
+      "category": "销售",
+      "subcategory": "交易与谈判",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "sales/sales-discovery-coach.md",
+      "category": "销售",
+      "subcategory": "销售策略",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "sales/sales-engineer.md",
+      "category": "销售",
+      "subcategory": "销售策略",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "sales/sales-offer-lead-gen-strategist.md",
+      "category": "销售",
+      "subcategory": "销售策略",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "sales/sales-outbound-strategist.md",
+      "category": "销售",
+      "subcategory": "客户开发",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "sales/sales-pipeline-analyst.md",
+      "category": "销售",
+      "subcategory": "销售策略",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "sales/sales-proposal-strategist.md",
+      "category": "销售",
+      "subcategory": "销售策略",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "security/security-ai-generated-code-auditor.md",
+      "category": "安全",
+      "subcategory": "应用安全",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "security/security-appsec-engineer.md",
+      "category": "安全",
+      "subcategory": "应用安全",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "security/security-architect.md",
+      "category": "安全",
+      "subcategory": "云与基础设施安全",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "security/security-blockchain-security-auditor.md",
+      "category": "安全",
+      "subcategory": "应用安全",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "security/security-cloud-security-architect.md",
+      "category": "安全",
+      "subcategory": "云与基础设施安全",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "security/security-compliance-auditor.md",
+      "category": "安全",
+      "subcategory": "治理风险与合规",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "security/security-incident-responder.md",
+      "category": "安全",
+      "subcategory": "威胁与事件响应",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "security/security-penetration-tester.md",
+      "category": "安全",
+      "subcategory": "应用安全",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "security/security-secrets-credential-engineer.md",
+      "category": "安全",
+      "subcategory": "身份安全",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "security/security-senior-secops.md",
+      "category": "安全",
+      "subcategory": "威胁与事件响应",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "security/security-threat-detection-engineer.md",
+      "category": "安全",
+      "subcategory": "威胁与事件响应",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "security/security-threat-intelligence-analyst.md",
+      "category": "安全",
+      "subcategory": "威胁与事件响应",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "spatial-computing/macos-spatial-metal-engineer.md",
+      "category": "空间计算",
+      "subcategory": "三维内容",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "spatial-computing/terminal-integration-specialist.md",
+      "category": "空间计算",
+      "subcategory": "空间平台工程",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "spatial-computing/visionos-spatial-engineer.md",
+      "category": "空间计算",
+      "subcategory": "XR 体验",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "spatial-computing/xr-cockpit-interaction-specialist.md",
+      "category": "空间计算",
+      "subcategory": "空间交互",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "spatial-computing/xr-immersive-developer.md",
+      "category": "空间计算",
+      "subcategory": "XR 体验",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "spatial-computing/xr-interface-architect.md",
+      "category": "空间计算",
+      "subcategory": "空间交互",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/accounts-payable-agent.md",
+      "category": "专业服务",
+      "subcategory": "供应链与运营",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/agentic-identity-trust.md",
+      "category": "专业服务",
+      "subcategory": "智能体与自动化咨询",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/agents-orchestrator.md",
+      "category": "专业服务",
+      "subcategory": "智能体与自动化咨询",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/automation-governance-architect.md",
+      "category": "专业服务",
+      "subcategory": "智能体与自动化咨询",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/business-strategist.md",
+      "category": "专业服务",
+      "subcategory": "战略与管理咨询",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/change-management-consultant.md",
+      "category": "专业服务",
+      "subcategory": "战略与管理咨询",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/chief-financial-officer.md",
+      "category": "专业服务",
+      "subcategory": "战略与管理咨询",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/corporate-training-designer.md",
+      "category": "专业服务",
+      "subcategory": "教育与培训",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/customer-service.md",
+      "category": "专业服务",
+      "subcategory": "行业解决方案",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/customer-success-manager.md",
+      "category": "专业服务",
+      "subcategory": "行业解决方案",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/data-consolidation-agent.md",
+      "category": "专业服务",
+      "subcategory": "智能体与自动化咨询",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/data-privacy-officer.md",
+      "category": "专业服务",
+      "subcategory": "法律与合规",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/esg-sustainability-officer.md",
+      "category": "专业服务",
+      "subcategory": "法律与合规",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/government-digital-presales-consultant.md",
+      "category": "专业服务",
+      "subcategory": "政府与公共服务",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/grant-writer.md",
+      "category": "专业服务",
+      "subcategory": "创作与编辑",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/healthcare-customer-service.md",
+      "category": "专业服务",
+      "subcategory": "行业解决方案",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/healthcare-marketing-compliance.md",
+      "category": "专业服务",
+      "subcategory": "法律与合规",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/hospitality-guest-services.md",
+      "category": "专业服务",
+      "subcategory": "行业解决方案",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/hr-onboarding.md",
+      "category": "专业服务",
+      "subcategory": "人才与组织",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/identity-graph-operator.md",
+      "category": "专业服务",
+      "subcategory": "智能体与自动化咨询",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/language-translator.md",
+      "category": "专业服务",
+      "subcategory": "创作与编辑",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/legal-billing-time-tracking.md",
+      "category": "专业服务",
+      "subcategory": "法律与合规",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/legal-client-intake.md",
+      "category": "专业服务",
+      "subcategory": "法律与合规",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/legal-document-review.md",
+      "category": "专业服务",
+      "subcategory": "法律与合规",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/loan-officer-assistant.md",
+      "category": "专业服务",
+      "subcategory": "行业解决方案",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/lsp-index-engineer.md",
+      "category": "专业服务",
+      "subcategory": "智能体与自动化咨询",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/ma-integration-manager.md",
+      "category": "专业服务",
+      "subcategory": "战略与管理咨询",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/medical-billing-coding-specialist.md",
+      "category": "专业服务",
+      "subcategory": "行业解决方案",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/operations-manager.md",
+      "category": "专业服务",
+      "subcategory": "供应链与运营",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/organizational-psychologist.md",
+      "category": "专业服务",
+      "subcategory": "人才与组织",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/personal-growth-mentor.md",
+      "category": "专业服务",
+      "subcategory": "教育与培训",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/real-estate-buyer-seller.md",
+      "category": "专业服务",
+      "subcategory": "行业解决方案",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/recruitment-specialist.md",
+      "category": "专业服务",
+      "subcategory": "人才与组织",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/report-distribution-agent.md",
+      "category": "专业服务",
+      "subcategory": "智能体与自动化咨询",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/resume-tailor.md",
+      "category": "专业服务",
+      "subcategory": "人才与组织",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/retail-customer-returns.md",
+      "category": "专业服务",
+      "subcategory": "行业解决方案",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/sales-data-extraction-agent.md",
+      "category": "专业服务",
+      "subcategory": "智能体与自动化咨询",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/sales-outreach.md",
+      "category": "专业服务",
+      "subcategory": "行业解决方案",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/specialized-chief-of-staff.md",
+      "category": "专业服务",
+      "subcategory": "战略与管理咨询",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/specialized-civil-engineer.md",
+      "category": "专业服务",
+      "subcategory": "行业解决方案",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/specialized-codebase-archaeologist.md",
+      "category": "专业服务",
+      "subcategory": "研究与分析",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/specialized-cultural-intelligence-strategist.md",
+      "category": "专业服务",
+      "subcategory": "研究与分析",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/specialized-developer-advocate.md",
+      "category": "专业服务",
+      "subcategory": "教育与培训",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/specialized-document-generator.md",
+      "category": "专业服务",
+      "subcategory": "创作与编辑",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/specialized-fedramp-rmf-compliance.md",
+      "category": "专业服务",
+      "subcategory": "法律与合规",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/specialized-french-consulting-market.md",
+      "category": "专业服务",
+      "subcategory": "研究与分析",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/specialized-korean-business-navigator.md",
+      "category": "专业服务",
+      "subcategory": "研究与分析",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/specialized-mcp-builder.md",
+      "category": "专业服务",
+      "subcategory": "智能体与自动化咨询",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/specialized-model-qa.md",
+      "category": "专业服务",
+      "subcategory": "智能体与自动化咨询",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/specialized-pricing-analyst.md",
+      "category": "专业服务",
+      "subcategory": "研究与分析",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/specialized-salesforce-architect.md",
+      "category": "专业服务",
+      "subcategory": "行业解决方案",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/specialized-strategy-duel-agent.md",
+      "category": "专业服务",
+      "subcategory": "战略与管理咨询",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/specialized-workflow-architect.md",
+      "category": "专业服务",
+      "subcategory": "智能体与自动化咨询",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/study-abroad-advisor.md",
+      "category": "专业服务",
+      "subcategory": "教育与培训",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/supply-chain-strategist.md",
+      "category": "专业服务",
+      "subcategory": "供应链与运营",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/zk-steward.md",
+      "category": "专业服务",
+      "subcategory": "智能体与自动化咨询",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "support/support-analytics-reporter.md",
+      "category": "客户支持",
+      "subcategory": "客户服务",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "support/support-executive-summary-generator.md",
+      "category": "客户支持",
+      "subcategory": "客户服务",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "support/support-finance-tracker.md",
+      "category": "客户支持",
+      "subcategory": "客户服务",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "support/support-infrastructure-maintainer.md",
+      "category": "客户支持",
+      "subcategory": "客户服务",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "support/support-legal-compliance-checker.md",
+      "category": "客户支持",
+      "subcategory": "合规支持",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "support/support-support-responder.md",
+      "category": "客户支持",
+      "subcategory": "客户服务",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "testing/testing-accessibility-auditor.md",
+      "category": "测试质量",
+      "subcategory": "专项质量工程",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "testing/testing-api-tester.md",
+      "category": "测试质量",
+      "subcategory": "专项质量工程",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "testing/testing-evidence-collector.md",
+      "category": "测试质量",
+      "subcategory": "测试策略",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "testing/testing-performance-benchmarker.md",
+      "category": "测试质量",
+      "subcategory": "性能与可靠性测试",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "testing/testing-reality-checker.md",
+      "category": "测试质量",
+      "subcategory": "测试策略",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "testing/testing-test-automation-engineer.md",
+      "category": "测试质量",
+      "subcategory": "自动化测试",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "testing/testing-test-results-analyzer.md",
+      "category": "测试质量",
+      "subcategory": "测试策略",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "testing/testing-tool-evaluator.md",
+      "category": "测试质量",
+      "subcategory": "专项质量工程",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "testing/testing-workflow-optimizer.md",
+      "category": "测试质量",
+      "subcategory": "测试策略",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    }
+  ]
+}

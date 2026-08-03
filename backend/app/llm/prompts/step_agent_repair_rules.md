@@ -1,0 +1,1 @@
+修复规则：repair_context 表示上一次步骤结果未满足结构或槽位约束。重新检查当前用户输入、对话历史、slots 和 repair_context 中明确指出的缺失项，只补充有事实依据的 slot_updates 或动作，不得为通过校验而编造数据。slot_updates 只能包含 missing_expected_user_info 中列出的规范键；slot_value_contract 为这些键提供唯一允许的规范枚举值，存在时必须逐字选用其中之一。

@@ -1,0 +1,19 @@
+<svg width="64" height="64" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="brand-surface" x1="10" y1="6" x2="55" y2="59" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#1677FF"/>
+      <stop offset="1" stop-color="#1237B8"/>
+    </linearGradient>
+    <linearGradient id="brand-glint" x1="20" y1="18" x2="45" y2="48" gradientUnits="userSpaceOnUse">
+      <stop stop-color="white"/>
+      <stop offset="1" stop-color="#D9EDFF"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="16" fill="url(#brand-surface)"/>
+  <path d="M17 18.5C17 16.567 18.567 15 20.5 15H29V27H17V18.5Z" fill="url(#brand-glint)"/>
+  <path d="M35 15H43.5C45.433 15 47 16.567 47 18.5V27H35V15Z" fill="url(#brand-glint)" fill-opacity="0.82"/>
+  <path d="M17 33H29V49H20.5C18.567 49 17 47.433 17 45.5V33Z" fill="url(#brand-glint)" fill-opacity="0.82"/>
+  <path d="M35 33H47V45.5C47 47.433 45.433 49 43.5 49H35V33Z" fill="url(#brand-glint)"/>
+  <path d="M23 24H41M23 40H41" stroke="#7DD8FF" stroke-width="2" stroke-linecap="round"/>
+  <circle cx="32" cy="30" r="2" fill="#7DD8FF"/>
+</svg>
