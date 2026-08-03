@@ -728,6 +728,7 @@ class DynamicTaskAgent:
             },
         }
         self.db.add(instance)
+        self.db.flush()
         if resources:
             with self.store.owned(instance, worker_id=f"input:{source_ref or session_id}"):
                 for resource in resources:
@@ -736,7 +737,6 @@ class DynamicTaskAgent:
                         resource,
                         source_message_id=source_ref,
                     )
-        self.db.flush()
         return instance, True
 
     @staticmethod

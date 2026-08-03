@@ -15,10 +15,19 @@ from sqlmodel import Session, SQLModel, create_engine, select
 
 from app.api.executions import (
     ExecutionCommandRequest,
+    get_execution,
     get_execution_result,
     issue_execution_command,
 )
-from app.db.models import ExecutionCommand, SopInstance, Tenant, User
+from app.db.models import (
+    ExecutionCommand,
+    ExecutionPlanRevision,
+    SopInstance,
+    SopNodeExecution,
+    SopWorkItem,
+    Tenant,
+    User,
+)
 
 
 @pytest.fixture
@@ -99,6 +108,83 @@ def test_cancel_command_reaches_terminal_result_and_publication(db: Session) -> 
     assert result.result["status"] == "cancelled"
     assert result.publications[0]["required"] is True
     assert result.publications[0]["status"] == "settled"
+
+
+def test_execution_card_projects_plan_progress_budget_and_attention(db: Session) -> None:
+    """执行卡必须从权威聚合返回目标、当前步骤、预算使用和活动 Attention。"""
+
+    owner, _, instance = _seed_execution(db, suffix="card")
+    assert owner is not None
+    plan = ExecutionPlanRevision(
+        id="plan_1",
+        tenant_id="tenant_demo",
+        execution_id=instance.id,
+        revision_number=1,
+        status="active",
+        plan_json={
+            "goal": "生成合同风险简报",
+            "success_criteria": ["覆盖合同证据"],
+            "steps": [
+                {
+                    "step_key": "read_contract",
+                    "title": "读取合同",
+                    "kind": "tool.read",
+                    "required": True,
+                    "depends_on": [],
+                },
+                {
+                    "step_key": "clarify_region",
+                    "title": "确认区域",
+                    "kind": "clarification",
+                    "required": True,
+                    "depends_on": ["read_contract"],
+                },
+            ],
+            "budget": {"max_steps": 4},
+        },
+        checksum="b" * 64,
+        capability_snapshot_json={},
+        capability_checksum="c" * 64,
+    )
+    instance.budget_snapshot_json = {"max_steps": 4, "max_model_calls": 8}
+    instance.context_json = {"dynamic_budget_usage": {"model_calls": 3, "tool_calls": 1}}
+    db.add(plan)
+    db.add(instance)
+    db.add(
+        SopNodeExecution(
+            tenant_id="tenant_demo",
+            instance_id=instance.id,
+            node_id="clarify_region",
+            step_key="clarify_region",
+            plan_revision_id=plan.id,
+            step_kind="clarification",
+            title="确认区域",
+            status="waiting",
+        )
+    )
+    db.add(
+        SopWorkItem(
+            tenant_id="tenant_demo",
+            instance_id=instance.id,
+            attention_kind="clarification",
+            attention_key="clarify_region:clarification",
+            attention_identity="attention_identity_card",
+            title="确认区域",
+            status="offered",
+        )
+    )
+    db.commit()
+
+    card = get_execution(instance.id, "tenant_demo", owner, db)
+
+    assert card.goal == "生成合同风险简报"
+    assert card.success_criteria == ["覆盖合同证据"]
+    assert card.current_step_key == "clarify_region"
+    assert card.steps[0]["status"] == "pending"
+    assert card.steps[1]["status"] == "waiting"
+    assert card.budget == {"max_steps": 4, "max_model_calls": 8}
+    assert card.usage == {"model_calls": 3, "tool_calls": 1}
+    assert card.pending_attention_count == 1
 
 
 def test_steer_stays_pending_and_idempotency_conflict_is_rejected(db: Session) -> None:

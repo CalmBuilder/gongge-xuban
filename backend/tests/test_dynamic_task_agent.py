@@ -11,12 +11,14 @@ from __future__ import annotations
 import base64
 from datetime import datetime
 from io import BytesIO
+from pathlib import Path
+import sys
 
 from pypdf import PdfWriter
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from app.agents.branching import ensure_agent_private_knowledge_branch
+from app.agents.branching import ensure_agent_private_knowledge_branch, ensure_private_resource_binding
 from app.db.models import (
     AgentProfile,
     ExecutionSignal,
@@ -24,14 +26,23 @@ from app.db.models import (
     ExecutionResult,
     KnowledgeBase,
     KnowledgeBaseVersion,
+    MCPServer,
     Message,
     ModelConfig,
     SopOperation,
     SopWorkItem,
+    Tenant,
+    Tool,
     User,
 )
 from app.dynamic_tasks.agent import DynamicTaskAgent, DynamicTaskAgentError
-from app.dynamic_tasks.capability_catalog import CapabilitySnapshot, capability_checksum
+from app.dynamic_tasks.capability_catalog import (
+    CapabilitySnapshot,
+    DynamicCapabilityCatalog,
+    ToolReliabilityContract,
+    capability_checksum,
+    publish_tool_contract,
+)
 from app.dynamic_tasks.worker import due_dynamic_task_signals, process_dynamic_task_signal
 from app.dynamic_tasks.planning import (
     ActionKind,
@@ -49,6 +60,7 @@ from app.sop_runtime.execution_store import SopExecutionStore
 from app.sop_runtime.execution_control import ExecutionControlService
 from app.session.managed_resources import ManagedInputResourceService
 from app.tools.tool_schema import ToolResult
+from app.tools.tool_executor import ToolExecutor
 
 
 class _Catalog:
@@ -312,6 +324,113 @@ class _KnowledgeService:
         )
 
 
+class _CombinedPlanner:
+    """构造附件上下文下 knowledge→双 read→answer 的生产同形计划。"""
+
+    def create_plan(self, *, goal, success_criteria, capabilities, input_resources=()):
+        """验证规划期只接收安全附件元数据，并返回有界依赖图。"""
+
+        assert len(input_resources) == 1
+        assert input_resources[0]["filename"] == "contract.txt"
+        assert "storage_locator" not in str(input_resources)
+        return NormalizedPlan(
+            goal=goal,
+            success_criteria=tuple(success_criteria),
+            steps=(
+                PlanStep(
+                    step_key="search_policy",
+                    title="检索当前制度",
+                    kind="knowledge",
+                    capability_refs=("knowledge.search",),
+                ),
+                PlanStep(
+                    step_key="query_contract",
+                    title="读取合同台账",
+                    kind="tool.read",
+                    depends_on=("search_policy",),
+                    capability_refs=("contract.query",),
+                ),
+                PlanStep(
+                    step_key="query_risk",
+                    title="读取风险登记",
+                    kind="tool.read",
+                    depends_on=("query_contract",),
+                    capability_refs=("risk.query",),
+                ),
+                PlanStep(
+                    step_key="answer",
+                    title="生成可核验简报",
+                    kind="answer",
+                    depends_on=("query_risk",),
+                ),
+            ),
+            budget={
+                "max_steps": 6,
+                "max_tool_calls": 3,
+                "max_model_calls": 6,
+                "max_input_tokens": 120_000,
+                "max_output_tokens": 24_000,
+                "max_total_tokens": 144_000,
+                "max_runtime_seconds": 900,
+            },
+        )
+
+
+class _CombinedProposer:
+    """按组合计划返回知识、双工具和最终结果提案并核验附件投影。"""
+
+    def __init__(self) -> None:
+        """初始化步骤调用轨迹。"""
+
+        self.calls: list[str] = []
+
+    def propose(self, *, view, step):
+        """为每个步骤生成严格匹配的动作，确保附件贯穿临时 provider view。"""
+
+        serialized = view.model_dump_json()
+        assert "合同正文：续约日期 2026-12-31" in serialized
+        assert "storage_locator" not in serialized
+        self.calls.append(step.step_key)
+        if step.kind == "knowledge":
+            return CompletedProviderProposal(
+                response_id="combined_knowledge",
+                finish_reason="stop",
+                proposal=RuntimeActionProposal(
+                    action_kind=ActionKind.QUERY_KNOWLEDGE,
+                    capability_ref="knowledge.search",
+                    arguments={"query": "合同续约制度", "desired_evidence": "当前有效制度"},
+                    rationale="先取得制度证据",
+                ),
+            )
+        if step.step_key == "query_contract":
+            return _tool_response(
+                response_id="combined_contract",
+                capability_ref="contract.query",
+                arguments={"text": "C-001"},
+            )
+        if step.step_key == "query_risk":
+            return _tool_response(
+                response_id="combined_risk",
+                capability_ref="risk.query",
+                arguments={"numbers": [2, 3]},
+            )
+        return CompletedProviderProposal(
+            response_id="combined_answer",
+            finish_reason="stop",
+            proposal=RuntimeActionProposal(
+                action_kind=ActionKind.ANSWER,
+                arguments={
+                    "markdown": "# 续约风险简报\n\n附件、当前制度、合同台账与风险登记均已核验。",
+                    "criterion_evidence": {
+                        "criterion_01": ["search_policy", "query_contract", "query_risk"]
+                    },
+                    "pending_questions": [],
+                },
+                rationale="全部必需证据已经形成闭环",
+            ),
+        )
+
+
 class _ClarificationPlanner:
     """返回 clarification→read→answer 计划以验证跨连接恢复。"""
 
@@ -385,6 +504,26 @@ def _snapshot(*, risk_class: str = "read") -> CapabilitySnapshot:
         **payload,
         agent_id="agent_demo",
         checksum=capability_checksum(payload),
+    )
+
+
+def _tool_response(
+    *,
+    response_id: str,
+    capability_ref: str,
+    arguments: dict[str, object],
+) -> CompletedProviderProposal:
+    """为组合闭环构造一个完整结束的指定只读工具提案。"""
+
+    return CompletedProviderProposal(
+        response_id=response_id,
+        finish_reason="stop",
+        proposal=RuntimeActionProposal(
+            action_kind=ActionKind.CALL_TOOL,
+            capability_ref=capability_ref,
+            arguments=arguments,
+            rationale="读取完成任务所需的权威事实",
+        ),
     )
 
 
@@ -555,6 +694,60 @@ def test_plan_draft_receives_stable_server_keys_and_bounded_budget() -> None:
         "max_total_tokens": 144_000,
         "max_runtime_seconds": 900,
     }
+
+
+def test_plan_budget_counts_knowledge_and_tools_as_external_read_calls() -> None:
+    """规划期与 Runtime 必须一致地把 knowledge 和 tool.read 计入同一外部调用预算。"""
+
+    draft = DynamicPlanDraft(
+        goal="形成证据简报",
+        success_criteria=(
+            SuccessCriterion(id="brief_ready", type="assertion", spec={"required": True}),
+        ),
+        steps=(
+            DynamicPlanDraftStep(
+                draft_id="policy",
+                title="检索制度",
+                kind="knowledge",
+                capability_refs=("knowledge.search",),
+            ),
+            DynamicPlanDraftStep(
+                draft_id="contract",
+                title="读取合同",
+                kind="tool.read",
+                capability_refs=("contract.query",),
+                depends_on=("policy",),
+            ),
+            DynamicPlanDraftStep(
+                draft_id="risk",
+                title="读取风险",
+                kind="tool.read",
+                capability_refs=("risk.query",),
+                depends_on=("contract",),
+            ),
+            DynamicPlanDraftStep(
+                draft_id="answer",
+                title="形成答复",
+                kind="answer",
+                depends_on=("risk",),
+            ),
+        ),
+    )
+
+    try:
+        normalize_plan_draft(draft, max_steps=5, max_tool_calls=2, max_model_calls=6)
+    except ValueError as exc:
+        assert str(exc) == "动态计划外部读取步骤超过服务端预算"
+    else:
+        raise AssertionError("知识与工具合计超过预算时必须在计划激活前拒绝")
+
+    accepted = normalize_plan_draft(
+        draft,
+        max_steps=5,
+        max_tool_calls=3,
+        max_model_calls=6,
+    )
+    assert accepted.budget["max_tool_calls"] == 3
 
 
 def test_start_task_uses_preflight_catalog_and_reuses_same_active_execution() -> None:
@@ -989,6 +1182,7 @@ def test_native_image_and_pdf_require_explicit_preflight_and_never_expose_locato
     engine = create_engine("sqlite://", poolclass=StaticPool)
     SQLModel.metadata.create_all(engine)
     with Session(engine, expire_on_commit=False) as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
         user = User(
             id="user_demo",
             tenant_id="tenant_demo",
@@ -1254,6 +1448,265 @@ def test_knowledge_step_freezes_version_reauthorizes_and_resumes_without_second_
         assert proposer.calls == 2
         assert instance.lease_owner is None
         assert instance.lease_expires_at is None
+
+
+def test_combined_attachment_knowledge_two_tools_and_result_form_one_execution(
+    tmp_path,
+) -> None:
+    """验证附件、知识、双只读工具和最终发布在同一 Execution 内形成生产级组合闭环。"""
+
+    engine = create_engine("sqlite://", poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as db:
+        user = User(
+            id="user_demo",
+            tenant_id="tenant_demo",
+            username="demo",
+            password_hash="x",
+        )
+        profile = AgentProfile(
+            id="agent_demo",
+            tenant_id="tenant_demo",
+            name="合同风控数字员工",
+            owner_user_id=user.id,
+        )
+        knowledge_base = KnowledgeBase(
+            id="kb_policy",
+            tenant_id="tenant_demo",
+            name="合同续约制度",
+            owner_user_id=user.id,
+            access_scope="owner",
+        )
+        version = KnowledgeBaseVersion(
+            id="kb_version_1",
+            tenant_id="tenant_demo",
+            knowledge_base_id=knowledge_base.id,
+            version="1.0.0",
+            name="合同续约制度",
+        )
+        capabilities = _model_capabilities()
+        model = ModelConfig(
+            id="model_combined",
+            tenant_id="tenant_demo",
+            name="动态模型",
+            api_key_encrypted="encrypted",
+            model="model-demo",
+            capability_snapshot_json=capabilities,
+            capability_checksum=capability_checksum(capabilities),
+            preflight_status="ready",
+        )
+        db.add(user)
+        db.add(profile)
+        db.add(knowledge_base)
+        db.add(version)
+        db.add(model)
+        db.flush()
+        ensure_agent_private_knowledge_branch(
+            db,
+            "tenant_demo",
+            profile.id,
+            knowledge_base,
+            metadata_json={"owner_user_id": user.id},
+        )
+        mcp_server_path = Path(__file__).resolve().parents[1] / "mock_servers" / "mcp_stdio_server.py"
+        contract_server = MCPServer(
+            id="mcp_contract",
+            tenant_id="tenant_demo",
+            name="合同只读系统",
+            transport="stdio",
+            command=sys.executable,
+            args_json=[str(mcp_server_path)],
+        )
+        risk_server = MCPServer(
+            id="mcp_risk",
+            tenant_id="tenant_demo",
+            name="风险只读系统",
+            transport="stdio",
+            command=sys.executable,
+            args_json=[str(mcp_server_path)],
+        )
+        read_contract = ToolReliabilityContract.model_validate(
+            {
+                "risk_class": "read",
+                "side_effect": "none",
+                "confirmation_policy": "none",
+                "timeout_policy": "failed",
+                "dynamic_task_enabled": True,
+                "model_visibility": {
+                    "allowed_paths": ["input.text", "output.text", "output.length"],
+                    "user_display_paths": [],
+                    "audit_only_paths": [],
+                },
+            }
+        )
+        read_risk = ToolReliabilityContract.model_validate(
+            {
+                "risk_class": "read",
+                "side_effect": "none",
+                "confirmation_policy": "none",
+                "timeout_policy": "failed",
+                "dynamic_task_enabled": True,
+                "model_visibility": {
+                    "allowed_paths": ["input.numbers", "output.total", "output.count"],
+                    "user_display_paths": [],
+                    "audit_only_paths": [],
+                },
+            }
+        )
+        contract_tool = Tool(
+            id="tool_contract",
+            tenant_id="tenant_demo",
+            name="contract.query",
+            display_name="合同台账查询",
+            tool_type="mcp",
+            method="POST",
+            url="mcp://contract/echo",
+            mcp_server_id=contract_server.id,
+            config_json={"tool": "echo"},
+            input_schema={"type": "object", "properties": {"text": {"type": "string"}}},
+            output_schema={
+                "type": "object",
+                "properties": {"text": {"type": "string"}, "length": {"type": "integer"}},
+            },
+        )
+        risk_tool = Tool(
+            id="tool_risk",
+            tenant_id="tenant_demo",
+            name="risk.query",
+            display_name="风险登记查询",
+            tool_type="mcp",
+            method="POST",
+            url="mcp://risk/sum",
+            mcp_server_id=risk_server.id,
+            config_json={"tool": "sum"},
+            input_schema={
+                "type": "object",
+                "properties": {"numbers": {"type": "array", "items": {"type": "number"}}},
+            },
+            output_schema={
+                "type": "object",
+                "properties": {"total": {"type": "number"}, "count": {"type": "integer"}},
+            },
+        )
+        publish_tool_contract(contract_tool, read_contract)
+        publish_tool_contract(risk_tool, read_risk)
+        db.add(contract_server)
+        db.add(risk_server)
+        db.add(contract_tool)
+        db.add(risk_tool)
+        db.flush()
+        ensure_private_resource_binding(
+            db, "tenant_demo", profile.id, "tool", contract_tool.id, "active"
+        )
+        ensure_private_resource_binding(
+            db, "tenant_demo", profile.id, "tool", risk_tool.id, "active"
+        )
+        resource_service = ManagedInputResourceService(db, storage_root=tmp_path)
+        resource, attachment = resource_service.persist_upload(
+            tenant_id="tenant_demo",
+            owner_user_id=user.id,
+            agent_id=profile.id,
+            filename="contract.txt",
+            content_type="text/plain",
+            data="合同正文：续约日期 2026-12-31".encode(),
+        )
+        user_message = Message(
+            id="message_combined",
+            tenant_id="tenant_demo",
+            session_id="session_combined",
+            role="user",
+            content="结合附件和内部证据生成续约风险简报",
+            metadata_json={"attachments": [attachment.model_dump(mode="json")]},
+        )
+        db.add(user_message)
+        db.flush()
+
+        knowledge_service = _KnowledgeService()
+        proposer = _CombinedProposer()
+        agent = DynamicTaskAgent(
+            db,
+            catalog=DynamicCapabilityCatalog(db),
+            tool_executor=ToolExecutor(db),
+            planner=_CombinedPlanner(),
+            action_proposer=proposer,
+            resource_service=resource_service,
+            knowledge_service=knowledge_service,
+        )
+        instance, created = agent.start_task(
+            tenant_id="tenant_demo",
+            session_id="session_combined",
+            agent_id=profile.id,
+            initiator_user_id=user.id,
+            goal="生成续约风险简报",
+            success_criteria=("附件、制度、合同台账和风险登记均有证据",),
+            model_config=model,
+            source_ref=user_message.id,
+            input_resource_ids=(resource.id,),
+            knowledge_capability={
+                "available": True,
+                "knowledge_bases": [
+                    {
+                        "id": knowledge_base.id,
+                        "version_id": version.id,
+                        "version": version.version,
+                        "name": version.name,
+                    }
+                ],
+            },
+        )
+
+        outcome = agent.run_until_blocked_or_complete(
+            execution_id=instance.id,
+            model_config=model,
+            worker_id="worker_combined",
+            actor_user_id=user.id,
+        )
+
+        db.refresh(instance)
+        operations = db.exec(
+            select(SopOperation)
+            .where(SopOperation.instance_id == instance.id)
+            .order_by(SopOperation.created_at, SopOperation.id)
+        ).all()
+        assistant_messages = db.exec(
+            select(Message).where(
+                Message.session_id == instance.session_id,
+                Message.role == "assistant",
+            )
+        ).all()
+        result = db.exec(
+            select(ExecutionResult).where(ExecutionResult.execution_id == instance.id)
+        ).one()
+        publication = db.exec(
+            select(ExecutionPublication).where(
+                ExecutionPublication.execution_id == instance.id
+            )
+        ).one()
+
+        assert created is True
+        assert outcome.status == "succeeded"
+        assert instance.status == "succeeded"
+        assert proposer.calls == ["search_policy", "query_contract", "query_risk", "answer"]
+        assert knowledge_service.calls == 1
+        assert [operation.operation_name for operation in operations] == [
+            "knowledge.search",
+            "contract.query",
+            "risk.query",
+        ]
+        assert all(operation.status == "succeeded" for operation in operations)
+        assert operations[1].result_json["data"] == {"text": "C-001", "length": 5}
+        assert operations[2].result_json["data"]["total"] == 5
+        assert result.status == "verified"
+        assert publication.status == "settled"
+        assert len(assistant_messages) == 1
+        assert assistant_messages[0].metadata_json["execution_id"] == instance.id
+        assert instance.context_json["dynamic_budget_usage"] == {
+            "model_calls": 5,
+            "tool_calls": 3,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+        }
 
 
 def test_knowledge_revocation_is_rejected_before_search_dispatch() -> None:

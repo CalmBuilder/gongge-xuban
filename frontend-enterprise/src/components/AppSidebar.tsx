@@ -57,7 +57,7 @@ type NavItem = {
 const PRIMARY_NAV: NavItem[] = [
   { route: EnterpriseRoute.Platform, label: '开放广场平台', Icon: IconPlatform },
   { route: EnterpriseRoute.Agents, label: '数字员工管理', Icon: IconAgents },
-  { route: EnterpriseRoute.WorkItems, label: '流程任务箱', Icon: IconCalendar },
+  { route: EnterpriseRoute.WorkItems, label: '待我处理中心', Icon: IconCalendar },
   { route: EnterpriseRoute.EnterpriseInfo, label: '企业信息', Icon: IconAccounts },
 ];
 

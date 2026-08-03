@@ -184,9 +184,9 @@ def normalize_plan_draft(
         raise ValueError("动态计划预算无效")
     if len(draft.steps) > max_steps:
         raise ValueError("动态计划步骤超过服务端预算")
-    tool_steps = sum(step.kind == "tool.read" for step in draft.steps)
-    if tool_steps > max_tool_calls:
-        raise ValueError("动态计划工具步骤超过服务端预算")
+    external_read_steps = sum(step.kind in {"tool.read", "knowledge"} for step in draft.steps)
+    if external_read_steps > max_tool_calls:
+        raise ValueError("动态计划外部读取步骤超过服务端预算")
     key_by_draft_id = {
         step.draft_id: _stable_step_key(index, step)
         for index, step in enumerate(draft.steps, start=1)

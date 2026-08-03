@@ -58,6 +58,14 @@ class FakeDb:
     def refresh(self, row: object) -> None:
         self.refreshed.append(row)
 
+    def flush(self) -> None:
+        """模拟生成主键后的事务内可见性。"""
+
+    def exec(self, _statement: object) -> "FakeExecResult":
+        """返回当前事务内已添加的消息，供幂等投影检查使用。"""
+
+        return FakeExecResult([row for row in self.added if isinstance(row, Message)])
+
 
 class FakeExecResult:
     def __init__(self, rows: list[object]) -> None:
@@ -68,6 +76,41 @@ class FakeExecResult:
 
     def first(self) -> object | None:
         return self.rows[0] if self.rows else None
+
+
+def test_dynamic_waiting_message_is_persisted_once_with_execution_identity() -> None:
+    """相同 Execution 阻塞点重放时复用等待消息并保留恢复所需身份。"""
+
+    loop = object.__new__(AgentLoop)
+    loop.db = FakeDb()
+    loop.events = FakeEvents()
+    session = ChatSession(id="session_waiting", tenant_id="tenant_demo")
+
+    first = loop._persist_dynamic_waiting_message(
+        chat_session=session,
+        execution_id="execution_1",
+        blocking_step_key="clarify_region",
+        user_message_id="message_1",
+    )
+    second = loop._persist_dynamic_waiting_message(
+        chat_session=session,
+        execution_id="execution_1",
+        blocking_step_key="clarify_region",
+        user_message_id="message_retry",
+    )
+
+    assert second is first
+    assert first.metadata_json == {
+        "message_kind": "dynamic_task_status",
+        "execution_id": "execution_1",
+        "execution_status": "waiting",
+        "blocking_step_key": "clarify_region",
+        "turn_id": "message_1",
+        "user_message_id": "message_1",
+    }
+    messages = [row for row in loop.db.added if isinstance(row, Message)]
+    assert messages == [first]
+    assert [record[2] for record in loop.events.records] == ["assistant_message_created"]
 
 
 def test_deterministic_tool_result_wait_stops_before_model_continuation() -> None:

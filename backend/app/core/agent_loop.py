@@ -6799,6 +6799,42 @@ class AgentLoop:
             worker_id=f"chat:{user_message_id}",
             actor_user_id=request.user_id,
         )
+        if outcome.status == "waiting" and outcome.blocking_step_key:
+            waiting_message = self._persist_dynamic_waiting_message(
+                chat_session=chat_session,
+                execution_id=instance.id,
+                blocking_step_key=outcome.blocking_step_key,
+                user_message_id=user_message_id,
+            )
+            self.events.record(
+                request.tenant_id,
+                chat_session.id,
+                "dynamic_task_delegated",
+                self._turn_payload(
+                    {
+                        "execution_id": instance.id,
+                        "execution_created": created,
+                        "execution_status": "waiting",
+                        "blocking_step_key": outcome.blocking_step_key,
+                    },
+                    user_message_id,
+                ),
+            )
+            self.db.commit()
+            self.db.refresh(chat_session)
+            return ChatTurnResponse(
+                reply=waiting_message.content,
+                session_id=chat_session.id,
+                router_decision=RouterDecision(
+                    decision="answer_only",
+                    reason="DynamicTaskAgent paused on a governed clarification.",
+                ),
+                step_result=StepAgentResult(
+                    reply=waiting_message.content,
+                    is_step_completed=False,
+                ),
+                session_state=public_session(chat_session),
+            )
         if outcome.status != "succeeded" or outcome.message is None:
             raise DynamicTaskAgentError("DYNAMIC_TASK_DID_NOT_CLOSE")
         self.events.record(
@@ -6825,6 +6861,71 @@ class AgentLoop:
             ),
             session_state=public_session(chat_session),
         )
+
+    def _persist_dynamic_waiting_message(
+        self,
+        *,
+        chat_session: ChatSession,
+        execution_id: str,
+        blocking_step_key: str,
+        user_message_id: str,
+    ) -> Message:
+        """幂等投影动态任务等待状态，使聊天回放与 Attention 恢复指向同一 Execution。"""
+
+        existing_messages = self.db.exec(
+            select(Message)
+            .where(
+                Message.tenant_id == chat_session.tenant_id,
+                Message.session_id == chat_session.id,
+                Message.role == "assistant",
+            )
+            .order_by(Message.created_at, Message.id)
+        ).all()
+        for message in existing_messages:
+            metadata = message.metadata_json or {}
+            if (
+                metadata.get("message_kind") == "dynamic_task_status"
+                and metadata.get("execution_id") == execution_id
+                and metadata.get("blocking_step_key") == blocking_step_key
+            ):
+                return message
+
+        content = "任务已暂停，正在等待你补充信息。请到待我处理中心办理，完成后将从原执行记录继续。"
+        message = self._append_message(
+            chat_session.tenant_id,
+            chat_session.id,
+            "assistant",
+            content,
+            metadata={
+                "message_kind": "dynamic_task_status",
+                "execution_id": execution_id,
+                "execution_status": "waiting",
+                "blocking_step_key": blocking_step_key,
+                "turn_id": user_message_id,
+                "user_message_id": user_message_id,
+            },
+        )
+        self.db.flush()
+        chat_session.status = "active"
+        chat_session.summary = f"最近回复：{content}"
+        chat_session.updated_at = utc_now()
+        self.db.add(chat_session)
+        self.events.record(
+            chat_session.tenant_id,
+            chat_session.id,
+            "assistant_message_created",
+            {
+                "message_id": message.id,
+                "assistant_message_id": message.id,
+                "reply": content,
+                "execution_id": execution_id,
+                "execution_status": "waiting",
+                "blocking_step_key": blocking_step_key,
+                "turn_id": user_message_id,
+                "user_message_id": user_message_id,
+            },
+        )
+        return message
 
     def _select_general_capability(
         self,

@@ -75,6 +75,7 @@ class DynamicTaskPlanner:
             "limits": {
                 "max_steps": self.max_steps,
                 "max_tool_calls": self.max_tool_calls,
+                "max_tool_calls_semantics": "tool.read 与 knowledge 外部读取调用总和",
                 "max_model_calls": self.max_model_calls,
                 "max_input_tokens": self.max_input_tokens,
                 "max_output_tokens": self.max_output_tokens,

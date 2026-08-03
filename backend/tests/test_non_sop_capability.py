@@ -261,6 +261,90 @@ def test_agent_loop_delegates_effective_dynamic_route_without_copying_loop(monke
     assert calls == ["init", "start", "run"]
 
 
+def test_dynamic_task_clarification_returns_durable_waiting_projection(monkeypatch) -> None:
+    """动态执行等待澄清时必须正常结束聊天回合，而不是把可恢复状态抛成异常。"""
+
+    route = _route(
+        NonSopCapabilityRouter(
+            shadow_enabled=False,
+            execution_enabled=True,
+            shadow_selector=_ShadowSelector(
+                NonSopCapabilityDecision(
+                    mode="dynamic_task",
+                    goal="生成风险简报",
+                    success_criteria=["明确报告区域"],
+                    confidence=0.95,
+                )
+            ),
+        ),
+        _GeneralSelector(GeneralSkillSelection()),
+    )
+    calls: list[str] = []
+
+    class _DynamicAgent:
+        """模拟创建成功后进入受控澄清等待的独立动态 Agent。"""
+
+        def __init__(self, _db) -> None:
+            """记录 Agent 初始化。"""
+
+            calls.append("init")
+
+        def start_task(self, **kwargs):
+            """返回已经创建的权威 Execution。"""
+
+            calls.append("start")
+            return SimpleNamespace(id="execution_waiting"), True
+
+        def run_until_blocked_or_complete(self, **kwargs):
+            """返回带稳定阻塞步骤的 waiting 结果。"""
+
+            calls.append("run")
+            return DynamicRunOutcome(
+                status="waiting",
+                execution_id="execution_waiting",
+                blocking_step_key="clarify_region",
+            )
+
+    monkeypatch.setattr("app.core.agent_loop.DynamicTaskAgent", _DynamicAgent)
+    loop = object.__new__(AgentLoop)
+    loop.db = SimpleNamespace(
+        refresh=lambda _row: None,
+        commit=lambda: None,
+        begin_nested=lambda: nullcontext(),
+    )
+    recorded_events: list[tuple] = []
+    loop.events = SimpleNamespace(record=lambda *args, **_kwargs: recorded_events.append(args))
+    loop._knowledge_capability_payload = lambda *_args: {"available": False}
+    loop._persist_dynamic_waiting_message = lambda **_kwargs: SimpleNamespace(
+        content="任务已暂停，正在等待你补充信息。"
+    )
+    session = ChatSession(
+        id="session_dynamic_waiting",
+        tenant_id="tenant_demo",
+        agent_id="agent_demo",
+    )
+
+    response = loop._try_handle_dynamic_task(
+        ChatTurnRequest(
+            tenant_id="tenant_demo",
+            user_id="user_demo",
+            agent_id="agent_demo",
+            message="生成风险简报",
+        ),
+        session,
+        SimpleNamespace(id="model_1"),
+        route,
+        "message_waiting",
+    )
+
+    assert response is not None
+    assert response.reply == "任务已暂停，正在等待你补充信息。"
+    assert response.step_result is not None
+    assert response.step_result.is_step_completed is False
+    assert calls == ["init", "start", "run"]
+    assert any(args[2] == "dynamic_task_delegated" for args in recorded_events)
+
+
 def test_low_confidence_dynamic_shadow_degrades_to_answer() -> None:
     """低置信度动态提案必须收敛为 answer 并留下结构化失败码。"""
 

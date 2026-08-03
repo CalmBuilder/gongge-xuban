@@ -15,9 +15,12 @@ from sqlmodel import Session, select
 from app.db import get_session
 from app.db.models import (
     ExecutionCommand,
+    ExecutionPlanRevision,
     ExecutionPublication,
     ExecutionResult,
     SopInstance,
+    SopNodeExecution,
+    SopWorkItem,
     User,
 )
 from app.organization.permissions import user_permission_codes
@@ -67,6 +70,13 @@ class ExecutionRead(BaseModel):
     current_plan_revision_id: str | None
     current_result_id: str | None
     terminal_reason: dict[str, object]
+    goal: str | None
+    success_criteria: list[str]
+    current_step_key: str | None
+    steps: list[dict[str, object]]
+    budget: dict[str, object]
+    usage: dict[str, object]
+    pending_attention_count: int
 
 
 class ExecutionResultRead(BaseModel):
@@ -92,7 +102,7 @@ def get_execution(
     """按 tenant 和显式 Execution 管理资格读取执行卡状态。"""
 
     instance = _authorized_execution(db, tenant_id, execution_id, current_user)
-    return _execution_read(instance)
+    return _execution_read(db, instance)
 
 
 @router.post("/{execution_id}/commands", response_model=ExecutionCommandRead)
@@ -219,8 +229,70 @@ def _authorized_execution(
     return instance
 
 
-def _execution_read(instance: SopInstance) -> ExecutionRead:
+def _execution_read(db: Session, instance: SopInstance) -> ExecutionRead:
     """把 Execution 聚合映射成稳定 API 契约。"""
+
+    plan_revision = (
+        db.get(ExecutionPlanRevision, instance.current_plan_revision_id)
+        if instance.current_plan_revision_id
+        else None
+    )
+    plan = dict(plan_revision.plan_json or {}) if plan_revision is not None else {}
+    node_rows = db.exec(
+        select(SopNodeExecution)
+        .where(
+            SopNodeExecution.tenant_id == instance.tenant_id,
+            SopNodeExecution.instance_id == instance.id,
+            SopNodeExecution.plan_revision_id == instance.current_plan_revision_id,
+        )
+        .order_by(SopNodeExecution.step_key, SopNodeExecution.attempt.desc())
+    ).all()
+    latest_nodes: dict[str, SopNodeExecution] = {}
+    for node in node_rows:
+        latest_nodes.setdefault(node.step_key, node)
+    steps: list[dict[str, object]] = []
+    raw_steps = plan.get("steps")
+    for raw_step in raw_steps if isinstance(raw_steps, list) else []:
+        if not isinstance(raw_step, dict):
+            continue
+        step_key = str(raw_step.get("step_key") or "")
+        if not step_key:
+            continue
+        node = latest_nodes.get(step_key)
+        steps.append(
+            {
+                "step_key": step_key,
+                "title": str(raw_step.get("title") or step_key),
+                "kind": str(raw_step.get("kind") or "unknown"),
+                "required": bool(raw_step.get("required", True)),
+                "depends_on": [
+                    str(value)
+                    for value in raw_step.get("depends_on", [])
+                    if isinstance(value, str)
+                ],
+                "status": node.status if node is not None else "pending",
+                "attempt": node.attempt if node is not None else 0,
+            }
+        )
+    current_step = next(
+        (
+            str(step["step_key"])
+            for step in steps
+            if step["status"] in {"running", "waiting", "scheduled"}
+        ),
+        None,
+    )
+    pending_attention_count = len(
+        db.exec(
+            select(SopWorkItem.id).where(
+                SopWorkItem.tenant_id == instance.tenant_id,
+                SopWorkItem.instance_id == instance.id,
+                SopWorkItem.status.in_(("offered", "claimed")),
+            )
+        ).all()
+    )
+    goal_snapshot = dict(instance.goal_snapshot_json or {})
+    criteria = plan.get("success_criteria", goal_snapshot.get("success_criteria", []))
 
     return ExecutionRead(
         id=instance.id,
@@ -234,6 +306,15 @@ def _execution_read(instance: SopInstance) -> ExecutionRead:
         current_plan_revision_id=instance.current_plan_revision_id,
         current_result_id=instance.current_result_id,
         terminal_reason=dict(instance.terminal_reason_json or {}),
+        goal=str(plan.get("goal") or goal_snapshot.get("goal") or "").strip() or None,
+        success_criteria=[str(value) for value in criteria if isinstance(value, str)]
+        if isinstance(criteria, list)
+        else [],
+        current_step_key=current_step,
+        steps=steps,
+        budget=dict(instance.budget_snapshot_json or plan.get("budget") or {}),
+        usage=dict((instance.context_json or {}).get("dynamic_budget_usage") or {}),
+        pending_attention_count=pending_attention_count,
     )
 
 
