@@ -1,5 +1,5 @@
 """
-@Time       : 2026/08/04 06:10
+@Time       : 2026/08/10 19:20
 @Author     : zhanglp8181
 @File       : worker.py
 @CallChain  : scheduled worker → pending ExecutionSignal → DynamicTaskAgent durable resume
@@ -9,18 +9,64 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
 
-from sqlalchemy import or_
+from sqlalchemy import and_, or_
 from sqlmodel import Session, select
 
 from app.config import get_settings
+from app.db import engine
 from app.db.models import ExecutionCommand, ExecutionSignal, ModelConfig, SopInstance, SopWorkItem
-from app.dynamic_tasks.agent import DynamicRunOutcome, DynamicTaskAgent
+from app.dynamic_tasks.agent import DynamicRunOutcome, DynamicTaskAgent, DynamicTaskAgentError
+from app.dynamic_tasks.quotas import (
+    DynamicTaskQuotaError,
+    DynamicTaskQuotaService,
+    quota_limits_from_settings,
+)
 from app.sop_runtime.execution_control import ExecutionControlService
 from app.sop_runtime.execution_store import SopExecutionStore
 
 
 DynamicAgentFactory = Callable[[Session], DynamicTaskAgent]
+_settings = get_settings()
+SIGNAL_DISPATCH_WORKERS = _settings.dynamic_task_signal_dispatch_workers
+SIGNAL_DISPATCH_CAPACITY = _settings.dynamic_task_signal_dispatch_capacity
+_signal_executor = ThreadPoolExecutor(
+    max_workers=SIGNAL_DISPATCH_WORKERS,
+    thread_name_prefix="gongge-xuban-dynamic-signal",
+)
+_signal_inflight: set[str] = set()
+_signal_inflight_lock = Lock()
+
+
+def start_dynamic_task_signal_async(signal_id: str) -> bool:
+    """有界提交一个 Signal；同进程重复扫描不会重复排队，跨进程由数据库租约仲裁。"""
+
+    with _signal_inflight_lock:
+        if signal_id in _signal_inflight or len(_signal_inflight) >= SIGNAL_DISPATCH_CAPACITY:
+            return False
+        _signal_inflight.add(signal_id)
+    try:
+        _signal_executor.submit(_process_dynamic_task_signal_in_background, signal_id)
+    except RuntimeError:
+        with _signal_inflight_lock:
+            _signal_inflight.discard(signal_id)
+        raise
+    return True
+
+
+def _process_dynamic_task_signal_in_background(signal_id: str) -> None:
+    """在独立数据库会话中消费 Signal，完成后解除进程内排队去重。"""
+
+    try:
+        with Session(engine) as db:
+            signal = db.get(ExecutionSignal, signal_id)
+            if signal is not None:
+                process_dynamic_task_signal(db, signal)
+    finally:
+        with _signal_inflight_lock:
+            _signal_inflight.discard(signal_id)
 
 
 def due_dynamic_task_signals(db: Session, *, limit: int = 50) -> list[ExecutionSignal]:
@@ -32,7 +78,15 @@ def due_dynamic_task_signals(db: Session, *, limit: int = 50) -> list[ExecutionS
     candidates = db.exec(
         select(ExecutionSignal)
         .where(
-            ExecutionSignal.signal_type.in_(("attention_decided", "command")),
+            or_(
+                ExecutionSignal.signal_type.in_(
+                    ("attention_decided", "command", "timer", "scheduled_start")
+                ),
+                and_(
+                    ExecutionSignal.signal_type == "operation_settled",
+                    ExecutionSignal.causation_type == "standing_rule_dispatch",
+                ),
+            ),
             ExecutionSignal.available_at <= now,
             or_(
                 ExecutionSignal.status == "pending",
@@ -80,7 +134,7 @@ def process_dynamic_task_signal(
     if signal.signal_type == "command":
         command = db.get(ExecutionCommand, signal.causation_id)
         actor_user_id = str(command.actor_user_id or "") if command is not None else ""
-    else:
+    elif signal.signal_type == "attention_decided":
         attention_id = str(signal.payload_json.get("attention_id") or "")
         attention = db.get(SopWorkItem, attention_id) if attention_id else None
         actor_user_id = (
@@ -88,6 +142,9 @@ def process_dynamic_task_signal(
             if attention is not None
             else ""
         )
+    else:
+        attention = None
+        actor_user_id = instance.initiator_user_id
     worker_id = f"dynamic-signal:{signal.id}:{signal.attempt_count + 1}"
     if model is None or model.tenant_id != instance.tenant_id or not actor_user_id:
         return _retry_unprocessable_signal(
@@ -99,6 +156,20 @@ def process_dynamic_task_signal(
         )
     try:
         agent = agent_factory(db)
+        quota_limits = quota_limits_from_settings(get_settings())
+        if quota_limits.configured:
+            agent.quota_limits = quota_limits
+            try:
+                DynamicTaskQuotaService(db).acquire_execution(instance, limits=quota_limits)
+                db.commit()
+            except DynamicTaskQuotaError as exc:
+                return _retry_unprocessable_signal(
+                    db,
+                    instance,
+                    signal,
+                    worker_id=worker_id,
+                    code=exc.code,
+                )
         if signal.signal_type == "command":
             return agent.resume_steer_signal(
                 signal_id=signal.id,
@@ -106,6 +177,51 @@ def process_dynamic_task_signal(
                 worker_id=worker_id,
                 actor_user_id=actor_user_id,
                 steering_enabled=get_settings().dynamic_task_steering_enabled,
+            )
+        if signal.signal_type == "scheduled_start":
+            return agent.resume_scheduled_start_signal(
+                signal_id=signal.id,
+                model_config=model,
+                worker_id=worker_id,
+            )
+        if signal.signal_type == "timer":
+            return agent.resume_connector_timer_signal(
+                signal_id=signal.id,
+                model_config=model,
+                worker_id=worker_id,
+            )
+        if signal.signal_type == "operation_settled":
+            return agent.resume_standing_dispatch_signal(
+                signal_id=signal.id,
+                model_config=model,
+                worker_id=worker_id,
+            )
+        if signal.signal_type == "capacity_retry":
+            return agent.resume_capacity_retry_signal(
+                signal_id=signal.id,
+                model_config=model,
+                worker_id=worker_id,
+            )
+        if attention is not None and attention.attention_kind == "reauth":
+            return agent.resume_reauth_signal(
+                signal_id=signal.id,
+                model_config=model,
+                worker_id=worker_id,
+                actor_user_id=actor_user_id,
+            )
+        if attention is not None and attention.attention_kind == "tool_approval":
+            return agent.resume_tool_approval_signal(
+                signal_id=signal.id,
+                model_config=model,
+                worker_id=worker_id,
+                actor_user_id=actor_user_id,
+            )
+        if attention is not None and attention.attention_kind == "exception":
+            return agent.resume_write_reconciliation_signal(
+                signal_id=signal.id,
+                model_config=model,
+                worker_id=worker_id,
+                actor_user_id=actor_user_id,
             )
         return agent.resume_clarification_signal(
             signal_id=signal.id,
@@ -124,10 +240,23 @@ def process_dynamic_task_signal(
                     instance,
                     signal,
                     worker_id=worker_id,
-                    error={"code": type(exc).__name__[:128]},
+                    error={"code": _stable_signal_error_code(exc)},
                 )
             db.commit()
         return None
+
+
+def _stable_signal_error_code(exc: Exception) -> str:
+    """保留受控领域错误码并对未知异常退回类型名，避免 signal 账本泄露敏感消息。"""
+
+    explicit_code = getattr(exc, "code", None)
+    if isinstance(explicit_code, str) and explicit_code.strip():
+        return explicit_code.strip()[:128]
+    if isinstance(exc, DynamicTaskAgentError) and exc.args:
+        domain_code = str(exc.args[0]).strip()
+        if domain_code:
+            return domain_code[:128]
+    return type(exc).__name__[:128]
 
 
 def _retry_unprocessable_signal(

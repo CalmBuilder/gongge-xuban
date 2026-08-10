@@ -1,5 +1,5 @@
 """
-@Time       : 2026/08/04 01:04
+@Time       : 2026/08/10 17:15
 @Author     : zhanglp8181
 @File       : test_alembic_configuration.py
 @CallChain  : pytest → Alembic ScriptDirectory → 迁移链和配置安全断言
@@ -21,7 +21,7 @@ def test_alembic_has_single_expected_head_and_baseline() -> None:
     config = Config(str(BACKEND_DIR / "alembic.ini"))
     script = ScriptDirectory.from_config(config)
 
-    assert script.get_heads() == ["20260804_0041"]
+    assert script.get_heads() == ["20260811_0048"]
     member_lifecycle = script.get_revision("20260728_0016")
     assert member_lifecycle.down_revision == "20260727_0015"
     organization_units = script.get_revision("20260728_0017")
@@ -74,6 +74,22 @@ def test_alembic_has_single_expected_head_and_baseline() -> None:
     assert execution_control.down_revision == "20260803_0039"
     execution_artifacts = script.get_revision("20260804_0041")
     assert execution_artifacts.down_revision == "20260803_0040"
+    connection_profiles = script.get_revision("20260810_0042")
+    assert connection_profiles.down_revision == "20260804_0041"
+    connector_inbound = script.get_revision("20260810_0043")
+    assert connector_inbound.down_revision == "20260810_0042"
+    connector_delivery = script.get_revision("20260810_0044")
+    assert connector_delivery.down_revision == "20260810_0043"
+    controlled_writes = script.get_revision("20260810_0045")
+    assert controlled_writes.down_revision == "20260810_0044"
+    scheduled_dynamic_runs = script.get_revision("20260811_0046")
+    assert scheduled_dynamic_runs.down_revision == "20260810_0045"
+    standing_approvals = script.get_revision("20260811_0047")
+    assert standing_approvals is not None
+    assert standing_approvals.down_revision == "20260811_0046"
+    quota_leases = script.get_revision("20260811_0048")
+    assert quota_leases is not None
+    assert quota_leases.down_revision == "20260811_0047"
     approval_requests = script.get_revision("20260727_0015")
     assert approval_requests.down_revision == "20260727_0014"
     unique_default_model = script.get_revision("20260727_0014")

@@ -20,7 +20,7 @@ from pathlib import Path
 FRONTEND_DIR = Path(__file__).resolve().parents[1]
 BACKEND_DIR = FRONTEND_DIR.parent / "backend"
 E2E_PORT = 5148
-E2E_SECRET = "fullstack-e2e-secret"
+E2E_SECRET = "fullstack-e2e-isolated-secret-at-least-32-bytes"
 E2E_RUNTIME_DIR = Path(tempfile.gettempdir()) / "gongge-fullstack-e2e-current"
 
 
@@ -44,6 +44,18 @@ def configure_environment(database_path: Path) -> None:
             "AUTO_RESTART": "false",
             "DATABASE_URL": f"sqlite:///{database_path}",
             "PUBLIC_MOCK_API_KEY": "fullstack-e2e-public-mock-key",
+            "DYNAMIC_TASK_EXECUTION_ENABLED": "true",
+            "DYNAMIC_TASK_TENANT_ALLOWLIST": "*",
+            "DYNAMIC_TASK_AGENT_ALLOWLIST": "*",
+            "DYNAMIC_TASK_ALERT_SIGNAL_BACKLOG_THRESHOLD": "100",
+            "DYNAMIC_TASK_ALERT_DEAD_LETTER_THRESHOLD": "1",
+            "DYNAMIC_TASK_ALERT_UNKNOWN_OPERATION_THRESHOLD": "1",
+            "DYNAMIC_TASK_ALERT_PUBLICATION_BACKLOG_THRESHOLD": "10",
+            "DYNAMIC_TASK_ALERT_WAITING_AGE_SECONDS": "3600",
+            "DYNAMIC_TASK_MAX_ACTIVE_PER_TENANT": "16",
+            "DYNAMIC_TASK_MAX_ACTIVE_PER_AGENT": "8",
+            "DYNAMIC_TASK_MAX_ACTIVE_PER_USER": "4",
+            "DYNAMIC_TASK_MAX_ACTIVE_PER_TOOL": "4",
             "GONGGE_XUBAN_DATA_DIR": str(E2E_RUNTIME_DIR / "user-data"),
         }
     )
@@ -1294,6 +1306,383 @@ def seed_dynamic_task_browser_fixtures() -> None:
         db.commit()
 
 
+def seed_schedule_dynamic_model() -> None:
+    """为 Schedule 全栈回归配置通过 dynamic-v1 预检的隔离默认模型。"""
+
+    from sqlmodel import Session, select
+
+    from app.db import engine
+    from app.db.models import ModelConfig
+    from app.dynamic_tasks.capability_catalog import capability_checksum
+    from app.security.encryption import encrypt_secret
+
+    capabilities = {
+        "protocol_version": "dynamic-v1",
+        "sdk_available": True,
+        "credentials_verified": True,
+        "structured_output": True,
+        "tool_calling": True,
+    }
+    with Session(engine) as db:
+        model = db.exec(
+            select(ModelConfig).where(
+                ModelConfig.tenant_id == "tenant_demo",
+                ModelConfig.is_default == True,  # noqa: E712
+            )
+        ).first()
+        if model is None:
+            model = ModelConfig(
+                id="model_e2e_schedule_dynamic",
+                tenant_id="tenant_demo",
+                name="E2E Schedule Dynamic Model",
+                provider="openai_compatible",
+                model="e2e-schedule-model",
+                is_default=True,
+                enabled=True,
+            )
+        model.api_key_encrypted = encrypt_secret("e2e-schedule-model-key")
+        model.capability_snapshot_json = capabilities
+        model.capability_checksum = capability_checksum(capabilities)
+        model.preflight_status = "ready"
+        model.enabled = True
+        db.add(model)
+        db.commit()
+
+
+def install_schedule_llm_override() -> None:
+    """仅替换隔离 provider 响应，保留 Router、AgentLoop、Planner、Signal 和 Runtime 真链路。"""
+
+    from app.llm.client import LLMClient
+    from app.llm.stage_protocol import STAGE_PROTOCOL_KEY
+
+    def deterministic_json(
+        client: LLMClient,
+        system_prompt: str,
+        user_payload: dict[str, object],
+    ) -> dict[str, object]:
+        """按正式阶段协议返回可预测结构，禁止测试直接调用内部 Agent。"""
+
+        stage = user_payload.get(STAGE_PROTOCOL_KEY, {})
+        phase = str(stage.get("phase") or "") if isinstance(stage, dict) else ""
+        if phase == "Router":
+            return {
+                "decision": "answer_only",
+                "confidence": 0.99,
+                "general_intent": "生成需要确认范围的合同巡检结果",
+                "reason": "没有匹配正式 SOP，交由非 SOP 能力仲裁",
+            }
+        if phase == "Router / General Skill Selector":
+            return {
+                "use_general_skill": False,
+                "selected_slug": None,
+                "use_knowledge": False,
+                "knowledge_query": None,
+                "knowledge_mode": "disabled",
+                "confidence": 0.99,
+                "reason": "该任务需要持久执行而非原子技能",
+            }
+        if phase == "Router / Dynamic Task Shadow":
+            goal = str(user_payload.get("user_message") or "生成合同巡检结果")
+            return {
+                "mode": "dynamic_task",
+                "goal": goal,
+                "success_criteria": ["确认合同范围后生成巡检结果"],
+                "requires_durable_execution": True,
+                "requires_artifact": False,
+                "capability_hints": [],
+                "clarification": None,
+                "execution_intent": "new_task",
+                "confidence": 0.99,
+                "reason": "任务需要跨轮等待用户确认",
+            }
+        if "受控动态任务规划器" in system_prompt:
+            return {
+                "goal": str(user_payload.get("goal") or "生成合同巡检结果"),
+                "success_criteria": user_payload.get("success_criteria", []),
+                "constraints": [],
+                "assumptions": [],
+                "steps": [
+                    {
+                        "draft_id": "clarify_scope",
+                        "title": "确认合同范围",
+                        "kind": "clarification",
+                        "required": True,
+                        "depends_on": [],
+                        "capability_refs": [],
+                        "expected_output_schema": {},
+                    },
+                    {
+                        "draft_id": "answer",
+                        "title": "生成巡检结果",
+                        "kind": "answer",
+                        "required": True,
+                        "depends_on": ["clarify_scope"],
+                        "capability_refs": [],
+                        "expected_output_schema": {},
+                    },
+                ],
+            }
+        if "受控单步动作提议器" in system_prompt:
+            client._last_completed_response_metadata = {
+                "response_id": "e2e-schedule-clarification-response",
+                "finish_reason": "stop",
+                "usage": {"input_tokens": 10, "output_tokens": 10},
+            }
+            return {
+                "action_kind": "wait_input",
+                "arguments": {
+                    "question": "请选择本次需要巡检的合同范围",
+                    "options": ["未来30天到期", "未来90天到期"],
+                },
+                "capability_ref": None,
+                "expected_output_schema": {},
+                "rationale": "先确认范围再生成可核验结果",
+            }
+        raise RuntimeError(f"Unhandled E2E model stage: {phase or system_prompt[:40]}")
+
+    LLMClient.generate_json = deterministic_json
+
+
+def seed_connection_browser_fixtures() -> None:
+    """准备 Slack 控制面、企业微信消息接入，以及浏览器可办理的 reauth Attention。"""
+
+    import json
+
+    from sqlmodel import Session
+
+    from app.connectors.service import ConnectionService
+    from app.connectors.slack import SlackCallResult
+    from app.connectors.wecom import WeComCallResult
+    from app.db import engine
+    from app.db.models import ConnectorInboundEvent
+    from app.security.encryption import encrypt_secret
+    from app.dynamic_tasks.planning import NormalizedPlan, PlanStep, SuccessCriterion
+    from app.sop_runtime.execution_control import ExecutionControlService
+    from app.sop_runtime.execution_store import SopExecutionStore
+
+    class SeedSlack:
+        """只在夹具构建阶段返回两个稳定 workspace 身份。"""
+
+        def __init__(self) -> None:
+            """按建档顺序准备管理与重授权账号。"""
+
+            self.team_ids = iter(("T-E2E-MANAGE", "T-E2E-REAUTH"))
+
+        def auth_test(self, _token: str) -> SlackCallResult:
+            """返回下一个测试 workspace 及只读 scope。"""
+
+            return SlackCallResult(
+                True,
+                {"ok": True, "team_id": next(self.team_ids)},
+                granted_scopes=frozenset({"channels:read"}),
+            )
+
+        def conversations_info(self, _token: str, *, channel_id: str) -> SlackCallResult:
+            """夹具构建不执行频道读取。"""
+
+            return SlackCallResult(True, {"ok": True, "channel": {"id": channel_id}})
+
+    class SeedWeCom:
+        """为消息接入浏览器夹具返回稳定自建应用身份。"""
+
+        def application_info(self, **_credentials: str) -> WeComCallResult:
+            """返回启用应用和最小只读 scope。"""
+
+            return WeComCallResult(
+                True,
+                {
+                    "agent_id": "1000002",
+                    "name": "E2E 企业微信消息",
+                    "description": "消息接入浏览器回归",
+                    "enabled": True,
+                    "home_url": "",
+                },
+                granted_scopes=frozenset({"application:read"}),
+            )
+
+        def invalidate_credentials(self, **_credentials: str) -> None:
+            """夹具没有进程 token 缓存。"""
+
+    with Session(engine, expire_on_commit=False) as db:
+        service = ConnectionService(db, slack=SeedSlack(), wecom=SeedWeCom())
+        manage_profile = service.create_slack_profile(
+            tenant_id="tenant_demo",
+            display_name="E2E 管理工作区",
+            token="xoxb-e2e-manage-seed",
+            required_scopes={"channels:read"},
+            actor_user_id="admin",
+        )
+        service.bind_agent(
+            tenant_id="tenant_demo",
+            profile_id=manage_profile.id,
+            agent_id="agent_e2e_employee",
+            allowed_scopes={"channels:read"},
+            expected_profile_revision=manage_profile.revision,
+            actor_user_id="admin",
+        )
+        wecom_profile = service.create_wecom_profile(
+            tenant_id="tenant_demo",
+            display_name="E2E 企业微信消息",
+            corp_id="ww-e2e-corp",
+            agent_id="1000002",
+            corp_secret="e2e-wecom-secret",
+            callback_token="e2e-callback-token",
+            callback_encoding_aes_key="abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
+            actor_user_id="admin",
+        )
+        service.bind_agent(
+            tenant_id="tenant_demo",
+            profile_id=wecom_profile.id,
+            agent_id="agent_e2e_employee",
+            allowed_scopes={"application:read"},
+            expected_profile_revision=wecom_profile.revision,
+            actor_user_id="admin",
+        )
+        plaintext = (
+            "<xml><ToUserName>ww-e2e-corp</ToUserName>"
+            "<FromUserName>e2e-external-user</FromUserName>"
+            "<MsgType>text</MsgType><Content>浏览器消息接入测试</Content>"
+            "<AgentID>1000002</AgentID><MsgId>e2e-inbound-message</MsgId></xml>"
+        )
+        db.add(
+            ConnectorInboundEvent(
+                id="connin_e2e_pending",
+                tenant_id="tenant_demo",
+                provider="wecom",
+                profile_id=wecom_profile.id,
+                external_event_id="e2e-inbound-message",
+                payload_checksum=hashlib.sha256(plaintext.encode()).hexdigest(),
+                encrypted_payload=encrypt_secret(plaintext),
+                event_type="text",
+                sender_ref_hash=hashlib.sha256(
+                    "ww-e2e-corp\0e2e-external-user".encode()
+                ).hexdigest(),
+            )
+        )
+        reauth_profile = service.create_slack_profile(
+            tenant_id="tenant_demo",
+            display_name="E2E 待重授权工作区",
+            token="xoxb-e2e-expired-seed",
+            required_scopes={"channels:read"},
+            actor_user_id="admin",
+        )
+        reauth_profile.status = "reauth_required"
+        reauth_profile.health_status = "unhealthy"
+        reauth_profile.health_error_code = "CONNECTION_TOKEN_EXPIRED"
+        reauth_profile.revision += 1
+        db.add(reauth_profile)
+        db.commit()
+
+        plan = NormalizedPlan(
+            goal="浏览器恢复 Slack 只读任务",
+            success_criteria=(
+                SuccessCriterion(id="channel", type="assertion", spec={"required": True}),
+            ),
+            steps=(
+                PlanStep(
+                    step_key="read_channel",
+                    title="读取 Slack 频道",
+                    kind="tool.read",
+                    capability_refs=(f"slack.channel_info@{reauth_profile.id}",),
+                ),
+            ),
+            budget={"max_steps": 2},
+        )
+        store = SopExecutionStore(db)
+        instance = store.start_dynamic_instance(
+            tenant_id="tenant_demo",
+            session_id="session_e2e_connection_reauth",
+            agent_id="agent_e2e_employee",
+            initiator_user_id="admin",
+            plan=plan,
+            capability_snapshot={
+                "tools": [],
+                "connectors": [
+                    {
+                        "name": f"slack.channel_info@{reauth_profile.id}",
+                        "capability_id": reauth_profile.id,
+                    }
+                ],
+            },
+        )[0]
+        with store.owned(instance, worker_id="e2e_prepare_reauth"):
+            node = store.enter_node(
+                instance,
+                "read_channel",
+                step_key="read_channel",
+                plan_revision_id=instance.current_plan_revision_id,
+                step_kind="tool.read",
+                title="读取 Slack 频道",
+            )
+            attention, _ = ExecutionControlService(db, store).offer_attention(
+                instance,
+                attention_kind="reauth",
+                attention_key="read_channel:reauth:e2e",
+                title="重新授权 E2E 待重授权工作区",
+                payload={
+                    "provider": "slack",
+                    "profile_id": reauth_profile.id,
+                    "account_id": reauth_profile.account_id,
+                    "secret_revision": reauth_profile.secret_revision,
+                    "profile_revision": reauth_profile.revision,
+                    "operation_id": "operation_e2e_connection_reauth",
+                    "reason_code": "CONNECTION_TOKEN_EXPIRED",
+                },
+                allowed_commands=["reauthorize"],
+                candidate_user_ids=["admin"],
+                node_execution=node,
+            )
+            store.wait_for_work_item(instance, node, work_item_id=attention.id)
+        db.commit()
+        assert json.dumps(attention.payload_json).find("xoxb-") == -1
+
+
+def install_connection_service_override() -> None:
+    """仅为隔离全栈进程注入可预测 Slack 边界，生产应用和租户请求均不能选择该地址。"""
+
+    from fastapi import Depends
+    from sqlmodel import Session
+
+    from app.api.connection_profiles import get_connection_service
+    from app.connectors.service import ConnectionService
+    from app.connectors.slack import SlackCallResult
+    from app.db import get_session
+    from app.main import app
+
+    class BrowserSlack:
+        """模拟同一待重授权 workspace 的验证与安全只读响应。"""
+
+        def auth_test(self, token: str) -> SlackCallResult:
+            """按测试 token 明确返回账号，避免浏览器回归访问公网。"""
+
+            if "reauth" in token:
+                team_id = "T-E2E-REAUTH"
+            elif "create" in token:
+                team_id = "T-E2E-CREATED"
+            else:
+                team_id = "T-E2E-MANAGE"
+            return SlackCallResult(
+                True,
+                {"ok": True, "team_id": team_id},
+                granted_scopes=frozenset({"channels:read"}),
+            )
+
+        def conversations_info(self, _token: str, *, channel_id: str) -> SlackCallResult:
+            """返回固定频道身份，供管理面授权读取验收。"""
+
+            return SlackCallResult(
+                True,
+                {"ok": True, "channel": {"id": channel_id, "name": "contracts"}},
+            )
+
+    def override_service(db: Session = Depends(get_session)) -> ConnectionService:
+        """让每个 HTTP 请求继续使用真实事务，只替换 provider adapter。"""
+
+        return ConnectionService(db, slack=BrowserSlack())
+
+    app.dependency_overrides[get_connection_service] = override_service
+
+
 def seed_pagination_browser_fixtures() -> None:
     """为员工广场、任务箱、档案日志、记忆和定时任务写入跨页数据。"""
 
@@ -1375,8 +1764,12 @@ def seed_pagination_browser_fixtures() -> None:
                     scheduled_task_id=task_id,
                     agent_id=agent_id,
                     user_id="admin",
+                    source_kind="legacy",
+                    source_ref=f"legacy:schedrun_e2e_page_{index:02d}",
+                    source_snapshot_json={},
+                    source_checksum=f"legacy-e2e-{index:02d}",
                     scheduled_for=scheduled_for,
-                    status="completed",
+                    status="succeeded",
                     result_summary=f"浏览器分页执行结果 {index:02d}",
                 )
             )
@@ -1440,9 +1833,13 @@ def main() -> None:
     E2E_RUNTIME_DIR.mkdir(mode=0o700)
     configure_environment(E2E_RUNTIME_DIR / "e2e.sqlite3")
     seed_e2e_fixtures()
+    seed_schedule_dynamic_model()
     seed_dynamic_task_browser_fixtures()
+    seed_connection_browser_fixtures()
     seed_pagination_browser_fixtures()
     seed_large_organization_browser_fixture()
+    install_connection_service_override()
+    install_schedule_llm_override()
 
     import uvicorn
     from single_port_app import app

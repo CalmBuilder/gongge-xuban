@@ -53,3 +53,42 @@ def test_result_requires_completed_step_evidence_for_every_criterion() -> None:
     assert invalid["passed"] is False
     assert invalid["invalid_step_refs"] == ["invented_step"]
     assert valid["passed"] is True
+
+
+def test_result_requires_declared_operation_values_in_markdown() -> None:
+    """引用步骤但只写占位语不能通过，真实值及显式空配置必须进入交付正文。"""
+
+    required = {
+        "query_contract": {
+            "name": "共格·序伴连接器测试",
+            "enabled": True,
+            "home_url": "",
+        }
+    }
+    placeholder = verify_dynamic_result(
+        DynamicTaskResult(
+            markdown="应用名称为步骤返回值，状态与主页地址同上。",
+            criterion_evidence={"brief_ready": ("query_contract",)},
+        ),
+        plan=_plan(),
+        completed_step_keys={"query_contract"},
+        required_evidence_by_step=required,
+    )
+    factual = verify_dynamic_result(
+        DynamicTaskResult(
+            markdown="应用名称：共格·序伴连接器测试；状态：已启用；主页地址：未配置。",
+            criterion_evidence={"brief_ready": ("query_contract",)},
+        ),
+        plan=_plan(),
+        completed_step_keys={"query_contract"},
+        required_evidence_by_step=required,
+    )
+
+    assert placeholder["passed"] is False
+    assert placeholder["missing_result_evidence"] == [
+        "query_contract:enabled",
+        "query_contract:home_url",
+        "query_contract:name",
+    ]
+    assert factual["passed"] is True
+    assert factual["missing_result_evidence"] == []

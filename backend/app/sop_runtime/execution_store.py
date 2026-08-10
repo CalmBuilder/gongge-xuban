@@ -1,5 +1,5 @@
 """
-@Time       : 2026/07/22 12:45
+@Time       : 2026/08/10 19:55
 @Author     : zhanglp8181
 @File       : execution_store.py
 @CallChain  : Agent Loop/Runtime Scheduler → SopExecutionStore → SQLModel 执行聚合
@@ -44,6 +44,7 @@ from app.dynamic_tasks.planning import (
     PlanReason,
     canonical_checksum,
 )
+from app.dynamic_tasks.quotas import DynamicTaskQuotaService
 from app.session.managed_resources import (
     InputResourceAccessDenied,
     assert_input_resource_access,
@@ -858,6 +859,48 @@ class SopExecutionStore:
         self.db.add(instance)
         self.db.flush()
 
+    def wait_for_timer(
+        self,
+        instance: SopInstance,
+        execution: SopNodeExecution,
+        *,
+        signal_id: str,
+    ) -> None:
+        """将节点和实例暂停到持久 timer signal，不借用人工 Attention 语义。"""
+
+        self._assert_execution_owner(instance, execution)
+        self._guard_mutation(instance, "node.wait_timer")
+        node_transition = transition_node(
+            NodeExecutionStatus(execution.status),
+            NodeExecutionStatus.WAITING,
+            actual_revision=execution.revision,
+        )
+        instance_transition = transition_instance(
+            SopInstanceStatus(instance.status),
+            SopInstanceStatus.WAITING,
+            actual_revision=instance.revision,
+        )
+        self._apply_node_transition(execution, node_transition)
+        execution.output_json = {"timer_signal_id": signal_id}
+        self._apply_instance_transition(instance, instance_transition)
+        self.db.add(execution)
+        self.db.add(instance)
+        self.db.flush()
+
+    def wait_for_publication(self, instance: SopInstance) -> None:
+        """在结果步骤完成后把实例暂停到 required 外部 publication 结算。"""
+
+        self._guard_mutation(instance, "instance.wait_publication")
+        transition = transition_instance(
+            SopInstanceStatus(instance.status),
+            SopInstanceStatus.WAITING,
+            actual_revision=instance.revision,
+        )
+        self._apply_instance_transition(instance, transition)
+        instance.current_node_id = None
+        self.db.add(instance)
+        self.db.flush()
+
     def resume_waiting_node(
         self,
         instance: SopInstance,
@@ -882,6 +925,28 @@ class SopExecutionStore:
         self._apply_node_transition(execution, node_transition)
         self._apply_instance_transition(instance, instance_transition)
         instance.slots_json = dict(slots)
+        self.db.add(execution)
+        self.db.add(instance)
+        self.db.flush()
+
+    def retarget_waiting_work_item(
+        self,
+        instance: SopInstance,
+        execution: SopNodeExecution,
+        *,
+        work_item_id: str,
+    ) -> None:
+        """保持 waiting 状态，仅把节点的当前阻塞依据切换到新的持久工作项。"""
+
+        self._assert_execution_owner(instance, execution)
+        self._guard_mutation(instance, "node.retarget_work_item")
+        if execution.status != "waiting" or instance.status != "waiting":
+            raise SopExecutionConflictError("只有 waiting 节点可以切换阻塞工作项。")
+        execution.output_json = {"work_item_id": work_item_id}
+        execution.revision += 1
+        execution.updated_at = self._database_now()
+        instance.revision += 1
+        instance.updated_at = execution.updated_at
         self.db.add(execution)
         self.db.add(instance)
         self.db.flush()
@@ -1129,6 +1194,54 @@ class SopExecutionStore:
         self.db.add(operation)
         self.db.flush()
 
+    def authorize_external_operation_dispatch(
+        self,
+        operation: SopOperation,
+        *,
+        approval_work_item_id: str | None,
+        approval_fingerprint: str,
+        approved_by_user_id: str,
+        authorization_evidence: Mapping[str, object],
+        authorization_source_type: str = "attention",
+        authorization_source_ref: str | None = None,
+    ) -> None:
+        """在同一事务冻结 Attention 或长期规则授权证据，提交后方可外呼。"""
+
+        if operation.effect_kind != "external_write" or operation.status != "prepared":
+            raise SopExecutionConflictError("只有 prepared 外部写可以绑定批准并派发。")
+        if not approval_fingerprint.strip() or not approved_by_user_id.strip() or not authorization_evidence:
+            raise SopExecutionConflictError("外部写批准和再授权证据不能为空。")
+        if authorization_source_type == "attention":
+            if not approval_work_item_id or not approval_work_item_id.strip():
+                raise SopExecutionConflictError("一次性批准必须绑定 Attention。")
+            reused = self.db.exec(
+                select(SopOperation).where(
+                    SopOperation.tenant_id == operation.tenant_id,
+                    SopOperation.approval_work_item_id == approval_work_item_id,
+                    SopOperation.id != operation.id,
+                )
+            ).first()
+            if reused is not None:
+                raise SopExecutionConflictError("一次性批准已绑定其他 Operation。")
+            source_ref = authorization_source_ref or approval_work_item_id
+        elif authorization_source_type == "standing_rule":
+            if approval_work_item_id is not None or not (authorization_source_ref or "").strip():
+                raise SopExecutionConflictError("长期批准必须绑定规则且不能伪装 Attention。")
+            source_ref = authorization_source_ref
+        else:
+            raise SopExecutionConflictError("外部写授权来源类型无效。")
+        operation.approval_work_item_id = approval_work_item_id
+        operation.approval_fingerprint = approval_fingerprint
+        operation.approved_by_user_id = approved_by_user_id
+        operation.approved_at = utc_now()
+        operation.authorization_evidence_json = dict(authorization_evidence)
+        operation.authorization_source_type = authorization_source_type
+        operation.authorization_source_ref = source_ref
+        self.start_operation(operation)
+        operation.dispatched_at = operation.started_at
+        self.db.add(operation)
+        self.db.flush()
+
     def finish_operation(
         self,
         operation: SopOperation,
@@ -1177,6 +1290,7 @@ class SopExecutionStore:
         self.db.add(operation)
         instance = self._operation_instance(operation)
         self.aggregate_effect_state(instance)
+        DynamicTaskQuotaService(self.db).release_tool_operation(operation)
         self.db.flush()
 
     def cancel_prepared_operation(self, operation: SopOperation) -> None:
@@ -1199,6 +1313,7 @@ class SopExecutionStore:
             self.db.add(attempt)
         self.db.add(operation)
         self.aggregate_effect_state(self._operation_instance(operation))
+        DynamicTaskQuotaService(self.db).release_tool_operation(operation)
         self.db.flush()
 
     def mark_operation_unknown(
@@ -1308,6 +1423,7 @@ class SopExecutionStore:
         )
         self.db.add(operation)
         self.aggregate_effect_state(instance)
+        DynamicTaskQuotaService(self.db).release_tool_operation(operation)
         return self._settle_requested_cancellation(instance)
 
     def request_cancellation(
@@ -1450,6 +1566,8 @@ class SopExecutionStore:
             instance.slots_json = dict(slots)
         instance.completed_at = utc_now()
         self.db.add(instance)
+        if instance.kind == "dynamic_task":
+            DynamicTaskQuotaService(self.db).release_execution(instance)
         self.db.flush()
 
     def fail_instance(
@@ -1486,6 +1604,8 @@ class SopExecutionStore:
             }
         instance.completed_at = utc_now()
         self.db.add(instance)
+        if instance.kind == "dynamic_task":
+            DynamicTaskQuotaService(self.db).release_execution(instance)
         self.db.flush()
 
     def timeout_instance(
@@ -1522,6 +1642,8 @@ class SopExecutionStore:
             }
         instance.completed_at = utc_now()
         self.db.add(instance)
+        if instance.kind == "dynamic_task":
+            DynamicTaskQuotaService(self.db).release_execution(instance)
         self.db.flush()
 
     @staticmethod
@@ -1796,6 +1918,7 @@ class SopExecutionStore:
             attempt.updated_at = operation.completed_at
             self.db.add(attempt)
         self.db.add(operation)
+        DynamicTaskQuotaService(self.db).release_tool_operation(operation)
 
     def _settle_requested_cancellation(self, instance: SopInstance) -> bool:
         """仅在没有 running/unknown 动作时把已请求取消的实例推进到终态。"""
@@ -1841,6 +1964,8 @@ class SopExecutionStore:
         instance.cancellation_disposition = "cancelled"
         instance.completed_at = utc_now()
         self.db.add(instance)
+        if instance.kind == "dynamic_task":
+            DynamicTaskQuotaService(self.db).release_execution(instance)
         self.db.flush()
         return True
 

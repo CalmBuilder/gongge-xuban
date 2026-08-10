@@ -1,3 +1,11 @@
+"""
+@Time: 2026-08-10
+@Author: zhanglp8181
+@File: desktop_launcher.py
+@CallChain: desktop executable -> desktop_launcher.main -> uvicorn single_port_app
+@Description: 配置并启动桌面端单端口服务，负责端口选择、实例复用和浏览器唤起。
+"""
+
 from __future__ import annotations
 
 import importlib
@@ -17,7 +25,7 @@ from app.brand import DESKTOP_APP_ID, PRODUCT_NAME, PRODUCT_SLUG, desktop_env_va
 APP_NAME = PRODUCT_NAME
 APP_ID = DESKTOP_APP_ID
 APP_VERSION = "0.1.0"
-DEFAULT_PORT_RANGE_START = 5173
+DEFAULT_PORT_RANGE_START = 5137
 DEFAULT_PORT_RANGE_END = 5199
 _MACOS_DELEGATE_REF = None
 _MACOS_INSTANCE_LOCK_HANDLE = None

@@ -1,3 +1,11 @@
+"""
+@Time       : 2026/08/10 16:20
+@Author     : zhanglp8181
+@File       : router.py
+@CallChain  : AgentLoop → Router → LLMClient → RouterDecision
+@Description: 生成并规范化场景技能路由，阻止无显式触发词的演示流程抢占业务请求。
+"""
+
 from __future__ import annotations
 
 from typing import Any
@@ -55,11 +63,17 @@ class Router:
             if isinstance(exc, LLMError):
                 raise
             raise LLMError(f"Router returned invalid JSON schema: {exc}") from exc
-        return self._normalize_decision(decision, session, available_skills)
+        return self._normalize_decision(decision, session, available_skills, message)
 
     def _normalize_decision(
-        self, decision: RouterDecision, session: ChatSession, available_skills: list[Skill]
+        self,
+        decision: RouterDecision,
+        session: ChatSession,
+        available_skills: list[Skill],
+        message: str,
     ) -> RouterDecision:
+        """校验模型返回的技能、任务和演示流程触发边界，产出可执行路由。"""
+
         self._strip_generated_message_slots(decision)
         decision.general_intent = " ".join(
             str(decision.general_intent or "").split()
@@ -76,6 +90,19 @@ class Router:
                 decision.target_skill_id = None
                 decision.target_step_id = None
                 decision.clarification_question = "请问您想办理哪类业务？"
+                return decision
+            target_skill = skills[decision.target_skill_id]
+            if not _demo_skill_explicitly_triggered(target_skill, message):
+                decision.decision = "answer_only"
+                decision.selected_task_id = None
+                decision.target_skill_id = None
+                decision.target_step_id = None
+                decision.task_frames = []
+                decision.pending_tasks = []
+                decision.created_tasks = []
+                decision.task_updates = []
+                decision.clarification_question = None
+                decision.reason = "演示流程未命中显式触发词，交回非场景能力路由。"
                 return decision
         if decision.decision == "switch_to_pending":
             pending_ids = {
@@ -196,6 +223,22 @@ def _first_node_id(skill: Skill) -> str | None:
     return None
 
 
+def _demo_skill_explicitly_triggered(skill: Skill, message: str) -> bool:
+    """仅允许显式命中触发词的 demo 技能启动，业务技能不增加词法限制。"""
+
+    if str(skill.business_domain or "").strip().casefold() != "demo":
+        return True
+    normalized_message = " ".join(str(message or "").casefold().split())
+    trigger_intents = (skill.content_json or {}).get("trigger_intents")
+    if not isinstance(trigger_intents, list):
+        return False
+    return any(
+        normalized_trigger in normalized_message
+        for trigger in trigger_intents
+        if (normalized_trigger := " ".join(str(trigger).casefold().split()))
+    )
+
+
 def _available_skill_payloads(available_skills: list[Skill]) -> list[dict[str, Any]]:
     return [_skill_payload(skill) for skill in available_skills]
 
@@ -207,6 +250,11 @@ def _skill_payload(skill: Skill) -> dict[str, Any]:
             "skill_id": skill.skill_id,
             "name": skill.name,
             "description": skill.description,
+            "business_domain": (
+                skill.business_domain
+                if str(skill.business_domain or "").strip().casefold() == "demo"
+                else None
+            ),
             "trigger_intents": content.get("trigger_intents", []),
         }
     )

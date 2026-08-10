@@ -139,6 +139,10 @@ class ScheduledTaskRunRead(BaseModel):
     agent_id: str
     user_id: str
     session_id: Optional[str] = None
+    execution_id: Optional[str] = None
+    source_kind: str
+    source_ref: str
+    source_checksum: str
     scheduled_for: str
     status: str
     started_at: Optional[str] = None

@@ -149,7 +149,9 @@ class DynamicPlanDraftStep(PlanningContract):
 
     draft_id: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
     title: str = Field(min_length=1, max_length=256)
-    kind: str = Field(pattern=r"^(tool\.read|knowledge|answer|clarification)$")
+    kind: str = Field(
+        pattern=r"^(tool\.read|tool\.write|knowledge|explore|answer|clarification)$"
+    )
     required: bool = True
     depends_on: tuple[str, ...] = ()
     capability_refs: tuple[str, ...] = ()
@@ -211,9 +213,12 @@ def normalize_plan_draft(
         raise ValueError("动态计划预算无效")
     if len(draft.steps) > max_steps:
         raise ValueError("动态计划步骤超过服务端预算")
-    external_read_steps = sum(step.kind in {"tool.read", "knowledge"} for step in draft.steps)
-    if external_read_steps > max_tool_calls:
-        raise ValueError("动态计划外部读取步骤超过服务端预算")
+    capability_steps = sum(
+        step.kind in {"tool.read", "tool.write", "knowledge", "explore"}
+        for step in draft.steps
+    )
+    if capability_steps > max_tool_calls:
+        raise ValueError("动态计划能力调用步骤超过服务端预算")
     key_by_draft_id = {
         step.draft_id: _stable_step_key(index, step)
         for index, step in enumerate(draft.steps, start=1)

@@ -440,7 +440,7 @@ class LLMClient:
         return payload, dict(metadata)
 
     def preflight_dynamic_capabilities(self) -> dict[str, bool | str]:
-        """使用原生 JSON mode 与强制 tool call 探针验证动态计划必需协议。"""
+        """使用原生 JSON mode 与真实 tool call 探针验证动态计划必需协议。"""
 
         structured_request = {
             "model": self.model,
@@ -479,13 +479,28 @@ class LLMClient:
                 "function": {"name": "dynamic_capability_probe"},
             },
         }
+        thinking_kwargs = _thinking_request_kwargs(
+            getattr(self, "thinking_mode", ""),
+            getattr(self, "extra_body", {}),
+        )
+        structured_request.update(thinking_kwargs)
+        tool_request.update(thinking_kwargs)
         try:
             structured = self.client.chat.completions.create(**structured_request)
             content = _completion_message_content(structured)
             parsed = json.loads(content)
             if parsed != {"probe": "ready"}:
                 raise LLMError("Structured-output capability probe returned an invalid payload")
-            tool_completion = self.client.chat.completions.create(**tool_request)
+            try:
+                tool_completion = self.client.chat.completions.create(**tool_request)
+            except Exception as exc:
+                if not _tool_choice_unsupported(exc):
+                    raise
+                compatible_tool_request = dict(tool_request)
+                compatible_tool_request.pop("tool_choice", None)
+                tool_completion = self.client.chat.completions.create(
+                    **compatible_tool_request
+                )
             tool_calls = _completion_tool_calls(tool_completion)
             if not any(call["name"] == "dynamic_capability_probe" for call in tool_calls):
                 raise LLMError("Tool-calling capability probe returned no required tool call")
@@ -1288,6 +1303,30 @@ def _response_format_unsupported(message: str) -> bool:
             "unknown parameter",
             "unrecognized",
             "extra inputs are not permitted",
+            "invalid parameter",
+        )
+    )
+
+
+def _tool_choice_unsupported(exc: Exception) -> bool:
+    """只对明确拒绝 tool_choice 的协议错误启用无强制参数的真实工具探针。"""
+
+    status_code = getattr(exc, "status_code", None)
+    if status_code not in {400, 422}:
+        return False
+    fragments = [str(exc)]
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        fragments.append(json.dumps(body, ensure_ascii=False, default=str))
+    lowered = " ".join(fragments).lower()
+    return "tool_choice" in lowered and any(
+        phrase in lowered
+        for phrase in (
+            "does not support",
+            "not support",
+            "unsupported",
+            "unknown parameter",
+            "unrecognized",
             "invalid parameter",
         )
     )

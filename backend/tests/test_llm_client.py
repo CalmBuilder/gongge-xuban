@@ -160,7 +160,7 @@ def test_model_config_create_defaults_to_8192_output_tokens():
 
 
 def test_dynamic_preflight_requires_native_structured_output_and_tool_call() -> None:
-    """验证动态预检分别发送 JSON mode 和强制工具调用探针。"""
+    """验证动态预检分别发送 JSON mode 和优先强制的工具调用探针。"""
 
     client = object.__new__(LLMClient)
     client.model = "demo-model"
@@ -200,6 +200,57 @@ def test_dynamic_preflight_requires_native_structured_output_and_tool_call() -> 
         "type": "function",
         "function": {"name": "dynamic_capability_probe"},
     }
+
+
+def test_dynamic_preflight_retries_without_tool_choice_when_protocol_rejects_it() -> None:
+    """验证 thinking provider 只拒绝 tool_choice 时仍以真实工具返回证明能力。"""
+
+    client = object.__new__(LLMClient)
+    client.model = "opaque-thinking-model"
+    client.thinking_mode = "enabled"
+    client.extra_body = {}
+    calls: list[dict[str, object]] = []
+
+    class ToolChoiceError(Exception):
+        """模拟 provider 对 thinking + tool_choice 返回的明确协议错误。"""
+
+        status_code = 400
+        body = {"error": {"message": "Thinking mode does not support this tool_choice"}}
+
+    class Completions:
+        """先拒绝强制选择，再接受由提示驱动的同一工具探针。"""
+
+        def create(self, **kwargs):  # noqa: ANN003, ANN201
+            """记录请求并按协议分支返回结构化或工具响应。"""
+
+            calls.append(kwargs)
+            if "response_format" in kwargs:
+                return _completion_with_content('{"probe":"ready"}')
+            if "tool_choice" in kwargs:
+                raise ToolChoiceError("Thinking mode does not support this tool_choice")
+            if "tools" in kwargs:
+                function = type(
+                    "Function", (), {"name": "dynamic_capability_probe", "arguments": "{}"}
+                )()
+                tool_call = type("ToolCall", (), {"function": function})()
+                message = type("Message", (), {"content": None, "tool_calls": [tool_call]})()
+                choice = type("Choice", (), {"message": message})()
+                return type("Completion", (), {"choices": [choice]})()
+            return _completion_with_content("unsupported optional input")
+
+    client.client = type(
+        "Client",
+        (),
+        {"chat": type("Chat", (), {"completions": Completions()})()},
+    )()
+
+    result = client.preflight_dynamic_capabilities()
+
+    assert result["tool_calling"] is True
+    assert calls[0]["extra_body"] == {"thinking": {"type": "enabled"}}
+    assert "tool_choice" in calls[1]
+    assert "tool_choice" not in calls[2]
+    assert calls[2]["tools"] == calls[1]["tools"]
 
 
 def test_dynamic_preflight_freezes_successful_optional_image_and_pdf_probes() -> None:

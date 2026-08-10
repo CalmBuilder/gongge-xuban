@@ -65,7 +65,7 @@ const TASK_FILTERS: Record<TaskListFilter, (row: ScheduledTaskRead) => boolean> 
 };
 const RUN_FILTERS: Record<RunListFilter, (row: ScheduledTaskRunRead) => boolean> = {
   all: () => true,
-  pending: (row) => row.status === 'queued' || row.status === 'running',
+  pending: (row) => ['queued', 'running', 'waiting'].includes(row.status),
   failed: (row) => row.status === 'failed' || row.status === 'skipped',
   completed: (row) => row.status === 'succeeded',
 };
@@ -95,7 +95,9 @@ export const TASK_STATUS_BADGE: Record<string, { tone: BadgeTone; text: string }
 export const RUN_STATUS_BADGE: Record<string, { tone: BadgeTone; text: string }> = {
   succeeded: { tone: 'green', text: '成功' },
   failed: { tone: 'red', text: '失败' },
+  queued: { tone: 'gray', text: '待执行' },
   running: { tone: 'blue', text: '执行中' },
+  waiting: { tone: 'orange', text: '等待处理' },
   skipped: { tone: 'gray', text: '已跳过' },
 };
 

@@ -1,3 +1,11 @@
+"""
+@Time       : 2026/08/11 01:15
+@Author     : zhanglp8181
+@File       : test_chat_agent_binding.py
+@CallChain  : pytest → Chat API/AgentLoop → ChatSession 员工身份快照
+@Description: 验证聊天与调度会话的 Agent 绑定、访问边界、标题和来源投影。
+"""
+
 from __future__ import annotations
 
 import pytest
@@ -355,6 +363,10 @@ def test_chat_session_list_exposes_scheduled_origin_without_title_inference() ->
                 agent_id="agent_demo",
                 user_id="user_demo",
                 session_id="session_scheduled",
+                source_kind="legacy",
+                source_ref="legacy:schedrun_demo",
+                source_snapshot_json={},
+                source_checksum="legacy-schedrun-demo",
                 scheduled_for=utc_now(),
             )
         )

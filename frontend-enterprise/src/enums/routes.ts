@@ -20,4 +20,5 @@ export enum EnterpriseRoute {
   OrganizationRoles = '/enterprise/organization-roles',
   ManagementAudit = '/enterprise/management-audit',
   Models = '/enterprise/models',
+  Connections = '/enterprise/connections',
 }

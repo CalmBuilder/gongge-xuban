@@ -175,6 +175,42 @@ BUILTIN_PERMISSIONS = (
         "允许取消或调整当前租户 Execution，不授予 Attention 办理或工具执行资格。",
     ),
     BuiltinPermissionDefinition(
+        "connection_profile.manage",
+        "管理外部连接",
+        "governance",
+        "connection_profile",
+        "manage",
+        None,
+        "允许管理当前租户的外部账号连接、凭据轮换和数字员工绑定，不授予运行时使用权。",
+    ),
+    BuiltinPermissionDefinition(
+        "dynamic_task.standing_approval.manage",
+        "管理动态任务长期批准",
+        "governance",
+        "dynamic_task.standing_approval",
+        "manage",
+        None,
+        "允许在同时具备调度、数字员工、连接和外部写权限时创建或撤销精确长期批准规则。",
+    ),
+    BuiltinPermissionDefinition(
+        "external_connection.read",
+        "使用外部只读连接",
+        "cross_functional",
+        "external_connection",
+        "read",
+        None,
+        "允许在当前组织权限范围内通过已绑定数字员工读取受管外部账号，不授予连接管理权。",
+    ),
+    BuiltinPermissionDefinition(
+        "external_connection.write",
+        "批准外部连接写入",
+        "cross_functional",
+        "external_connection",
+        "write",
+        None,
+        "允许作为候选办理人批准并派发精确冻结的外部写操作，不授予连接管理或长期自动放行权。",
+    ),
+    BuiltinPermissionDefinition(
         "agent.read",
         "查看数字员工治理信息",
         "governance",
@@ -696,6 +732,7 @@ def ensure_builtin_permission_catalog(db: Session, tenant_id: str) -> None:
         select(PermissionDefinition).where(PermissionDefinition.tenant_id == tenant_id)
     ).all()
     by_code = {item.permission_code: item for item in existing}
+    dialect_name = db.get_bind().dialect.name
     for definition in BUILTIN_PERMISSIONS:
         row = by_code.get(definition.code)
         if row is None:
@@ -710,6 +747,26 @@ def ensure_builtin_permission_catalog(db: Session, tenant_id: str) -> None:
                 description=definition.description,
                 metadata_json={"source": "builtin_permission_catalog"},
             )
+            values = {
+                column.name: getattr(row, column.name)
+                for column in PermissionDefinition.__table__.columns
+            }
+            if dialect_name == "sqlite":
+                statement = (
+                    sqlite_insert(PermissionDefinition)
+                    .values(**values)
+                    .on_conflict_do_nothing(index_elements=["tenant_id", "permission_code"])
+                )
+                db.exec(statement)
+            elif dialect_name == "mysql":
+                statement = mysql_insert(PermissionDefinition).values(**values)
+                db.exec(
+                    statement.on_duplicate_key_update(
+                        id=PermissionDefinition.__table__.c.id,
+                    )
+                )
+            else:
+                db.add(row)
         else:
             row.category = definition.category
             row.resource = definition.resource
@@ -718,7 +775,7 @@ def ensure_builtin_permission_catalog(db: Session, tenant_id: str) -> None:
             row.description = definition.description
             row.status = "active"
             row.updated_at = utc_now()
-        db.add(row)
+            db.add(row)
     db.flush()
 
 
@@ -760,14 +817,39 @@ def sync_role_permissions(
         if mapping.permission_definition_id not in desired_ids:
             db.delete(mapping)
     existing_ids = {mapping.permission_definition_id for mapping in existing}
+    dialect_name = db.get_bind().dialect.name
     for permission_id in sorted(desired_ids - existing_ids):
-        db.add(
-            BusinessRolePermission(
-                tenant_id=role.tenant_id,
-                business_role_id=role.id,
-                permission_definition_id=permission_id,
-            )
+        mapping = BusinessRolePermission(
+            tenant_id=role.tenant_id,
+            business_role_id=role.id,
+            permission_definition_id=permission_id,
         )
+        values = {
+            column.name: getattr(mapping, column.name)
+            for column in BusinessRolePermission.__table__.columns
+        }
+        if dialect_name == "sqlite":
+            statement = (
+                sqlite_insert(BusinessRolePermission)
+                .values(**values)
+                .on_conflict_do_nothing(
+                    index_elements=[
+                        "tenant_id",
+                        "business_role_id",
+                        "permission_definition_id",
+                    ]
+                )
+            )
+            db.exec(statement)
+        elif dialect_name == "mysql":
+            statement = mysql_insert(BusinessRolePermission).values(**values)
+            db.exec(
+                statement.on_duplicate_key_update(
+                    id=BusinessRolePermission.__table__.c.id,
+                )
+            )
+        else:
+            db.add(mapping)
     role.permissions_json = normalized_codes
     role.updated_at = utc_now()
     db.add(role)

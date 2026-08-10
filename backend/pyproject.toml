@@ -59,4 +59,5 @@ target-version = "py311"
 testpaths = ["tests"]
 markers = [
   "mysql: requires the local MySQL 8.4 integration service",
+  "slack_live: requires an isolated Slack workspace, bot token, team id, and channel id",
 ]

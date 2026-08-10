@@ -1,5 +1,5 @@
 """
-@Time       : 2026/08/04 01:04
+@Time       : 2026/08/10 19:20
 @Author     : zhanglp8181
 @File       : test_dynamic_task_agent.py
 @CallChain  : pytest → DynamicTaskAgent → Execution Store/受控 ToolExecutor
@@ -20,9 +20,20 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from app.agents.branching import ensure_agent_private_knowledge_branch, ensure_private_resource_binding
+from app.connectors.service import ConnectionService
+from app.connectors.runtime import ConnectorRuntimeService
+from app.connectors.slack import SlackCallResult
+from app.connectors.wecom import WeComCallResult
 from app.db.models import (
     AgentProfile,
+    AgentEvent,
     ArtifactInputLink,
+    BusinessRole,
+    EmployeeProfile,
+    EmployeeRoleAssignment,
+    ConnectorOutboundDelivery,
+    ConnectorThreadBinding,
+    DynamicTaskQuotaLease,
     ExecutionArtifact,
     ExecutionPlanRevision,
     ExecutionSignal,
@@ -39,6 +50,7 @@ from app.db.models import (
     Tenant,
     Tool,
     User,
+    utc_now,
 )
 from app.dynamic_tasks.agent import DynamicRunOutcome, DynamicTaskAgent, DynamicTaskAgentError
 from app.dynamic_tasks.artifacts import ArtifactAccessDenied, ArtifactService
@@ -49,7 +61,9 @@ from app.dynamic_tasks.capability_catalog import (
     capability_checksum,
     publish_tool_contract,
 )
+from app.dynamic_tasks.execution_context import build_execution_context_projection
 from app.dynamic_tasks.worker import due_dynamic_task_signals, process_dynamic_task_signal
+from app.security.encryption import encrypt_secret
 from app.dynamic_tasks.planning import (
     ActionKind,
     CompletedProviderProposal,
@@ -61,7 +75,10 @@ from app.dynamic_tasks.planning import (
     DynamicPlanDraftStep,
     normalize_plan_draft,
 )
+from app.dynamic_tasks.quotas import DynamicTaskQuotaError
 from app.knowledge.schema import KnowledgeSearchResponse
+from app.organization.governance import ensure_builtin_governance_catalog
+from app.organization.permissions import sync_role_permissions
 from app.sop_runtime.execution_store import SopExecutionStore
 from app.sop_runtime.execution_control import ExecutionControlService
 from app.session.managed_resources import ManagedInputResourceService
@@ -124,6 +141,32 @@ class _StartCatalog(_Catalog):
 
         return []
 
+    def list_connector_reads(
+        self,
+        tenant_id: str,
+        agent_id: str,
+        actor_user_id: str,
+    ) -> list[CapabilitySnapshot]:
+        """本测试不提供外部连接读取能力。"""
+
+        assert actor_user_id
+        return []
+
+    def list_connector_writes(
+        self,
+        tenant_id: str,
+        agent_id: str,
+        actor_user_id: str,
+        session_id: str,
+    ) -> list[CapabilitySnapshot]:
+        """普通动态任务测试不暴露外部写能力，且验证新目录契约参数完整。"""
+
+        assert tenant_id == self.model.tenant_id
+        assert agent_id
+        assert actor_user_id
+        assert session_id
+        return []
+
 
 class _Planner:
     """记录服务端任务契约并返回固定有界计划。"""
@@ -152,6 +195,43 @@ class _Planner:
                     title="形成风险简报",
                     kind="answer",
                     depends_on=("query_contract",),
+                ),
+            ),
+            budget={"max_steps": 4},
+        )
+
+
+class _EmptyStartCatalog(_StartCatalog):
+    """模拟没有工具、连接、知识或规划指南，但模型本身可执行动态协议的 Agent。"""
+
+    def list_tools(self, tenant_id: str, agent_id: str) -> list[CapabilitySnapshot]:
+        """返回空工具目录，验证澄清/回答计划不依赖伪造能力。"""
+
+        return []
+
+
+class _EmptyCapabilityPlanner(_Planner):
+    """在空能力目录下只规划澄清和回答，不引用任何 capability。"""
+
+    def create_plan(self, *, goal, success_criteria, capabilities, input_resources=()):
+        """断言目录为空，并返回由 Runtime 原生支持的无工具动态计划。"""
+
+        self.calls += 1
+        assert capabilities == []
+        return NormalizedPlan(
+            goal=goal,
+            success_criteria=tuple(success_criteria),
+            steps=(
+                PlanStep(
+                    step_key="clarify_scope",
+                    title="确认范围",
+                    kind="clarification",
+                ),
+                PlanStep(
+                    step_key="answer",
+                    title="形成答复",
+                    kind="answer",
+                    depends_on=("clarify_scope",),
                 ),
             ),
             budget={"max_steps": 4},
@@ -558,6 +638,38 @@ def _snapshot(*, risk_class: str = "read") -> CapabilitySnapshot:
     )
 
 
+def _output_snapshot() -> CapabilitySnapshot:
+    """构造只允许模型读取 contracts 字段、禁止泄漏同级敏感字段的能力快照。"""
+
+    payload = {
+        "capability_type": "tool",
+        "capability_id": "tool_contract",
+        "tenant_id": "tenant_demo",
+        "name": "contract.query",
+        "contract": {"risk_class": "read"},
+        "model_view": {
+            "name": "contract.query",
+            "output_schema": {
+                "type": "object",
+                "properties": {
+                    "contracts": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    }
+                },
+                "additionalProperties": False,
+            },
+        },
+        "user_view": {"name": "contract.query"},
+        "audit_view": {"name": "contract.query"},
+    }
+    return CapabilitySnapshot(
+        **payload,
+        agent_id="agent_demo",
+        checksum=capability_checksum(payload),
+    )
+
+
 def _tool_response(
     *,
     response_id: str,
@@ -631,6 +743,417 @@ def _instance(db: Session, snapshot: CapabilitySnapshot):
         plan=plan,
         capability_snapshot={"tools": [snapshot.model_dump(mode="json")]},
     )[0]
+
+
+class _ConnectorSlackStub:
+    """为动态 reauth 闭环提供建档、轮换和一次真实读取的 provider 替身。"""
+
+    def __init__(self) -> None:
+        """初始化健康探测和读取计数。"""
+
+        self.read_calls = 0
+        self.rate_limit_once = False
+
+    def auth_test(self, _token: str) -> SlackCallResult:
+        """始终确认同一 workspace 和必需 scope。"""
+
+        return SlackCallResult(
+            True,
+            {"ok": True, "team_id": "T-DYNAMIC"},
+            granted_scopes=frozenset({"channels:read"}),
+        )
+
+    def conversations_info(self, _token: str, *, channel_id: str) -> SlackCallResult:
+        """记录恢复后唯一一次 provider read。"""
+
+        self.read_calls += 1
+        if self.rate_limit_once and self.read_calls == 1:
+            return SlackCallResult(
+                False,
+                {},
+                error_code="SLACK_RATE_LIMITED",
+                rate_limited_until=utc_now(),
+            )
+        return SlackCallResult(
+            True,
+            {"ok": True, "channel": {"id": channel_id, "name": "contracts"}},
+        )
+
+
+class _ConnectorWeComStub:
+    """为动态企业微信只读闭环返回固定应用事实并记录调用次数。"""
+
+    def __init__(self) -> None:
+        """初始化调用和缓存撤销计数。"""
+
+        self.calls = 0
+        self.invalidations = 0
+
+    def application_info(
+        self,
+        *,
+        corp_id: str,
+        corp_secret: str,
+        agent_id: str,
+    ) -> WeComCallResult:
+        """验证凭据抵达 adapter 边界并返回不含成员数据的应用投影。"""
+
+        assert corp_id == "corp-dynamic"
+        assert corp_secret == "secret-dynamic"
+        assert agent_id == "1000002"
+        self.calls += 1
+        return WeComCallResult(
+            True,
+            {
+                "agent_id": agent_id,
+                "name": "企业微信动态应用",
+                "description": "动态只读闭环",
+                "enabled": True,
+                "home_url": "",
+            },
+            granted_scopes=frozenset({"application:read"}),
+        )
+
+    def invalidate_credentials(
+        self,
+        *,
+        corp_id: str,
+        corp_secret: str,
+        agent_id: str,
+    ) -> None:
+        """记录旧凭据 token 缓存撤销。"""
+
+        assert corp_id and corp_secret and agent_id
+        self.invalidations += 1
+
+
+def _connector_response(capability_name: str) -> CompletedProviderProposal:
+    """构造引用冻结 Slack 账号能力的完整 read proposal。"""
+
+    return CompletedProviderProposal(
+        response_id="provider_connector_read",
+        finish_reason="stop",
+        proposal=RuntimeActionProposal(
+            action_kind=ActionKind.CALL_TOOL,
+            capability_ref=capability_name,
+            arguments={"channel_id": "C123"},
+            rationale="读取合同频道信息",
+        ),
+    )
+
+
+def _wecom_connector_response(capability_name: str) -> CompletedProviderProposal:
+    """构造无自由参数的企业微信应用信息 read proposal。"""
+
+    return CompletedProviderProposal(
+        response_id="provider_wecom_connector_read",
+        finish_reason="stop",
+        proposal=RuntimeActionProposal(
+            action_kind=ActionKind.CALL_TOOL,
+            capability_ref=capability_name,
+            arguments={},
+            rationale="读取已绑定企业微信应用状态",
+        ),
+    )
+
+
+def test_reauth_signal_resumes_same_connector_read_operation_without_duplicate_dispatch() -> None:
+    """验证 token 失效等待、轮换、持久 signal 和原 Operation 恢复形成完整闭环。"""
+
+    engine = create_engine("sqlite://", poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as db:
+        user = User(
+            id="user_demo",
+            tenant_id="tenant_demo",
+            username="demo",
+            role="admin",
+            password_hash="x",
+        )
+        agent_profile = AgentProfile(
+            id="agent_demo",
+            tenant_id="tenant_demo",
+            name="Slack 数字员工",
+            owner_user_id=user.id,
+        )
+        model = ModelConfig(
+            id="model_connector",
+            tenant_id="tenant_demo",
+            name="Dynamic Model",
+            api_key_encrypted="encrypted",
+            model="model-demo",
+            capability_snapshot_json=_model_capabilities(),
+            capability_checksum=capability_checksum(_model_capabilities()),
+            preflight_status="ready",
+        )
+        db.add_all([Tenant(id="tenant_demo", name="Demo"), user, agent_profile, model])
+        db.flush()
+        employee = EmployeeProfile(
+            id="employee_connector_reader",
+            tenant_id="tenant_demo",
+            user_id=user.id,
+            employee_id="E-CONNECTOR",
+            employee_name="连接读取人",
+        )
+        role = BusinessRole(
+            id="role_connector_reader",
+            tenant_id="tenant_demo",
+            role_code="cross.external_reader",
+            name="外部连接读取人",
+            category="cross_functional",
+        )
+        db.add_all([employee, role])
+        ensure_builtin_governance_catalog(db, "tenant_demo")
+        db.flush()
+        sync_role_permissions(
+            db,
+            role=role,
+            permission_codes=["external_connection.read"],
+        )
+        db.add(
+            EmployeeRoleAssignment(
+                id="grant_connector_reader",
+                tenant_id="tenant_demo",
+                employee_profile_id=employee.id,
+                business_role_id=role.id,
+                scope_type="tenant",
+                scope_id="*",
+                include_descendants=True,
+                granted_by_user_id=user.id,
+            )
+        )
+        slack = _ConnectorSlackStub()
+        connection_service = ConnectionService(db, slack=slack)
+        profile = connection_service.create_slack_profile(
+            tenant_id="tenant_demo",
+            display_name="合同工作区",
+            token="expired-token",
+            required_scopes={"channels:read"},
+            actor_user_id=user.id,
+        )
+        binding = connection_service.bind_agent(
+            tenant_id="tenant_demo",
+            profile_id=profile.id,
+            agent_id=agent_profile.id,
+            allowed_scopes={"channels:read"},
+            expected_profile_revision=profile.revision,
+            actor_user_id=user.id,
+        )
+        profile.status = "reauth_required"
+        profile.health_status = "unhealthy"
+        profile.health_error_code = "CONNECTION_TOKEN_EXPIRED"
+        profile.revision += 1
+        db.add(profile)
+        db.commit()
+        snapshot = DynamicCapabilityCatalog._slack_channel_snapshot(profile, binding)
+        plan = NormalizedPlan(
+            goal="读取合同频道",
+            success_criteria=(
+                SuccessCriterion(id="channel_found", type="assertion", spec={"required": True}),
+            ),
+            steps=(
+                PlanStep(
+                    step_key="read_slack_channel",
+                    title="读取 Slack 频道",
+                    kind="tool.read",
+                    capability_refs=(snapshot.name,),
+                ),
+            ),
+            budget={"max_steps": 3, "max_tool_calls": 3},
+        )
+        instance = SopExecutionStore(db).start_dynamic_instance(
+            tenant_id="tenant_demo",
+            session_id="session_connector",
+            agent_id="agent_demo",
+            initiator_user_id=user.id,
+            plan=plan,
+            capability_snapshot={
+                "tools": [],
+                "connectors": [snapshot.model_dump(mode="json")],
+                "model": {
+                    "model_config_id": model.id,
+                    "capabilities": _model_capabilities(),
+                    "checksum": model.capability_checksum,
+                },
+            },
+        )[0]
+        runtime = DynamicTaskAgent(db, connection_service=connection_service)
+
+        blocked = runtime.execute_read_proposal(
+            execution_id=instance.id,
+            step_key="read_slack_channel",
+            completed_response=_connector_response(snapshot.name),
+            provider="openai_compatible",
+            model="model-demo",
+            model_capabilities=_model_capabilities(),
+            worker_id="worker_before_reauth",
+            actor_user_id=user.id,
+        )
+
+        operation = db.exec(select(SopOperation)).one()
+        attention = db.exec(select(SopWorkItem)).one()
+        assert blocked.error is not None and blocked.error.code == "DYNAMIC_REAUTH_REQUIRED"
+        assert operation.status == "prepared"
+        assert attention.attention_kind == "reauth"
+        assert attention.payload_json["operation_id"] == operation.id
+        assert slack.read_calls == 0
+
+        connection_service.rotate_slack_secret(
+            tenant_id="tenant_demo",
+            profile_id=profile.id,
+            token="fresh-token",
+            expected_revision=profile.revision,
+            actor_user_id=user.id,
+        )
+        db.commit()
+        control = ExecutionControlService(db)
+        with control.store.owned(instance, worker_id="reauth_attention"):
+            control.resolve_attention(
+                instance,
+                attention,
+                actor_user_id=user.id,
+                command_id="reauth_completed_1",
+                command="reauthorize",
+                expected_revision=attention.revision,
+            )
+        db.commit()
+        signal = db.exec(select(ExecutionSignal)).one()
+        restarted = DynamicTaskAgent(db, connection_service=connection_service)
+        restarted.run_until_blocked_or_complete = lambda **_kwargs: DynamicRunOutcome(
+            "resumed", instance.id
+        )
+        slack.rate_limit_once = True
+
+        reauth_outcome = process_dynamic_task_signal(
+            db,
+            signal,
+            agent_factory=lambda _db: restarted,
+        )
+        timer_signal = db.exec(
+            select(ExecutionSignal).where(ExecutionSignal.signal_type == "timer")
+        ).one()
+        timer_signal.available_at = datetime(2000, 1, 1)
+        db.add(timer_signal)
+        db.commit()
+        assert [item.id for item in due_dynamic_task_signals(db)] == [timer_signal.id]
+        outcome = process_dynamic_task_signal(
+            db,
+            timer_signal,
+            agent_factory=lambda _db: restarted,
+        )
+        replay = restarted.resume_reauth_signal(
+            signal_id=signal.id,
+            model_config=model,
+            worker_id="worker_replay",
+            actor_user_id=user.id,
+        )
+
+        db.refresh(operation)
+        db.refresh(signal)
+        db.refresh(timer_signal)
+        assert reauth_outcome is not None and reauth_outcome.status == "blocked"
+        assert outcome is not None, (timer_signal.status, timer_signal.last_error_json)
+        assert outcome.status == replay.status == "resumed"
+        assert operation.status == "succeeded"
+        assert db.exec(select(SopOperation)).all() == [operation]
+        assert signal.status == "consumed"
+        assert timer_signal.status == "consumed"
+        assert slack.read_calls == 2
+        event_types = {
+            row.event_type
+            for row in db.exec(
+                select(AgentEvent).where(AgentEvent.aggregate_id == instance.id)
+            ).all()
+        }
+        assert {
+            "connection_profile_reauth_required",
+            "connection_profile_unhealthy",
+            "connection_profile_recovered",
+        } <= event_types
+
+        wecom = _ConnectorWeComStub()
+        wecom_service = ConnectionService(db, slack=slack, wecom=wecom)
+        wecom_profile = wecom_service.create_wecom_profile(
+            tenant_id="tenant_demo",
+            display_name="企业微信动态应用",
+            corp_id="corp-dynamic",
+            agent_id="1000002",
+            corp_secret="secret-dynamic",
+            actor_user_id=user.id,
+        )
+        wecom_binding = wecom_service.bind_agent(
+            tenant_id="tenant_demo",
+            profile_id=wecom_profile.id,
+            agent_id=agent_profile.id,
+            allowed_scopes={"application:read"},
+            expected_profile_revision=wecom_profile.revision,
+            actor_user_id=user.id,
+        )
+        db.commit()
+        wecom_snapshot = DynamicCapabilityCatalog._wecom_application_snapshot(
+            wecom_profile,
+            wecom_binding,
+        )
+        wecom_plan = NormalizedPlan(
+            goal="核验企业微信应用状态",
+            success_criteria=(
+                SuccessCriterion(id="application_found", type="assertion", spec={"required": True}),
+            ),
+            steps=(
+                PlanStep(
+                    step_key="read_wecom_application",
+                    title="读取企业微信应用",
+                    kind="tool.read",
+                    capability_refs=(wecom_snapshot.name,),
+                ),
+            ),
+            budget={"max_steps": 2, "max_tool_calls": 1},
+        )
+        wecom_instance = SopExecutionStore(db).start_dynamic_instance(
+            tenant_id="tenant_demo",
+            session_id="session_wecom_connector",
+            agent_id=agent_profile.id,
+            initiator_user_id=user.id,
+            plan=wecom_plan,
+            capability_snapshot={
+                "tools": [],
+                "connectors": [wecom_snapshot.model_dump(mode="json")],
+                "model": {
+                    "model_config_id": model.id,
+                    "capabilities": _model_capabilities(),
+                    "checksum": model.capability_checksum,
+                },
+            },
+        )[0]
+        db.commit()
+
+        wecom_result = DynamicTaskAgent(db, connection_service=wecom_service).execute_read_proposal(
+            execution_id=wecom_instance.id,
+            step_key="read_wecom_application",
+            completed_response=_wecom_connector_response(wecom_snapshot.name),
+            provider="openai_compatible",
+            model="model-demo",
+            model_capabilities=_model_capabilities(),
+            worker_id="worker_wecom_read",
+            actor_user_id=user.id,
+        )
+
+        assert wecom_result.success is True
+        assert wecom_result.data["agent_id"] == "1000002"
+        assert wecom.calls == 2
+        assert len(db.exec(select(SopOperation)).all()) == 2
+        assert wecom_snapshot.contract["required_result_evidence_paths"] == [
+            "name",
+            "enabled",
+            "home_url",
+        ]
+        assert set(wecom_snapshot.model_view["output_schema"]["properties"]) == {
+            "name",
+            "enabled",
+            "home_url",
+        }
+        assert "corp-dynamic" not in wecom_snapshot.model_dump_json()
+        assert "1000002" not in wecom_snapshot.model_dump_json()
 
 
 def test_completed_read_operation_is_reused_without_second_adapter_call() -> None:
@@ -747,8 +1270,8 @@ def test_plan_draft_receives_stable_server_keys_and_bounded_budget() -> None:
     }
 
 
-def test_plan_budget_counts_knowledge_and_tools_as_external_read_calls() -> None:
-    """规划期与 Runtime 必须一致地把 knowledge 和 tool.read 计入同一外部调用预算。"""
+def test_plan_budget_counts_knowledge_and_tools_as_capability_calls() -> None:
+    """规划期与 Runtime 必须一致地把读写工具和 knowledge 计入同一能力调用预算。"""
 
     draft = DynamicPlanDraft(
         goal="形成证据简报",
@@ -788,7 +1311,7 @@ def test_plan_budget_counts_knowledge_and_tools_as_external_read_calls() -> None
     try:
         normalize_plan_draft(draft, max_steps=5, max_tool_calls=2, max_model_calls=6)
     except ValueError as exc:
-        assert str(exc) == "动态计划外部读取步骤超过服务端预算"
+        assert str(exc) == "动态计划能力调用步骤超过服务端预算"
     else:
         raise AssertionError("知识与工具合计超过预算时必须在计划激活前拒绝")
 
@@ -854,6 +1377,50 @@ def test_start_task_uses_preflight_catalog_and_reuses_same_active_execution() ->
         assert first.goal_snapshot_json["success_criteria"][0]["id"] == "criterion_01"
 
 
+def test_start_task_without_tools_can_create_clarification_and_answer_plan() -> None:
+    """空工具目录仍可创建只含澄清/回答的持久动态任务，且冻结快照不伪造能力。"""
+
+    engine = create_engine("sqlite://", poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as db:
+        capabilities = _model_capabilities()
+        model = ModelConfig(
+            id="model_empty_catalog",
+            tenant_id="tenant_demo",
+            name="空目录动态模型",
+            api_key_encrypted="encrypted",
+            model="model-demo",
+            capability_snapshot_json=capabilities,
+            capability_checksum=capability_checksum(capabilities),
+            preflight_status="ready",
+        )
+        db.add(model)
+        db.flush()
+        planner = _EmptyCapabilityPlanner()
+        agent = DynamicTaskAgent(
+            db,
+            catalog=_EmptyStartCatalog(model, _snapshot()),
+            planner=planner,
+        )
+
+        instance, created = agent.start_task(
+            tenant_id="tenant_demo",
+            session_id="session_empty_catalog",
+            agent_id="agent_demo",
+            initiator_user_id="user_demo",
+            goal="确认范围后形成答复",
+            success_criteria=("获得范围并完成答复",),
+            model_config=model,
+        )
+
+        assert created is True
+        assert planner.calls == 1
+        assert instance.status == "running"
+        assert instance.capability_snapshot_json["tools"] == []
+        assert instance.capability_snapshot_json["connectors"] == []
+        assert instance.capability_snapshot_json["knowledge"] == []
+
+
 def test_advance_connects_plan_provider_view_proposal_and_read_operation() -> None:
     """验证 B1 主链从权威计划机械选步，经唯一 provider view 后落提案并执行 read。"""
 
@@ -906,6 +1473,71 @@ def test_advance_connects_plan_provider_view_proposal_and_read_operation() -> No
         assert result.success is True
         assert proposer.calls == 1
         assert executor.calls == 1
+
+
+def test_completed_read_result_is_schema_projected_into_answer_context() -> None:
+    """最终回答模型必须看到工具真实结果，同时不得看到 output schema 未声明字段。"""
+
+    engine = create_engine("sqlite://", poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as db:
+        capabilities = _model_capabilities()
+        model = ModelConfig(
+            id="model_projected_result",
+            tenant_id="tenant_demo",
+            name="动态模型",
+            api_key_encrypted="encrypted",
+            model="model-demo",
+            capability_snapshot_json=capabilities,
+            capability_checksum=capability_checksum(capabilities),
+            preflight_status="ready",
+        )
+        db.add(model)
+        db.flush()
+        agent = DynamicTaskAgent(
+            db,
+            catalog=_StartCatalog(model, _output_snapshot()),
+            tool_executor=_Executor(),
+            planner=_Planner(),
+            action_proposer=_Proposer(),
+        )
+        instance, _ = agent.start_task(
+            tenant_id="tenant_demo",
+            session_id="session_projected_result",
+            agent_id="agent_demo",
+            initiator_user_id="user_demo",
+            goal="生成续约风险简报",
+            success_criteria=("覆盖合同证据",),
+            model_config=model,
+        )
+        agent.advance_next_read_step(
+            execution_id=instance.id,
+            model_config=model,
+            worker_id="worker_projected_result",
+            actor_user_id="user_demo",
+        )
+        operation = db.exec(
+            select(SopOperation).where(SopOperation.instance_id == instance.id)
+        ).one()
+        operation.result_json = {
+            "data": {
+                "contracts": ["C-001"],
+                "access_token": "must-not-enter-provider-view",
+            }
+        }
+        db.add(operation)
+        db.commit()
+
+        projection = build_execution_context_projection(
+            db,
+            tenant_id="tenant_demo",
+            execution_id=instance.id,
+        )
+
+        assert projection.completed_steps[0]["model_output"] == {
+            "contracts": ["C-001"]
+        }
+        assert "must-not-enter-provider-view" not in projection.model_dump_json()
 
 
 def test_verified_result_message_publication_and_terminal_state_commit_together() -> None:
@@ -982,6 +1614,123 @@ def test_verified_result_message_publication_and_terminal_state_commit_together(
         assert publication.status == "settled"
         assert publication.receipt_json["message_id"] == message.id
         assert instance.status == "succeeded"
+
+
+def test_connector_result_waits_for_required_external_publication() -> None:
+    """Connector 动态结果先停在 waiting，只有外部 outbox 结算后才能成功终止。"""
+
+    engine = create_engine("sqlite://", poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as db:
+        capabilities = _model_capabilities()
+        model = ModelConfig(
+            id="model_connector_result",
+            tenant_id="tenant_demo",
+            name="动态模型",
+            api_key_encrypted="encrypted",
+            model="model-demo",
+            capability_snapshot_json=capabilities,
+            capability_checksum=capability_checksum(capabilities),
+            preflight_status="ready",
+        )
+        db.add(model)
+        db.add(
+            ConnectorThreadBinding(
+                id="thread_connector_result",
+                tenant_id="tenant_demo",
+                provider="wecom",
+                profile_id="profile_connector_result",
+                sender_ref_hash="a" * 64,
+                encrypted_recipient_ref=encrypt_secret("external-user"),
+                user_id="user_demo",
+                agent_id="agent_demo",
+                session_id="session_connector_result",
+            )
+        )
+        db.flush()
+        agent = DynamicTaskAgent(
+            db,
+            catalog=_StartCatalog(model, _snapshot()),
+            tool_executor=_Executor(),
+            planner=_Planner(),
+            action_proposer=_Proposer(),
+        )
+        instance, _ = agent.start_task(
+            tenant_id="tenant_demo",
+            session_id="session_connector_result",
+            agent_id="agent_demo",
+            initiator_user_id="user_demo",
+            goal="生成续约风险简报",
+            success_criteria=("覆盖合同证据",),
+            model_config=model,
+            source_kind="connector",
+        )
+        agent.advance_next_read_step(
+            execution_id=instance.id,
+            model_config=model,
+            worker_id="worker_connector_read",
+            actor_user_id="user_demo",
+        )
+        response = CompletedProviderProposal(
+            response_id="provider_connector_result",
+            finish_reason="stop",
+            proposal=RuntimeActionProposal(
+                action_kind=ActionKind.ANSWER,
+                arguments={
+                    "markdown": "# 验收简报\n\n已核验。",
+                    "criterion_evidence": {"criterion_01": ["query_contract"]},
+                    "pending_questions": [],
+                },
+                rationale="证据已完整",
+            ),
+        )
+
+        agent.complete_with_result_proposal(
+            execution_id=instance.id,
+            step_key="answer",
+            completed_response=response,
+            provider="openai_compatible",
+            model="model-demo",
+            model_capabilities=capabilities,
+            worker_id="worker_connector_result",
+        )
+
+        db.refresh(instance)
+        publications = db.exec(
+            select(ExecutionPublication).where(
+                ExecutionPublication.execution_id == instance.id
+            )
+        ).all()
+        delivery = db.exec(select(ConnectorOutboundDelivery)).one()
+        assert instance.status == "waiting"
+        assert {item.target_type: item.status for item in publications} == {
+            "application": "settled",
+            "external_thread": "pending",
+        }
+        delivery.status = "unknown"
+        delivery.error_json = {"code": "WECOM_DELIVERY_UNKNOWN"}
+        db.add(delivery)
+        db.commit()
+        runtime = ConnectorRuntimeService(db)
+        assert runtime.sync_execution_delivery_status(
+            delivery,
+            worker_id="publication-status",
+        ) is True
+        db.refresh(instance)
+        assert instance.status == "waiting"
+        assert db.get(ExecutionPublication, delivery.source_ref).status == "unknown"
+        delivery.status = "settled"
+        delivery.receipt_json = {"provider_message_id": "remote-1"}
+        db.add(delivery)
+        db.commit()
+
+        assert runtime.settle_execution_delivery(
+            delivery,
+            worker_id="publication-settler",
+        ) is True
+        db.refresh(instance)
+        assert instance.status == "succeeded"
+        assert db.get(ExecutionPublication, delivery.source_ref).status == "settled"
 
 
 def test_artifact_integrity_failure_rolls_back_result_message_and_terminal_state(tmp_path) -> None:
@@ -2513,7 +3262,7 @@ def test_steer_retries_while_dispatched_operation_is_unsettled(monkeypatch) -> N
         assert outcome is None
         assert command.status == "pending"
         assert signal.status == "pending"
-        assert signal.last_error_json["code"] == "DynamicTaskAgentError"
+        assert signal.last_error_json["code"] == "DYNAMIC_STEER_OPERATION_UNSETTLED"
 
 
 def test_steer_rolls_back_prepared_cancellation_when_plan_append_fails(monkeypatch) -> None:
@@ -2583,3 +3332,53 @@ def test_steer_rolls_back_prepared_cancellation_when_plan_append_fails(monkeypat
         assert node.status == "running"
         assert command.status == "pending"
         assert signal.status == "pending"
+
+
+def test_capacity_retry_signal_backfills_quota_and_persistently_backs_off(monkeypatch) -> None:
+    """验证升级前活动 Execution 先补齐三类槽位，工具仍满载时 signal 不会热循环或丢失。"""
+
+    engine = create_engine("sqlite://", poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as db:
+        agent, instance, model, _, _, _ = _steering_execution(db)
+        signal = ExecutionControlService(db).enqueue_signal(
+            instance,
+            signal_type="capacity_retry",
+            causation_type="quota_backpressure",
+            causation_id=f"{instance.id}:{instance.revision}",
+            payload={"reason_code": "DYNAMIC_TASK_TOOL_QUOTA_EXCEEDED"},
+            max_attempts=16,
+        )
+        db.commit()
+        configured = type(
+            "Settings",
+            (),
+            {
+                "dynamic_task_steering_enabled": True,
+                "dynamic_task_max_active_per_tenant": 2,
+                "dynamic_task_max_active_per_agent": 2,
+                "dynamic_task_max_active_per_user": 2,
+                "dynamic_task_max_active_per_tool": 1,
+            },
+        )()
+        monkeypatch.setattr("app.dynamic_tasks.worker.get_settings", lambda: configured)
+
+        def still_saturated(**_kwargs):
+            """模拟持久恢复时工具槽仍被其他 Execution 占用。"""
+
+            raise DynamicTaskQuotaError("DYNAMIC_TASK_TOOL_QUOTA_EXCEEDED")
+
+        agent.run_until_blocked_or_complete = still_saturated
+        outcome = process_dynamic_task_signal(db, signal, agent_factory=lambda _db: agent)
+
+        db.refresh(signal)
+        assert outcome is None
+        assert signal.status == "pending"
+        assert signal.attempt_count == 1
+        assert signal.last_error_json == {"code": "DYNAMIC_TASK_TOOL_QUOTA_EXCEEDED"}
+        leases = db.exec(
+            select(DynamicTaskQuotaLease).where(
+                DynamicTaskQuotaLease.holder_id == instance.id
+            )
+        ).all()
+        assert {lease.scope_type for lease in leases} == {"tenant", "agent", "user"}

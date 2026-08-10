@@ -54,12 +54,14 @@ class DynamicActionProposer:
                     mode="json", exclude={"native_input_parts"}
                 ),
                 "current_step": step.model_dump(mode="json"),
+                "output_contract": _action_output_contract(step, view=view),
                 PROVIDER_CONTENT_PARTS_KEY: list(view.native_input_parts),
             },
         )
         proposal = RuntimeActionProposal.model_validate(raw)
         allowed_kinds = {
             "tool.read": {ActionKind.CALL_TOOL},
+            "tool.write": {ActionKind.CALL_TOOL},
             "knowledge": {ActionKind.QUERY_KNOWLEDGE},
             "answer": {ActionKind.ANSWER, ActionKind.COMPLETE},
             "clarification": {ActionKind.WAIT_INPUT, ActionKind.WAIT_ATTENTION},
@@ -81,5 +83,62 @@ class DynamicActionProposer:
 
 _ACTION_SYSTEM_PROMPT = """你是共格·序伴的受控单步动作提议器。只输出一个 RuntimeActionProposal JSON object。
 只能处理 current_step，不得跳步、并行、改计划、改变 tenant/agent/权限或调用未列出的能力。
-tool.read 只可 call_tool，knowledge 只可 query_knowledge，answer 只可 answer/complete，clarification 只可等待输入。
+tool.read/tool.write 只可 call_tool，knowledge 只可 query_knowledge，answer 只可 answer/complete，clarification 只可等待输入。
+必须严格按 output_contract 输出顶层字段，禁止增加 action/proposal/result 包装层，以及 execution、revision、step 或 action id。
 arguments 必须符合能力 schema；不得输出授权结论、风险等级、凭据、URL、header 或 provider sidecar。"""
+
+_ACTION_OUTPUT_CONTRACT = {
+    "action_kind": "call_tool | query_knowledge | answer | complete | wait_input | wait_attention",
+    "arguments": {},
+    "capability_ref": "仅 call_tool/query_knowledge 使用；否则为 null",
+    "expected_output_schema": {},
+    "rationale": "说明该动作如何完成 current_step 的简短字符串",
+}
+
+
+def _action_output_contract(
+    step: PlanStep,
+    *,
+    view: ProviderExecutionView,
+) -> dict[str, object]:
+    """按冻结计划事实补充精确形态，避免模型自创结果、证据引用或信封。"""
+
+    contract: dict[str, object] = dict(_ACTION_OUTPUT_CONTRACT)
+    if step.kind == "answer":
+        criterion_ids = [
+            str(item["id"])
+            for item in view.execution_context.get("success_criteria", [])
+            if isinstance(item, dict) and item.get("id")
+        ]
+        completed_step_keys = [
+            str(item["step_key"])
+            for item in view.execution_context.get("completed_steps", [])
+            if isinstance(item, dict) and item.get("step_key")
+        ]
+        contract["arguments"] = {
+            "markdown": (
+                "最终 Markdown 字符串；必须从 completed_steps[].model_output 读取真实字段值，"
+                "禁止使用“步骤返回中的值”等占位语，空字符串必须明确写为未配置"
+            ),
+            "criterion_evidence": {
+                criterion_id: (
+                    "字符串数组，至少选择一个且只能使用这些已完成 step_key："
+                    f"{completed_step_keys}"
+                )
+                for criterion_id in criterion_ids
+            },
+            "pending_questions": ["尚未解决的问题；没有则为空数组"],
+        }
+    elif step.kind == "knowledge":
+        contract["arguments"] = {
+            "query": "检索问题字符串",
+            "desired_evidence": "可选的期望证据字符串",
+        }
+    elif step.kind == "clarification":
+        contract["arguments"] = {
+            "question": "需要用户回答的问题",
+            "options": ["可选答案字符串"],
+        }
+    else:
+        contract["arguments"] = "严格符合当前 capability 的 input_schema；无参数时返回空对象"
+    return contract

@@ -5,6 +5,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui';
+import { ShieldCheck } from 'lucide-react';
 
 import IconEdit from '../../assets/icons/edit.svg?react';
 import IconListBulleted from '../../assets/icons/list-bulleted.svg?react';
@@ -25,6 +26,7 @@ export type TaskActionsMenuProps = {
   onEdit: (task: ScheduledTaskRead) => void;
   onRunNow: (task: ScheduledTaskRead) => void;
   onToggleStatus: (task: ScheduledTaskRead) => void;
+  onStandingApproval: (task: ScheduledTaskRead) => void;
   onDelete: (task: ScheduledTaskRead) => void;
 };
 
@@ -35,6 +37,7 @@ export function TaskActionsMenu({
   onEdit,
   onRunNow,
   onToggleStatus,
+  onStandingApproval,
   onDelete,
 }: TaskActionsMenuProps) {
   const isArchived = task.status === 'archived';
@@ -64,6 +67,10 @@ export function TaskActionsMenu({
             <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => onRunNow(task)}>
               <IconPlay />
               立即执行
+            </DropdownMenuItem>
+            <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => onStandingApproval(task)}>
+              <ShieldCheck />
+              长期批准
             </DropdownMenuItem>
             {!isCompleted && (
               <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => onToggleStatus(task)}>

@@ -1,15 +1,20 @@
 /**
- * @Time       : 2026/08/04 06:32
+ * @Time       : 2026/08/10 21:15
  * @Author     : zhanglp8181
  * @File       : AttentionCenter.tsx
- * @CallChain  : 待我处理中心 → Attention API/Execution API → clarification 决定与持久恢复
- * @Description: 在保留 SOP 任务箱的同时展示并办理动态澄清等统一 Attention。
+ * @CallChain  : 待我处理中心 → Attention/Connection/Execution API → typed 决定与持久恢复
+ * @Description: 展示并专用办理动态澄清和连接重授权等统一 Attention。
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { CircleHelp, Clock3, History, MessageSquareText, RefreshCw, Route } from 'lucide-react';
+import { CircleHelp, Clock3, History, KeyRound, MessageSquareText, RefreshCw, Route, ShieldCheck } from 'lucide-react';
 
 import { api, getRequestTenantId } from '@/api/client';
+import {
+  reauthorizeConnectionAttention,
+  reauthorizeWeComConnectionAttention,
+  startSlackOAuth,
+} from '@/api/connections';
 import { notify } from '@/components/ui/app-toast';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogTitle, Textarea } from '@/components/ui';
@@ -68,6 +73,10 @@ export default function AttentionCenter() {
   const [selected, setSelected] = useState<AttentionItem | null>(null);
   const [execution, setExecution] = useState<ExecutionState | null>(null);
   const [answer, setAnswer] = useState('');
+  const [reauthToken, setReauthToken] = useState('');
+  const [reauthCorpId, setReauthCorpId] = useState('');
+  const [reauthAgentId, setReauthAgentId] = useState('');
+  const [reauthCorpSecret, setReauthCorpSecret] = useState('');
   const [acting, setActing] = useState(false);
   const requestId = useRef(0);
 
@@ -121,11 +130,18 @@ export default function AttentionCenter() {
     () => items.filter((item) => item.available_commands.length > 0).length,
     [items],
   );
+  const selectedReauthProvider = selected?.kind === 'reauth'
+    ? stringPayload(selected, 'provider') || 'slack'
+    : null;
 
-  async function resolve(command: 'answer' | 'cancel') {
+  async function resolve(command: 'answer' | 'cancel' | 'allow_once' | 'deny' | 'confirm_applied' | 'confirm_not_applied') {
     if (!selected) return;
     if (command === 'answer' && !answer.trim()) {
       notify.error('请先补充任务所需信息');
+      return;
+    }
+    if (['confirm_applied', 'confirm_not_applied'].includes(command) && !answer.trim()) {
+      notify.error('请填写用于人工对账的外部证据');
       return;
     }
     setActing(true);
@@ -138,14 +154,115 @@ export default function AttentionCenter() {
       };
       if (answer.trim()) payload.comment = answer.trim();
       await api.post(`/api/attention-items/${selected.id}/resolve`, payload);
-      notify.success(command === 'answer' ? '信息已补充，原任务将继续执行' : '任务取消请求已提交');
+      const successCopy: Record<string, string> = {
+        answer: '信息已补充，原任务将继续执行',
+        cancel: '任务取消请求已提交',
+        allow_once: '已一次性批准，系统将在派发前重新校验全部授权',
+        deny: '已拒绝，冻结操作不会发送',
+        confirm_applied: '已登记外部效果存在，原任务将继续',
+        confirm_not_applied: '已登记外部效果未发生，任务将确定失败',
+      };
+      notify.success(successCopy[command]);
       setSelected(null);
       setAnswer('');
+      setReauthToken('');
+      setReauthCorpId('');
+      setReauthAgentId('');
+      setReauthCorpSecret('');
       await loadItems(view);
     } catch (error) {
       notify.error(error instanceof Error ? error.message : '处理待办事项失败');
       await loadItems(view);
     } finally {
+      setActing(false);
+    }
+  }
+
+  async function completeReauth() {
+    /** 原子轮换 provider 凭据并决定 Attention，避免任务唤醒与密钥更新出现事务缝隙。 */
+
+    if (!selected || selected.kind !== 'reauth') return;
+    const profileId = stringPayload(selected, 'profile_id');
+    const profileRevision = numberPayload(selected, 'profile_revision');
+    if (!profileId || profileRevision === null) {
+      notify.error('连接重授权事项缺少账号修订，请刷新后重试');
+      return;
+    }
+    const provider = stringPayload(selected, 'provider') || 'slack';
+    if (provider === 'slack' && !reauthToken.trim()) {
+      notify.error('请填写新的 Slack Bot Token');
+      return;
+    }
+    if (
+      provider === 'wecom'
+      && (!reauthCorpId.trim() || !reauthAgentId.trim() || !reauthCorpSecret.trim())
+    ) {
+      notify.error('请完整填写企业 ID、AgentId 和 Secret');
+      return;
+    }
+    setActing(true);
+    try {
+      if (provider === 'wecom') {
+        await reauthorizeWeComConnectionAttention({
+          profileId,
+          attentionId: selected.id,
+          profileRevision,
+          attentionRevision: selected.revision,
+          corpId: reauthCorpId.trim(),
+          agentId: reauthAgentId.trim(),
+          corpSecret: reauthCorpSecret.trim(),
+          commandId: crypto.randomUUID(),
+        });
+      } else {
+        await reauthorizeConnectionAttention({
+          profileId,
+          attentionId: selected.id,
+          profileRevision,
+          attentionRevision: selected.revision,
+          token: reauthToken.trim(),
+          commandId: crypto.randomUUID(),
+        });
+      }
+      setReauthToken('');
+      setReauthCorpId('');
+      setReauthAgentId('');
+      setReauthCorpSecret('');
+      setSelected(null);
+      notify.success('连接已重新授权，原任务将从等待步骤继续');
+      await loadItems(view);
+    } catch (error) {
+      setReauthToken('');
+      setReauthCorpSecret('');
+      notify.error(error instanceof Error ? error.message : '重新授权失败');
+      await loadItems(view);
+    } finally {
+      setActing(false);
+    }
+  }
+
+  async function beginReauthOAuth() {
+    /** 为当前 reauth Attention 创建一次性 OAuth state，并把 callback 绑定原 Execution。 */
+
+    if (!selected || selected.kind !== 'reauth') return;
+    if (stringPayload(selected, 'provider') === 'wecom') return;
+    const profileId = stringPayload(selected, 'profile_id');
+    const profileRevision = numberPayload(selected, 'profile_revision');
+    if (!profileId || profileRevision === null) {
+      notify.error('连接重授权事项缺少账号修订，请刷新后重试');
+      return;
+    }
+    setActing(true);
+    try {
+      const result = await startSlackOAuth({
+        flowType: 'reauthorize_attention',
+        profileId,
+        attentionId: selected.id,
+        expectedProfileRevision: profileRevision,
+        expectedAttentionRevision: selected.revision,
+      });
+      window.location.assign(result.authorize_url);
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '启动 Slack OAuth 失败');
       setActing(false);
     }
   }
@@ -200,10 +317,12 @@ export default function AttentionCenter() {
           <button
             key={item.id}
             type="button"
-            onClick={() => { setSelected(item); setAnswer(''); }}
+            onClick={() => { setSelected(item); setAnswer(''); setReauthToken(''); }}
             className="group grid grid-cols-[36px_minmax(0,1fr)_auto] items-center gap-[11px] rounded-[12px] border border-[#e7eaf2] px-[12px] py-[11px] text-left transition hover:border-[#bdc9f5] hover:bg-[#fafbff] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#3157e8]/35"
           >
-            <span className="grid size-[36px] place-items-center rounded-[10px] bg-[#fff4e8] text-[#b55a09]"><CircleHelp className="size-[17px]" /></span>
+            <span className={cn('grid size-[36px] place-items-center rounded-[10px]', ['reauth', 'tool_approval'].includes(item.kind) ? 'bg-[#edf2ff] text-[#3157e8]' : 'bg-[#fff4e8] text-[#b55a09]')}>
+              {item.kind === 'reauth' ? <KeyRound className="size-[17px]" /> : item.kind === 'tool_approval' ? <ShieldCheck className="size-[17px]" /> : <CircleHelp className="size-[17px]" />}
+            </span>
             <span className="min-w-0">
               <strong className="block truncate text-[13px] font-semibold text-[#252936]">{item.title || attentionKindLabel(item.kind)}</strong>
               <span className="mt-[2px] block truncate text-[12px] text-[#737c95]">{attentionQuestion(item)}</span>
@@ -218,7 +337,13 @@ export default function AttentionCenter() {
         ))}
       </div>
 
-      <Dialog open={Boolean(selected)} onOpenChange={(open) => !open && setSelected(null)}>
+      <Dialog open={Boolean(selected)} onOpenChange={(open) => {
+        if (!open) {
+          setSelected(null);
+          setAnswer('');
+          setReauthToken('');
+        }
+      }}>
         <DialogContent aria-describedby={undefined} className="gap-[16px] rounded-[14px] sm:max-w-[560px]">
           {selected ? (
             <>
@@ -232,6 +357,16 @@ export default function AttentionCenter() {
               <div className="rounded-[12px] border border-[#e5e9f3] bg-[#f8faff] px-[13px] py-[12px] text-[13px] leading-[1.65] text-[#313747]">
                 {attentionQuestion(selected)}
               </div>
+              {selected.kind === 'tool_approval' ? (
+                <div className="grid gap-[9px] rounded-[12px] border border-[#dce5ff] bg-[#fbfcff] px-[13px] py-[12px]" aria-label="待批准外部写">
+                  <div className="flex items-center justify-between gap-[10px] text-[11px] text-[#68738d]">
+                    <span>目标：当前企业微信会话</span>
+                    <code className="font-mono">{stringPayload(selected, 'content_checksum').slice(0, 12)}</code>
+                  </div>
+                  <pre className="max-h-[220px] overflow-auto whitespace-pre-wrap break-words rounded-[9px] bg-white p-[10px] text-[12px] leading-[1.65] text-[#283044]">{stringPayload(selected, 'content')}</pre>
+                  <p className="text-[11px] leading-[1.6] text-[#6a7388]">批准只绑定本次 Operation、正文、目标、能力与连接修订；任何变化都会重新进入待处理。</p>
+                </div>
+              ) : null}
               {execution?.goal ? (
                 <div className="grid gap-[8px] rounded-[12px] border border-[#e7eaf2] bg-white px-[13px] py-[11px]" aria-label="执行计划">
                   <div className="flex items-center justify-between gap-[12px]">
@@ -251,7 +386,7 @@ export default function AttentionCenter() {
                   ) : null}
                 </div>
               ) : null}
-              {attentionOptions(selected).length > 0 && selected.status !== 'completed' ? (
+              {attentionOptions(selected).length > 0 && selected.status !== 'completed' && selected.kind !== 'reauth' ? (
                 <div className="flex flex-wrap gap-[7px]" aria-label="可选答案">
                   {attentionOptions(selected).map((option) => (
                     <button key={option} type="button" onClick={() => setAnswer(option)} className={cn('rounded-full border px-[10px] py-[5px] text-[12px]', answer === option ? 'border-[#3157e8] bg-[#eef1fb] text-[#244bc7]' : 'border-[#dfe4ef] text-[#5f6880] hover:border-[#aebcf0]')}>
@@ -262,16 +397,37 @@ export default function AttentionCenter() {
               ) : null}
               {selected.status === 'completed' ? (
                 <div className="rounded-[11px] bg-[#f2f8f4] px-[12px] py-[10px] text-[12px] text-[#25623c]">处理结果：{String(selected.resolution.comment || selected.resolution.command || '已完成')}</div>
-              ) : (
+              ) : selected.kind === 'reauth' ? (
+                <div className="grid gap-[10px]">
+                  {selectedReauthProvider === 'wecom' ? (
+                    <div className="grid gap-[9px]">
+                      <ReauthField label="企业 ID（CorpID）" value={reauthCorpId} onChange={setReauthCorpId} autoFocus />
+                      <ReauthField label="应用 AgentId" value={reauthAgentId} onChange={setReauthAgentId} />
+                      <ReauthField label="应用 Secret" value={reauthCorpSecret} onChange={setReauthCorpSecret} secret />
+                    </div>
+                  ) : (
+                    <ReauthField label="新的 Slack Bot Token" value={reauthToken} onChange={setReauthToken} secret autoFocus placeholder="xoxb-…" />
+                  )}
+                  <div className="rounded-[11px] border border-[#dce5ff] bg-[#f7f9ff] px-[12px] py-[10px] text-[11px] leading-[1.6] text-[#52617f]">
+                    {selectedReauthProvider === 'wecom' ? '新凭据必须属于同一企业微信自建应用。验证成功后，系统通过持久信号恢复原 Operation。' : '新凭据必须属于同一 Slack 工作区并包含 channels:read。验证成功后，系统通过持久信号恢复原 Operation。'}
+                  </div>
+                </div>
+              ) : selected.kind === 'tool_approval' ? null : (
                 <label className="grid gap-[6px]">
-                  <span className="text-[12px] font-medium text-[#464c5e]">补充信息</span>
-                  <Textarea value={answer} onChange={(event) => setAnswer(event.target.value)} rows={4} placeholder="填写任务继续执行所需的准确信息" />
+                  <span className="text-[12px] font-medium text-[#464c5e]">{selected.kind === 'exception' ? '外部对账证据（必填）' : '补充信息'}</span>
+                  <Textarea value={answer} onChange={(event) => setAnswer(event.target.value)} rows={4} placeholder={selected.kind === 'exception' ? '填写后台记录、客户端核对结果或工单证据；系统不会自动重发' : '填写任务继续执行所需的准确信息'} />
                 </label>
               )}
               <div className="flex flex-wrap justify-end gap-[8px]">
                 <Button variant="outline" disabled={acting} onClick={() => setSelected(null)}>关闭</Button>
                 {selected.available_commands.includes('cancel') ? <Button variant="outline" disabled={acting} onClick={() => void resolve('cancel')}>取消任务</Button> : null}
                 {selected.available_commands.includes('answer') ? <Button disabled={acting} onClick={() => void resolve('answer')} className="bg-[#3157e8] text-white hover:bg-[#244bc7]">补充并继续</Button> : null}
+                {selected.available_commands.includes('deny') ? <Button variant="outline" disabled={acting} onClick={() => void resolve('deny')}>拒绝发送</Button> : null}
+                {selected.available_commands.includes('allow_once') ? <Button disabled={acting} onClick={() => void resolve('allow_once')} className="bg-[#3157e8] text-white hover:bg-[#244bc7]">仅批准本次发送</Button> : null}
+                {selected.available_commands.includes('confirm_not_applied') ? <Button variant="outline" disabled={acting} onClick={() => void resolve('confirm_not_applied')}>确认未送达</Button> : null}
+                {selected.available_commands.includes('confirm_applied') ? <Button disabled={acting} onClick={() => void resolve('confirm_applied')} className="bg-[#3157e8] text-white hover:bg-[#244bc7]">确认已送达</Button> : null}
+                {selected.available_commands.includes('reauthorize') ? <Button disabled={acting} onClick={() => void completeReauth()} className="bg-[#3157e8] text-white hover:bg-[#244bc7]">验证并恢复任务</Button> : null}
+                {selected.available_commands.includes('reauthorize') && selectedReauthProvider === 'slack' ? <Button variant="outline" disabled={acting} onClick={() => void beginReauthOAuth()}>通过 Slack OAuth</Button> : null}
               </div>
             </>
           ) : null}
@@ -281,7 +437,48 @@ export default function AttentionCenter() {
   );
 }
 
+function ReauthField({
+  label,
+  value,
+  onChange,
+  secret = false,
+  autoFocus = false,
+  placeholder,
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  secret?: boolean;
+  autoFocus?: boolean;
+  placeholder?: string;
+}) {
+  /** 渲染不会被浏览器自动填充的连接重授权字段。 */
+
+  return (
+    <label className="grid gap-[6px]">
+      <span className="text-[12px] font-medium text-[#464c5e]">{label}</span>
+      <input
+        autoFocus={autoFocus}
+        type={secret ? 'password' : 'text'}
+        autoComplete={secret ? 'new-password' : 'off'}
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        placeholder={placeholder}
+        className="h-[38px] rounded-[10px] border border-[#dfe4ef] bg-white px-[11px] text-[13px] outline-none transition focus:border-[#3157e8] focus:ring-2 focus:ring-[#3157e8]/15"
+      />
+    </label>
+  );
+}
+
 function attentionQuestion(item: AttentionItem): string {
+  if (item.kind === 'reauth') {
+    const accountId = stringPayload(item, 'account_id');
+    const reasonCode = stringPayload(item, 'reason_code');
+    const provider = stringPayload(item, 'provider') === 'wecom' ? '企业微信应用' : 'Slack 账号';
+    return `${provider} ${accountId || '未知'} 需要重新授权${reasonCode ? `（${reasonCode}）` : ''}`;
+  }
+  if (item.kind === 'tool_approval') return '请核对下方精确正文，并决定是否仅批准本次企业微信发送。';
+  if (item.kind === 'exception') return stringPayload(item, 'instruction') || '外部效果不确定，请依据独立证据人工对账。';
   return typeof item.payload.question === 'string' && item.payload.question.trim()
     ? item.payload.question
     : '打开查看需要处理的内容';
@@ -294,7 +491,21 @@ function attentionOptions(item: AttentionItem): string[] {
 }
 
 function attentionKindLabel(kind: string): string {
-  return ({ clarification: '补充任务信息', exception: '处理执行异常', publication: '处理结果投递', result_review: '复核执行结果' } as Record<string, string>)[kind] || '处理任务事项';
+  return ({ clarification: '补充任务信息', tool_approval: '批准外部写操作', reauth: '重新授权外部连接', exception: '核对外部效果', publication: '处理结果投递', result_review: '复核执行结果' } as Record<string, string>)[kind] || '处理任务事项';
+}
+
+function stringPayload(item: AttentionItem, key: string): string {
+  /** 从不可信 Attention payload 中读取非空字符串。 */
+
+  const value = item.payload[key];
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function numberPayload(item: AttentionItem, key: string): number | null {
+  /** 从不可信 Attention payload 中读取有限整数修订号。 */
+
+  const value = item.payload[key];
+  return typeof value === 'number' && Number.isInteger(value) ? value : null;
 }
 
 function isAttentionItem(value: unknown): value is AttentionItem {

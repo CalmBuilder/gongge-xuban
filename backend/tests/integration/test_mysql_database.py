@@ -1,5 +1,5 @@
 """
-@Time       : 2026/08/04 01:04
+@Time       : 2026/08/10 17:15
 @Author     : zhanglp8181
 @File       : test_mysql_database.py
 @CallChain  : pytest mysql 标记 → Alembic/SQLModel → 临时 MySQL 8.4 数据库
@@ -24,6 +24,8 @@ from app.db.models import (
     AgentEvent,
     AgentProfile,
     ArtifactInputLink,
+    BusinessRole,
+    BusinessRolePermission,
     EventOutbox,
     ExecutionCommand,
     ExecutionPublication,
@@ -35,6 +37,7 @@ from app.db.models import (
     Message,
     ModelConfig,
     InputResourceSnapshot,
+    PermissionDefinition,
     Skill,
     SkillVersion,
     SopInstance,
@@ -47,6 +50,10 @@ from app.db.models import (
     User,
 )
 from app.dynamic_tasks.artifacts import ArtifactService
+from app.organization.governance import (
+    BUILTIN_GOVERNANCE_ROLES,
+    ensure_builtin_governance_catalog,
+)
 from app.dynamic_tasks.planning import (
     ActionKind,
     CompletedProviderProposal,
@@ -141,6 +148,14 @@ def test_alembic_upgrades_empty_mysql_database(mysql_database_url: str) -> None:
     assert "agent_resource_bindings" in tables
     assert "execution_artifacts" in tables
     assert "artifact_input_links" in tables
+    assert "connection_secrets" in tables
+    assert "connection_profiles" in tables
+    assert "agent_connection_bindings" in tables
+    assert "connection_command_receipts" in tables
+    assert "connection_oauth_states" in tables
+    assert "connector_inbound_events" in tables
+    assert "standing_approval_rules" in tables
+    assert "standing_approval_command_receipts" in tables
     assert "code_sets" in tables
     assert "code_items" in tables
     assert "organization_units" in tables
@@ -317,7 +332,7 @@ def test_alembic_upgrades_empty_mysql_database(mysql_database_url: str) -> None:
     with engine.connect() as connection:
         assert (
             connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-                == "20260804_0041"
+            == "20260811_0048"
         )
 
 
@@ -2303,3 +2318,52 @@ def test_mysql_serializes_default_model_switches(mysql_database_url: str) -> Non
 
     assert switched == {"model_a", "model_b"}
     assert len(defaults) == 1
+
+
+def test_mysql_builtin_governance_catalog_is_safe_under_concurrent_requests(
+    mysql_database_url: str,
+) -> None:
+    """验证多个页面请求同时补齐内置权限时不会产生唯一键异常或重复映射。"""
+
+    upgrade(mysql_database_url)
+    engine = create_engine(mysql_database_url, pool_pre_ping=True)
+    with Session(engine) as db:
+        db.add(Tenant(id="tenant_governance_race", name="并发治理目录企业"))
+        db.commit()
+
+    barrier = threading.Barrier(4)
+
+    def sync_catalog() -> None:
+        """在独立事务中同时同步同一租户的治理目录并提交结果。"""
+
+        with Session(engine) as db:
+            barrier.wait(timeout=10)
+            ensure_builtin_governance_catalog(db, "tenant_governance_race")
+            db.commit()
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(sync_catalog) for _ in range(4)]
+        for future in futures:
+            future.result(timeout=30)
+
+    with Session(engine) as db:
+        roles = db.exec(
+            select(BusinessRole).where(BusinessRole.tenant_id == "tenant_governance_race")
+        ).all()
+        definitions = db.exec(
+            select(PermissionDefinition).where(
+                PermissionDefinition.tenant_id == "tenant_governance_race"
+            )
+        ).all()
+        mappings = db.exec(
+            select(BusinessRolePermission).where(
+                BusinessRolePermission.tenant_id == "tenant_governance_race"
+            )
+        ).all()
+
+    assert {role.role_code for role in roles} == set(BUILTIN_GOVERNANCE_ROLES)
+    assert len(definitions) == len({row.permission_code for row in definitions})
+    assert len(mappings) == len(
+        {(row.business_role_id, row.permission_definition_id) for row in mappings}
+    )
+    assert len(mappings) == sum(len(codes) for _, codes in BUILTIN_GOVERNANCE_ROLES.values())

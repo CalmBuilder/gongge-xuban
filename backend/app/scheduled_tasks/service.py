@@ -1,10 +1,19 @@
+"""
+@Time       : 2026/08/11 01:05
+@Author     : zhanglp8181
+@File       : service.py
+@CallChain  : ScheduledTask API/worker → AgentLoop/DynamicTaskAgent → ScheduledTaskRun 对账
+@Description: 管理调度定义、到期租约、稳定运行来源及动态 Execution 的挂起恢复和终态回写。
+"""
+
 from __future__ import annotations
 
 import calendar
 import re
 import socket
-import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, time, timedelta
+from threading import BoundedSemaphore
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -22,8 +31,10 @@ from app.db.models import (
     AgentEvent,
     AgentProfile,
     ChatSession,
+    Message,
     ScheduledTask,
     ScheduledTaskRun,
+    SopInstance,
     User,
     new_id,
     utc_now,
@@ -38,7 +49,9 @@ from app.scheduled_tasks.schema import (
     ScheduledTaskUpdateRequest,
 )
 from app.session.session_schema import ChatTurnRequest, ChatTurnResponse
+from app.sop_runtime.execution_control import canonical_checksum
 from app.security.permissions import agent_owned_by_user as _agent_owned_by_user
+from app.security.permissions import can_use_agent_in_chat
 from app.security.permissions import is_admin_user as _is_admin_user
 from app.security.tenant import ensure_tenant
 
@@ -47,7 +60,15 @@ DEFAULT_TIMEZONE = "Asia/Shanghai"
 DEFAULT_TASK_TIME = "09:00"
 LEASE_SECONDS = 15 * 60
 WORKER_SLEEP_SECONDS = 5
+MISFIRE_GRACE_SECONDS = 60
 SCHEDULE_TYPES = {"once", "daily", "weekly", "monthly"}
+SCHEDULE_DISPATCH_WORKERS = 4
+SCHEDULE_DISPATCH_CAPACITY = 16
+_scheduled_dispatch_executor = ThreadPoolExecutor(
+    max_workers=SCHEDULE_DISPATCH_WORKERS,
+    thread_name_prefix="gongge-xuban-schedule-run",
+)
+_scheduled_dispatch_slots = BoundedSemaphore(SCHEDULE_DISPATCH_CAPACITY)
 
 
 class _LLMScheduledTaskDraft(BaseModel):
@@ -132,6 +153,10 @@ def scheduled_task_run_read(row: ScheduledTaskRun, task: ScheduledTask | None = 
         agent_id=row.agent_id,
         user_id=row.user_id,
         session_id=row.session_id,
+        execution_id=row.execution_id,
+        source_kind=row.source_kind,
+        source_ref=row.source_ref,
+        source_checksum=row.source_checksum,
         scheduled_for=row.scheduled_for.isoformat(),
         status=row.status,
         started_at=_dt(row.started_at),
@@ -335,15 +360,40 @@ def start_scheduled_task_async(
     *,
     scheduled_for: datetime | None = None,
     manual: bool = False,
-) -> ScheduledTaskRun:
+) -> ScheduledTaskRun | None:
+    """在有界执行池中启动调度入口；容量耗尽时释放租约并保留到期事实重试。"""
+
+    if not _scheduled_dispatch_slots.acquire(blocking=False):
+        task.lease_owner = None
+        task.lease_until = None
+        task.updated_at = utc_now()
+        db.add(task)
+        db.commit()
+        return None
     scheduled_for = scheduled_for or task.next_run_at or utc_now()
-    run = _prepare_scheduled_task_run(db, task, scheduled_for, manual)
-    if run.status == "running" and run.session_id:
-        threading.Thread(
-            target=_execute_prepared_scheduled_task_in_background,
-            args=(task.id, run.id, manual),
-            daemon=True,
-        ).start()
+    try:
+        run = _prepare_scheduled_task_run(db, task, scheduled_for, manual)
+    except Exception:
+        _scheduled_dispatch_slots.release()
+        raise
+    if run.status != "running" or not run.session_id:
+        _scheduled_dispatch_slots.release()
+        return run
+    try:
+        _scheduled_dispatch_executor.submit(
+            _execute_prepared_scheduled_task_in_background,
+            task.id,
+            run.id,
+            manual,
+        )
+    except RuntimeError:
+        _scheduled_dispatch_slots.release()
+        task.lease_owner = None
+        task.lease_until = None
+        task.updated_at = utc_now()
+        db.add(task)
+        db.commit()
+        raise
     return run
 
 
@@ -363,15 +413,29 @@ def _prepare_scheduled_task_run(
     ).first()
     if existing:
         return existing
+    now = utc_now()
+    if (
+        not manual
+        and task.misfire_policy == "skip"
+        and scheduled_for < now - timedelta(seconds=MISFIRE_GRACE_SECONDS)
+    ):
+        run = _create_run(db, task, scheduled_for, "skipped", manual=manual)
+        run.error = "自动任务已超过 misfire 宽限时间，按 skip 策略跳过本次唤醒。"
+        run.finished_at = now
+        _finish_task_schedule(db, task, scheduled_for, "skipped", manual)
+        db.add(run)
+        db.commit()
+        db.refresh(run)
+        return run
     if task.concurrency_policy == "forbid":
         running = db.exec(
             select(ScheduledTaskRun).where(
                 ScheduledTaskRun.scheduled_task_id == task.id,
-                ScheduledTaskRun.status == "running",
+                ScheduledTaskRun.status.in_(("queued", "running", "waiting")),
             )
         ).first()
         if running:
-            run = _create_run(db, task, scheduled_for, "skipped")
+            run = _create_run(db, task, scheduled_for, "skipped", manual=manual)
             run.error = "上一轮自动任务仍在执行，已按 forbid 策略跳过本次唤醒。"
             run.finished_at = utc_now()
             _finish_task_schedule(db, task, scheduled_for, "skipped", manual)
@@ -380,7 +444,7 @@ def _prepare_scheduled_task_run(
             db.refresh(run)
             return run
 
-    run = _create_run(db, task, scheduled_for, "running")
+    run = _create_run(db, task, scheduled_for, "running", manual=manual)
     try:
         db.commit()
     except IntegrityError:
@@ -418,12 +482,17 @@ def _prepare_scheduled_task_run(
 
 
 def _execute_prepared_scheduled_task_in_background(task_id: str, run_id: str, manual: bool) -> None:
-    with Session(engine) as db:
-        task = db.get(ScheduledTask, task_id)
-        run = db.get(ScheduledTaskRun, run_id)
-        if not task or not run:
-            return
-        _execute_prepared_scheduled_task(db, task, run, manual=manual)
+    """使用独立会话推进已持久化运行，并确保任何退出路径都会归还有界容量。"""
+
+    try:
+        with Session(engine) as db:
+            task = db.get(ScheduledTask, task_id)
+            run = db.get(ScheduledTaskRun, run_id)
+            if not task or not run:
+                return
+            _execute_prepared_scheduled_task(db, task, run, manual=manual)
+    finally:
+        _scheduled_dispatch_slots.release()
 
 
 def _execute_prepared_scheduled_task(
@@ -436,11 +505,13 @@ def _execute_prepared_scheduled_task(
     try:
         if not run.session_id:
             raise RuntimeError("自动任务缺少独立会话")
+        _ensure_scheduled_execution_access(db, task)
         request = ChatTurnRequest(
             tenant_id=task.tenant_id,
             session_id=run.session_id,
             agent_id=task.agent_id,
             user_id=task.created_by_user_id,
+            client_turn_id=f"scheduled-run:{run.id}",
             message=automatic_task_message(task),
             channel="scheduled_task",
             interaction_mode="scheduled_task",
@@ -453,16 +524,28 @@ def _execute_prepared_scheduled_task(
                 result = ChatTurnResponse.model_validate(item["data"])
         if result is None:
             raise RuntimeError("自动任务执行未返回完整结果")
-        run.status = "succeeded"
+        dynamic_execution = _scheduled_dynamic_execution(db, run)
+        if dynamic_execution is not None:
+            run.execution_id = dynamic_execution.id
         run.result_summary = result.reply[:500]
         run.trace_json = {
             "router_decision": result.router_decision.model_dump(mode="json")
             if result.router_decision
             else None,
             "session_state": result.session_state.model_dump(mode="json"),
+            "execution_id": dynamic_execution.id if dynamic_execution is not None else None,
         }
-        run.finished_at = utc_now()
-        _finish_task_schedule(db, task, run.scheduled_for, "succeeded", manual)
+        if dynamic_execution is not None and dynamic_execution.status in {
+            "created",
+            "running",
+            "waiting",
+        }:
+            run.status = "waiting"
+            _finish_task_schedule(db, task, run.scheduled_for, "waiting", manual)
+        else:
+            run.status = "succeeded"
+            run.finished_at = utc_now()
+            _finish_task_schedule(db, task, run.scheduled_for, "succeeded", manual)
     except Exception as exc:
         run.status = "failed"
         run.error = str(exc)
@@ -486,6 +569,60 @@ def _execute_prepared_scheduled_task(
         db.commit()
         db.refresh(run)
     return run
+
+
+def reconcile_scheduled_dynamic_runs(db: Session, *, limit: int = 100) -> int:
+    """把已挂起调度关联的动态 Execution 终态幂等回写到原 ScheduledTaskRun。"""
+
+    runs = db.exec(
+        select(ScheduledTaskRun)
+        .where(
+            ScheduledTaskRun.execution_id != None,  # noqa: E711
+            ScheduledTaskRun.status.in_(("running", "waiting")),
+        )
+        .order_by(ScheduledTaskRun.scheduled_for, ScheduledTaskRun.id)
+        .limit(limit)
+    ).all()
+    settled = 0
+    for run in runs:
+        execution = db.get(SopInstance, run.execution_id)
+        if execution is None or execution.tenant_id != run.tenant_id:
+            continue
+        if execution.status in {"created", "running", "waiting"}:
+            if run.status != "waiting":
+                run.status = "waiting"
+                run.updated_at = utc_now()
+                db.add(run)
+            continue
+        run.status = "succeeded" if execution.status == "succeeded" else "failed"
+        run.finished_at = execution.completed_at or utc_now()
+        if run.status == "succeeded":
+            message = db.exec(
+                select(Message)
+                .where(
+                    Message.tenant_id == run.tenant_id,
+                    Message.session_id == execution.session_id,
+                    Message.role == "assistant",
+                )
+                .order_by(Message.created_at.desc(), Message.id.desc())
+            ).first()
+            if message is not None:
+                run.result_summary = message.content[:500]
+        if run.status == "failed":
+            reason = execution.terminal_reason_json or {}
+            run.error = str(reason.get("code") or execution.status)[:1000]
+        run.trace_json = {
+            **dict(run.trace_json or {}),
+            "execution_id": execution.id,
+            "execution_status": execution.status,
+        }
+        run.updated_at = utc_now()
+        db.add(run)
+        _refresh_latest_task_status(db, run)
+        settled += 1
+    if runs:
+        db.commit()
+    return settled
 
 
 def _record_scheduled_task_stream_event(
@@ -624,18 +761,101 @@ def parse_user_datetime(value: str, timezone: str = DEFAULT_TIMEZONE) -> datetim
     return parsed.astimezone(UTC).replace(tzinfo=None)
 
 
-def _create_run(db: Session, task: ScheduledTask, scheduled_for: datetime, status: str) -> ScheduledTaskRun:
+def _create_run(
+    db: Session,
+    task: ScheduledTask,
+    scheduled_for: datetime,
+    status: str,
+    *,
+    manual: bool,
+) -> ScheduledTaskRun:
+    """用任务定义和到期时间生成稳定来源身份，网络或租约重放不会改变语义。"""
+
+    source_kind = "manual" if manual else "schedule"
+    source_ref = f"scheduled-task:{task.id}:{source_kind}:{scheduled_for.isoformat()}"
+    source_snapshot = {
+        "scheduled_task_id": task.id,
+        "tenant_id": task.tenant_id,
+        "agent_id": task.agent_id,
+        "initiator_user_id": task.created_by_user_id,
+        "source_kind": source_kind,
+        "source_ref": source_ref,
+        "scheduled_for": scheduled_for.isoformat(),
+        "prompt": task.prompt,
+        "timezone": task.timezone,
+        "schedule_type": task.schedule_type,
+        "schedule": dict(task.schedule_json or {}),
+        "rrule": task.rrule,
+        "concurrency_policy": task.concurrency_policy,
+        "misfire_policy": task.misfire_policy,
+    }
     run = ScheduledTaskRun(
         tenant_id=task.tenant_id,
         scheduled_task_id=task.id,
         agent_id=task.agent_id,
         user_id=task.created_by_user_id,
+        source_kind=source_kind,
+        source_ref=source_ref,
+        source_snapshot_json=source_snapshot,
+        source_checksum=canonical_checksum(source_snapshot),
         scheduled_for=scheduled_for,
         status=status,
         started_at=utc_now() if status == "running" else None,
     )
     db.add(run)
     return run
+
+
+def _scheduled_dynamic_execution(db: Session, run: ScheduledTaskRun) -> SopInstance | None:
+    """按不可变 run identity 查找本轮唯一动态 Execution，不依赖聊天标题或尾消息。"""
+
+    return db.exec(
+        select(SopInstance).where(
+            SopInstance.tenant_id == run.tenant_id,
+            SopInstance.kind == "dynamic_task",
+            SopInstance.source_kind == "schedule",
+            SopInstance.source_ref == run.id,
+        )
+    ).first()
+
+
+def _ensure_scheduled_execution_access(
+    db: Session,
+    task: ScheduledTask,
+) -> tuple[User, AgentProfile]:
+    """每次到期重新校验发起成员与 Agent 使用关系，历史配置不能永久授权。"""
+
+    user = db.get(User, task.created_by_user_id)
+    agent = db.get(AgentProfile, task.agent_id)
+    if (
+        user is None
+        or user.tenant_id != task.tenant_id
+        or user.membership_status != "active"
+    ):
+        raise RuntimeError("SCHEDULE_INITIATOR_INACTIVE")
+    if agent is None or not can_use_agent_in_chat(db, agent, user):
+        raise RuntimeError("SCHEDULE_AGENT_ACCESS_DENIED")
+    return user, agent
+
+
+def _refresh_latest_task_status(db: Session, run: ScheduledTaskRun) -> None:
+    """仅允许最新一轮完成事实更新任务摘要，迟到旧 run 不覆盖新状态。"""
+
+    newer = db.exec(
+        select(ScheduledTaskRun.id).where(
+            ScheduledTaskRun.scheduled_task_id == run.scheduled_task_id,
+            ScheduledTaskRun.scheduled_for > run.scheduled_for,
+        )
+    ).first()
+    if newer is not None:
+        return
+    task = db.get(ScheduledTask, run.scheduled_task_id)
+    if task is None or task.tenant_id != run.tenant_id:
+        return
+    task.last_status = run.status
+    task.last_run_at = run.finished_at
+    task.updated_at = utc_now()
+    db.add(task)
 
 
 def _finish_task_schedule(db: Session, task: ScheduledTask, scheduled_for: datetime, status: str, manual: bool) -> None:

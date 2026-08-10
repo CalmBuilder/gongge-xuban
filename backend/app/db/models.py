@@ -1,5 +1,5 @@
 """
-@Time       : 2026/08/04 01:04
+@Time       : 2026/08/10 16:20
 @Author     : zhanglp8181
 @File       : models.py
 @CallChain  : API/Seed/Workers → SQLModel Session → models.py → SQLAlchemy Engine
@@ -1056,6 +1056,20 @@ class SopOperation(SQLModel, table=True):
     error_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     capability_snapshot_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     capability_checksum: OptionalVersionString = Field(default=None, index=True)
+    approval_work_item_id: OptionalIdentifierString = Field(default=None, index=True)
+    approval_fingerprint: OptionalVersionString = Field(default=None, index=True)
+    approved_by_user_id: OptionalIdentifierString = Field(default=None, index=True)
+    approved_at: datetime | None = None
+    authorization_evidence_json: dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSON),
+    )
+    authorization_source_type: LabelString = Field(default="legacy", index=True)
+    authorization_source_ref: str | None = Field(
+        default=None,
+        sa_column=Column(String(512), nullable=True, index=True),
+    )
+    dispatched_at: datetime | None = None
     external_reference: OptionalIdentifierString = Field(default=None, index=True)
     reconciled_at: datetime | None = None
     revision: int = Field(default=0, ge=0)
@@ -1461,7 +1475,7 @@ class ExecutionSignal(SQLModel, table=True):
         UniqueConstraint("tenant_id", "dedupe_key", name="uq_execution_signal_dedupe"),
         CheckConstraint(
             "signal_type IN ('command', 'attention_decided', 'timer', 'operation_settled', "
-            "'external_event', 'publication_retry')",
+            "'external_event', 'publication_retry', 'scheduled_start', 'capacity_retry')",
             name="ck_execution_signal_type",
         ),
         CheckConstraint(
@@ -1500,6 +1514,52 @@ class ExecutionSignal(SQLModel, table=True):
     last_error_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
+
+
+class DynamicTaskQuotaLease(SQLModel, table=True):
+    """用数据库唯一槽位限制跨进程动态 Execution 和工具并发，不保存业务参数。"""
+
+    __tablename__ = "dynamic_task_quota_leases"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "scope_type",
+            "scope_ref",
+            "slot_number",
+            name="uq_dynamic_quota_scope_slot",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "holder_type",
+            "holder_id",
+            "scope_type",
+            name="uq_dynamic_quota_holder_scope",
+        ),
+        CheckConstraint(
+            "scope_type IN ('tenant', 'agent', 'user', 'tool')",
+            name="ck_dynamic_quota_scope_type",
+        ),
+        CheckConstraint(
+            "holder_type IN ('execution', 'operation')",
+            name="ck_dynamic_quota_holder_type",
+        ),
+        CheckConstraint("slot_number >= 0", name="ck_dynamic_quota_slot_nonnegative"),
+        Index(
+            "ix_dynamic_quota_holder",
+            "tenant_id",
+            "holder_type",
+            "holder_id",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("quota"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    scope_type: LabelString = Field(index=True)
+    scope_ref: str = Field(sa_column=Column(String(512), nullable=False, index=True))
+    slot_number: int = Field(ge=0)
+    holder_type: LabelString = Field(index=True)
+    holder_id: str = Field(sa_column=Column(String(512), nullable=False, index=True))
+    acquired_at: datetime = Field(default_factory=utc_now)
 
 
 class ExecutionResult(SQLModel, table=True):
@@ -2129,6 +2189,364 @@ class AgentResourceBinding(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=utc_now)
 
 
+class ConnectionSecret(SQLModel, table=True):
+    """保存 Connector 凭据密文；业务档案仅持有其不透明引用和修订号。"""
+
+    __tablename__ = "connection_secrets"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "provider",
+            "reference_id",
+            "revision",
+            name="uq_connection_secret_revision",
+        ),
+        CheckConstraint("revision >= 1", name="ck_connection_secret_revision"),
+        CheckConstraint(
+            "status IN ('active', 'superseded', 'revoked')",
+            name="ck_connection_secret_status",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("connsecret"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    provider: LabelString = Field(index=True)
+    reference_id: IdentifierString = Field(index=True)
+    encrypted_payload: LongTextString
+    revision: int = Field(default=1, ge=1)
+    status: LabelString = Field(default="active", index=True)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+    revoked_at: datetime | None = None
+
+
+class ConnectionProfile(SQLModel, table=True):
+    """定义租户内稳定的外部账号身份、授权快照和可观测健康状态。"""
+
+    __tablename__ = "connection_profiles"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "provider",
+            "account_id",
+            name="uq_connection_profile_account",
+        ),
+        CheckConstraint("revision >= 1", name="ck_connection_profile_revision"),
+        CheckConstraint("secret_revision >= 1", name="ck_connection_profile_secret_revision"),
+        CheckConstraint(
+            "status IN ('active', 'disabled', 'reauth_required')",
+            name="ck_connection_profile_status",
+        ),
+        CheckConstraint(
+            "health_status IN ('unverified', 'healthy', 'degraded', 'unhealthy')",
+            name="ck_connection_profile_health",
+        ),
+        Index(
+            "ix_connection_profiles_tenant_provider_status",
+            "tenant_id",
+            "provider",
+            "status",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("connprofile"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    provider: LabelString = Field(index=True)
+    account_id: IdentifierString = Field(index=True)
+    display_name: NameString
+    secret_ref_id: IdentifierString = Field(index=True)
+    secret_revision: int = Field(default=1, ge=1)
+    callback_configured: bool = Field(default=False, index=True)
+    required_scopes_json: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    granted_scopes_json: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    tool_allowlist_json: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    status: LabelString = Field(default="active", index=True)
+    health_status: LabelString = Field(default="unverified", index=True)
+    health_error_code: OptionalIdentifierString = None
+    rate_limited_until: datetime | None = None
+    last_checked_at: datetime | None = None
+    last_healthy_at: datetime | None = None
+    revision: int = Field(default=1, ge=1)
+    created_by_user_id: IdentifierString = Field(index=True)
+    updated_by_user_id: IdentifierString = Field(index=True)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class ConnectorInboundEvent(SQLModel, table=True):
+    """持久保存已验签的 Connector 入站事件，供异步消费与幂等重放。"""
+
+    __tablename__ = "connector_inbound_events"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "provider",
+            "profile_id",
+            "external_event_id",
+            name="uq_connector_inbound_external_event",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'processing', 'processed', 'failed', 'dead_letter')",
+            name="ck_connector_inbound_status",
+        ),
+        CheckConstraint("attempt_count >= 0", name="ck_connector_inbound_attempts"),
+        Index(
+            "ix_connector_inbound_dispatch",
+            "status",
+            "available_at",
+            "created_at",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("connin"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    provider: LabelString = Field(index=True)
+    profile_id: IdentifierString = Field(index=True)
+    external_event_id: str = Field(sa_column=Column(String(255), nullable=False, index=True))
+    payload_checksum: VersionString = Field(index=True)
+    encrypted_payload: LongTextString
+    event_type: LabelString = Field(index=True)
+    sender_ref_hash: OptionalVersionString = Field(default=None, index=True)
+    status: LabelString = Field(default="pending", index=True)
+    attempt_count: int = Field(default=0, ge=0)
+    available_at: datetime = Field(default_factory=utc_now, index=True)
+    last_error_code: OptionalIdentifierString = None
+    processed_at: datetime | None = None
+    lease_owner: OptionalIdentifierString = Field(default=None, index=True)
+    lease_until: datetime | None = Field(default=None, index=True)
+    thread_binding_id: OptionalIdentifierString = Field(default=None, index=True)
+    session_id: OptionalIdentifierString = Field(default=None, index=True)
+    message_id: OptionalIdentifierString = Field(default=None, index=True)
+    execution_id: OptionalIdentifierString = Field(default=None, index=True)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class ConnectorPrincipalBinding(SQLModel, table=True):
+    """把已验签外部发送者摘要显式映射到同租户活动用户。"""
+
+    __tablename__ = "connector_principal_bindings"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "provider",
+            "profile_id",
+            "sender_ref_hash",
+            name="uq_connector_principal_sender",
+        ),
+        CheckConstraint("revision >= 1", name="ck_connector_principal_revision"),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("connprincipal"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    provider: LabelString = Field(index=True)
+    profile_id: IdentifierString = Field(index=True)
+    sender_ref_hash: VersionString = Field(index=True)
+    user_id: IdentifierString = Field(index=True)
+    enabled: bool = Field(default=True, index=True)
+    revision: int = Field(default=1, ge=1)
+    created_by_user_id: IdentifierString = Field(index=True)
+    updated_by_user_id: IdentifierString = Field(index=True)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class ConnectorInboundRoute(SQLModel, table=True):
+    """为一个入站连接档案指定唯一 Agent，禁止运行时猜测绑定。"""
+
+    __tablename__ = "connector_inbound_routes"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "provider", "profile_id", name="uq_connector_inbound_route_profile"
+        ),
+        CheckConstraint("revision >= 1", name="ck_connector_inbound_route_revision"),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("connroute"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    provider: LabelString = Field(index=True)
+    profile_id: IdentifierString = Field(index=True)
+    agent_id: IdentifierString = Field(index=True)
+    enabled: bool = Field(default=True, index=True)
+    revision: int = Field(default=1, ge=1)
+    created_by_user_id: IdentifierString = Field(index=True)
+    updated_by_user_id: IdentifierString = Field(index=True)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class ConnectorThreadBinding(SQLModel, table=True):
+    """关联外部发送者、平台会话和加密回复目标，供恢复与定向回发。"""
+
+    __tablename__ = "connector_thread_bindings"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "provider",
+            "profile_id",
+            "sender_ref_hash",
+            "agent_id",
+            name="uq_connector_thread_sender_agent",
+        ),
+        UniqueConstraint("tenant_id", "session_id", name="uq_connector_thread_session"),
+        CheckConstraint("status IN ('active', 'disabled')", name="ck_connector_thread_status"),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("connthread"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    provider: LabelString = Field(index=True)
+    profile_id: IdentifierString = Field(index=True)
+    sender_ref_hash: VersionString = Field(index=True)
+    encrypted_recipient_ref: LongTextString
+    user_id: IdentifierString = Field(index=True)
+    agent_id: IdentifierString = Field(index=True)
+    session_id: IdentifierString = Field(index=True)
+    status: LabelString = Field(default="active", index=True)
+    lease_owner: OptionalIdentifierString = Field(default=None, index=True)
+    lease_until: datetime | None = Field(default=None, index=True)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class ConnectorOutboundDelivery(SQLModel, table=True):
+    """保存普通回答或 Execution publication 的外部回发 outbox 状态。"""
+
+    __tablename__ = "connector_outbound_deliveries"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "source_type", "source_ref", name="uq_connector_outbound_source"
+        ),
+        CheckConstraint(
+            "source_type IN ('assistant_message', 'execution_publication')",
+            name="ck_connector_outbound_source_type",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'delivering', 'settled', 'unknown', 'dead_letter')",
+            name="ck_connector_outbound_status",
+        ),
+        CheckConstraint("attempt_count >= 0", name="ck_connector_outbound_attempts"),
+        Index(
+            "ix_connector_outbound_dispatch", "status", "available_at", "created_at"
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("connout"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    provider: LabelString = Field(index=True)
+    profile_id: IdentifierString = Field(index=True)
+    thread_binding_id: IdentifierString = Field(index=True)
+    source_type: LabelString = Field(index=True)
+    source_ref: str = Field(sa_column=Column(String(512), nullable=False, index=True))
+    payload_checksum: VersionString = Field(index=True)
+    status: LabelString = Field(default="pending", index=True)
+    attempt_count: int = Field(default=0, ge=0)
+    available_at: datetime = Field(default_factory=utc_now, index=True)
+    lease_owner: OptionalIdentifierString = Field(default=None, index=True)
+    lease_until: datetime | None = Field(default=None, index=True)
+    receipt_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    error_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    settled_at: datetime | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class AgentConnectionBinding(SQLModel, table=True):
+    """把明确 Connector 账号绑定给同租户 Agent，并分别收窄 scope 与动作。"""
+
+    __tablename__ = "agent_connection_bindings"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "agent_id",
+            "profile_id",
+            name="uq_agent_connection_binding",
+        ),
+        Index(
+            "ix_agent_connection_bindings_resolve",
+            "tenant_id",
+            "agent_id",
+            "enabled",
+        ),
+        CheckConstraint("revision >= 1", name="ck_agent_connection_binding_revision"),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("agentconn"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    agent_id: IdentifierString = Field(index=True)
+    profile_id: IdentifierString = Field(index=True)
+    allowed_scopes_json: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    allowed_actions_json: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    enabled: bool = Field(default=True, index=True)
+    revision: int = Field(default=1, ge=1)
+    created_by_user_id: IdentifierString = Field(index=True)
+    updated_by_user_id: IdentifierString = Field(index=True)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class ConnectionCommandReceipt(SQLModel, table=True):
+    """保存连接管理命令的安全语义摘要与成功响应，供网络重放返回原始结果。"""
+
+    __tablename__ = "connection_command_receipts"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "command_id",
+            name="uq_connection_command_receipt",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("conncmd"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    command_id: IdentifierString = Field(index=True)
+    command_type: LabelString = Field(index=True)
+    actor_user_id: IdentifierString = Field(index=True)
+    payload_checksum: VersionString
+    resource_type: LabelString
+    resource_id: IdentifierString = Field(index=True)
+    result_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class ConnectionOAuthState(SQLModel, table=True):
+    """保存一次性 Slack OAuth state 的摘要及完成连接命令所需的服务端上下文。"""
+
+    __tablename__ = "connection_oauth_states"
+    __table_args__ = (
+        UniqueConstraint("state_hash", name="uq_connection_oauth_state_hash"),
+        UniqueConstraint(
+            "tenant_id", "command_id", name="uq_connection_oauth_tenant_command"
+        ),
+        CheckConstraint(
+            "flow_type IN ('create', 'reauthorize', 'reauthorize_attention')",
+            name="ck_connection_oauth_flow_type",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'processing', 'consumed', 'failed')",
+            name="ck_connection_oauth_state_status",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("connoauth"), primary_key=True)
+    state_hash: VersionString = Field(index=True)
+    encrypted_state: LongTextString
+    tenant_id: IdentifierString = Field(index=True)
+    actor_user_id: IdentifierString = Field(index=True)
+    flow_type: LabelString = Field(index=True)
+    profile_id: OptionalIdentifierString = Field(default=None, index=True)
+    attention_id: OptionalIdentifierString = Field(default=None, index=True)
+    display_name: OptionalNameString = None
+    command_id: IdentifierString = Field(index=True)
+    expected_profile_revision: int = Field(default=0, ge=0)
+    expected_attention_revision: int | None = None
+    required_scopes_json: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    status: LabelString = Field(default="pending", index=True)
+    expires_at: datetime = Field(index=True)
+    consumed_at: datetime | None = None
+    error_code: OptionalIdentifierString = None
+    created_at: datetime = Field(default_factory=utc_now)
+
+
 class Tool(SQLModel, table=True):
     __tablename__ = "tools"
     __table_args__ = (UniqueConstraint("tenant_id", "name", name="uq_tool_tenant_name"),)
@@ -2317,6 +2735,20 @@ class ScheduledTaskRun(SQLModel, table=True):
         UniqueConstraint(
             "scheduled_task_id", "scheduled_for", name="uq_scheduled_task_run_due_time"
         ),
+        UniqueConstraint(
+            "tenant_id", "source_ref", name="uq_scheduled_task_run_source_ref"
+        ),
+        UniqueConstraint(
+            "tenant_id", "execution_id", name="uq_scheduled_task_run_execution"
+        ),
+        CheckConstraint(
+            "status IN ('queued', 'running', 'waiting', 'succeeded', 'failed', 'skipped')",
+            name="ck_scheduled_task_run_status",
+        ),
+        CheckConstraint(
+            "source_kind IN ('schedule', 'manual', 'legacy')",
+            name="ck_scheduled_task_run_source_kind",
+        ),
         Index(
             "ix_sched_runs_tenant_agent_scheduled",
             "tenant_id",
@@ -2338,6 +2770,11 @@ class ScheduledTaskRun(SQLModel, table=True):
     agent_id: IdentifierString = Field(index=True)
     user_id: IdentifierString = Field(index=True)
     session_id: OptionalIdentifierString = Field(default=None, index=True)
+    execution_id: OptionalIdentifierString = Field(default=None, index=True)
+    source_kind: LabelString = Field(default="schedule", index=True)
+    source_ref: str = Field(sa_column=Column(String(512), nullable=False, index=True))
+    source_snapshot_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    source_checksum: VersionString = Field(index=True)
     scheduled_for: datetime = Field(index=True)
     status: LabelString = Field(default="queued", index=True)
     started_at: Optional[datetime] = Field(default=None, index=True)
@@ -2347,6 +2784,89 @@ class ScheduledTaskRun(SQLModel, table=True):
     trace_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
+
+
+class StandingApprovalRule(SQLModel, table=True):
+    """保存受管调度任务对精确外部目标和受限参数的长期批准规则。"""
+
+    __tablename__ = "standing_approval_rules"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "active_scope_key",
+            name="uq_standing_rule_active_scope",
+        ),
+        CheckConstraint("risk_class = 'external_write'", name="ck_standing_rule_risk"),
+        CheckConstraint(
+            "status IN ('active', 'revoked')",
+            name="ck_standing_rule_status",
+        ),
+        CheckConstraint("revision >= 1", name="ck_standing_rule_revision"),
+        Index(
+            "ix_standing_rules_active_lookup",
+            "tenant_id",
+            "source_schedule_id",
+            "agent_id",
+            "status",
+            "valid_from",
+            "valid_to",
+        ),
+        Index(
+            "ix_standing_rules_target_lookup",
+            "tenant_id",
+            "tool_id",
+            "target_hash",
+            "status",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("standing"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    agent_id: IdentifierString = Field(index=True)
+    source_schedule_id: IdentifierString = Field(index=True)
+    source_schedule_checksum: VersionString = Field(index=True)
+    profile_id: IdentifierString = Field(index=True)
+    binding_id: IdentifierString = Field(index=True)
+    tool_id: str = Field(sa_column=Column(String(255), nullable=False, index=True))
+    tool_snapshot_checksum: VersionString = Field(index=True)
+    risk_class: LabelString = Field(default="external_write", index=True)
+    target_type: LabelString = Field(index=True)
+    canonical_target: str = Field(sa_column=Column(String(512), nullable=False))
+    target_hash: VersionString = Field(index=True)
+    argument_constraints_json: dict[str, Any] = Field(sa_column=Column(JSON, nullable=False))
+    active_scope_key: OptionalVersionString = Field(default=None, index=True)
+    valid_from: datetime = Field(index=True)
+    valid_to: datetime = Field(index=True)
+    status: LabelString = Field(default="active", index=True)
+    revision: int = Field(default=1, ge=1)
+    created_by_user_id: IdentifierString = Field(index=True)
+    revoked_by_user_id: OptionalIdentifierString = Field(default=None, index=True)
+    revoked_at: datetime | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class StandingApprovalCommandReceipt(SQLModel, table=True):
+    """保存长期批准创建和撤销命令的幂等语义摘要与结果。"""
+
+    __tablename__ = "standing_approval_command_receipts"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "command_id",
+            name="uq_standing_approval_command_receipt",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("standingcmd"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    command_id: IdentifierString = Field(index=True)
+    command_type: LabelString = Field(index=True)
+    actor_user_id: IdentifierString = Field(index=True)
+    payload_checksum: VersionString
+    rule_id: IdentifierString = Field(index=True)
+    result_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    created_at: datetime = Field(default_factory=utc_now)
 
 
 class Message(SQLModel, table=True):

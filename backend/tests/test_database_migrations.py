@@ -1,5 +1,5 @@
 """
-@Time       : 2026/08/04 01:04
+@Time       : 2026/08/10 18:30
 @Author     : zhanglp8181
 @File       : test_database_migrations.py
 @CallChain  : pytest → Alembic/数据库适配器 → SQLite/MySQL schema
@@ -1538,6 +1538,327 @@ def test_scheduled_task_pagination_indexes_migration_is_reversible(tmp_path) -> 
         assert connection.execute(text("SELECT COUNT(*) FROM scheduled_tasks")).scalar_one() == 1
 
 
+def test_scheduled_dynamic_run_migration_backfills_source_and_is_reversible(tmp_path) -> None:
+    """验证 0046 回填历史 run、扩展 Signal 类型，并在无新事实时可安全降级。"""
+
+    database_url = f"sqlite:///{tmp_path / 'scheduled-dynamic-run.db'}"
+    config = Config(str(BACKEND_DIR / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
+    config.attributes["database_url"] = database_url
+    engine = create_engine(database_url)
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)"))
+        connection.execute(text("INSERT INTO alembic_version VALUES ('20260810_0045')"))
+        connection.execute(
+            text(
+                "CREATE TABLE scheduled_task_runs ("
+                "id VARCHAR PRIMARY KEY, tenant_id VARCHAR NOT NULL, "
+                "scheduled_task_id VARCHAR NOT NULL, agent_id VARCHAR NOT NULL, "
+                "user_id VARCHAR NOT NULL, scheduled_for DATETIME NOT NULL, "
+                "status VARCHAR NOT NULL, trace_json JSON NOT NULL, "
+                "created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL, "
+                "CONSTRAINT uq_scheduled_task_run_due_time UNIQUE "
+                "(scheduled_task_id, scheduled_for))"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE TABLE execution_signals ("
+                "id VARCHAR PRIMARY KEY, signal_type VARCHAR NOT NULL, "
+                "CONSTRAINT ck_execution_signal_type CHECK ("
+                "signal_type IN ('command', 'attention_decided', 'timer', "
+                "'operation_settled', 'external_event', 'publication_retry')))"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO scheduled_task_runs ("
+                "id, tenant_id, scheduled_task_id, agent_id, user_id, scheduled_for, status, "
+                "trace_json, created_at, updated_at) VALUES ("
+                "'legacy_run', 'tenant_demo', 'task_demo', 'agent_demo', 'user_demo', "
+                "'2026-08-11 09:00:00', 'succeeded', '{}', "
+                "'2026-08-11 09:00:00', '2026-08-11 09:00:01')"
+            )
+        )
+
+    command.upgrade(config, "20260811_0046")
+    with engine.connect() as connection:
+        columns = {
+            str(column["name"]): column
+            for column in inspect(connection).get_columns("scheduled_task_runs")
+        }
+        row = connection.execute(
+            text(
+                "SELECT source_kind, source_ref, source_snapshot_json, source_checksum "
+                "FROM scheduled_task_runs WHERE id='legacy_run'"
+            )
+        ).one()
+        assert row.source_kind == "legacy"
+        assert row.source_ref == "legacy:legacy_run"
+        assert "legacy_run" in str(row.source_snapshot_json)
+        assert len(row.source_checksum) == 64
+        assert columns["source_ref"]["nullable"] is False
+        assert columns["source_snapshot_json"]["nullable"] is False
+        assert columns["source_checksum"]["nullable"] is False
+        unique_names = {
+            item["name"]
+            for item in inspect(connection).get_unique_constraints("scheduled_task_runs")
+        }
+        assert "uq_scheduled_task_run_source_ref" in unique_names
+        signal_checks = {
+            item["name"]: item["sqltext"]
+            for item in inspect(connection).get_check_constraints("execution_signals")
+        }
+        assert "scheduled_start" in signal_checks["ck_execution_signal_type"]
+
+    command.downgrade(config, "20260810_0045")
+    with engine.connect() as connection:
+        columns = {
+            column["name"]
+            for column in inspect(connection).get_columns("scheduled_task_runs")
+        }
+        assert "source_ref" not in columns
+        assert connection.execute(
+            text("SELECT COUNT(*) FROM scheduled_task_runs")
+        ).scalar_one() == 1
+
+
+def test_scheduled_dynamic_run_migration_resumes_after_partial_mysql_ddl(tmp_path) -> None:
+    """验证 0046 在来源列已增加、Signal 旧检查已丢失时仍可从非事务 DDL 中断点恢复。"""
+
+    database_url = f"sqlite:///{tmp_path / 'scheduled-dynamic-run-partial.db'}"
+    config = Config(str(BACKEND_DIR / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
+    config.attributes["database_url"] = database_url
+    engine = create_engine(database_url)
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)"))
+        connection.execute(text("INSERT INTO alembic_version VALUES ('20260810_0045')"))
+        connection.execute(
+            text(
+                "CREATE TABLE scheduled_task_runs ("
+                "id VARCHAR PRIMARY KEY, tenant_id VARCHAR NOT NULL, "
+                "scheduled_task_id VARCHAR NOT NULL, agent_id VARCHAR NOT NULL, "
+                "user_id VARCHAR NOT NULL, scheduled_for DATETIME NOT NULL, "
+                "status VARCHAR NOT NULL, trace_json JSON NOT NULL, "
+                "created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL, "
+                "execution_id VARCHAR, source_kind VARCHAR, source_ref VARCHAR, "
+                "source_snapshot_json JSON, source_checksum VARCHAR, "
+                "CONSTRAINT uq_scheduled_task_run_due_time UNIQUE "
+                "(scheduled_task_id, scheduled_for))"
+            )
+        )
+        connection.execute(
+            text("CREATE TABLE execution_signals (id VARCHAR PRIMARY KEY, signal_type VARCHAR NOT NULL)")
+        )
+        connection.execute(
+            text(
+                "INSERT INTO scheduled_task_runs ("
+                "id, tenant_id, scheduled_task_id, agent_id, user_id, scheduled_for, status, "
+                "trace_json, created_at, updated_at) VALUES ("
+                "'partial_run', 'tenant_demo', 'task_demo', 'agent_demo', 'user_demo', "
+                "'2026-08-11 09:00:00', 'running', '{}', "
+                "'2026-08-11 09:00:00', '2026-08-11 09:00:01')"
+            )
+        )
+
+    command.upgrade(config, "20260811_0046")
+    with engine.connect() as connection:
+        inspector = inspect(connection)
+        columns = {
+            str(column["name"]): column
+            for column in inspector.get_columns("scheduled_task_runs")
+        }
+        assert columns["source_kind"]["nullable"] is False
+        assert columns["source_ref"]["nullable"] is False
+        assert connection.execute(
+            text("SELECT source_ref FROM scheduled_task_runs WHERE id='partial_run'")
+        ).scalar_one() == "legacy:partial_run"
+        signal_checks = {
+            item["name"]: item["sqltext"]
+            for item in inspector.get_check_constraints("execution_signals")
+        }
+        assert "scheduled_start" in signal_checks["ck_execution_signal_type"]
+
+
+def test_standing_approval_migration_backfills_authorization_and_is_reversible(
+    tmp_path,
+) -> None:
+    """验证 0047 建表/索引、历史授权来源回填及无新事实时安全降级。"""
+
+    database_url = f"sqlite:///{tmp_path / 'standing-approval.db'}"
+    config = Config(str(BACKEND_DIR / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
+    config.attributes["database_url"] = database_url
+    engine = create_engine(database_url)
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)"))
+        connection.execute(text("INSERT INTO alembic_version VALUES ('20260811_0046')"))
+        connection.execute(text("CREATE TABLE scheduled_tasks (id VARCHAR PRIMARY KEY)"))
+        connection.execute(text("CREATE TABLE connection_profiles (id VARCHAR PRIMARY KEY)"))
+        connection.execute(text("CREATE TABLE agent_connection_bindings (id VARCHAR PRIMARY KEY)"))
+        connection.execute(
+            text(
+                "CREATE TABLE sop_operations ("
+                "id VARCHAR PRIMARY KEY, approval_work_item_id VARCHAR NULL)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO sop_operations (id, approval_work_item_id) VALUES "
+                "('operation_attention', 'attention_1'), ('operation_legacy', NULL)"
+            )
+        )
+
+    command.upgrade(config, "20260811_0047")
+    command.upgrade(config, "20260811_0047")
+    with engine.connect() as connection:
+        inspector = inspect(connection)
+        assert {
+            "standing_approval_rules",
+            "standing_approval_command_receipts",
+        }.issubset(inspector.get_table_names())
+        operation_columns = {
+            str(column["name"]): column
+            for column in inspector.get_columns("sop_operations")
+        }
+        assert operation_columns["authorization_source_type"]["nullable"] is False
+        sources = dict(
+            connection.execute(
+                text("SELECT id, authorization_source_type FROM sop_operations")
+            ).all()
+        )
+        assert sources == {
+            "operation_attention": "attention",
+            "operation_legacy": "legacy",
+        }
+        rule_indexes = {
+            str(index["name"])
+            for index in inspector.get_indexes("standing_approval_rules")
+        }
+        assert {
+            "ix_standing_rules_active_lookup",
+            "ix_standing_rules_target_lookup",
+        }.issubset(rule_indexes)
+        assert "uq_standing_rule_active_scope" in {
+            str(item["name"])
+            for item in inspector.get_unique_constraints("standing_approval_rules")
+        }
+
+    command.downgrade(config, "20260811_0046")
+    with engine.connect() as connection:
+        inspector = inspect(connection)
+        assert "standing_approval_rules" not in inspector.get_table_names()
+        assert "standing_approval_command_receipts" not in inspector.get_table_names()
+        assert "authorization_source_type" not in {
+            column["name"] for column in inspector.get_columns("sop_operations")
+        }
+        assert connection.execute(text("SELECT COUNT(*) FROM sop_operations")).scalar_one() == 2
+
+
+def test_standing_approval_migration_refuses_to_drop_dispatch_evidence(tmp_path) -> None:
+    """存在长期规则派发事实时 0047 降级必须失败，禁止丢失授权审计链。"""
+
+    database_url = f"sqlite:///{tmp_path / 'standing-approval-safety.db'}"
+    config = Config(str(BACKEND_DIR / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
+    config.attributes["database_url"] = database_url
+    engine = create_engine(database_url)
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)"))
+        connection.execute(text("INSERT INTO alembic_version VALUES ('20260811_0046')"))
+        connection.execute(text("CREATE TABLE scheduled_tasks (id VARCHAR PRIMARY KEY)"))
+        connection.execute(text("CREATE TABLE connection_profiles (id VARCHAR PRIMARY KEY)"))
+        connection.execute(text("CREATE TABLE agent_connection_bindings (id VARCHAR PRIMARY KEY)"))
+        connection.execute(
+            text(
+                "CREATE TABLE sop_operations ("
+                "id VARCHAR PRIMARY KEY, approval_work_item_id VARCHAR NULL)"
+            )
+        )
+        connection.execute(
+            text("INSERT INTO sop_operations (id) VALUES ('standing_operation')")
+        )
+    command.upgrade(config, "20260811_0047")
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE sop_operations SET authorization_source_type='standing_rule', "
+                "authorization_source_ref='rule_1:1' WHERE id='standing_operation'"
+            )
+        )
+
+    with pytest.raises(RuntimeError, match="dispatch facts"):
+        command.downgrade(config, "20260811_0046")
+
+
+def test_dynamic_task_quota_lease_migration_is_reentrant_and_safe(tmp_path) -> None:
+    """验证 0048 唯一槽表可重入创建，且活动租约存在时拒绝降级绕过配额。"""
+
+    database_url = f"sqlite:///{tmp_path / 'dynamic-quota.db'}"
+    config = Config(str(BACKEND_DIR / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
+    config.attributes["database_url"] = database_url
+    engine = create_engine(database_url)
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)"))
+        connection.execute(text("INSERT INTO alembic_version VALUES ('20260811_0047')"))
+        connection.execute(text("CREATE TABLE sop_instances (id VARCHAR PRIMARY KEY)"))
+        connection.execute(
+            text(
+                "CREATE TABLE execution_signals ("
+                "id VARCHAR PRIMARY KEY, signal_type VARCHAR NOT NULL, "
+                "CONSTRAINT ck_execution_signal_type CHECK ("
+                "signal_type IN ('command', 'attention_decided', 'timer', "
+                "'operation_settled', 'external_event', 'publication_retry', "
+                "'scheduled_start')))"
+            )
+        )
+
+    command.upgrade(config, "20260811_0048")
+    command.upgrade(config, "20260811_0048")
+    with engine.connect() as connection:
+        inspector = inspect(connection)
+        assert "dynamic_task_quota_leases" in inspector.get_table_names()
+        assert {
+            "uq_dynamic_quota_scope_slot",
+            "uq_dynamic_quota_holder_scope",
+        }.issubset(
+            {
+                str(item["name"])
+                for item in inspector.get_unique_constraints("dynamic_task_quota_leases")
+            }
+        )
+        signal_checks = {
+            item["name"]: item["sqltext"]
+            for item in inspector.get_check_constraints("execution_signals")
+        }
+        assert "capacity_retry" in signal_checks["ck_execution_signal_type"]
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO dynamic_task_quota_leases "
+                "(id, tenant_id, scope_type, scope_ref, slot_number, holder_type, holder_id, acquired_at) "
+                "VALUES ('quota_1', 'tenant_a', 'tenant', 'tenant_a', 0, "
+                "'execution', 'execution_a', '2026-08-11 00:00:00')"
+            )
+        )
+
+    with pytest.raises(RuntimeError, match="active dynamic task quota leases"):
+        command.downgrade(config, "20260811_0047")
+
+    with engine.begin() as connection:
+        connection.execute(text("DELETE FROM dynamic_task_quota_leases"))
+    command.downgrade(config, "20260811_0047")
+    with engine.connect() as connection:
+        assert "dynamic_task_quota_leases" not in inspect(connection).get_table_names()
+        signal_checks = {
+            item["name"]: item["sqltext"]
+            for item in inspect(connection).get_check_constraints("execution_signals")
+        }
+        assert "capacity_retry" not in signal_checks["ck_execution_signal_type"]
+
+
 def test_agent_gallery_pagination_indexes_migration_is_reversible(tmp_path) -> None:
     """验证 0034 创建员工广场分页索引且降级保留员工数据。"""
 
@@ -2692,6 +3013,158 @@ def test_execution_artifact_migration_is_repeatable_and_guards_facts(tmp_path) -
         )
     with pytest.raises(RuntimeError, match="cannot downgrade execution artifacts"):
         command.downgrade(config, "20260803_0040")
+
+
+def test_connection_profile_migration_is_repeatable_and_guards_secrets(tmp_path) -> None:
+    """验证 0042 可重复升级、包含解析索引，并拒绝删除已有密钥事实。"""
+
+    database_url = f"sqlite:///{tmp_path / 'connection-profiles.db'}"
+    config = Config(str(BACKEND_DIR / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
+    config.attributes["database_url"] = database_url
+    engine = create_engine(database_url)
+    _prepare_0039_execution_control_database(engine, config)
+    with engine.begin() as connection:
+        for table_name in ("tenants", "users", "agent_profiles"):
+            connection.execute(text(f"CREATE TABLE {table_name} (id VARCHAR(512) PRIMARY KEY)"))
+    command.upgrade(config, "20260810_0042")
+    command.upgrade(config, "20260810_0042")
+    with engine.connect() as connection:
+        inspector = inspect(connection)
+        assert {
+            "connection_secrets",
+            "connection_profiles",
+            "agent_connection_bindings",
+            "connection_command_receipts",
+            "connection_oauth_states",
+        } <= set(inspector.get_table_names())
+        binding_indexes = {
+            item["name"] for item in inspector.get_indexes("agent_connection_bindings")
+        }
+        assert "ix_agent_connection_bindings_resolve" in binding_indexes
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO connection_secrets ("
+                "id, tenant_id, provider, reference_id, encrypted_payload, revision, status, "
+                "created_at, updated_at) VALUES ("
+                "'secret_1', 'tenant_1', 'slack', 'ref_1', 'ciphertext', 1, 'active', "
+                "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+        )
+    with pytest.raises(RuntimeError, match="cannot downgrade connection profiles"):
+        command.downgrade(config, "20260804_0041")
+
+
+def test_connector_inbound_migration_is_repeatable_and_guards_received_facts(tmp_path) -> None:
+    """验证 0043 可重复升级并拒绝通过回退删除已经确认接收的外部事件。"""
+
+    database_url = f"sqlite:///{tmp_path / 'connector-inbound.db'}"
+    config = Config(str(BACKEND_DIR / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
+    config.attributes["database_url"] = database_url
+    engine = create_engine(database_url)
+    _prepare_0039_execution_control_database(engine, config)
+    with engine.begin() as connection:
+        for table_name in ("tenants", "users", "agent_profiles"):
+            connection.execute(text(f"CREATE TABLE {table_name} (id VARCHAR(512) PRIMARY KEY)"))
+    command.upgrade(config, "20260810_0043")
+    command.upgrade(config, "20260810_0043")
+    with engine.connect() as connection:
+        inspector = inspect(connection)
+        assert "connector_inbound_events" in inspector.get_table_names()
+        indexes = {
+            item["name"] for item in inspector.get_indexes("connector_inbound_events")
+        }
+        assert "ix_connector_inbound_dispatch" in indexes
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO connector_inbound_events ("
+                "id, tenant_id, provider, profile_id, external_event_id, payload_checksum, "
+                "encrypted_payload, event_type, status, attempt_count, available_at, "
+                "created_at, updated_at) VALUES ("
+                "'event_1', 'tenant_1', 'wecom', 'profile_1', 'message_1', :checksum, "
+                "'ciphertext', 'text', 'pending', 0, CURRENT_TIMESTAMP, "
+                "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            ),
+            {"checksum": "a" * 64},
+        )
+    with pytest.raises(RuntimeError, match="cannot downgrade connector inbox"):
+        command.downgrade(config, "20260810_0042")
+
+
+def test_controlled_write_migration_backfills_and_guards_authorization_facts(tmp_path) -> None:
+    """验证 0045 双方言安全字段、空白名单回填及已有写授权事实的降级拒绝。"""
+
+    database_url = f"sqlite:///{tmp_path / 'controlled-writes.db'}"
+    config = Config(str(BACKEND_DIR / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
+    config.attributes["database_url"] = database_url
+    engine = create_engine(database_url)
+    _prepare_0039_execution_control_database(engine, config)
+    with engine.begin() as connection:
+        for table_name in ("tenants", "users", "agent_profiles"):
+            connection.execute(text(f"CREATE TABLE {table_name} (id VARCHAR(512) PRIMARY KEY)"))
+    command.upgrade(config, "20260810_0044")
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "ALTER TABLE agent_connection_bindings "
+                "ADD COLUMN allowed_actions_json JSON NULL"
+            )
+        )
+        connection.execute(
+            text(
+                "ALTER TABLE sop_operations "
+                "ADD COLUMN authorization_evidence_json JSON NULL"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO agent_connection_bindings ("
+                "id, tenant_id, agent_id, profile_id, allowed_scopes_json, enabled, revision, "
+                "created_by_user_id, updated_by_user_id, created_at, updated_at) VALUES ("
+                "'binding_1', 'tenant_1', 'agent_1', 'profile_1', '[]', 1, 1, "
+                "'user_1', 'user_1', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+        )
+    command.upgrade(config, "20260810_0045")
+    command.upgrade(config, "20260810_0045")
+    with engine.connect() as connection:
+        inspector = inspect(connection)
+        binding_columns = {
+            item["name"]: item for item in inspector.get_columns("agent_connection_bindings")
+        }
+        operation_columns = {
+            item["name"]: item for item in inspector.get_columns("sop_operations")
+        }
+        assert binding_columns["allowed_actions_json"]["nullable"] is False
+        assert operation_columns["authorization_evidence_json"]["nullable"] is False
+        assert {
+            "approval_work_item_id",
+            "approval_fingerprint",
+            "approved_by_user_id",
+            "approved_at",
+            "authorization_evidence_json",
+            "dispatched_at",
+        } <= set(operation_columns)
+        assert connection.execute(
+            text(
+                "SELECT allowed_actions_json FROM agent_connection_bindings "
+                "WHERE id = 'binding_1'"
+            )
+        ).scalar_one() == "[]"
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE agent_connection_bindings "
+                "SET allowed_actions_json = :actions WHERE id = 'binding_1'"
+            ),
+            {"actions": '["wecom.message_send"]'},
+        )
+    with pytest.raises(RuntimeError, match="cannot downgrade controlled writes"):
+        command.downgrade(config, "20260810_0044")
 
 
 def test_desktop_sqlite_rebuilds_legacy_work_item_as_typed_attention(tmp_path) -> None:

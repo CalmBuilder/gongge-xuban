@@ -1,5 +1,5 @@
 """
-@Time       : 2026/08/04 01:04
+@Time       : 2026/08/10 19:55
 @Author     : zhanglp8181
 @File       : execution_control.py
 @CallChain  : Attention/Execution API/Workers → ExecutionControlService → Execution Store/SQLModel
@@ -106,6 +106,7 @@ class ExecutionControlService:
         source_ref: str | None = None,
         required: bool = True,
         node_execution: SopNodeExecution | None = None,
+        exclude_initiator: bool = False,
     ) -> tuple[SopWorkItem, bool]:
         """在 execution 写屏障内按稳定身份幂等创建一条 typed Attention。"""
 
@@ -160,7 +161,7 @@ class ExecutionControlService:
             required=required,
             allowed_outcomes_json=commands,
             initiator_user_id=instance.initiator_user_id,
-            exclude_initiator=False,
+            exclude_initiator=exclude_initiator,
             created_at=now,
             updated_at=now,
         )
@@ -323,6 +324,15 @@ class ExecutionControlService:
         )
         if not command_allowed:
             raise ExecutionControlError("ATTENTION_COMMAND_FORBIDDEN", "命令不在 Attention 允许集合中。")
+        if (
+            attention.attention_kind == "exception"
+            and command in {"confirm_applied", "confirm_not_applied"}
+            and not (comment or "").strip()
+        ):
+            raise ExecutionControlError(
+                "ATTENTION_COMMENT_REQUIRED",
+                "外部效果人工对账必须填写证据说明。",
+            )
         from app.sop_runtime.work_items import SopWorkItemService
 
         self.store.authorize_mutation(instance, "attention.resolve")
@@ -410,6 +420,7 @@ class ExecutionControlService:
         payload: Mapping[str, object] | None = None,
         priority: int = 0,
         max_attempts: int = 8,
+        available_at: datetime | None = None,
     ) -> ExecutionSignal:
         """按因果事实去重写入恢复信号；signal 本身不授予 execution 推进权。"""
 
@@ -449,7 +460,7 @@ class ExecutionControlService:
             payload_checksum=canonical_checksum(body),
             priority=priority,
             max_attempts=max_attempts,
-            available_at=now,
+            available_at=max(now, available_at) if available_at is not None else now,
             created_at=now,
             updated_at=now,
         )
@@ -808,6 +819,117 @@ class ExecutionControlService:
         publication.receipt_json = {"message_id": message_id}
         publication.settled_at = self.store.database_now()
         publication.updated_at = publication.settled_at
+        self.db.add(publication)
+        self.db.flush()
+
+    def ensure_external_publication(
+        self,
+        instance: SopInstance,
+        result: ExecutionResult,
+        *,
+        thread_binding_id: str,
+    ) -> tuple[ExecutionPublication, bool]:
+        """为 Connector 发起的 Execution 幂等创建同线程 required 外部发布。"""
+
+        self._assert_instance(instance)
+        if result.execution_id != instance.id or result.tenant_id != instance.tenant_id:
+            raise ExecutionControlError("PUBLICATION_RESULT_MISMATCH", "结果不属于当前 Execution。")
+        target_ref = thread_binding_id.strip()
+        if not target_ref:
+            raise ExecutionControlError("PUBLICATION_TARGET_REQUIRED", "外部线程目标不能为空。")
+        existing = self.db.exec(
+            select(ExecutionPublication).where(
+                ExecutionPublication.tenant_id == instance.tenant_id,
+                ExecutionPublication.execution_id == instance.id,
+                ExecutionPublication.result_id == result.id,
+                ExecutionPublication.target_type == "external_thread",
+            )
+        ).first()
+        if existing is not None:
+            if existing.target_ref != target_ref:
+                raise ExecutionControlError(
+                    "PUBLICATION_TARGET_CONFLICT", "结果已经绑定另一外部线程。"
+                )
+            return existing, False
+        self.store.authorize_mutation(instance, "publication.external.create")
+        publication = ExecutionPublication(
+            tenant_id=instance.tenant_id,
+            execution_id=instance.id,
+            result_id=result.id,
+            publication_key=canonical_checksum(
+                {
+                    "tenant_id": instance.tenant_id,
+                    "execution_id": instance.id,
+                    "result_id": result.id,
+                    "target_type": "external_thread",
+                    "target_ref": target_ref,
+                }
+            ),
+            target_type="external_thread",
+            target_ref=target_ref,
+            required=True,
+            status="pending",
+        )
+        self.db.add(publication)
+        self.db.flush()
+        return publication, True
+
+    def settle_external_publication(
+        self,
+        instance: SopInstance,
+        publication: ExecutionPublication,
+        *,
+        outbox_id: str,
+        receipt: Mapping[str, object],
+    ) -> None:
+        """在 Execution 写屏障内以已结算 outbox 回执完成 required 外部发布。"""
+
+        if (
+            publication.execution_id != instance.id
+            or publication.tenant_id != instance.tenant_id
+            or publication.target_type != "external_thread"
+        ):
+            raise ExecutionControlError("PUBLICATION_EXECUTION_MISMATCH", "外部发布归属错误。")
+        if publication.status == "settled":
+            if publication.outbox_id != outbox_id:
+                raise ExecutionControlError(
+                    "PUBLICATION_RECEIPT_CONFLICT", "外部发布已由另一 outbox 结算。"
+                )
+            return
+        self.store.authorize_mutation(instance, "publication.external.settle")
+        publication.status = "settled"
+        publication.outbox_id = outbox_id
+        publication.receipt_json = dict(receipt)
+        publication.settled_at = self.store.database_now()
+        publication.updated_at = publication.settled_at
+        self.db.add(publication)
+        self.db.flush()
+
+    def record_external_publication_status(
+        self,
+        instance: SopInstance,
+        publication: ExecutionPublication,
+        *,
+        status: str,
+        outbox_id: str,
+        error: Mapping[str, object] | None = None,
+    ) -> None:
+        """在写屏障内同步外部 outbox 的非成功状态，unknown/dead letter 继续阻塞终态。"""
+
+        if status not in {"pending", "delivering", "unknown", "dead_letter"}:
+            raise ExecutionControlError("PUBLICATION_STATUS_INVALID", "外部发布状态不合法。")
+        if (
+            publication.execution_id != instance.id
+            or publication.tenant_id != instance.tenant_id
+            or publication.target_type != "external_thread"
+            or publication.status == "settled"
+        ):
+            raise ExecutionControlError("PUBLICATION_EXECUTION_MISMATCH", "外部发布归属或终态错误。")
+        self.store.authorize_mutation(instance, "publication.external.status")
+        publication.status = status
+        publication.outbox_id = outbox_id
+        publication.error_json = dict(error or {})
+        publication.updated_at = self.store.database_now()
         self.db.add(publication)
         self.db.flush()
 

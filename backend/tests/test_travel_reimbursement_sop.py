@@ -8,6 +8,9 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, tzinfo
+
+import pytest
 from sqlmodel import SQLModel, Session, create_engine, select
 
 from app.db.demo_sop_versions import (
@@ -29,8 +32,21 @@ def _definition():
     return compile_legacy_skill_card(_travel_reimbursement_deterministic_content({}))
 
 
-def test_travel_policy_assessment_freezes_domestic_staff_lodging_rules() -> None:
+def test_travel_policy_assessment_freezes_domestic_staff_lodging_rules(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """验证境内普通员工住宿档位、晚数、限额和超标金额均由确定性回执产生。"""
+
+    class FrozenDatetime(datetime):
+        """把演示政策判断冻结在行程结束后的有效提交窗口内。"""
+
+        @classmethod
+        def now(cls, tz: tzinfo | None = None) -> "FrozenDatetime":
+            """返回固定 UTC 时点，防止用例随真实日期越过十四天门限。"""
+
+            return cls(2026, 7, 27, tzinfo=tz or UTC)
+
+    monkeypatch.setattr("app.public_mock.service.datetime", FrozenDatetime)
 
     within = execute_public_mock(
         "expense.travel_policy_assess",

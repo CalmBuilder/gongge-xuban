@@ -1,11 +1,19 @@
+"""
+@Time       : 2026/08/10 16:25
+@Author     : zhanglp8181
+@File       : permissions.py
+@CallChain  : API/Connector Runtime → tenant/Agent permission predicates → allow or reject
+@Description: 集中维护租户管理、Agent 治理和跨入口聊天使用权限。
+"""
+
 from __future__ import annotations
 
 from fastapi import Depends, HTTPException, Query
-from sqlmodel import Session
+from sqlmodel import Session, select
 
 from app.agents.identity import agent_is_published, agent_owner_user_id
 from app.db import get_session
-from app.db.models import AgentProfile, User
+from app.db.models import AgentProfile, AgentUsage, User
 from app.security.auth import ensure_current_user_tenant, get_current_user
 
 ADMIN_ROLE = "admin"
@@ -82,3 +90,26 @@ def agent_owned_by_user(row: AgentProfile, user: User) -> bool:
     """按正式 owner 用户 ID 判断管理责任，兼容尚未回填的历史 metadata。"""
 
     return agent_owner_user_id(row) == user.id
+
+
+def can_use_agent_in_chat(
+    db: Session,
+    row: AgentProfile,
+    user: User,
+) -> bool:
+    """统一判断用户能否在交互入口使用 Agent，防止连接器绕过聊天使用关系。"""
+
+    if row.tenant_id != user.tenant_id or row.status != "active" or row.is_overall:
+        return False
+    if agent_owned_by_user(row, user):
+        return True
+    if not agent_is_published(row):
+        return False
+    usage = db.exec(
+        select(AgentUsage).where(
+            AgentUsage.tenant_id == row.tenant_id,
+            AgentUsage.user_id == user.id,
+            AgentUsage.agent_id == row.id,
+        )
+    ).first()
+    return usage is not None

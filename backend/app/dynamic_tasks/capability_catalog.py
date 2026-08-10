@@ -1,5 +1,5 @@
 """
-@Time       : 2026/08/03 23:42
+@Time       : 2026/08/10 18:55
 @Author     : zhanglp8181
 @File       : capability_catalog.py
 @CallChain  : Tool/GeneralSkill publish → capability catalog → DynamicTaskAgent dispatch
@@ -24,7 +24,29 @@ from app.agents.branching import (
     is_open_gallery_resource,
     visible_tool_rows,
 )
-from app.db.models import AgentResourceBinding, GeneralSkill, ModelConfig, Tool, utc_now
+from app.connectors.service import (
+    CONNECTION_READ_PERMISSION_CODE,
+    CONNECTION_WRITE_PERMISSION_CODE,
+    ConnectionError,
+    authorize_connection_read_actor,
+    authorize_connection_write_actor,
+)
+from app.connectors.wecom import (
+    WECOM_APPLICATION_INFO_ACTION,
+    WECOM_APPLICATION_READ_SCOPE,
+    WECOM_MESSAGE_SEND_ACTION,
+)
+from app.db.models import (
+    AgentConnectionBinding,
+    AgentResourceBinding,
+    ConnectionProfile,
+    ConnectorThreadBinding,
+    GeneralSkill,
+    ModelConfig,
+    Tool,
+    User,
+    utc_now,
+)
 from app.organization.agent_execution import AgentExecutionAuthorizer, AgentExecutionDenied
 
 
@@ -142,6 +164,7 @@ class ToolReliabilityContract(BaseModel):
     model_visibility: ModelVisibilityContract = Field(default_factory=ModelVisibilityContract)
     timeout_policy: Literal["failed", "unknown"]
     dynamic_task_enabled: bool = False
+    explore_safe: bool = False
     model_config = ConfigDict(extra="forbid")
 
     @model_validator(mode="after")
@@ -172,6 +195,13 @@ class ToolReliabilityContract(BaseModel):
             raise ValueError("首期破坏性能力必须禁止")
         if self.dynamic_task_enabled and self.risk_class == "destructive":
             raise ValueError("破坏性能力不得进入首期动态目录")
+        if self.explore_safe and (
+            not self.dynamic_task_enabled
+            or self.risk_class != "read"
+            or self.side_effect != "none"
+            or self.confirmation_policy != "none"
+        ):
+            raise ValueError("Explore 只允许显式启用的无副作用纯读工具")
         return self
 
 
@@ -186,7 +216,7 @@ class CapabilityViews(BaseModel):
 class CapabilitySnapshot(BaseModel):
     """保存计划/操作引用的不可变能力事实，不承载持续授权。"""
 
-    capability_type: Literal["tool", "general_skill", "knowledge"]
+    capability_type: Literal["tool", "general_skill", "knowledge", "connector"]
     capability_id: str
     tenant_id: str
     agent_id: str
@@ -210,6 +240,15 @@ def capability_checksum(value: object) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _tool_contract_payload(contract: ToolReliabilityContract) -> dict[str, Any]:
+    """序列化发布契约，并在默认关闭时保持既有 checksum 向后兼容。"""
+
+    payload = contract.model_dump(mode="json")
+    if payload.get("explore_safe") is False:
+        payload.pop("explore_safe", None)
+    return payload
 
 
 def project_tool_capability(tool: Tool, contract: ToolReliabilityContract) -> CapabilityViews:
@@ -238,7 +277,7 @@ def project_tool_capability(tool: Tool, contract: ToolReliabilityContract) -> Ca
         "tool_type": tool.tool_type,
         "method": tool.method,
         "url": tool.url,
-        "contract": contract.model_dump(mode="json"),
+        "contract": _tool_contract_payload(contract),
         "input_schema": dict(tool.input_schema or {}),
         "output_schema": dict(tool.output_schema or {}),
     }
@@ -255,7 +294,7 @@ def publish_tool_contract(
         tool.reliability_checksum = None
         tool.reliability_published_at = None
         return
-    tool.reliability_contract_json = contract.model_dump(mode="json")
+    tool.reliability_contract_json = _tool_contract_payload(contract)
     tool.reliability_checksum = None
     snapshot = DynamicCapabilityCatalog._tool_snapshot(tool, "__publication__", contract)
     tool.reliability_checksum = snapshot.checksum
@@ -294,6 +333,107 @@ class DynamicCapabilityCatalog:
             snapshots.append(self._tool_snapshot(tool, agent_id, contract))
         return snapshots
 
+    def list_connector_reads(
+        self,
+        tenant_id: str,
+        agent_id: str,
+        actor_user_id: str,
+    ) -> list[CapabilitySnapshot]:
+        """把明确绑定且当前健康可用的 provider 账号投影为只读能力。"""
+
+        try:
+            authorize_connection_read_actor(
+                self.db,
+                tenant_id=tenant_id,
+                actor_user_id=actor_user_id,
+            )
+        except ConnectionError:
+            return []
+
+        bindings = self.db.exec(
+            select(AgentConnectionBinding).where(
+                AgentConnectionBinding.tenant_id == tenant_id,
+                AgentConnectionBinding.agent_id == agent_id,
+                AgentConnectionBinding.enabled.is_(True),
+            )
+        ).all()
+        snapshots: list[CapabilitySnapshot] = []
+        for binding in bindings:
+            profile = self.db.get(ConnectionProfile, binding.profile_id)
+            if profile is None or profile.tenant_id != tenant_id or profile.status != "active":
+                continue
+            if (
+                profile.provider == "slack"
+                and "channels:read" in set(binding.allowed_scopes_json or [])
+                and "channels:read" in set(profile.granted_scopes_json or [])
+                and "slack.channel_info" in set(profile.tool_allowlist_json or [])
+            ):
+                snapshots.append(self._slack_channel_snapshot(profile, binding))
+            elif (
+                profile.provider == "wecom"
+                and WECOM_APPLICATION_READ_SCOPE in set(binding.allowed_scopes_json or [])
+                and WECOM_APPLICATION_READ_SCOPE in set(profile.granted_scopes_json or [])
+                and WECOM_APPLICATION_INFO_ACTION in set(profile.tool_allowlist_json or [])
+            ):
+                snapshots.append(self._wecom_application_snapshot(profile, binding))
+        return snapshots
+
+    def list_connector_writes(
+        self,
+        tenant_id: str,
+        agent_id: str,
+        actor_user_id: str,
+        session_id: str,
+        *,
+        source_kind: str = "chat",
+        source_ref: str | None = None,
+    ) -> list[CapabilitySnapshot]:
+        """为交互线程投影一次性批准能力，为调度来源投影精确长期规则能力。"""
+
+        if source_kind == "schedule" and source_ref:
+            from app.dynamic_tasks.standing_approvals import scheduled_write_snapshots
+
+            return scheduled_write_snapshots(
+                self.db,
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                initiator_user_id=actor_user_id,
+                run_id=source_ref,
+            )
+
+        thread = self.db.exec(
+            select(ConnectorThreadBinding).where(
+                ConnectorThreadBinding.tenant_id == tenant_id,
+                ConnectorThreadBinding.session_id == session_id,
+                ConnectorThreadBinding.agent_id == agent_id,
+                ConnectorThreadBinding.user_id == actor_user_id,
+                ConnectorThreadBinding.provider == "wecom",
+                ConnectorThreadBinding.status == "active",
+            )
+        ).first()
+        if thread is None:
+            return []
+        profile = self.db.get(ConnectionProfile, thread.profile_id)
+        binding = self.db.exec(
+            select(AgentConnectionBinding).where(
+                AgentConnectionBinding.tenant_id == tenant_id,
+                AgentConnectionBinding.agent_id == agent_id,
+                AgentConnectionBinding.profile_id == thread.profile_id,
+                AgentConnectionBinding.enabled.is_(True),
+            )
+        ).first()
+        if (
+            profile is None
+            or profile.tenant_id != tenant_id
+            or profile.status != "active"
+            or binding is None
+            or WECOM_MESSAGE_SEND_ACTION not in set(profile.tool_allowlist_json or [])
+            or WECOM_MESSAGE_SEND_ACTION not in set(binding.allowed_actions_json or [])
+            or not self.write_approver_ids(tenant_id, exclude_user_id=actor_user_id)
+        ):
+            return []
+        return [self._wecom_message_snapshot(profile, binding, thread)]
+
     def resolve_tool(
         self, tenant_id: str, agent_id: str, operation_name: str
     ) -> CapabilitySnapshot:
@@ -303,6 +443,248 @@ class DynamicCapabilityCatalog:
             if snapshot.name == operation_name:
                 return snapshot
         raise CapabilityAccessDenied("CAPABILITY_NOT_AVAILABLE")
+
+    @staticmethod
+    def _slack_channel_snapshot(
+        profile: ConnectionProfile,
+        binding: AgentConnectionBinding,
+    ) -> CapabilitySnapshot:
+        """生成不含 token、secret reference 和可变健康状态的 Slack 只读快照。"""
+
+        name = f"slack.channel_info@{profile.id}"
+        payload = {
+            "capability_type": "connector",
+            "capability_id": profile.id,
+            "tenant_id": profile.tenant_id,
+            "name": name,
+            "contract": {
+                "risk_class": "read",
+                "side_effect": "none",
+                "required_permission_code": CONNECTION_READ_PERMISSION_CODE,
+                "provider": "slack",
+                "required_scope": "channels:read",
+                "required_action": "slack.channel_info",
+            },
+            "model_view": {
+                "name": name,
+                "display_name": f"读取 Slack 频道信息（{profile.display_name}）",
+                "description": "按频道 ID 读取该工作区中当前应用可见的频道基础信息。",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "channel_id": {
+                            "type": "string",
+                            "description": "Slack 频道 ID",
+                        }
+                    },
+                    "required": ["channel_id"],
+                },
+                "output_schema": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "name": {"type": "string"},
+                        "is_private": {"type": "boolean"},
+                        "is_archived": {"type": "boolean"},
+                        "topic": {"type": "object", "additionalProperties": True},
+                        "purpose": {"type": "object", "additionalProperties": True},
+                    },
+                    "additionalProperties": False,
+                },
+            },
+            "user_view": {
+                "name": "Slack 频道信息",
+                "account_display_name": profile.display_name,
+            },
+            "audit_view": {
+                "provider": "slack",
+                "profile_id": profile.id,
+                "account_id": profile.account_id,
+                "binding_id": binding.id,
+                "required_scope": "channels:read",
+                "required_action": "slack.channel_info",
+            },
+        }
+        return CapabilitySnapshot(
+            **payload,
+            agent_id=binding.agent_id,
+            checksum=capability_checksum(payload),
+        )
+
+    @staticmethod
+    def _wecom_application_snapshot(
+        profile: ConnectionProfile,
+        binding: AgentConnectionBinding,
+    ) -> CapabilitySnapshot:
+        """生成不含 CorpID、AgentID、Secret、token 或密钥引用的企业微信只读快照。"""
+
+        name = f"{WECOM_APPLICATION_INFO_ACTION}@{profile.id}"
+        payload = {
+            "capability_type": "connector",
+            "capability_id": profile.id,
+            "tenant_id": profile.tenant_id,
+            "name": name,
+            "contract": {
+                "risk_class": "read",
+                "side_effect": "none",
+                "required_permission_code": CONNECTION_READ_PERMISSION_CODE,
+                "provider": "wecom",
+                "required_scope": WECOM_APPLICATION_READ_SCOPE,
+                "required_action": WECOM_APPLICATION_INFO_ACTION,
+                "required_result_evidence_paths": ["name", "enabled", "home_url"],
+            },
+            "model_view": {
+                "name": name,
+                "display_name": f"读取企业微信应用信息（{profile.display_name}）",
+                "description": "读取当前已绑定自建应用的名称、状态和基础说明，不读取成员信息。",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+                "output_schema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "enabled": {"type": "boolean"},
+                        "home_url": {"type": "string"},
+                    },
+                    "required": ["name", "enabled", "home_url"],
+                    "additionalProperties": False,
+                },
+            },
+            "user_view": {
+                "name": "企业微信应用信息",
+                "account_display_name": profile.display_name,
+            },
+            "audit_view": {
+                "provider": "wecom",
+                "profile_id": profile.id,
+                "account_id": profile.account_id,
+                "binding_id": binding.id,
+                "required_scope": WECOM_APPLICATION_READ_SCOPE,
+                "required_action": WECOM_APPLICATION_INFO_ACTION,
+            },
+        }
+        return CapabilitySnapshot(
+            **payload,
+            agent_id=binding.agent_id,
+            checksum=capability_checksum(payload),
+        )
+
+    @staticmethod
+    def _wecom_message_snapshot(
+        profile: ConnectionProfile,
+        binding: AgentConnectionBinding,
+        thread: ConnectorThreadBinding,
+    ) -> CapabilitySnapshot:
+        """冻结当前线程目标与连接修订，模型只可生成待批准正文。"""
+
+        name = f"{WECOM_MESSAGE_SEND_ACTION}@{profile.id}"
+        target_checksum = capability_checksum(
+            {
+                "tenant_id": profile.tenant_id,
+                "profile_id": profile.id,
+                "thread_binding_id": thread.id,
+                "agent_id": binding.agent_id,
+            }
+        )
+        payload = {
+            "capability_type": "connector",
+            "capability_id": profile.id,
+            "tenant_id": profile.tenant_id,
+            "name": name,
+            "contract": {
+                "risk_class": "external_write",
+                "side_effect": "external",
+                "confirmation_policy": "once",
+                "required_permission_code": CONNECTION_WRITE_PERMISSION_CODE,
+                "provider": "wecom",
+                "required_scope": WECOM_APPLICATION_READ_SCOPE,
+                "required_action": WECOM_MESSAGE_SEND_ACTION,
+                "canonical_target": f"wecom_thread:{thread.id}",
+                "target_checksum": target_checksum,
+                "profile_revision": profile.revision,
+                "secret_revision": profile.secret_revision,
+                "binding_revision": binding.revision,
+                "idempotency": {
+                    "mode": "provider_duplicate_check",
+                    "window_seconds": 1800,
+                },
+                "reconcile": {"supported": False, "fallback": "exception_attention"},
+                "required_result_evidence_paths": ["delivery_status"],
+            },
+            "model_view": {
+                "name": name,
+                "display_name": f"向当前企业微信会话发送消息（{profile.display_name}）",
+                "description": "生成待审批的精确消息正文；批准前不会调用企业微信发送接口。",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "content": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 4000,
+                            "description": "将原样展示给审批人并发送到当前线程的正文",
+                        }
+                    },
+                    "required": ["content"],
+                    "additionalProperties": False,
+                },
+                "output_schema": {
+                    "type": "object",
+                    "properties": {
+                        "delivery_status": {"type": "string"},
+                        "message_id": {"type": "string"},
+                    },
+                    "required": ["delivery_status", "message_id"],
+                    "additionalProperties": False,
+                },
+            },
+            "user_view": {
+                "name": "企业微信审批后发送",
+                "account_display_name": profile.display_name,
+                "target": "当前企业微信会话",
+            },
+            "audit_view": {
+                "provider": "wecom",
+                "profile_id": profile.id,
+                "profile_revision": profile.revision,
+                "secret_revision": profile.secret_revision,
+                "binding_id": binding.id,
+                "binding_revision": binding.revision,
+                "thread_binding_id": thread.id,
+                "target_checksum": target_checksum,
+            },
+        }
+        return CapabilitySnapshot(
+            **payload,
+            agent_id=binding.agent_id,
+            checksum=capability_checksum(payload),
+        )
+
+    def write_approver_ids(self, tenant_id: str, *, exclude_user_id: str) -> list[str]:
+        """返回当前仍具外部写权限的活动非发起人，防止规划不可办理动作。"""
+
+        users = self.db.exec(
+            select(User).where(
+                User.tenant_id == tenant_id,
+                User.membership_status == "active",
+                User.id != exclude_user_id,
+            )
+        ).all()
+        approved: list[str] = []
+        for user in users:
+            try:
+                authorize_connection_write_actor(
+                    self.db,
+                    tenant_id=tenant_id,
+                    actor_user_id=user.id,
+                )
+            except ConnectionError:
+                continue
+            approved.append(user.id)
+        return approved
 
     def list_general_skills(
         self, tenant_id: str, agent_id: str
@@ -433,7 +815,7 @@ class DynamicCapabilityCatalog:
             "capability_id": tool.id,
             "tenant_id": tool.tenant_id,
             "name": tool.name,
-            "contract": contract.model_dump(mode="json"),
+            "contract": _tool_contract_payload(contract),
             "model_view": views.model,
             "user_view": views.user,
             "audit_view": views.audit,

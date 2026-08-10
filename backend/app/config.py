@@ -9,7 +9,7 @@
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.brand import desktop_env_value
@@ -47,6 +47,25 @@ class Settings(BaseSettings):
     dynamic_task_router_shadow_enabled: bool = False
     dynamic_task_execution_enabled: bool = False
     dynamic_task_steering_enabled: bool = False
+    dynamic_task_external_write_enabled: bool = False
+    dynamic_task_standing_approval_enabled: bool = False
+    dynamic_task_explore_enabled: bool = False
+    dynamic_task_tenant_allowlist: str = ""
+    dynamic_task_agent_allowlist: str = ""
+    dynamic_task_signal_dispatch_workers: int = Field(default=4, ge=1, le=64)
+    dynamic_task_signal_dispatch_capacity: int = Field(default=16, ge=1, le=4096)
+    dynamic_task_alert_signal_backlog_threshold: int = Field(default=0, ge=0)
+    dynamic_task_alert_dead_letter_threshold: int = Field(default=0, ge=0)
+    dynamic_task_alert_unknown_operation_threshold: int = Field(default=0, ge=0)
+    dynamic_task_alert_publication_backlog_threshold: int = Field(default=0, ge=0)
+    dynamic_task_alert_waiting_age_seconds: int = Field(default=0, ge=0)
+    dynamic_task_max_active_per_tenant: int = Field(default=0, ge=0, le=4096)
+    dynamic_task_max_active_per_agent: int = Field(default=0, ge=0, le=1024)
+    dynamic_task_max_active_per_user: int = Field(default=0, ge=0, le=256)
+    dynamic_task_max_active_per_tool: int = Field(default=0, ge=0, le=1024)
+    slack_oauth_client_id: str = ""
+    slack_oauth_client_secret: str = ""
+    slack_oauth_redirect_uri: str = ""
     dynamic_task_router_shadow_timeout_seconds: float = Field(default=2.0, ge=0.1, le=30.0)
     dynamic_task_router_shadow_min_confidence: float = Field(default=0.7, ge=0.0, le=1.0)
     tool_timeout_seconds: float = 8.0
@@ -77,6 +96,67 @@ class Settings(BaseSettings):
         """移除工具服务基础地址末尾的斜杠，便于拼接请求路径。"""
         return self.tool_base_url.rstrip("/")
 
+    @staticmethod
+    def _identifier_allowlist(value: str) -> frozenset[str]:
+        """把逗号分隔灰度标识规范化为不可变集合，保留星号作为显式全量选择。"""
+
+        return frozenset(item.strip() for item in value.split(",") if item.strip())
+
+    def dynamic_task_rollout_allows(self, tenant_id: str, agent_id: str) -> bool:
+        """要求总开关、双灰度名单和生产告警阈值同时就绪，任一缺失均默认拒绝。"""
+
+        if (
+            not self.dynamic_task_execution_enabled
+            or not self.dynamic_task_alert_thresholds_configured
+            or not self.dynamic_task_quota_limits_configured
+        ):
+            return False
+        tenants = self._identifier_allowlist(self.dynamic_task_tenant_allowlist)
+        agents = self._identifier_allowlist(self.dynamic_task_agent_allowlist)
+        return ("*" in tenants or tenant_id in tenants) and (
+            "*" in agents or agent_id in agents
+        )
+
+    @property
+    def dynamic_task_alert_thresholds_configured(self) -> bool:
+        """要求五项运行停止阈值均由部署方填写正数，零保持显式未就绪语义。"""
+
+        return all(
+            value > 0
+            for value in (
+                self.dynamic_task_alert_signal_backlog_threshold,
+                self.dynamic_task_alert_dead_letter_threshold,
+                self.dynamic_task_alert_unknown_operation_threshold,
+                self.dynamic_task_alert_publication_backlog_threshold,
+                self.dynamic_task_alert_waiting_age_seconds,
+            )
+        )
+
+    @property
+    def dynamic_task_quota_limits_configured(self) -> bool:
+        """要求 tenant、Agent、用户和工具四级上限均为正数，零表示发布门禁未就绪。"""
+
+        return all(
+            value > 0
+            for value in (
+                self.dynamic_task_max_active_per_tenant,
+                self.dynamic_task_max_active_per_agent,
+                self.dynamic_task_max_active_per_user,
+                self.dynamic_task_max_active_per_tool,
+            )
+        )
+
+    @model_validator(mode="after")
+    def validate_dynamic_task_dispatch_capacity(self) -> "Settings":
+        """拒绝小于 worker 数的队列容量，避免配置后部分 worker 永远无法入队。"""
+
+        if self.dynamic_task_signal_dispatch_capacity < self.dynamic_task_signal_dispatch_workers:
+            raise ValueError(
+                "DYNAMIC_TASK_SIGNAL_DISPATCH_CAPACITY must be greater than or equal to "
+                "DYNAMIC_TASK_SIGNAL_DISPATCH_WORKERS"
+            )
+        return self
+
     @field_validator("public_mock_api_key")
     @classmethod
     def validate_public_mock_api_key(cls, value: str) -> str:
@@ -90,6 +170,23 @@ class Settings(BaseSettings):
     def general_skill_runtime_package_list(self) -> list[str]:
         """拆分并清理通用技能运行时配置中的非空包名。"""
         return [item.strip() for item in self.general_skill_runtime_packages.split(",") if item.strip()]
+
+    @property
+    def slack_oauth_configured(self) -> bool:
+        """仅在三项服务端 OAuth 配置齐全且回调使用 HTTPS 时启用 Slack 安装入口。"""
+
+        return bool(
+            self.slack_oauth_client_id.strip()
+            and self.slack_oauth_client_secret.strip()
+            and self.slack_oauth_redirect_uri.strip().startswith("https://")
+        )
+
+    @property
+    def connection_secret_backend_configured(self) -> bool:
+        """要求连接凭据使用非占位且长度足够的应用主密钥派生加密键。"""
+
+        value = self.app_secret.strip()
+        return len(value) >= 32 and value != "change-me-in-development"
 
 
 @lru_cache

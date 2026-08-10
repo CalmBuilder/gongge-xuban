@@ -112,6 +112,12 @@ const SYSTEM_NAV: NavItem[] = [
     governancePermissions: ['audit.read'],
   },
   { route: EnterpriseRoute.Models, label: '模型配置', Icon: IconModels },
+  {
+    route: EnterpriseRoute.Connections,
+    label: '外部连接',
+    Icon: IconGlobe,
+    governancePermissions: ['connection_profile.manage'],
+  },
 ];
 
 function primaryNavItems(

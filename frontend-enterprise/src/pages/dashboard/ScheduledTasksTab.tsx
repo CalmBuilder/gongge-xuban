@@ -25,6 +25,7 @@ import type {
 import { StatusBadge, TaskRunResultBadge, TaskStatusBadge } from '../scheduled-tasks/StatusBadge';
 import { TaskActionsMenu } from '../scheduled-tasks/TaskActionsMenu';
 import { TaskSection } from '../scheduled-tasks/TaskSection';
+import { StandingApprovalDialog } from '../scheduled-tasks/StandingApprovalDialog';
 import {
   ENTERPRISE_AGENT_STORAGE_KEY,
   RUN_FILTER_TABS,
@@ -73,6 +74,7 @@ export default function ScheduledTasksTab() {
   const [runModalPage, setRunModalPage] = useState(1);
   const [runModalTotal, setRunModalTotal] = useState(0);
   const [deleteTarget, setDeleteTarget] = useState<ScheduledTaskRead | null>(null);
+  const [standingApprovalTarget, setStandingApprovalTarget] = useState<ScheduledTaskRead | null>(null);
   const [deleting, setDeleting] = useState(false);
   const taskRequestIdRef = useRef(0);
   const runRequestIdRef = useRef(0);
@@ -311,6 +313,7 @@ export default function ScheduledTasksTab() {
       onEdit={(task) => navigate(`/enterprise/scheduled-tasks/${task.id}/edit`)}
       onRunNow={runNow}
       onToggleStatus={toggleStatus}
+      onStandingApproval={setStandingApprovalTarget}
       onDelete={remove}
     />
   );
@@ -641,6 +644,13 @@ export default function ScheduledTasksTab() {
         title={`删除定时任务「${deleteTarget?.title ?? ''}」？`}
         description="删除后不再唤醒该员工，历史执行记录会继续保留。"
         onConfirm={() => void confirmDelete()}
+      />
+      <StandingApprovalDialog
+        task={standingApprovalTarget}
+        open={Boolean(standingApprovalTarget)}
+        onOpenChange={(open) => {
+          if (!open) setStandingApprovalTarget(null);
+        }}
       />
     </>
   );

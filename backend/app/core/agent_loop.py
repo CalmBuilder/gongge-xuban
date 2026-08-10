@@ -36,6 +36,7 @@ from app.core.cancellation import clear_chat_turn_cancelled, is_chat_turn_cancel
 from app.core.conversation_context import build_conversation_context
 from app.core.non_sop_capability import (
     LlmDynamicTaskShadowSelector,
+    NonSopCapabilityDecision,
     NonSopCapabilityRouteResult,
     NonSopCapabilityRouter,
 )
@@ -61,13 +62,19 @@ from app.db.models import (
     ModelConfig,
     PersonaConfig,
     Skill,
+    ScheduledTaskRun,
     Tool,
     UIConfig,
     User,
     new_id,
     utc_now,
 )
-from app.dynamic_tasks.agent import DynamicTaskAgent, DynamicTaskAgentError
+from app.dynamic_tasks.agent import DynamicRunOutcome, DynamicTaskAgent, DynamicTaskAgentError
+from app.dynamic_tasks.quotas import (
+    DynamicTaskQuotaError,
+    DynamicTaskQuotaService,
+    quota_limits_from_settings,
+)
 from app.general_skills import GeneralSkillRunner, GeneralSkillSelector
 from app.general_skills.schema import GeneralSkillRunResponse, GeneralSkillSelection
 from app.knowledge import KnowledgeService
@@ -101,6 +108,7 @@ from app.session.session_schema import (
     StepAgentResult,
 )
 from app.sop_runtime.coordinator import DeterministicSopCoordinator
+from app.sop_runtime.execution_control import ExecutionControlService, canonical_checksum
 from app.sop_runtime.scheduler import RuntimeAction
 from app.tools import ToolExecutor
 from app.tools.tool_schema import ToolCall, ToolError, ToolResult
@@ -291,6 +299,8 @@ class AgentLoop:
             ),
             minimum_confidence=settings.dynamic_task_router_shadow_min_confidence,
         )
+        self._dynamic_task_rollout_allows = settings.dynamic_task_rollout_allows
+        self._dynamic_task_quota_limits = quota_limits_from_settings(settings)
         self.general_skill_runner = GeneralSkillRunner()
         self.tool_executor = ToolExecutor(db)
         self.deterministic_runtime = DeterministicSopCoordinator(db)
@@ -6757,11 +6767,50 @@ class AgentLoop:
         """只在独立 kill switch 生效且路由通过时委托 DynamicTaskAgent 完整执行。"""
 
         decision = route.effective_decision
+        if request.interaction_mode == "scheduled_task":
+            decision = NonSopCapabilityDecision(
+                mode="dynamic_task",
+                goal=request.message.strip(),
+                success_criteria=["完成调度目标并形成可审计的结果或明确等待事项"],
+                requires_durable_execution=True,
+                confidence=1.0,
+                reason="调度入口本身要求独立、可恢复且可审计的持久执行。",
+            )
         if decision.mode != "dynamic_task":
             return None
         if not chat_session.agent_id or not request.user_id:
             return None
+        rollout_check = getattr(self, "_dynamic_task_rollout_allows", None)
+        rollout_allowed = (
+            bool(rollout_check(request.tenant_id, chat_session.agent_id))
+            if callable(rollout_check)
+            else True
+        )
+        if not rollout_allowed:
+            self.events.record(
+                request.tenant_id,
+                chat_session.id,
+                "dynamic_task_rollout_denied",
+                self._turn_payload(
+                    {
+                        "reason_code": "DYNAMIC_TASK_ROLLOUT_DENIED",
+                        "agent_id": chat_session.agent_id,
+                        "source_kind": request.interaction_mode,
+                    },
+                    user_message_id,
+                ),
+            )
+            if request.interaction_mode == "scheduled_task":
+                raise DynamicTaskAgentError("DYNAMIC_TASK_ROLLOUT_DENIED")
+            return None
         dynamic_agent = DynamicTaskAgent(self.db)
+        quota_limits = getattr(self, "_dynamic_task_quota_limits", None)
+        dynamic_agent.quota_limits = quota_limits
+        source_kind, source_ref = self._dynamic_task_source(
+            request,
+            chat_session,
+            user_message_id,
+        )
         try:
             with self.db.begin_nested():
                 instance, created = dynamic_agent.start_task(
@@ -6772,7 +6821,8 @@ class AgentLoop:
                     goal=str(decision.goal or ""),
                     success_criteria=tuple(decision.success_criteria),
                     model_config=model_config,
-                    source_ref=user_message_id,
+                    source_ref=source_ref,
+                    source_kind=source_kind,
                     input_resource_ids=tuple(
                         item.resource_id
                         for item in request.attachments
@@ -6784,6 +6834,11 @@ class AgentLoop:
                         chat_session.agent_id,
                     ),
                 )
+                if created and quota_limits is not None:
+                    DynamicTaskQuotaService(self.db).acquire_execution(
+                        instance,
+                        limits=quota_limits,
+                    )
         except Exception as exc:
             failure_code = str(getattr(exc, "code", "") or type(exc).__name__)
             self.events.record(
@@ -6792,13 +6847,114 @@ class AgentLoop:
                 "dynamic_task_delegation_failed",
                 self._turn_payload({"code": failure_code[:128]}, user_message_id),
             )
-            return None
-        outcome = dynamic_agent.run_until_blocked_or_complete(
-            execution_id=instance.id,
-            model_config=model_config,
-            worker_id=f"chat:{user_message_id}",
-            actor_user_id=request.user_id,
-        )
+            raise DynamicTaskAgentError(failure_code[:128]) from exc
+        if source_kind == "schedule":
+            control = ExecutionControlService(self.db, dynamic_agent.store)
+            scheduled_run = self.db.get(ScheduledTaskRun, source_ref)
+            if scheduled_run is None or scheduled_run.tenant_id != request.tenant_id:
+                raise DynamicTaskAgentError("DYNAMIC_SCHEDULE_RUN_NOT_FOUND")
+            if scheduled_run.execution_id not in {None, instance.id}:
+                raise DynamicTaskAgentError("DYNAMIC_SCHEDULE_EXECUTION_CONFLICT")
+            scheduled_run.execution_id = instance.id
+            scheduled_run.updated_at = utc_now()
+            self.db.add(scheduled_run)
+            signal = control.enqueue_signal(
+                instance,
+                signal_type="scheduled_start",
+                causation_type="scheduled_task_run",
+                causation_id=source_ref,
+                payload={"scheduled_task_run_id": source_ref},
+                priority=10,
+            )
+            waiting_message = self._persist_dynamic_waiting_message(
+                chat_session=chat_session,
+                execution_id=instance.id,
+                blocking_step_key="scheduled_start",
+                user_message_id=user_message_id,
+            )
+            self.events.record(
+                request.tenant_id,
+                chat_session.id,
+                "dynamic_task_delegated",
+                self._turn_payload(
+                    {
+                        "execution_id": instance.id,
+                        "execution_created": created,
+                        "execution_status": "scheduled",
+                        "signal_id": signal.id,
+                    },
+                    user_message_id,
+                ),
+            )
+            self.db.commit()
+            self.db.refresh(chat_session)
+            return ChatTurnResponse(
+                reply=waiting_message.content,
+                session_id=chat_session.id,
+                router_decision=RouterDecision(
+                    decision="answer_only",
+                    reason="DynamicTaskAgent queued by a durable schedule signal.",
+                ),
+                step_result=StepAgentResult(
+                    reply=waiting_message.content,
+                    is_step_completed=False,
+                ),
+                session_state=public_session(chat_session),
+            )
+        try:
+            outcome = dynamic_agent.run_until_blocked_or_complete(
+                execution_id=instance.id,
+                model_config=model_config,
+                worker_id=f"chat:{user_message_id}",
+                actor_user_id=request.user_id,
+            )
+        except DynamicTaskQuotaError as exc:
+            control = ExecutionControlService(self.db, dynamic_agent.store)
+            signal = control.enqueue_signal(
+                instance,
+                signal_type="capacity_retry",
+                causation_type="quota_backpressure",
+                causation_id=f"{instance.id}:{instance.revision}",
+                payload={"reason_code": exc.code},
+                max_attempts=16,
+            )
+            self.events.record(
+                request.tenant_id,
+                chat_session.id,
+                "dynamic_task_capacity_deferred",
+                self._turn_payload(
+                    {
+                        "execution_id": instance.id,
+                        "signal_id": signal.id,
+                        "code": exc.code,
+                    },
+                    user_message_id,
+                ),
+            )
+            self.db.commit()
+            outcome = DynamicRunOutcome(
+                "waiting",
+                instance.id,
+                blocking_step_key="capacity_retry",
+            )
+        except Exception as exc:
+            failure_code = str(getattr(exc, "code", "") or type(exc).__name__)[:128]
+            dynamic_agent.fail_execution(
+                execution_id=instance.id,
+                worker_id=f"chat-failure:{user_message_id}",
+                error_code=failure_code,
+            )
+            self.events.record(
+                request.tenant_id,
+                chat_session.id,
+                "dynamic_task_execution_failed",
+                self._turn_payload(
+                    {"execution_id": instance.id, "code": failure_code},
+                    user_message_id,
+                ),
+            )
+            self.db.commit()
+            raise
         if outcome.status == "waiting" and outcome.blocking_step_key:
             waiting_message = self._persist_dynamic_waiting_message(
                 chat_session=chat_session,
@@ -6862,6 +7018,41 @@ class AgentLoop:
             session_state=public_session(chat_session),
         )
 
+    def _dynamic_task_source(
+        self,
+        request: ChatTurnRequest,
+        chat_session: ChatSession,
+        user_message_id: str,
+    ) -> tuple[str, str]:
+        """把交互入口解析为稳定来源身份，调度只信任已准备的同租户 run。"""
+
+        if request.channel == "wecom":
+            return "connector", user_message_id
+        if request.channel != "scheduled_task":
+            return "chat", user_message_id
+        run = self.db.exec(
+            select(ScheduledTaskRun).where(
+                ScheduledTaskRun.tenant_id == request.tenant_id,
+                ScheduledTaskRun.session_id == chat_session.id,
+                ScheduledTaskRun.agent_id == chat_session.agent_id,
+                ScheduledTaskRun.user_id == request.user_id,
+                ScheduledTaskRun.status == "running",
+            )
+        ).first()
+        if run is None:
+            raise DynamicTaskAgentError("DYNAMIC_SCHEDULE_SOURCE_INVALID")
+        source_snapshot = dict(run.source_snapshot_json or {})
+        if (
+            run.source_kind not in {"schedule", "manual"}
+            or canonical_checksum(source_snapshot) != run.source_checksum
+            or source_snapshot.get("scheduled_task_id") != run.scheduled_task_id
+            or source_snapshot.get("tenant_id") != run.tenant_id
+            or source_snapshot.get("agent_id") != run.agent_id
+            or source_snapshot.get("initiator_user_id") != run.user_id
+        ):
+            raise DynamicTaskAgentError("DYNAMIC_SCHEDULE_SOURCE_TAMPERED")
+        return "schedule", run.id
+
     def _persist_dynamic_waiting_message(
         self,
         *,
@@ -6890,7 +7081,7 @@ class AgentLoop:
             ):
                 return message
 
-        content = "任务已暂停，正在等待你补充信息。请到待我处理中心办理，完成后将从原执行记录继续。"
+        content = self._dynamic_waiting_content(blocking_step_key)
         message = self._append_message(
             chat_session.tenant_id,
             chat_session.id,
@@ -6926,6 +7117,20 @@ class AgentLoop:
             },
         )
         return message
+
+
+    @staticmethod
+    def _dynamic_waiting_content(blocking_step_key: str) -> str:
+        """按真实阻塞原因返回人工办理或自动恢复文案，禁止把容量队列伪装成 Attention。"""
+
+        if blocking_step_key == "capacity_retry":
+            return (
+                "当前执行容量繁忙，任务已进入持久重试队列，将从原执行记录自动恢复；"
+                "如长时间未恢复，请由管理员在运行门禁中处置。"
+            )
+        if blocking_step_key == "scheduled_start":
+            return "定时任务已进入持久执行队列，将从该执行记录自动开始。"
+        return "任务已暂停，正在等待你补充信息。请到待我处理中心办理，完成后将从原执行记录继续。"
 
     def _select_general_capability(
         self,
