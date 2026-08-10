@@ -1,9 +1,9 @@
 """
-@Time       : 2026/07/27
+@Time       : 2026/08/10
 @Author     : zhanglp8181
 @File       : start_fullstack_server.py
 @CallChain  : Playwright fullstack 配置 → 临时 SQLite → FastAPI 单端口应用
-@Description: 启动隔离的真实前后端服务，并准备登录、知识、流程和分页浏览器回归数据。
+@Description: 启动隔离真实全栈服务，并准备登录、流程、动态任务、Artifact 和分页浏览器数据。
 """
 
 from __future__ import annotations
@@ -44,6 +44,7 @@ def configure_environment(database_path: Path) -> None:
             "AUTO_RESTART": "false",
             "DATABASE_URL": f"sqlite:///{database_path}",
             "PUBLIC_MOCK_API_KEY": "fullstack-e2e-public-mock-key",
+            "GONGGE_XUBAN_DATA_DIR": str(E2E_RUNTIME_DIR / "user-data"),
         }
     )
     os.chdir(BACKEND_DIR)
@@ -167,6 +168,7 @@ def seed_e2e_fixtures() -> None:
                 tenant_id="tenant_demo",
                 name="E2E 数字员工",
                 status="active",
+                owner_user_id="admin",
                 metadata_json={"owner_user_id": "admin", "owner_username": "admin"},
             )
         )
@@ -176,6 +178,7 @@ def seed_e2e_fixtures() -> None:
                 tenant_id="tenant_demo",
                 name="E2E 成员数字员工",
                 status="active",
+                owner_user_id="member_e2e",
                 metadata_json={
                     "owner_user_id": "member_e2e",
                     "owner_username": "member",
@@ -205,6 +208,7 @@ def seed_e2e_fixtures() -> None:
                 id="kb_e2e",
                 tenant_id="tenant_demo",
                 name="E2E Knowledge Base",
+                owner_user_id="admin",
                 metadata_json={
                     "current_version": "1.0.0",
                     "owner_agent_id": "agent_e2e_employee",
@@ -226,6 +230,7 @@ def seed_e2e_fixtures() -> None:
                 id="kb_e2e_member",
                 tenant_id="tenant_demo",
                 name="E2E Member Knowledge Base",
+                owner_user_id="member_e2e",
                 metadata_json={
                     "current_version": "1.0.0",
                     "owner_agent_id": "agent_e2e_member_employee",
@@ -552,24 +557,28 @@ def seed_e2e_fixtures() -> None:
             tenant_id="tenant_demo",
             user_id="member_e2e",
             employee_id="E2E-MEMBER",
+            employee_name="E2E Member",
         )
         other_profile = EmployeeProfile(
             id="profile_e2e_other_member",
             tenant_id="tenant_demo",
             user_id="other_member_e2e",
             employee_id="E2E-OTHER-MEMBER",
+            employee_name="E2E Other Member",
         )
         member_two_profile = EmployeeProfile(
             id="profile_e2e_member_two",
             tenant_id="tenant_demo",
             user_id="member_two_e2e",
             employee_id="E2E-MEMBER-TWO",
+            employee_name="E2E Member Two",
         )
         finance_profile = EmployeeProfile(
             id="profile_e2e_finance",
             tenant_id="tenant_demo",
             user_id="finance_e2e",
             employee_id="E2E-FINANCE",
+            employee_name="E2E Finance",
         )
         requestor_profile = EmployeeProfile(
             id="profile_e2e_requestor",
@@ -585,6 +594,12 @@ def seed_e2e_fixtures() -> None:
         db.add(finance_profile)
         db.add(requestor_profile)
         db.flush()
+        admin_profile = db.exec(
+            select(EmployeeProfile).where(
+                EmployeeProfile.tenant_id == "tenant_demo",
+                EmployeeProfile.user_id == "admin",
+            )
+        ).one()
         root = ensure_organization_foundation(db, "tenant_demo")
         scoped_branch = create_organization_unit(
             db,
@@ -609,6 +624,13 @@ def seed_e2e_fixtures() -> None:
             code="E2E_SIBLING_BRANCH",
             name="E2E 兄弟分部",
             unit_type_code="department",
+        )
+        assign_member_to_organization(
+            db,
+            tenant_id="tenant_demo",
+            employee_profile_id=admin_profile.id,
+            org_unit_id=root.id,
+            assignment_type="primary",
         )
         assign_member_to_organization(
             db,
@@ -709,6 +731,7 @@ def seed_e2e_fixtures() -> None:
             id="instance_e2e_admin_process",
             tenant_id="tenant_demo",
             session_id="session_e2e_admin_process",
+            active_slot_key="foreground:session_e2e_admin_process",
             skill_id="m0_admin_process",
             skill_version_id="version_e2e_admin_process",
             skill_version="1.0.0",
@@ -721,6 +744,7 @@ def seed_e2e_fixtures() -> None:
             tenant_id="tenant_demo",
             instance_id=instance.id,
             node_id="administrative_review",
+            step_key="administrative_review",
             status="running",
         )
         db.add(instance)
@@ -813,6 +837,7 @@ def seed_e2e_fixtures() -> None:
             id="instance_e2e_legacy_tenant_process",
             tenant_id="tenant_demo",
             session_id="session_e2e_legacy_tenant_process",
+            active_slot_key="foreground:session_e2e_legacy_tenant_process",
             skill_id="m0_legacy_tenant_process",
             skill_version_id="version_e2e_legacy_tenant_process",
             skill_version="1.0.0",
@@ -825,6 +850,7 @@ def seed_e2e_fixtures() -> None:
             tenant_id="tenant_demo",
             instance_id=legacy_instance.id,
             node_id="legacy_review",
+            step_key="legacy_review",
             status="running",
         )
         db.add(legacy_version)
@@ -886,6 +912,7 @@ def seed_e2e_fixtures() -> None:
             id="instance_e2e_expense_org_scope",
             tenant_id="tenant_demo",
             session_id=expense_session.id,
+            active_slot_key=f"foreground:{expense_session.id}",
             skill_id=expense_skill.skill_id,
             skill_version_id=expense_version.id,
             skill_version=expense_version.version,
@@ -906,6 +933,7 @@ def seed_e2e_fixtures() -> None:
             tenant_id="tenant_demo",
             instance_id=expense_instance.id,
             node_id="create_special_application",
+            step_key="create_special_application",
             status="succeeded",
         )
         department_execution = SopNodeExecution(
@@ -913,6 +941,7 @@ def seed_e2e_fixtures() -> None:
             tenant_id="tenant_demo",
             instance_id=expense_instance.id,
             node_id="department_special_approval",
+            step_key="department_special_approval",
             status="waiting",
         )
         db.add(expense_session)
@@ -928,6 +957,12 @@ def seed_e2e_fixtures() -> None:
                 node_execution_id=create_execution.id,
                 operation_name="expense.special_approval_create",
                 idempotency_key="e2e-expense-special-create",
+                logical_action_id="e2e-expense-special-create",
+                request_fingerprint=(
+                    "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+                ),
+                effect_kind="external_write",
+                effect_state="complete",
                 status="succeeded",
                 result_json=expense_request,
             )
@@ -973,6 +1008,292 @@ def seed_large_organization_browser_fixture() -> None:
         db.commit()
 
 
+def seed_dynamic_task_browser_fixtures() -> None:
+    """准备普通消息、可信 Artifact 和可办理澄清的生产同形动态 Execution。"""
+
+    from sqlmodel import Session
+
+    from app.db import engine
+    from app.db.models import (
+        ChatSession,
+        ExecutionPlanRevision,
+        ExecutionPublication,
+        ExecutionResult,
+        Message,
+        SopInstance,
+        SopNodeExecution,
+        SopWorkItem,
+        SopWorkItemCandidate,
+        utc_now,
+    )
+    from app.dynamic_tasks.artifacts import ArtifactService
+    from app.dynamic_tasks.capability_catalog import capability_checksum
+    from app.dynamic_tasks.planning import canonical_checksum
+    from app.sop_runtime.execution_control import attention_identity
+
+    tenant_id = "tenant_demo"
+    capability = {"model": {"id": "model_e2e_dynamic", "status": "ready"}}
+    capability_digest = capability_checksum(capability)
+    now = utc_now()
+    artifact_content = "# 浏览器续约风险简报\n\n合同证据、风险项和处理建议均已核验。"
+    artifact_plan = {
+        "goal": "生成浏览器续约风险简报",
+        "success_criteria": ["风险简报可下载且输入证据完整"],
+        "steps": [{
+            "step_key": "answer",
+            "title": "生成风险简报",
+            "kind": "answer",
+            "required": True,
+            "depends_on": [],
+        }],
+        "expected_artifacts": [{
+            "artifact_key": "renewal_risk_brief",
+            "filename": "浏览器续约风险简报.md",
+            "mime_type": "text/markdown",
+            "content_source": "result.markdown",
+            "required": True,
+        }],
+        "budget": {"max_model_calls": 6, "max_steps": 4},
+    }
+    artifact_checksum = canonical_checksum(artifact_plan)
+
+    with Session(engine, expire_on_commit=False) as db:
+        session = ChatSession(
+            id="session_e2e_dynamic_artifact",
+            tenant_id=tenant_id,
+            user_id="admin",
+            agent_id="agent_e2e_employee",
+            agent_profile_revision=1,
+            title="浏览器动态任务与交付物",
+            summary="续约风险简报已完成",
+            status="active",
+        )
+        instance = SopInstance(
+            id="execution_e2e_dynamic_artifact",
+            tenant_id=tenant_id,
+            session_id=session.id,
+            kind="dynamic_task",
+            initiator_user_id="admin",
+            agent_id="agent_e2e_employee",
+            goal_snapshot_json={"goal": artifact_plan["goal"]},
+            current_plan_revision_id="plan_e2e_dynamic_artifact",
+            current_plan_checksum=artifact_checksum,
+            capability_snapshot_json=capability,
+            capability_checksum=capability_digest,
+            budget_snapshot_json=dict(artifact_plan["budget"]),
+            context_json={"dynamic_budget_usage": {"model_calls": 2}},
+            current_result_id="result_e2e_dynamic_artifact",
+            status="succeeded",
+            revision=8,
+            started_at=now,
+            completed_at=now,
+        )
+        plan = ExecutionPlanRevision(
+            id=instance.current_plan_revision_id,
+            tenant_id=tenant_id,
+            execution_id=instance.id,
+            revision_number=1,
+            reason="initial",
+            status="active",
+            plan_json=artifact_plan,
+            checksum=artifact_checksum,
+            capability_snapshot_json=capability,
+            capability_checksum=capability_digest,
+            activated_at=now,
+        )
+        node = SopNodeExecution(
+            id="node_e2e_dynamic_artifact",
+            tenant_id=tenant_id,
+            instance_id=instance.id,
+            node_id="answer",
+            step_key="answer",
+            plan_revision_id=plan.id,
+            step_kind="answer",
+            title="生成风险简报",
+            status="succeeded",
+            started_at=now,
+            completed_at=now,
+        )
+        result_payload = {
+            "markdown": artifact_content,
+            "criterion_evidence": {"criterion_01": ["answer"]},
+            "pending_questions": [],
+        }
+        result = ExecutionResult(
+            id=instance.current_result_id,
+            tenant_id=tenant_id,
+            execution_id=instance.id,
+            status="verified",
+            result_json=result_payload,
+            verification_json={"passed": True},
+            checksum=canonical_checksum(result_payload),
+            created_by_step_key="answer",
+        )
+        message = Message(
+            id="message_e2e_dynamic_artifact",
+            tenant_id=tenant_id,
+            session_id=session.id,
+            role="assistant",
+            content=artifact_content,
+            metadata_json={"execution_id": instance.id, "result_id": result.id},
+        )
+        db.add(session)
+        db.add(Message(
+            id="message_e2e_ordinary_answer",
+            tenant_id=tenant_id,
+            session_id=session.id,
+            role="assistant",
+            content="普通问答仍可正常展示，不会创建新的动态执行。",
+        ))
+        db.add(instance)
+        db.add(plan)
+        db.add(node)
+        db.add(result)
+        db.add(message)
+        db.flush()
+        artifact, _ = ArtifactService(db).register(
+            instance=instance,
+            source_node=node,
+            artifact_key="renewal_risk_brief",
+            filename="浏览器续约风险简报.md",
+            mime_type="text/markdown",
+            data=artifact_content.encode("utf-8"),
+        )
+        result.verification_json = {"passed": True, "artifact_ids": [artifact.id]}
+        message.metadata_json = {
+            "execution_id": instance.id,
+            "result_id": result.id,
+            "artifact_ids": [artifact.id],
+        }
+        db.add(result)
+        db.add(message)
+        db.add(ExecutionPublication(
+            id="publication_e2e_dynamic_artifact",
+            tenant_id=tenant_id,
+            execution_id=instance.id,
+            result_id=result.id,
+            publication_key=canonical_checksum({
+                "execution_id": instance.id,
+                "target_type": "application",
+            }),
+            target_type="application",
+            target_ref=session.id,
+            required=True,
+            status="settled",
+            receipt_json={"message_id": message.id},
+            settled_at=now,
+        ))
+
+        waiting_plan = {
+            "goal": "补充合作方后继续合同核验",
+            "success_criteria": ["明确合作方并完成核验"],
+            "steps": [
+                {
+                    "step_key": "clarify_partner",
+                    "title": "确认合作方",
+                    "kind": "clarification",
+                    "required": True,
+                    "depends_on": [],
+                },
+                {
+                    "step_key": "answer",
+                    "title": "完成合同核验",
+                    "kind": "answer",
+                    "required": True,
+                    "depends_on": ["clarify_partner"],
+                },
+            ],
+            "expected_artifacts": [],
+            "budget": {"max_model_calls": 6, "max_steps": 4},
+        }
+        waiting_checksum = canonical_checksum(waiting_plan)
+        waiting = SopInstance(
+            id="execution_e2e_dynamic_attention",
+            tenant_id=tenant_id,
+            session_id="session_e2e_dynamic_attention",
+            kind="dynamic_task",
+            active_slot_key="dynamic:e2e-attention",
+            initiator_user_id="admin",
+            agent_id="agent_e2e_employee",
+            goal_snapshot_json={"goal": waiting_plan["goal"]},
+            current_plan_revision_id="plan_e2e_dynamic_attention",
+            current_plan_checksum=waiting_checksum,
+            capability_snapshot_json=capability,
+            capability_checksum=capability_digest,
+            budget_snapshot_json=dict(waiting_plan["budget"]),
+            status="waiting",
+            revision=4,
+            started_at=now,
+        )
+        waiting_node = SopNodeExecution(
+            id="node_e2e_dynamic_attention",
+            tenant_id=tenant_id,
+            instance_id=waiting.id,
+            node_id="clarify_partner",
+            step_key="clarify_partner",
+            plan_revision_id=waiting.current_plan_revision_id,
+            step_kind="clarification",
+            title="确认合作方",
+            status="waiting",
+            started_at=now,
+        )
+        attention = SopWorkItem(
+            id="attention_e2e_dynamic_clarification",
+            tenant_id=tenant_id,
+            instance_id=waiting.id,
+            node_execution_id=waiting_node.id,
+            attention_kind="clarification",
+            attention_key="clarify_partner",
+            attention_identity=attention_identity(
+                tenant_id=tenant_id,
+                execution_id=waiting.id,
+                attention_key="clarify_partner",
+            ),
+            title="确认需要核验的合作方",
+            payload_json={
+                "question": "请选择需要核验的合作方",
+                "options": ["星海科技", "云帆数据"],
+            },
+            allowed_commands_json=["answer", "cancel"],
+            allowed_outcomes_json=["answer", "cancel"],
+            status="offered",
+            initiator_user_id="admin",
+            exclude_initiator=False,
+        )
+        db.add(ChatSession(
+            id=waiting.session_id,
+            tenant_id=tenant_id,
+            user_id="admin",
+            agent_id="agent_e2e_employee",
+            title="浏览器动态澄清",
+            status="waiting",
+        ))
+        db.add(waiting)
+        db.add(ExecutionPlanRevision(
+            id=waiting.current_plan_revision_id,
+            tenant_id=tenant_id,
+            execution_id=waiting.id,
+            revision_number=1,
+            reason="initial",
+            status="active",
+            plan_json=waiting_plan,
+            checksum=waiting_checksum,
+            capability_snapshot_json=capability,
+            capability_checksum=capability_digest,
+            activated_at=now,
+        ))
+        db.add(waiting_node)
+        db.add(attention)
+        db.add(SopWorkItemCandidate(
+            tenant_id=tenant_id,
+            work_item_id=attention.id,
+            user_id="admin",
+            source_role_codes_json=["initiator"],
+            source_types_json=["execution_initiator"],
+        ))
+        db.commit()
+
+
 def seed_pagination_browser_fixtures() -> None:
     """为员工广场、任务箱、档案日志、记忆和定时任务写入跨页数据。"""
 
@@ -987,6 +1308,8 @@ def seed_pagination_browser_fixtures() -> None:
         MemoryRecord,
         ScheduledTask,
         ScheduledTaskRun,
+        SopInstance,
+        SopNodeExecution,
         SopWorkItem,
     )
     from app.db.models import utc_now
@@ -994,6 +1317,29 @@ def seed_pagination_browser_fixtures() -> None:
     now = utc_now()
     agent_id = "agent_e2e_employee"
     with Session(engine) as db:
+        pagination_session = ChatSession(
+            id="session_e2e_work_item_pagination",
+            tenant_id="tenant_demo",
+            user_id="admin",
+            agent_id=agent_id,
+            title="浏览器流程任务分页",
+            status="waiting",
+        )
+        pagination_instance = SopInstance(
+            id="instance_e2e_work_item_pagination",
+            tenant_id="tenant_demo",
+            session_id=pagination_session.id,
+            skill_id="expense_over_limit_approval",
+            skill_version_id="skillver_e2e_expense_org_scope",
+            skill_version="2.1.0",
+            definition_checksum="f" * 64,
+            active_slot_key=f"foreground:{pagination_session.id}",
+            initiator_user_id="requestor_e2e",
+            status="waiting",
+            current_node_id="浏览器分页节点_20",
+        )
+        db.add(pagination_session)
+        db.add(pagination_instance)
         for index in range(13):
             db.add(
                 AgentProfile(
@@ -1057,14 +1403,26 @@ def seed_pagination_browser_fixtures() -> None:
                 )
             )
         for index in range(21):
+            node_execution_id = f"execution_e2e_page_{index:02d}"
+            node_id = f"浏览器分页节点_{index:02d}"
+            db.add(
+                SopNodeExecution(
+                    id=node_execution_id,
+                    tenant_id="tenant_demo",
+                    instance_id=pagination_instance.id,
+                    node_id=node_id,
+                    step_key=node_id,
+                    status="waiting",
+                )
+            )
             db.add(
                 SopWorkItem(
                     id=f"sopwork_e2e_page_{index:02d}",
                     tenant_id="tenant_demo",
-                    instance_id="instance_e2e_expense_org_scope",
-                    node_execution_id=f"execution_e2e_page_{index:02d}",
+                    instance_id=pagination_instance.id,
+                    node_execution_id=node_execution_id,
                     skill_version_id="skillver_e2e_expense_org_scope",
-                    node_id=f"浏览器分页节点_{index:02d}",
+                    node_id=node_id,
                     status="offered",
                     owner_user_id="admin",
                     initiator_user_id="requestor_e2e",
@@ -1082,6 +1440,7 @@ def main() -> None:
     E2E_RUNTIME_DIR.mkdir(mode=0o700)
     configure_environment(E2E_RUNTIME_DIR / "e2e.sqlite3")
     seed_e2e_fixtures()
+    seed_dynamic_task_browser_fixtures()
     seed_pagination_browser_fixtures()
     seed_large_organization_browser_fixture()
 
