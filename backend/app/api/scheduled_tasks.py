@@ -49,7 +49,7 @@ RunStatusFilter = Literal["all", "pending", "completed", "failed"]
 TaskStatusFilter = Literal["all", "pending", "completed", "paused"]
 RUN_STATUS_FILTERS: dict[RunStatusFilter, tuple[str, ...]] = {
     "all": (),
-    "pending": ("queued", "running"),
+    "pending": ("queued", "running", "waiting"),
     "completed": ("succeeded",),
     "failed": ("failed", "skipped"),
 }
@@ -310,6 +310,8 @@ def run_enterprise_scheduled_task_now(
     if row.status == "archived":
         raise HTTPException(status_code=400, detail="已删除的自动任务不能运行")
     run = start_scheduled_task_async(db, row, scheduled_for=utc_now(), manual=True)
+    if run is None:
+        raise HTTPException(status_code=503, detail="自动任务执行队列繁忙，请稍后重试")
     return scheduled_task_run_read(run, row)
 
 

@@ -21,6 +21,8 @@ class GeneralSkillFile(BaseModel):
 
 
 class GeneralSkillImportRequest(BaseModel):
+    """导入通用技能，并显式选择原子执行或规划指南语义。"""
+
     tenant_id: str
     agent_id: Optional[str] = None
     name: Optional[str] = None
@@ -30,6 +32,7 @@ class GeneralSkillImportRequest(BaseModel):
     markdown: Optional[str] = None
     files: list[GeneralSkillFile] = Field(default_factory=list)
     status: str = "published"
+    usage_mode: Literal["atomic_execution", "planning_guidance"] = "atomic_execution"
     original_slug: Optional[str] = None
 
 
@@ -57,6 +60,8 @@ class GeneralSkillPackageUploadRequest(BaseModel):
 
 
 class GeneralSkillRead(BaseModel):
+    """返回通用技能当前内容和已发布规范快照元数据。"""
+
     id: str
     tenant_id: str
     slug: str
@@ -69,6 +74,9 @@ class GeneralSkillRead(BaseModel):
     status: str
     permissions: dict[str, Any] = Field(default_factory=dict)
     runtime_config: dict[str, Any] = Field(default_factory=dict)
+    usage_mode: Literal["atomic_execution", "planning_guidance"] = "atomic_execution"
+    capability_checksum: Optional[str] = None
+    capability_published_at: Optional[str] = None
     created_at: str
     updated_at: str
 

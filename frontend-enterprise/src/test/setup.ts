@@ -12,7 +12,8 @@ if (!Element.prototype.scrollIntoView) {
   Element.prototype.scrollIntoView = () => undefined;
 }
 
-afterEach(() => {
+afterEach(async () => {
   cleanup();
   window.localStorage.clear();
+  await new Promise((resolve) => window.setTimeout(resolve, 0));
 });

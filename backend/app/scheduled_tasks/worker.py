@@ -17,10 +17,17 @@ from sqlmodel import Session
 
 from app.db import engine, init_db
 from app.db.seed import seed_demo_data
+from app.dynamic_tasks.worker import (
+    due_dynamic_task_signals,
+    process_dynamic_task_signal,
+    start_dynamic_task_signal_async,
+)
 from app.scheduled_tasks.service import (
     WORKER_SLEEP_SECONDS,
     due_scheduled_tasks,
     execute_scheduled_task,
+    reconcile_scheduled_dynamic_runs,
+    start_scheduled_task_async,
 )
 from app.sop_runtime.coordinator import DeterministicSopCoordinator
 from app.sop_runtime.work_items import SopWorkItemService
@@ -47,7 +54,12 @@ def run_worker(*, once: bool = False, poll_seconds: float = WORKER_SLEEP_SECONDS
         with Session(engine) as db:
             due = due_scheduled_tasks(db)
             for task in due:
-                execute_scheduled_task(db, task)
+                if once:
+                    execute_scheduled_task(db, task)
+                else:
+                    start_scheduled_task_async(db, task)
+            _process_due_dynamic_signals(db, once=once)
+            reconcile_scheduled_dynamic_runs(db)
             expired_work_items = SopWorkItemService(db).expire_due()
             coordinator = DeterministicSopCoordinator(db)
             for work_item in expired_work_items:
@@ -56,6 +68,19 @@ def run_worker(*, once: bool = False, poll_seconds: float = WORKER_SLEEP_SECONDS
         if once:
             return
         sleep(max(1.0, poll_seconds))
+
+
+def _process_due_dynamic_signals(db: Session, *, once: bool) -> int:
+    """单次模式确定性执行，常驻模式有界派发，避免慢 Agent 阻塞调度扫描。"""
+
+    dispatched = 0
+    for dynamic_signal in due_dynamic_task_signals(db):
+        if once:
+            process_dynamic_task_signal(db, dynamic_signal)
+            dispatched += 1
+        elif start_dynamic_task_signal_async(dynamic_signal.id):
+            dispatched += 1
+    return dispatched
 
 
 def start_background_worker(*, poll_seconds: float = WORKER_SLEEP_SECONDS) -> None:

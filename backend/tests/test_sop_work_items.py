@@ -970,6 +970,7 @@ def _seed_runtime(
         skill_version="1.0.0",
         definition_checksum="a" * 64,
         status="running",
+        active_slot_key="foreground:session_test",
         current_node_id="human_review",
     )
     execution = SopNodeExecution(
@@ -977,6 +978,7 @@ def _seed_runtime(
         tenant_id="tenant_demo",
         instance_id=instance.id,
         node_id="human_review",
+        step_key="human_review",
         status="running",
     )
     db.add(instance)

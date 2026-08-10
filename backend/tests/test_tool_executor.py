@@ -304,6 +304,60 @@ def test_execute_get_tool_preserves_query_string_when_arguments_empty(monkeypatc
     }
 
 
+def test_execute_http_write_sends_authoritative_remote_idempotency_header(monkeypatch) -> None:
+    """验证远端幂等键只进入 HTTP 写请求头，并覆盖工具配置中的同名大小写变体。"""
+
+    requested: dict[str, object] = {}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            """接受真实客户端构造参数但不建立网络连接。"""
+
+        def __enter__(self):
+            """返回当前假客户端。"""
+
+            return self
+
+        def __exit__(self, *args):
+            """结束上下文时无需释放外部资源。"""
+
+            return None
+
+        def request(self, method, url, headers=None, json=None, params=None):
+            """记录最终请求头并返回成功响应。"""
+
+            requested.update({"method": method, "headers": dict(headers or {}), "json": json})
+            return httpx.Response(
+                200,
+                json={"id": "remote-1"},
+                request=httpx.Request(method, url),
+            )
+
+    monkeypatch.setattr(httpx, "Client", FakeClient)
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.add(
+            Tool(
+                tenant_id="tenant_demo",
+                name="expense.submit",
+                method="POST",
+                url="https://example.test/expenses",
+                headers_json={"idempotency-key": "untrusted-config-value"},
+            )
+        )
+        db.commit()
+
+        result = ToolExecutor(db).execute(
+            tenant_id="tenant_demo",
+            tool_call=ToolCall(name="expense.submit", arguments={"amount": 100}),
+            remote_idempotency_key="runtime-command-key",
+        )
+
+    assert result.success is True
+    assert requested["headers"] == {"Idempotency-Key": "runtime-command-key"}
+    assert requested["json"] == {"amount": 100}
+
+
 def _mock_mcp_server_path() -> Path:
     return Path(__file__).resolve().parents[1] / "mock_servers" / "mcp_stdio_server.py"
 

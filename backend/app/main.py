@@ -1,5 +1,5 @@
 """
-@Time       : 2026/07/22 09:27
+@Time       : 2026/08/10 17:40
 @Author     : zhanglp8181
 @File       : main.py
 @CallChain  : ASGI Server → FastAPI lifespan/routers → application services
@@ -17,8 +17,13 @@ from sqlmodel import Session
 
 from app.api import (
     agents,
+    attention_items,
+    artifacts,
     auth,
     chat,
+    connection_profiles,
+    dynamic_task_operations,
+    executions,
     feedback,
     expert_taxonomy,
     general_skills,
@@ -35,17 +40,23 @@ from app.api import (
     persona,
     reference_data,
     scheduled_tasks,
+    standing_approval_rules,
     sessions,
     skills,
     sop_migrations,
     tools,
     traces,
     ui_config,
+    wecom_callbacks,
     work_items,
 )
 from app.async_jobs import shutdown_async_jobs
 from app.brand import health_payload
 from app.config import get_settings
+from app.connectors.worker import (
+    start_connector_background_worker,
+    stop_connector_background_worker,
+)
 from app.db import engine, init_db
 from app.db.seed import seed_demo_data
 from app.public_mock import router as public_mock_router
@@ -60,10 +71,13 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     with Session(engine) as db:
         seed_demo_data(db)
     start_background_worker()
+    if settings.app_env != "test":
+        start_connector_background_worker()
     try:
         yield
     finally:
         stop_background_worker()
+        stop_connector_background_worker()
         shutdown_async_jobs()
 
 
@@ -92,6 +106,9 @@ def health() -> dict[str, str]:
 
 
 app.include_router(chat.router)
+app.include_router(connection_profiles.router)
+app.include_router(dynamic_task_operations.router)
+app.include_router(wecom_callbacks.router)
 app.include_router(agents.chat_router)
 app.include_router(ui_config.chat_router)
 app.include_router(auth.router)
@@ -101,6 +118,9 @@ app.include_router(organization_leaders.router)
 app.include_router(organization_units.router)
 app.include_router(reference_data.router)
 app.include_router(work_items.router)
+app.include_router(attention_items.router)
+app.include_router(artifacts.router)
+app.include_router(executions.router)
 app.include_router(agents.scope_router)
 app.include_router(agents.enterprise_router)
 app.include_router(expert_taxonomy.router)
@@ -117,6 +137,7 @@ app.include_router(persona.router)
 app.include_router(scheduled_tasks.enterprise_router)
 app.include_router(scheduled_tasks.chat_router)
 app.include_router(scheduled_tasks.chat_draft_router)
+app.include_router(standing_approval_rules.router)
 app.include_router(ui_config.enterprise_router)
 app.include_router(tools.router)
 app.include_router(tools.mcp_router)

@@ -31,8 +31,15 @@ from app.agents.branching import (
 )
 from app.agents.session_snapshot import anchor_chat_session
 from app.audit.service import append_user_management_audit
-from app.core.conversation_context import build_conversation_context
+from app.config import get_settings
 from app.core.cancellation import clear_chat_turn_cancelled, is_chat_turn_cancelled
+from app.core.conversation_context import build_conversation_context
+from app.core.non_sop_capability import (
+    LlmDynamicTaskShadowSelector,
+    NonSopCapabilityDecision,
+    NonSopCapabilityRouteResult,
+    NonSopCapabilityRouter,
+)
 from app.core.reflection_agent import ReflectionAgent, ReflectionDecision, action_needs_reflection
 from app.core.response_generator import (
     FALLBACK_REPLY,
@@ -55,11 +62,18 @@ from app.db.models import (
     ModelConfig,
     PersonaConfig,
     Skill,
+    ScheduledTaskRun,
     Tool,
     UIConfig,
     User,
     new_id,
     utc_now,
+)
+from app.dynamic_tasks.agent import DynamicRunOutcome, DynamicTaskAgent, DynamicTaskAgentError
+from app.dynamic_tasks.quotas import (
+    DynamicTaskQuotaError,
+    DynamicTaskQuotaService,
+    quota_limits_from_settings,
 )
 from app.general_skills import GeneralSkillRunner, GeneralSkillSelector
 from app.general_skills.schema import GeneralSkillRunResponse, GeneralSkillSelection
@@ -94,6 +108,7 @@ from app.session.session_schema import (
     StepAgentResult,
 )
 from app.sop_runtime.coordinator import DeterministicSopCoordinator
+from app.sop_runtime.execution_control import ExecutionControlService, canonical_checksum
 from app.sop_runtime.scheduler import RuntimeAction
 from app.tools import ToolExecutor
 from app.tools.tool_schema import ToolCall, ToolError, ToolResult
@@ -265,6 +280,9 @@ class QueuedTaskContinuation:
 
 class AgentLoop:
     def __init__(self, db: Session):
+        """组装聊天、SOP、通用能力及默认关闭的动态任务 shadow 编排依赖。"""
+
+        settings = get_settings()
         self.db = db
         self.events = EventLog(db)
         self.router = Router()
@@ -273,6 +291,16 @@ class AgentLoop:
         self.reflection_agent = ReflectionAgent()
         self.response_generator = ResponseGenerator()
         self.general_skill_selector = GeneralSkillSelector()
+        self.non_sop_capability_router = NonSopCapabilityRouter(
+            shadow_enabled=settings.dynamic_task_router_shadow_enabled,
+            execution_enabled=settings.dynamic_task_execution_enabled,
+            shadow_selector=LlmDynamicTaskShadowSelector(
+                settings.dynamic_task_router_shadow_timeout_seconds
+            ),
+            minimum_confidence=settings.dynamic_task_router_shadow_min_confidence,
+        )
+        self._dynamic_task_rollout_allows = settings.dynamic_task_rollout_allows
+        self._dynamic_task_quota_limits = quota_limits_from_settings(settings)
         self.general_skill_runner = GeneralSkillRunner()
         self.tool_executor = ToolExecutor(db)
         self.deterministic_runtime = DeterministicSopCoordinator(db)
@@ -655,13 +683,15 @@ class AgentLoop:
     ) -> ChatTurnResponse | None:
         if not self._scene_router_deferred_to_general(router_decision):
             return None
-        capability = capability or self._select_general_capability(
+        capability = capability or self._route_non_sop_capability(
             request.message,
             model_config,
+            chat_session,
             chat_session.agent_id,
             conversation_context,
             memory_context,
             user_id=request.user_id,
+            user_message_id=user_message_id,
         )
         skill, selection = capability
         if skill is None:
@@ -1668,13 +1698,54 @@ class AgentLoop:
                 yield self._stream_status(
                     chat_session, "routing", "正在判断用户意图", user_message_id=user_message_id
                 )
-                capability = self._select_general_capability(
+                capability_route = self._decide_non_sop_capability(
                     request.message,
                     model_config,
+                    chat_session,
                     chat_session.agent_id,
                     no_skill_context,
                     [],
                     user_id=request.user_id,
+                    user_message_id=user_message_id,
+                )
+                dynamic_response = self._try_handle_dynamic_task(
+                    request,
+                    chat_session,
+                    model_config,
+                    capability_route,
+                    user_message.id,
+                )
+                if dynamic_response is not None:
+                    yield self._stream_status(
+                        chat_session,
+                        "completed",
+                        "动态任务已完成",
+                        {"execution_mode": "dynamic_task"},
+                        user_message_id,
+                    )
+                    yield self._stream_event(
+                        "stream_delta",
+                        chat_session,
+                        self._turn_payload(
+                            {"content": dynamic_response.reply}, user_message_id
+                        ),
+                    )
+                    yield self._stream_event(
+                        "stream_end",
+                        chat_session,
+                        self._turn_payload({}, user_message_id),
+                    )
+                    yield self._stream_event(
+                        "complete",
+                        chat_session,
+                        self._turn_payload(
+                            dynamic_response.model_dump(mode="json"), user_message_id
+                        ),
+                    )
+                    return
+                capability = (
+                    capability_route.selected_general_skill,
+                    capability_route.general_selection,
                 )
                 if capability[0] is not None:
                     yield from self._stream_general_skill_response(
@@ -1832,13 +1903,52 @@ class AgentLoop:
             )
             capability_selection: GeneralSkillSelection | None = None
             if self._scene_router_deferred_to_general(router_decision):
-                capability = self._select_general_capability(
+                capability_route = self._decide_non_sop_capability(
                     request.message,
                     model_config,
+                    chat_session,
                     chat_session.agent_id,
                     conversation_context,
                     memory_context,
                     user_id=request.user_id,
+                    user_message_id=user_message_id,
+                )
+                dynamic_response = self._try_handle_dynamic_task(
+                    request,
+                    chat_session,
+                    model_config,
+                    capability_route,
+                    user_message.id,
+                )
+                if dynamic_response is not None:
+                    yield self._stream_status(
+                        chat_session,
+                        "completed",
+                        "动态任务已完成",
+                        {"execution_mode": "dynamic_task"},
+                        user_message_id,
+                    )
+                    yield self._stream_event(
+                        "stream_delta",
+                        chat_session,
+                        self._turn_payload(
+                            {"content": dynamic_response.reply}, user_message_id
+                        ),
+                    )
+                    yield self._stream_event(
+                        "stream_end", chat_session, self._turn_payload({}, user_message_id)
+                    )
+                    yield self._stream_event(
+                        "complete",
+                        chat_session,
+                        self._turn_payload(
+                            dynamic_response.model_dump(mode="json"), user_message_id
+                        ),
+                    )
+                    return
+                capability = (
+                    capability_route.selected_general_skill,
+                    capability_route.general_selection,
                 )
                 capability_selection = capability[1]
                 if capability[0] is not None:
@@ -2440,13 +2550,39 @@ class AgentLoop:
             )
             if self._context_compacted_now(no_skill_context):
                 status("preparing", {"compacted_now": True})
-            capability = self._select_general_capability(
+            capability_route = self._decide_non_sop_capability(
                 request.message,
                 model_config,
+                chat_session,
                 chat_session.agent_id,
                 no_skill_context,
                 [],
                 user_id=request.user_id,
+                user_message_id=user_message.id,
+            )
+            dynamic_response = self._try_handle_dynamic_task(
+                request,
+                chat_session,
+                model_config,
+                capability_route,
+                user_message.id,
+            )
+            if dynamic_response is not None:
+                return PreparedTurn(
+                    chat_session=chat_session,
+                    model_config=model_config,
+                    active_skill=None,
+                    router_decision=dynamic_response.router_decision or RouterDecision(),
+                    step_result=dynamic_response.step_result or StepAgentResult(),
+                    tool_result=dynamic_response.tool_result,
+                    memory_context=[],
+                    conversation_context=no_skill_context,
+                    general_response=dynamic_response,
+                    user_message_id=user_message.id,
+                )
+            capability = (
+                capability_route.selected_general_skill,
+                capability_route.general_selection,
             )
             router_decision = RouterDecision(
                 decision="answer_only",
@@ -2548,13 +2684,39 @@ class AgentLoop:
         )
         capability: tuple[GeneralSkill | None, GeneralSkillSelection] | None = None
         if self._scene_router_deferred_to_general(router_decision):
-            capability = self._select_general_capability(
+            capability_route = self._decide_non_sop_capability(
                 request.message,
                 model_config,
+                chat_session,
                 chat_session.agent_id,
                 conversation_context,
                 memory_context,
                 user_id=request.user_id,
+                user_message_id=user_message.id,
+            )
+            dynamic_response = self._try_handle_dynamic_task(
+                request,
+                chat_session,
+                model_config,
+                capability_route,
+                user_message.id,
+            )
+            if dynamic_response is not None:
+                return PreparedTurn(
+                    chat_session=chat_session,
+                    model_config=model_config,
+                    active_skill=None,
+                    router_decision=dynamic_response.router_decision or router_decision,
+                    step_result=dynamic_response.step_result or StepAgentResult(),
+                    tool_result=dynamic_response.tool_result,
+                    memory_context=memory_context,
+                    conversation_context=conversation_context,
+                    general_response=dynamic_response,
+                    user_message_id=user_message.id,
+                )
+            capability = (
+                capability_route.selected_general_skill,
+                capability_route.general_selection,
             )
         general_response = self._try_handle_general_skill_after_scene_router(
             request,
@@ -3980,6 +4142,7 @@ class AgentLoop:
                 if runtime_plan.action in {
                     RuntimeAction.WAIT_INPUT,
                     RuntimeAction.WAIT_WORK_ITEM,
+                    RuntimeAction.WAIT_OPERATION,
                     RuntimeAction.FAIL,
                 }:
                     payload = self._tool_loop_decision_payload(
@@ -5551,6 +5714,8 @@ class AgentLoop:
         conversation_context: dict[str, object] | None = None,
         memory_context: list[dict[str, object]] | None = None,
     ) -> ToolResult:
+        """记录工具调用边界并执行适配器；确定性外部写额外传递账本生成的远端幂等键。"""
+
         if (
             not tool_call.name.startswith(GENERAL_SKILL_TOOL_PREFIX)
             and chat_session.agent_id
@@ -5667,12 +5832,27 @@ class AgentLoop:
                 memory_context=memory_context,
             )
         else:
+            deterministic_runtime = getattr(self, "deterministic_runtime", None)
+            remote_idempotency_key = (
+                deterministic_runtime.remote_idempotency_key_for(
+                    chat_session,
+                    tool_call.name,
+                )
+                if deterministic_runtime is not None
+                else None
+            )
+            execution_options = (
+                {"remote_idempotency_key": remote_idempotency_key}
+                if remote_idempotency_key
+                else {}
+            )
             tool_result = self.tool_executor.execute(
                 request.tenant_id,
                 tool_call,
                 chat_session.active_skill_id,
                 chat_session.agent_id,
                 request.user_id,
+                **execution_options,
             )
         finished_payload = tool_result.model_dump(mode="json")
         if tool_call_id:
@@ -6511,6 +6691,446 @@ class AgentLoop:
         if skill is None:
             return None
         return skill, selection
+
+    def _route_non_sop_capability(
+        self,
+        message: str,
+        model_config: ModelConfig,
+        chat_session: ChatSession,
+        agent_id: str | None = None,
+        conversation_context: dict[str, object] | None = None,
+        memory_context: list[dict[str, object]] | None = None,
+        *,
+        user_id: str | None = None,
+        user_message_id: str | None = None,
+    ) -> tuple[GeneralSkill | None, GeneralSkillSelection]:
+        """统一非 SOP 权威选择与脱敏 shadow；A 批只返回旧 GeneralSkill 行为。"""
+
+        route = self._decide_non_sop_capability(
+            message,
+            model_config,
+            chat_session,
+            agent_id,
+            conversation_context,
+            memory_context,
+            user_id=user_id,
+            user_message_id=user_message_id,
+        )
+        return route.selected_general_skill, route.general_selection
+
+    def _decide_non_sop_capability(
+        self,
+        message: str,
+        model_config: ModelConfig,
+        chat_session: ChatSession,
+        agent_id: str | None = None,
+        conversation_context: dict[str, object] | None = None,
+        memory_context: list[dict[str, object]] | None = None,
+        *,
+        user_id: str | None = None,
+        user_message_id: str | None = None,
+    ) -> NonSopCapabilityRouteResult:
+        """返回完整非 SOP 路由结果，供 B1 委托动态 Agent 且保持旧 tuple 兼容。"""
+
+        general_skills = self._list_published_general_skills(model_config.tenant_id, agent_id)
+        knowledge_capability = self._knowledge_capability_payload(
+            model_config.tenant_id,
+            user_id,
+            agent_id,
+        )
+        route = self.non_sop_capability_router.decide(
+            message=message,
+            general_skills=general_skills,
+            model_config=model_config,
+            general_skill_selector=self.general_skill_selector,
+            conversation_context=conversation_context,
+            memory_context=memory_context,
+            knowledge_capability=knowledge_capability,
+        )
+        if route.shadow_decision is not None:
+            self.events.record(
+                model_config.tenant_id,
+                chat_session.id,
+                "non_sop_capability_shadow_decided",
+                self._turn_payload(route.audit_payload(), user_message_id),
+            )
+        return route
+
+    def _try_handle_dynamic_task(
+        self,
+        request: ChatTurnRequest,
+        chat_session: ChatSession,
+        model_config: ModelConfig,
+        route: NonSopCapabilityRouteResult,
+        user_message_id: str,
+    ) -> ChatTurnResponse | None:
+        """只在独立 kill switch 生效且路由通过时委托 DynamicTaskAgent 完整执行。"""
+
+        decision = route.effective_decision
+        if request.interaction_mode == "scheduled_task":
+            decision = NonSopCapabilityDecision(
+                mode="dynamic_task",
+                goal=request.message.strip(),
+                success_criteria=["完成调度目标并形成可审计的结果或明确等待事项"],
+                requires_durable_execution=True,
+                confidence=1.0,
+                reason="调度入口本身要求独立、可恢复且可审计的持久执行。",
+            )
+        if decision.mode != "dynamic_task":
+            return None
+        if not chat_session.agent_id or not request.user_id:
+            return None
+        rollout_check = getattr(self, "_dynamic_task_rollout_allows", None)
+        rollout_allowed = (
+            bool(rollout_check(request.tenant_id, chat_session.agent_id))
+            if callable(rollout_check)
+            else True
+        )
+        if not rollout_allowed:
+            self.events.record(
+                request.tenant_id,
+                chat_session.id,
+                "dynamic_task_rollout_denied",
+                self._turn_payload(
+                    {
+                        "reason_code": "DYNAMIC_TASK_ROLLOUT_DENIED",
+                        "agent_id": chat_session.agent_id,
+                        "source_kind": request.interaction_mode,
+                    },
+                    user_message_id,
+                ),
+            )
+            if request.interaction_mode == "scheduled_task":
+                raise DynamicTaskAgentError("DYNAMIC_TASK_ROLLOUT_DENIED")
+            return None
+        dynamic_agent = DynamicTaskAgent(self.db)
+        quota_limits = getattr(self, "_dynamic_task_quota_limits", None)
+        dynamic_agent.quota_limits = quota_limits
+        source_kind, source_ref = self._dynamic_task_source(
+            request,
+            chat_session,
+            user_message_id,
+        )
+        try:
+            with self.db.begin_nested():
+                instance, created = dynamic_agent.start_task(
+                    tenant_id=request.tenant_id,
+                    session_id=chat_session.id,
+                    agent_id=chat_session.agent_id,
+                    initiator_user_id=request.user_id,
+                    goal=str(decision.goal or ""),
+                    success_criteria=tuple(decision.success_criteria),
+                    model_config=model_config,
+                    source_ref=source_ref,
+                    source_kind=source_kind,
+                    input_resource_ids=tuple(
+                        item.resource_id
+                        for item in request.attachments
+                        if item.resource_id is not None
+                    ),
+                    knowledge_capability=self._knowledge_capability_payload(
+                        request.tenant_id,
+                        request.user_id,
+                        chat_session.agent_id,
+                    ),
+                )
+                if created and quota_limits is not None:
+                    DynamicTaskQuotaService(self.db).acquire_execution(
+                        instance,
+                        limits=quota_limits,
+                    )
+        except Exception as exc:
+            failure_code = str(getattr(exc, "code", "") or type(exc).__name__)
+            self.events.record(
+                request.tenant_id,
+                chat_session.id,
+                "dynamic_task_delegation_failed",
+                self._turn_payload({"code": failure_code[:128]}, user_message_id),
+            )
+            raise DynamicTaskAgentError(failure_code[:128]) from exc
+        if source_kind == "schedule":
+            control = ExecutionControlService(self.db, dynamic_agent.store)
+            scheduled_run = self.db.get(ScheduledTaskRun, source_ref)
+            if scheduled_run is None or scheduled_run.tenant_id != request.tenant_id:
+                raise DynamicTaskAgentError("DYNAMIC_SCHEDULE_RUN_NOT_FOUND")
+            if scheduled_run.execution_id not in {None, instance.id}:
+                raise DynamicTaskAgentError("DYNAMIC_SCHEDULE_EXECUTION_CONFLICT")
+            scheduled_run.execution_id = instance.id
+            scheduled_run.updated_at = utc_now()
+            self.db.add(scheduled_run)
+            signal = control.enqueue_signal(
+                instance,
+                signal_type="scheduled_start",
+                causation_type="scheduled_task_run",
+                causation_id=source_ref,
+                payload={"scheduled_task_run_id": source_ref},
+                priority=10,
+            )
+            waiting_message = self._persist_dynamic_waiting_message(
+                chat_session=chat_session,
+                execution_id=instance.id,
+                blocking_step_key="scheduled_start",
+                user_message_id=user_message_id,
+            )
+            self.events.record(
+                request.tenant_id,
+                chat_session.id,
+                "dynamic_task_delegated",
+                self._turn_payload(
+                    {
+                        "execution_id": instance.id,
+                        "execution_created": created,
+                        "execution_status": "scheduled",
+                        "signal_id": signal.id,
+                    },
+                    user_message_id,
+                ),
+            )
+            self.db.commit()
+            self.db.refresh(chat_session)
+            return ChatTurnResponse(
+                reply=waiting_message.content,
+                session_id=chat_session.id,
+                router_decision=RouterDecision(
+                    decision="answer_only",
+                    reason="DynamicTaskAgent queued by a durable schedule signal.",
+                ),
+                step_result=StepAgentResult(
+                    reply=waiting_message.content,
+                    is_step_completed=False,
+                ),
+                session_state=public_session(chat_session),
+            )
+        try:
+            outcome = dynamic_agent.run_until_blocked_or_complete(
+                execution_id=instance.id,
+                model_config=model_config,
+                worker_id=f"chat:{user_message_id}",
+                actor_user_id=request.user_id,
+            )
+        except DynamicTaskQuotaError as exc:
+            control = ExecutionControlService(self.db, dynamic_agent.store)
+            signal = control.enqueue_signal(
+                instance,
+                signal_type="capacity_retry",
+                causation_type="quota_backpressure",
+                causation_id=f"{instance.id}:{instance.revision}",
+                payload={"reason_code": exc.code},
+                max_attempts=16,
+            )
+            self.events.record(
+                request.tenant_id,
+                chat_session.id,
+                "dynamic_task_capacity_deferred",
+                self._turn_payload(
+                    {
+                        "execution_id": instance.id,
+                        "signal_id": signal.id,
+                        "code": exc.code,
+                    },
+                    user_message_id,
+                ),
+            )
+            self.db.commit()
+            outcome = DynamicRunOutcome(
+                "waiting",
+                instance.id,
+                blocking_step_key="capacity_retry",
+            )
+        except Exception as exc:
+            failure_code = str(getattr(exc, "code", "") or type(exc).__name__)[:128]
+            dynamic_agent.fail_execution(
+                execution_id=instance.id,
+                worker_id=f"chat-failure:{user_message_id}",
+                error_code=failure_code,
+            )
+            self.events.record(
+                request.tenant_id,
+                chat_session.id,
+                "dynamic_task_execution_failed",
+                self._turn_payload(
+                    {"execution_id": instance.id, "code": failure_code},
+                    user_message_id,
+                ),
+            )
+            self.db.commit()
+            raise
+        if outcome.status == "waiting" and outcome.blocking_step_key:
+            waiting_message = self._persist_dynamic_waiting_message(
+                chat_session=chat_session,
+                execution_id=instance.id,
+                blocking_step_key=outcome.blocking_step_key,
+                user_message_id=user_message_id,
+            )
+            self.events.record(
+                request.tenant_id,
+                chat_session.id,
+                "dynamic_task_delegated",
+                self._turn_payload(
+                    {
+                        "execution_id": instance.id,
+                        "execution_created": created,
+                        "execution_status": "waiting",
+                        "blocking_step_key": outcome.blocking_step_key,
+                    },
+                    user_message_id,
+                ),
+            )
+            self.db.commit()
+            self.db.refresh(chat_session)
+            return ChatTurnResponse(
+                reply=waiting_message.content,
+                session_id=chat_session.id,
+                router_decision=RouterDecision(
+                    decision="answer_only",
+                    reason="DynamicTaskAgent paused on a governed clarification.",
+                ),
+                step_result=StepAgentResult(
+                    reply=waiting_message.content,
+                    is_step_completed=False,
+                ),
+                session_state=public_session(chat_session),
+            )
+        if outcome.status != "succeeded" or outcome.message is None:
+            raise DynamicTaskAgentError("DYNAMIC_TASK_DID_NOT_CLOSE")
+        self.events.record(
+            request.tenant_id,
+            chat_session.id,
+            "dynamic_task_delegated",
+            self._turn_payload(
+                {"execution_id": instance.id, "execution_created": created},
+                user_message_id,
+            ),
+        )
+        self.db.commit()
+        self.db.refresh(chat_session)
+        return ChatTurnResponse(
+            reply=outcome.message.content,
+            session_id=chat_session.id,
+            router_decision=RouterDecision(
+                decision="answer_only",
+                reason="DynamicTaskAgent completed a governed read-only execution.",
+            ),
+            step_result=StepAgentResult(
+                reply=outcome.message.content,
+                is_step_completed=True,
+            ),
+            session_state=public_session(chat_session),
+        )
+
+    def _dynamic_task_source(
+        self,
+        request: ChatTurnRequest,
+        chat_session: ChatSession,
+        user_message_id: str,
+    ) -> tuple[str, str]:
+        """把交互入口解析为稳定来源身份，调度只信任已准备的同租户 run。"""
+
+        if request.channel == "wecom":
+            return "connector", user_message_id
+        if request.channel != "scheduled_task":
+            return "chat", user_message_id
+        run = self.db.exec(
+            select(ScheduledTaskRun).where(
+                ScheduledTaskRun.tenant_id == request.tenant_id,
+                ScheduledTaskRun.session_id == chat_session.id,
+                ScheduledTaskRun.agent_id == chat_session.agent_id,
+                ScheduledTaskRun.user_id == request.user_id,
+                ScheduledTaskRun.status == "running",
+            )
+        ).first()
+        if run is None:
+            raise DynamicTaskAgentError("DYNAMIC_SCHEDULE_SOURCE_INVALID")
+        source_snapshot = dict(run.source_snapshot_json or {})
+        if (
+            run.source_kind not in {"schedule", "manual"}
+            or canonical_checksum(source_snapshot) != run.source_checksum
+            or source_snapshot.get("scheduled_task_id") != run.scheduled_task_id
+            or source_snapshot.get("tenant_id") != run.tenant_id
+            or source_snapshot.get("agent_id") != run.agent_id
+            or source_snapshot.get("initiator_user_id") != run.user_id
+        ):
+            raise DynamicTaskAgentError("DYNAMIC_SCHEDULE_SOURCE_TAMPERED")
+        return "schedule", run.id
+
+    def _persist_dynamic_waiting_message(
+        self,
+        *,
+        chat_session: ChatSession,
+        execution_id: str,
+        blocking_step_key: str,
+        user_message_id: str,
+    ) -> Message:
+        """幂等投影动态任务等待状态，使聊天回放与 Attention 恢复指向同一 Execution。"""
+
+        existing_messages = self.db.exec(
+            select(Message)
+            .where(
+                Message.tenant_id == chat_session.tenant_id,
+                Message.session_id == chat_session.id,
+                Message.role == "assistant",
+            )
+            .order_by(Message.created_at, Message.id)
+        ).all()
+        for message in existing_messages:
+            metadata = message.metadata_json or {}
+            if (
+                metadata.get("message_kind") == "dynamic_task_status"
+                and metadata.get("execution_id") == execution_id
+                and metadata.get("blocking_step_key") == blocking_step_key
+            ):
+                return message
+
+        content = self._dynamic_waiting_content(blocking_step_key)
+        message = self._append_message(
+            chat_session.tenant_id,
+            chat_session.id,
+            "assistant",
+            content,
+            metadata={
+                "message_kind": "dynamic_task_status",
+                "execution_id": execution_id,
+                "execution_status": "waiting",
+                "blocking_step_key": blocking_step_key,
+                "turn_id": user_message_id,
+                "user_message_id": user_message_id,
+            },
+        )
+        self.db.flush()
+        chat_session.status = "active"
+        chat_session.summary = f"最近回复：{content}"
+        chat_session.updated_at = utc_now()
+        self.db.add(chat_session)
+        self.events.record(
+            chat_session.tenant_id,
+            chat_session.id,
+            "assistant_message_created",
+            {
+                "message_id": message.id,
+                "assistant_message_id": message.id,
+                "reply": content,
+                "execution_id": execution_id,
+                "execution_status": "waiting",
+                "blocking_step_key": blocking_step_key,
+                "turn_id": user_message_id,
+                "user_message_id": user_message_id,
+            },
+        )
+        return message
+
+
+    @staticmethod
+    def _dynamic_waiting_content(blocking_step_key: str) -> str:
+        """按真实阻塞原因返回人工办理或自动恢复文案，禁止把容量队列伪装成 Attention。"""
+
+        if blocking_step_key == "capacity_retry":
+            return (
+                "当前执行容量繁忙，任务已进入持久重试队列，将从原执行记录自动恢复；"
+                "如长时间未恢复，请由管理员在运行门禁中处置。"
+            )
+        if blocking_step_key == "scheduled_start":
+            return "定时任务已进入持久执行队列，将从该执行记录自动开始。"
+        return "任务已暂停，正在等待你补充信息。请到待我处理中心办理，完成后将从原执行记录继续。"
 
     def _select_general_capability(
         self,

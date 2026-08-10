@@ -1,3 +1,11 @@
+"""
+@Time: 2026-08-10
+@Author: zhanglp8181
+@File: test_desktop_launcher.py
+@CallChain: pytest -> desktop_launcher -> single-port desktop server configuration
+@Description: 验证桌面启动器的端口、品牌、健康检查和平台集成行为。
+"""
+
 import desktop_launcher
 
 
@@ -8,12 +16,13 @@ def _clear_port_env(monkeypatch) -> None:
 
 
 def test_build_server_config_defaults(monkeypatch) -> None:
+    """未配置桌面端环境变量时应使用统一应用的 5137 默认端口。"""
     monkeypatch.delenv("GONGGE_XUBAN_HOST", raising=False)
     _clear_port_env(monkeypatch)
     monkeypatch.setattr(desktop_launcher, "port_in_use", lambda _host, _port: False)
     cfg = desktop_launcher.build_server_config()
     assert cfg["host"] == "127.0.0.1"
-    assert cfg["port"] == 5173
+    assert cfg["port"] == 5137
     assert cfg["app"] == "single_port_app:app"
 
 
@@ -26,19 +35,21 @@ def test_build_server_config_env_override(monkeypatch) -> None:
 
 
 def test_build_server_config_ignores_unrecognized_port_env(monkeypatch) -> None:
+    """非产品命名空间的端口变量不得改变桌面端默认端口。"""
     _clear_port_env(monkeypatch)
     foreign_prefix = "".join(("ULTRA", "RAG"))
     monkeypatch.setenv(f"{foreign_prefix}_PORT", "6000")
     monkeypatch.setattr(desktop_launcher, "port_in_use", lambda _host, _port: False)
 
-    assert desktop_launcher.build_server_config()["port"] == 5173
+    assert desktop_launcher.build_server_config()["port"] == 5137
 
 
 def test_build_server_config_uses_next_port_in_range(monkeypatch) -> None:
+    """默认端口被占用时应选择端口范围中的下一个可用端口。"""
     _clear_port_env(monkeypatch)
-    monkeypatch.setattr(desktop_launcher, "port_in_use", lambda _host, port: port == 5173)
+    monkeypatch.setattr(desktop_launcher, "port_in_use", lambda _host, port: port == 5137)
     cfg = desktop_launcher.build_server_config()
-    assert cfg["port"] == 5174
+    assert cfg["port"] == 5138
 
 
 def test_build_server_config_honors_custom_port_range(monkeypatch) -> None:
@@ -51,10 +62,11 @@ def test_build_server_config_honors_custom_port_range(monkeypatch) -> None:
 
 
 def test_explicit_port_is_tried_before_range(monkeypatch) -> None:
+    """显式端口占用时应回退到用户配置范围内的首个可用端口。"""
     _clear_port_env(monkeypatch)
     monkeypatch.setenv("GONGGE_XUBAN_PORT", "7000")
-    monkeypatch.setenv("GONGGE_XUBAN_PORT_RANGE_START", "5173")
-    monkeypatch.setenv("GONGGE_XUBAN_PORT_RANGE_END", "5174")
+    monkeypatch.setenv("GONGGE_XUBAN_PORT_RANGE_START", "5137")
+    monkeypatch.setenv("GONGGE_XUBAN_PORT_RANGE_END", "5138")
     checked_ports = []
 
     def fake_port_in_use(_host, port):
@@ -63,8 +75,8 @@ def test_explicit_port_is_tried_before_range(monkeypatch) -> None:
 
     monkeypatch.setattr(desktop_launcher, "port_in_use", fake_port_in_use)
     cfg = desktop_launcher.build_server_config()
-    assert checked_ports == [7000, 5173]
-    assert cfg["port"] == 5173
+    assert checked_ports == [7000, 5137]
+    assert cfg["port"] == 5137
 
 
 def test_port_in_use_false_for_unused_port() -> None:
@@ -77,6 +89,7 @@ def test_desktop_identity_uses_new_brand() -> None:
 
 
 def test_health_accepts_new_product_marker(monkeypatch) -> None:
+    """健康检查应接受 5137 端口返回的当前产品标识。"""
     class FakeResponse:
         def __init__(self, payload: bytes):
             self.payload = payload
@@ -91,17 +104,18 @@ def test_health_accepts_new_product_marker(monkeypatch) -> None:
             return self.payload
 
     def fake_urlopen(url, timeout):
-        assert url == "http://127.0.0.1:5173/api/health"
+        assert url == "http://127.0.0.1:5137/api/health"
         assert timeout == 1
         return FakeResponse(
             '{"status":"ok","product_id":"gongge-xuban","app":"共格·序伴"}'.encode()
         )
 
     monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
-    assert desktop_launcher._health_ok("http://127.0.0.1:5173") is True
+    assert desktop_launcher._health_ok("http://127.0.0.1:5137") is True
 
 
 def test_health_rejects_unrecognized_product_marker(monkeypatch) -> None:
+    """健康检查应拒绝缺少当前产品标识的本地服务。"""
     class FakeResponse:
         def __enter__(self):
             return self
@@ -114,7 +128,7 @@ def test_health_rejects_unrecognized_product_marker(monkeypatch) -> None:
             return f'{{"status":"ok","app":"{foreign_name}"}}'.encode()
 
     monkeypatch.setattr("urllib.request.urlopen", lambda *_args, **_kwargs: FakeResponse())
-    assert desktop_launcher._health_ok("http://127.0.0.1:5173") is False
+    assert desktop_launcher._health_ok("http://127.0.0.1:5137") is False
 
 
 def test_health_rejects_other_local_service(monkeypatch) -> None:
@@ -183,13 +197,14 @@ def test_windows_restore_command_detection() -> None:
 
 
 def test_frozen_server_disables_api_access_logging(monkeypatch) -> None:
+    """冻结版桌面服务应在统一端口启动且关闭访问日志。"""
     import uvicorn
 
     calls = []
     monkeypatch.setattr(desktop_launcher.sys, "frozen", True, raising=False)
     monkeypatch.setattr(uvicorn, "run", lambda *args, **kwargs: calls.append((args, kwargs)))
 
-    desktop_launcher._serve({"app": "single_port_app:app", "host": "127.0.0.1", "port": 5173})
+    desktop_launcher._serve({"app": "single_port_app:app", "host": "127.0.0.1", "port": 5137})
 
     assert calls[0][1]["access_log"] is False
     assert calls[0][1]["log_config"] is None

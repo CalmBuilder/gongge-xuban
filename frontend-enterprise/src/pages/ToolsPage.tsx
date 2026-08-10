@@ -42,6 +42,7 @@ import {
 import { Button as UIButton } from '@/components/ui/button';
 import { notify } from '@/components/ui/app-toast';
 import { cn } from '@/lib/utils';
+import { parseToolReliabilityContract } from '@/lib/tool-reliability';
 import {
   MENU_CONTENT_CLASS,
   MENU_ITEM_CLASS,
@@ -98,6 +99,7 @@ const TOOL_FORM_INITIAL_VALUES = {
   mcp_config: '{}',
   input_schema: '{}',
   output_schema: '{}',
+  reliability_contract: '',
 };
 
 type ToolFormValues = typeof TOOL_FORM_INITIAL_VALUES & {
@@ -150,6 +152,7 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
   const canOpenCreateMenu = canManageCurrentScope;
 
   const agentQuery = agentId ? `&agent_id=${encodeURIComponent(agentId)}` : '';
+  const agentRouteSearch = agentId ? `?agent_id=${encodeURIComponent(agentId)}` : '';
   const load = () => {
     if (!agentScopeLoaded) {
       setRows([]);
@@ -273,7 +276,7 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
 
   function handleCreateAction(key: string) {
     if (key === 'blank') {
-      navigate('/enterprise/tools/new');
+      navigate(`/enterprise/tools/new${agentRouteSearch}`);
       return;
     }
     if (key === 'mcp') {
@@ -434,12 +437,18 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end" className={MENU_CONTENT_CLASS}>
           {canManageCurrentScope && !isMcpChild && (
-            <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => navigate(`/enterprise/tools/${row.id}/edit`)}>
+            <DropdownMenuItem
+              className={MENU_ITEM_CLASS}
+              onSelect={() => navigate(`/enterprise/tools/${row.id}/edit${agentRouteSearch}`)}
+            >
               <IconEdit />
               编辑
             </DropdownMenuItem>
           )}
-          <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => navigate(`/enterprise/tools/${row.id}/test`)}>
+          <DropdownMenuItem
+            className={MENU_ITEM_CLASS}
+            onSelect={() => navigate(`/enterprise/tools/${row.id}/test${agentRouteSearch}`)}
+          >
             <FlaskConical />
             测试
           </DropdownMenuItem>
@@ -918,9 +927,21 @@ function ToolEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'edit' 
   const navigate = useNavigate();
   const { toolId } = useParams();
   const isEdit = mode === 'edit';
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [agentId] = useState(() => (
+    searchParams.get('agent_id') || window.localStorage.getItem(ENTERPRISE_AGENT_STORAGE_KEY) || ''
+  ));
+  const agentQuery = agentId ? `&agent_id=${encodeURIComponent(agentId)}` : '';
 
   const setField = <K extends keyof ToolFormValues>(name: K, value: ToolFormValues[K]) =>
     setValues((prev) => ({ ...prev, [name]: value }));
+
+  useEffect(() => {
+    if (!agentId || searchParams.get('agent_id') === agentId) return;
+    const next = new URLSearchParams(searchParams);
+    next.set('agent_id', agentId);
+    setSearchParams(next, { replace: true });
+  }, [agentId, searchParams, setSearchParams]);
 
   useEffect(() => {
     void loadBucketOptions().then(setBucketOptions);
@@ -938,7 +959,6 @@ function ToolEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'edit' 
     }
     if (!toolId) return;
     setLoading(true);
-    const agentQuery = currentAgentQuery();
     api
       .get<ToolRead>(`/api/enterprise/tools/${toolId}?tenant_id=${getRequestTenantId()}${agentQuery}`)
       .then((row) => {
@@ -947,7 +967,7 @@ function ToolEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'edit' 
       })
       .catch((error) => notify.error(error instanceof Error ? error.message : '加载工具失败'))
       .finally(() => setLoading(false));
-  }, [isEdit, toolId]);
+  }, [agentQuery, isEdit, toolId]);
 
   async function save() {
     if (!String(values.name || '').trim()) {
@@ -965,7 +985,6 @@ function ToolEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'edit' 
     if (!payload) return;
     setLoading(true);
     try {
-      const agentQuery = currentAgentQuery();
       const saved = isEdit && toolId
         ? await api.put<ToolRead>(`/api/enterprise/tools/${toolId}${agentQuery ? `?${agentQuery.slice(1)}` : ''}`, payload)
         : await api.post<ToolRead>(`/api/enterprise/tools${agentQuery ? `?${agentQuery.slice(1)}` : ''}`, payload);
@@ -973,7 +992,9 @@ function ToolEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'edit' 
       setTool(saved);
       setValues(toolToFormValues(saved));
       if (!isEdit) {
-        navigate(`/enterprise/tools/${saved.id}/edit`, { replace: true });
+        navigate(`/enterprise/tools/${saved.id}/edit${agentId ? `?agent_id=${encodeURIComponent(agentId)}` : ''}`, {
+          replace: true,
+        });
       }
     } catch (error) {
       notify.error(error instanceof Error ? error.message : '保存失败');
@@ -1002,7 +1023,7 @@ function ToolEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'edit' 
         {isEdit && tool && (
           <UIButton
             variant="outline"
-            onClick={() => navigate(`/enterprise/tools/${tool.id}/test`)}
+            onClick={() => navigate(`/enterprise/tools/${tool.id}/test${agentId ? `?agent_id=${encodeURIComponent(agentId)}` : ''}`)}
             className={RETURN_BUTTON_CLASS}
           >
             <ExperimentOutlined />
@@ -1113,17 +1134,21 @@ export function ToolTestPage({ currentUser, onLogout }: ToolPageProps = {}) {
   const [loading, setLoading] = useState(false);
   const navigate = useNavigate();
   const { toolId } = useParams();
+  const [searchParams] = useSearchParams();
+  const [agentId] = useState(() => (
+    searchParams.get('agent_id') || window.localStorage.getItem(ENTERPRISE_AGENT_STORAGE_KEY) || ''
+  ));
+  const agentQuery = agentId ? `&agent_id=${encodeURIComponent(agentId)}` : '';
 
   useEffect(() => {
     if (!toolId) return;
     setLoading(true);
-    const agentQuery = currentAgentQuery();
     api
       .get<ToolRead>(`/api/enterprise/tools/${toolId}?tenant_id=${getRequestTenantId()}${agentQuery}`)
       .then(setTool)
       .catch((error) => notify.error(error instanceof Error ? error.message : '加载工具失败'))
       .finally(() => setLoading(false));
-  }, [toolId]);
+  }, [agentQuery, toolId]);
 
   return (
     <div className="min-h-full box-border px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]" aria-busy={loading}>
@@ -1141,7 +1166,7 @@ export function ToolTestPage({ currentUser, onLogout }: ToolPageProps = {}) {
         {tool && (
           <UIButton
             variant="outline"
-            onClick={() => navigate(`/enterprise/tools/${tool.id}/edit`)}
+            onClick={() => navigate(`/enterprise/tools/${tool.id}/edit${agentId ? `?agent_id=${encodeURIComponent(agentId)}` : ''}`)}
             className={RETURN_BUTTON_CLASS}
           >
             <IconEdit className="size-3.5" />
@@ -1720,6 +1745,21 @@ function ToolFormFields({
         </Field>
       </div>
 
+      <Field
+        label="动态任务可靠性契约"
+        htmlFor="tool-reliability-contract"
+        hint="留空表示不向动态任务发布。只有无副作用纯读工具可设置 explore_safe=true；保存时由服务端复核风险、Schema 路径和发布校验和。"
+      >
+        <Textarea
+          id="tool-reliability-contract"
+          rows={8}
+          className={MONO_INPUT_CLASS}
+          placeholder={'{\n  "risk_class": "read",\n  "side_effect": "none",\n  "confirmation_policy": "none",\n  "timeout_policy": "failed",\n  "dynamic_task_enabled": true,\n  "explore_safe": true\n}'}
+          value={values.reliability_contract}
+          onChange={(event) => setField('reliability_contract', event.target.value)}
+        />
+      </Field>
+
       <div className="grid grid-cols-1 gap-[16px] sm:grid-cols-2">
         <Field label="工具分桶" htmlFor="tool-bucket">
           <Input
@@ -2123,6 +2163,9 @@ function toolToFormValues(row: ToolRead): ToolFormValues {
     mcp_config: JSON.stringify(row.mcp_config || {}, null, 2),
     input_schema: JSON.stringify(row.input_schema || {}, null, 2),
     output_schema: JSON.stringify(row.output_schema || {}, null, 2),
+    reliability_contract: row.reliability_contract
+      ? JSON.stringify(row.reliability_contract, null, 2)
+      : '',
     allowed_skills: (row.allowed_skills || []).join(','),
     required_permission_code: row.required_permission_code || '',
     permission_authorization_mode: row.permission_authorization_mode || 'caller_and_agent',
@@ -2159,13 +2202,14 @@ function buildToolPayload(
       clear_credential_fields: [],
       input_schema: parseJson(values.input_schema, {}),
       output_schema: parseJson(values.output_schema, {}),
+      reliability_contract: parseToolReliabilityContract(values.reliability_contract),
       allowed_skills: String(values.allowed_skills || '').split(',').map((item) => item.trim()).filter(Boolean),
       required_permission_code: String(values.required_permission_code || '').trim() || null,
       permission_authorization_mode: values.permission_authorization_mode || 'caller_and_agent',
       enabled: values.enabled,
     };
   } catch {
-    notify.error('JSON 配置格式不正确，请检查 Headers、Auth、Schema 或 MCP Config');
+    notify.error('JSON 配置格式不正确，请检查 Headers、Auth、Schema、可靠性契约或 MCP Config');
     return null;
   }
 }

@@ -88,6 +88,7 @@ def test_m55_upgrade_creates_derived_versions_without_reanchoring_old_instance()
             skill_version=source_snapshot.version,
             definition_checksum=source_snapshot.compiled_definition_checksum or "checksum",
             status="waiting",
+            active_slot_key="foreground:session_m55d_old",
         )
         db.add(instance)
         db.commit()

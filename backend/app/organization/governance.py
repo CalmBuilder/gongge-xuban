@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from fastapi import HTTPException
+from sqlalchemy.dialects.mysql import insert as mysql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlmodel import Session, select
 
 from app.db.models import (
@@ -21,6 +23,7 @@ from app.db.models import (
     Position,
     PositionAssignment,
     PositionRoleBinding,
+    Tenant,
     User,
     utc_now,
 )
@@ -48,6 +51,8 @@ GOVERNANCE_PERMISSION_CODES = frozenset(
         "reference_data.manage",
         "authorization.read",
         "authorization.manage",
+        "connection_profile.manage",
+        "dynamic_task.standing_approval.manage",
         "agent.read",
         "agent.manage",
         "knowledge.read",
@@ -75,7 +80,15 @@ BUILTIN_GOVERNANCE_ROLES: dict[str, tuple[str, frozenset[str]]] = {
     ),
     "governance_agent_admin": (
         "数字员工管理员",
-        frozenset({"agent.read", "agent.manage", "authorization.read"}),
+        frozenset(
+            {
+                "agent.read",
+                "agent.manage",
+                "connection_profile.manage",
+                "dynamic_task.standing_approval.manage",
+                "authorization.read",
+            }
+        ),
     ),
     "governance_knowledge_admin": (
         "知识管理员",
@@ -115,7 +128,14 @@ class PermissionGrant:
 
 
 def ensure_builtin_governance_catalog(db: Session, tenant_id: str) -> None:
-    """幂等创建治理权限与内置治理角色，不给任何成员隐式写入业务任职。"""
+    """锁定租户事务后幂等创建治理目录，避免并发初始化形成 MySQL 插入死锁。"""
+
+    # 治理目录包含分类、权限、角色和映射四组唯一键写入。仅依赖各表的 upsert，
+    # 多事务仍可能因取得唯一索引锁的顺序交叉而被 MySQL 判定为死锁。租户行是
+    # 现成且跨进程可见的聚合锁；锁会由调用方事务统一释放，不引入进程内状态。
+    db.exec(
+        select(Tenant).where(Tenant.id == tenant_id).with_for_update()
+    ).first()
 
     ensure_builtin_role_categories(db, tenant_id)
     ensure_builtin_permission_catalog(db, tenant_id)
@@ -123,6 +143,7 @@ def ensure_builtin_governance_catalog(db: Session, tenant_id: str) -> None:
         select(BusinessRole).where(BusinessRole.tenant_id == tenant_id)
     ).all()
     by_code = {role.role_code: role for role in existing}
+    dialect_name = db.get_bind().dialect.name
     now = utc_now()
     for role_code, (name, permission_codes) in BUILTIN_GOVERNANCE_ROLES.items():
         role = by_code.get(role_code)
@@ -137,8 +158,37 @@ def ensure_builtin_governance_catalog(db: Session, tenant_id: str) -> None:
                 created_at=now,
                 updated_at=now,
             )
-            db.add(role)
+            values = {
+                column.name: getattr(role, column.name)
+                for column in BusinessRole.__table__.columns
+            }
+            if dialect_name == "sqlite":
+                statement = (
+                    sqlite_insert(BusinessRole)
+                    .values(**values)
+                    .on_conflict_do_nothing(index_elements=["tenant_id", "role_code"])
+                )
+                db.exec(statement)
+            elif dialect_name == "mysql":
+                statement = mysql_insert(BusinessRole).values(**values)
+                db.exec(
+                    statement.on_duplicate_key_update(
+                        id=BusinessRole.__table__.c.id,
+                    )
+                )
+            else:
+                db.add(role)
             db.flush()
+            role = db.exec(
+                select(BusinessRole)
+                .where(
+                    BusinessRole.tenant_id == tenant_id,
+                    BusinessRole.role_code == role_code,
+                )
+                .with_for_update()
+            ).one()
+            if role.role_kind != "governance":
+                raise ValueError(f"GOVERNANCE_ROLE_CODE_CONFLICT:{role_code}")
         elif role.role_kind != "governance":
             raise ValueError(f"GOVERNANCE_ROLE_CODE_CONFLICT:{role_code}")
         else:

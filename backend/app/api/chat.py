@@ -16,7 +16,6 @@ from sqlalchemy import or_
 from sqlmodel import Session, select
 
 from app.agents.branching import model_for_agent
-from app.agents.identity import agent_is_published
 from app.agents.session_snapshot import anchor_chat_session
 from app.core import AgentLoop
 from app.core.cancellation import cancel_chat_turn
@@ -24,7 +23,6 @@ from app.db import engine, get_session
 from app.db.models import (
     AgentEvent,
     AgentProfile,
-    AgentUsage,
     ChatSession,
     HumanHandoffRequest,
     KnowledgeChunk,
@@ -48,11 +46,11 @@ from app.observability.spans import (
     set_span_sink,
 )
 from app.security.auth import get_current_user
-from app.security.permissions import agent_owned_by_user, is_admin_user
+from app.security.permissions import can_use_agent_in_chat, is_admin_user
 from app.security.tenant import ensure_tenant
 from app.scheduled_tasks.schema import ScheduledTaskDraftRead
 from app.scheduled_tasks.service import DEFAULT_TASK_TIME, detect_scheduled_task_draft
-from app.session.attachments import parse_chat_attachment
+from app.session.managed_resources import ManagedInputResourceService
 from app.session.helpers import public_session
 from app.session.session_schema import (
     ChatAttachmentRead,
@@ -900,18 +898,39 @@ async def upload_chat_attachments(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_session),
 ) -> list[ChatAttachmentRead]:
+    """持久化聊天附件并返回兼容解析内容及服务端资源引用。"""
+
     _ensure_request_tenant(tenant_id, current_user)
     ensure_tenant(db, tenant_id)
     if not files:
         raise HTTPException(status_code=400, detail="No files uploaded")
     if len(files) > MAX_CHAT_ATTACHMENTS:
         raise HTTPException(status_code=400, detail=f"最多一次上传 {MAX_CHAT_ATTACHMENTS} 个文件")
-    parsed: list[ChatAttachmentRead] = []
+    uploads: list[tuple[str, str | None, bytes]] = []
     for file in files:
         data = await file.read()
         if len(data) > MAX_CHAT_ATTACHMENT_BYTES:
             raise HTTPException(status_code=413, detail=f"{file.filename or '文件'} 超过上传大小限制")
-        parsed.append(parse_chat_attachment(file.filename or "uploaded-file", file.content_type, data))
+        uploads.append((file.filename or "uploaded-file", file.content_type, data))
+    parsed: list[ChatAttachmentRead] = []
+    persisted = []
+    resource_service = ManagedInputResourceService(db)
+    try:
+        for filename, content_type, data in uploads:
+            resource, attachment = resource_service.persist_upload(
+                tenant_id=tenant_id,
+                owner_user_id=current_user.id,
+                filename=filename,
+                content_type=content_type,
+                data=data,
+            )
+            persisted.append(resource)
+            parsed.append(attachment)
+        db.commit()
+    except Exception:
+        db.rollback()
+        resource_service.discard_uncommitted(persisted)
+        raise
     return parsed
 
 
@@ -2558,18 +2577,7 @@ def _ensure_request_tenant(tenant_id: str, current_user: User) -> None:
 def _chat_agent_visible_to_user(db: Session, row: AgentProfile, user: User) -> bool:
     """所有者可直接工作；租户广场员工必须先由当前成员建立使用关系。"""
 
-    if agent_owned_by_user(row, user):
-        return True
-    if not agent_is_published(row):
-        return False
-    usage = db.exec(
-        select(AgentUsage).where(
-            AgentUsage.tenant_id == row.tenant_id,
-            AgentUsage.user_id == user.id,
-            AgentUsage.agent_id == row.id,
-        )
-    ).first()
-    return usage is not None
+    return can_use_agent_in_chat(db, row, user)
 
 
 

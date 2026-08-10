@@ -214,7 +214,7 @@ test('M4-A 正式字段兼容旧 owner，并在真实 Chromium 展示企业广�
   }));
 
   await page.goto('/workspace/gallery');
-  await page.getByRole('tab', { name: '数字员工广场' }).click();
+  await page.getByRole('tab', { name: '发现' }).click();
   await expect(page.getByText(/^E2E 企业广场员工/)).toBeVisible();
   await expect(page.getByText('Not Found', { exact: true })).toHaveCount(0);
   expect(failures).toEqual([]);
@@ -519,8 +519,12 @@ test('超标特批 v2.1 按申请部门子树竞争认领并流转到集中财�
     && response.request().method() === 'POST',
   );
   await financePage.getByRole('button', { name: '批准本级' }).click();
-  expect((await financeComplete).status()).toBe(200);
-  await financePage.getByRole('button', { name: '关闭' }).click();
+  const financeCompleteResponse = await financeComplete;
+  expect(
+    financeCompleteResponse.status(),
+    JSON.stringify(await financeCompleteResponse.json()),
+  ).toBe(200);
+  await expect(financePage.getByRole('dialog')).toBeHidden();
   await financePage.getByRole('tab', { name: '已办' }).click();
   await expect(
     financePage.getByText('expense_over_limit_approval', { exact: true }),
@@ -789,7 +793,7 @@ test('管理员治理发布后普通成员可添加对话和复制，但不能�
   );
   await page.getByRole('button', { name: '同意' }).click();
   expect((await legacyCompleteResponse).status()).toBe(200);
-  await page.getByRole('button', { name: '关闭' }).click();
+  await expect(page.getByRole('dialog')).toBeHidden();
   await page.goto('/enterprise/platform/agents');
 
   const sourceCard = page.getByRole('button', { name: new RegExp(sourceName) });
@@ -870,12 +874,12 @@ test('管理员治理发布后普通成员可添加对话和复制，但不能�
   await expect(page).toHaveURL(new RegExp(`/workspace/chat/draft/${sourceAgent.id}$`));
 
   await page.goto('/workspace/gallery');
-  await expect(page.getByRole('tab', { name: '常用数字员工' })).toHaveAttribute(
+  await expect(page.getByRole('tab', { name: '常用', exact: true })).toHaveAttribute(
     'aria-selected',
     'true',
   );
   await expect(page.getByRole('button', { name: new RegExp(sourceName) })).toBeVisible();
-  await page.getByRole('tab', { name: '我创建的数字员工' }).click();
+  await page.getByRole('tab', { name: /^我创建的/ }).click();
   await expect(page.getByRole('button', { name: new RegExp(copiedName) })).toBeVisible();
 
   const m4Contracts = await page.evaluate(async ({ sourceId, copyName }) => {
@@ -1265,13 +1269,10 @@ test('普通成员可以处理自己员工的建议，其他成员仍被拒绝',
   await expect(dialog.getByText(rejectTitle, { exact: true })).toBeHidden();
 
   const verified = await page.evaluate(async () => {
-    const adminLoginResponse = await fetch('/api/auth/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ tenant_id: 'tenant_demo', username: 'admin', password: 'admin' }),
-    });
-    const adminLogin = await adminLoginResponse.json() as { token: string };
-    const headers = { Authorization: `Bearer ${adminLogin.token}` };
+    const rawSession = localStorage.getItem('gongge_auth');
+    if (!rawSession) throw new Error('成员登录后未保存认证会话');
+    const token = (JSON.parse(rawSession) as { token: string }).token;
+    const headers = { Authorization: `Bearer ${token}` };
     const scope = 'tenant_id=tenant_demo&agent_id=agent_e2e_member_employee';
     const [discoveries, skills, tools] = await Promise.all([
       fetch(`/api/enterprise/knowledge/discoveries?${scope}`, { headers })
@@ -2175,7 +2176,11 @@ test('治理角色按组织子树授权，范围管理员与普通成员在真�
     async function request<T>(path: string, init?: RequestInit): Promise<T> {
       const response = await fetch(path, { ...init, headers: { ...headers, ...init?.headers } });
       const body = await response.json();
-      if (!response.ok) throw new Error(`${init?.method || 'GET'} ${path}: ${response.status}`);
+      if (!response.ok) {
+        throw new Error(
+          `${init?.method || 'GET'} ${path}: ${response.status} ${JSON.stringify(body)}`,
+        );
+      }
       return body as T;
     }
 
@@ -2221,6 +2226,8 @@ test('治理角色按组织子树授权，范围管理员与普通成员在真�
           scope_type: 'org_unit',
           scope_id: scoped.id,
           include_descendants: true,
+          grant_reason: '隔离浏览器治理范围回归',
+          effective_until: '2099-12-31T00:00:00Z',
         }),
       },
     );

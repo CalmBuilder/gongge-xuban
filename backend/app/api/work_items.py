@@ -20,6 +20,7 @@ from app.db import get_session
 from app.db.models import (
     AgentEvent,
     ChatSession,
+    ExecutionSignal,
     SopInstance,
     SopWorkItem,
     SopWorkItemCandidate,
@@ -28,6 +29,8 @@ from app.db.models import (
 from app.organization.permissions import user_permission_codes
 from app.security.auth import ensure_current_user_tenant, get_current_user
 from app.sop_runtime.coordinator import DeterministicSopCoordinator
+from app.sop_runtime.execution_control import ExecutionControlError, ExecutionControlService
+from app.sop_runtime.execution_store import SopExecutionConflictError
 from app.sop_runtime.state_machine import RevisionConflictError
 from app.sop_runtime.work_items import (
     ACTIVE_WORK_ITEM_STATUSES,
@@ -187,6 +190,7 @@ def _visible_work_item_query(
     )
     statement = select(SopWorkItem).where(
         SopWorkItem.tenant_id == tenant_id,
+        SopWorkItem.attention_kind == "sop_human_task",
         or_(
             SopWorkItem.initiator_user_id == current_user.id,
             SopWorkItem.owner_user_id == current_user.id,
@@ -289,14 +293,52 @@ def complete_work_item(
     item = _tenant_work_item(db, request.tenant_id, work_item_id)
     was_completed = item.status == "completed"
     try:
-        _, completed = SopWorkItemService(db).complete(
+        instance = db.get(SopInstance, item.instance_id)
+        if instance is None or instance.tenant_id != item.tenant_id:
+            raise WorkItemError("WORK_ITEM_INSTANCE_NOT_FOUND", "工作项所属 Execution 不存在。")
+        coordinator = DeterministicSopCoordinator(db)
+        control = ExecutionControlService(db, coordinator.store)
+        replay = control.replayed_attention_resolution(
             item,
             actor_user_id=current_user.id,
             command_id=request.command_id,
-            outcome=request.outcome,
-            comment=request.comment,
-            expected_revision=request.expected_revision,
+            command=request.outcome,
         )
+        if replay is not None:
+            return _work_item_read(db, item, current_user.id)
+        with coordinator.store.owned(
+            instance,
+            worker_id=f"attention-{item.id[-16:]}",
+        ):
+            _, completed = control.resolve_attention(
+                instance,
+                item,
+                actor_user_id=current_user.id,
+                command_id=request.command_id,
+                command=request.outcome,
+                comment=request.comment,
+                expected_revision=request.expected_revision
+                if request.expected_revision is not None
+                else item.revision,
+            )
+            if completed:
+                signal = db.exec(
+                    select(ExecutionSignal).where(
+                        ExecutionSignal.tenant_id == item.tenant_id,
+                        ExecutionSignal.execution_id == instance.id,
+                        ExecutionSignal.signal_type == "attention_decided",
+                        ExecutionSignal.causation_id == f"{item.id}:{item.revision}",
+                    )
+                ).first()
+                if signal is not None and signal.status == "pending":
+                    control.claim_signal(signal, worker_id=f"attention-{item.id[-16:]}")
+                    control.consume_signal(
+                        instance,
+                        signal,
+                        worker_id=f"attention-{item.id[-16:]}",
+                    )
+                if not was_completed:
+                    coordinator.resume_completed_work_item(item)
         _record_work_item_event(
             db,
             item,
@@ -304,11 +346,14 @@ def complete_work_item(
             current_user.id,
             payload={"outcome": request.outcome, "completed": completed},
         )
-        if completed and not was_completed:
-            DeterministicSopCoordinator(db).resume_completed_work_item(item)
         db.commit()
         db.refresh(item)
-    except (WorkItemError, RevisionConflictError) as error:
+    except (
+        ExecutionControlError,
+        SopExecutionConflictError,
+        WorkItemError,
+        RevisionConflictError,
+    ) as error:
         db.rollback()
         raise _work_item_http_error(error) from error
     return _work_item_read(db, item, current_user.id)
@@ -482,7 +527,11 @@ def _tenant_work_item(db: Session, tenant_id: str, work_item_id: str) -> SopWork
     """读取当前租户工作项并拒绝通过主键跨租户访问。"""
 
     item = db.get(SopWorkItem, work_item_id)
-    if item is None or item.tenant_id != tenant_id:
+    if (
+        item is None
+        or item.tenant_id != tenant_id
+        or item.attention_kind != "sop_human_task"
+    ):
         raise HTTPException(status_code=404, detail="Work item not found")
     return item
 
@@ -520,7 +569,9 @@ def _record_work_item_event(
     )
 
 
-def _work_item_http_error(error: WorkItemError | RevisionConflictError) -> HTTPException:
+def _work_item_http_error(
+    error: WorkItemError | RevisionConflictError | ExecutionControlError | SopExecutionConflictError,
+) -> HTTPException:
     """将领域错误映射为稳定 HTTP 状态，不向客户端泄露内部异常。"""
 
     if isinstance(error, RevisionConflictError):

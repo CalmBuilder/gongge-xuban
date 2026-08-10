@@ -94,6 +94,200 @@ def test_public_mock_settings_reject_a_blank_api_key() -> None:
         Settings(_env_file=None, public_mock_api_key="   ")
 
 
+def test_dynamic_task_router_shadow_is_safe_by_default(monkeypatch) -> None:
+    """未显式配置时关闭动态任务 shadow，并保持有界超时与置信度门禁。"""
+
+    monkeypatch.delenv("DYNAMIC_TASK_ROUTER_SHADOW_ENABLED", raising=False)
+    monkeypatch.delenv("DYNAMIC_TASK_ROUTER_SHADOW_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.delenv("DYNAMIC_TASK_ROUTER_SHADOW_MIN_CONFIDENCE", raising=False)
+
+    settings = Settings(_env_file=None, public_mock_api_key="test-key")
+
+    assert settings.dynamic_task_router_shadow_enabled is False
+    assert settings.dynamic_task_execution_enabled is False
+    assert settings.dynamic_task_steering_enabled is False
+    assert settings.dynamic_task_external_write_enabled is False
+    assert settings.dynamic_task_tenant_allowlist == ""
+    assert settings.dynamic_task_agent_allowlist == ""
+    assert settings.dynamic_task_rollout_allows("tenant_demo", "agent_demo") is False
+    assert settings.dynamic_task_signal_dispatch_workers == 4
+    assert settings.dynamic_task_signal_dispatch_capacity == 16
+    assert settings.dynamic_task_alert_signal_backlog_threshold == 0
+    assert settings.dynamic_task_alert_dead_letter_threshold == 0
+    assert settings.dynamic_task_alert_unknown_operation_threshold == 0
+    assert settings.dynamic_task_alert_publication_backlog_threshold == 0
+    assert settings.dynamic_task_alert_waiting_age_seconds == 0
+    assert settings.dynamic_task_alert_thresholds_configured is False
+    assert settings.dynamic_task_max_active_per_tenant == 0
+    assert settings.dynamic_task_max_active_per_agent == 0
+    assert settings.dynamic_task_max_active_per_user == 0
+    assert settings.dynamic_task_max_active_per_tool == 0
+    assert settings.dynamic_task_quota_limits_configured is False
+    assert settings.dynamic_task_router_shadow_timeout_seconds == 2.0
+    assert settings.dynamic_task_router_shadow_min_confidence == 0.7
+
+
+@pytest.mark.parametrize(
+    ("tenant_allowlist", "agent_allowlist", "tenant_id", "agent_id", "allowed"),
+    [
+        ("tenant_a", "agent_a", "tenant_a", "agent_a", True),
+        ("tenant_a", "agent_a", "tenant_b", "agent_a", False),
+        ("tenant_a", "agent_a", "tenant_a", "agent_b", False),
+        ("*", "agent_a", "tenant_b", "agent_a", True),
+        ("tenant_a", "*", "tenant_a", "agent_b", True),
+        ("", "", "tenant_a", "agent_a", False),
+    ],
+)
+def test_dynamic_task_rollout_requires_tenant_and_agent_allowlists(
+    tenant_allowlist: str,
+    agent_allowlist: str,
+    tenant_id: str,
+    agent_id: str,
+    allowed: bool,
+) -> None:
+    """验证打开总开关后仍须同时命中 tenant 与 Agent 灰度边界。"""
+
+    settings = Settings(
+        _env_file=None,
+        public_mock_api_key="test-key",
+        dynamic_task_execution_enabled=True,
+        dynamic_task_tenant_allowlist=tenant_allowlist,
+        dynamic_task_agent_allowlist=agent_allowlist,
+        dynamic_task_alert_signal_backlog_threshold=10,
+        dynamic_task_alert_dead_letter_threshold=1,
+        dynamic_task_alert_unknown_operation_threshold=1,
+        dynamic_task_alert_publication_backlog_threshold=5,
+        dynamic_task_alert_waiting_age_seconds=3600,
+        dynamic_task_max_active_per_tenant=16,
+        dynamic_task_max_active_per_agent=8,
+        dynamic_task_max_active_per_user=4,
+        dynamic_task_max_active_per_tool=4,
+    )
+
+    assert settings.dynamic_task_rollout_allows(tenant_id, agent_id) is allowed
+
+
+def test_dynamic_task_rollout_global_kill_switch_overrides_wildcards() -> None:
+    """验证显式全量灰度也不能绕过关闭的全局执行开关。"""
+
+    settings = Settings(
+        _env_file=None,
+        public_mock_api_key="test-key",
+        dynamic_task_execution_enabled=False,
+        dynamic_task_tenant_allowlist="*",
+        dynamic_task_agent_allowlist="*",
+    )
+
+    assert settings.dynamic_task_rollout_allows("tenant_a", "agent_a") is False
+
+
+def test_dynamic_task_rollout_rejects_allowlists_without_alert_thresholds() -> None:
+    """验证 tenant/Agent 即使命中，也不能在停止阈值未配置时开放生产执行。"""
+
+    settings = Settings(
+        _env_file=None,
+        public_mock_api_key="test-key",
+        dynamic_task_execution_enabled=True,
+        dynamic_task_tenant_allowlist="tenant_a",
+        dynamic_task_agent_allowlist="agent_a",
+    )
+
+    assert settings.dynamic_task_alert_thresholds_configured is False
+    assert settings.dynamic_task_rollout_allows("tenant_a", "agent_a") is False
+
+
+def test_dynamic_task_rollout_rejects_allowlists_without_quota_limits() -> None:
+    """验证停止阈值已配置但四级配额为空时仍不能开放动态执行。"""
+
+    settings = Settings(
+        _env_file=None,
+        public_mock_api_key="test-key",
+        dynamic_task_execution_enabled=True,
+        dynamic_task_tenant_allowlist="tenant_a",
+        dynamic_task_agent_allowlist="agent_a",
+        dynamic_task_alert_signal_backlog_threshold=10,
+        dynamic_task_alert_dead_letter_threshold=1,
+        dynamic_task_alert_unknown_operation_threshold=1,
+        dynamic_task_alert_publication_backlog_threshold=5,
+        dynamic_task_alert_waiting_age_seconds=3600,
+    )
+
+    assert settings.dynamic_task_alert_thresholds_configured is True
+    assert settings.dynamic_task_quota_limits_configured is False
+    assert settings.dynamic_task_rollout_allows("tenant_a", "agent_a") is False
+
+
+def test_dynamic_task_signal_capacity_must_cover_all_workers() -> None:
+    """验证 Signal 队列容量配置不能小于派发 worker 数。"""
+
+    with pytest.raises(ValidationError, match="DISPATCH_CAPACITY"):
+        Settings(
+            _env_file=None,
+            public_mock_api_key="test-key",
+            dynamic_task_signal_dispatch_workers=8,
+            dynamic_task_signal_dispatch_capacity=4,
+        )
+
+
+def test_dynamic_task_alert_thresholds_reject_negative_values() -> None:
+    """验证告警阈值只能是未配置的零或正数，拒绝含义不明的负值。"""
+
+    with pytest.raises(ValidationError, match="greater than or equal to 0"):
+        Settings(
+            _env_file=None,
+            public_mock_api_key="test-key",
+            dynamic_task_alert_waiting_age_seconds=-1,
+        )
+
+
+@pytest.mark.parametrize(
+    ("redirect_uri", "configured"),
+    [
+        ("https://app.example.com/api/slack/callback", True),
+        ("http://app.example.com/api/slack/callback", False),
+        ("", False),
+    ],
+)
+def test_slack_oauth_requires_complete_https_server_configuration(
+    redirect_uri: str,
+    configured: bool,
+) -> None:
+    """验证生产 OAuth 只有 client 两项和 HTTPS callback 同时存在时才启用。"""
+
+    settings = Settings(
+        _env_file=None,
+        public_mock_api_key="test-key",
+        slack_oauth_client_id="client-id",
+        slack_oauth_client_secret="client-secret",
+        slack_oauth_redirect_uri=redirect_uri,
+    )
+
+    assert settings.slack_oauth_configured is configured
+
+
+@pytest.mark.parametrize(
+    ("app_secret", "configured"),
+    [
+        ("connection-profile-production-key-32-bytes", True),
+        ("change-me-in-development", False),
+        ("short", False),
+    ],
+)
+def test_connection_secret_backend_rejects_placeholder_or_short_master_key(
+    app_secret: str,
+    configured: bool,
+) -> None:
+    """验证连接凭据写入门禁不会接受可预测或低强度主密钥。"""
+
+    settings = Settings(
+        _env_file=None,
+        public_mock_api_key="test-key",
+        app_secret=app_secret,
+    )
+
+    assert settings.connection_secret_backend_configured is configured
+
+
 def test_active_production_tool_base_url_is_reachable_from_the_host() -> None:
     settings = Settings()
     hostname = urlsplit(settings.normalized_tool_base_url).hostname

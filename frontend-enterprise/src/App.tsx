@@ -115,6 +115,7 @@ const ReferenceDataPage = lazy(() => import("./pages/ReferenceDataPage"));
 const ManagementAuditPage = lazy(() => import("./pages/ManagementAuditPage"));
 const EnterpriseInfoPage = lazy(() => import("./pages/EnterpriseInfoPage"));
 const WorkItemsPage = lazy(() => import("./pages/WorkItemsPage"));
+const ConnectionsPage = lazy(() => import("./pages/ConnectionsPage"));
 
 const ENTERPRISE_SIDEBAR_STORAGE_KEY = "gongge_enterprise_sidebar_expanded";
 const MODEL_CONFIGS_UPDATED_EVENT = "gongge-enterprise-model-configs-updated";
@@ -177,6 +178,10 @@ function Shell({
   const canReadAuthorization = hasGovernancePermission(auth.user, "authorization.read");
   const canReadReferenceData = hasGovernancePermission(auth.user, "reference_data.read");
   const canReadAudit = hasGovernancePermission(auth.user, "audit.read");
+  const canManageConnections = hasGovernancePermission(
+    auth.user,
+    "connection_profile.manage",
+  );
   const accountRoleLabel = isAdmin ? "管理员" : "";
   const isDistillRoute = location.pathname === "/enterprise/skills/distill";
   const selected =
@@ -787,6 +792,16 @@ function Shell({
                 element={
                   isAdmin ? (
                     <ModelsPage currentUser={auth.user} onLogout={onLogout} />
+                  ) : (
+                    <Navigate to={EnterpriseRoute.Gallery} replace />
+                  )
+                }
+              />
+              <Route
+                path="/enterprise/connections"
+                element={
+                  canManageConnections ? (
+                    <ConnectionsPage currentUser={auth.user} onLogout={onLogout} />
                   ) : (
                     <Navigate to={EnterpriseRoute.Gallery} replace />
                   )

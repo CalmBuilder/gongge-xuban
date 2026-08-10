@@ -1,5 +1,5 @@
 """
-@Time       : 2026/07/27 16:10
+@Time       : 2026/08/10 17:15
 @Author     : zhanglp8181
 @File       : test_mysql_database.py
 @CallChain  : pytest mysql 标记 → Alembic/SQLModel → 临时 MySQL 8.4 数据库
@@ -8,17 +8,62 @@
 
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
+import json
 import threading
 
 import pytest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy import inspect, text
 from sqlmodel import Session, create_engine, select
 
 from app.api.model_configs import set_default_model_config
-from app.db.models import Message, ModelConfig, Skill, SkillVersion, SopInstance, SopWorkItem, Tenant
+from app.db.models import (
+    ActionProposalRecord,
+    AgentEvent,
+    AgentProfile,
+    ArtifactInputLink,
+    BusinessRole,
+    BusinessRolePermission,
+    EventOutbox,
+    ExecutionCommand,
+    ExecutionPublication,
+    ExecutionResult,
+    ExecutionSignal,
+    ExecutionArtifact,
+    ExecutionPlanRevision,
+    ExecutionMutationRejection,
+    Message,
+    ModelConfig,
+    InputResourceSnapshot,
+    PermissionDefinition,
+    Skill,
+    SkillVersion,
+    SopInstance,
+    SopNodeExecution,
+    SopOperation,
+    SopOperationAttempt,
+    SopOperationEffect,
+    SopWorkItem,
+    Tenant,
+    User,
+)
+from app.dynamic_tasks.artifacts import ArtifactService
+from app.organization.governance import (
+    BUILTIN_GOVERNANCE_ROLES,
+    ensure_builtin_governance_catalog,
+)
+from app.dynamic_tasks.planning import (
+    ActionKind,
+    CompletedProviderProposal,
+    NormalizedPlan,
+    PlanReason,
+    PlanStep,
+    RuntimeActionProposal,
+    SuccessCriterion,
+)
+from app.dynamic_tasks.agent import DynamicRunOutcome, DynamicTaskAgent
 from app.db.seed import (
     EXCHANGE_SKILL,
     PRICE_COMPARE_SKILL,
@@ -32,6 +77,12 @@ from app.sop_runtime.bulk_migration import (
     apply_m55_published_head_upgrade,
 )
 from app.sop_runtime.migration_inventory import build_sop_migration_inventory
+from app.sop_runtime.execution_store import (
+    SopExecutionConflictError,
+    SopExecutionFencedError,
+    SopExecutionStore,
+)
+from app.sop_runtime.execution_control import ExecutionControlService
 
 
 pytestmark = pytest.mark.mysql
@@ -95,6 +146,16 @@ def test_alembic_upgrades_empty_mysql_database(mysql_database_url: str) -> None:
     assert "alembic_version" in tables
     assert "messages" in tables
     assert "agent_resource_bindings" in tables
+    assert "execution_artifacts" in tables
+    assert "artifact_input_links" in tables
+    assert "connection_secrets" in tables
+    assert "connection_profiles" in tables
+    assert "agent_connection_bindings" in tables
+    assert "connection_command_receipts" in tables
+    assert "connection_oauth_states" in tables
+    assert "connector_inbound_events" in tables
+    assert "standing_approval_rules" in tables
+    assert "standing_approval_command_receipts" in tables
     assert "code_sets" in tables
     assert "code_items" in tables
     assert "organization_units" in tables
@@ -106,6 +167,18 @@ def test_alembic_upgrades_empty_mysql_database(mysql_database_url: str) -> None:
     assert "organization_leader_assignments" in tables
     assert "knowledge_base_org_access" in tables
     assert "management_audit_logs" in tables
+    assert "execution_mutation_rejections" in tables
+    assert "execution_plan_revisions" in tables
+    assert "action_proposal_records" in tables
+    assert "managed_input_resources" in tables
+    assert "input_resource_snapshots" in tables
+    assert {
+        "execution_commands",
+        "execution_signals",
+        "execution_results",
+        "execution_publications",
+        "event_outbox",
+    }.issubset(tables)
     assert "ix_org_unit_tenant_parent_status_sort" in {
         item["name"] for item in inspector.get_indexes("organization_units")
     }
@@ -126,6 +199,15 @@ def test_alembic_upgrades_empty_mysql_database(mysql_database_url: str) -> None:
     user_columns = {item["name"]: item for item in inspector.get_columns("users")}
     employee_columns = {item["name"]: item for item in inspector.get_columns("employee_profiles")}
     work_item_columns = {item["name"]: item for item in inspector.get_columns("sop_work_items")}
+    execution_columns = {item["name"]: item for item in inspector.get_columns("sop_instances")}
+    operation_columns = {item["name"]: item for item in inspector.get_columns("sop_operations")}
+    step_columns = {
+        item["name"]: item for item in inspector.get_columns("sop_node_executions")
+    }
+    tool_columns = {item["name"]: item for item in inspector.get_columns("tools")}
+    general_skill_columns = {
+        item["name"]: item for item in inspector.get_columns("general_skills")
+    }
     agent_columns = {item["name"]: item for item in inspector.get_columns("agent_profiles")}
     session_columns = {item["name"]: item for item in inspector.get_columns("sessions")}
     knowledge_columns = {
@@ -155,6 +237,75 @@ def test_alembic_upgrades_empty_mysql_database(mysql_database_url: str) -> None:
     assert {"join_date", "leave_date"}.issubset(employee_columns)
     assert "participant_scope_snapshot_json" in work_item_columns
     assert {
+        "kind",
+        "active_slot_key",
+        "initiator_user_id",
+        "source_kind",
+        "source_ref",
+        "cancellation_requested_at",
+        "cancellation_requested_by",
+        "cancellation_reason",
+        "cancellation_disposition",
+        "lease_owner",
+        "lease_expires_at",
+        "lease_acquired_at",
+        "lease_heartbeat_at",
+        "fencing_token",
+        "effect_state",
+        "agent_id",
+        "goal_snapshot_json",
+        "current_plan_revision_id",
+        "current_plan_checksum",
+        "capability_snapshot_json",
+        "capability_checksum",
+        "budget_snapshot_json",
+        "terminal_reason_json",
+    }.issubset(execution_columns)
+    assert {
+        "step_key",
+        "plan_revision_id",
+        "step_kind",
+        "required",
+        "superseded_by_step_key",
+    }.issubset(step_columns)
+    assert {
+        "logical_action_id",
+        "request_fingerprint",
+        "remote_idempotency_key",
+        "idempotency_required",
+        "effect_kind",
+        "effect_state",
+        "reconciled_at",
+        "capability_snapshot_json",
+        "capability_checksum",
+    }.issubset(operation_columns)
+    assert {
+        "reliability_contract_json",
+        "reliability_checksum",
+        "reliability_published_at",
+    }.issubset(tool_columns)
+    assert {
+        "usage_mode",
+        "planning_guidance_json",
+        "planning_guidance_checksum",
+    }.issubset(general_skill_columns)
+    assert {
+        "capability_snapshot_json",
+        "capability_checksum",
+        "preflight_status",
+        "capability_verified_at",
+    }.issubset(model_columns)
+    assert "sop_operation_attempts" in tables
+    assert "sop_operation_effects" in tables
+    attempt_columns = {
+        item["name"]: item for item in inspector.get_columns("sop_operation_attempts")
+    }
+    effect_columns = {
+        item["name"]: item for item in inspector.get_columns("sop_operation_effects")
+    }
+    assert attempt_columns["operation_id"]["type"].length == 512
+    assert effect_columns["operation_id"]["type"].length == 512
+    assert {
         "owner_user_id",
         "responsible_org_unit_id",
         "source_agent_id",
@@ -181,8 +332,655 @@ def test_alembic_upgrades_empty_mysql_database(mysql_database_url: str) -> None:
     with engine.connect() as connection:
         assert (
             connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-            == "20260802_0035"
+            == "20260811_0048"
         )
+
+
+def test_mysql_capability_catalog_backfills_legacy_tools_and_guards_downgrade(
+    mysql_database_url: str,
+) -> None:
+    """验证 MySQL 8.4 上 0038 存量工具默认关闭动态执行，发布后拒绝丢历史回退。"""
+
+    upgrade(mysql_database_url)
+    downgrade(mysql_database_url, "20260803_0037")
+    engine = create_engine(mysql_database_url, pool_pre_ping=True)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO tools ("
+                "id, tenant_id, name, bucket, tool_type, method, url, headers_json, auth_json, "
+                "config_json, input_schema, output_schema, allowed_skills_json, "
+                "permission_authorization_mode, enabled, created_at, updated_at"
+                ") VALUES ("
+                "'tool_legacy_b03', 'tenant_b03', 'legacy.lookup', '未分桶', 'http', "
+                "'GET', 'https://example.invalid', '{}', '{}', '{}', '{}', '{}', '[]', "
+                "'caller_and_agent', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+        )
+
+    upgrade(mysql_database_url)
+    with engine.connect() as connection:
+        row = connection.execute(
+            text(
+                "SELECT reliability_contract_json, reliability_checksum "
+                "FROM tools WHERE id='tool_legacy_b03'"
+            )
+        ).one()
+        assert json.loads(row[0]) == {}
+        assert row[1] is None
+
+    downgrade(mysql_database_url, "20260803_0037")
+    upgrade(mysql_database_url)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE tools SET reliability_contract_json=:contract, "
+                "reliability_checksum='published' WHERE id='tool_legacy_b03'"
+            ),
+            {"contract": '{"dynamic_task_enabled": true}'},
+        )
+    with pytest.raises(RuntimeError, match="managed history"):
+        downgrade(mysql_database_url, "20260803_0037")
+
+
+def test_mysql_execution_plan_migration_backfills_steps_and_protects_dynamic_history(
+    mysql_database_url: str,
+) -> None:
+    """验证 MySQL 8.4 上 0039 回填稳定步骤、创建新账本并拒绝丢弃动态历史。"""
+
+    upgrade(mysql_database_url)
+    downgrade(mysql_database_url, "20260803_0038")
+    engine = create_engine(mysql_database_url, pool_pre_ping=True)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO sop_instances ("
+                "id, tenant_id, session_id, skill_id, skill_version_id, skill_version, "
+                "definition_checksum, run_number, kind, active_slot_key, source_kind, status, "
+                "current_node_id, slots_json, context_json, revision, cancellation_disposition, "
+                "fencing_token, effect_state, created_at, updated_at"
+                ") VALUES ("
+                "'instance_mysql_0039', 'tenant_mysql_0039', 'session_mysql_0039', "
+                "'skill_mysql_0039', 'version_mysql_0039', '1.0.0', :checksum, 1, 'sop', "
+                "'foreground:session_mysql_0039', 'chat', 'running', 'collect', '{}', '{}', 0, "
+                "'none', 0, 'none', CURRENT_TIMESTAMP(6), CURRENT_TIMESTAMP(6))"
+            ),
+            {"checksum": "a" * 64},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO sop_node_executions ("
+                "id, tenant_id, instance_id, node_id, attempt, status, input_json, output_json, "
+                "error_json, revision, created_at, updated_at"
+                ") VALUES ("
+                "'node_mysql_0039', 'tenant_mysql_0039', 'instance_mysql_0039', 'collect', 1, "
+                "'running', '{}', '{}', '{}', 0, CURRENT_TIMESTAMP(6), CURRENT_TIMESTAMP(6))"
+            )
+        )
+
+    upgrade(mysql_database_url)
+    with engine.connect() as connection:
+        assert connection.execute(
+            text(
+                "SELECT step_key, step_kind, required FROM sop_node_executions "
+                "WHERE id='node_mysql_0039'"
+            )
+        ).one() == ("collect", "sop_node", 1)
+        assert "action_proposal_records" in inspect(connection).get_table_names()
+
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO sop_instances ("
+                "id, tenant_id, session_id, run_number, kind, active_slot_key, initiator_user_id, "
+                "source_kind, agent_id, goal_snapshot_json, current_plan_revision_id, "
+                "current_plan_checksum, capability_snapshot_json, budget_snapshot_json, "
+                "terminal_reason_json, status, slots_json, context_json, revision, "
+                "cancellation_disposition, fencing_token, effect_state, created_at, updated_at"
+                ") VALUES ("
+                "'dynamic_mysql_0039', 'tenant_mysql_0039', 'session_dynamic_0039', 1, "
+                "'dynamic_task', 'foreground:session_dynamic_0039', 'user_mysql', 'chat', "
+                "'agent_mysql', '{\"goal\":\"demo\"}', 'plan_mysql', :checksum, '{}', '{}', "
+                "'{}', 'running', '{}', '{}', 0, 'none', 0, 'none', CURRENT_TIMESTAMP(6), "
+                "CURRENT_TIMESTAMP(6))"
+            ),
+            {"checksum": "b" * 64},
+        )
+    with pytest.raises(RuntimeError, match="managed history"):
+        downgrade(mysql_database_url, "20260803_0038")
+
+
+def test_mysql_dynamic_plan_proposal_and_operation_round_trip(mysql_database_url: str) -> None:
+    """验证 MySQL 8.4 上计划修订、提案消费及 Operation 绑定遵循同一事务契约。"""
+
+    upgrade(mysql_database_url)
+    engine = create_engine(mysql_database_url, pool_pre_ping=True)
+    initial_plan = NormalizedPlan(
+        goal="读取销售数据并形成摘要",
+        success_criteria=(
+            SuccessCriterion(id="summary_ready", type="assertion", spec={"required": True}),
+        ),
+        steps=(
+            PlanStep(
+                step_key="read_sales",
+                title="读取销售数据",
+                kind="tool.read",
+                capability_refs=("sales.read",),
+            ),
+        ),
+    )
+    capability_snapshot = {"tools": [{"id": "sales.read", "checksum": "a" * 64}]}
+    with Session(engine) as db:
+        db.add(Tenant(id="tenant_dynamic_mysql", name="Dynamic MySQL"))
+        db.add(
+            User(
+                id="user_dynamic_mysql",
+                tenant_id="tenant_dynamic_mysql",
+                username="dynamic-owner",
+                password_hash="x",
+            )
+        )
+        db.add(
+            AgentProfile(
+                id="agent_dynamic_mysql",
+                tenant_id="tenant_dynamic_mysql",
+                name="MySQL 动态员工",
+                owner_user_id="user_dynamic_mysql",
+            )
+        )
+        db.flush()
+        store = SopExecutionStore(db)
+        instance, first_revision = store.start_dynamic_instance(
+            tenant_id="tenant_dynamic_mysql",
+            session_id="session_dynamic_mysql",
+            agent_id="agent_dynamic_mysql",
+            initiator_user_id="user_dynamic_mysql",
+            plan=initial_plan,
+            capability_snapshot=capability_snapshot,
+        )
+        with store.owned(instance, worker_id="worker-dynamic-mysql"):
+            execution = store.enter_node(
+                instance,
+                "read_sales",
+                step_key="read_sales",
+                plan_revision_id=first_revision.id,
+                step_kind="tool.read",
+            )
+            proposal, _ = store.record_action_proposal(
+                instance,
+                execution,
+                provider="openai_compatible",
+                model="mysql-model",
+                model_capability_snapshot={"structured_output": True},
+                completed_response=CompletedProviderProposal(
+                    response_id="mysql-response-1",
+                    finish_reason="stop",
+                    proposal=RuntimeActionProposal(
+                        action_kind=ActionKind.CALL_TOOL,
+                        capability_ref="sales.read",
+                        arguments={"region": "east"},
+                        rationale="读取受管销售数据",
+                    ),
+                ),
+            )
+            operation, _ = store.prepare_operation_from_proposal(
+                instance,
+                execution,
+                proposal,
+                operation_name="sales.read",
+                request={"region": "east"},
+            )
+            changed_plan = initial_plan.model_copy(
+                update={"constraints": ("只汇总华东区域",)}
+            )
+            second_revision, _ = store.append_plan_revision(
+                instance,
+                plan=changed_plan,
+                reason=PlanReason.USER_CONSTRAINT,
+                capability_snapshot=capability_snapshot,
+            )
+            restored_revision, _ = store.append_plan_revision(
+                instance,
+                plan=initial_plan,
+                reason=PlanReason.EXTERNAL_CHANGE,
+                capability_snapshot=capability_snapshot,
+            )
+            operation_id = operation.id
+            execution_id = execution.id
+        db.commit()
+        revisions = db.exec(
+            select(ExecutionPlanRevision)
+            .where(ExecutionPlanRevision.execution_id == instance.id)
+            .order_by(ExecutionPlanRevision.revision_number)
+        ).all()
+        persisted_proposal = db.get(ActionProposalRecord, proposal.id)
+        persisted_operation = db.get(SopOperation, operation_id)
+
+    assert [row.status for row in revisions] == ["superseded", "superseded", "active"]
+    assert second_revision.revision_number == 2
+    assert restored_revision.checksum == first_revision.checksum
+    assert persisted_proposal is not None
+    assert persisted_proposal.status == "consumed"
+    assert persisted_proposal.consumed_operation_id == operation_id
+    assert persisted_operation is not None
+    assert persisted_operation.node_execution_id == execution_id
+
+
+def test_mysql_dynamic_steer_command_appends_plan_revision_atomically(
+    mysql_database_url: str,
+) -> None:
+    """验证 MySQL 8.4 上 steer 命令、savepoint 和追加计划修订使用同一事务边界。"""
+
+    upgrade(mysql_database_url)
+    engine = create_engine(mysql_database_url, pool_pre_ping=True)
+    plan = NormalizedPlan(
+        goal="形成合同摘要",
+        success_criteria=(
+            SuccessCriterion(id="summary_ready", type="assertion", spec={"required": True}),
+        ),
+        steps=(PlanStep(step_key="answer", title="形成摘要", kind="answer"),),
+        budget={"max_steps": 2},
+    )
+    snapshot = {"model": {"id": "mysql-steer-model", "checksum": "f" * 64}}
+    with Session(engine, expire_on_commit=False) as db:
+        user = User(
+            id="user_steer_mysql",
+            tenant_id="tenant_steer_mysql",
+            username="steer-owner",
+            password_hash="x",
+        )
+        db.add(Tenant(id="tenant_steer_mysql", name="Steer MySQL"))
+        db.add(user)
+        db.add(
+            AgentProfile(
+                id="agent_steer_mysql",
+                tenant_id="tenant_steer_mysql",
+                name="MySQL Steering 员工",
+                owner_user_id=user.id,
+            )
+        )
+        db.flush()
+        store = SopExecutionStore(db)
+        instance, first_revision = store.start_dynamic_instance(
+            tenant_id="tenant_steer_mysql",
+            session_id="session_steer_mysql",
+            agent_id="agent_steer_mysql",
+            initiator_user_id=user.id,
+            plan=plan,
+            capability_snapshot=snapshot,
+        )
+        command_row, _ = ExecutionControlService(db).issue_command(
+            instance,
+            command_id="steer_mysql_1",
+            command_type="steer",
+            actor_user_id=user.id,
+            expected_execution_revision=instance.revision,
+            payload={"instruction": "只覆盖 2026 年内到期合同"},
+        )
+        db.commit()
+        signal = db.exec(
+            select(ExecutionSignal).where(ExecutionSignal.causation_id == command_row.id)
+        ).one()
+        agent = DynamicTaskAgent(db)
+        agent.run_until_blocked_or_complete = lambda **kwargs: DynamicRunOutcome(
+            "blocked", instance.id
+        )
+
+        outcome = agent.resume_steer_signal(
+            signal_id=signal.id,
+            model_config=ModelConfig(
+                id="model_steer_mysql",
+                tenant_id=instance.tenant_id,
+                name="Steer model",
+                model="mysql-model",
+                api_key_encrypted="x",
+            ),
+            worker_id="worker_steer_mysql",
+            actor_user_id=user.id,
+            steering_enabled=True,
+        )
+
+        db.refresh(command_row)
+        db.refresh(signal)
+        revisions = db.exec(
+            select(ExecutionPlanRevision)
+            .where(ExecutionPlanRevision.execution_id == instance.id)
+            .order_by(ExecutionPlanRevision.revision_number)
+        ).all()
+        assert outcome.status == "blocked"
+        assert [row.status for row in revisions] == ["superseded", "active"]
+        assert revisions[0].id == first_revision.id
+        assert revisions[1].plan_json["constraints"] == ["只覆盖 2026 年内到期合同"]
+        assert command_row.status == "applied"
+        assert command_row.result_plan_revision_id == revisions[1].id
+        assert signal.status == "claimed"
+
+
+def test_mysql_operation_unknown_reconcile_and_cancellation_are_consistent(
+    mysql_database_url: str,
+) -> None:
+    """验证 MySQL 上外部写取消先进入 unknown，对账后才释放活动槽并保留双账本。"""
+
+    upgrade(mysql_database_url)
+    engine = create_engine(mysql_database_url, pool_pre_ping=True)
+    with Session(engine) as session:
+        store = SopExecutionStore(session)
+        instance, _ = store.start_instance(
+            tenant_id="tenant_b02",
+            session_id="session_b02",
+            skill_id="skill_b02",
+            skill_version_id="version_b02",
+            skill_version="1.0.0",
+            definition_checksum="c" * 64,
+            start_node_id="submit",
+        )
+        with store.owned(instance, worker_id="mysql-b02-a"):
+            execution = store.enter_node(instance, "submit", input_snapshot={})
+            operation, _ = store.prepare_operation(
+                instance,
+                execution,
+                operation_name="expense.submit",
+                request={"request_id": "REQ-MYSQL-1"},
+                logical_action_id="action-mysql-submit",
+                effect_kind="external_write",
+            )
+            store.start_operation(operation)
+            settled = store.request_cancellation(
+                instance,
+                actor_user_id="user_b02",
+                reason="集成测试取消",
+            )
+            assert settled is False
+        session.commit()
+        instance_id = instance.id
+        operation_id = operation.id
+
+    with Session(engine) as session:
+        store = SopExecutionStore(session)
+        instance = session.get(SopInstance, instance_id)
+        operation = session.get(SopOperation, operation_id)
+        assert instance is not None and operation is not None
+        with store.owned(instance, worker_id="mysql-b02-b"):
+            settled = store.reconcile_operation(
+                instance,
+                operation,
+                succeeded=False,
+                error={"code": "REMOTE_NOT_APPLIED"},
+                effect_confirmed=False,
+            )
+        session.commit()
+        assert settled is True
+
+    with Session(engine) as session:
+        instance = session.get(SopInstance, instance_id)
+        operation = session.get(SopOperation, operation_id)
+        attempts = session.exec(
+            select(SopOperationAttempt).where(
+                SopOperationAttempt.operation_id == operation_id
+            )
+        ).all()
+        effects = session.exec(
+            select(SopOperationEffect)
+            .where(SopOperationEffect.operation_id == operation_id)
+            .order_by(SopOperationEffect.sequence)
+        ).all()
+
+    assert instance is not None and instance.status == "cancelled"
+    assert instance.active_slot_key is None
+    assert instance.effect_state == "none"
+    assert operation is not None and operation.status == "failed"
+    assert operation.effect_state == "none"
+    assert [attempt.status for attempt in attempts] == ["failed"]
+    assert [effect.effect_state for effect in effects] == ["unknown", "none"]
+
+
+def test_execution_ownership_migration_backfills_and_reverses_mysql(
+    mysql_database_url: str,
+) -> None:
+    """验证 MySQL 0036 对真实 0035 表完成回填、约束和可重复升降级。"""
+
+    upgrade(mysql_database_url, "20260802_0035")
+    engine = create_engine(mysql_database_url, pool_pre_ping=True)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO sop_instances "
+                "(id, tenant_id, session_id, skill_id, skill_version_id, skill_version, "
+                "definition_checksum, run_number, status, current_node_id, slots_json, "
+                "context_json, revision, started_at, completed_at, created_at, updated_at) VALUES "
+                "('mysql_active', 'tenant_b01', 'session_active', 'skill_a', 'version_a', "
+                "'1.0.0', :checksum, 1, 'running', 'node_a', JSON_OBJECT(), JSON_OBJECT(), "
+                "1, UTC_TIMESTAMP(), NULL, UTC_TIMESTAMP(), UTC_TIMESTAMP()), "
+                "('mysql_done', 'tenant_b01', 'session_done', 'skill_b', 'version_b', "
+                "'1.0.0', :checksum, 1, 'succeeded', 'node_b', JSON_OBJECT(), JSON_OBJECT(), "
+                "3, UTC_TIMESTAMP(), UTC_TIMESTAMP(), UTC_TIMESTAMP(), UTC_TIMESTAMP())"
+            ),
+            {"checksum": "a" * 64},
+        )
+
+    upgrade(mysql_database_url, "20260803_0036")
+    inspector = inspect(engine)
+    with engine.connect() as connection:
+        rows = connection.execute(
+            text(
+                "SELECT id, kind, active_slot_key, source_kind, source_ref, fencing_token "
+                "FROM sop_instances ORDER BY id"
+            )
+        ).mappings().all()
+    assert rows[0]["active_slot_key"] == "foreground:session_active"
+    assert rows[1]["active_slot_key"] is None
+    assert all(row["kind"] == "sop" for row in rows)
+    assert all(row["source_kind"] == "legacy" for row in rows)
+    assert all(row["fencing_token"] == 0 for row in rows)
+    assert "uq_execution_tenant_active_slot" in {
+        item["name"] for item in inspector.get_unique_constraints("sop_instances")
+    }
+    assert inspector.has_table("execution_mutation_rejections")
+
+    downgrade(mysql_database_url, "20260802_0035")
+    inspector = inspect(engine)
+    assert "kind" not in {
+        item["name"] for item in inspector.get_columns("sop_instances")
+    }
+    assert not inspector.has_table("execution_mutation_rejections")
+    upgrade(mysql_database_url, "20260803_0036")
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT COUNT(*) FROM sop_instances")).scalar_one() == 2
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO sop_instances "
+                "(id, tenant_id, session_id, run_number, kind, active_slot_key, source_kind, "
+                "status, slots_json, context_json, revision, cancellation_disposition, "
+                "fencing_token, created_at, updated_at) VALUES "
+                "('mysql_dynamic', 'tenant_b01', 'session_dynamic', 1, 'dynamic_task', "
+                "'foreground:session_dynamic', 'api', 'running', JSON_OBJECT(), JSON_OBJECT(), "
+                "0, 'none', 0, UTC_TIMESTAMP(), UTC_TIMESTAMP())"
+            )
+        )
+    with engine.begin() as connection:
+        with pytest.raises((IntegrityError, OperationalError)):
+            connection.execute(
+                text(
+                    "INSERT INTO sop_instances "
+                    "(id, tenant_id, session_id, run_number, kind, active_slot_key, "
+                    "source_kind, status, slots_json, context_json, revision, "
+                    "cancellation_disposition, fencing_token, created_at, updated_at) VALUES "
+                    "('mysql_invalid_sop', 'tenant_b01', 'session_invalid', 1, 'sop', "
+                    "'foreground:session_invalid', 'api', 'running', JSON_OBJECT(), "
+                    "JSON_OBJECT(), 0, 'none', 0, UTC_TIMESTAMP(), UTC_TIMESTAMP())"
+                )
+            )
+
+
+def test_mysql_execution_control_signal_result_and_outbox_round_trip(
+    mysql_database_url: str,
+) -> None:
+    """验证 MySQL 8.4 上 signal/Execution 双租约、取消结果和 outbox 事实真实可写。"""
+
+    upgrade(mysql_database_url)
+    engine = create_engine(mysql_database_url, pool_pre_ping=True)
+    with Session(engine, expire_on_commit=False) as db:
+        instance = SopInstance(
+            id="execution_b05_mysql",
+            tenant_id="tenant_b05",
+            session_id="session_b05",
+            kind="dynamic_task",
+            active_slot_key="dynamic:b05",
+            initiator_user_id="user_b05",
+            agent_id="agent_b05",
+            goal_snapshot_json={"goal": "verify control"},
+            current_plan_revision_id="plan_b05",
+            current_plan_checksum="a" * 64,
+            capability_snapshot_json={"capabilities": []},
+            status="running",
+        )
+        db.add(instance)
+        db.commit()
+        store = SopExecutionStore(db)
+        control = ExecutionControlService(db, store)
+        command_row, created = control.issue_command(
+            instance,
+            command_id="cancel_b05",
+            command_type="cancel",
+            actor_user_id="user_b05",
+            expected_execution_revision=instance.revision,
+            payload={"reason": "mysql_contract"},
+        )
+        assert created is True
+        signal = db.exec(select(ExecutionSignal)).one()
+        control.claim_signal(signal, worker_id="signal_worker")
+        with pytest.raises(SopExecutionConflictError):
+            control.consume_signal(instance, signal, worker_id="signal_worker")
+        db.commit()
+
+        with store.owned(instance, worker_id="execution_worker"):
+            control.apply_cancel_command(
+                instance,
+                command_row,
+                worker_id="execution_worker",
+            )
+        db.commit()
+        db.refresh(instance)
+        db.refresh(command_row)
+        assert instance.status == "cancelled"
+        assert command_row.status == "applied"
+        result = db.get(ExecutionResult, instance.current_result_id)
+        assert result is not None and result.result_json["status"] == "cancelled"
+        publication = db.exec(select(ExecutionPublication)).one()
+        assert publication.status == "settled"
+        assert db.exec(select(ExecutionSignal)).one().status == "discarded"
+        assert db.exec(select(ExecutionCommand)).one().id == command_row.id
+        events = db.exec(
+            select(AgentEvent).where(
+                AgentEvent.tenant_id == instance.tenant_id,
+                AgentEvent.aggregate_id == instance.id,
+            )
+        ).all()
+        for event in events:
+            control.enqueue_event_delivery(
+                event,
+                destination="webhook",
+                destination_ref="configured:webhook:mysql-contract",
+            )
+        db.flush()
+        outboxes = db.exec(select(EventOutbox)).all()
+        assert len(outboxes) >= 2
+        assert len({item.publication_key for item in outboxes}) == len(outboxes)
+
+
+def test_mysql_execution_active_slot_and_fencing_are_cross_worker_safe(
+    mysql_database_url: str,
+) -> None:
+    """验证 MySQL 并发活动槽仲裁及租约过期后的旧 Operation 写拒绝与审计。"""
+
+    upgrade(mysql_database_url)
+    engine = create_engine(mysql_database_url, pool_pre_ping=True)
+    barrier = threading.Barrier(2)
+
+    def start_execution(version_id: str) -> tuple[str, bool] | str:
+        """从独立 MySQL 事务同时申请同一 tenant/session 的活动槽。"""
+
+        with Session(engine) as session:
+            barrier.wait()
+            try:
+                instance, created = SopExecutionStore(session).start_instance(
+                    tenant_id="tenant_b01",
+                    session_id="session_race",
+                    skill_id="skill_b01",
+                    skill_version_id=version_id,
+                    skill_version="1.0.0",
+                    definition_checksum="b" * 64,
+                    start_node_id="start",
+                )
+                session.commit()
+                return instance.id, created
+            except (IntegrityError, SopExecutionConflictError) as error:
+                session.rollback()
+                return type(error).__name__
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(start_execution, ("version-a", "version-b")))
+
+    with Session(engine) as verify_session:
+        active = verify_session.exec(
+            select(SopInstance).where(
+                SopInstance.tenant_id == "tenant_b01",
+                SopInstance.active_slot_key == "foreground:session_race",
+            )
+        ).all()
+        assert len(active) == 1
+        instance_id = active[0].id
+    assert sum(isinstance(outcome, tuple) for outcome in outcomes) == 1
+
+    with Session(engine) as worker_a_session:
+        instance_a = worker_a_session.get(SopInstance, instance_id)
+        assert instance_a is not None
+        store_a = SopExecutionStore(worker_a_session)
+        with store_a.owned(instance_a, worker_id="mysql-worker-a") as lease_a:
+            execution_a = store_a.enter_node(instance_a, "tool", input_snapshot={})
+            operation_a, _ = store_a.prepare_operation(
+                instance_a,
+                execution_a,
+                operation_name="demo.read",
+                request={"record_id": "R-1"},
+            )
+            operation_id = operation_a.id
+            worker_a_session.commit()
+
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "UPDATE sop_instances SET lease_expires_at = "
+                        "UTC_TIMESTAMP() - INTERVAL 1 SECOND WHERE id = :instance_id"
+                    ),
+                    {"instance_id": instance_id},
+                )
+
+            with Session(engine) as worker_b_session:
+                instance_b = worker_b_session.get(SopInstance, instance_id)
+                assert instance_b is not None
+                with SopExecutionStore(worker_b_session).owned(
+                    instance_b,
+                    worker_id="mysql-worker-b",
+                ) as lease_b:
+                    assert lease_b.fencing_token > lease_a.fencing_token
+                worker_b_session.commit()
+
+            with pytest.raises(SopExecutionFencedError):
+                store_a.start_operation(operation_a)
+            worker_a_session.commit()
+
+    with Session(engine) as verify_session:
+        operation = verify_session.get(SopOperation, operation_id)
+        rejection = verify_session.exec(
+            select(ExecutionMutationRejection).where(
+                ExecutionMutationRejection.instance_id == instance_id
+            )
+        ).one()
+    assert operation is not None and operation.status == "prepared"
+    assert rejection.action == "operation.start"
+    assert rejection.rejected_fencing_token < rejection.current_fencing_token
 
 
 def test_mysql_effective_interval_precision_migration_is_reversible(
@@ -1283,6 +2081,111 @@ def test_mysql_engine_pool_survives_dispose(mysql_database_url: str) -> None:
     with engine.connect() as connection:
         assert connection.execute(text("SELECT 1")).scalar_one() == 1
     engine.dispose()
+
+
+def test_mysql_execution_artifact_and_exact_lineage_round_trip(
+    mysql_database_url: str,
+    tmp_path: Path,
+) -> None:
+    """验证 MySQL 8.4 上 Artifact JSON、Unicode、唯一血缘和内容校验完整往返。"""
+
+    upgrade(mysql_database_url)
+    engine = create_engine(mysql_database_url, pool_pre_ping=True)
+    with Session(engine, expire_on_commit=False) as db:
+        owner = User(
+            id="mysql_artifact_owner",
+            tenant_id="tenant_mysql_artifact",
+            username="mysql-artifact-owner",
+            password_hash="x",
+        )
+        instance = SopInstance(
+            id="mysql_execution_artifact",
+            tenant_id=owner.tenant_id,
+            session_id="mysql_session_artifact",
+            kind="dynamic_task",
+            active_slot_key="dynamic:mysql-artifact",
+            initiator_user_id=owner.id,
+            agent_id="mysql_agent_artifact",
+            goal_snapshot_json={"goal": "生成中文风险简报"},
+            current_plan_revision_id="mysql_plan_artifact",
+            current_plan_checksum="a" * 64,
+            capability_snapshot_json={"model": {"id": "mysql_model_artifact"}},
+            capability_checksum="b" * 64,
+            status="running",
+        )
+        node = SopNodeExecution(
+            id="mysql_node_artifact",
+            tenant_id=owner.tenant_id,
+            instance_id=instance.id,
+            node_id="answer",
+            step_key="answer",
+            step_kind="answer",
+            status="running",
+        )
+        snapshot = InputResourceSnapshot(
+            id="mysql_snapshot_artifact",
+            tenant_id=owner.tenant_id,
+            execution_id=instance.id,
+            source_type="managed_upload",
+            source_resource_id="mysql_resource_artifact",
+            source_version="v1",
+            filename="合同.pdf",
+            mime_type="application/pdf",
+            size_bytes=128,
+            content_checksum="c" * 64,
+            extraction_checksum="d" * 64,
+            ingestion_status="ready",
+            identity_checksum="e" * 64,
+            storage_locator_digest="f" * 64,
+            captured_acl_json={"owner": owner.id},
+        )
+        db.add(owner)
+        db.add(instance)
+        db.add(node)
+        db.add(snapshot)
+        db.commit()
+
+        service = ArtifactService(db, storage_root=tmp_path)
+        artifact, created = service.register(
+            instance=instance,
+            source_node=node,
+            artifact_key="risk_brief",
+            filename="续约风险简报.md",
+            mime_type="text/markdown",
+            data="# 续约风险简报\n\n证据已核验。".encode(),
+            input_snapshot_ids=(snapshot.id,),
+        )
+        db.commit()
+        artifact_id = artifact.id
+
+    with Session(engine, expire_on_commit=False) as db:
+        artifact = db.get(ExecutionArtifact, artifact_id)
+        assert artifact is not None
+        service = ArtifactService(db, storage_root=tmp_path)
+        resolved, data = service.resolve(
+            artifact.id,
+            tenant_id="tenant_mysql_artifact",
+            actor_user_id="mysql_artifact_owner",
+        )
+        links = db.exec(
+            select(ArtifactInputLink).where(ArtifactInputLink.artifact_id == artifact.id)
+        ).all()
+        assert created is True
+        assert resolved.filename == "续约风险简报.md"
+        assert data.decode().startswith("# 续约风险简报")
+        assert [item.input_snapshot_id for item in links] == ["mysql_snapshot_artifact"]
+        with pytest.raises(IntegrityError):
+            db.add(
+                ArtifactInputLink(
+                    tenant_id=artifact.tenant_id,
+                    execution_id=artifact.execution_id,
+                    artifact_id=artifact.id,
+                    input_snapshot_id="mysql_snapshot_artifact",
+                )
+            )
+            db.commit()
+        db.rollback()
+    engine.dispose()
     with engine.connect() as connection:
         assert connection.execute(text("SELECT 1")).scalar_one() == 1
 
@@ -1415,3 +2318,52 @@ def test_mysql_serializes_default_model_switches(mysql_database_url: str) -> Non
 
     assert switched == {"model_a", "model_b"}
     assert len(defaults) == 1
+
+
+def test_mysql_builtin_governance_catalog_is_safe_under_concurrent_requests(
+    mysql_database_url: str,
+) -> None:
+    """验证多个页面请求同时补齐内置权限时不会产生唯一键异常或重复映射。"""
+
+    upgrade(mysql_database_url)
+    engine = create_engine(mysql_database_url, pool_pre_ping=True)
+    with Session(engine) as db:
+        db.add(Tenant(id="tenant_governance_race", name="并发治理目录企业"))
+        db.commit()
+
+    barrier = threading.Barrier(4)
+
+    def sync_catalog() -> None:
+        """在独立事务中同时同步同一租户的治理目录并提交结果。"""
+
+        with Session(engine) as db:
+            barrier.wait(timeout=10)
+            ensure_builtin_governance_catalog(db, "tenant_governance_race")
+            db.commit()
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(sync_catalog) for _ in range(4)]
+        for future in futures:
+            future.result(timeout=30)
+
+    with Session(engine) as db:
+        roles = db.exec(
+            select(BusinessRole).where(BusinessRole.tenant_id == "tenant_governance_race")
+        ).all()
+        definitions = db.exec(
+            select(PermissionDefinition).where(
+                PermissionDefinition.tenant_id == "tenant_governance_race"
+            )
+        ).all()
+        mappings = db.exec(
+            select(BusinessRolePermission).where(
+                BusinessRolePermission.tenant_id == "tenant_governance_race"
+            )
+        ).all()
+
+    assert {role.role_code for role in roles} == set(BUILTIN_GOVERNANCE_ROLES)
+    assert len(definitions) == len({row.permission_code for row in definitions})
+    assert len(mappings) == len(
+        {(row.business_role_id, row.permission_definition_id) for row in mappings}
+    )
+    assert len(mappings) == sum(len(codes) for _, codes in BUILTIN_GOVERNANCE_ROLES.values())

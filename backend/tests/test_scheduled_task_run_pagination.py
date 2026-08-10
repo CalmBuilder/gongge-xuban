@@ -105,12 +105,17 @@ def test_scheduled_run_page_filters_before_count_and_returns_unfiltered_total() 
                 _run("run_1", "owner_user", "succeeded", base_time + timedelta(minutes=3)),
                 _run("run_2", "owner_user", "running", base_time + timedelta(minutes=2)),
                 _run("run_3", "other_user", "queued", base_time + timedelta(minutes=1)),
+                _run("run_waiting", "owner_user", "waiting", base_time),
                 ScheduledTaskRun(
                     id="run_other_agent",
                     tenant_id="tenant_demo",
                     scheduled_task_id="task_demo",
                     agent_id="agent_other",
                     user_id="owner_user",
+                    source_kind="legacy",
+                    source_ref="legacy:run_other_agent",
+                    source_snapshot_json={},
+                    source_checksum="legacy-run-other-agent",
                     scheduled_for=base_time + timedelta(minutes=4),
                     status="running",
                 ),
@@ -132,8 +137,8 @@ def test_scheduled_run_page_filters_before_count_and_returns_unfiltered_total() 
             "tenant_demo", "agent_demo", None, "pending", 2, 1, admin, db
         )
 
-    assert result.run_total == 3
-    assert result.total == 2
+    assert result.run_total == 4
+    assert result.total == 3
     assert [item.id for item in result.items] == ["run_2"]
     assert [item.id for item in second_page.items] == ["run_3"]
     assert result.items[0].task_title == "日报任务"
@@ -224,6 +229,10 @@ def _run(run_id: str, user_id: str, status: str, scheduled_for: datetime) -> Sch
         scheduled_task_id="task_demo",
         agent_id="agent_demo",
         user_id=user_id,
+        source_kind="legacy",
+        source_ref=f"legacy:{run_id}",
+        source_snapshot_json={},
+        source_checksum=f"legacy-{run_id}",
         scheduled_for=scheduled_for,
         status=status,
     )

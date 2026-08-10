@@ -64,6 +64,7 @@ class OperationStatus(StrEnum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     UNKNOWN = "unknown"
+    CANCELLED = "cancelled"
 
 
 class DeliveryStatus(StrEnum):

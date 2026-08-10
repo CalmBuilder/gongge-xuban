@@ -131,6 +131,7 @@ def _seed_runtime(
         skill_version=version.version,
         definition_checksum="checksum",
         status="waiting",
+        active_slot_key="foreground:session_special",
         current_node_id="department_special_approval",
     )
     execution = SopNodeExecution(
@@ -138,6 +139,7 @@ def _seed_runtime(
         tenant_id="tenant_demo",
         instance_id=instance.id,
         node_id="create_special_approval",
+        step_key="create_special_approval",
         status="succeeded",
     )
     operation = SopOperation(
@@ -146,6 +148,12 @@ def _seed_runtime(
         node_execution_id=execution.id,
         operation_name="expense.special_approval_create",
         idempotency_key="special-create",
+        logical_action_id="action-special-create",
+        request_fingerprint=(
+            "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+        ),
+        effect_kind="external_write",
+        effect_state="complete",
         status="succeeded",
         result_json={"approval_request_id": request_number},
     )
@@ -174,6 +182,7 @@ def _complete_step(
         tenant_id="tenant_demo",
         instance_id=instance.id,
         node_id=node_id,
+        step_key=node_id,
         status="succeeded",
     )
     work_item = SopWorkItem(

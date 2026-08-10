@@ -20,6 +20,7 @@ import { formatDateTime } from '@/lib/enterprise-ui';
 
 import { api, getRequestTenantId } from '../api/client';
 import type { EnterpriseAuthUser } from '../auth';
+import AttentionCenter from './work-items/AttentionCenter';
 
 type InboxView = 'pending' | 'claimed' | 'completed';
 
@@ -233,15 +234,17 @@ export default function WorkItemsPage({
 
   return (
     <div className="min-h-full box-border px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]" aria-busy={loading}>
-      <AppHeader onLogout={onLogout} userName={currentUser?.username} title="流程任务箱" />
+      <AppHeader onLogout={onLogout} userName={currentUser?.username} title="待我处理中心" />
 
-      <section className="mt-[20px] flex items-center justify-between gap-[16px] rounded-[16px] border border-[#dfe5f2] bg-white px-[18px] py-[15px] max-[700px]:items-start">
+      <AttentionCenter />
+
+      <section className="mt-[16px] flex items-center justify-between gap-[16px] rounded-[16px] border border-[#dfe5f2] bg-white px-[18px] py-[15px] max-[700px]:items-start">
         <div className="flex min-w-0 items-center gap-[12px]">
           <span className="grid size-[38px] shrink-0 place-items-center rounded-[11px] bg-[#eef1fb] text-[#3157e8]">
             <GitPullRequestArrow className="size-[18px]" />
           </span>
           <span className="min-w-0">
-            <strong className="block text-[14px] font-semibold text-[#18181a]">任务资格由流程实例快照决定</strong>
+            <strong className="block text-[14px] font-semibold text-[#18181a]">SOP 流程任务</strong>
             <span className="mt-[2px] block text-[12px] leading-[1.5] text-[#858b9c]">平台管理员不会自动进入候选池；角色变更不改写已经创建的历史任务。</span>
           </span>
         </div>

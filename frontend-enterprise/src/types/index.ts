@@ -452,11 +452,39 @@ export type ToolRead = {
   allowed_skills: string[];
   required_permission_code?: string | null;
   permission_authorization_mode?: 'caller_and_agent' | 'workflow_delegated';
+  reliability_contract?: ToolReliabilityContract | null;
+  reliability_checksum?: string | null;
+  reliability_published_at?: string | null;
   mcp_server_id?: string | null;
   enabled: boolean;
   metadata?: Record<string, unknown>;
   created_at: string;
   updated_at: string;
+};
+
+export type ToolReliabilityContract = {
+  risk_class: 'read' | 'local_write' | 'execute' | 'external_write' | 'destructive';
+  side_effect: 'none' | 'local' | 'external';
+  confirmation_policy: 'none' | 'once' | 'always' | 'forbidden';
+  idempotency?: {
+    mode: 'none' | 'request_key' | 'business_key';
+    argument?: string | null;
+    remote_scope?: string | null;
+  };
+  reconcile?: {
+    supported: boolean;
+    tool_name?: string | null;
+    reference_source?: string | null;
+    terminal_status_mapping?: Record<string, 'complete' | 'failed' | 'unknown'>;
+  };
+  model_visibility?: {
+    allowed_paths: string[];
+    user_display_paths: string[];
+    audit_only_paths: string[];
+  };
+  timeout_policy: 'failed' | 'unknown';
+  dynamic_task_enabled: boolean;
+  explore_safe?: boolean;
 };
 
 export type PermissionDefinitionRead = {
@@ -571,6 +599,10 @@ export type ScheduledTaskRunRead = {
   agent_id: string;
   user_id: string;
   session_id?: string;
+  execution_id?: string;
+  source_kind: 'schedule' | 'manual' | 'legacy';
+  source_ref: string;
+  source_checksum: string;
   scheduled_for: string;
   status: string;
   started_at?: string;

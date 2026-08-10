@@ -66,7 +66,7 @@ test('真实 Chromium 逐页回归全部服务端分页入口', async ({ page })
   );
 
   await page.goto('/enterprise/work-items');
-  await expect(page.getByRole('paragraph').filter({ hasText: '流程任务箱' })).toBeVisible();
+  await expect(page.getByText('SOP 流程任务', { exact: true })).toBeVisible();
   await expectSuccessfulPageTwo(page, '流程任务分页', '/api/work-items/page');
 
   await page.goto('/enterprise/scheduled-tasks');

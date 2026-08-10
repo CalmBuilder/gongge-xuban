@@ -15,8 +15,15 @@ from sqlmodel import Session, select
 
 from app.db import get_session
 from app.db.models import ModelConfig, Tenant, User, utc_now
+from app.dynamic_tasks.capability_catalog import capability_checksum
 from app.llm import LLMClient, LLMError
-from app.llm.schemas import ModelConfigCreateRequest, ModelConfigRead, ModelConfigTestResponse, ModelConfigUpdateRequest
+from app.llm.schemas import (
+    ModelCapabilityPreflightResponse,
+    ModelConfigCreateRequest,
+    ModelConfigRead,
+    ModelConfigTestResponse,
+    ModelConfigUpdateRequest,
+)
 from app.security.auth import get_current_user, require_current_tenant
 from app.security.encryption import decrypt_secret, encrypt_secret, mask_secret
 from app.security.permissions import ensure_tenant_admin, require_tenant_admin
@@ -43,6 +50,13 @@ def model_config_read(row: ModelConfig) -> ModelConfigRead:
         temperature=row.temperature,
         max_output_tokens=row.max_output_tokens,
         extra_body=dict(extra_body),
+        capability_snapshot=dict(row.capability_snapshot_json or {}),
+        capability_checksum=row.capability_checksum,
+        preflight_status=row.preflight_status,
+        preflight_error=row.preflight_error,
+        capability_verified_at=(
+            row.capability_verified_at.isoformat() if row.capability_verified_at else None
+        ),
         is_default=row.is_default,
         enabled=row.enabled,
         created_at=row.created_at.isoformat(),
@@ -117,6 +131,8 @@ def update_model_config(
         row.extra_body_json = dict(request.extra_body)
     if request.is_default is not None:
         row.is_default = request.is_default
+    if request.model_fields_set & {"provider", "base_url", "api_key", "model", "extra_body"}:
+        _invalidate_dynamic_preflight(row)
     row.updated_at = utc_now()
     db.add(row)
     _commit_model_config(db)
@@ -164,6 +180,51 @@ def test_model_config(
         return ModelConfigTestResponse(success=False, message=str(exc), output=None)
 
 
+@router.post(
+    "/{config_id}/preflight-dynamic",
+    response_model=ModelCapabilityPreflightResponse,
+    dependencies=[Depends(require_tenant_admin)],
+)
+def preflight_dynamic_model_config(
+    config_id: str,
+    tenant_id: str = Query(...),
+    db: Session = Depends(get_session),
+) -> ModelCapabilityPreflightResponse:
+    """验证原生 structured-output/tool-call 协议并持久化可审计能力快照。"""
+
+    row = _get_model_config(db, tenant_id, config_id)
+    if row.provider != "openai_compatible":
+        return _record_preflight_failure(
+            db,
+            row,
+            "UNSUPPORTED_PROVIDER_SDK",
+        )
+    try:
+        capabilities = LLMClient(row).preflight_dynamic_capabilities()
+    except LLMError as exc:
+        return _record_preflight_failure(db, row, _sanitize_preflight_error(row, str(exc)))
+    snapshot = {
+        **capabilities,
+        "provider": row.provider,
+        "model": row.model,
+    }
+    row.capability_snapshot_json = snapshot
+    row.capability_checksum = capability_checksum(snapshot)
+    row.preflight_status = "ready"
+    row.preflight_error = None
+    row.capability_verified_at = utc_now()
+    row.updated_at = utc_now()
+    db.add(row)
+    db.commit()
+    return ModelCapabilityPreflightResponse(
+        success=True,
+        status="ready",
+        capabilities=snapshot,
+        checksum=row.capability_checksum,
+        message="Dynamic model capability preflight succeeded",
+    )
+
+
 def _get_model_config(db: Session, tenant_id: str, config_id: str) -> ModelConfig:
     """按租户边界读取模型配置，不接受跨租户标识。"""
 
@@ -207,3 +268,44 @@ def _commit_model_config(db: Session) -> None:
     except IntegrityError as exc:
         db.rollback()
         raise HTTPException(status_code=409, detail="MODEL_DEFAULT_CONFLICT") from exc
+
+
+def _invalidate_dynamic_preflight(row: ModelConfig) -> None:
+    """连接或协议配置变更时撤销旧能力事实，防止模型切换沿用快照。"""
+
+    row.capability_snapshot_json = {}
+    row.capability_checksum = None
+    row.preflight_status = "unverified"
+    row.preflight_error = None
+    row.capability_verified_at = None
+
+
+def _record_preflight_failure(
+    db: Session,
+    row: ModelConfig,
+    message: str,
+) -> ModelCapabilityPreflightResponse:
+    """持久化脱敏预检失败事实，且不保留部分成功的能力快照。"""
+
+    row.capability_snapshot_json = {}
+    row.capability_checksum = None
+    row.preflight_status = "failed"
+    row.preflight_error = message[:2000]
+    row.capability_verified_at = None
+    row.updated_at = utc_now()
+    db.add(row)
+    db.commit()
+    return ModelCapabilityPreflightResponse(
+        success=False,
+        status="failed",
+        capabilities={},
+        checksum=None,
+        message=message[:2000],
+    )
+
+
+def _sanitize_preflight_error(row: ModelConfig, message: str) -> str:
+    """从 provider 错误中移除当前明文 API key，避免落库和返回给前端。"""
+
+    secret = decrypt_secret(row.api_key_encrypted)
+    return message.replace(secret, "***") if secret else message

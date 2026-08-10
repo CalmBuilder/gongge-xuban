@@ -1,3 +1,11 @@
+"""
+@Time       : 2026/08/10 16:25
+@Author     : zhanglp8181
+@File       : test_router.py
+@CallChain  : pytest → Router → LLMClient stub → RouterDecision
+@Description: 验证场景路由协议、任务规范化及演示流程防误选边界。
+"""
+
 import pytest
 
 from app.core.router import Router
@@ -280,6 +288,68 @@ def test_router_removes_hallucinated_target_skill_from_non_matching_flow(monkeyp
     assert decision.target_step_id is None
 
 
+def test_router_rejects_demo_skill_without_explicit_trigger_and_defers_non_sop(monkeypatch):
+    """动态外部任务即使含流程泛词，也不得被平台演示 SOP 抢占。"""
+
+    def fake_init(self, model_config):  # noqa: ANN001
+        """跳过真实模型客户端初始化。"""
+
+        return None
+
+    def fake_generate_json(self, system_prompt, payload):  # noqa: ANN001
+        """模拟模型将动态任务误判成图结构演示流程。"""
+
+        assert "演示/验证流程仅用于明确的演示请求" in payload["_agent_stage"]["instructions"]
+        assert payload["available_skills"][0]["business_domain"] == "demo"
+        return {
+            "decision": "start_new_task",
+            "target_skill_id": "skill_graph_visual_demo",
+            "confidence": 0.96,
+            "user_intent": "执行可恢复的企业微信外发任务",
+            "reason": "模型被多步骤和恢复等泛词误导。",
+        }
+
+    monkeypatch.setattr(LLMClient, "__init__", fake_init)
+    monkeypatch.setattr(LLMClient, "generate_json", fake_generate_json)
+    demo_skill = _demo_skill()
+
+    decision = Router().decide(
+        "创建一个可持久恢复的动态任务，审批后向企业微信发送消息",
+        ChatSession(id="session_test", tenant_id="tenant_demo"),
+        [demo_skill],
+        model_config=None,  # type: ignore[arg-type]
+    )
+
+    assert decision.decision == "answer_only"
+    assert decision.target_skill_id is None
+    assert decision.task_frames == []
+
+
+def test_router_allows_demo_skill_when_current_message_contains_explicit_trigger(monkeypatch):
+    """用户明确要求图结构验证时仍可启动演示 SOP。"""
+
+    monkeypatch.setattr(LLMClient, "__init__", lambda self, model_config: None)
+    monkeypatch.setattr(
+        LLMClient,
+        "generate_json",
+        lambda self, system_prompt, payload: {
+            "decision": "start_new_task",
+            "target_skill_id": "skill_graph_visual_demo",
+            "confidence": 0.96,
+        },
+    )
+
+    decision = Router().decide(
+        "帮我跑一次图结构验证",
+        ChatSession(id="session_test", tenant_id="tenant_demo"),
+        [_demo_skill()],
+        model_config=None,  # type: ignore[arg-type]
+    )
+
+    assert decision.decision == "start_new_task"
+    assert decision.target_skill_id == "skill_graph_visual_demo"
+
+
 def test_router_strips_generated_message_content_slots(monkeypatch):
     def fake_init(self, model_config):  # noqa: ANN001
         return None
@@ -358,6 +428,23 @@ def _purchase_skill() -> Skill:
             "edges": [],
             "start_node_id": "collect_user_name",
             "terminal_node_ids": ["collect_user_name"],
+        },
+    )
+
+
+def _demo_skill() -> Skill:
+    """构造只能由显式触发词启动的平台演示流程。"""
+
+    return Skill(
+        tenant_id="tenant_demo",
+        skill_id="skill_graph_visual_demo",
+        name="图结构可视化验证流程",
+        business_domain="demo",
+        description="验证分支和恢复流程。",
+        status="published",
+        content_json={
+            "trigger_intents": ["图结构验证", "流程图验证", "graph demo"],
+            "nodes": [{"node_id": "intake_request"}],
         },
     )
 

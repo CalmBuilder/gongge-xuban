@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vite --host 127.0.0.1 --port 5173 --strictPort",
+    "dev": "vite --host 127.0.0.1 --port 5137 --strictPort",
     "i18n:check": "node scripts/check-i18n.cjs",
     "brand:check": "node scripts/check-brand.cjs",
     "brand:check:test": "node --test scripts/check-brand.test.cjs",

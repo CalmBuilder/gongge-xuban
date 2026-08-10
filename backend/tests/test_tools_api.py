@@ -11,6 +11,7 @@ from app.agents.branching import ensure_open_gallery_binding, ensure_private_res
 from app.api.tools import (
     _ensure_tool_visible,
     _normalize_probe_url,
+    create_tool,
     delete_tool,
     list_tools,
     probe_tool as _probe_tool,
@@ -18,7 +19,7 @@ from app.api.tools import (
 )
 from app.config import get_settings
 from app.db.models import AgentProfile, AgentResourceBinding, Tenant, Tool, User
-from app.tools.tool_schema import ToolProbeRequest
+from app.tools.tool_schema import ToolCreateRequest, ToolProbeRequest
 
 
 def _admin_user() -> User:
@@ -199,6 +200,176 @@ def test_tool_read_discloses_credential_keys_without_values() -> None:
     assert result.credential_state.header_keys == ["Authorization", "X-Trace"]
     assert result.credential_state.auth_keys == ["api_key"]
     assert result.credential_state.mcp_config_keys == ["token"]
+
+
+def test_tool_api_publishes_read_contract_but_legacy_default_stays_out() -> None:
+    """验证显式纯读契约生成 checksum，未声明工具仍默认不进动态目录。"""
+
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.add(
+            AgentProfile(
+                id="agent_overall", tenant_id="tenant_demo", name="开放广场", is_overall=True
+            )
+        )
+        db.commit()
+        legacy = create_tool(
+            ToolCreateRequest(
+                tenant_id="tenant_demo",
+                name="legacy.lookup",
+                method="GET",
+                url="https://example.invalid/legacy",
+            ),
+            agent_id="agent_overall",
+            db=db,
+            current_user=_admin_user(),
+        )
+        published = create_tool(
+            ToolCreateRequest(
+                tenant_id="tenant_demo",
+                name="weather.lookup",
+                method="GET",
+                url="https://example.invalid/weather",
+                input_schema={
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                },
+                reliability_contract={
+                    "risk_class": "read",
+                    "side_effect": "none",
+                    "confirmation_policy": "none",
+                    "idempotency": {
+                        "mode": "none",
+                        "argument": None,
+                        "remote_scope": None,
+                    },
+                    "reconcile": {
+                        "supported": False,
+                        "tool_name": None,
+                        "reference_source": None,
+                        "terminal_status_mapping": {},
+                    },
+                    "model_visibility": {
+                        "allowed_paths": ["input.city"],
+                        "user_display_paths": [],
+                        "audit_only_paths": [],
+                    },
+                    "timeout_policy": "failed",
+                    "dynamic_task_enabled": True,
+                },
+            ),
+            agent_id="agent_overall",
+            db=db,
+            current_user=_admin_user(),
+        )
+
+        assert legacy.reliability_contract is None
+        assert legacy.reliability_checksum is None
+        assert published.reliability_contract is not None
+        assert published.reliability_checksum is not None
+
+
+def test_reconcile_contract_requires_an_enabled_published_read_tool() -> None:
+    """验证外部写不能仅填对账工具名就伪装为可对账。"""
+
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.add(
+            AgentProfile(
+                id="agent_overall", tenant_id="tenant_demo", name="开放广场", is_overall=True
+            )
+        )
+        db.commit()
+        with pytest.raises(HTTPException) as caught:
+            create_tool(
+                ToolCreateRequest(
+                    tenant_id="tenant_demo",
+                    name="message.send",
+                    method="POST",
+                    url="https://example.invalid/send",
+                    reliability_contract={
+                        "risk_class": "external_write",
+                        "side_effect": "external",
+                        "confirmation_policy": "once",
+                        "idempotency": {
+                            "mode": "none",
+                            "argument": None,
+                            "remote_scope": None,
+                        },
+                        "reconcile": {
+                            "supported": True,
+                            "tool_name": "message.status",
+                            "reference_source": "result.message_id",
+                            "terminal_status_mapping": {"sent": "complete"},
+                        },
+                        "model_visibility": {
+                            "allowed_paths": [],
+                            "user_display_paths": [],
+                            "audit_only_paths": [],
+                        },
+                        "timeout_policy": "unknown",
+                        "dynamic_task_enabled": False,
+                    },
+                ),
+                agent_id="agent_overall",
+                db=db,
+                current_user=_admin_user(),
+            )
+
+        assert caught.value.status_code == 422
+        assert caught.value.detail == "RECONCILE_TOOL_NOT_AVAILABLE"
+
+
+def test_tool_api_rejects_visibility_path_missing_from_schema() -> None:
+    """验证发布不得接受无法在当前 schema 解析的模型可见路径。"""
+
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.add(
+            AgentProfile(
+                id="agent_overall", tenant_id="tenant_demo", name="开放广场", is_overall=True
+            )
+        )
+        db.commit()
+        with pytest.raises(HTTPException) as caught:
+            create_tool(
+                ToolCreateRequest(
+                    tenant_id="tenant_demo",
+                    name="weather.invalid-view",
+                    method="GET",
+                    url="https://example.invalid/weather",
+                    input_schema={"type": "object", "properties": {}},
+                    reliability_contract={
+                        "risk_class": "read",
+                        "side_effect": "none",
+                        "confirmation_policy": "none",
+                        "idempotency": {
+                            "mode": "none",
+                            "argument": None,
+                            "remote_scope": None,
+                        },
+                        "reconcile": {
+                            "supported": False,
+                            "tool_name": None,
+                            "reference_source": None,
+                            "terminal_status_mapping": {},
+                        },
+                        "model_visibility": {
+                            "allowed_paths": ["input.city"],
+                            "user_display_paths": [],
+                            "audit_only_paths": [],
+                        },
+                        "timeout_policy": "failed",
+                        "dynamic_task_enabled": True,
+                    },
+                ),
+                agent_id="agent_overall",
+                db=db,
+                current_user=_admin_user(),
+            )
+
+        assert caught.value.status_code == 422
+        assert caught.value.detail == "CAPABILITY_PATH_NOT_FOUND:input.city"
 
 
 def test_private_tool_is_not_visible_without_employee_scope() -> None:

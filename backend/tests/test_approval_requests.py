@@ -136,6 +136,7 @@ def test_decision_requires_matching_completed_work_item_and_persists_audit() -> 
             skill_version=version.version,
             definition_checksum="checksum",
             status="waiting",
+            active_slot_key="foreground:session_seal",
             current_node_id="normal_seal_approval",
         )
         execution = SopNodeExecution(
@@ -143,6 +144,7 @@ def test_decision_requires_matching_completed_work_item_and_persists_audit() -> 
             tenant_id="tenant_demo",
             instance_id=instance.id,
             node_id="normal_seal_approval",
+            step_key="normal_seal_approval",
             status="waiting",
         )
         operation = SopOperation(
@@ -151,6 +153,12 @@ def test_decision_requires_matching_completed_work_item_and_persists_audit() -> 
             node_execution_id=execution.id,
             operation_name="admin.seal_application_create",
             idempotency_key="seal-create",
+            logical_action_id="action-seal-create",
+            request_fingerprint=(
+                "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+            ),
+            effect_kind="external_write",
+            effect_state="complete",
             status="succeeded",
             result_json={"approval_request_id": request_number},
         )
@@ -254,6 +262,7 @@ def test_expired_work_item_expires_linked_pending_request() -> None:
             skill_version=version.version,
             definition_checksum="checksum",
             status="waiting",
+            active_slot_key="foreground:session_expired",
             current_node_id="normal_seal_approval",
         )
         execution = SopNodeExecution(
@@ -261,6 +270,7 @@ def test_expired_work_item_expires_linked_pending_request() -> None:
             tenant_id="tenant_demo",
             instance_id=instance.id,
             node_id="normal_seal_approval",
+            step_key="normal_seal_approval",
             status="waiting",
         )
         work_item = SopWorkItem(
@@ -279,6 +289,12 @@ def test_expired_work_item_expires_linked_pending_request() -> None:
             node_execution_id=execution.id,
             operation_name="admin.seal_application_create",
             idempotency_key="seal-create-expired",
+            logical_action_id="action-seal-create-expired",
+            request_fingerprint=(
+                "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+            ),
+            effect_kind="external_write",
+            effect_state="complete",
             status="succeeded",
             result_json={"approval_request_id": request_number},
         )

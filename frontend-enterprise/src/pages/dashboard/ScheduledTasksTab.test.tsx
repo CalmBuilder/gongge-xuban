@@ -39,6 +39,10 @@ const run = {
   task_status: task.status,
   agent_id: task.agent_id,
   user_id: 'user_demo',
+  execution_id: 'execution_demo',
+  source_kind: 'schedule',
+  source_ref: 'run_demo',
+  source_checksum: 'checksum_demo',
   scheduled_for: '2026-08-01T10:00:00Z',
   status: 'succeeded',
   result_summary: '日报已生成',
@@ -75,6 +79,46 @@ beforeEach(() => {
     }
     throw new Error(`unexpected request: ${path}`);
   });
+});
+
+it('等待人工处理的动态执行保留在待完成筛选并展示会话入口', async () => {
+  // 调度运行进入动态任务等待态后，不应被误报为成功或从待完成列表消失。
+
+  vi.mocked(api.get).mockImplementation(async (path: string) => {
+    if (path.startsWith('/api/enterprise/agents?')) {
+      return [{ id: 'agent_demo', name: '日报员工', is_overall: false }];
+    }
+    if (path.startsWith('/api/enterprise/scheduled-tasks/page?')) {
+      return { items: [task], total: 1, status_counts: { active: 1 }, page: 1, page_size: 10 };
+    }
+    if (path.startsWith('/api/enterprise/scheduled-tasks/runs/page?')) {
+      return {
+        items: [{ ...run, session_id: 'session_waiting', status: 'waiting', result_summary: undefined }],
+        total: 1,
+        run_total: 1,
+        page: 1,
+        page_size: 10,
+      };
+    }
+    throw new Error(`unexpected request: ${path}`);
+  });
+
+  const user = userEvent.setup();
+  render(
+    <I18nProvider>
+      <MemoryRouter>
+        <ScheduledTasksTab />
+      </MemoryRouter>
+    </I18nProvider>,
+  );
+
+  const runSection = await screen.findByRole('region', { name: '执行记录' });
+  expect(within(runSection).getAllByText('等待处理').length).toBeGreaterThan(0);
+  await user.click(within(runSection).getByRole('tab', { name: '待完成' }));
+  await waitFor(() => expect(api.get).toHaveBeenCalledWith(
+    '/api/enterprise/scheduled-tasks/runs/page?tenant_id=tenant_demo&agent_id=agent_demo&status_filter=pending&page=1&page_size=10',
+  ));
+  expect(within(runSection).getAllByRole('button', { name: '查看会话' })[0]).toBeEnabled();
 });
 
 it('执行记录主列表、状态筛选和任务弹窗均使用服务端分页', async () => {

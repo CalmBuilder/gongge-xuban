@@ -1,5 +1,16 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { CheckCircle2, ChevronLeft, ChevronRight, Eye, Search, ShieldCheck, XCircle } from 'lucide-react';
+import {
+  Activity,
+  AlertTriangle,
+  CheckCircle2,
+  ChevronLeft,
+  ChevronRight,
+  Eye,
+  RefreshCw,
+  Search,
+  ShieldCheck,
+  XCircle,
+} from 'lucide-react';
 
 import AppHeader from '@/components/AppHeader';
 import {
@@ -28,6 +39,10 @@ import type {
   ManagementAuditOutcome,
   ManagementAuditPageResult,
 } from '../types/management-audit';
+import type {
+  DynamicTaskOperationalAlert,
+  DynamicTaskOperationalSnapshot,
+} from '../types/dynamic-task-operations';
 
 type AuditFilters = {
   actorUserId: string;
@@ -63,6 +78,14 @@ const ACTION_KIND_LABELS: Record<ManagementAuditActionKind, string> = {
   execute: '执行',
 };
 
+const OPERATIONAL_ALERT_LABELS: Record<string, string> = {
+  signal_backlog: '唤醒积压',
+  dead_letters: '死信',
+  unknown_operations: '待对账动作',
+  publication_backlog: '投递积压',
+  waiting_age_seconds: '最长等待',
+};
+
 export default function ManagementAuditPage({
   currentUser,
   onLogout,
@@ -80,6 +103,9 @@ export default function ManagementAuditPage({
   const [selected, setSelected] = useState<ManagementAuditLog | null>(null);
   const [detailOpen, setDetailOpen] = useState(false);
   const [detailLoading, setDetailLoading] = useState(false);
+  const [operations, setOperations] = useState<DynamicTaskOperationalSnapshot | null>(null);
+  const [operationsLoading, setOperationsLoading] = useState(false);
+  const [operationsDenied, setOperationsDenied] = useState(false);
   const pageSize = 20;
 
   const query = useMemo(() => {
@@ -113,9 +139,32 @@ export default function ManagementAuditPage({
     }
   }, [query]);
 
+  const loadOperations = useCallback(async () => {
+    setOperationsLoading(true);
+    try {
+      const result = await api.get<DynamicTaskOperationalSnapshot>(
+        `/api/dynamic-task-operations/snapshot?tenant_id=${encodeURIComponent(tenant.id)}`,
+      );
+      setOperations(result);
+      setOperationsDenied(false);
+    } catch (error) {
+      if (isForbidden(error)) {
+        setOperationsDenied(true);
+        return;
+      }
+      notify.error(error instanceof Error ? error.message : '加载动态任务运行状态失败');
+    } finally {
+      setOperationsLoading(false);
+    }
+  }, [tenant.id]);
+
   useEffect(() => {
     void loadRows();
   }, [loadRows]);
+
+  useEffect(() => {
+    void loadOperations();
+  }, [loadOperations]);
 
   async function openDetail(row: ManagementAuditLog) {
     setSelected(row);
@@ -149,6 +198,12 @@ export default function ManagementAuditPage({
   return (
     <div className="min-h-full box-border px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]">
       <AppHeader onLogout={onLogout} userName={currentUser?.username} title="管理审计" />
+      <OperationalRail
+        snapshot={operations}
+        loading={operationsLoading}
+        denied={operationsDenied}
+        onRefresh={() => void loadOperations()}
+      />
       <section className="mt-[20px] overflow-hidden rounded-[20px] border border-[#e8ebf3] bg-white shadow-[0_16px_44px_rgba(24,39,75,0.07)]">
         <header className="flex flex-wrap items-start justify-between gap-[16px] border-b border-[#eef1f6] px-[22px] py-[20px]">
           <div className="flex items-start gap-[12px]">
@@ -345,6 +400,143 @@ export default function ManagementAuditPage({
       </Sheet>
     </div>
   );
+}
+
+function OperationalRail({
+  snapshot,
+  loading,
+  denied,
+  onRefresh,
+}: {
+  snapshot: DynamicTaskOperationalSnapshot | null;
+  loading: boolean;
+  denied: boolean;
+  onRefresh: () => void;
+}) {
+  const triggered = snapshot?.alerts.filter((item) => item.triggered) || [];
+  const hasCritical = triggered.some((item) => item.severity === 'critical');
+  const verdict = !snapshot?.thresholds_configured || !snapshot.quota_limits_configured
+    ? { label: '门禁未就绪', className: 'border-[#efd29a] bg-[#fff8e8] text-[#8d6118]' }
+    : hasCritical
+      ? { label: '停止扩大灰度', className: 'border-[#efb8b8] bg-[#fff2f2] text-[#a83c3c]' }
+      : triggered.length > 0
+        ? { label: '保持观察', className: 'border-[#efd29a] bg-[#fff8e8] text-[#8d6118]' }
+        : { label: '运行阈值内', className: 'border-[#a9ddc2] bg-[#edf9f2] text-[#197449]' };
+
+  return (
+    <section
+      aria-label="动态任务运行门禁"
+      className="mt-[20px] overflow-hidden rounded-[20px] border border-[#dfe5f1] bg-[#151b2b] text-white shadow-[0_18px_42px_rgba(17,27,51,0.16)]"
+    >
+      <header className="flex flex-wrap items-center justify-between gap-[12px] border-b border-white/10 px-[22px] py-[17px]">
+        <div className="flex items-center gap-[11px]">
+          <span className="grid size-[36px] place-items-center rounded-[11px] bg-[#2f5be7] text-white">
+            <Activity className="size-[17px]" />
+          </span>
+          <div>
+            <h2 className="text-[14px] font-semibold tracking-[0.01em]">动态任务运行门禁</h2>
+            <p className="mt-[3px] text-[11px] text-[#9aa7c4]">
+              直接读取统一 Runtime 权威状态；告警只观察，不改变执行结果。
+            </p>
+          </div>
+        </div>
+        <div className="flex items-center gap-[9px]">
+          {snapshot ? (
+            <span className={cn('rounded-full border px-[10px] py-[5px] text-[10px] font-medium', verdict.className)}>
+              {verdict.label}
+            </span>
+          ) : null}
+          <Button
+            variant="outline"
+            size="sm"
+            aria-label="刷新动态任务运行状态"
+            disabled={loading}
+            onClick={onRefresh}
+            className="border-white/15 bg-white/5 text-white hover:bg-white/10 hover:text-white"
+          >
+            <RefreshCw className={cn('size-[13px]', loading && 'animate-spin')} />
+            刷新
+          </Button>
+        </div>
+      </header>
+
+      {denied ? (
+        <div className="px-[22px] py-[20px] text-[12px] text-[#c5cee2]">
+          运行聚合需要租户全域审计权限；当前账号仍可查看其组织授权范围内的管理台账。
+        </div>
+      ) : snapshot ? (
+        <div className="grid gap-px bg-white/10 sm:grid-cols-2 xl:grid-cols-5">
+          {snapshot.alerts.map((alert) => (
+            <OperationalCell key={alert.code} alert={alert} />
+          ))}
+        </div>
+      ) : (
+        <div className="px-[22px] py-[20px] text-[12px] text-[#aeb9d1]">
+          {loading ? '正在读取运行快照…' : '尚未取得运行快照，请刷新重试。'}
+        </div>
+      )}
+
+      {snapshot ? (
+        <footer className="flex flex-wrap items-center justify-between gap-[8px] border-t border-white/10 px-[22px] py-[11px] text-[10px] text-[#8996b4]">
+          <span>
+            活动执行 {activeExecutions(snapshot)} · 待处理 {activeAttentions(snapshot)} ·
+            配额租约 {activeQuotaLeases(snapshot)} · 最长等待 {formatDuration(snapshot.oldest_waiting_age_seconds)}
+          </span>
+          <time dateTime={snapshot.observed_at}>快照时间 {formatAuditTime(snapshot.observed_at)}</time>
+        </footer>
+      ) : null}
+    </section>
+  );
+}
+
+function OperationalCell({ alert }: { alert: DynamicTaskOperationalAlert }) {
+  const value = alert.code === 'waiting_age_seconds' ? formatDuration(alert.current) : String(alert.current);
+  const threshold = alert.threshold === null
+    ? '待配置'
+    : alert.code === 'waiting_age_seconds'
+      ? formatDuration(alert.threshold)
+      : String(alert.threshold);
+  return (
+    <div className="bg-[#151b2b] px-[18px] py-[16px]">
+      <div className="flex items-center justify-between gap-[8px]">
+        <span className="text-[10px] font-medium tracking-[0.08em] text-[#8996b4]">
+          {OPERATIONAL_ALERT_LABELS[alert.code] || alert.code}
+        </span>
+        {alert.triggered ? (
+          <AlertTriangle className={cn('size-[13px]', alert.severity === 'critical' ? 'text-[#ff8b8b]' : 'text-[#f0c36b]')} />
+        ) : null}
+      </div>
+      <strong className={cn(
+        'mt-[9px] block font-mono text-[22px] font-semibold leading-none',
+        alert.triggered && alert.severity === 'critical' ? 'text-[#ff9b9b]' : 'text-white',
+      )}>
+        {value}
+      </strong>
+      <span className="mt-[7px] block text-[10px] text-[#6f7c9b]">停止阈值 {threshold}</span>
+    </div>
+  );
+}
+
+function activeExecutions(snapshot: DynamicTaskOperationalSnapshot): number {
+  return ['created', 'running', 'waiting'].reduce((total, status) => total + (snapshot.executions[status] || 0), 0);
+}
+
+function activeAttentions(snapshot: DynamicTaskOperationalSnapshot): number {
+  return ['offered', 'claimed'].reduce((total, status) => total + (snapshot.attentions[status] || 0), 0);
+}
+
+function activeQuotaLeases(snapshot: DynamicTaskOperationalSnapshot): number {
+  return Object.values(snapshot.quota_leases).reduce((total, count) => total + count, 0);
+}
+
+function formatDuration(seconds: number): string {
+  if (seconds < 60) return `${seconds}秒`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}分`;
+  return `${Math.floor(seconds / 3600)}时${Math.floor((seconds % 3600) / 60)}分`;
+}
+
+function isForbidden(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && 'status' in error && error.status === 403;
 }
 
 function OutcomeBadge({ outcome }: { outcome: ManagementAuditOutcome }) {

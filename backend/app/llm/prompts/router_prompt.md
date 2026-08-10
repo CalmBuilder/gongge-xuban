@@ -51,6 +51,7 @@ slot_hints、task_frames/pending_tasks/task_updates.slot_hints 只能填写订�
 7. clarify 只用于用户明显想办理企业流程但意图不清楚，或多个 available_skills 都可能且缺少区分信息；不要用 clarify 表示“技能明确但缺槽位”，也不要用 clarify 承接不存在的流程。
 8. 只有当前 SOP/技能节点明确声明需要人工处理，或节点类型/allowed_actions 包含 `handoff_human` 时，才选择 handoff_human；用户单纯要求人工但当前流程没有显式转人工节点时，不要触发转人工。
 9. 判断只能基于 current_session 与 available_skills 的 skill_id、名称、描述、trigger_intents；不要依赖 SOP graph 或平台内置业务假设。
+9.1 `business_domain=demo` 的演示/验证流程仅用于明确的演示请求；只有用户当前消息直接命中该技能的 trigger_intents 时才可启动，不要因“流程、多步骤、验证、恢复”等泛化词选中演示技能。
 10. 如果用户当前回答只是补充当前步骤缺失信息，尤其是很短、明显在回答上一轮问题的内容，应优先选择 continue_active。
 11. 如果用户一句话同时补充当前步骤信息，并明确提出临时咨询、前置查询、比较、核实、取消、售后等另一个可由场景技能处理的诉求，不要让原则10吞掉复合意图；把这些本轮任务全部按顺序写入 `task_frames`。
 12. 临时咨询如果需要企业数据、实时数据、外部事实、工具结果、通用能力或另一个已发布场景技能才能可靠回答，不得降级成普通话术回答，也不得把事实性答案写进 clarification_question；应优先选择 available_skills 中能执行该诉求的技能任务，或保留/继续当前技能并让执行阶段基于 available_tools、知识或已知信息行动。若没有 active/pending 场景任务且 available_skills 中没有对应流程，才选择 answer_only；不要编造场景流程。

@@ -41,6 +41,7 @@ from app.sop_runtime.definition import (
     HumanTaskKind,
     ParticipantScopeResolver,
 )
+from app.sop_runtime.execution_control import attention_identity
 from app.sop_runtime.state_machine import RevisionConflictError, transition_work_item
 
 
@@ -137,6 +138,18 @@ class SopWorkItemService:
             node_execution_id=execution.id,
             skill_version_id=instance.skill_version_id,
             node_id=execution.node_id,
+            attention_kind="sop_human_task",
+            attention_key=f"sop-node:{execution.id}",
+            attention_identity=attention_identity(
+                tenant_id=instance.tenant_id,
+                execution_id=instance.id,
+                attention_key=f"sop-node:{execution.id}",
+            ),
+            source_type="formal_sop",
+            source_ref=execution.id,
+            payload_json={"node_id": execution.node_id},
+            allowed_commands_json=["claim", "unclaim", "complete"],
+            required=True,
             initiator_user_id=initiator_user_id,
             subject_employee_profile_id=str(
                 identity_context.get("subject_employee_profile_id") or ""
