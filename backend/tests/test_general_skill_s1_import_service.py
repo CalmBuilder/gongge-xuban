@@ -23,11 +23,13 @@ from sqlmodel import Session, SQLModel, create_engine, select
 from app.db.models import (
     AgentProfile,
     AgentResourceBinding,
+    ConnectionSecret,
     GeneralSkill,
     GeneralSkillDependency,
     GeneralSkillImportJob,
     GeneralSkillImportQuota,
     GeneralSkillRevision,
+    GeneralSkillSourceCredential,
     ManagementAuditLog,
     Tenant,
     User,
@@ -38,10 +40,12 @@ from app.general_skills.import_schema import (
     GeneralSkillImportConfirm,
     GeneralSkillImportJobCreate,
     GeneralSkillUploadFile,
+    GeneralSkillSourceCredentialCreate,
 )
 from app.general_skills.import_service import GeneralSkillImportError, GeneralSkillImportService
 from app.general_skills.object_store import FileSystemSkillObjectStore, SkillObjectStoreError
 from app.general_skills.remote_source import RemoteFetchResult
+from app.general_skills.source_credentials import GeneralSkillSourceCredentialService
 
 
 def _package(*names: str) -> bytes:
@@ -141,16 +145,20 @@ class _RemoteFetcherStub:
 
         self.payload = payload
         self.calls: list[tuple[str, frozenset[str] | None]] = []
+        self.authorizations: list[tuple[str | None, frozenset[str] | None]] = []
 
     def fetch(
         self,
         source_url: str,
         *,
         allowed_hosts: frozenset[str] | None = None,
+        authorization: str | None = None,
+        authorization_hosts: frozenset[str] | None = None,
     ) -> RemoteFetchResult:
         """记录请求并返回已去敏的固定结果。"""
 
         self.calls.append((source_url, allowed_hosts))
+        self.authorizations.append((authorization, authorization_hosts))
         return RemoteFetchResult(source_url, self.payload, 0)
 
 
@@ -675,6 +683,186 @@ def test_background_worker_reconstructs_deferred_remote_plan_without_secret_quer
     )
 
 
+def test_private_source_credential_rotates_and_worker_uses_only_latest_secret(tmp_path) -> None:
+    """验证用户凭据密文追加修订，后台只解析最新 token 且 API 作业投影不暴露引用。"""
+
+    db, service, owner, _ = _context(tmp_path)
+    credentials = GeneralSkillSourceCredentialService(db, https_allowed_hosts=None)
+    created = credentials.create(
+        GeneralSkillSourceCredentialCreate(
+            tenant_id="tenant_a",
+            display_name="私人 GitHub",
+            source_kind="github",
+            token="private-token-v1-never-log",
+        ),
+        current_user=owner,
+    )
+    rotated = credentials.rotate(
+        created.id,
+        "private-token-v2-never-log",
+        expected_row_version=created.row_version,
+        current_user=owner,
+    )
+    revision = "84fdeffd12f2ee307994d1eb6feb48173b6e0502"
+    queued = service.create_job(
+        GeneralSkillImportJobCreate(
+            tenant_id="tenant_a",
+            target_agent_id="agent_a",
+            source_kind="github",
+            source_url="https://github.com/mattpocock/skills",
+            revision=revision,
+            source_subpath="skills",
+            credential_reference=created.id,
+        ),
+        idempotency_key="private-github-001",
+        current_user=owner,
+        defer_processing=True,
+    )
+    fetcher = _RemoteFetcherStub(_repository_package("private-skill"))
+    processed = service.process_pending_jobs(
+        worker_id="gsworker_private",
+        fetcher=fetcher,
+        now=utc_now(),
+        lease_seconds=300,
+    )
+
+    assert [item.status for item in processed] == ["awaiting_approval"]
+    assert "credential" not in queued.model_dump()
+    assert fetcher.authorizations == [
+        ("Bearer private-token-v2-never-log", frozenset({"github.com"}))
+    ]
+    secrets = db.exec(select(ConnectionSecret).order_by(ConnectionSecret.revision)).all()
+    assert [secret.status for secret in secrets] == ["superseded", "active"]
+    persisted = str(
+        db.exec(select(GeneralSkillImportJob)).all()
+        + db.exec(select(GeneralSkillSourceCredential)).all()
+        + db.exec(select(ManagementAuditLog)).all()
+    )
+    assert "private-token-v1-never-log" not in persisted
+    assert "private-token-v2-never-log" not in persisted
+    assert rotated.secret_revision == 2
+
+
+def test_revoked_private_source_credential_fails_before_network_call(tmp_path) -> None:
+    """验证排队后撤销凭据会在 worker 外呼前失败关闭，不能继续使用旧 token。"""
+
+    db, service, owner, _ = _context(tmp_path)
+    credentials = GeneralSkillSourceCredentialService(db, https_allowed_hosts=None)
+    created = credentials.create(
+        GeneralSkillSourceCredentialCreate(
+            tenant_id="tenant_a",
+            display_name="待撤销 GitHub",
+            source_kind="github",
+            token="revoked-token-never-send",
+        ),
+        current_user=owner,
+    )
+    queued = service.create_job(
+        GeneralSkillImportJobCreate(
+            tenant_id="tenant_a",
+            target_agent_id="agent_a",
+            source_kind="github",
+            source_url="https://github.com/mattpocock/skills",
+            revision="84fdeffd12f2ee307994d1eb6feb48173b6e0502",
+            source_subpath="skills",
+            credential_reference=created.id,
+        ),
+        idempotency_key="revoked-private-github-001",
+        current_user=owner,
+        defer_processing=True,
+    )
+    credentials.revoke(
+        created.id,
+        expected_row_version=created.row_version,
+        current_user=owner,
+    )
+    fetcher = _RemoteFetcherStub(_repository_package("must-not-fetch"))
+    processed = service.process_pending_jobs(
+        worker_id="gsworker_revoked",
+        fetcher=fetcher,
+        now=utc_now(),
+        lease_seconds=300,
+    )
+
+    assert [item.status for item in processed] == ["failed"]
+    assert processed[0].error_code == "GENERAL_SKILL_CREDENTIAL_NOT_AVAILABLE"
+    assert fetcher.calls == []
+    assert db.get(GeneralSkillImportJob, queued.id).quota_bytes == 0
+
+
+def test_private_source_rotation_during_fetch_discards_old_credential_response(tmp_path) -> None:
+    """验证下载过程中轮换 token 后，旧修订取得的响应不会进入 raw 检查点或预览。"""
+
+    db, service, owner, _ = _context(tmp_path)
+    credentials = GeneralSkillSourceCredentialService(db, https_allowed_hosts=None)
+    created = credentials.create(
+        GeneralSkillSourceCredentialCreate(
+            tenant_id="tenant_a",
+            display_name="并发轮换 GitHub",
+            source_kind="github",
+            token="credential-before-fetch-rotation",
+        ),
+        current_user=owner,
+    )
+    queued = service.create_job(
+        GeneralSkillImportJobCreate(
+            tenant_id="tenant_a",
+            target_agent_id="agent_a",
+            source_kind="github",
+            source_url="https://github.com/mattpocock/skills",
+            revision="84fdeffd12f2ee307994d1eb6feb48173b6e0502",
+            source_subpath="skills",
+            credential_reference=created.id,
+        ),
+        idempotency_key="rotate-during-fetch-001",
+        current_user=owner,
+        defer_processing=True,
+    )
+
+    class RotatingFetcher(_RemoteFetcherStub):
+        """返回响应前轮换凭据，模拟网络请求与用户操作竞态。"""
+
+        def fetch(
+            self,
+            source_url: str,
+            *,
+            allowed_hosts: frozenset[str] | None = None,
+            authorization: str | None = None,
+            authorization_hosts: frozenset[str] | None = None,
+        ) -> RemoteFetchResult:
+            """先记录旧授权，再提交凭据新修订。"""
+
+            result = super().fetch(
+                source_url,
+                allowed_hosts=allowed_hosts,
+                authorization=authorization,
+                authorization_hosts=authorization_hosts,
+            )
+            credentials.rotate(
+                created.id,
+                "credential-after-fetch-rotation",
+                expected_row_version=created.row_version,
+                current_user=owner,
+            )
+            return result
+
+    fetcher = RotatingFetcher(_repository_package("discarded-private-response"))
+    processed = service.process_pending_jobs(
+        worker_id="gsworker_rotating_credential",
+        fetcher=fetcher,
+        now=utc_now(),
+        lease_seconds=300,
+    )
+
+    assert [item.status for item in processed] == ["failed"]
+    assert processed[0].error_code == "GENERAL_SKILL_CREDENTIAL_CHANGED"
+    assert fetcher.authorizations[0][0] == "Bearer credential-before-fetch-rotation"
+    row = db.get(GeneralSkillImportJob, queued.id)
+    assert row is not None
+    assert row.raw_checksum is None
+    assert row.preview_checksum is None
+
+
 def test_uncheckpointed_stale_job_fails_closed_and_expired_preview_releases_quota(tmp_path) -> None:
     """验证无 raw 的崩溃态不会猜测恢复，已预览到期后全部暂存和配额均回收。"""
 
@@ -910,6 +1098,83 @@ def test_concurrent_confirm_has_one_physical_install_and_idempotent_replay(tmp_p
         installed_job = verify_db.get(GeneralSkillImportJob, preview.id)
         assert installed_job is not None
         assert installed_job.status == "installed"
+    engine.dispose()
+
+
+def test_concurrent_cancel_releases_quota_exactly_once(tmp_path) -> None:
+    """验证两个独立请求同时取消时共享同一终态，tenant/user 配额只归还一次。"""
+
+    database_path = tmp_path / "cancel-concurrency.db"
+    engine = create_engine(
+        f"sqlite:///{database_path}",
+        connect_args={"check_same_thread": False, "timeout": 10},
+    )
+    SQLModel.metadata.create_all(engine)
+    object_store = FileSystemSkillObjectStore(tmp_path / "cancel-objects")
+    with Session(engine) as setup_db:
+        owner = User(
+            id="cancel_owner",
+            tenant_id="tenant_cancel",
+            username="cancel-owner",
+            role="member",
+            password_hash="unused",
+        )
+        setup_db.add(Tenant(id="tenant_cancel", name="Cancel Tenant"))
+        setup_db.add(owner)
+        setup_db.add(
+            AgentProfile(
+                id="agent_cancel",
+                tenant_id="tenant_cancel",
+                name="取消并发员工",
+                owner_user_id=owner.id,
+            )
+        )
+        setup_db.commit()
+        preview = GeneralSkillImportService(setup_db, object_store).create_upload_job(
+            GeneralSkillImportJobCreate(
+                tenant_id="tenant_cancel",
+                target_agent_id="agent_cancel",
+                source_kind="upload",
+                filename="cancel.zip",
+                content_base64=base64.b64encode(_package("cancel-skill")).decode(),
+            ),
+            idempotency_key="concurrent-cancel-001",
+            current_user=owner,
+        )
+    barrier = Barrier(2)
+
+    def cancel_from_independent_session() -> str:
+        """让两个请求同时提交相同行版本，并返回各自观察到的终态。"""
+
+        with Session(engine) as worker_db:
+            worker_owner = worker_db.get(User, "cancel_owner")
+            assert worker_owner is not None
+            service = GeneralSkillImportService(worker_db, object_store)
+            barrier.wait(timeout=5)
+            return service.cancel_job(
+                preview.id,
+                expected_row_version=preview.row_version,
+                current_user=worker_owner,
+            ).status
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(lambda _index: cancel_from_independent_session(), range(2)))
+
+    assert outcomes == ["cancelled", "cancelled"]
+    with Session(engine) as verify_db:
+        cancelled = verify_db.get(GeneralSkillImportJob, preview.id)
+        assert cancelled is not None
+        assert cancelled.status == "cancelled"
+        assert cancelled.quota_bytes == 0
+        quotas = verify_db.exec(select(GeneralSkillImportQuota)).all()
+        assert len(quotas) == 2
+        assert all(row.active_jobs == 0 and row.staged_bytes == 0 for row in quotas)
+        audits = verify_db.exec(
+            select(ManagementAuditLog).where(
+                ManagementAuditLog.action == "general_skill_import_cancelled"
+            )
+        ).all()
+        assert len(audits) == 1
     engine.dispose()
 
 

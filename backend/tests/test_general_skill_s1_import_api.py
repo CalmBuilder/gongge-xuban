@@ -22,7 +22,15 @@ from sqlmodel import Session, SQLModel, create_engine, select
 from app.config import get_settings
 from app.api.general_skill_imports import get_general_skill_remote_fetcher
 from app.db import get_session
-from app.db.models import AgentProfile, AgentResourceBinding, GeneralSkillRevision, Tenant, User
+from app.db.models import (
+    AgentProfile,
+    AgentResourceBinding,
+    ConnectionSecret,
+    GeneralSkillRevision,
+    GeneralSkillSourceCredential,
+    Tenant,
+    User,
+)
 from app.main import app
 from app.general_skills.remote_source import RemoteFetchResult
 from app.security.auth import create_access_token
@@ -96,6 +104,8 @@ def import_api_context(
             source_url: str,
             *,
             allowed_hosts: frozenset[str] | None = None,
+            authorization: str | None = None,
+            authorization_hosts: frozenset[str] | None = None,
         ) -> RemoteFetchResult:
             """验证 GitHub 固定归档 URL 后返回上传用例的同一 ZIP。"""
 
@@ -297,3 +307,109 @@ def test_api_github_source_requires_and_persists_fixed_revision(
         f"https://github.com/mattpocock/skills@{revision}#skills"
     )
     assert "secret" not in response.text
+
+
+def test_api_source_credential_lifecycle_is_private_versioned_and_redacted(
+    import_api_context: tuple[TestClient, Session, dict[str, str]],
+) -> None:
+    """验证本人凭据创建、轮换、撤销、用户隔离及响应/审计去敏形成闭环。"""
+
+    client, db, tokens = import_api_context
+    created_response = client.post(
+        "/api/enterprise/general-skill-import-jobs/credentials",
+        headers=_auth(tokens["owner"]),
+        json={
+            "tenant_id": "tenant_a",
+            "display_name": "私人 GitHub",
+            "source_kind": "github",
+            "token": "github-private-token-v1-never-return",
+        },
+    )
+    assert created_response.status_code == 201, created_response.text
+    created = created_response.json()
+    assert created["secret_revision"] == 1
+    assert "token" not in created_response.text.lower()
+    assert "secret_reference" not in created_response.text
+
+    owner_list = client.get(
+        "/api/enterprise/general-skill-import-jobs/credentials",
+        headers=_auth(tokens["owner"]),
+    )
+    other_list = client.get(
+        "/api/enterprise/general-skill-import-jobs/credentials",
+        headers=_auth(tokens["other"]),
+    )
+    assert [row["id"] for row in owner_list.json()] == [created["id"]]
+    assert other_list.json() == []
+
+    rotated_response = client.post(
+        f"/api/enterprise/general-skill-import-jobs/credentials/{created['id']}/rotate",
+        headers=_auth(tokens["owner"]),
+        json={
+            "token": "github-private-token-v2-never-return",
+            "expected_row_version": created["row_version"],
+        },
+    )
+    assert rotated_response.status_code == 200, rotated_response.text
+    rotated = rotated_response.json()
+    assert rotated["secret_revision"] == 2
+    stale_rotate = client.post(
+        f"/api/enterprise/general-skill-import-jobs/credentials/{created['id']}/rotate",
+        headers=_auth(tokens["owner"]),
+        json={
+            "token": "stale-token-must-not-win",
+            "expected_row_version": created["row_version"],
+        },
+    )
+    assert stale_rotate.status_code == 409
+    forbidden = client.post(
+        f"/api/enterprise/general-skill-import-jobs/credentials/{created['id']}/revoke",
+        headers=_auth(tokens["other"]),
+        json={"expected_row_version": rotated["row_version"]},
+    )
+    assert forbidden.status_code == 404
+
+    revoked_response = client.post(
+        f"/api/enterprise/general-skill-import-jobs/credentials/{created['id']}/revoke",
+        headers=_auth(tokens["owner"]),
+        json={"expected_row_version": rotated["row_version"]},
+    )
+    assert revoked_response.status_code == 200
+    assert revoked_response.json()["status"] == "revoked"
+    secrets = db.exec(select(ConnectionSecret).order_by(ConnectionSecret.revision)).all()
+    assert [row.status for row in secrets] == ["superseded", "revoked"]
+    profile = db.exec(select(GeneralSkillSourceCredential)).one()
+    assert profile.status == "revoked"
+    serialized = created_response.text + rotated_response.text + revoked_response.text
+    assert "github-private-token-v1-never-return" not in serialized
+    assert "github-private-token-v2-never-return" not in serialized
+
+
+def test_api_refuses_source_credential_when_secret_backend_is_not_configured(
+    import_api_context: tuple[TestClient, Session, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证开发占位 APP_SECRET 下不能把私有仓库 token 写入看似加密的生产档案。"""
+
+    client, db, _tokens = import_api_context
+    monkeypatch.setenv("APP_SECRET", "change-me-in-development")
+    get_settings.cache_clear()
+    owner = db.get(User, "user_owner")
+    assert owner is not None
+    placeholder_secret_token = create_access_token(owner)
+    response = client.post(
+        "/api/enterprise/general-skill-import-jobs/credentials",
+        headers=_auth(placeholder_secret_token),
+        json={
+            "tenant_id": "tenant_a",
+            "display_name": "不能保存",
+            "source_kind": "github",
+            "token": "must-never-be-persisted",
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["error_code"] == (
+        "GENERAL_SKILL_CREDENTIAL_BACKEND_NOT_CONFIGURED"
+    )
+    assert db.exec(select(ConnectionSecret)).all() == []

@@ -423,6 +423,19 @@ export type GeneralSkillImportJobRead = {
   installed_revision_ids: string[];
 };
 
+export type GeneralSkillSourceCredentialRead = {
+  id: string;
+  tenant_id: string;
+  display_name: string;
+  source_kind: 'github' | 'https';
+  allowed_host: string;
+  secret_revision: number;
+  status: 'active' | 'revoked';
+  row_version: number;
+  created_at: string;
+  updated_at: string;
+};
+
 export type ModelConfigRead = {
   id: string;
   tenant_id: string;

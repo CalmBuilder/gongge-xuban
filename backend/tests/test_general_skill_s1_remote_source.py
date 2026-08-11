@@ -30,7 +30,7 @@ class _ExchangeStub:
         """初始化响应队列和调用记录。"""
 
         self.responses = deque(responses)
-        self.calls: list[tuple[str, str, int, float]] = []
+        self.calls: list[tuple[str, str, int, float, str | None]] = []
 
     def __call__(
         self,
@@ -38,10 +38,11 @@ class _ExchangeStub:
         address: str,
         max_bytes: int,
         timeout_seconds: float,
+        authorization: str | None,
     ) -> _ExchangeResult:
         """记录 URL/IP/预算并返回下一个预设响应。"""
 
-        self.calls.append((source_url, address, max_bytes, timeout_seconds))
+        self.calls.append((source_url, address, max_bytes, timeout_seconds, authorization))
         return self.responses.popleft()
 
 
@@ -182,8 +183,30 @@ def test_fetcher_preserves_explicit_download_budget_for_exchange() -> None:
         timeout_seconds=17,
     ).fetch("https://packages.example.com/archive.zip")
     assert exchange.calls == [
-        ("https://packages.example.com/archive.zip", "8.8.8.8", 1234, 17)
+        ("https://packages.example.com/archive.zip", "8.8.8.8", 1234, 17, None)
     ]
+
+
+def test_fetcher_never_forwards_authorization_to_redirected_host() -> None:
+    """验证私有来源授权只发往绑定主机，合法跨主机重定向也不会携带 Token。"""
+
+    exchange = _ExchangeStub(
+        _ExchangeResult(302, {"location": "https://codeload.github.com/org/repo.zip"}, b""),
+        _ExchangeResult(200, {}, b"zip"),
+    )
+    result = SecureHttpsFetcher(
+        resolver=lambda _host, _port: ("8.8.8.8",),
+        exchange=exchange,
+    ).fetch(
+        "https://github.com/org/repo/archive/abc.zip",
+        allowed_hosts=GITHUB_ARCHIVE_HOSTS,
+        authorization="Bearer private-token",
+        authorization_hosts=frozenset({"github.com"}),
+    )
+
+    assert result.payload == b"zip"
+    assert exchange.calls[0][-1] == "Bearer private-token"
+    assert exchange.calls[1][-1] is None
 
 
 @pytest.mark.parametrize("failure", [TimeoutError("late"), ssl.SSLError("bad certificate")])
@@ -195,6 +218,7 @@ def test_fetcher_converts_transport_failures_to_redacted_domain_error(failure: E
         _address: str,
         _max_bytes: int,
         _timeout_seconds: float,
+        _authorization: str | None,
     ) -> _ExchangeResult:
         """模拟供应商网络在 socket/TLS 阶段失败。"""
 

@@ -1942,6 +1942,53 @@ class GeneralSkillImportQuota(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=utc_now)
 
 
+class GeneralSkillSourceCredential(SQLModel, table=True):
+    """保存用户级私有 Skill 来源档案；密文继续由追加式 ConnectionSecret 持有。"""
+
+    __tablename__ = "general_skill_source_credentials"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "owner_user_id",
+            "id",
+            name="uq_general_skill_source_credential_owner",
+        ),
+        CheckConstraint(
+            "source_kind IN ('github', 'https')",
+            name="ck_general_skill_source_credential_kind",
+        ),
+        CheckConstraint(
+            "status IN ('active', 'revoked')",
+            name="ck_general_skill_source_credential_status",
+        ),
+        CheckConstraint("secret_revision >= 1", name="ck_general_skill_source_secret_revision"),
+        CheckConstraint("row_version >= 1", name="ck_general_skill_source_row_version"),
+        Index(
+            "ix_general_skill_source_credential_owner_status",
+            "tenant_id",
+            "owner_user_id",
+            "status",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(
+        default_factory=lambda: new_id("gssourcecred"),
+        primary_key=True,
+    )
+    tenant_id: IdentifierString
+    owner_user_id: IdentifierString
+    display_name: NameString
+    source_kind: LabelString
+    allowed_host: PlainTextString
+    secret_reference_id: IdentifierString = Field(index=True)
+    secret_revision: int = Field(default=1, ge=1)
+    status: LabelString = "active"
+    row_version: int = Field(default=1, ge=1)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+    revoked_at: datetime | None = None
+
+
 class GeneralSkillDependency(SQLModel, table=True):
     """保存经人工确认、以稳定 Skill 与 Revision 标识表达的不可变依赖边。"""
 

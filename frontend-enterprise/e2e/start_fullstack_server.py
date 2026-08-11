@@ -1708,6 +1708,8 @@ def install_general_skill_remote_fetcher_override() -> None:
             source_url: str,
             *,
             allowed_hosts: frozenset[str] | None = None,
+            authorization: str | None = None,
+            authorization_hosts: frozenset[str] | None = None,
         ) -> RemoteFetchResult:
             """校验来源专属 URL/allowlist 后生成确定性 provider 响应。"""
 
@@ -1730,6 +1732,11 @@ def install_general_skill_remote_fetcher_override() -> None:
                 raise RuntimeError("unexpected E2E remote archive URL")
             if not allowed_hosts or "codeload.github.com" not in allowed_hosts:
                 raise RuntimeError("missing E2E GitHub redirect allowlist")
+            if authorization is not None:
+                if authorization != "Bearer e2e-private-github-token":
+                    raise RuntimeError("unexpected E2E private source authorization")
+                if authorization_hosts != frozenset({"github.com"}):
+                    raise RuntimeError("private source authorization escaped its host binding")
             time.sleep(0.8)
             with ZipFile(payload, "w", ZIP_DEFLATED) as archive:
                 archive.writestr(

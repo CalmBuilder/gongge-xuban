@@ -19,6 +19,10 @@ from app.general_skills.import_schema import (
     GeneralSkillImportConfirm,
     GeneralSkillImportJobCreate,
     GeneralSkillImportJobRead,
+    GeneralSkillSourceCredentialCreate,
+    GeneralSkillSourceCredentialRead,
+    GeneralSkillSourceCredentialRevoke,
+    GeneralSkillSourceCredentialRotate,
 )
 from app.general_skills.import_service import (
     GeneralSkillImportError,
@@ -27,6 +31,10 @@ from app.general_skills.import_service import (
 )
 from app.general_skills.object_store import FileSystemSkillObjectStore
 from app.general_skills.remote_source import RemoteFetcher, SecureHttpsFetcher
+from app.general_skills.source_credentials import (
+    GeneralSkillSourceCredentialError,
+    GeneralSkillSourceCredentialService,
+)
 from app.security.auth import get_current_user
 
 
@@ -79,6 +87,85 @@ def create_import_job(
             defer_processing=settings.general_skill_import_async_enabled,
         )
     except GeneralSkillImportError as exc:
+        raise _http_error(exc) from exc
+
+
+@router.get("/credentials", response_model=list[GeneralSkillSourceCredentialRead])
+def list_source_credentials(
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+    settings: Settings = Depends(get_settings),
+) -> list[GeneralSkillSourceCredentialRead]:
+    """列出当前用户可用于私有 Skill 来源的凭据档案。"""
+
+    return _credential_service(db, settings).list_owned(current_user=current_user)
+
+
+@router.post(
+    "/credentials",
+    response_model=GeneralSkillSourceCredentialRead,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_source_credential(
+    request: GeneralSkillSourceCredentialCreate,
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+    settings: Settings = Depends(get_settings),
+) -> GeneralSkillSourceCredentialRead:
+    """加密创建本人私有来源凭据，响应永不回显 token 或密文引用。"""
+
+    _ensure_secret_backend(settings)
+    try:
+        return _credential_service(db, settings).create(request, current_user=current_user)
+    except GeneralSkillSourceCredentialError as exc:
+        raise _http_error(exc) from exc
+
+
+@router.post(
+    "/credentials/{credential_id}/rotate",
+    response_model=GeneralSkillSourceCredentialRead,
+)
+def rotate_source_credential(
+    credential_id: str,
+    request: GeneralSkillSourceCredentialRotate,
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+    settings: Settings = Depends(get_settings),
+) -> GeneralSkillSourceCredentialRead:
+    """追加密文修订并原子切换稳定凭据档案。"""
+
+    _ensure_secret_backend(settings)
+    try:
+        return _credential_service(db, settings).rotate(
+            credential_id,
+            request.token.get_secret_value(),
+            expected_row_version=request.expected_row_version,
+            current_user=current_user,
+        )
+    except GeneralSkillSourceCredentialError as exc:
+        raise _http_error(exc) from exc
+
+
+@router.post(
+    "/credentials/{credential_id}/revoke",
+    response_model=GeneralSkillSourceCredentialRead,
+)
+def revoke_source_credential(
+    credential_id: str,
+    request: GeneralSkillSourceCredentialRevoke,
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+    settings: Settings = Depends(get_settings),
+) -> GeneralSkillSourceCredentialRead:
+    """撤销本人凭据，使尚未抓取的后台作业在外呼前失败关闭。"""
+
+    try:
+        return _credential_service(db, settings).revoke(
+            credential_id,
+            expected_row_version=request.expected_row_version,
+            current_user=current_user,
+        )
+    except GeneralSkillSourceCredentialError as exc:
         raise _http_error(exc) from exc
 
 
@@ -154,7 +241,33 @@ def _service(db: Session, settings: Settings) -> GeneralSkillImportService:
     )
 
 
-def _http_error(exc: GeneralSkillImportError) -> HTTPException:
+def _credential_service(
+    db: Session,
+    settings: Settings,
+) -> GeneralSkillSourceCredentialService:
+    """创建受同一 V2 开关与 HTTPS host allowlist 约束的凭据服务。"""
+
+    if not settings.general_skill_import_v2_enabled:
+        raise HTTPException(status_code=404, detail={"error_code": "FEATURE_NOT_AVAILABLE"})
+    return GeneralSkillSourceCredentialService(
+        db,
+        https_allowed_hosts=settings.general_skill_https_allowed_host_set,
+    )
+
+
+def _ensure_secret_backend(settings: Settings) -> None:
+    """禁止用开发占位 APP_SECRET 持久化可用于生产外呼的私有 token。"""
+
+    if not settings.connection_secret_backend_configured:
+        raise HTTPException(
+            status_code=503,
+            detail={"error_code": "GENERAL_SKILL_CREDENTIAL_BACKEND_NOT_CONFIGURED"},
+        )
+
+
+def _http_error(
+    exc: GeneralSkillImportError | GeneralSkillSourceCredentialError,
+) -> HTTPException:
     """把领域错误映射为不包含内部栈和原始正文的 HTTP detail。"""
 
     return HTTPException(

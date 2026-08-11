@@ -53,8 +53,10 @@ class RemoteFetcher(Protocol):
         source_url: str,
         *,
         allowed_hosts: frozenset[str] | None = None,
+        authorization: str | None = None,
+        authorization_hosts: frozenset[str] | None = None,
     ) -> RemoteFetchResult:
-        """按可选 host allowlist 返回有限、已校验的远程正文。"""
+        """按 host allowlist 返回有限正文，并把授权头限制在明确授权的主机。"""
 
         ...
 
@@ -69,7 +71,7 @@ class _ExchangeResult:
 
 
 Resolver = Callable[[str, int], tuple[str, ...]]
-Exchange = Callable[[str, str, int, float], _ExchangeResult]
+Exchange = Callable[[str, str, int, float, str | None], _ExchangeResult]
 
 
 class SecureHttpsFetcher:
@@ -97,9 +99,18 @@ class SecureHttpsFetcher:
         source_url: str,
         *,
         allowed_hosts: frozenset[str] | None = None,
+        authorization: str | None = None,
+        authorization_hosts: frozenset[str] | None = None,
     ) -> RemoteFetchResult:
         """校验每个 URL 与 DNS 结果，手动跟随有限重定向并整包读取。"""
 
+        if authorization and (
+            not authorization_hosts or "\r" in authorization or "\n" in authorization
+        ):
+            raise GeneralSkillRemoteSourceError(
+                "GENERAL_SKILL_CREDENTIAL_INVALID",
+                "remote source authorization policy is invalid",
+            )
         current = source_url
         for redirect_count in range(self.max_redirects + 1):
             parsed = _validated_https_url(current, allowed_hosts)
@@ -112,6 +123,7 @@ class SecureHttpsFetcher:
                     public_addresses[0],
                     self.max_bytes,
                     self.timeout_seconds,
+                    authorization if authorization and host in authorization_hosts else None,
                 )
             except GeneralSkillRemoteSourceError:
                 raise
@@ -282,6 +294,7 @@ def _https_exchange(
     address: str,
     max_bytes: int,
     timeout_seconds: float,
+    authorization: str | None,
 ) -> _ExchangeResult:
     """连接已验证 IP，以原 hostname 完成 TLS SNI/证书校验并有限读取响应。"""
 
@@ -305,11 +318,13 @@ def _https_exchange(
             raise GeneralSkillRemoteSourceError(
                 "GENERAL_SKILL_PACKAGE_INVALID", "remote peer address changed during connect"
             )
+        authorization_line = f"Authorization: {authorization}\r\n" if authorization else ""
         request = (
             f"GET {target} HTTP/1.1\r\n"
             f"Host: {hostname}\r\n"
             "User-Agent: gongge-xuban-skill-import/1\r\n"
             "Accept: application/zip, application/octet-stream\r\n"
+            f"{authorization_line}"
             "Connection: close\r\n\r\n"
         )
         tls_socket.sendall(request.encode("ascii"))

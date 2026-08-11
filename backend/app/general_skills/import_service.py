@@ -18,6 +18,7 @@ from datetime import datetime, timedelta
 from io import BytesIO
 from pathlib import PurePath
 from typing import Any
+from urllib.parse import urlsplit
 from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
 from sqlalchemy import or_, update
@@ -66,6 +67,12 @@ from app.general_skills.remote_source import (
     github_archive_url,
     skillhub_archive_url,
     validated_remote_reference,
+)
+from app.general_skills.source_credentials import (
+    GeneralSkillSourceCredentialError,
+    resolve_source_authorization,
+    validate_source_credential_reference,
+    validate_source_credential_revision,
 )
 from app.security.permissions import ensure_agent_scope_manager
 from app.security.tenant import ensure_tenant
@@ -250,22 +257,51 @@ class GeneralSkillImportService:
         job = self._owned_job(job_id, current_user)
         if job.status == ImportJobStatus.CANCELLED:
             return import_job_read(job)
-        try:
-            transition_import_job(
-                job,
-                ImportJobStatus.CANCELLED,
-                expected_row_version=expected_row_version,
+        if job.status in IMPORT_JOB_TERMINAL_STATUSES:
+            raise GeneralSkillImportError(
+                "GENERAL_SKILL_STATE_CONFLICT",
+                "terminal import job cannot be cancelled",
+                409,
             )
-        except GeneralSkillLifecycleError as exc:
-            raise _state_conflict(exc) from exc
-        self.object_store.release_staging(job.id)
+        now = utc_now()
+        result = self.db.exec(
+            update(GeneralSkillImportJob)
+            .where(
+                GeneralSkillImportJob.id == job.id,
+                GeneralSkillImportJob.status == job.status,
+                GeneralSkillImportJob.row_version == expected_row_version,
+            )
+            .values(
+                status=ImportJobStatus.CANCELLED.value,
+                row_version=GeneralSkillImportJob.row_version + 1,
+                worker_id=None,
+                lease_expires_at=None,
+                error_code=None,
+                error_detail_redacted=None,
+                terminal_at=now,
+                updated_at=now,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if result.rowcount != 1:
+            self.db.rollback()
+            self.db.expire(job)
+            self.db.refresh(job)
+            if job.status == ImportJobStatus.CANCELLED:
+                return import_job_read(job)
+            raise GeneralSkillImportError(
+                "GENERAL_SKILL_STATE_CONFLICT",
+                "import job changed concurrently",
+                409,
+            )
+        self.db.expire(job)
+        self.db.refresh(job)
         self._release_import_quota(job)
-        job.worker_id = None
-        job.lease_expires_at = None
         self.db.add(job)
         self._append_job_audit(job, "cancelled", "success")
         self.db.commit()
         self.db.refresh(job)
+        self.object_store.release_staging(job.id)
         return import_job_read(job)
 
     def confirm_job(
@@ -581,6 +617,19 @@ class GeneralSkillImportService:
             request.revision,
             request.source_subpath,
         )
+        source_host = (urlsplit(validated_reference).hostname or "").lower().rstrip(".")
+        if request.credential_reference:
+            try:
+                validate_source_credential_reference(
+                    self.db,
+                    credential_id=request.credential_reference,
+                    tenant_id=request.tenant_id,
+                    owner_user_id=current_user.id,
+                    source_kind=request.source_kind,
+                    source_host=source_host,
+                )
+            except GeneralSkillSourceCredentialError as exc:
+                raise GeneralSkillImportError(exc.error_code, str(exc), exc.status_code) from exc
         if request.source_kind == "github":
             remote_fetch_descriptor: dict[str, object] = {
                 "kind": "github",
@@ -598,6 +647,7 @@ class GeneralSkillImportService:
             {
                 "source_kind": request.source_kind,
                 "source_reference": source_reference,
+                "credential_reference": request.credential_reference,
             }
         )
         attempt, parent_job_id, existing = self._resolve_import_attempt(
@@ -624,6 +674,7 @@ class GeneralSkillImportService:
             target_agent_id=request.target_agent_id,
             source_kind=request.source_kind,
             source_reference_redacted=source_reference,
+            credential_reference=request.credential_reference,
             idempotency_key=key,
             attempt=attempt,
             parent_job_id=parent_job_id,
@@ -647,7 +698,20 @@ class GeneralSkillImportService:
             self.db.add(job)
             self.db.commit()
             self.db.refresh(job)
-            result = fetcher.fetch(source_url, allowed_hosts=allowed_hosts)
+            (
+                fetch_url,
+                fetch_hosts,
+                authorization,
+                authorization_hosts,
+                credential_revision,
+            ) = self._remote_fetch_plan(job)
+            result = fetcher.fetch(
+                fetch_url,
+                allowed_hosts=fetch_hosts,
+                authorization=authorization,
+                authorization_hosts=authorization_hosts,
+            )
+            self._validate_completed_fetch_credential(job, credential_revision)
             self._checkpoint_raw_payload(job, result.payload)
             return self._normalize_fetched(
                 job,
@@ -662,6 +726,9 @@ class GeneralSkillImportService:
             return import_job_read(job)
         except SkillObjectStoreError as exc:
             self._fail_job(job, "GENERAL_SKILL_STORAGE_UNAVAILABLE", str(exc))
+            return import_job_read(job)
+        except GeneralSkillSourceCredentialError as exc:
+            self._fail_job(job, exc.error_code, str(exc))
             return import_job_read(job)
         except GeneralSkillImportError as exc:
             if exc.error_code != "GENERAL_SKILL_QUOTA_EXCEEDED":
@@ -765,7 +832,13 @@ class GeneralSkillImportService:
             lease_token = job.lease_token
             try:
                 if job.status == ImportJobStatus.CREATED:
-                    source_url, allowed_hosts = self._remote_fetch_plan(job)
+                    (
+                        source_url,
+                        allowed_hosts,
+                        authorization,
+                        authorization_hosts,
+                        credential_revision,
+                    ) = self._remote_fetch_plan(job)
                     transition_import_job(
                         job,
                         ImportJobStatus.FETCHING,
@@ -774,7 +847,13 @@ class GeneralSkillImportService:
                     self.db.add(job)
                     self.db.commit()
                     self.db.refresh(job)
-                    result = fetcher.fetch(source_url, allowed_hosts=allowed_hosts)
+                    result = fetcher.fetch(
+                        source_url,
+                        allowed_hosts=allowed_hosts,
+                        authorization=authorization,
+                        authorization_hosts=authorization_hosts,
+                    )
+                    self._validate_completed_fetch_credential(job, credential_revision)
                     self._refresh_processing_claim(
                         job,
                         worker_id=worker_id,
@@ -815,6 +894,9 @@ class GeneralSkillImportService:
                 ):
                     processed.append(import_job_read(job))
             except GeneralSkillImportError as exc:
+                if self._fail_claimed_job(job, worker_id, lease_token, exc.error_code, str(exc)):
+                    processed.append(import_job_read(job))
+            except GeneralSkillSourceCredentialError as exc:
                 if self._fail_claimed_job(job, worker_id, lease_token, exc.error_code, str(exc)):
                     processed.append(import_job_read(job))
         return processed
@@ -906,7 +988,7 @@ class GeneralSkillImportService:
     def _remote_fetch_plan(
         self,
         job: GeneralSkillImportJob,
-    ) -> tuple[str, frozenset[str] | None]:
+    ) -> tuple[str, frozenset[str] | None, str | None, frozenset[str] | None, int | None]:
         """从无凭据持久描述符重建远程请求，拒绝缺失或被篡改的来源计划。"""
 
         descriptor = job.preview_json.get("remote_fetch_descriptor")
@@ -918,18 +1000,62 @@ class GeneralSkillImportService:
         if kind == "github" and isinstance(descriptor.get("archive_url"), str):
             archive_url = str(descriptor["archive_url"])
             validated_remote_reference(archive_url, allowed_hosts=GITHUB_ARCHIVE_HOSTS)
-            return archive_url, GITHUB_ARCHIVE_HOSTS
+            return self._authorized_fetch_plan(job, archive_url, GITHUB_ARCHIVE_HOSTS)
         if kind == "skillhub" and isinstance(descriptor.get("slug"), str):
             archive_url, _reference = skillhub_archive_url(str(descriptor["slug"]))
-            return archive_url, SKILLHUB_DOWNLOAD_HOSTS
+            return archive_url, SKILLHUB_DOWNLOAD_HOSTS, None, None, None
         if kind == "https" and isinstance(descriptor.get("url"), str):
             url = validated_remote_reference(
                 str(descriptor["url"]),
                 allowed_hosts=self.https_allowed_hosts,
             )
-            return url, self.https_allowed_hosts
+            return self._authorized_fetch_plan(job, url, self.https_allowed_hosts)
         raise GeneralSkillImportError(
             "GENERAL_SKILL_PACKAGE_INVALID", "remote fetch descriptor is invalid", 400
+        )
+
+    def _authorized_fetch_plan(
+        self,
+        job: GeneralSkillImportJob,
+        source_url: str,
+        allowed_hosts: frozenset[str] | None,
+    ) -> tuple[str, frozenset[str] | None, str | None, frozenset[str] | None, int | None]:
+        """在外呼前解析不透明引用，并把授权传播范围固定到来源档案主机。"""
+
+        if not job.credential_reference:
+            return source_url, allowed_hosts, None, None, None
+        source_host = (urlsplit(source_url).hostname or "").lower().rstrip(".")
+        authorization, authorization_hosts, credential_revision = resolve_source_authorization(
+            self.db,
+            credential_id=job.credential_reference,
+            tenant_id=job.tenant_id,
+            owner_user_id=job.owner_user_id,
+            source_kind=job.source_kind,
+            source_host=source_host,
+        )
+        return (
+            source_url,
+            allowed_hosts,
+            authorization,
+            authorization_hosts,
+            credential_revision,
+        )
+
+    def _validate_completed_fetch_credential(
+        self,
+        job: GeneralSkillImportJob,
+        credential_revision: int | None,
+    ) -> None:
+        """私有下载结束后复核凭据修订，拒绝撤销/轮换竞态下的旧响应。"""
+
+        if not job.credential_reference or credential_revision is None:
+            return
+        validate_source_credential_revision(
+            self.db,
+            credential_id=job.credential_reference,
+            tenant_id=job.tenant_id,
+            owner_user_id=job.owner_user_id,
+            expected_revision=credential_revision,
         )
 
     def expire_jobs(

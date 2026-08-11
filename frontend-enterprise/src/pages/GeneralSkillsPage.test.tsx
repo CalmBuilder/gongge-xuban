@@ -137,3 +137,14 @@ it('shows a resumable background-processing state without exposing confirm actio
   expect(screen.getByText(/关闭不会丢失作业/)).toBeVisible();
   expect(screen.queryByRole('button', { name: '固定版本并绑定' })).not.toBeInTheDocument();
 });
+
+it('offers user-owned private credentials without rendering the token as plain text', () => {
+  /** 验证远程来源可选择本人凭据，Token 输入使用密码语义且公开来源仍是默认值。 */
+
+  renderDialog('github');
+
+  expect(screen.getByLabelText('本次导入使用的私有来源凭据')).toHaveValue('');
+  expect(screen.getByLabelText('私有来源 Token')).toHaveAttribute('type', 'password');
+  expect(screen.getByRole('option', { name: '公开来源（不发送 Token）' })).toBeVisible();
+  expect(screen.getByRole('button', { name: '加密保存并用于本次导入' })).toBeDisabled();
+});

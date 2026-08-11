@@ -363,7 +363,7 @@ def test_0052_migration_constraint_survives_later_heads(tmp_path) -> None:
     assert "uq_general_skill_import_retry_attempt" in constraints
     with engine.connect() as connection:
         assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-            "20260812_0053"
+            "20260812_0054"
         )
     engine.dispose()
 
@@ -404,7 +404,7 @@ def test_0053_migration_adds_idempotent_worker_lease_contract(tmp_path) -> None:
     }
     with engine.connect() as connection:
         assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-            "20260812_0053"
+            "20260812_0054"
         )
     engine.dispose()
 
@@ -450,4 +450,41 @@ def test_0053_downgrade_refuses_active_worker_lease(tmp_path) -> None:
     assert {item["name"] for item in inspect(engine).get_columns("general_skill_import_jobs")} == {
         "id"
     }
+    engine.dispose()
+
+
+def test_0054_migration_creates_reentrant_user_source_credential_profile(tmp_path) -> None:
+    """验证 0054 档案表可重复升级，并具备用户、状态、版本和来源约束。"""
+
+    database_url = f"sqlite:///{tmp_path / 'skill-source-credential.db'}"
+    config = Config(str(BACKEND_DIR / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
+    config.attributes["database_url"] = database_url
+    engine = create_engine(database_url)
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)"))
+        connection.execute(text("INSERT INTO alembic_version VALUES ('20260812_0053')"))
+    command.upgrade(config, "head")
+    command.upgrade(config, "head")
+    inspector = inspect(engine)
+
+    assert inspector.has_table("general_skill_source_credentials")
+    assert "ix_general_skill_source_credential_owner_status" in {
+        item["name"] for item in inspector.get_indexes("general_skill_source_credentials")
+    }
+    assert {
+        "ck_general_skill_source_credential_kind",
+        "ck_general_skill_source_credential_status",
+        "ck_general_skill_source_secret_revision",
+        "ck_general_skill_source_row_version",
+    } <= {
+        item["name"]
+        for item in inspector.get_check_constraints("general_skill_source_credentials")
+    }
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
+            "20260812_0054"
+        )
+    command.downgrade(config, "20260812_0053")
+    assert not inspect(engine).has_table("general_skill_source_credentials")
     engine.dispose()

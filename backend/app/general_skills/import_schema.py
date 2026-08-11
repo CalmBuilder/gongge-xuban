@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, SecretStr, model_validator
 
 
 class GeneralSkillUploadFile(BaseModel):
@@ -33,6 +33,10 @@ class GeneralSkillImportJobCreate(BaseModel):
     revision: str | None = Field(default=None, pattern=r"^[a-fA-F0-9]{40}$")
     source_subpath: str | None = Field(default=None, min_length=1, max_length=512)
     retry_parent_job_id: str | None = Field(default=None, pattern=r"^gsjob_[a-f0-9]{16}$")
+    credential_reference: str | None = Field(
+        default=None,
+        pattern=r"^gssourcecred_[a-f0-9]{16}$",
+    )
 
     @model_validator(mode="after")
     def validate_source_fields(self) -> "GeneralSkillImportJobCreate":
@@ -47,6 +51,7 @@ class GeneralSkillImportJobCreate(BaseModel):
                 or self.source_url
                 or self.revision
                 or self.source_subpath
+                or self.credential_reference
             ):
                 raise ValueError("GENERAL_SKILL_UPLOAD_SOURCE_INVALID")
             return self
@@ -56,9 +61,59 @@ class GeneralSkillImportJobCreate(BaseModel):
             raise ValueError("GENERAL_SKILL_GITHUB_REVISION_AND_SUBPATH_REQUIRED")
         if self.source_kind == "skillhub" and (self.revision or self.source_subpath):
             raise ValueError("GENERAL_SKILL_SKILLHUB_REVISION_NOT_ALLOWED")
+        if self.source_kind == "skillhub" and self.credential_reference:
+            raise ValueError("GENERAL_SKILL_SKILLHUB_CREDENTIAL_NOT_ALLOWED")
         if self.source_kind == "https" and (self.revision or self.source_subpath):
             raise ValueError("GENERAL_SKILL_HTTPS_REVISION_NOT_ALLOWED")
         return self
+
+
+class GeneralSkillSourceCredentialCreate(BaseModel):
+    """创建只属于当前用户的私有 GitHub 或受控 HTTPS 来源凭据。"""
+
+    tenant_id: str = Field(min_length=1, max_length=512)
+    display_name: str = Field(min_length=1, max_length=128)
+    source_kind: Literal["github", "https"]
+    allowed_host: str | None = Field(default=None, min_length=1, max_length=253)
+    token: SecretStr = Field(min_length=1, max_length=8192)
+
+    @model_validator(mode="after")
+    def validate_host_contract(self) -> "GeneralSkillSourceCredentialCreate":
+        """GitHub 固定官方主机，自定义 HTTPS 则必须明确绑定单一主机。"""
+
+        if self.source_kind == "github" and self.allowed_host:
+            raise ValueError("GENERAL_SKILL_GITHUB_CREDENTIAL_HOST_FIXED")
+        if self.source_kind == "https" and not self.allowed_host:
+            raise ValueError("GENERAL_SKILL_HTTPS_CREDENTIAL_HOST_REQUIRED")
+        return self
+
+
+class GeneralSkillSourceCredentialRotate(BaseModel):
+    """以乐观锁轮换来源凭据且不改变稳定引用。"""
+
+    token: SecretStr = Field(min_length=1, max_length=8192)
+    expected_row_version: int = Field(ge=1)
+
+
+class GeneralSkillSourceCredentialRevoke(BaseModel):
+    """以乐观锁撤销来源凭据。"""
+
+    expected_row_version: int = Field(ge=1)
+
+
+class GeneralSkillSourceCredentialRead(BaseModel):
+    """返回不包含 token、密文或底层 secret reference 的凭据档案。"""
+
+    id: str
+    tenant_id: str
+    display_name: str
+    source_kind: str
+    allowed_host: str
+    secret_revision: int
+    status: str
+    row_version: int
+    created_at: str
+    updated_at: str
 
 
 class GeneralSkillImportCandidateRead(BaseModel):

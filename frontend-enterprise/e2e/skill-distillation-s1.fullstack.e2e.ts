@@ -198,7 +198,7 @@ test('S1 GitHub 固定 commit 经供应商边界发现多候选并全部绑定',
   ));
   await dialog.getByRole('button', { name: '固定版本并绑定' }).click();
   expect((await confirmResponse).status()).toBe(200);
-  await expect(page.getByRole('row').filter({ hasText: 'tdd' })).toBeVisible();
+  await expect(page.getByRole('row', { name: /^tdd tdd Use test-driven/ })).toBeVisible();
   await expect(page.getByRole('row').filter({ hasText: 'systematic-debugging' })).toBeVisible();
   expect(failures).toEqual([]);
 });
@@ -226,6 +226,44 @@ test('S1 SkillHub slug 不经过旧入口而完成预览与固定绑定', async 
   await dialog.getByRole('button', { name: '固定版本并绑定' }).click();
   expect((await confirmResponse).status()).toBe(200);
   await expect(page.getByRole('row').filter({ hasText: 'skillhub-browser-helper' })).toBeVisible();
+  expect(failures).toEqual([]);
+});
+
+test('S1 本人私有 GitHub 凭据经加密引用进入后台抓取且完成绑定', async ({ page }) => {
+  const failures = collectBrowserFailures(page);
+  await page.goto('/enterprise/dashboard');
+  await loginAsMember(page);
+  await page.goto('/enterprise/general-skills');
+  await openSecureImport(page);
+  const dialog = page.getByRole('dialog', { name: '安全导入 Skill 包' });
+  await dialog.getByRole('tab', { name: 'GitHub 固定版本' }).click();
+  await dialog.getByLabel('GitHub 仓库地址').fill('https://github.com/mattpocock/skills');
+  await dialog.getByLabel('完整 commit SHA').fill('84fdeffd12f2ee307994d1eb6feb48173b6e0502');
+  await dialog.getByLabel('私有来源凭据名称').fill('E2E 私有 GitHub');
+  await dialog.getByLabel('私有来源 Token').fill('e2e-private-github-token');
+  const credentialResponse = page.waitForResponse((response) => (
+    new URL(response.url()).pathname.endsWith('/general-skill-import-jobs/credentials')
+    && response.request().method() === 'POST'
+  ));
+  await dialog.getByRole('button', { name: '加密保存并用于本次导入' }).click();
+  expect((await credentialResponse).status()).toBe(201);
+  await expect(dialog.getByLabel('本次导入使用的私有来源凭据')).toContainText(
+    'E2E 私有 GitHub · github.com · v1',
+  );
+  await expect(dialog.getByLabel('私有来源 Token')).toHaveValue('');
+
+  await dialog.getByRole('button', { name: '生成安全预览' }).click();
+  await expect(dialog.getByRole('status')).toContainText('后台正在安全检查 Skill 包');
+  await expect(dialog.getByText('tdd', { exact: true })).toBeVisible();
+  const confirmResponse = page.waitForResponse((response) => (
+    new URL(response.url()).pathname.endsWith('/confirm')
+    && response.request().method() === 'POST'
+  ));
+  await dialog.getByRole('button', { name: '固定版本并绑定' }).click();
+  const confirmed = await confirmResponse;
+  expect(confirmed.status()).toBe(200);
+  expect((await confirmed.json()).installed_revision_ids).toHaveLength(2);
+  await expect(dialog).toBeHidden();
   expect(failures).toEqual([]);
 });
 

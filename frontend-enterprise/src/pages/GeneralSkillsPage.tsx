@@ -78,6 +78,7 @@ import type { BadgeTone } from './scheduled-tasks/shared';
 import type {
   AgentProfileRead,
   GeneralSkillImportJobRead,
+  GeneralSkillSourceCredentialRead,
   GeneralSkillRead,
   GeneralSkillRunResponse,
   ModelConfigRead,
@@ -368,6 +369,11 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
   const [secureImportDependencyDecisions, setSecureImportDependencyDecisions] = useState<Record<string, SkillDependencyDecision>>({});
   const [secureImportRetryParentId, setSecureImportRetryParentId] = useState<string | null>(null);
   const [secureImportLoading, setSecureImportLoading] = useState(false);
+  const [secureImportCredentials, setSecureImportCredentials] = useState<GeneralSkillSourceCredentialRead[]>([]);
+  const [secureImportCredentialId, setSecureImportCredentialId] = useState('');
+  const [secureImportCredentialName, setSecureImportCredentialName] = useState('');
+  const [secureImportCredentialToken, setSecureImportCredentialToken] = useState('');
+  const [secureImportCredentialLoading, setSecureImportCredentialLoading] = useState(false);
 
   const pageTitle = isOverallAgent ? '技能广场' : '技能';
   const listLabel = isOverallAgent ? '技能广场列表' : '技能列表';
@@ -699,7 +705,106 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
     setSecureImportSelectedIds([]);
     setSecureImportDependencyDecisions({});
     setSecureImportRetryParentId(null);
+    setSecureImportCredentialId('');
+    setSecureImportCredentialName('');
+    setSecureImportCredentialToken('');
     setSecureImportOpen(true);
+    void loadSecureImportCredentials();
+  }
+
+  async function loadSecureImportCredentials() {
+    try {
+      const credentials = await api.get<GeneralSkillSourceCredentialRead[]>(
+        '/api/enterprise/general-skill-import-jobs/credentials',
+      );
+      setSecureImportCredentials(credentials);
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '加载私有来源凭据失败');
+    }
+  }
+
+  async function createSecureImportCredential() {
+    if (!secureImportCredentialName.trim() || !secureImportCredentialToken) {
+      notify.warning('请输入凭据名称和 Token');
+      return;
+    }
+    let allowedHost: string | undefined;
+    if (secureImportSourceKind === 'https') {
+      try {
+        allowedHost = new URL(secureImportSourceUrl).hostname;
+      } catch {
+        notify.warning('请先输入有效的 HTTPS 来源地址');
+        return;
+      }
+    }
+    if (!['github', 'https'].includes(secureImportSourceKind)) return;
+    setSecureImportCredentialLoading(true);
+    try {
+      const credential = await api.post<GeneralSkillSourceCredentialRead>(
+        '/api/enterprise/general-skill-import-jobs/credentials',
+        {
+          tenant_id: getRequestTenantId(),
+          display_name: secureImportCredentialName.trim(),
+          source_kind: secureImportSourceKind,
+          allowed_host: allowedHost,
+          token: secureImportCredentialToken,
+        },
+      );
+      setSecureImportCredentials((current) => [...current, credential]);
+      setSecureImportCredentialId(credential.id);
+      setSecureImportCredentialToken('');
+      notify.success('私有来源凭据已加密保存');
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '保存私有来源凭据失败');
+    } finally {
+      setSecureImportCredentialToken('');
+      setSecureImportCredentialLoading(false);
+    }
+  }
+
+  async function rotateSecureImportCredential() {
+    const credential = secureImportCredentials.find((item) => item.id === secureImportCredentialId);
+    if (!credential || !secureImportCredentialToken) {
+      notify.warning('请选择凭据并输入新的 Token');
+      return;
+    }
+    setSecureImportCredentialLoading(true);
+    try {
+      const rotated = await api.post<GeneralSkillSourceCredentialRead>(
+        `/api/enterprise/general-skill-import-jobs/credentials/${encodeURIComponent(credential.id)}/rotate`,
+        { token: secureImportCredentialToken, expected_row_version: credential.row_version },
+      );
+      setSecureImportCredentials((current) => current.map((item) => (
+        item.id === rotated.id ? rotated : item
+      )));
+      notify.success('凭据已轮换，排队作业将使用最新修订');
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '轮换凭据失败');
+    } finally {
+      setSecureImportCredentialToken('');
+      setSecureImportCredentialLoading(false);
+    }
+  }
+
+  async function revokeSecureImportCredential() {
+    const credential = secureImportCredentials.find((item) => item.id === secureImportCredentialId);
+    if (!credential) return;
+    setSecureImportCredentialLoading(true);
+    try {
+      const revoked = await api.post<GeneralSkillSourceCredentialRead>(
+        `/api/enterprise/general-skill-import-jobs/credentials/${encodeURIComponent(credential.id)}/revoke`,
+        { expected_row_version: credential.row_version },
+      );
+      setSecureImportCredentials((current) => current.map((item) => (
+        item.id === revoked.id ? revoked : item
+      )));
+      setSecureImportCredentialId('');
+      notify.success('凭据已撤销');
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '撤销凭据失败');
+    } finally {
+      setSecureImportCredentialLoading(false);
+    }
   }
 
   async function previewSecurePackage() {
@@ -756,6 +861,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
           tenant_id: getRequestTenantId(),
           target_agent_id: agentId,
           retry_parent_job_id: secureImportRetryParentId || undefined,
+          credential_reference: secureImportCredentialId || undefined,
           ...sourcePayload,
         },
         { 'Idempotency-Key': `skill-upload-${crypto.randomUUID()}` },
@@ -826,6 +932,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
       }
     }
     setSecureImportLoading(false);
+    setSecureImportCredentialToken('');
     window.localStorage.removeItem(secureImportStorageKey);
     setSecureImportOpen(false);
   }
@@ -1121,6 +1228,11 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
         sourceUrl={secureImportSourceUrl}
         revision={secureImportRevision}
         sourceSubpath={secureImportSubpath}
+        credentials={secureImportCredentials}
+        credentialId={secureImportCredentialId}
+        credentialName={secureImportCredentialName}
+        credentialToken={secureImportCredentialToken}
+        credentialLoading={secureImportCredentialLoading}
         job={secureImportJob}
         selectedIds={secureImportSelectedIds}
         dependencyDecisions={secureImportDependencyDecisions}
@@ -1136,12 +1248,33 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
         }}
         onSourceKindChange={(kind) => {
           setSecureImportSourceKind(kind);
+          setSecureImportCredentialId('');
+          setSecureImportCredentialToken('');
           setSecureImportJob(null);
           setSecureImportSelectedIds([]);
         }}
-        onSourceUrlChange={setSecureImportSourceUrl}
+        onSourceUrlChange={(value) => {
+          setSecureImportSourceUrl(value);
+          const selectedCredential = secureImportCredentials.find(
+            (item) => item.id === secureImportCredentialId,
+          );
+          if (secureImportSourceKind !== 'https' || !selectedCredential) return;
+          try {
+            if (new URL(value).hostname !== selectedCredential.allowed_host) {
+              setSecureImportCredentialId('');
+            }
+          } catch {
+            setSecureImportCredentialId('');
+          }
+        }}
         onRevisionChange={setSecureImportRevision}
         onSourceSubpathChange={setSecureImportSubpath}
+        onCredentialIdChange={setSecureImportCredentialId}
+        onCredentialNameChange={setSecureImportCredentialName}
+        onCredentialTokenChange={setSecureImportCredentialToken}
+        onCredentialCreate={() => void createSecureImportCredential()}
+        onCredentialRotate={() => void rotateSecureImportCredential()}
+        onCredentialRevoke={() => void revokeSecureImportCredential()}
         onSelectedIdsChange={setSecureImportSelectedIds}
         onDependencyDecisionChange={(candidateId, decision) => setSecureImportDependencyDecisions(
           (current) => ({ ...current, [candidateId]: decision }),
@@ -1285,6 +1418,11 @@ export function SecureSkillImportDialog({
   sourceUrl,
   revision,
   sourceSubpath,
+  credentials = [],
+  credentialId = '',
+  credentialName = '',
+  credentialToken = '',
+  credentialLoading = false,
   job,
   selectedIds,
   dependencyDecisions,
@@ -1294,6 +1432,12 @@ export function SecureSkillImportDialog({
   onSourceUrlChange,
   onRevisionChange,
   onSourceSubpathChange,
+  onCredentialIdChange,
+  onCredentialNameChange,
+  onCredentialTokenChange,
+  onCredentialCreate,
+  onCredentialRotate,
+  onCredentialRevoke,
   onSelectedIdsChange,
   onDependencyDecisionChange,
   onPreview,
@@ -1310,6 +1454,11 @@ export function SecureSkillImportDialog({
   sourceUrl: string;
   revision: string;
   sourceSubpath: string;
+  credentials?: GeneralSkillSourceCredentialRead[];
+  credentialId?: string;
+  credentialName?: string;
+  credentialToken?: string;
+  credentialLoading?: boolean;
   job: GeneralSkillImportJobRead | null;
   selectedIds: string[];
   dependencyDecisions: Record<string, SkillDependencyDecision>;
@@ -1319,6 +1468,12 @@ export function SecureSkillImportDialog({
   onSourceUrlChange: (value: string) => void;
   onRevisionChange: (value: string) => void;
   onSourceSubpathChange: (value: string) => void;
+  onCredentialIdChange?: (value: string) => void;
+  onCredentialNameChange?: (value: string) => void;
+  onCredentialTokenChange?: (value: string) => void;
+  onCredentialCreate?: () => void;
+  onCredentialRotate?: () => void;
+  onCredentialRevoke?: () => void;
   onSelectedIdsChange: (ids: string[]) => void;
   onDependencyDecisionChange: (candidateId: string, decision: SkillDependencyDecision) => void;
   onPreview: () => void;
@@ -1487,6 +1642,93 @@ export function SecureSkillImportDialog({
                         />
                       </label>
                     </div>
+                  ) : null}
+                  {['github', 'https'].includes(sourceKind) ? (
+                    <section className="grid gap-3 rounded-[11px] border border-[#dfe5f2] bg-white p-4">
+                      <div>
+                        <strong className="text-[12px] font-semibold text-[#303747]">
+                          私有来源凭据（可选）
+                        </strong>
+                        <p className="mt-1 text-[11px] leading-[1.6] text-[#858b9c]">
+                          Token 加密保存且只属于你；导入作业仅保存不透明引用，跨主机重定向不会携带授权头。
+                        </p>
+                      </div>
+                      <label className="grid gap-1.5 text-[11px] font-medium text-[#4e5668]">
+                        本次导入使用
+                        <select
+                          aria-label="本次导入使用的私有来源凭据"
+                          value={credentialId}
+                          disabled={credentialLoading}
+                          onChange={(event) => onCredentialIdChange?.(event.target.value)}
+                          className="h-9 rounded-[8px] border border-[#cfd7e6] bg-white px-3 text-[12px] text-[#303747] outline-none focus:border-[var(--gg-cobalt)]"
+                        >
+                          <option value="">公开来源（不发送 Token）</option>
+                          {credentials
+                            .filter((credential) => (
+                              credential.status === 'active' && credential.source_kind === sourceKind
+                            ))
+                            .map((credential) => (
+                              <option key={credential.id} value={credential.id}>
+                                {credential.display_name} · {credential.allowed_host} · v{credential.secret_revision}
+                              </option>
+                            ))}
+                        </select>
+                      </label>
+                      <div className="grid gap-2 sm:grid-cols-[minmax(0,0.8fr)_minmax(0,1.2fr)]">
+                        <Input
+                          aria-label="私有来源凭据名称"
+                          value={credentialName}
+                          disabled={credentialLoading}
+                          onChange={(event) => onCredentialNameChange?.(event.target.value)}
+                          placeholder="例如：我的 GitHub 只读 Token"
+                          className="h-9 rounded-[8px] border-[#cfd7e6] text-[12px]"
+                        />
+                        <Input
+                          aria-label="私有来源 Token"
+                          type="password"
+                          autoComplete="new-password"
+                          value={credentialToken}
+                          disabled={credentialLoading}
+                          onChange={(event) => onCredentialTokenChange?.(event.target.value)}
+                          placeholder={credentialId ? '输入新 Token 可轮换当前凭据' : 'Token 不会回显'}
+                          className="h-9 rounded-[8px] border-[#cfd7e6] font-mono text-[12px]"
+                        />
+                      </div>
+                      <div className="flex flex-wrap justify-end gap-2">
+                        {credentialId ? (
+                          <>
+                            <UIButton
+                              type="button"
+                              variant="outline"
+                              disabled={credentialLoading || !credentialToken}
+                              onClick={onCredentialRotate}
+                              className="h-8 text-[11px]"
+                            >
+                              轮换 Token
+                            </UIButton>
+                            <UIButton
+                              type="button"
+                              variant="outline"
+                              disabled={credentialLoading}
+                              onClick={onCredentialRevoke}
+                              className="h-8 border-[#efcaca] text-[11px] text-[#a62626]"
+                            >
+                              撤销凭据
+                            </UIButton>
+                          </>
+                        ) : (
+                          <UIButton
+                            type="button"
+                            variant="outline"
+                            disabled={credentialLoading || !credentialName.trim() || !credentialToken}
+                            onClick={onCredentialCreate}
+                            className="h-8 text-[11px]"
+                          >
+                            加密保存并用于本次导入
+                          </UIButton>
+                        )}
+                      </div>
+                    </section>
                   ) : null}
                   <p className="text-[11px] leading-[1.6] text-[#858b9c]">
                     每次重定向都会重新检查 HTTPS 主机与 DNS；私网、loopback、metadata 地址和漂移版本会在下载前拒绝。
