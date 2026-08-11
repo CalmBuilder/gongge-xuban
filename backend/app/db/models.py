@@ -13,6 +13,7 @@ from typing import Any, Optional
 from uuid import uuid4
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     CheckConstraint,
     Column,
@@ -1893,6 +1894,42 @@ class GeneralSkillImportJob(SQLModel, table=True):
     analyzed_at: datetime | None = None
     confirmed_at: datetime | None = None
     terminal_at: datetime | None = None
+
+
+class GeneralSkillImportQuota(SQLModel, table=True):
+    """保存 tenant/user 两级可原子更新的导入并发数与暂存字节计数。"""
+
+    __tablename__ = "general_skill_import_quotas"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "scope_kind",
+            "scope_id",
+            name="uq_general_skill_import_quota_scope",
+        ),
+        CheckConstraint(
+            "scope_kind IN ('tenant', 'user')",
+            name="ck_general_skill_import_quota_scope_kind",
+        ),
+        CheckConstraint(
+            "active_jobs >= 0 AND staged_bytes >= 0 AND row_version >= 1",
+            name="ck_general_skill_import_quota_nonnegative",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("gsquota"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    scope_kind: LabelString = Field(index=True)
+    scope_id: IdentifierString = Field(index=True)
+    active_jobs: int = Field(default=0, ge=0)
+    staged_bytes: int = Field(
+        default=0,
+        ge=0,
+        sa_column=Column(BigInteger, nullable=False, default=0),
+    )
+    row_version: int = Field(default=1, ge=1)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
 
 
 class GeneralSkillDependency(SQLModel, table=True):

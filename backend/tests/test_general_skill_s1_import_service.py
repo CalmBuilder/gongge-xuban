@@ -24,6 +24,7 @@ from app.db.models import (
     GeneralSkill,
     GeneralSkillDependency,
     GeneralSkillImportJob,
+    GeneralSkillImportQuota,
     GeneralSkillRevision,
     Tenant,
     User,
@@ -245,6 +246,38 @@ def test_confirm_creates_published_revision_and_default_pinned_private_binding(t
     assert not (tmp_path / "staging" / preview.id).exists()
 
 
+def test_confirm_replay_requires_the_same_semantic_request(tmp_path) -> None:
+    """验证同一确认可幂等重放，而改选候选不能借 installed 终态伪装成功。"""
+
+    db, service, owner, _ = _context(tmp_path)
+    preview = service.create_upload_job(
+        _request(_package("alpha", "beta")),
+        idempotency_key="upload-confirm-replay-001",
+        current_user=owner,
+    )
+    first_candidate, second_candidate = preview.candidates
+    request = GeneralSkillImportConfirm(
+        preview_checksum=preview.preview_checksum or "",
+        candidate_ids=[first_candidate.candidate_id],
+        expected_row_version=preview.row_version,
+    )
+    installed = service.confirm_job(preview.id, request, current_user=owner)
+    replay = service.confirm_job(preview.id, request, current_user=owner)
+    assert replay.installed_revision_ids == installed.installed_revision_ids
+    with pytest.raises(GeneralSkillImportError) as captured:
+        service.confirm_job(
+            preview.id,
+            GeneralSkillImportConfirm(
+                preview_checksum=preview.preview_checksum or "",
+                candidate_ids=[second_candidate.candidate_id],
+                expected_row_version=preview.row_version,
+            ),
+            current_user=owner,
+        )
+    assert captured.value.error_code == "GENERAL_SKILL_STATE_CONFLICT"
+    assert len(db.exec(select(GeneralSkill)).all()) == 1
+
+
 def test_dependency_candidate_requires_explicit_decision_and_selected_child(tmp_path) -> None:
     """验证正文引用既不能静默授权，也不能指向本次未安装的依赖。"""
 
@@ -403,6 +436,7 @@ def test_uncheckpointed_stale_job_fails_closed_and_expired_preview_releases_quot
         created_at=utc_now() - timedelta(minutes=10),
         updated_at=utc_now() - timedelta(minutes=10),
     )
+    service._reserve_import_quota("tenant_a", owner.id)
     db.add(stale)
     db.commit()
     failed = service.recover_stale_jobs(stale_before=utc_now() - timedelta(minutes=5))
@@ -467,6 +501,53 @@ def test_folder_upload_unsafe_relative_path_fails_entire_job(tmp_path) -> None:
     assert result.status == "failed"
     assert result.error_code == "GENERAL_SKILL_PACKAGE_INVALID"
     assert db.exec(select(GeneralSkill)).all() == []
+
+
+def test_user_concurrent_import_quota_is_atomic_and_released_on_cancel(tmp_path) -> None:
+    """验证同一用户第三个活跃导入被 429 拒绝，取消后名额和字节立即可复用。"""
+
+    db, service, owner, _ = _context(tmp_path)
+    first = service.create_upload_job(
+        _request(_package("quota-one")),
+        idempotency_key="upload-quota-001",
+        current_user=owner,
+    )
+    second = service.create_upload_job(
+        _request(_package("quota-two")),
+        idempotency_key="upload-quota-002",
+        current_user=owner,
+    )
+    with pytest.raises(GeneralSkillImportError) as captured:
+        service.create_upload_job(
+            _request(_package("quota-three")),
+            idempotency_key="upload-quota-003",
+            current_user=owner,
+        )
+    assert captured.value.error_code == "GENERAL_SKILL_QUOTA_EXCEEDED"
+    assert captured.value.status_code == 429
+    user_quota = db.exec(
+        select(GeneralSkillImportQuota).where(
+            GeneralSkillImportQuota.scope_kind == "user",
+            GeneralSkillImportQuota.scope_id == owner.id,
+        )
+    ).one()
+    assert user_quota.active_jobs == 2
+    assert user_quota.staged_bytes == first.quota_bytes + second.quota_bytes
+
+    service.cancel_job(
+        first.id,
+        expected_row_version=first.row_version,
+        current_user=owner,
+    )
+    third = service.create_upload_job(
+        _request(_package("quota-three")),
+        idempotency_key="upload-quota-003",
+        current_user=owner,
+    )
+    assert third.status == "awaiting_approval"
+    db.refresh(user_quota)
+    assert user_quota.active_jobs == 2
+    assert user_quota.staged_bytes == second.quota_bytes + third.quota_bytes
 
 
 def test_create_is_idempotent_and_rejects_same_key_for_different_content(tmp_path) -> None:

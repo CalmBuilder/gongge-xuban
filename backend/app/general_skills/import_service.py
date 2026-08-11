@@ -21,6 +21,7 @@ from typing import Any
 from urllib.parse import urlsplit
 from zipfile import ZIP_DEFLATED, ZipFile
 
+from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
@@ -29,6 +30,7 @@ from app.db.models import (
     GeneralSkill,
     GeneralSkillDependency,
     GeneralSkillImportJob,
+    GeneralSkillImportQuota,
     GeneralSkillRevision,
     User,
     utc_now,
@@ -67,6 +69,10 @@ from app.security.tenant import ensure_tenant
 
 
 SLUG_INVALID = re.compile(r"[^a-z0-9]+")
+TENANT_ACTIVE_IMPORT_LIMIT = 4
+USER_ACTIVE_IMPORT_LIMIT = 2
+TENANT_STAGED_BYTE_LIMIT = 500 * 1024 * 1024
+USER_STAGED_BYTE_LIMIT = 100 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +147,7 @@ class GeneralSkillImportService:
                     409,
                 )
             return import_job_read(existing)
+        self._reserve_import_quota(request.tenant_id, current_user.id)
         now = utc_now()
         job = GeneralSkillImportJob(
             tenant_id=request.tenant_id,
@@ -172,6 +179,11 @@ class GeneralSkillImportService:
             return import_job_read(job)
         except SkillObjectStoreError as exc:
             self._fail_job(job, "GENERAL_SKILL_STORAGE_UNAVAILABLE", str(exc))
+            return import_job_read(job)
+        except GeneralSkillImportError as exc:
+            if exc.error_code != "GENERAL_SKILL_QUOTA_EXCEEDED":
+                raise
+            self._fail_job(job, exc.error_code, str(exc))
             return import_job_read(job)
 
     def create_job(
@@ -223,7 +235,7 @@ class GeneralSkillImportService:
         except GeneralSkillLifecycleError as exc:
             raise _state_conflict(exc) from exc
         self.object_store.release_staging(job.id)
-        job.quota_bytes = 0
+        self._release_import_quota(job)
         self.db.add(job)
         self.db.commit()
         self.db.refresh(job)
@@ -245,8 +257,15 @@ class GeneralSkillImportService:
             job.target_agent_id,
             current_user,
         )
+        confirmation_checksum = _confirmation_request_checksum(request)
         if job.status == ImportJobStatus.INSTALLED:
-            return import_job_read(job)
+            if job.preview_json.get("confirmation_request_checksum") == confirmation_checksum:
+                return import_job_read(job)
+            raise GeneralSkillImportError(
+                "GENERAL_SKILL_STATE_CONFLICT",
+                "installed import cannot be replayed with a different confirmation",
+                409,
+            )
         if job.status != ImportJobStatus.AWAITING_APPROVAL:
             raise GeneralSkillImportError(
                 "GENERAL_SKILL_STATE_CONFLICT", "import job is not awaiting approval", 409
@@ -275,11 +294,11 @@ class GeneralSkillImportService:
             request.dependency_decisions,
         )
         try:
-            transition_import_job(
-                job,
-                ImportJobStatus.CONFIRMING,
-                expected_row_version=request.expected_row_version,
-            )
+            self._claim_confirmation(job, expected_row_version=request.expected_row_version)
+            job.preview_json = {
+                **job.preview_json,
+                "confirmation_request_checksum": confirmation_checksum,
+            }
             installed = {
                 candidate_id: self._install_candidate(
                     job,
@@ -302,13 +321,20 @@ class GeneralSkillImportService:
             )
             job.installed_revision_ids_json = revision_ids
             self.object_store.release_staging(job.id)
-            job.quota_bytes = 0
+            self._release_import_quota(job)
             self.db.add(job)
             self.db.commit()
         except GeneralSkillLifecycleError as exc:
             self.db.rollback()
             raise _state_conflict(exc) from exc
-        except (IntegrityError, SkillObjectStoreError) as exc:
+        except IntegrityError as exc:
+            self.db.rollback()
+            raise GeneralSkillImportError(
+                "GENERAL_SKILL_STATE_CONFLICT",
+                "confirmation conflicted with another committed write",
+                409,
+            ) from exc
+        except SkillObjectStoreError as exc:
             self.db.rollback()
             raise GeneralSkillImportError(
                 "GENERAL_SKILL_STORAGE_UNAVAILABLE",
@@ -317,6 +343,34 @@ class GeneralSkillImportService:
             ) from exc
         self.db.refresh(job)
         return import_job_read(job)
+
+    def _claim_confirmation(
+        self,
+        job: GeneralSkillImportJob,
+        *,
+        expected_row_version: int,
+    ) -> None:
+        """用数据库条件更新抢占 confirm，确保多进程中只有一个写者进入安装事务。"""
+
+        result = self.db.exec(
+            update(GeneralSkillImportJob)
+            .where(
+                GeneralSkillImportJob.id == job.id,
+                GeneralSkillImportJob.status == ImportJobStatus.AWAITING_APPROVAL.value,
+                GeneralSkillImportJob.row_version == expected_row_version,
+            )
+            .values(
+                status=ImportJobStatus.CONFIRMING.value,
+                row_version=GeneralSkillImportJob.row_version + 1,
+                updated_at=utc_now(),
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if result.rowcount != 1:
+            self.db.rollback()
+            raise GeneralSkillLifecycleError("import confirmation was already claimed")
+        self.db.expire(job)
+        self.db.refresh(job)
 
     def _checkpoint_raw_payload(
         self,
@@ -338,7 +392,7 @@ class GeneralSkillImportService:
                 "media_type": "application/zip",
             }
         ]
-        job.quota_bytes = len(payload)
+        self._adjust_import_quota(job, len(payload))
         transition_import_job(job, ImportJobStatus.FETCHED, expected_row_version=job.row_version)
         self.db.add(job)
         self.db.commit()
@@ -389,7 +443,10 @@ class GeneralSkillImportService:
             }
             for resource in sorted(unique_resources.values(), key=lambda item: item.content_checksum)
         ]
-        job.quota_bytes = sum(int(item.get("size", 0)) for item in raw_entries) + package.expanded_bytes
+        self._adjust_import_quota(
+            job,
+            sum(int(item.get("size", 0)) for item in raw_entries) + package.expanded_bytes,
+        )
         transition_import_job(
             job,
             ImportJobStatus.AWAITING_APPROVAL,
@@ -457,6 +514,7 @@ class GeneralSkillImportService:
                     409,
                 )
             return import_job_read(existing)
+        self._reserve_import_quota(request.tenant_id, current_user.id)
         now = utc_now()
         job = GeneralSkillImportJob(
             tenant_id=request.tenant_id,
@@ -495,6 +553,11 @@ class GeneralSkillImportService:
             return import_job_read(job)
         except SkillObjectStoreError as exc:
             self._fail_job(job, "GENERAL_SKILL_STORAGE_UNAVAILABLE", str(exc))
+            return import_job_read(job)
+        except GeneralSkillImportError as exc:
+            if exc.error_code != "GENERAL_SKILL_QUOTA_EXCEEDED":
+                raise
+            self._fail_job(job, exc.error_code, str(exc))
             return import_job_read(job)
 
     def recover_stale_jobs(
@@ -581,7 +644,7 @@ class GeneralSkillImportService:
                 error_detail_redacted="import approval window expired",
             )
             self.object_store.release_staging(job.id)
-            job.quota_bytes = 0
+            self._release_import_quota(job)
             self.db.add(job)
             self.db.commit()
             self.db.refresh(job)
@@ -599,10 +662,139 @@ class GeneralSkillImportService:
             error_detail_redacted=detail,
         )
         self.object_store.release_staging(job.id)
-        job.quota_bytes = 0
+        self._release_import_quota(job)
         self.db.add(job)
         self.db.commit()
         self.db.refresh(job)
+
+    def _reserve_import_quota(self, tenant_id: str, owner_user_id: str) -> None:
+        """以条件更新同时预留 tenant/user 活动作业名额，任一级失败则整体回滚。"""
+
+        scopes = (
+            ("tenant", tenant_id, TENANT_ACTIVE_IMPORT_LIMIT),
+            ("user", owner_user_id, USER_ACTIVE_IMPORT_LIMIT),
+        )
+        for scope_kind, scope_id, _ in scopes:
+            self._ensure_quota_row(tenant_id, scope_kind, scope_id)
+        for scope_kind, scope_id, active_limit in scopes:
+            result = self.db.exec(
+                update(GeneralSkillImportQuota)
+                .where(
+                    GeneralSkillImportQuota.tenant_id == tenant_id,
+                    GeneralSkillImportQuota.scope_kind == scope_kind,
+                    GeneralSkillImportQuota.scope_id == scope_id,
+                    GeneralSkillImportQuota.active_jobs < active_limit,
+                )
+                .values(
+                    active_jobs=GeneralSkillImportQuota.active_jobs + 1,
+                    row_version=GeneralSkillImportQuota.row_version + 1,
+                    updated_at=utc_now(),
+                )
+                .execution_options(synchronize_session=False)
+            )
+            if result.rowcount != 1:
+                self.db.rollback()
+                raise GeneralSkillImportError(
+                    "GENERAL_SKILL_QUOTA_EXCEEDED",
+                    f"{scope_kind} concurrent import limit exceeded",
+                    429,
+                )
+
+    def _ensure_quota_row(self, tenant_id: str, scope_kind: str, scope_id: str) -> None:
+        """幂等创建配额计数行；并发唯一冲突回滚后重新读取既有行。"""
+
+        existing = self.db.exec(
+            select(GeneralSkillImportQuota).where(
+                GeneralSkillImportQuota.tenant_id == tenant_id,
+                GeneralSkillImportQuota.scope_kind == scope_kind,
+                GeneralSkillImportQuota.scope_id == scope_id,
+            )
+        ).first()
+        if existing:
+            return
+        self.db.add(
+            GeneralSkillImportQuota(
+                tenant_id=tenant_id,
+                scope_kind=scope_kind,
+                scope_id=scope_id,
+            )
+        )
+        try:
+            self.db.commit()
+        except IntegrityError:
+            self.db.rollback()
+            if not self.db.exec(
+                select(GeneralSkillImportQuota.id).where(
+                    GeneralSkillImportQuota.tenant_id == tenant_id,
+                    GeneralSkillImportQuota.scope_kind == scope_kind,
+                    GeneralSkillImportQuota.scope_id == scope_id,
+                )
+            ).first():
+                raise
+
+    def _adjust_import_quota(self, job: GeneralSkillImportJob, new_bytes: int) -> None:
+        """原子调整两级暂存字节，正增量受硬上限约束且任一级失败全部回滚。"""
+
+        delta = new_bytes - job.quota_bytes
+        if delta == 0:
+            return
+        scopes = (
+            ("tenant", job.tenant_id, TENANT_STAGED_BYTE_LIMIT),
+            ("user", job.owner_user_id, USER_STAGED_BYTE_LIMIT),
+        )
+        for scope_kind, scope_id, byte_limit in scopes:
+            statement = update(GeneralSkillImportQuota).where(
+                GeneralSkillImportQuota.tenant_id == job.tenant_id,
+                GeneralSkillImportQuota.scope_kind == scope_kind,
+                GeneralSkillImportQuota.scope_id == scope_id,
+                GeneralSkillImportQuota.staged_bytes + delta >= 0,
+            )
+            if delta > 0:
+                statement = statement.where(
+                    GeneralSkillImportQuota.staged_bytes + delta <= byte_limit
+                )
+            result = self.db.exec(
+                statement.values(
+                    staged_bytes=GeneralSkillImportQuota.staged_bytes + delta,
+                    row_version=GeneralSkillImportQuota.row_version + 1,
+                    updated_at=utc_now(),
+                ).execution_options(synchronize_session=False)
+            )
+            if result.rowcount != 1:
+                self.db.rollback()
+                self.db.refresh(job)
+                raise GeneralSkillImportError(
+                    "GENERAL_SKILL_QUOTA_EXCEEDED",
+                    f"{scope_kind} staged byte limit exceeded",
+                    429,
+                )
+        job.quota_bytes = new_bytes
+
+    def _release_import_quota(self, job: GeneralSkillImportJob) -> None:
+        """在作业终止事务中同时归还两级活跃名额和其当前暂存字节。"""
+
+        scopes = (("tenant", job.tenant_id), ("user", job.owner_user_id))
+        for scope_kind, scope_id in scopes:
+            result = self.db.exec(
+                update(GeneralSkillImportQuota)
+                .where(
+                    GeneralSkillImportQuota.tenant_id == job.tenant_id,
+                    GeneralSkillImportQuota.scope_kind == scope_kind,
+                    GeneralSkillImportQuota.scope_id == scope_id,
+                    GeneralSkillImportQuota.active_jobs > 0,
+                    GeneralSkillImportQuota.staged_bytes >= job.quota_bytes,
+                )
+                .values(
+                    active_jobs=GeneralSkillImportQuota.active_jobs - 1,
+                    staged_bytes=GeneralSkillImportQuota.staged_bytes - job.quota_bytes,
+                    row_version=GeneralSkillImportQuota.row_version + 1,
+                    updated_at=utc_now(),
+                )
+                .execution_options(synchronize_session=False)
+            )
+            if result.rowcount != 1:
+                raise SkillObjectStoreError("import quota reservation is inconsistent")
+        job.quota_bytes = 0
 
     def _owned_job(self, job_id: str, current_user: User) -> GeneralSkillImportJob:
         """按当前用户 tenant 和 owner 同时定位作业，越权统一表现为不可用。"""
@@ -947,6 +1139,27 @@ def _canonical_checksum(value: object) -> str:
         separators=(",", ":"),
     ).encode()
     return hashlib.sha256(payload).hexdigest()
+
+
+def _confirmation_request_checksum(request: GeneralSkillImportConfirm) -> str:
+    """规范化 confirm 的语义集合，使同内容重放成功而不同裁决稳定冲突。"""
+
+    return _canonical_checksum(
+        {
+            "preview_checksum": request.preview_checksum,
+            "candidate_ids": sorted(request.candidate_ids),
+            "dependency_decisions": sorted(
+                (
+                    {
+                        "dependency_candidate_id": decision.dependency_candidate_id,
+                        "dependency_kind": decision.dependency_kind,
+                    }
+                    for decision in request.dependency_decisions
+                ),
+                key=lambda item: str(item["dependency_candidate_id"]),
+            ),
+        }
+    )
 
 
 def _state_conflict(exc: Exception) -> GeneralSkillImportError:

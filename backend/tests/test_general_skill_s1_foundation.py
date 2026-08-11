@@ -277,3 +277,59 @@ def test_0049_migration_refuses_downgrade_when_revision_exists(tmp_path) -> None
         )
     with pytest.raises(RuntimeError, match="general_skill_revisions"):
         command.downgrade(config, "20260811_0048")
+
+
+def test_0051_migration_backfills_active_import_quota_without_double_counting(tmp_path) -> None:
+    """验证升级窗口中的待确认作业会形成两级计数，迁移重入不会重复占额。"""
+
+    database_url = f"sqlite:///{tmp_path / 'skill-import-quota.db'}"
+    config = Config(str(BACKEND_DIR / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
+    config.attributes["database_url"] = database_url
+    engine = create_engine(database_url)
+    now = utc_now()
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)"))
+        connection.execute(text("INSERT INTO alembic_version VALUES ('20260812_0050')"))
+        connection.execute(
+            text(
+                "CREATE TABLE general_skill_import_jobs ("
+                "id VARCHAR PRIMARY KEY, tenant_id VARCHAR NOT NULL, "
+                "owner_user_id VARCHAR NOT NULL, target_agent_id VARCHAR NOT NULL, "
+                "source_kind VARCHAR NOT NULL, status VARCHAR NOT NULL, attempt INTEGER NOT NULL, "
+                "idempotency_key VARCHAR NOT NULL, quota_bytes INTEGER NOT NULL, "
+                "staging_manifest_json JSON NOT NULL, preview_json JSON NOT NULL, "
+                "installed_revision_ids_json JSON NOT NULL, row_version INTEGER NOT NULL, "
+                "expires_at DATETIME NOT NULL, created_at DATETIME NOT NULL, "
+                "updated_at DATETIME NOT NULL)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO general_skill_import_jobs "
+                "(id, tenant_id, owner_user_id, target_agent_id, source_kind, status, attempt, "
+                "idempotency_key, quota_bytes, staging_manifest_json, preview_json, "
+                "installed_revision_ids_json, row_version, expires_at, created_at, updated_at) "
+                "VALUES ('gsjob_backfill0001', 'tenant_a', 'user_a', 'agent_a', 'upload', "
+                "'awaiting_approval', 1, 'quota-backfill-001', 321, '[]', '{}', '[]', 7, "
+                ":expires_at, :created_at, :updated_at)"
+            ),
+            {
+                "expires_at": now + timedelta(hours=1),
+                "created_at": now,
+                "updated_at": now,
+            },
+        )
+    command.upgrade(config, "20260812_0051")
+    command.upgrade(config, "20260812_0051")
+    with engine.connect() as connection:
+        rows = connection.execute(
+            text(
+                "SELECT scope_kind, scope_id, active_jobs, staged_bytes "
+                "FROM general_skill_import_quotas ORDER BY scope_kind"
+            )
+        ).all()
+    assert rows == [
+        ("tenant", "tenant_a", 1, 321),
+        ("user", "user_a", 1, 321),
+    ]
