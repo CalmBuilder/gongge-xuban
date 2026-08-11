@@ -24,6 +24,7 @@ from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
+from app.audit.service import append_management_audit
 from app.db.models import (
     AgentResourceBinding,
     GeneralSkill,
@@ -167,6 +168,7 @@ class GeneralSkillImportService:
             updated_at=now,
         )
         self.db.add(job)
+        self._append_job_audit(job, "created", "success")
         try:
             self.db.commit()
         except IntegrityError as exc:
@@ -242,6 +244,7 @@ class GeneralSkillImportService:
         self.object_store.release_staging(job.id)
         self._release_import_quota(job)
         self.db.add(job)
+        self._append_job_audit(job, "cancelled", "success")
         self.db.commit()
         self.db.refresh(job)
         return import_job_read(job)
@@ -328,6 +331,12 @@ class GeneralSkillImportService:
             self.object_store.release_staging(job.id)
             self._release_import_quota(job)
             self.db.add(job)
+            self._append_job_audit(
+                job,
+                "installed",
+                "success",
+                detail={"revision_ids": revision_ids},
+            )
             self.db.commit()
         except GeneralSkillLifecycleError as exc:
             self.db.rollback()
@@ -400,6 +409,12 @@ class GeneralSkillImportService:
         self._adjust_import_quota(job, len(payload))
         transition_import_job(job, ImportJobStatus.FETCHED, expected_row_version=job.row_version)
         self.db.add(job)
+        self._append_job_audit(
+            job,
+            "fetched",
+            "success",
+            detail={"raw_checksum": raw_checksum, "quota_bytes": job.quota_bytes},
+        )
         self.db.commit()
         self.db.refresh(job)
 
@@ -458,6 +473,16 @@ class GeneralSkillImportService:
             expected_row_version=job.row_version,
         )
         self.db.add(job)
+        self._append_job_audit(
+            job,
+            "awaiting_approval",
+            "success",
+            detail={
+                "normalized_checksum": job.normalized_checksum,
+                "preview_checksum": job.preview_checksum,
+                "candidate_count": len(candidates),
+            },
+        )
         self.db.commit()
         self.db.refresh(job)
         return import_job_read(job)
@@ -561,6 +586,7 @@ class GeneralSkillImportService:
         )
         self.db.add(job)
         try:
+            self._append_job_audit(job, "created", "success")
             self.db.commit()
             transition_import_job(job, ImportJobStatus.FETCHING, expected_row_version=job.row_version)
             self.db.add(job)
@@ -674,6 +700,12 @@ class GeneralSkillImportService:
             self.object_store.release_staging(job.id)
             self._release_import_quota(job)
             self.db.add(job)
+            self._append_job_audit(
+                job,
+                "expired",
+                "failure",
+                detail={"error_code": "GENERAL_SKILL_IMPORT_EXPIRED"},
+            )
             self.db.commit()
             self.db.refresh(job)
             expired.append(import_job_read(job))
@@ -692,8 +724,43 @@ class GeneralSkillImportService:
         self.object_store.release_staging(job.id)
         self._release_import_quota(job)
         self.db.add(job)
+        self._append_job_audit(
+            job,
+            "failed",
+            "failure",
+            detail={"error_code": error_code},
+        )
         self.db.commit()
         self.db.refresh(job)
+
+    def _append_job_audit(
+        self,
+        job: GeneralSkillImportJob,
+        status_name: str,
+        outcome: str,
+        *,
+        detail: dict[str, object] | None = None,
+    ) -> None:
+        """在当前业务事务追加不含正文、URL query 或凭据的导入状态审计。"""
+
+        append_management_audit(
+            self.db,
+            tenant_id=job.tenant_id,
+            actor_user_id=job.owner_user_id,
+            actor_display_name=None,
+            actor_type="user",
+            action=f"general_skill_import_{status_name}",
+            action_kind="skill_import",
+            outcome=outcome,
+            resource_type="general_skill_import_job",
+            resource_id=job.id,
+            correlation_id=job.id,
+            detail={
+                "status": status_name,
+                "source_kind": job.source_kind,
+                **(detail or {}),
+            },
+        )
 
     def _reserve_import_quota(self, tenant_id: str, owner_user_id: str) -> None:
         """以条件更新同时预留 tenant/user 活动作业名额，任一级失败则整体回滚。"""

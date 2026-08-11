@@ -104,14 +104,22 @@ class SecureHttpsFetcher:
         for redirect_count in range(self.max_redirects + 1):
             parsed = _validated_https_url(current, allowed_hosts)
             host = parsed.hostname or ""
-            addresses = self.resolver(host, 443)
-            public_addresses = _validated_public_addresses(addresses)
-            response = self.exchange(
-                current,
-                public_addresses[0],
-                self.max_bytes,
-                self.timeout_seconds,
-            )
+            try:
+                addresses = self.resolver(host, 443)
+                public_addresses = _validated_public_addresses(addresses)
+                response = self.exchange(
+                    current,
+                    public_addresses[0],
+                    self.max_bytes,
+                    self.timeout_seconds,
+                )
+            except GeneralSkillRemoteSourceError:
+                raise
+            except (OSError, TimeoutError, ssl.SSLError, http.client.HTTPException, ValueError) as exc:
+                raise GeneralSkillRemoteSourceError(
+                    "GENERAL_SKILL_PACKAGE_INVALID",
+                    "remote source request failed or timed out",
+                ) from exc
             if response.status in REDIRECT_STATUSES:
                 location = response.headers.get("location")
                 if not location:

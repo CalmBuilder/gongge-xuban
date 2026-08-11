@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 from collections import deque
+import ssl
 
 import pytest
 
@@ -183,3 +184,29 @@ def test_fetcher_preserves_explicit_download_budget_for_exchange() -> None:
     assert exchange.calls == [
         ("https://packages.example.com/archive.zip", "8.8.8.8", 1234, 17)
     ]
+
+
+@pytest.mark.parametrize("failure", [TimeoutError("late"), ssl.SSLError("bad certificate")])
+def test_fetcher_converts_transport_failures_to_redacted_domain_error(failure: Exception) -> None:
+    """验证超时/TLS 异常不会穿透为 500 或携带底层连接目标。"""
+
+    def failing_exchange(
+        _source_url: str,
+        _address: str,
+        _max_bytes: int,
+        _timeout_seconds: float,
+    ) -> _ExchangeResult:
+        """模拟供应商网络在 socket/TLS 阶段失败。"""
+
+        raise failure
+
+    fetcher = SecureHttpsFetcher(
+        resolver=lambda _host, _port: ("8.8.8.8",),
+        exchange=failing_exchange,
+    )
+    with pytest.raises(GeneralSkillRemoteSourceError) as captured:
+        fetcher.fetch("https://packages.example.com/archive.zip?token=never-log")
+
+    assert captured.value.error_code == "GENERAL_SKILL_PACKAGE_INVALID"
+    assert str(captured.value) == "remote source request failed or timed out"
+    assert "never-log" not in str(captured.value)

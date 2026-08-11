@@ -9,9 +9,11 @@
 from __future__ import annotations
 
 import base64
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from io import BytesIO
 from pathlib import Path
+from threading import Barrier
 from zipfile import ZipFile
 
 import pytest
@@ -26,6 +28,7 @@ from app.db.models import (
     GeneralSkillImportJob,
     GeneralSkillImportQuota,
     GeneralSkillRevision,
+    ManagementAuditLog,
     Tenant,
     User,
     utc_now,
@@ -244,12 +247,28 @@ def test_confirm_creates_published_revision_and_default_pinned_private_binding(t
         older_than=utc_now() + timedelta(seconds=1),
     ) == []
     assert not (tmp_path / "staging" / preview.id).exists()
+    audit_rows = db.exec(
+        select(ManagementAuditLog)
+        .where(ManagementAuditLog.resource_id == preview.id)
+        .order_by(ManagementAuditLog.created_at, ManagementAuditLog.id)
+    ).all()
+    assert {row.action for row in audit_rows} == {
+        "general_skill_import_created",
+        "general_skill_import_fetched",
+        "general_skill_import_awaiting_approval",
+        "general_skill_import_installed",
+    }
+    installed_audit = next(
+        row for row in audit_rows if row.action == "general_skill_import_installed"
+    )
+    assert installed_audit.detail_json["revision_ids"] == [revision.id]
+    assert installed_audit.correlation_id == preview.id
 
 
 def test_single_skill_markdown_uses_the_same_secure_preview_pipeline(tmp_path) -> None:
     """验证直接上传 SKILL.md 会封装后进入 ZIP 规范化器，而非走宽松旁路。"""
 
-    _, service, owner, _ = _context(tmp_path)
+    db, service, owner, _ = _context(tmp_path)
     manifest = b"---\nname: direct-skill\ndescription: Direct import\n---\nDo the work safely.\n"
     result = service.create_upload_job(
         GeneralSkillImportJobCreate(
@@ -625,6 +644,90 @@ def test_create_is_idempotent_and_rejects_same_key_for_different_content(tmp_pat
     assert captured.value.error_code == "GENERAL_SKILL_STATE_CONFLICT"
 
 
+def test_concurrent_confirm_has_one_physical_install_and_idempotent_replay(tmp_path) -> None:
+    """验证两个独立 SQLite Session 同时确认时只写一组 revision/binding，另一请求可安全重放。"""
+
+    database_path = tmp_path / "confirm-concurrency.db"
+    engine = create_engine(
+        f"sqlite:///{database_path}",
+        connect_args={"check_same_thread": False, "timeout": 10},
+    )
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as setup_db:
+        owner = User(
+            id="concurrent_owner",
+            tenant_id="tenant_concurrent",
+            username="concurrent-owner",
+            role="member",
+            password_hash="unused",
+        )
+        setup_db.add(Tenant(id="tenant_concurrent", name="Concurrent Tenant"))
+        setup_db.add(owner)
+        setup_db.add(
+            AgentProfile(
+                id="agent_concurrent",
+                tenant_id="tenant_concurrent",
+                name="并发验收员工",
+                owner_user_id=owner.id,
+            )
+        )
+        setup_db.commit()
+        preview = GeneralSkillImportService(
+            setup_db,
+            FileSystemSkillObjectStore(tmp_path / "objects"),
+        ).create_upload_job(
+            GeneralSkillImportJobCreate(
+                tenant_id="tenant_concurrent",
+                target_agent_id="agent_concurrent",
+                source_kind="upload",
+                filename="concurrent.zip",
+                content_base64=base64.b64encode(_package("concurrent-skill")).decode(),
+            ),
+            idempotency_key="concurrent-confirm-001",
+            current_user=owner,
+        )
+    request = GeneralSkillImportConfirm(
+        preview_checksum=preview.preview_checksum or "",
+        candidate_ids=[preview.candidates[0].candidate_id],
+        expected_row_version=preview.row_version,
+    )
+    barrier = Barrier(2)
+
+    def confirm_from_independent_session() -> tuple[str, str]:
+        """等待两个 worker 同时起跑，并返回成功状态或稳定领域错误码。"""
+
+        with Session(engine) as worker_db:
+            worker_owner = worker_db.get(User, "concurrent_owner")
+            assert worker_owner is not None
+            service = GeneralSkillImportService(
+                worker_db,
+                FileSystemSkillObjectStore(tmp_path / "objects"),
+            )
+            barrier.wait(timeout=5)
+            try:
+                result = service.confirm_job(
+                    preview.id,
+                    request,
+                    current_user=worker_owner,
+                )
+                return "success", result.status
+            except GeneralSkillImportError as exc:
+                return "error", exc.error_code
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(lambda _index: confirm_from_independent_session(), range(2)))
+
+    assert all(outcome in {("success", "installed"), ("error", "GENERAL_SKILL_STATE_CONFLICT")} for outcome in outcomes)
+    assert any(outcome == ("success", "installed") for outcome in outcomes)
+    with Session(engine) as verify_db:
+        assert len(verify_db.exec(select(GeneralSkillRevision)).all()) == 1
+        assert len(verify_db.exec(select(AgentResourceBinding)).all()) == 1
+        installed_job = verify_db.get(GeneralSkillImportJob, preview.id)
+        assert installed_job is not None
+        assert installed_job.status == "installed"
+    engine.dispose()
+
+
 def test_preview_checksum_mismatch_keeps_job_uninstalled(tmp_path) -> None:
     """验证未经本次预览审核的 checksum 不能安装任何修订或绑定。"""
 
@@ -773,7 +876,7 @@ def test_cancel_releases_staging_and_is_idempotent(tmp_path) -> None:
 def test_github_source_uses_full_revision_and_shared_preview_pipeline(tmp_path) -> None:
     """验证 GitHub repo 被转换为固定 commit 归档并产生与上传一致的候选预览。"""
 
-    _, service, owner, _ = _context(tmp_path)
+    db, service, owner, _ = _context(tmp_path)
     revision = "84fdeffd12f2ee307994d1eb6feb48173b6e0502"
     fetcher = _RemoteFetcherStub(_repository_package("tdd"))
     request = GeneralSkillImportJobCreate(
@@ -799,6 +902,7 @@ def test_github_source_uses_full_revision_and_shared_preview_pipeline(tmp_path) 
         f"https://github.com/mattpocock/skills/archive/{revision}.zip"
     )
     assert "must-not-persist" not in str(result.model_dump(mode="json"))
+    assert "must-not-persist" not in str(db.exec(select(ManagementAuditLog)).all())
 
 
 def test_skillhub_slug_uses_vendor_allowlist_and_shared_preview_pipeline(tmp_path) -> None:
