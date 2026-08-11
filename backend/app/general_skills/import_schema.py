@@ -13,6 +13,13 @@ from typing import Literal
 from pydantic import BaseModel, Field, model_validator
 
 
+class GeneralSkillUploadFile(BaseModel):
+    """表达浏览器文件夹选择产生的相对路径和严格 base64 正文。"""
+
+    path: str = Field(min_length=1, max_length=1024)
+    content_base64: str
+
+
 class GeneralSkillImportJobCreate(BaseModel):
     """创建上传、固定 GitHub revision 或公开 HTTPS ZIP 导入作业。"""
 
@@ -21,6 +28,7 @@ class GeneralSkillImportJobCreate(BaseModel):
     source_kind: Literal["upload", "github", "https"] = "upload"
     filename: str | None = Field(default=None, min_length=1, max_length=255)
     content_base64: str | None = Field(default=None, min_length=1)
+    files: list[GeneralSkillUploadFile] | None = Field(default=None, min_length=1, max_length=240)
     source_url: str | None = Field(default=None, min_length=1, max_length=2048)
     revision: str | None = Field(default=None, pattern=r"^[a-fA-F0-9]{40}$")
     source_subpath: str | None = Field(default=None, min_length=1, max_length=512)
@@ -30,16 +38,18 @@ class GeneralSkillImportJobCreate(BaseModel):
         """要求上传正文与远程 URL 互斥，GitHub 额外固定完整 commit。"""
 
         if self.source_kind == "upload":
+            has_archive = self.content_base64 is not None
+            has_files = self.files is not None
             if (
                 not self.filename
-                or not self.content_base64
+                or has_archive == has_files
                 or self.source_url
                 or self.revision
                 or self.source_subpath
             ):
                 raise ValueError("GENERAL_SKILL_UPLOAD_SOURCE_INVALID")
             return self
-        if self.filename or self.content_base64 or not self.source_url:
+        if self.filename or self.content_base64 or self.files or not self.source_url:
             raise ValueError("GENERAL_SKILL_REMOTE_SOURCE_INVALID")
         if self.source_kind == "github" and (not self.revision or not self.source_subpath):
             raise ValueError("GENERAL_SKILL_GITHUB_REVISION_AND_SUBPATH_REQUIRED")

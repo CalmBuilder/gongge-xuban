@@ -30,7 +30,11 @@ from app.db.models import (
     utc_now,
 )
 from app.general_skills import import_service as import_service_module
-from app.general_skills.import_schema import GeneralSkillImportConfirm, GeneralSkillImportJobCreate
+from app.general_skills.import_schema import (
+    GeneralSkillImportConfirm,
+    GeneralSkillImportJobCreate,
+    GeneralSkillUploadFile,
+)
 from app.general_skills.import_service import GeneralSkillImportError, GeneralSkillImportService
 from app.general_skills.object_store import FileSystemSkillObjectStore, SkillObjectStoreError
 from app.general_skills.remote_source import RemoteFetchResult
@@ -105,6 +109,23 @@ def _request(payload: bytes) -> GeneralSkillImportJobCreate:
         target_agent_id="agent_a",
         filename="skills.zip",
         content_base64=base64.b64encode(payload).decode(),
+    )
+
+
+def _folder_request(files: list[tuple[str, bytes]]) -> GeneralSkillImportJobCreate:
+    """构造浏览器文件夹上传使用的相对路径清单。"""
+
+    return GeneralSkillImportJobCreate(
+        tenant_id="tenant_a",
+        target_agent_id="agent_a",
+        filename="folder-upload",
+        files=[
+            GeneralSkillUploadFile(
+                path=path,
+                content_base64=base64.b64encode(content).decode(),
+            )
+            for path, content in files
+        ],
     )
 
 
@@ -395,6 +416,50 @@ def test_uncheckpointed_stale_job_fails_closed_and_expired_preview_releases_quot
     assert [item.status for item in expired] == ["expired"]
     assert expired[0].quota_bytes == 0
     assert not (tmp_path / "staging" / preview.id).exists()
+
+
+def test_folder_upload_reuses_normalizer_and_preserves_empty_resources(tmp_path) -> None:
+    """验证完整文件夹无需客户端打 ZIP，仍复用候选发现与严格资源规范化。"""
+
+    _db, service, owner, _ = _context(tmp_path)
+    preview = service.create_upload_job(
+        _folder_request(
+            [
+                (
+                    "folder-skill/SKILL.md",
+                    b"---\nname: folder-skill\ndescription: imported folder\n---\n# Folder\n",
+                ),
+                ("folder-skill/references/empty.md", b""),
+            ]
+        ),
+        idempotency_key="upload-folder-001",
+        current_user=owner,
+    )
+    assert preview.status == "awaiting_approval"
+    assert preview.candidates[0].name == "folder-skill"
+    assert [item["relative_path"] for item in preview.candidates[0].resources] == [
+        "SKILL.md",
+        "references/empty.md",
+    ]
+
+
+def test_folder_upload_unsafe_relative_path_fails_entire_job(tmp_path) -> None:
+    """验证文件夹来源不能借相对路径绕过 ZIP 路径穿越门禁。"""
+
+    db, service, owner, _ = _context(tmp_path)
+    result = service.create_upload_job(
+        _folder_request(
+            [
+                ("safe/SKILL.md", b"---\nname: safe\ndescription: safe\n---\n"),
+                ("../outside.txt", b"unsafe"),
+            ]
+        ),
+        idempotency_key="upload-folder-unsafe-001",
+        current_user=owner,
+    )
+    assert result.status == "failed"
+    assert result.error_code == "GENERAL_SKILL_PACKAGE_INVALID"
+    assert db.exec(select(GeneralSkill)).all() == []
 
 
 def test_create_is_idempotent_and_rejects_same_key_for_different_content(tmp_path) -> None:

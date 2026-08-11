@@ -5,11 +5,12 @@ import { expect, it, vi } from 'vitest';
 import { I18nProvider } from '../i18n';
 import { SecureSkillImportDialog } from './GeneralSkillsPage';
 
-function renderDialog() {
+function renderDialog(sourceKind: 'upload' | 'folder' | 'github' | 'https' = 'github') {
   /** 用受控属性渲染安全导入对话框，隔离验证来源契约和无障碍名称。 */
 
   const callbacks = {
     onFileChange: vi.fn(),
+    onFolderFilesChange: vi.fn(),
     onSourceKindChange: vi.fn(),
     onSourceUrlChange: vi.fn(),
     onRevisionChange: vi.fn(),
@@ -25,8 +26,9 @@ function renderDialog() {
       <SecureSkillImportDialog
         open
         loading={false}
-        sourceKind="github"
+        sourceKind={sourceKind}
         file={null}
+        folderFiles={[]}
         sourceUrl="https://github.com/mattpocock/skills"
         revision=""
         sourceSubpath="skills"
@@ -72,4 +74,14 @@ it('switches source adapters without hiding the fail-closed network explanation'
   expect(callbacks.onSourceKindChange).toHaveBeenCalledWith('https');
   await user.click(screen.getByRole('tab', { name: '上传 ZIP' }));
   expect(callbacks.onSourceKindChange).toHaveBeenCalledWith('upload');
+});
+
+it('offers a directory picker that uses the same fail-closed preview action', () => {
+  /** 验证文件夹不是旧编辑器旁路，而是安全导入对话框中的明确来源适配器。 */
+
+  renderDialog('folder');
+  expect(screen.getByText('选择完整 Skill 文件夹')).toBeVisible();
+  expect(document.querySelector('input[webkitdirectory]')).toBeInstanceOf(HTMLInputElement);
+  expect(screen.getByRole('button', { name: '生成安全预览' })).toBeDisabled();
+  expect(screen.getByText(/ZIP 与文件夹共用完整检查/)).toBeVisible();
 });

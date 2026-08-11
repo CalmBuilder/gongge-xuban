@@ -15,9 +15,11 @@ import json
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from io import BytesIO
 from pathlib import PurePath
 from typing import Any
 from urllib.parse import urlsplit
+from zipfile import ZIP_DEFLATED, ZipFile
 
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
@@ -37,6 +39,7 @@ from app.general_skills.import_schema import (
     GeneralSkillImportConfirm,
     GeneralSkillImportJobCreate,
     GeneralSkillImportJobRead,
+    GeneralSkillUploadFile,
 )
 from app.general_skills.lifecycle import (
     GeneralSkillLifecycleError,
@@ -112,11 +115,15 @@ class GeneralSkillImportService:
             current_user,
         )
         key = _validated_idempotency_key(idempotency_key)
-        if request.content_base64 is None or request.filename is None:
+        if request.filename is None:
             raise GeneralSkillImportError(
                 "GENERAL_SKILL_PACKAGE_INVALID", "upload source is incomplete", 400
             )
-        payload = _decode_base64(request.content_base64)
+        payload = (
+            _decode_base64(request.content_base64)
+            if request.content_base64 is not None
+            else _build_folder_archive(request.files or [])
+        )
         raw_checksum = hashlib.sha256(payload).hexdigest()
         existing = self.db.exec(
             select(GeneralSkillImportJob).where(
@@ -849,7 +856,7 @@ def _candidate_preview(candidate: SkillCandidate) -> dict[str, object]:
     }
 
 
-def _decode_base64(value: str) -> bytes:
+def _decode_base64(value: str, *, allow_empty: bool = False) -> bytes:
     """严格解码上传正文，拒绝非 base64 字符和空包。"""
 
     try:
@@ -858,11 +865,38 @@ def _decode_base64(value: str) -> bytes:
         raise GeneralSkillImportError(
             "GENERAL_SKILL_PACKAGE_INVALID", "upload content is not valid base64", 400
         ) from exc
-    if not payload:
+    if not payload and not allow_empty:
         raise GeneralSkillImportError(
             "GENERAL_SKILL_PACKAGE_INVALID", "upload package is empty", 400
         )
     return payload
+
+
+def _build_folder_archive(files: list[GeneralSkillUploadFile]) -> bytes:
+    """把文件夹相对路径清单重建为内存 ZIP，再交给唯一安全规范化入口。"""
+
+    if not files or len(files) > 240:
+        raise GeneralSkillImportError(
+            "GENERAL_SKILL_PACKAGE_LIMIT_EXCEEDED", "folder file count is invalid", 413
+        )
+    decoded: list[tuple[str, bytes]] = []
+    expanded_bytes = 0
+    for item in files:
+        path = str(item.path)
+        content = _decode_base64(str(item.content_base64), allow_empty=True)
+        expanded_bytes += len(content)
+        if expanded_bytes > 80 * 1024 * 1024:
+            raise GeneralSkillImportError(
+                "GENERAL_SKILL_PACKAGE_LIMIT_EXCEEDED",
+                "folder expanded size exceeds configured byte limit",
+                413,
+            )
+        decoded.append((path, content))
+    buffer = BytesIO()
+    with ZipFile(buffer, "w", ZIP_DEFLATED) as archive:
+        for path, content in decoded:
+            archive.writestr(path, content)
+    return buffer.getvalue()
 
 
 def _validated_idempotency_key(value: str) -> str:

@@ -201,6 +201,7 @@ type DroppedSkillFile = {
 
 type GeneralSkillImportMode = 'plaza' | 'employee';
 type SkillDependencyDecision = 'required' | 'optional' | 'ignored';
+type SecureSkillImportSourceKind = 'upload' | 'folder' | 'github' | 'https';
 
 type SkillFileSystemEntry = {
   name: string;
@@ -347,8 +348,9 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
   const [deleting, setDeleting] = useState(false);
   const [secureImportAvailable, setSecureImportAvailable] = useState(false);
   const [secureImportOpen, setSecureImportOpen] = useState(false);
-  const [secureImportSourceKind, setSecureImportSourceKind] = useState<'upload' | 'github' | 'https'>('upload');
+  const [secureImportSourceKind, setSecureImportSourceKind] = useState<SecureSkillImportSourceKind>('upload');
   const [secureImportFile, setSecureImportFile] = useState<File | null>(null);
+  const [secureImportFolderFiles, setSecureImportFolderFiles] = useState<File[]>([]);
   const [secureImportSourceUrl, setSecureImportSourceUrl] = useState('');
   const [secureImportRevision, setSecureImportRevision] = useState('');
   const [secureImportSubpath, setSecureImportSubpath] = useState('skills');
@@ -635,6 +637,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
   function requestSecurePackageImport() {
     setSecureImportSourceKind('upload');
     setSecureImportFile(null);
+    setSecureImportFolderFiles([]);
     setSecureImportSourceUrl('');
     setSecureImportRevision('');
     setSecureImportSubpath('skills');
@@ -653,7 +656,11 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
       notify.warning('请选择一个 ZIP Skill 包');
       return;
     }
-    if (secureImportSourceKind !== 'upload' && !secureImportSourceUrl.trim()) {
+    if (secureImportSourceKind === 'folder' && !secureImportFolderFiles.length) {
+      notify.warning('请选择一个包含 SKILL.md 的文件夹');
+      return;
+    }
+    if (!['upload', 'folder'].includes(secureImportSourceKind) && !secureImportSourceUrl.trim()) {
       notify.warning('请输入 HTTPS 来源地址');
       return;
     }
@@ -673,7 +680,16 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
             filename: secureImportFile.name,
             content_base64: await fileToBase64(secureImportFile),
           }
-        : {
+        : secureImportSourceKind === 'folder'
+          ? {
+              source_kind: 'upload',
+              filename: secureImportFolderFiles[0]?.webkitRelativePath.split('/')[0] || 'folder-upload',
+              files: await Promise.all(secureImportFolderFiles.map(async (file) => ({
+                path: file.webkitRelativePath || file.name,
+                content_base64: await fileToBase64(file),
+              }))),
+            }
+          : {
             source_kind: secureImportSourceKind,
             source_url: secureImportSourceUrl.trim(),
             revision: secureImportSourceKind === 'github' ? secureImportRevision.trim() : undefined,
@@ -1042,6 +1058,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
         loading={secureImportLoading}
         sourceKind={secureImportSourceKind}
         file={secureImportFile}
+        folderFiles={secureImportFolderFiles}
         sourceUrl={secureImportSourceUrl}
         revision={secureImportRevision}
         sourceSubpath={secureImportSubpath}
@@ -1050,6 +1067,11 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
         dependencyDecisions={secureImportDependencyDecisions}
         onFileChange={(file) => {
           setSecureImportFile(file);
+          setSecureImportJob(null);
+          setSecureImportSelectedIds([]);
+        }}
+        onFolderFilesChange={(files) => {
+          setSecureImportFolderFiles(files);
           setSecureImportJob(null);
           setSecureImportSelectedIds([]);
         }}
@@ -1191,6 +1213,7 @@ export function SecureSkillImportDialog({
   loading,
   sourceKind,
   file,
+  folderFiles,
   sourceUrl,
   revision,
   sourceSubpath,
@@ -1198,6 +1221,7 @@ export function SecureSkillImportDialog({
   selectedIds,
   dependencyDecisions,
   onFileChange,
+  onFolderFilesChange,
   onSourceKindChange,
   onSourceUrlChange,
   onRevisionChange,
@@ -1210,8 +1234,9 @@ export function SecureSkillImportDialog({
 }: {
   open: boolean;
   loading: boolean;
-  sourceKind: 'upload' | 'github' | 'https';
+  sourceKind: SecureSkillImportSourceKind;
   file: File | null;
+  folderFiles: File[];
   sourceUrl: string;
   revision: string;
   sourceSubpath: string;
@@ -1219,7 +1244,8 @@ export function SecureSkillImportDialog({
   selectedIds: string[];
   dependencyDecisions: Record<string, SkillDependencyDecision>;
   onFileChange: (file: File | null) => void;
-  onSourceKindChange: (kind: 'upload' | 'github' | 'https') => void;
+  onFolderFilesChange: (files: File[]) => void;
+  onSourceKindChange: (kind: SecureSkillImportSourceKind) => void;
   onSourceUrlChange: (value: string) => void;
   onRevisionChange: (value: string) => void;
   onSourceSubpathChange: (value: string) => void;
@@ -1280,9 +1306,10 @@ export function SecureSkillImportDialog({
         <div className="min-h-0 flex-1 overflow-y-auto px-[24px] py-[20px]">
           {!job ? (
             <div className="grid gap-4">
-              <div role="tablist" aria-label="Skill 来源" className="grid grid-cols-3 rounded-[11px] bg-[#f1f3f8] p-1">
+              <div role="tablist" aria-label="Skill 来源" className="grid grid-cols-2 rounded-[11px] bg-[#f1f3f8] p-1 sm:grid-cols-4">
                 {([
                   ['upload', '上传 ZIP'],
+                  ['folder', '选择文件夹'],
                   ['github', 'GitHub 固定版本'],
                   ['https', 'HTTPS ZIP'],
                 ] as const).map(([kind, label]) => (
@@ -1325,6 +1352,24 @@ export function SecureSkillImportDialog({
                     accept=".zip,application/zip"
                     disabled={loading}
                     onChange={(event) => onFileChange(event.target.files?.[0] || null)}
+                  />
+                </label>
+              ) : sourceKind === 'folder' ? (
+                <label className="flex min-h-[190px] cursor-pointer flex-col items-center justify-center rounded-[14px] border border-dashed border-[#bfc9dc] bg-[#fbfcff] px-6 text-center transition-colors hover:border-[var(--gg-cobalt)] hover:bg-[#f7f9ff] focus-within:ring-2 focus-within:ring-[#b9c8ff]">
+                  <IconFolder className="mb-3 size-8 text-[#5574dc]" />
+                  <strong className="text-[14px] font-semibold text-[#252936]">
+                    {folderFiles.length ? `已选择 ${folderFiles.length} 个文件` : '选择完整 Skill 文件夹'}
+                  </strong>
+                  <span className="mt-2 text-[12px] leading-[1.6] text-[#858b9c]">
+                    相对路径和全部文件会送入与 ZIP 相同的 fail-closed 检查；不会读取所选目录之外的内容。
+                  </span>
+                  <input
+                    className="sr-only"
+                    type="file"
+                    multiple
+                    {...FOLDER_INPUT_PROPS}
+                    disabled={loading}
+                    onChange={(event) => onFolderFilesChange(Array.from(event.target.files || []))}
                   />
                 </label>
               ) : (
@@ -1504,7 +1549,7 @@ export function SecureSkillImportDialog({
 
         <footer className="flex items-center justify-between gap-3 border-t border-[#e8ebf2] bg-white px-[24px] py-[16px]">
           <span className="text-[11px] text-[#858b9c]">
-            {hasPreview ? '默认固定本次修订；后续升级需再次审核。' : '只接受 ZIP；任一文件失败则整包拒绝。'}
+            {hasPreview ? '默认固定本次修订；后续升级需再次审核。' : 'ZIP 与文件夹共用完整检查；任一文件失败则整包拒绝。'}
           </span>
           <div className="flex items-center gap-2">
             <UIButton variant="outline" disabled={loading} onClick={onClose} className={RETURN_BUTTON_CLASS}>
@@ -1512,7 +1557,13 @@ export function SecureSkillImportDialog({
             </UIButton>
             {!job ? (
               <UIButton
-                disabled={loading || (sourceKind === 'upload' ? !file : !sourceUrl.trim())}
+                disabled={loading || (
+                  sourceKind === 'upload'
+                    ? !file
+                    : sourceKind === 'folder'
+                      ? folderFiles.length === 0
+                      : !sourceUrl.trim()
+                )}
                 onClick={onPreview}
                 className={PRIMARY_BUTTON_CLASS}
               >

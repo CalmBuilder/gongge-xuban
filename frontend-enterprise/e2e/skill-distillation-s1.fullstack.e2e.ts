@@ -7,6 +7,8 @@
  */
 
 import { expect, test, type Page } from '@playwright/test';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const VALID_SKILL_ZIP_BASE64 = 'UEsDBBQAAAAIAMWqC11jNQ9nvAAAAOwAAAAWAAAAcmVmdW5kLWhlbHBlci9TS0lMTC5tZHWOOwrCQBQA+z3FgvV6gNwmmC2EJCsbwTaIGvNTixgQQUQLP5jYiPgJehh9m03lFVTS2NjPMEMIQaZqUAXLQ5K7G4hSGA3kqgP9iZifim2ANGrVeL3RrDNTwSJwYJ/9suBthOuXrEwXEI6fFx/SGZyPcrUsHK+wbbG7ieieJ/HDbiNV11mLaqTJmG4pCGOCa9yoMq5RXuVU1RD5TFX+DyHo9uX+CsP4t/fKAuiFkI3zaF0mSwmmszyJvuE3UEsDBBQAAAAIAMWqC12C6hQSMwAAADIAAAApAAAAcmVmdW5kLWhlbHBlci9yZWZlcmVuY2VzL3JlZnVuZC1wb2xpY3kubWRTVnjZ0PBszb4Xy1uedszk4no2Z9XT/okvtix/sW7R096pT/vXP+2b/2L7eoiqxw1NXABQSwECFAMUAAAACADFqgtdYzUPZ7wAAADsAAAAFgAAAAAAAAAAAAAAgAEAAAAAcmVmdW5kLWhlbHBlci9TS0lMTC5tZFBLAQIUAxQAAAAIAMWqC12C6hQSMwAAADIAAAApAAAAAAAAAAAAAACAAfAAAAByZWZ1bmQtaGVscGVyL3JlZmVyZW5jZXMvcmVmdW5kLXBvbGljeS5tZFBLBQYAAAAAAgACAJsAAABqAQAAAAA=';
 const MALICIOUS_SKILL_ZIP_BASE64 = 'UEsDBBQAAAAAANKqC11uA8/yBgAAAAYAAAALAAAALi4vU0tJTEwubWR1bnNhZmVQSwECFAMUAAAAAADSqgtdbgPP8gYAAAAGAAAACwAAAAAAAAAAAAAAgAEAAAAALi4vU0tJTEwubWRQSwUGAAAAAAEAAQA5AAAALwAAAAAA';
@@ -15,6 +17,8 @@ type BrowserFailure = {
   kind: 'console' | 'pageerror' | 'request' | 'response';
   detail: string;
 };
+
+const E2E_DIRECTORY = path.dirname(fileURLToPath(import.meta.url));
 
 async function loginAsMember(page: Page) {
   const status = await page.evaluate(async () => {
@@ -170,5 +174,35 @@ test('S1 GitHub 固定 commit 经供应商边界发现多候选并全部绑定',
   expect((await confirmResponse).status()).toBe(200);
   await expect(page.getByRole('row').filter({ hasText: 'tdd' })).toBeVisible();
   await expect(page.getByRole('row').filter({ hasText: 'systematic-debugging' })).toBeVisible();
+  expect(failures).toEqual([]);
+});
+
+test('S1 浏览器选择完整文件夹后复用安全预览并固定绑定', async ({ page }) => {
+  const failures = collectBrowserFailures(page);
+  await page.goto('/enterprise/dashboard');
+  await loginAsMember(page);
+  await page.goto('/enterprise/general-skills');
+  await openSecureImport(page);
+  const dialog = page.getByRole('dialog', { name: '安全导入 Skill 包' });
+  await dialog.getByRole('tab', { name: '选择文件夹' }).click();
+  await dialog.locator('input[webkitdirectory]').setInputFiles(
+    path.join(E2E_DIRECTORY, 'fixtures/folder-skill'),
+  );
+  await expect(dialog.getByText('已选择 2 个文件')).toBeVisible();
+  const previewResponse = page.waitForResponse((response) => (
+    new URL(response.url()).pathname === '/api/enterprise/general-skill-import-jobs'
+    && response.request().method() === 'POST'
+  ));
+  await dialog.getByRole('button', { name: '生成安全预览' }).click();
+  expect((await previewResponse).status()).toBe(202);
+  await expect(dialog.getByText('browser-folder-skill', { exact: true })).toBeVisible();
+  await expect(dialog.getByText('2 个文件', { exact: true })).toBeVisible();
+  const confirmResponse = page.waitForResponse((response) => (
+    new URL(response.url()).pathname.endsWith('/confirm')
+    && response.request().method() === 'POST'
+  ));
+  await dialog.getByRole('button', { name: '固定版本并绑定' }).click();
+  expect((await confirmResponse).status()).toBe(200);
+  await expect(page.getByRole('row').filter({ hasText: 'browser-folder-skill' })).toBeVisible();
   expect(failures).toEqual([]);
 });
