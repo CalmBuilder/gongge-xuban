@@ -21,7 +21,7 @@ def test_alembic_has_single_expected_head_and_baseline() -> None:
     config = Config(str(BACKEND_DIR / "alembic.ini"))
     script = ScriptDirectory.from_config(config)
 
-    assert script.get_heads() == ["20260811_0049"]
+    assert script.get_heads() == ["20260812_0054"]
     member_lifecycle = script.get_revision("20260728_0016")
     assert member_lifecycle.down_revision == "20260727_0015"
     organization_units = script.get_revision("20260728_0017")
@@ -90,6 +90,18 @@ def test_alembic_has_single_expected_head_and_baseline() -> None:
     quota_leases = script.get_revision("20260811_0048")
     assert quota_leases is not None
     assert quota_leases.down_revision == "20260811_0047"
+    skill_revision_foundation = script.get_revision("20260811_0049")
+    assert skill_revision_foundation.down_revision == "20260811_0048"
+    skill_dependencies = script.get_revision("20260812_0050")
+    assert skill_dependencies.down_revision == "20260811_0049"
+    skill_import_quotas = script.get_revision("20260812_0051")
+    assert skill_import_quotas.down_revision == "20260812_0050"
+    skill_retry_chain = script.get_revision("20260812_0052")
+    assert skill_retry_chain.down_revision == "20260812_0051"
+    skill_worker_lease = script.get_revision("20260812_0053")
+    assert skill_worker_lease.down_revision == "20260812_0052"
+    skill_source_credentials = script.get_revision("20260812_0054")
+    assert skill_source_credentials.down_revision == "20260812_0053"
     approval_requests = script.get_revision("20260727_0015")
     assert approval_requests.down_revision == "20260727_0014"
     unique_default_model = script.get_revision("20260727_0014")
