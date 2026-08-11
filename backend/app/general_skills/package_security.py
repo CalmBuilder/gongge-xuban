@@ -14,7 +14,7 @@ import math
 import mimetypes
 import re
 import stat
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import PurePosixPath
 from typing import Any
@@ -47,6 +47,10 @@ TEXT_EXTENSIONS = frozenset(
 )
 DRIVE_PREFIX = re.compile(r"^[A-Za-z]:")
 FRONTMATTER_END = re.compile(r"^---[ \t]*$", re.MULTILINE)
+SKILL_REFERENCE = re.compile(
+    r"`/([a-z][a-z0-9-]{0,79})`|(?<![\w./:@-])/([a-z][a-z0-9-]{0,79})(?![a-z0-9-])"
+)
+PLATFORM_COMMANDS = frozenset({"clear", "compact", "help", "reset"})
 
 
 class _StrictManifestLoader(yaml.SafeLoader):
@@ -97,6 +101,21 @@ class _StrictManifestLoader(yaml.SafeLoader):
         return mapping
 
 
+_StrictManifestLoader.yaml_implicit_resolvers = {
+    key: [
+        (tag, pattern)
+        for tag, pattern in resolvers
+        if tag != "tag:yaml.org,2002:bool"
+    ]
+    for key, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+}
+_StrictManifestLoader.add_implicit_resolver(
+    "tag:yaml.org,2002:bool",
+    re.compile(r"^(?:true|false)$", re.IGNORECASE),
+    list("tTfF"),
+)
+
+
 class GeneralSkillPackageError(ValueError):
     """携带稳定公开错误码的 Skill 包拒绝结果。"""
 
@@ -133,6 +152,16 @@ class NormalizedResource:
 
 
 @dataclass(frozen=True, slots=True)
+class SkillDependencyCandidate:
+    """表达正文引用产生、仍需人工确认才能成为运行依赖的同包候选边。"""
+
+    dependency_candidate_id: str
+    referenced_name: str
+    referenced_candidate_id: str
+    reference_count: int
+
+
+@dataclass(frozen=True, slots=True)
 class SkillCandidate:
     """表达归档内一个需由用户显式选择的 SKILL.md 根。"""
 
@@ -143,6 +172,10 @@ class SkillCandidate:
     description: str
     metadata: dict[str, Any]
     allowed_tools: tuple[str, ...]
+    invocation_policy: str
+    argument_hint: str | None
+    dependency_candidates: tuple[SkillDependencyCandidate, ...]
+    platform_commands: tuple[str, ...]
     resources: tuple[NormalizedResource, ...]
     content_checksum: str
     manifest_checksum: str
@@ -291,6 +324,7 @@ def _build_package(
     candidates = tuple(
         _build_candidate(manifest, resources, manifest_paths) for manifest in manifest_resources
     )
+    candidates = _attach_reference_graph(candidates)
     normalized_items = [
         {"path": item.path, "checksum": item.content_checksum, "size": item.size}
         for item in resources
@@ -323,6 +357,8 @@ def _build_candidate(
     name = _required_metadata_text(metadata, "name")
     description = _required_metadata_text(metadata, "description")
     allowed_tools = _normalize_allowed_tools(metadata.get("allowed-tools"))
+    invocation_policy = _normalize_invocation_policy(metadata.get("disable-model-invocation"))
+    argument_hint = _normalize_argument_hint(metadata.get("argument-hint"))
     manifest_checksum = manifest.content_checksum
     content_checksum = _json_checksum(
         [
@@ -339,10 +375,71 @@ def _build_candidate(
         description=description,
         metadata=metadata,
         allowed_tools=allowed_tools,
+        invocation_policy=invocation_policy,
+        argument_hint=argument_hint,
+        dependency_candidates=(),
+        platform_commands=(),
         resources=candidate_resources,
         content_checksum=content_checksum,
         manifest_checksum=manifest_checksum,
     )
+
+
+def _attach_reference_graph(
+    candidates: tuple[SkillCandidate, ...],
+) -> tuple[SkillCandidate, ...]:
+    """把正文斜杠引用分类为同包 Skill 候选或平台命令，不静默授权依赖。"""
+
+    by_name: dict[str, SkillCandidate] = {}
+    for candidate in candidates:
+        normalized_name = candidate.name.casefold()
+        if normalized_name in by_name:
+            raise GeneralSkillPackageError(
+                "GENERAL_SKILL_DEPENDENCY_INVALID",
+                "package contains duplicate Skill names",
+            )
+        by_name[normalized_name] = candidate
+    enriched: list[SkillCandidate] = []
+    for candidate in candidates:
+        manifest = next(
+            resource for resource in candidate.resources if resource.path == candidate.manifest_path
+        )
+        references: dict[str, int] = {}
+        platform_commands: set[str] = set()
+        for match in SKILL_REFERENCE.finditer(_manifest_body(_decode_utf8(manifest.content))):
+            referenced_name = (match.group(1) or match.group(2)).casefold()
+            if referenced_name in PLATFORM_COMMANDS:
+                platform_commands.add(referenced_name)
+            elif referenced_name in by_name:
+                references[referenced_name] = references.get(referenced_name, 0) + 1
+        dependency_candidates = tuple(
+            SkillDependencyCandidate(
+                dependency_candidate_id=(
+                    f"gsdepcand_{_sha256(f'{candidate.candidate_id}:{by_name[name].candidate_id}'.encode())[:24]}"
+                ),
+                referenced_name=name,
+                referenced_candidate_id=by_name[name].candidate_id,
+                reference_count=count,
+            )
+            for name, count in sorted(references.items())
+        )
+        enriched.append(
+            replace(
+                candidate,
+                dependency_candidates=dependency_candidates,
+                platform_commands=tuple(sorted(platform_commands)),
+            )
+        )
+    return tuple(enriched)
+
+
+def _manifest_body(markdown: str) -> str:
+    """返回 frontmatter 精确结束行之后的正文，供非授权性的依赖候选扫描。"""
+
+    closing_match = FRONTMATTER_END.search(markdown, 4)
+    if closing_match is None:
+        return ""
+    return markdown[closing_match.end() :]
 
 
 def _belongs_to_candidate(
@@ -472,7 +569,11 @@ def _required_metadata_text(metadata: dict[str, Any], key: str) -> str:
         raise GeneralSkillPackageError(
             "GENERAL_SKILL_PACKAGE_INVALID", f"SKILL.md requires non-empty {key}"
         )
-    return value.strip()
+    normalized = value.strip()
+    limit = 255 if key == "name" else 1_000
+    if len(normalized) > limit:
+        _reject_limit(f"SKILL.md {key} exceeds configured character limit")
+    return normalized
 
 
 def _normalize_allowed_tools(value: object) -> tuple[str, ...]:
@@ -490,6 +591,33 @@ def _normalize_allowed_tools(value: object) -> tuple[str, ...]:
         )
     normalized = {item.strip() for item in raw_items if item.strip()}
     return tuple(sorted(normalized))
+
+
+def _normalize_invocation_policy(value: object) -> str:
+    """把兼容字段映射为明确调用策略，拒绝字符串 truthy 等歧义输入。"""
+
+    if value is None or value is False:
+        return "model_allowed"
+    if value is True:
+        return "user_only"
+    raise GeneralSkillPackageError(
+        "GENERAL_SKILL_PACKAGE_INVALID", "disable-model-invocation must be a boolean"
+    )
+
+
+def _normalize_argument_hint(value: object) -> str | None:
+    """规范化仅用于显式调用提示的 argument-hint，并限制展示预算。"""
+
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise GeneralSkillPackageError(
+            "GENERAL_SKILL_PACKAGE_INVALID", "argument-hint must be a non-empty string"
+        )
+    normalized = value.strip()
+    if len(normalized) > 500:
+        _reject_limit("SKILL.md argument-hint exceeds configured character limit")
+    return normalized
 
 
 def _normalized_resource(path: str, content: bytes) -> NormalizedResource:

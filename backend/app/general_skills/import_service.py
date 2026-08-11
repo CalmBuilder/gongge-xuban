@@ -645,6 +645,18 @@ def _candidate_preview(candidate: SkillCandidate) -> dict[str, object]:
         "manifest_checksum": candidate.manifest_checksum,
         "metadata": candidate.metadata,
         "allowed_tools": list(candidate.allowed_tools),
+        "invocation_policy": candidate.invocation_policy,
+        "argument_hint": candidate.argument_hint,
+        "dependency_candidates": [
+            {
+                "dependency_candidate_id": dependency.dependency_candidate_id,
+                "referenced_name": dependency.referenced_name,
+                "referenced_candidate_id": dependency.referenced_candidate_id,
+                "reference_count": dependency.reference_count,
+            }
+            for dependency in candidate.dependency_candidates
+        ],
+        "platform_commands": list(candidate.platform_commands),
         "resources": resources,
     }
 

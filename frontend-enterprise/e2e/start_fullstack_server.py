@@ -1717,13 +1717,15 @@ def install_general_skill_remote_fetcher_override() -> None:
                     "---\n"
                     "name: tdd\n"
                     "description: Use test-driven development with an explicit red-green-refactor loop.\n"
-                    "---\n# TDD\n",
+                    "---\n# TDD\nUse `/systematic-debugging` when the red test is not understood.\n",
                 )
                 archive.writestr(
                     "skills-main/skills/engineering/systematic-debugging/SKILL.md",
                     "---\n"
                     "name: systematic-debugging\n"
                     "description: Diagnose failures by evidence before changing implementation.\n"
+                    "disable-model-invocation: true\n"
+                    'argument-hint: "Describe the reproducible failure"\n'
                     "---\n# Systematic debugging\n",
                 )
             return RemoteFetchResult(source_url, payload.getvalue(), 0)

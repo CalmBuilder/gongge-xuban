@@ -156,6 +156,10 @@ test('S1 GitHub 固定 commit 经供应商边界发现多候选并全部绑定',
   expect((await createResponse).status()).toBe(202);
   await expect(dialog.getByText('tdd', { exact: true })).toBeVisible();
   await expect(dialog.getByText('systematic-debugging', { exact: true })).toBeVisible();
+  await expect(dialog.getByText('仅显式调用', { exact: true })).toBeVisible();
+  await expect(dialog.getByText('调用提示：Describe the reproducible failure', { exact: true })).toBeVisible();
+  await expect(dialog.getByText(/待确认的同包 Skill 引用/)).toBeVisible();
+  await expect(dialog.getByText('/systematic-debugging', { exact: true })).toBeVisible();
 
   const confirmResponse = page.waitForResponse((response) => (
     new URL(response.url()).pathname.endsWith('/confirm')

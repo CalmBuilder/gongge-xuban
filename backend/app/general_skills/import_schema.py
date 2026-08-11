@@ -58,6 +58,10 @@ class GeneralSkillImportCandidateRead(BaseModel):
     content_checksum: str
     manifest_checksum: str
     allowed_tools: list[str] = Field(default_factory=list)
+    invocation_policy: Literal["model_allowed", "user_only"] = "model_allowed"
+    argument_hint: str | None = None
+    dependency_candidates: list[dict[str, object]] = Field(default_factory=list)
+    platform_commands: list[str] = Field(default_factory=list)
     resources: list[dict[str, object]] = Field(default_factory=list)
 
 

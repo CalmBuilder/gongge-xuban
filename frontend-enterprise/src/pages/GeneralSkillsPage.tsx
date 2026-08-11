@@ -1421,6 +1421,35 @@ export function SecureSkillImportDialog({
                             </code>
                           )) : <span className="text-[11px] text-[#858b9c]">未声明额外工具范围</span>}
                         </span>
+                        <span className="mt-3 flex flex-wrap items-center gap-2 text-[11px]">
+                          <span className={cn(
+                            'rounded-full px-2 py-1 font-medium',
+                            candidate.invocation_policy === 'user_only'
+                              ? 'bg-[#fff4df] text-[#946200]'
+                              : 'bg-[#edf7ef] text-[#23733b]',
+                          )}>
+                            {candidate.invocation_policy === 'user_only' ? '仅显式调用' : '允许模型选择'}
+                          </span>
+                          {candidate.argument_hint ? (
+                            <span className="text-[#6f7789]">调用提示：{candidate.argument_hint}</span>
+                          ) : null}
+                        </span>
+                        {candidate.dependency_candidates.length ? (
+                          <span className="mt-3 block rounded-lg border border-[#e4e8f1] bg-white p-2.5 text-[11px] text-[#626b7d]">
+                            <strong className="font-semibold text-[#303747]">待确认的同包 Skill 引用：</strong>{' '}
+                            {candidate.dependency_candidates.map((dependency) => (
+                              <code key={dependency.dependency_candidate_id} className="mr-1 font-mono text-[#3157e8]">
+                                /{dependency.referenced_name}
+                              </code>
+                            ))}
+                            <span className="mt-1 block text-[#969daf]">正文引用不会自动获得依赖或工具权限。</span>
+                          </span>
+                        ) : null}
+                        {candidate.platform_commands.length ? (
+                          <span className="mt-2 block text-[11px] text-[#858b9c]">
+                            平台命令引用：{candidate.platform_commands.map((command) => `/${command}`).join('、')}
+                          </span>
+                        ) : null}
                         <code className="mt-3 block truncate font-mono text-[10px] text-[#9aa1b4]" title={candidate.content_checksum}>
                           内容：{candidate.content_checksum}
                         </code>

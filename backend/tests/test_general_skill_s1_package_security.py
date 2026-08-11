@@ -238,3 +238,64 @@ def test_manifest_requires_an_exact_frontmatter_closing_line() -> None:
     markdown = "---\nname: unsafe\ndescription: not closed\n---suffix\n# Unsafe\n"
     with pytest.raises(GeneralSkillPackageError, match="not closed"):
         normalize_zip_package(_zip([("skill/SKILL.md", markdown.encode())]))
+
+
+def test_invocation_hint_and_references_are_normalized_without_granting_dependencies() -> None:
+    """验证 matt 风格调用字段和正文引用被分类，候选边本身不代表授权。"""
+
+    parent = (
+        "---\n"
+        "name: grill-me\n"
+        "description: 通过提问澄清方案。\n"
+        "disable-model-invocation: true\n"
+        'argument-hint: "需要澄清的方案"\n'
+        "---\n"
+        "Run a `/grilling` session, then /clear. Ignore https://example.com/not-a-skill.\n"
+    )
+    package = normalize_zip_package(
+        _zip(
+            [
+                ("grill-me/SKILL.md", parent.encode()),
+                ("grilling/SKILL.md", _skill_markdown(name="grilling").encode()),
+            ]
+        )
+    )
+    candidate = package.candidates[0]
+    assert candidate.name == "grill-me"
+    assert candidate.invocation_policy == "user_only"
+    assert candidate.argument_hint == "需要澄清的方案"
+    assert [(item.referenced_name, item.reference_count) for item in candidate.dependency_candidates] == [
+        ("grilling", 1)
+    ]
+    assert candidate.platform_commands == ("clear",)
+
+
+@pytest.mark.parametrize(
+    "field_line",
+    [
+        "disable-model-invocation: yes",
+        "argument-hint: []",
+    ],
+)
+def test_invocation_metadata_rejects_ambiguous_types(field_line: str) -> None:
+    """验证调用策略不能利用 YAML 隐式 truthy 或错误结构绕过审核。"""
+
+    markdown = f"---\nname: unsafe\ndescription: invalid invocation\n{field_line}\n---\n"
+    with pytest.raises(GeneralSkillPackageError) as captured:
+        normalize_zip_package(_zip([("unsafe/SKILL.md", markdown.encode())]))
+    assert captured.value.error_code == "GENERAL_SKILL_PACKAGE_INVALID"
+
+
+def test_duplicate_skill_names_reject_ambiguous_dependency_identity() -> None:
+    """验证不同目录同名 Skill 不会让正文引用绑定到不确定候选。"""
+
+    with pytest.raises(GeneralSkillPackageError) as captured:
+        normalize_zip_package(
+            _zip(
+                [
+                    ("one/SKILL.md", _skill_markdown(name="duplicate").encode()),
+                    ("two/SKILL.md", _skill_markdown(name="duplicate").encode()),
+                ]
+            )
+        )
+    assert captured.value.error_code == "GENERAL_SKILL_DEPENDENCY_INVALID"

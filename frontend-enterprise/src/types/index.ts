@@ -383,6 +383,15 @@ export type GeneralSkillImportCandidateRead = {
   content_checksum: string;
   manifest_checksum: string;
   allowed_tools: string[];
+  invocation_policy: 'model_allowed' | 'user_only';
+  argument_hint?: string;
+  dependency_candidates: Array<{
+    dependency_candidate_id: string;
+    referenced_name: string;
+    referenced_candidate_id: string;
+    reference_count: number;
+  }>;
+  platform_commands: string[];
   resources: Array<{
     relative_path: string;
     content_checksum: string;
