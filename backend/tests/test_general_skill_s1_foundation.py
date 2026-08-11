@@ -335,8 +335,8 @@ def test_0051_migration_backfills_active_import_quota_without_double_counting(tm
     ]
 
 
-def test_0052_migration_adds_idempotent_linear_retry_constraint(tmp_path) -> None:
-    """验证空 SQLite 可升级到 retry head，重复升级后唯一约束仍只有一份。"""
+def test_0052_migration_constraint_survives_later_heads(tmp_path) -> None:
+    """验证从 0051 升至当前 head 后，线性重试约束仍存在且重复升级安全。"""
 
     database_url = f"sqlite:///{tmp_path / 'skill-import-retry.db'}"
     config = Config(str(BACKEND_DIR / "alembic.ini"))
@@ -363,6 +363,91 @@ def test_0052_migration_adds_idempotent_linear_retry_constraint(tmp_path) -> Non
     assert "uq_general_skill_import_retry_attempt" in constraints
     with engine.connect() as connection:
         assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-            "20260812_0052"
+            "20260812_0053"
         )
+    engine.dispose()
+
+
+def test_0053_migration_adds_idempotent_worker_lease_contract(tmp_path) -> None:
+    """验证 0053 可重入增加 worker lease、fencing token、索引和非负约束。"""
+
+    database_url = f"sqlite:///{tmp_path / 'skill-import-worker-lease.db'}"
+    config = Config(str(BACKEND_DIR / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
+    config.attributes["database_url"] = database_url
+    engine = create_engine(database_url)
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)"))
+        connection.execute(text("INSERT INTO alembic_version VALUES ('20260812_0052')"))
+        connection.execute(
+            text(
+                "CREATE TABLE general_skill_import_jobs ("
+                "id VARCHAR PRIMARY KEY, worker_id VARCHAR, lease_expires_at DATETIME, "
+                "lease_token INTEGER NOT NULL DEFAULT 0)"
+            )
+        )
+    command.upgrade(config, "head")
+    command.upgrade(config, "head")
+    inspector = inspect(engine)
+
+    assert {item["name"] for item in inspector.get_columns("general_skill_import_jobs")} >= {
+        "worker_id",
+        "lease_expires_at",
+        "lease_token",
+    }
+    assert {item["name"] for item in inspector.get_indexes("general_skill_import_jobs")} >= {
+        "ix_general_skill_import_jobs_worker_id",
+        "ix_general_skill_import_jobs_lease_expires_at",
+    }
+    assert "ck_general_skill_import_lease_token" in {
+        item["name"] for item in inspector.get_check_constraints("general_skill_import_jobs")
+    }
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
+            "20260812_0053"
+        )
+    engine.dispose()
+
+
+def test_0053_downgrade_refuses_active_worker_lease(tmp_path) -> None:
+    """验证存在活动 worker 时降级会失败，清除 lease 后才允许移除队列字段。"""
+
+    database_url = f"sqlite:///{tmp_path / 'skill-import-worker-downgrade.db'}"
+    config = Config(str(BACKEND_DIR / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
+    config.attributes["database_url"] = database_url
+    engine = create_engine(database_url)
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)"))
+        connection.execute(text("INSERT INTO alembic_version VALUES ('20260812_0052')"))
+        connection.execute(
+            text(
+                "CREATE TABLE general_skill_import_jobs ("
+                "id VARCHAR PRIMARY KEY, worker_id VARCHAR, lease_expires_at DATETIME, "
+                "lease_token INTEGER NOT NULL DEFAULT 0)"
+            )
+        )
+    command.upgrade(config, "head")
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO general_skill_import_jobs "
+                "(id, worker_id, lease_expires_at, lease_token) "
+                "VALUES ('job-active', 'worker-a', '2026-08-13 00:00:00', 1)"
+            )
+        )
+
+    with pytest.raises(RuntimeError, match="active general skill import worker leases"):
+        command.downgrade(config, "20260812_0052")
+
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE general_skill_import_jobs SET worker_id = NULL, lease_expires_at = NULL"
+            )
+        )
+    command.downgrade(config, "20260812_0052")
+    assert {item["name"] for item in inspect(engine).get_columns("general_skill_import_jobs")} == {
+        "id"
+    }
     engine.dispose()

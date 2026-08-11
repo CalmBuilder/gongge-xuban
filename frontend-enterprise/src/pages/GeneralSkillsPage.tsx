@@ -85,6 +85,14 @@ import type {
 
 const GENERAL_SKILL_PAGE_SIZE = 10;
 const GENERAL_SKILL_RUN_MODEL_STORAGE_KEY = 'general-skill-run-model';
+const GENERAL_SKILL_IMPORT_PROCESSING_STATUSES = new Set([
+  'created',
+  'fetching',
+  'fetched',
+  'normalizing',
+  'normalized',
+  'analyzing',
+]);
 
 const STATUS_BADGE: Record<GeneralSkillRead['status'], { tone: BadgeTone; text: string }> = {
   draft: { tone: 'blue', text: '草稿' },
@@ -414,17 +422,54 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
         `/api/enterprise/general-skill-import-jobs/${encodeURIComponent(jobId)}`,
       )
       .then((job) => {
-        if (job.status !== 'awaiting_approval') {
+        if (['installed', 'cancelled', 'expired'].includes(job.status)) {
           window.localStorage.removeItem(secureImportStorageKey);
           return;
         }
         setSecureImportJob(job);
-        setSecureImportSelectedIds(job.candidates.map((candidate) => candidate.candidate_id));
-        setSecureImportDependencyDecisions(defaultDependencyDecisions(job));
+        if (job.status === 'awaiting_approval') {
+          setSecureImportSelectedIds(job.candidates.map((candidate) => candidate.candidate_id));
+          setSecureImportDependencyDecisions(defaultDependencyDecisions(job));
+        }
         setSecureImportOpen(true);
       })
       .catch(() => window.localStorage.removeItem(secureImportStorageKey));
   }, [agentId, isOverallAgent, secureImportAvailable, secureImportStorageKey]);
+
+  useEffect(() => {
+    const job = secureImportJob;
+    if (!secureImportOpen || !job || !isSkillImportProcessing(job.status)) return;
+    let disposed = false;
+    let requestInFlight = false;
+    const poll = async () => {
+      if (requestInFlight) return;
+      requestInFlight = true;
+      try {
+        const next = await api.get<GeneralSkillImportJobRead>(
+          `/api/enterprise/general-skill-import-jobs/${encodeURIComponent(job.id)}`,
+        );
+        if (disposed) return;
+        setSecureImportJob(next);
+        if (next.status === 'awaiting_approval') {
+          setSecureImportSelectedIds(next.candidates.map((candidate) => candidate.candidate_id));
+          setSecureImportDependencyDecisions(defaultDependencyDecisions(next));
+        }
+        if (['installed', 'cancelled', 'expired'].includes(next.status)) {
+          window.localStorage.removeItem(secureImportStorageKey);
+        }
+      } catch {
+        // 短暂网络错误不丢弃持久作业；下一轮继续按作业 ID 恢复。
+      } finally {
+        requestInFlight = false;
+      }
+    };
+    const timer = window.setInterval(() => void poll(), 400);
+    void poll();
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [secureImportJob?.id, secureImportJob?.status, secureImportOpen, secureImportStorageKey]);
 
   useEffect(() => {
     api
@@ -718,7 +763,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
       setSecureImportJob(job);
       setSecureImportSelectedIds(job.candidates.map((candidate) => candidate.candidate_id));
       setSecureImportDependencyDecisions(defaultDependencyDecisions(job));
-      if (job.status === 'awaiting_approval') {
+      if (job.status === 'awaiting_approval' || isSkillImportProcessing(job.status)) {
         window.localStorage.setItem(secureImportStorageKey, job.id);
       }
       if (job.status === 'failed') {
@@ -1282,6 +1327,7 @@ export function SecureSkillImportDialog({
   onClose: () => void;
 }) {
   const hasPreview = job?.status === 'awaiting_approval';
+  const isProcessing = Boolean(job && isSkillImportProcessing(job.status));
   const selectedSet = useMemo(() => new Set(selectedIds), [selectedIds]);
 
   return (
@@ -1459,6 +1505,25 @@ export function SecureSkillImportDialog({
             </section>
           ) : null}
 
+          {isProcessing ? (
+            <section
+              role="status"
+              aria-live="polite"
+              className="flex min-h-[190px] flex-col items-center justify-center rounded-[14px] border border-[#d9e2f5] bg-[#f8faff] px-6 text-center"
+            >
+              <IconRefresh className="size-8 animate-spin text-[#5574dc]" />
+              <strong className="mt-4 text-[14px] font-semibold text-[#252936]">
+                后台正在安全检查 Skill 包
+              </strong>
+              <span className="mt-2 max-w-[520px] text-[12px] leading-[1.7] text-[#757f9c]">
+                作业已持久保存，可关闭页面后稍后恢复。系统正在完成来源抓取、完整文件树校验、风险分析和候选预览。
+              </span>
+              <code className="mt-3 rounded-full bg-white px-3 py-1 font-mono text-[10px] text-[#6f7789]">
+                {job?.status}
+              </code>
+            </section>
+          ) : null}
+
           {hasPreview ? (
             <div className="grid gap-4">
               <section className="grid gap-2 rounded-[12px] border border-[#e2e7f2] bg-[#fafbfe] p-4 text-[12px] text-[#60687b] sm:grid-cols-2">
@@ -1602,7 +1667,11 @@ export function SecureSkillImportDialog({
 
         <footer className="flex items-center justify-between gap-3 border-t border-[#e8ebf2] bg-white px-[24px] py-[16px]">
           <span className="text-[11px] text-[#858b9c]">
-            {hasPreview ? '默认固定本次修订；后续升级需再次审核。' : 'SKILL.md、ZIP 与文件夹共用完整检查；任一文件失败则整包拒绝。'}
+            {hasPreview
+              ? '默认固定本次修订；后续升级需再次审核。'
+              : isProcessing
+                ? '关闭不会丢失作业；再次进入当前数字员工时会继续恢复进度。'
+                : 'SKILL.md、ZIP 与文件夹共用完整检查；任一文件失败则整包拒绝。'}
           </span>
           <div className="flex items-center gap-2">
             <UIButton variant="outline" disabled={loading} onClick={onClose} className={RETURN_BUTTON_CLASS}>
@@ -1652,6 +1721,10 @@ function formatBytes(value: number): string {
   if (value < 1024) return `${value} B`;
   if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KiB`;
   return `${(value / (1024 * 1024)).toFixed(1)} MiB`;
+}
+
+function isSkillImportProcessing(status: string): boolean {
+  return GENERAL_SKILL_IMPORT_PROCESSING_STATUSES.has(status);
 }
 
 function skillRiskFindingLabel(finding: string): string {

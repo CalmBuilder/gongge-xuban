@@ -37,6 +37,7 @@ def import_api_context(
 
     monkeypatch.setenv("APP_SECRET", "general-skill-import-test-key-32-bytes")
     monkeypatch.setenv("GENERAL_SKILL_IMPORT_V2_ENABLED", "true")
+    monkeypatch.setenv("GENERAL_SKILL_IMPORT_ASYNC_ENABLED", "false")
     monkeypatch.setenv("GENERAL_SKILL_OBJECT_STORE_PATH", str(tmp_path / "objects"))
     get_settings.cache_clear()
     engine = create_engine(

@@ -12,6 +12,7 @@ import argparse
 import logging
 import threading
 from datetime import timedelta
+from uuid import uuid4
 
 from sqlmodel import Session, select
 
@@ -20,6 +21,7 @@ from app.db import engine
 from app.db.models import GeneralSkillRevision, utc_now
 from app.general_skills.import_service import GeneralSkillImportService, ImportQuotaPolicy
 from app.general_skills.object_store import FileSystemSkillObjectStore
+from app.general_skills.remote_source import RemoteFetcher, SecureHttpsFetcher
 
 
 LOGGER = logging.getLogger(__name__)
@@ -28,6 +30,13 @@ RECOVERY_STALE_SECONDS = 300
 ORPHAN_GRACE_SECONDS = 3600
 _stop_event = threading.Event()
 _worker_thread: threading.Thread | None = None
+WORKER_ID = f"gsworker_{uuid4().hex[:16]}"
+
+
+def get_remote_fetcher() -> RemoteFetcher:
+    """创建后台作业使用的安全远程抓取器，测试可替换供应商边界。"""
+
+    return SecureHttpsFetcher()
 
 
 def run_maintenance_once() -> int:
@@ -41,12 +50,19 @@ def run_maintenance_once() -> int:
         service = GeneralSkillImportService(
             db,
             FileSystemSkillObjectStore(settings.general_skill_object_store_path),
+            https_allowed_hosts=settings.general_skill_https_allowed_host_set,
             quota_policy=ImportQuotaPolicy(
                 tenant_active_jobs=settings.general_skill_import_tenant_active_limit,
                 user_active_jobs=settings.general_skill_import_user_active_limit,
                 tenant_staged_bytes=settings.general_skill_import_tenant_staged_bytes,
                 user_staged_bytes=settings.general_skill_import_user_staged_bytes,
             ),
+        )
+        processed = service.process_pending_jobs(
+            worker_id=WORKER_ID,
+            fetcher=get_remote_fetcher(),
+            now=now,
+            lease_seconds=settings.general_skill_import_worker_lease_seconds,
         )
         recovered = service.recover_stale_jobs(
             stale_before=now - timedelta(seconds=RECOVERY_STALE_SECONDS)
@@ -62,7 +78,7 @@ def run_maintenance_once() -> int:
             referenced_checksums,
             older_than=now - timedelta(seconds=ORPHAN_GRACE_SECONDS),
         )
-        return len(recovered) + len(expired) + len(removed)
+        return len(processed) + len(recovered) + len(expired) + len(removed)
 
 
 def run_worker(*, once: bool = False, poll_seconds: float = WORKER_POLL_SECONDS) -> None:
@@ -86,6 +102,9 @@ def start_background_worker(*, poll_seconds: float = WORKER_POLL_SECONDS) -> Non
         return
     if _worker_thread is not None and _worker_thread.is_alive():
         return
+    configured_poll_seconds = get_settings().general_skill_import_worker_poll_seconds
+    if poll_seconds == WORKER_POLL_SECONDS:
+        poll_seconds = configured_poll_seconds
     _stop_event.clear()
     _worker_thread = threading.Thread(
         target=run_worker,

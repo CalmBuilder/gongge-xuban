@@ -517,6 +517,164 @@ def test_raw_checkpoint_recovers_after_normalizer_process_crash(tmp_path, monkey
     assert recovered[0].quota_bytes > len(_package("recoverable"))
 
 
+def test_background_worker_claims_and_processes_deferred_upload(tmp_path) -> None:
+    """验证 HTTP 可只落 raw 检查点，由持久 worker lease 完成正常预览而非仅处理事故恢复。"""
+
+    db, service, owner, _ = _context(tmp_path)
+    queued = service.create_upload_job(
+        _request(_package("queued-upload")),
+        idempotency_key="queued-upload-001",
+        current_user=owner,
+        defer_processing=True,
+    )
+    assert queued.status == "fetched"
+    assert queued.candidates == []
+
+    processed = service.process_pending_jobs(
+        worker_id="gsworker_aaaaaaaaaaaaaaaa",
+        fetcher=_RemoteFetcherStub(_package("unused")),
+        now=utc_now(),
+        lease_seconds=300,
+    )
+
+    assert [item.status for item in processed] == ["awaiting_approval"]
+    row = db.get(GeneralSkillImportJob, queued.id)
+    assert row is not None
+    assert row.lease_token == 1
+    assert row.worker_id is None
+    assert row.lease_expires_at is None
+
+
+def test_background_worker_respects_live_lease_and_takes_over_after_expiry(tmp_path) -> None:
+    """验证第二 worker 不能处理有效租约，但可在租约到期后以更高 token 接管。"""
+
+    db, service, owner, _ = _context(tmp_path)
+    queued = service.create_upload_job(
+        _request(_package("leased-upload")),
+        idempotency_key="leased-upload-001",
+        current_user=owner,
+        defer_processing=True,
+    )
+    row = db.get(GeneralSkillImportJob, queued.id)
+    assert row is not None
+    claimed_at = utc_now()
+    assert service._claim_processing_job(
+        row,
+        worker_id="gsworker_first",
+        now=claimed_at,
+        lease_seconds=300,
+    )
+
+    assert service.process_pending_jobs(
+        worker_id="gsworker_second",
+        fetcher=_RemoteFetcherStub(_package("unused")),
+        now=claimed_at + timedelta(seconds=1),
+        lease_seconds=300,
+    ) == []
+    processed = service.process_pending_jobs(
+        worker_id="gsworker_second",
+        fetcher=_RemoteFetcherStub(_package("unused")),
+        now=claimed_at + timedelta(seconds=301),
+        lease_seconds=300,
+    )
+
+    assert [item.status for item in processed] == ["awaiting_approval"]
+    db.expire_all()
+    completed = db.get(GeneralSkillImportJob, queued.id)
+    assert completed is not None
+    assert completed.lease_token == 2
+    assert completed.worker_id is None
+    assert completed.lease_expires_at is None
+
+
+def test_background_worker_fencing_prevents_stale_completion_after_cancellation(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """验证安全分析期间取消作业后，旧 worker 不能凭内存快照覆盖取消终态。"""
+
+    db, service, owner, _ = _context(tmp_path)
+    queued = service.create_upload_job(
+        _request(_package("cancel-during-analysis")),
+        idempotency_key="cancel-during-analysis-001",
+        current_user=owner,
+        defer_processing=True,
+    )
+    real_normalize = import_service_module.normalize_zip_package
+
+    def cancel_while_normalizing(payload: bytes, *, source_subpath: str | None = None):
+        """模拟另一请求在耗时分析期间提交取消，并返回正常分析结果。"""
+
+        with Session(db.get_bind()) as cancelling_db:
+            row = cancelling_db.get(GeneralSkillImportJob, queued.id)
+            assert row is not None
+            row.status = "cancelled"
+            row.worker_id = None
+            row.lease_expires_at = None
+            row.row_version += 1
+            cancelling_db.add(row)
+            cancelling_db.commit()
+        return real_normalize(payload, source_subpath=source_subpath)
+
+    monkeypatch.setattr(
+        import_service_module,
+        "normalize_zip_package",
+        cancel_while_normalizing,
+    )
+    processed = service.process_pending_jobs(
+        worker_id="gsworker_stale",
+        fetcher=_RemoteFetcherStub(_package("unused")),
+        now=utc_now(),
+        lease_seconds=300,
+    )
+
+    assert processed == []
+    db.expire_all()
+    cancelled = db.get(GeneralSkillImportJob, queued.id)
+    assert cancelled is not None
+    assert cancelled.status == "cancelled"
+    assert cancelled.preview_checksum is None
+
+
+def test_background_worker_reconstructs_deferred_remote_plan_without_secret_query(tmp_path) -> None:
+    """验证远程作业只凭安全描述符恢复抓取，数据库不需要保存原始 query。"""
+
+    db, service, owner, _ = _context(tmp_path)
+    fetcher = _RemoteFetcherStub(_repository_package("queued-github"))
+    revision = "84fdeffd12f2ee307994d1eb6feb48173b6e0502"
+    queued = service.create_job(
+        GeneralSkillImportJobCreate(
+            tenant_id="tenant_a",
+            target_agent_id="agent_a",
+            source_kind="github",
+            source_url="https://github.com/mattpocock/skills?token=never-store",
+            revision=revision,
+            source_subpath="skills",
+        ),
+        idempotency_key="queued-github-001",
+        current_user=owner,
+        fetcher=fetcher,
+        defer_processing=True,
+    )
+    row = db.get(GeneralSkillImportJob, queued.id)
+    assert row is not None
+    assert queued.status == "created"
+    assert fetcher.calls == []
+    assert "never-store" not in str(row.preview_json)
+
+    processed = service.process_pending_jobs(
+        worker_id="gsworker_bbbbbbbbbbbbbbbb",
+        fetcher=fetcher,
+        now=utc_now(),
+        lease_seconds=300,
+    )
+
+    assert [item.status for item in processed] == ["awaiting_approval"]
+    assert fetcher.calls[0][0] == (
+        f"https://github.com/mattpocock/skills/archive/{revision}.zip"
+    )
+
+
 def test_uncheckpointed_stale_job_fails_closed_and_expired_preview_releases_quota(tmp_path) -> None:
     """验证无 raw 的崩溃态不会猜测恢复，已预览到期后全部暂存和配额均回收。"""
 

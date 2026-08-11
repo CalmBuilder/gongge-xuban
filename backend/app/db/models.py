@@ -1860,6 +1860,7 @@ class GeneralSkillImportJob(SQLModel, table=True):
         CheckConstraint("attempt >= 1", name="ck_general_skill_import_attempt"),
         CheckConstraint("quota_bytes >= 0", name="ck_general_skill_import_quota"),
         CheckConstraint("row_version >= 1", name="ck_general_skill_import_row_version"),
+        CheckConstraint("lease_token >= 0", name="ck_general_skill_import_lease_token"),
         Index(
             "ix_general_skill_import_owner_status",
             "tenant_id",
@@ -1892,6 +1893,9 @@ class GeneralSkillImportJob(SQLModel, table=True):
     preview_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     installed_revision_ids_json: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     row_version: int = Field(default=1, ge=1)
+    worker_id: OptionalIdentifierString = Field(default=None, index=True)
+    lease_expires_at: datetime | None = Field(default=None, index=True)
+    lease_token: int = Field(default=0, ge=0)
     expires_at: datetime
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)

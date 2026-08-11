@@ -5,7 +5,10 @@ import { expect, it, vi } from 'vitest';
 import { I18nProvider } from '../i18n';
 import { SecureSkillImportDialog } from './GeneralSkillsPage';
 
-function renderDialog(sourceKind: 'upload' | 'folder' | 'github' | 'https' = 'github') {
+function renderDialog(
+  sourceKind: 'upload' | 'folder' | 'github' | 'https' = 'github',
+  job: Parameters<typeof SecureSkillImportDialog>[0]['job'] = null,
+) {
   /** 用受控属性渲染安全导入对话框，隔离验证来源契约和无障碍名称。 */
 
   const callbacks = {
@@ -33,7 +36,7 @@ function renderDialog(sourceKind: 'upload' | 'folder' | 'github' | 'https' = 'gi
         sourceUrl="https://github.com/mattpocock/skills"
         revision=""
         sourceSubpath="skills"
-        job={null}
+        job={job}
         selectedIds={[]}
         dependencyDecisions={{}}
         {...callbacks}
@@ -118,4 +121,19 @@ it('hides arbitrary HTTPS when the deployment capability does not allow it', () 
   );
   expect(screen.queryByRole('tab', { name: 'HTTPS ZIP' })).not.toBeInTheDocument();
   expect(screen.getByRole('tab', { name: '上传文件' })).toBeVisible();
+});
+
+it('shows a resumable background-processing state without exposing confirm action', () => {
+  /** 验证异步作业尚未完成检查时有明确反馈，且不能越过预览直接绑定。 */
+
+  renderDialog('upload', {
+    id: 'gsjob_processing', tenant_id: 'tenant-a', target_agent_id: 'agent-a',
+    source_kind: 'upload', status: 'fetched', attempt: 1, quota_bytes: 128,
+    candidates: [], expires_at: '2026-08-13T00:00:00Z', row_version: 2,
+    installed_revision_ids: [],
+  });
+
+  expect(screen.getByRole('status')).toHaveTextContent('后台正在安全检查 Skill 包');
+  expect(screen.getByText(/关闭不会丢失作业/)).toBeVisible();
+  expect(screen.queryByRole('button', { name: '固定版本并绑定' })).not.toBeInTheDocument();
 });

@@ -14,6 +14,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 
@@ -57,6 +58,9 @@ def configure_environment(database_path: Path) -> None:
             "DYNAMIC_TASK_MAX_ACTIVE_PER_USER": "4",
             "DYNAMIC_TASK_MAX_ACTIVE_PER_TOOL": "4",
             "GENERAL_SKILL_IMPORT_V2_ENABLED": "true",
+            "GENERAL_SKILL_IMPORT_ASYNC_ENABLED": "true",
+            "GENERAL_SKILL_IMPORT_WORKER_POLL_SECONDS": "0.2",
+            "GENERAL_SKILL_IMPORT_WORKER_LEASE_SECONDS": "300",
             "GENERAL_SKILL_OBJECT_STORE_PATH": str(E2E_RUNTIME_DIR / "general-skill-objects"),
             "GONGGE_XUBAN_DATA_DIR": str(E2E_RUNTIME_DIR / "user-data"),
         }
@@ -1692,6 +1696,7 @@ def install_general_skill_remote_fetcher_override() -> None:
     from zipfile import ZIP_DEFLATED, ZipFile
 
     from app.api.general_skill_imports import get_general_skill_remote_fetcher
+    from app.general_skills import worker as general_skill_worker
     from app.general_skills.remote_source import RemoteFetchResult
     from app.main import app
 
@@ -1725,6 +1730,7 @@ def install_general_skill_remote_fetcher_override() -> None:
                 raise RuntimeError("unexpected E2E remote archive URL")
             if not allowed_hosts or "codeload.github.com" not in allowed_hosts:
                 raise RuntimeError("missing E2E GitHub redirect allowlist")
+            time.sleep(0.8)
             with ZipFile(payload, "w", ZIP_DEFLATED) as archive:
                 archive.writestr(
                     "skills-main/skills/engineering/tdd/SKILL.md",
@@ -1745,6 +1751,7 @@ def install_general_skill_remote_fetcher_override() -> None:
             return RemoteFetchResult(source_url, payload.getvalue(), 0)
 
     app.dependency_overrides[get_general_skill_remote_fetcher] = BrowserRemoteFetcher
+    general_skill_worker.get_remote_fetcher = BrowserRemoteFetcher
 
 
 def seed_pagination_browser_fixtures() -> None:

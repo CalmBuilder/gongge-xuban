@@ -95,6 +95,9 @@ class Settings(BaseSettings):
         ge=1,
         le=500 * 1024 * 1024,
     )
+    general_skill_import_async_enabled: bool = True
+    general_skill_import_worker_poll_seconds: float = Field(default=1.0, ge=0.1, le=60.0)
+    general_skill_import_worker_lease_seconds: int = Field(default=300, ge=180, le=1800)
 
     model_config = SettingsConfigDict(
         env_file=desktop_env_value("DOTENV", str(DEFAULT_DOTENV_PATH)),

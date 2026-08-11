@@ -182,6 +182,8 @@ test('S1 GitHub 固定 commit 经供应商边界发现多候选并全部绑定',
   ));
   await dialog.getByRole('button', { name: '生成安全预览' }).click();
   expect((await createResponse).status()).toBe(202);
+  await expect(dialog.getByRole('status')).toContainText('后台正在安全检查 Skill 包');
+  await expect(dialog.getByRole('button', { name: '固定版本并绑定' })).toHaveCount(0);
   await expect(dialog.getByText('tdd', { exact: true })).toBeVisible();
   await expect(dialog.getByText('systematic-debugging', { exact: true })).toBeVisible();
   await expect(dialog.getByText('仅显式调用', { exact: true })).toBeVisible();

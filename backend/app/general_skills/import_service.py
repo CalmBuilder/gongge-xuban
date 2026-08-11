@@ -20,7 +20,7 @@ from pathlib import PurePath
 from typing import Any
 from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
-from sqlalchemy import update
+from sqlalchemy import or_, update
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
@@ -104,6 +104,10 @@ class GeneralSkillImportError(RuntimeError):
         self.status_code = status_code
 
 
+class _WorkerClaimLost(RuntimeError):
+    """表示后台 worker 的 lease 已被取消、过期或由更高 fencing token 接管。"""
+
+
 class GeneralSkillImportService:
     """在单一事务边界内管理用户私有 Skill 的预览和确认。"""
 
@@ -128,6 +132,7 @@ class GeneralSkillImportService:
         *,
         idempotency_key: str,
         current_user: User,
+        defer_processing: bool = False,
     ) -> GeneralSkillImportJobRead:
         """鉴权、严格解码并同步形成可跨刷新恢复的 awaiting-approval 作业。"""
 
@@ -187,6 +192,8 @@ class GeneralSkillImportService:
             ) from exc
         try:
             self._checkpoint_raw_payload(job, payload)
+            if defer_processing:
+                return import_job_read(job)
             return self._normalize_fetched(job, payload)
         except GeneralSkillPackageError as exc:
             self._fail_job(job, exc.error_code, str(exc))
@@ -207,6 +214,7 @@ class GeneralSkillImportService:
         idempotency_key: str,
         current_user: User,
         fetcher: RemoteFetcher | None = None,
+        defer_processing: bool = False,
     ) -> GeneralSkillImportJobRead:
         """按来源类型进入同一作业状态机，远程来源固定请求后再复用规范化链。"""
 
@@ -215,12 +223,14 @@ class GeneralSkillImportService:
                 request,
                 idempotency_key=idempotency_key,
                 current_user=current_user,
+                defer_processing=defer_processing,
             )
         return self._create_remote_job(
             request,
             idempotency_key=idempotency_key,
             current_user=current_user,
             fetcher=fetcher or SecureHttpsFetcher(),
+            defer_processing=defer_processing,
         )
     def get_job(self, job_id: str, *, current_user: User) -> GeneralSkillImportJobRead:
         """按 tenant/user 双边界读取作业，管理员也不能跨 tenant 枚举。"""
@@ -250,6 +260,8 @@ class GeneralSkillImportService:
             raise _state_conflict(exc) from exc
         self.object_store.release_staging(job.id)
         self._release_import_quota(job)
+        job.worker_id = None
+        job.lease_expires_at = None
         self.db.add(job)
         self._append_job_audit(job, "cancelled", "success")
         self.db.commit()
@@ -431,11 +443,28 @@ class GeneralSkillImportService:
         payload: bytes,
         *,
         source_subpath: str | None = None,
+        worker_id: str | None = None,
+        lease_token: int | None = None,
     ) -> GeneralSkillImportJobRead:
         """把已完整抓取的 ZIP 复用到统一规范化、分析、暂存和预览阶段。"""
 
-        transition_import_job(job, ImportJobStatus.NORMALIZING, expected_row_version=job.row_version)
+        worker_claimed = worker_id is not None and lease_token is not None
+        if worker_claimed:
+            self._refresh_processing_claim(job, worker_id=worker_id, lease_token=lease_token)
+        else:
+            transition_import_job(
+                job,
+                ImportJobStatus.NORMALIZING,
+                expected_row_version=job.row_version,
+            )
         package = normalize_zip_package(payload, source_subpath=source_subpath)
+        if worker_claimed:
+            self._refresh_processing_claim(job, worker_id=worker_id, lease_token=lease_token)
+            transition_import_job(
+                job,
+                ImportJobStatus.NORMALIZING,
+                expected_row_version=job.row_version,
+            )
         transition_import_job(job, ImportJobStatus.NORMALIZED, expected_row_version=job.row_version)
         unique_resources = {
             resource.content_checksum: resource
@@ -479,6 +508,8 @@ class GeneralSkillImportService:
             ImportJobStatus.AWAITING_APPROVAL,
             expected_row_version=job.row_version,
         )
+        job.worker_id = None
+        job.lease_expires_at = None
         self.db.add(job)
         self._append_job_audit(
             job,
@@ -501,6 +532,7 @@ class GeneralSkillImportService:
         idempotency_key: str,
         current_user: User,
         fetcher: RemoteFetcher,
+        defer_processing: bool = False,
     ) -> GeneralSkillImportJobRead:
         """创建固定远程来源作业，逐跳安全下载后进入与上传相同的预览链。"""
 
@@ -549,6 +581,19 @@ class GeneralSkillImportService:
             request.revision,
             request.source_subpath,
         )
+        if request.source_kind == "github":
+            remote_fetch_descriptor: dict[str, object] = {
+                "kind": "github",
+                "archive_url": source_url,
+            }
+        elif request.source_kind == "skillhub":
+            remote_fetch_descriptor = {
+                "kind": "skillhub",
+                "slug": validated_reference.removeprefix("skillhub:"),
+            }
+        else:
+            source_url = validated_reference
+            remote_fetch_descriptor = {"kind": "https", "url": validated_reference}
         request_checksum = _canonical_checksum(
             {
                 "source_kind": request.source_kind,
@@ -585,6 +630,7 @@ class GeneralSkillImportService:
             preview_json={
                 "source_request_checksum": request_checksum,
                 "source_subpath": request.source_subpath,
+                "remote_fetch_descriptor": remote_fetch_descriptor,
             },
             expires_at=now + timedelta(hours=24),
             created_at=now,
@@ -594,6 +640,9 @@ class GeneralSkillImportService:
         try:
             self._append_job_audit(job, "created", "success")
             self.db.commit()
+            self.db.refresh(job)
+            if defer_processing:
+                return import_job_read(job)
             transition_import_job(job, ImportJobStatus.FETCHING, expected_row_version=job.row_version)
             self.db.add(job)
             self.db.commit()
@@ -640,6 +689,10 @@ class GeneralSkillImportService:
                 .where(
                     GeneralSkillImportJob.status.in_(active_statuses),
                     GeneralSkillImportJob.updated_at <= stale_before,
+                    or_(
+                        GeneralSkillImportJob.lease_expires_at.is_(None),
+                        GeneralSkillImportJob.lease_expires_at <= utc_now(),
+                    ),
                 )
                 .order_by(GeneralSkillImportJob.updated_at, GeneralSkillImportJob.id)
                 .limit(limit)
@@ -673,6 +726,212 @@ class GeneralSkillImportService:
             recovered.append(import_job_read(job))
         return recovered
 
+    def process_pending_jobs(
+        self,
+        *,
+        worker_id: str,
+        fetcher: RemoteFetcher,
+        now: datetime,
+        lease_seconds: int,
+        limit: int = 20,
+    ) -> list[GeneralSkillImportJobRead]:
+        """按数据库 lease 领取 created/fetched 作业并完成抓取、规范化和安全预览。"""
+
+        jobs = list(
+            self.db.exec(
+                select(GeneralSkillImportJob)
+                .where(
+                    GeneralSkillImportJob.status.in_(
+                        [ImportJobStatus.CREATED.value, ImportJobStatus.FETCHED.value]
+                    ),
+                    or_(
+                        GeneralSkillImportJob.lease_expires_at.is_(None),
+                        GeneralSkillImportJob.lease_expires_at <= now,
+                    ),
+                )
+                .order_by(GeneralSkillImportJob.created_at, GeneralSkillImportJob.id)
+                .limit(limit)
+            ).all()
+        )
+        processed: list[GeneralSkillImportJobRead] = []
+        for job in jobs:
+            if not self._claim_processing_job(
+                job,
+                worker_id=worker_id,
+                now=now,
+                lease_seconds=lease_seconds,
+            ):
+                continue
+            lease_token = job.lease_token
+            try:
+                if job.status == ImportJobStatus.CREATED:
+                    source_url, allowed_hosts = self._remote_fetch_plan(job)
+                    transition_import_job(
+                        job,
+                        ImportJobStatus.FETCHING,
+                        expected_row_version=job.row_version,
+                    )
+                    self.db.add(job)
+                    self.db.commit()
+                    self.db.refresh(job)
+                    result = fetcher.fetch(source_url, allowed_hosts=allowed_hosts)
+                    self._refresh_processing_claim(
+                        job,
+                        worker_id=worker_id,
+                        lease_token=lease_token,
+                    )
+                    self._checkpoint_raw_payload(job, result.payload)
+                if job.status != ImportJobStatus.FETCHED or not job.raw_checksum:
+                    raise SkillObjectStoreError("import has no replayable raw checkpoint")
+                payload = self.object_store.read_staged(job.id, job.raw_checksum)
+                source_subpath = job.preview_json.get("source_subpath")
+                processed.append(
+                    self._normalize_fetched(
+                        job,
+                        payload,
+                        source_subpath=(
+                            str(source_subpath) if isinstance(source_subpath, str) else None
+                        ),
+                        worker_id=worker_id,
+                        lease_token=lease_token,
+                    )
+                )
+            except _WorkerClaimLost:
+                self.db.rollback()
+                continue
+            except GeneralSkillRemoteSourceError as exc:
+                if self._fail_claimed_job(job, worker_id, lease_token, exc.error_code, str(exc)):
+                    processed.append(import_job_read(job))
+            except GeneralSkillPackageError as exc:
+                if self._fail_claimed_job(job, worker_id, lease_token, exc.error_code, str(exc)):
+                    processed.append(import_job_read(job))
+            except SkillObjectStoreError as exc:
+                if self._fail_claimed_job(
+                    job,
+                    worker_id,
+                    lease_token,
+                    "GENERAL_SKILL_STORAGE_UNAVAILABLE",
+                    str(exc),
+                ):
+                    processed.append(import_job_read(job))
+            except GeneralSkillImportError as exc:
+                if self._fail_claimed_job(job, worker_id, lease_token, exc.error_code, str(exc)):
+                    processed.append(import_job_read(job))
+        return processed
+
+    def _refresh_processing_claim(
+        self,
+        job: GeneralSkillImportJob,
+        *,
+        worker_id: str,
+        lease_token: int,
+    ) -> None:
+        """重读持久状态并拒绝已取消、已过期或已被更高 token 接管的 worker。"""
+
+        self.db.expire(job)
+        self.db.refresh(job)
+        if (
+            job.worker_id != worker_id
+            or job.lease_token != lease_token
+            or job.lease_expires_at is None
+            or job.lease_expires_at <= utc_now()
+            or job.status not in {
+                ImportJobStatus.CREATED.value,
+                ImportJobStatus.FETCHING.value,
+                ImportJobStatus.FETCHED.value,
+            }
+        ):
+            raise _WorkerClaimLost(job.id)
+
+    def _fail_claimed_job(
+        self,
+        job: GeneralSkillImportJob,
+        worker_id: str,
+        lease_token: int,
+        error_code: str,
+        detail: str,
+    ) -> bool:
+        """仅允许仍持有当前 fencing token 的 worker 写入失败终态。"""
+
+        try:
+            self._refresh_processing_claim(
+                job,
+                worker_id=worker_id,
+                lease_token=lease_token,
+            )
+        except _WorkerClaimLost:
+            self.db.rollback()
+            return False
+        self._fail_job(job, error_code, detail)
+        return True
+
+    def _claim_processing_job(
+        self,
+        job: GeneralSkillImportJob,
+        *,
+        worker_id: str,
+        now: datetime,
+        lease_seconds: int,
+    ) -> bool:
+        """用状态、row version 和 lease 到期条件原子领取作业并递增 fencing token。"""
+
+        result = self.db.exec(
+            update(GeneralSkillImportJob)
+            .where(
+                GeneralSkillImportJob.id == job.id,
+                GeneralSkillImportJob.status == job.status,
+                GeneralSkillImportJob.row_version == job.row_version,
+                or_(
+                    GeneralSkillImportJob.lease_expires_at.is_(None),
+                    GeneralSkillImportJob.lease_expires_at <= now,
+                ),
+            )
+            .values(
+                worker_id=worker_id,
+                lease_expires_at=now + timedelta(seconds=lease_seconds),
+                lease_token=GeneralSkillImportJob.lease_token + 1,
+                row_version=GeneralSkillImportJob.row_version + 1,
+                updated_at=now,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if result.rowcount != 1:
+            self.db.rollback()
+            return False
+        self.db.commit()
+        self.db.expire(job)
+        self.db.refresh(job)
+        return True
+
+    def _remote_fetch_plan(
+        self,
+        job: GeneralSkillImportJob,
+    ) -> tuple[str, frozenset[str] | None]:
+        """从无凭据持久描述符重建远程请求，拒绝缺失或被篡改的来源计划。"""
+
+        descriptor = job.preview_json.get("remote_fetch_descriptor")
+        if not isinstance(descriptor, dict):
+            raise GeneralSkillImportError(
+                "GENERAL_SKILL_PACKAGE_INVALID", "remote fetch descriptor is unavailable", 400
+            )
+        kind = descriptor.get("kind")
+        if kind == "github" and isinstance(descriptor.get("archive_url"), str):
+            archive_url = str(descriptor["archive_url"])
+            validated_remote_reference(archive_url, allowed_hosts=GITHUB_ARCHIVE_HOSTS)
+            return archive_url, GITHUB_ARCHIVE_HOSTS
+        if kind == "skillhub" and isinstance(descriptor.get("slug"), str):
+            archive_url, _reference = skillhub_archive_url(str(descriptor["slug"]))
+            return archive_url, SKILLHUB_DOWNLOAD_HOSTS
+        if kind == "https" and isinstance(descriptor.get("url"), str):
+            url = validated_remote_reference(
+                str(descriptor["url"]),
+                allowed_hosts=self.https_allowed_hosts,
+            )
+            return url, self.https_allowed_hosts
+        raise GeneralSkillImportError(
+            "GENERAL_SKILL_PACKAGE_INVALID", "remote fetch descriptor is invalid", 400
+        )
+
     def expire_jobs(
         self,
         *,
@@ -705,6 +964,8 @@ class GeneralSkillImportService:
             )
             self.object_store.release_staging(job.id)
             self._release_import_quota(job)
+            job.worker_id = None
+            job.lease_expires_at = None
             self.db.add(job)
             self._append_job_audit(
                 job,
@@ -729,6 +990,8 @@ class GeneralSkillImportService:
         )
         self.object_store.release_staging(job.id)
         self._release_import_quota(job)
+        job.worker_id = None
+        job.lease_expires_at = None
         self.db.add(job)
         self._append_job_audit(
             job,

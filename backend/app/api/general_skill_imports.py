@@ -76,6 +76,7 @@ def create_import_job(
             idempotency_key=idempotency_key,
             current_user=current_user,
             fetcher=remote_fetcher,
+            defer_processing=settings.general_skill_import_async_enabled,
         )
     except GeneralSkillImportError as exc:
         raise _http_error(exc) from exc
