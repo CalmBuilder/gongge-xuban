@@ -752,18 +752,6 @@ class DynamicCapabilityCatalog:
             "revision_id": item.revision_id,
             "revision_number": item.revision_number,
         }
-        if item.usage_mode == "planning_guidance":
-            model_view["skill_markdown"] = revision.normalized_skill_markdown
-            model_view["resources"] = [
-                {
-                    "resource_checksum": resource.get("content_checksum")
-                    or resource.get("checksum"),
-                    "path": resource.get("relative_path") or resource.get("path"),
-                    "size": resource.get("size"),
-                    "mime_type": resource.get("media_type"),
-                }
-                for resource in revision.resource_manifest_json
-            ]
         payload = {
             "capability_type": "general_skill",
             "capability_id": root.id,

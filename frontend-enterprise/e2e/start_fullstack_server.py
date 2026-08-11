@@ -1404,6 +1404,19 @@ def install_schedule_llm_override() -> None:
             }
         if phase == "Router / Dynamic Task Shadow":
             goal = str(user_payload.get("user_message") or "生成合同巡检结果")
+            if "S3" in goal or "本轮选定的指南" in goal:
+                return {
+                    "mode": "answer",
+                    "goal": None,
+                    "success_criteria": [],
+                    "requires_durable_execution": False,
+                    "requires_artifact": False,
+                    "capability_hints": [],
+                    "clarification": None,
+                    "execution_intent": "none",
+                    "confidence": 0.99,
+                    "reason": "S3 验证是单轮或跨轮对话 Skill，不需要持久动态执行",
+                }
             return {
                 "mode": "dynamic_task",
                 "goal": goal,
@@ -1416,7 +1429,74 @@ def install_schedule_llm_override() -> None:
                 "confidence": 0.99,
                 "reason": "任务需要跨轮等待用户确认",
             }
+        if "动态任务指导选择器" in system_prompt:
+            names = {
+                str(item.get("slug") or "")
+                for item in user_payload.get("skill_catalog", [])
+                if isinstance(item, dict)
+            }
+            selected = (
+                ["s4-dynamic-guidance"]
+                if "S4动态" in str(user_payload.get("goal") or "")
+                and "s4-dynamic-guidance" in names
+                else []
+            )
+            if "S4-DYNAMIC-FULL-GUIDANCE" in str(user_payload):
+                raise RuntimeError("S4 selector received full Skill instructions")
+            return {
+                "selected_skill_names": selected,
+                "reason": "仅为明确的 S4 动态任务选择诊断指导",
+            }
         if "受控动态任务规划器" in system_prompt:
+            loaded_guidance = user_payload.get("loaded_guidance", [])
+            if isinstance(loaded_guidance, list) and loaded_guidance:
+                if "S4-DYNAMIC-FULL-GUIDANCE" not in str(loaded_guidance):
+                    raise RuntimeError("S4 planner did not receive fixed Skill instructions")
+                knowledge_names = [
+                    str(item.get("name") or "")
+                    for item in user_payload.get("capabilities", [])
+                    if isinstance(item, dict) and item.get("name") == "knowledge.search"
+                ]
+                if knowledge_names != ["knowledge.search"]:
+                    raise RuntimeError("S4 planner did not receive governed knowledge capability")
+                return {
+                    "goal": str(user_payload.get("goal") or "完成 S4 动态核验"),
+                    "success_criteria": user_payload.get("success_criteria", []),
+                    "constraints": ["必须按固定 Skill 先确认范围再检索证据"],
+                    "assumptions": [],
+                    "steps": [
+                        {
+                            "draft_id": "clarify_scope",
+                            "title": "确认诊断范围",
+                            "kind": "clarification",
+                            "required": True,
+                            "depends_on": [],
+                            "capability_refs": [],
+                            "guidance_skill_refs": ["s4-dynamic-guidance"],
+                            "expected_output_schema": {},
+                        },
+                        {
+                            "draft_id": "search_evidence",
+                            "title": "检索固定知识证据",
+                            "kind": "knowledge",
+                            "required": True,
+                            "depends_on": ["clarify_scope"],
+                            "capability_refs": ["knowledge.search"],
+                            "guidance_skill_refs": ["s4-dynamic-guidance"],
+                            "expected_output_schema": {},
+                        },
+                        {
+                            "draft_id": "answer",
+                            "title": "形成可审计结论",
+                            "kind": "answer",
+                            "required": True,
+                            "depends_on": ["search_evidence"],
+                            "capability_refs": [],
+                            "guidance_skill_refs": ["s4-dynamic-guidance"],
+                            "expected_output_schema": {},
+                        },
+                    ],
+                }
             return {
                 "goal": str(user_payload.get("goal") or "生成合同巡检结果"),
                 "success_criteria": user_payload.get("success_criteria", []),
@@ -1430,6 +1510,7 @@ def install_schedule_llm_override() -> None:
                         "required": True,
                         "depends_on": [],
                         "capability_refs": [],
+                        "guidance_skill_refs": [],
                         "expected_output_schema": {},
                     },
                     {
@@ -1439,11 +1520,61 @@ def install_schedule_llm_override() -> None:
                         "required": True,
                         "depends_on": ["clarify_scope"],
                         "capability_refs": [],
+                        "guidance_skill_refs": [],
                         "expected_output_schema": {},
                     },
                 ],
             }
         if "受控单步动作提议器" in system_prompt:
+            current_step = user_payload.get("current_step", {})
+            step_kind = str(current_step.get("kind") or "") if isinstance(current_step, dict) else ""
+            is_s4 = "S4-DYNAMIC-FULL-GUIDANCE" in str(user_payload)
+            if is_s4 and step_kind == "knowledge":
+                client._last_completed_response_metadata = {
+                    "response_id": "e2e-s4-knowledge-response",
+                    "finish_reason": "stop",
+                    "usage": {"input_tokens": 12, "output_tokens": 8},
+                }
+                return {
+                    "action_kind": "query_knowledge",
+                    "arguments": {"query": "S4 动态任务固定知识证据"},
+                    "capability_ref": "knowledge.search",
+                    "expected_output_schema": {},
+                    "rationale": "按固定 Skill 纪律检索证据",
+                }
+            if is_s4 and step_kind == "answer":
+                execution_view = user_payload.get("provider_execution_view", {})
+                execution_context = (
+                    execution_view.get("execution_context", {})
+                    if isinstance(execution_view, dict)
+                    else {}
+                )
+                completed = [
+                    str(item.get("step_key") or "")
+                    for item in execution_context.get("completed_steps", [])
+                    if isinstance(item, dict) and item.get("step_key")
+                ]
+                criteria = [
+                    str(item.get("id") or "")
+                    for item in execution_context.get("success_criteria", [])
+                    if isinstance(item, dict) and item.get("id")
+                ]
+                client._last_completed_response_metadata = {
+                    "response_id": "e2e-s4-answer-response",
+                    "finish_reason": "stop",
+                    "usage": {"input_tokens": 14, "output_tokens": 12},
+                }
+                return {
+                    "action_kind": "answer",
+                    "arguments": {
+                        "markdown": "S4-DYNAMIC-GUIDED-SUCCESS：已确认范围、检索知识并形成可审计结论。",
+                        "criterion_evidence": {criterion: completed for criterion in criteria},
+                        "pending_questions": [],
+                    },
+                    "capability_ref": None,
+                    "expected_output_schema": {},
+                    "rationale": "按固定 Skill 和真实检索证据完成任务",
+                }
             client._last_completed_response_metadata = {
                 "response_id": "e2e-schedule-clarification-response",
                 "finish_reason": "stop",

@@ -67,6 +67,86 @@ def _snapshot() -> CapabilitySnapshot:
     )
 
 
+def _guidance_snapshot(*, invocation_policy: str = "model_allowed") -> CapabilitySnapshot:
+    """构造模型目录含描述但内部快照含敏感正文的固定指导能力。"""
+
+    payload = {
+        "capability_type": "general_skill",
+        "capability_id": "genskill_diagnose",
+        "tenant_id": "tenant_demo",
+        "name": "diagnosing-bugs",
+        "contract": {
+            "usage_mode": "planning_guidance",
+            "revision_id": "gsrev_diagnose_1",
+            "invocation_policy": invocation_policy,
+        },
+        "model_view": {
+            "id": "genskill_diagnose",
+            "slug": "diagnosing-bugs",
+            "name": "诊断缺陷",
+            "description": "先复现，再形成可证伪假设。",
+            "usage_mode": "planning_guidance",
+            "revision_id": "gsrev_diagnose_1",
+            "revision_number": 1,
+            "skill_markdown": "# 不应在选择阶段披露的完整正文",
+            "resources": [{"path": "references/debug.md"}],
+        },
+        "user_view": {"name": "诊断缺陷"},
+        "audit_view": {"content_checksum": "secret-checksum"},
+    }
+    return CapabilitySnapshot(
+        **payload,
+        agent_id="agent_demo",
+        checksum=capability_checksum(payload),
+    )
+
+
+class _GuidanceSelectionClient:
+    """记录无正文选择 payload，并返回固定 Skill 或越权 user-only 名称。"""
+
+    def __init__(self, selected_name: str) -> None:
+        """保存模型将提出的名称。"""
+
+        self.selected_name = selected_name
+        self.payload: dict | None = None
+
+    def generate_json(self, system_prompt: str, user_payload: dict) -> dict:
+        """返回单个选择并保留供应商实际可见内容。"""
+
+        self.payload = user_payload
+        return {
+            "selected_skill_names": [self.selected_name],
+            "reason": "该任务需要严格诊断纪律",
+        }
+
+
+def test_guidance_selector_discloses_catalog_only_and_rejects_user_only() -> None:
+    """动态选择阶段看不到正文/资源，且 user-only 即使模型点名也不进入自动选择。"""
+
+    client = _GuidanceSelectionClient("diagnosing-bugs")
+    criterion = SuccessCriterion(id="fixed", type="assertion", spec={"required": True})
+    selection = DynamicTaskPlanner(client).select_guidance_skills(
+        goal="诊断并修复问题",
+        success_criteria=(criterion,),
+        catalog=(_guidance_snapshot(),),
+    )
+
+    assert selection.selected_skill_names == ("diagnosing-bugs",)
+    assert client.payload is not None
+    assert "skill_markdown" not in str(client.payload)
+    assert "resources" not in str(client.payload)
+    assert "secret-checksum" not in str(client.payload)
+
+    user_only_client = _GuidanceSelectionClient("diagnosing-bugs")
+    user_only = DynamicTaskPlanner(user_only_client).select_guidance_skills(
+        goal="诊断并修复问题",
+        success_criteria=(criterion,),
+        catalog=(_guidance_snapshot(invocation_policy="user_only"),),
+    )
+    assert user_only.selected_skill_names == ()
+    assert user_only_client.payload is None
+
+
 def test_planner_only_discloses_model_view_and_freezes_server_contract() -> None:
     """验证审计/连接信息不进模型，目标、成功标准、预算和 step key 均由服务端裁决。"""
 

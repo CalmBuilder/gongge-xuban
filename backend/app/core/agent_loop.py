@@ -14,7 +14,7 @@ import queue
 import re
 import threading
 import traceback
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from time import sleep
 from types import SimpleNamespace
@@ -2089,6 +2089,7 @@ class AgentLoop:
                     model_config,
                     capability_route,
                     user_message.id,
+                    memory_context=[],
                 )
                 if dynamic_response is not None:
                     yield self._stream_status(
@@ -2313,6 +2314,7 @@ class AgentLoop:
                     model_config,
                     capability_route,
                     user_message.id,
+                    memory_context=memory_context,
                 )
                 if dynamic_response is not None:
                     yield self._stream_status(
@@ -2977,6 +2979,7 @@ class AgentLoop:
                 model_config,
                 capability_route,
                 user_message.id,
+                memory_context=[],
             )
             if dynamic_response is not None:
                 return PreparedTurn(
@@ -3111,6 +3114,7 @@ class AgentLoop:
                 model_config,
                 capability_route,
                 user_message.id,
+                memory_context=memory_context,
             )
             if dynamic_response is not None:
                 return PreparedTurn(
@@ -7284,11 +7288,10 @@ class AgentLoop:
         model_config: ModelConfig,
         route: NonSopCapabilityRouteResult,
         user_message_id: str,
+        memory_context: Sequence[Mapping[str, object]] = (),
     ) -> ChatTurnResponse | None:
         """只在独立 kill switch 生效且路由通过时委托 DynamicTaskAgent 完整执行。"""
 
-        if request.forced_general_skill_id:
-            return None
         decision = route.effective_decision
         if request.interaction_mode == "scheduled_task":
             decision = NonSopCapabilityDecision(
@@ -7303,6 +7306,13 @@ class AgentLoop:
             return None
         if not chat_session.agent_id or not request.user_id:
             return None
+        if request.forced_general_skill_id:
+            forced_skill, _selection = self._forced_general_skill_capability(
+                request,
+                chat_session,
+            )
+            if forced_skill is None:
+                return None
         rollout_check = getattr(self, "_dynamic_task_rollout_allows", None)
         rollout_allowed = (
             bool(rollout_check(request.tenant_id, chat_session.agent_id))
@@ -7356,6 +7366,10 @@ class AgentLoop:
                         request.user_id,
                         chat_session.agent_id,
                     ),
+                    forced_general_skill_id=(
+                        request.forced_general_skill_id if request.channel == "web" else None
+                    ),
+                    memory_context=memory_context,
                 )
                 if created and quota_limits is not None:
                     DynamicTaskQuotaService(self.db).acquire_execution(

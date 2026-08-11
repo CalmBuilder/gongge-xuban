@@ -1059,6 +1059,7 @@ class SopOperation(SQLModel, table=True):
     capability_checksum: OptionalVersionString = Field(default=None, index=True)
     approval_work_item_id: OptionalIdentifierString = Field(default=None, index=True)
     caused_by_skill_use_id: OptionalIdentifierString = Field(default=None, index=True)
+    caused_by_skill_use_ids_json: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     approval_fingerprint: OptionalVersionString = Field(default=None, index=True)
     approved_by_user_id: OptionalIdentifierString = Field(default=None, index=True)
     approved_at: datetime | None = None

@@ -12,6 +12,7 @@ import hashlib
 import json
 import re
 from enum import StrEnum
+from collections.abc import Mapping
 from typing import Any, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -67,6 +68,7 @@ class PlanStep(PlanningContract):
     required: bool = True
     depends_on: tuple[str, ...] = ()
     capability_refs: tuple[str, ...] = ()
+    guidance_skill_use_ids: tuple[str, ...] = ()
     expected_output_schema: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -77,6 +79,8 @@ class PlanStep(PlanningContract):
             raise ValueError("步骤不能依赖自身")
         if len(set(self.depends_on)) != len(self.depends_on):
             raise ValueError("depends_on 不得重复")
+        if len(set(self.guidance_skill_use_ids)) != len(self.guidance_skill_use_ids):
+            raise ValueError("guidance_skill_use_ids 不得重复")
         return self
 
 
@@ -155,6 +159,7 @@ class DynamicPlanDraftStep(PlanningContract):
     required: bool = True
     depends_on: tuple[str, ...] = ()
     capability_refs: tuple[str, ...] = ()
+    guidance_skill_refs: tuple[str, ...] = ()
     expected_output_schema: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -198,6 +203,7 @@ def normalize_plan_draft(
     max_output_tokens: int = 24_000,
     max_total_tokens: int = 144_000,
     max_runtime_seconds: int = 900,
+    guidance_use_ids_by_name: Mapping[str, tuple[str, ...]] | None = None,
 ) -> NormalizedPlan:
     """为草案生成稳定服务端 step key，并以服务端预算覆盖任何模型暗示。"""
 
@@ -223,6 +229,15 @@ def normalize_plan_draft(
         step.draft_id: _stable_step_key(index, step)
         for index, step in enumerate(draft.steps, start=1)
     }
+    guidance_mapping = guidance_use_ids_by_name or {}
+    unknown_guidance = {
+        reference
+        for step in draft.steps
+        for reference in step.guidance_skill_refs
+        if reference not in guidance_mapping
+    }
+    if unknown_guidance:
+        raise ValueError("动态计划引用了未加载的指导 Skill")
     return NormalizedPlan(
         goal=draft.goal,
         success_criteria=draft.success_criteria,
@@ -236,6 +251,13 @@ def normalize_plan_draft(
                 required=step.required,
                 depends_on=tuple(key_by_draft_id[value] for value in step.depends_on),
                 capability_refs=step.capability_refs,
+                guidance_skill_use_ids=tuple(
+                    dict.fromkeys(
+                        use_id
+                        for name in step.guidance_skill_refs
+                        for use_id in guidance_mapping[name]
+                    )
+                ),
                 expected_output_schema=step.expected_output_schema,
             )
             for step in draft.steps
@@ -262,6 +284,7 @@ def _stable_step_key(index: int, step: DynamicPlanDraftStep) -> str:
             "kind": step.kind,
             "depends_on": list(step.depends_on),
             "capability_refs": list(step.capability_refs),
+            "guidance_skill_refs": list(step.guidance_skill_refs),
         }
     )[:10]
     return f"step_{index:02d}_{digest}"

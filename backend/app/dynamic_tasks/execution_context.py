@@ -51,6 +51,7 @@ class ExecutionContextProjection(BaseModel):
     pending_action: dict[str, Any] | None
     operations: tuple[dict[str, Any], ...]
     input_resources: tuple[dict[str, Any], ...]
+    memory_context: tuple[dict[str, Any], ...] = ()
     attention_refs: tuple[str, ...] = ()
 
 
@@ -205,6 +206,11 @@ def build_execution_context_projection(
                 "ingestion_status": resource.ingestion_status,
             }
             for resource in resources
+        ),
+        memory_context=tuple(
+            dict(item)
+            for item in (instance.context_json or {}).get("memory_context", [])
+            if isinstance(item, dict)
         ),
     )
 

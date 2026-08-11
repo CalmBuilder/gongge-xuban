@@ -26,6 +26,7 @@ from app.db.models import (
     ExecutionArtifact,
     ExecutionPlanRevision,
     ExecutionSignal,
+    GeneralSkillUse,
     AgentEvent,
     ChatSession,
     ConnectionProfile,
@@ -54,6 +55,7 @@ from app.dynamic_tasks.capability_catalog import (
     capability_checksum,
 )
 from app.dynamic_tasks.planner_service import DynamicTaskPlanner
+from app.general_skills.runtime import GeneralSkillRuntimeError, GeneralSkillRuntimeService
 from app.dynamic_tasks.execution_context import build_execution_context_projection
 from app.dynamic_tasks.execution_context import project_result_for_model
 from app.dynamic_tasks.explorer import (
@@ -560,6 +562,7 @@ class DynamicTaskAgent:
                     lease = self.store.renew(lease, ttl_seconds=180)
                     continue
 
+                skill_guidance = self._step_guidance(instance, step_definition)
                 try:
                     usage = self._reserve_explore_model_call(instance, step.step_key)
                 except DynamicTaskAgentError as exc:
@@ -580,6 +583,7 @@ class DynamicTaskAgent:
                         ),
                         observations=observations,
                         remaining_tool_calls=max(0, remaining_tool_calls),
+                        general_skill_guidance=skill_guidance,
                     )
                 except ValueError:
                     self._fail_explore(
@@ -645,6 +649,7 @@ class DynamicTaskAgent:
                     operation_name=capability_ref,
                     request=completed.proposal.arguments,
                     effect_kind="read",
+                    caused_by_skill_use_ids=step_definition.guidance_skill_use_ids,
                     capability_snapshot=snapshot.model_dump(
                         mode="json", exclude={"checksum", "agent_id"}
                     ),
@@ -1119,6 +1124,7 @@ class DynamicTaskAgent:
                 request=arguments,
                 idempotency_policy=IdempotencyPolicy(),
                 effect_kind="external_write",
+                caused_by_skill_use_ids=step_definition.guidance_skill_use_ids,
                 capability_snapshot=snapshot.model_dump(
                     mode="json", exclude={"checksum", "agent_id"}
                 ),
@@ -2301,6 +2307,7 @@ class DynamicTaskAgent:
                 operation_name="knowledge.search",
                 request=arguments,
                 effect_kind="read",
+                caused_by_skill_use_ids=step_definition.guidance_skill_use_ids,
                 capability_snapshot=snapshot.model_dump(
                     mode="json", exclude={"checksum", "agent_id"}
                 ),
@@ -2363,6 +2370,8 @@ class DynamicTaskAgent:
         source_kind: str = "chat",
         input_resource_ids: Sequence[str] = (),
         knowledge_capability: dict[str, object] | None = None,
+        forced_general_skill_id: str | None = None,
+        memory_context: Sequence[Mapping[str, object]] = (),
     ) -> tuple[SopInstance, bool]:
         """经模型 preflight、实时能力目录和有界规划创建或复用统一动态 Execution。"""
 
@@ -2401,10 +2410,7 @@ class DynamicTaskAgent:
         )
         if not goal.strip() or not criteria:
             raise DynamicTaskAgentError("DYNAMIC_TASK_CONTRACT_INCOMPLETE")
-        planner = self.planner or DynamicTaskPlanner(
-            LLMClient(verified_model),
-            explore_enabled=self.explore_enabled,
-        )
+        memory_projection = self._memory_projection(memory_context)
         resources: list[ManagedInputResource] = []
         for resource_id in dict.fromkeys(input_resource_ids):
             resource = self.db.get(ManagedInputResource, resource_id)
@@ -2446,23 +2452,114 @@ class DynamicTaskAgent:
             ):
                 return existing, False
             raise DynamicTaskAgentError("DYNAMIC_ACTIVE_EXECUTION_CONFLICT")
-        plan = planner.create_plan(
-            goal=goal.strip(),
-            success_criteria=criteria,
-            capabilities=capabilities,
-            input_resources=tuple(
-                {
-                    "resource_id": resource.id,
-                    "version": resource.version,
-                    "filename": resource.filename,
-                    "mime_type": resource.mime_type,
-                    "size_bytes": resource.size_bytes,
-                    "content_checksum": resource.content_checksum,
-                    "ingestion_status": resource.ingestion_status,
-                }
-                for resource in resources
-            ),
+        planner = self.planner or DynamicTaskPlanner(
+            LLMClient(verified_model),
+            explore_enabled=self.explore_enabled,
         )
+        guidance_catalog = [
+            item for item in capabilities if item.capability_type == "general_skill"
+        ]
+        if forced_general_skill_id:
+            selected_guidance = [
+                item
+                for item in guidance_catalog
+                if item.capability_id == forced_general_skill_id
+            ]
+            if len(selected_guidance) != 1:
+                raise DynamicTaskAgentError("GENERAL_SKILL_NOT_AVAILABLE")
+            guidance_mode = "forced"
+        elif guidance_catalog:
+            selection = planner.select_guidance_skills(
+                goal=goal.strip(),
+                success_criteria=criteria,
+                catalog=guidance_catalog,
+            )
+            selected_by_name = {item.name: item for item in guidance_catalog}
+            selected_guidance = [
+                selected_by_name[name] for name in selection.selected_skill_names
+            ]
+            guidance_mode = "auto"
+        else:
+            selected_guidance = []
+            guidance_mode = "auto"
+        loaded_guidance: list[dict[str, object]] = []
+        loaded_use_ids: list[str] = []
+        actor = self.db.get(User, initiator_user_id) if selected_guidance else None
+        if selected_guidance and (actor is None or actor.tenant_id != tenant_id):
+            raise DynamicTaskAgentError("DYNAMIC_ACTOR_NOT_AVAILABLE")
+        runtime = GeneralSkillRuntimeService(self.db)
+        for selected in selected_guidance:
+            assert actor is not None
+            bundle = runtime.load_bundle(
+                actor,
+                session_id=session_id,
+                agent_id=agent_id,
+                turn_id=source_ref or f"dynamic:{session_id}",
+                skill_id=selected.capability_id,
+                selection_mode=guidance_mode,
+                commit=False,
+            )
+            loaded_use_ids.extend(item.use_id for item in bundle)
+            loaded_guidance.append(
+                {
+                    "name": selected.name,
+                    "skill_use_ids": [item.use_id for item in bundle],
+                    "skills": [item.prompt_block() for item in bundle],
+                }
+            )
+            for loaded in bundle:
+                self.db.add(
+                    AgentEvent(
+                        tenant_id=tenant_id,
+                        session_id=session_id,
+                        event_type="skill_loaded",
+                        payload_json={
+                            "turn_id": source_ref or f"dynamic:{session_id}",
+                            "user_message_id": source_ref or None,
+                            "skill_use_id": loaded.use_id,
+                            "skill_id": loaded.skill_id,
+                            "revision_id": loaded.revision_id,
+                            "selection_mode": loaded.selection_mode,
+                            "consumer": "dynamic_task",
+                        },
+                    )
+                )
+        planning_inputs = tuple(
+            {
+                "resource_id": resource.id,
+                "version": resource.version,
+                "filename": resource.filename,
+                "mime_type": resource.mime_type,
+                "size_bytes": resource.size_bytes,
+                "content_checksum": resource.content_checksum,
+                "ingestion_status": resource.ingestion_status,
+            }
+            for resource in resources
+        )
+        if loaded_guidance:
+            plan = planner.create_plan(
+                goal=goal.strip(),
+                success_criteria=criteria,
+                capabilities=capabilities,
+                input_resources=planning_inputs,
+                loaded_guidance=tuple(loaded_guidance),
+                memory_context=memory_projection,
+            )
+        elif memory_projection:
+            plan = planner.create_plan(
+                goal=goal.strip(),
+                success_criteria=criteria,
+                capabilities=capabilities,
+                input_resources=planning_inputs,
+                memory_context=memory_projection,
+            )
+        else:
+            plan = planner.create_plan(
+                goal=goal.strip(),
+                success_criteria=criteria,
+                capabilities=capabilities,
+                input_resources=planning_inputs,
+            )
         if any(
             step.kind
             not in {"tool.read", "tool.write", "knowledge", "explore", "clarification", "answer"}
@@ -2506,6 +2603,13 @@ class DynamicTaskAgent:
             source_kind=source_kind,
             source_ref=source_ref or session_id,
         )
+        for use_id in loaded_use_ids:
+            use = self.db.get(GeneralSkillUse, use_id)
+            if use is None:
+                raise DynamicTaskAgentError("GENERAL_SKILL_USE_NOT_AVAILABLE")
+            use.execution_id = instance.id
+            use.updated_at = instance.created_at
+            self.db.add(use)
         instance.context_json = {
             **(instance.context_json or {}),
             "dynamic_budget_usage": {
@@ -2515,6 +2619,7 @@ class DynamicTaskAgent:
                 "output_tokens": 0,
                 "total_tokens": 0,
             },
+            "memory_context": list(memory_projection),
         }
         self.db.add(instance)
         self.db.flush()
@@ -2527,6 +2632,34 @@ class DynamicTaskAgent:
                         source_message_id=source_ref,
                     )
         return instance, True
+
+    @staticmethod
+    def _memory_projection(
+        memory_context: Sequence[Mapping[str, object]],
+    ) -> tuple[dict[str, object], ...]:
+        """以有界白名单冻结用户/Agent 记忆，剥离身份、凭据和存储侧带。"""
+
+        projected: list[dict[str, object]] = []
+        blocked_keys = {"token", "secret", "password", "authorization", "api_key"}
+        for raw in memory_context[:20]:
+            content = str(raw.get("content") or "").strip()
+            if not content:
+                continue
+            metadata = raw.get("metadata")
+            safe_metadata = {
+                str(key): value
+                for key, value in (metadata.items() if isinstance(metadata, Mapping) else ())
+                if str(key).casefold() not in blocked_keys
+                and (value is None or isinstance(value, (str, bool, int, float)))
+            }
+            projected.append(
+                {
+                    "kind": str(raw.get("kind") or "fact")[:64],
+                    "content": content[:4000],
+                    "metadata": safe_metadata,
+                }
+            )
+        return tuple(projected)
 
     @staticmethod
     def _knowledge_snapshot(
@@ -2630,6 +2763,11 @@ class DynamicTaskAgent:
                 operation_name=capability_ref,
                 request=proposal.arguments,
                 effect_kind="read",
+                caused_by_skill_use_ids=tuple(
+                    str(value)
+                    for value in step_definition.get("guidance_skill_use_ids", ())
+                    if str(value).strip()
+                ),
                 capability_snapshot=snapshot.model_dump(
                     mode="json", exclude={"checksum", "agent_id"}
                 ),
@@ -3642,6 +3780,7 @@ class DynamicTaskAgent:
         verified_model = self.catalog.require_dynamic_model(instance.tenant_id, model_config.id)
         with self.store.owned(instance, worker_id=worker_id):
             self._assert_runtime_budget(instance)
+            skill_guidance = self._step_guidance(instance, step)
             self._consume_call_budget(instance, "model_calls")
             self.db.commit()
             projection = build_execution_context_projection(
@@ -3658,6 +3797,12 @@ class DynamicTaskAgent:
                 execution_context=projection.model_dump(mode="json"),
                 canonical_messages=[
                     {
+                        "role": "system",
+                        "content": {
+                            "general_skill_guidance": skill_guidance,
+                        },
+                    },
+                    {
                         "role": "user",
                         "content": {
                             "instruction": "请仅为当前计划步骤生成一个受控动作。",
@@ -3673,6 +3818,34 @@ class DynamicTaskAgent:
             self._record_model_usage(instance, completed.usage)
             self.db.commit()
             return completed
+
+    def _step_guidance(
+        self,
+        instance: SopInstance,
+        step: PlanStep,
+    ) -> list[dict[str, object]]:
+        """在每次模型动作前重授权固定 Use，并投影不具有越权能力的指导块。"""
+
+        if not step.guidance_skill_use_ids:
+            return []
+        actor = self.db.get(User, instance.initiator_user_id)
+        if actor is None or actor.tenant_id != instance.tenant_id:
+            raise DynamicTaskAgentError("DYNAMIC_SKILL_ACTOR_NOT_FOUND")
+        try:
+            return [
+                GeneralSkillRuntimeService(self.db)
+                .project_use_for_execution(
+                    actor,
+                    use_id=use_id,
+                    session_id=instance.session_id,
+                    agent_id=instance.agent_id,
+                    execution_id=instance.id,
+                )
+                .prompt_block()
+                for use_id in step.guidance_skill_use_ids
+            ]
+        except GeneralSkillRuntimeError as exc:
+            raise DynamicTaskAgentError(exc.code) from exc
 
     def _provider_input_resources(
         self,

@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -1043,10 +1043,11 @@ class SopExecutionStore:
         effect_kind: str = "read",
         compensates_operation_id: str | None = None,
         caused_by_skill_use_id: str | None = None,
+        caused_by_skill_use_ids: Sequence[str] = (),
         capability_snapshot: Mapping[str, object] | None = None,
         capability_snapshot_checksum: str | None = None,
     ) -> tuple[SopOperation, bool]:
-        """准备稳定逻辑动作，并保留触发它的固定 Skill Use 因果归属。"""
+        """准备稳定逻辑动作，并保留触发它的全部固定 Skill Use 因果归属。"""
 
         self._assert_execution_owner(instance, execution)
         self._guard_mutation(instance, "operation.prepare")
@@ -1058,6 +1059,17 @@ class SopExecutionStore:
         if capability_snapshot_checksum is not None and capability_snapshot_checksum != frozen_checksum:
             raise ValueError("capability snapshot checksum 与规范快照不一致。")
         fingerprint = self.request_fingerprint(request)
+        normalized_skill_use_ids = tuple(
+            dict.fromkeys(
+                value
+                for value in (
+                    str(caused_by_skill_use_id or "").strip(),
+                    *(str(item).strip() for item in caused_by_skill_use_ids),
+                )
+                if value
+            )
+        )
+        primary_skill_use_id = normalized_skill_use_ids[0] if normalized_skill_use_ids else None
         action_id = logical_action_id or self._default_logical_action_id(
             tenant_id=instance.tenant_id,
             instance_id=instance.id,
@@ -1087,7 +1099,9 @@ class SopExecutionStore:
                 or existing.idempotency_scope != policy.scope.value
                 or tuple(existing.idempotency_key_fields_json or ()) != policy.key_fields
                 or existing.compensates_operation_id != compensates_operation_id
-                or existing.caused_by_skill_use_id != caused_by_skill_use_id
+                or existing.caused_by_skill_use_id != primary_skill_use_id
+                or tuple(existing.caused_by_skill_use_ids_json or ())
+                != normalized_skill_use_ids
                 or dict(existing.capability_snapshot_json or {}) != frozen_capability
                 or existing.capability_checksum != frozen_checksum
             ):
@@ -1128,7 +1142,8 @@ class SopExecutionStore:
             idempotency_key_fields_json=list(policy.key_fields),
             effect_kind=effect_kind,
             compensates_operation_id=compensates_operation_id,
-            caused_by_skill_use_id=caused_by_skill_use_id,
+            caused_by_skill_use_id=primary_skill_use_id,
+            caused_by_skill_use_ids_json=list(normalized_skill_use_ids),
             request_json=dict(request),
             capability_snapshot_json=frozen_capability,
             capability_checksum=frozen_checksum,
@@ -1148,6 +1163,7 @@ class SopExecutionStore:
         request: Mapping[str, object],
         idempotency_policy: IdempotencyPolicy | None = None,
         effect_kind: str = "read",
+        caused_by_skill_use_ids: Sequence[str] = (),
         capability_snapshot: Mapping[str, object] | None = None,
         capability_snapshot_checksum: str | None = None,
     ) -> tuple[SopOperation, bool]:
@@ -1185,6 +1201,7 @@ class SopExecutionStore:
             logical_action_id=f"proposal:{proposal.id}",
             idempotency_policy=idempotency_policy,
             effect_kind=effect_kind,
+            caused_by_skill_use_ids=caused_by_skill_use_ids,
             capability_snapshot=capability_snapshot,
             capability_snapshot_checksum=capability_snapshot_checksum,
         )
@@ -1213,14 +1230,22 @@ class SopExecutionStore:
         self.db.flush()
 
     def _authorize_skill_caused_operation(self, operation: SopOperation) -> None:
-        """按 Operation 快照、执行归属和直接 Use 父链执行最后一道收窄授权。"""
+        """按 Operation 快照、执行归属和全部 Use 父链执行最后一道收窄授权。"""
 
-        use_id = str(operation.caused_by_skill_use_id or "").strip()
-        if not use_id:
+        explicit_use_ids = tuple(operation.caused_by_skill_use_ids_json or ())
+        use_ids = tuple(
+            dict.fromkeys(
+                str(value).strip()
+                for value in (
+                    *(operation.caused_by_skill_use_ids_json or ()),
+                    operation.caused_by_skill_use_id or "",
+                )
+                if str(value).strip()
+            )
+        )
+        if not use_ids:
             return
-        use = self.db.get(GeneralSkillUse, use_id)
         instance = self.db.get(SopInstance, operation.instance_id)
-        actor = self.db.get(User, use.user_id) if use is not None else None
         snapshot = dict(operation.capability_snapshot_json or {})
         snapshot_type = str(snapshot.get("capability_type") or "")
         if snapshot_type == "tool":
@@ -1232,17 +1257,13 @@ class SopExecutionStore:
                 if isinstance(audit_view, dict)
                 else ""
             )
+        elif snapshot_type == "knowledge":
+            action = str(snapshot.get("name") or "").strip()
         else:
             action = ""
         if (
-            use is None
-            or instance is None
-            or actor is None
-            or use.tenant_id != operation.tenant_id
+            instance is None
             or instance.tenant_id != operation.tenant_id
-            or use.session_id != instance.session_id
-            or use.agent_id != instance.agent_id
-            or use.user_id != instance.initiator_user_id
             or not action
         ):
             raise SopExecutionSkillAuthorizationError(
@@ -1254,18 +1275,34 @@ class SopExecutionStore:
             GeneralSkillRuntimeService,
         )
 
-        try:
-            GeneralSkillRuntimeService(self.db).authorize_tool_for_use(
-                actor,
-                use_id=use.id,
-                tool_name=action,
-                baseline_tools={action},
-            )
-        except GeneralSkillRuntimeError as exc:
-            raise SopExecutionSkillAuthorizationError(
-                "Skill 未授权本次工具动作。",
-                authorization_code=exc.code,
-            ) from exc
+        for use_id in use_ids:
+            use = self.db.get(GeneralSkillUse, use_id)
+            actor = self.db.get(User, use.user_id) if use is not None else None
+            if (
+                use is None
+                or actor is None
+                or use.tenant_id != operation.tenant_id
+                or use.session_id != instance.session_id
+                or (bool(explicit_use_ids) and use.execution_id != instance.id)
+                or use.agent_id != instance.agent_id
+                or use.user_id != instance.initiator_user_id
+            ):
+                raise SopExecutionSkillAuthorizationError(
+                    "Skill 因果链或执行归属不完整。",
+                    authorization_code="GENERAL_SKILL_TOOL_CAUSE_INVALID",
+                )
+            try:
+                GeneralSkillRuntimeService(self.db).authorize_tool_for_use(
+                    actor,
+                    use_id=use.id,
+                    tool_name=action,
+                    baseline_tools={action},
+                )
+            except GeneralSkillRuntimeError as exc:
+                raise SopExecutionSkillAuthorizationError(
+                    "Skill 未授权本次工具动作。",
+                    authorization_code=exc.code,
+                ) from exc
 
     def authorize_external_operation_dispatch(
         self,

@@ -66,6 +66,9 @@ def test_s3_mysql_runtime_load_is_idempotent_and_mute_is_durable(
     assert "caused_by_skill_use_id" in {
         column["name"] for column in inspect(engine).get_columns("sop_operations")
     }
+    assert "caused_by_skill_use_ids_json" in {
+        column["name"] for column in inspect(engine).get_columns("sop_operations")
+    }
     markdown = "# MySQL S3\nFollow reviewed guidance."
     resource_checksum = hashlib.sha256(markdown.encode()).hexdigest()
     with Session(engine) as db:

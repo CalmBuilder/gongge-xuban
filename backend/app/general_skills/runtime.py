@@ -258,8 +258,9 @@ class GeneralSkillRuntimeService:
         skill_id: str,
         selection_mode: Literal["auto", "forced", "dependency"],
         parent_skill_use_id: str | None = None,
+        commit: bool = True,
     ) -> LoadedGeneralSkill:
-        """在模型运行前固定 revision、校验对象和预算，并幂等写入 active Use。"""
+        """在模型运行前固定 revision、校验预算并按调用方事务边界写入 active Use。"""
 
         items = self.session_catalog(current_user, session_id=session_id, agent_id=agent_id)
         item = next((candidate for candidate in items if candidate.skill_id == skill_id), None)
@@ -320,22 +321,29 @@ class GeneralSkillRuntimeService:
             use.loaded_at = utc_now()
             use.updated_at = use.loaded_at
             self.db.add(use)
-            self.db.commit()
-            self.db.refresh(use)
+            if commit:
+                self.db.commit()
+                self.db.refresh(use)
+            else:
+                self.db.flush()
             return loaded
         except (GeneralSkillRuntimeError, SkillObjectStoreError, UnicodeDecodeError) as exc:
             use.status = "failed"
             use.invalidation_reason = getattr(exc, "code", "GENERAL_SKILL_STORAGE_UNAVAILABLE")
             use.updated_at = utc_now()
             self.db.add(use)
-            self.db.commit()
+            if commit:
+                self.db.commit()
+            else:
+                self.db.flush()
             if isinstance(exc, GeneralSkillRuntimeError):
                 raise
             raise GeneralSkillRuntimeError(
                 "GENERAL_SKILL_STORAGE_UNAVAILABLE", "reviewed skill content is unavailable", 503
             ) from exc
         except IntegrityError as exc:
-            self.db.rollback()
+            if commit:
+                self.db.rollback()
             raise GeneralSkillRuntimeError(
                 "GENERAL_SKILL_STATE_CONFLICT", "skill load raced with another worker"
             ) from exc
@@ -349,6 +357,7 @@ class GeneralSkillRuntimeService:
         turn_id: str,
         skill_id: str,
         selection_mode: Literal["auto", "forced"],
+        commit: bool = True,
     ) -> tuple[LoadedGeneralSkill, ...]:
         """预检并稳定加载主 Skill 及全部已批准 required 依赖，任一缺口整体拒绝。"""
 
@@ -379,6 +388,7 @@ class GeneralSkillRuntimeService:
                     parent_skill_use_id=(
                         uses_by_skill_id[parent_skill_id] if parent_skill_id is not None else None
                     ),
+                    commit=commit,
                 )
                 uses_by_skill_id[item.skill_id] = row.use_id
                 loaded.append(row)
@@ -391,7 +401,10 @@ class GeneralSkillRuntimeService:
                 use.invalidation_reason = "GENERAL_SKILL_DEPENDENCY_BUNDLE_FAILED"
                 use.updated_at = utc_now()
                 self.db.add(use)
-            self.db.commit()
+            if commit:
+                self.db.commit()
+            else:
+                self.db.flush()
             raise exc
         return tuple(loaded)
 
@@ -541,6 +554,7 @@ class GeneralSkillRuntimeService:
                 "GENERAL_SKILL_DEPENDENCY_NOT_APPROVED",
                 "dependency revision edge is not approved",
             )
+
     def complete(self, use_id: str, *, summary: dict[str, object] | None = None) -> None:
         """把 active Use 幂等结算为 completed，不覆盖已失效终态。"""
 
@@ -554,6 +568,70 @@ class GeneralSkillRuntimeService:
         row.updated_at = row.completed_at
         row.result_summary_json = dict(summary or {})
         self.db.add(row)
+
+    def project_use_for_execution(
+        self,
+        current_user: User,
+        *,
+        use_id: str,
+        session_id: str,
+        agent_id: str,
+        execution_id: str,
+    ) -> LoadedGeneralSkill:
+        """重查执行归属、当前 eligibility 与固定 checksum 后投影已加载指导正文。"""
+
+        use = self.db.get(GeneralSkillUse, use_id)
+        eligible_ids = {
+            item.skill_id
+            for item in self.session_catalog(
+                current_user,
+                session_id=session_id,
+                agent_id=agent_id,
+            )
+        }
+        if (
+            use is None
+            or use.tenant_id != current_user.tenant_id
+            or use.user_id != current_user.id
+            or use.session_id != session_id
+            or use.agent_id != agent_id
+            or use.execution_id != execution_id
+            or use.status not in {"active", "completed"}
+            or use.skill_id not in eligible_ids
+        ):
+            raise GeneralSkillRuntimeError(
+                "GENERAL_SKILL_COUNTERMANDED", "skill use is no longer executable", 409
+            )
+        revision = self.db.get(GeneralSkillRevision, use.revision_id)
+        skill = self.db.get(GeneralSkill, use.skill_id)
+        if (
+            revision is None
+            or skill is None
+            or revision.skill_id != use.skill_id
+            or revision.content_checksum != use.content_checksum
+        ):
+            raise GeneralSkillRuntimeError(
+                "GENERAL_SKILL_REVISION_CONFLICT", "fixed skill revision is unavailable"
+            )
+        instructions = revision.normalized_skill_markdown
+        if len(instructions) > get_settings().general_skill_instruction_char_limit:
+            raise GeneralSkillRuntimeError(
+                "GENERAL_SKILL_BUDGET_EXCEEDED", "skill instructions exceed turn budget"
+            )
+        requested = revision.requested_capabilities_json.get("allowed_tools", [])
+        return LoadedGeneralSkill(
+            use_id=use.id,
+            skill_id=skill.id,
+            revision_id=revision.id,
+            revision_number=revision.revision_number,
+            name=skill.slug,
+            description=skill.description,
+            instructions=instructions,
+            requested_tools=tuple(
+                str(value) for value in requested if isinstance(value, str)
+            ),
+            selection_mode=use.selection_mode,
+        )
 
     def invalidate_unavailable(
         self,

@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from typing import Protocol, Sequence
 
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
 from app.dynamic_tasks.capability_catalog import CapabilitySnapshot
 from app.dynamic_tasks.planning import (
     DynamicPlanDraft,
@@ -24,6 +26,24 @@ class JsonPlanningClient(Protocol):
 
     def generate_json(self, system_prompt: str, user_payload: dict) -> dict:
         """返回完整且可解析的 JSON object，不暴露流式半包。"""
+
+
+class DynamicGuidanceSelection(BaseModel):
+    """保存模型从无正文目录提出、再由服务端校验的动态指导选择。"""
+
+    selected_skill_names: tuple[str, ...] = Field(default=(), max_length=3)
+    reason: str = Field(min_length=1, max_length=1000)
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    @model_validator(mode="after")
+    def validate_unique_names(self) -> "DynamicGuidanceSelection":
+        """拒绝重复或空白名称，避免同一固定修订重复消耗预算。"""
+
+        if any(not value.strip() for value in self.selected_skill_names):
+            raise ValueError("动态指导 Skill 名称不能为空")
+        if len(set(self.selected_skill_names)) != len(self.selected_skill_names):
+            raise ValueError("动态指导 Skill 不得重复")
+        return self
 
 
 class DynamicTaskPlanner:
@@ -54,6 +74,60 @@ class DynamicTaskPlanner:
         self.max_runtime_seconds = max_runtime_seconds
         self.explore_enabled = explore_enabled
 
+    def select_guidance_skills(
+        self,
+        *,
+        goal: str,
+        success_criteria: Sequence[SuccessCriterion],
+        catalog: Sequence[CapabilitySnapshot],
+    ) -> DynamicGuidanceSelection:
+        """仅用无正文目录选择 model-allowed 指导 Skill，并拒绝模型虚构引用。"""
+
+        eligible = [
+            item
+            for item in catalog
+            if item.capability_type == "general_skill"
+            and item.contract.get("invocation_policy") == "model_allowed"
+        ]
+        if not eligible:
+            return DynamicGuidanceSelection(
+                selected_skill_names=(),
+                reason="没有允许模型自动选择的指导 Skill。",
+            )
+        catalog_rows = [
+            {
+                key: item.model_view[key]
+                for key in (
+                    "id",
+                    "slug",
+                    "name",
+                    "description",
+                    "usage_mode",
+                    "revision_id",
+                    "revision_number",
+                )
+                if key in item.model_view
+            }
+            for item in eligible
+        ]
+        raw = self.client.generate_json(
+            _GUIDANCE_SELECTOR_SYSTEM_PROMPT,
+            {
+                "goal": goal,
+                "success_criteria": [item.model_dump(mode="json") for item in success_criteria],
+                "skill_catalog": catalog_rows,
+                "output_contract": {
+                    "selected_skill_names": ["skill_catalog 中的 slug，最多 3 个"],
+                    "reason": "选择原因；不选择时也必须说明",
+                },
+            },
+        )
+        selection = DynamicGuidanceSelection.model_validate(raw)
+        allowed_names = {item.name for item in eligible}
+        if not set(selection.selected_skill_names) <= allowed_names:
+            raise ValueError("动态指导选择引用了目录外或 user-only Skill")
+        return selection
+
     def create_plan(
         self,
         *,
@@ -61,6 +135,8 @@ class DynamicTaskPlanner:
         success_criteria: Sequence[SuccessCriterion],
         capabilities: Sequence[CapabilitySnapshot],
         input_resources: Sequence[dict[str, object]] = (),
+        loaded_guidance: Sequence[dict[str, object]] = (),
+        memory_context: Sequence[dict[str, object]] = (),
     ) -> NormalizedPlan:
         """生成完整草案并覆盖目标/成功标准，防止模型改写用户任务契约。"""
 
@@ -89,6 +165,8 @@ class DynamicTaskPlanner:
             "success_criteria": [item.model_dump(mode="json") for item in success_criteria],
             "output_contract": _planner_output_contract(allowed_step_kinds),
             "capabilities": [snapshot.model_view for snapshot in executable_capabilities],
+            "loaded_guidance": [dict(item) for item in loaded_guidance],
+            "memory_context": [dict(item) for item in memory_context],
             "input_resources": [dict(item) for item in input_resources],
             "limits": {
                 "max_steps": self.max_steps,
@@ -111,6 +189,15 @@ class DynamicTaskPlanner:
                 "success_criteria": tuple(success_criteria),
             }
         )
+        guidance_use_ids_by_name = {
+            str(item.get("name") or ""): tuple(
+                str(use_id)
+                for use_id in item.get("skill_use_ids", ())
+                if str(use_id).strip()
+            )
+            for item in loaded_guidance
+            if str(item.get("name") or "").strip()
+        }
         plan = normalize_plan_draft(
             draft,
             max_steps=self.max_steps,
@@ -120,7 +207,13 @@ class DynamicTaskPlanner:
             max_output_tokens=self.max_output_tokens,
             max_total_tokens=self.max_total_tokens,
             max_runtime_seconds=self.max_runtime_seconds,
+            guidance_use_ids_by_name=guidance_use_ids_by_name,
         )
+        referenced_guidance = {
+            reference for step in draft.steps for reference in step.guidance_skill_refs
+        }
+        if referenced_guidance != set(guidance_use_ids_by_name):
+            raise ValueError("已加载指导 Skill 必须且只能由计划步骤显式引用")
         _validate_plan_capabilities(plan, executable_capabilities)
         _validate_plan_convergence(plan)
         return plan
@@ -135,6 +228,10 @@ draft_id 只用于本次草案依赖，持久 step key 由服务端生成。
 计划必须有界、无环并覆盖成功标准；必须且只能有一个最终 answer 步骤，所有 required 步骤都必须是该
 answer 的直接或间接前置，answer 之后不得再有步骤。"""
 
+_GUIDANCE_SELECTOR_SYSTEM_PROMPT = """你是共格·序伴的动态任务指导选择器。只输出一个 JSON object。
+你只能按 goal、success_criteria 和无正文 skill_catalog 判断是否需要指导；不得虚构名称、请求正文、工具或权限。
+只选择能实质改变任务执行纪律的 Skill，最多 3 个；没有必要时返回空数组。"""
+
 _PLANNER_OUTPUT_CONTRACT = {
     "goal": "原样返回输入 goal",
     "success_criteria": "原样返回输入 success_criteria 数组",
@@ -148,6 +245,7 @@ _PLANNER_OUTPUT_CONTRACT = {
             "required": True,
             "depends_on": ["已声明 draft_id"],
             "capability_refs": ["输入 capabilities 中的 name"],
+            "guidance_skill_refs": ["输入 loaded_guidance 中的 name"],
             "expected_output_schema": {},
         }
     ],

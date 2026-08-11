@@ -77,6 +77,7 @@ class ReadOnlyExploreProposer:
         capabilities: Sequence[CapabilitySnapshot],
         observations: Sequence[Mapping[str, object]],
         remaining_tool_calls: int,
+        general_skill_guidance: Sequence[Mapping[str, object]] = (),
     ) -> CompletedProviderProposal:
         """只披露本 Step 安全能力和已投影回执，并校验动作不能越界或递归。"""
 
@@ -102,6 +103,7 @@ class ReadOnlyExploreProposer:
                 },
                 "capabilities": [allowed[name].model_view for name in step.capability_refs],
                 "observations": [dict(item) for item in observations],
+                "general_skill_guidance": [dict(item) for item in general_skill_guidance],
                 "limits": {
                     "remaining_tool_calls": remaining_tool_calls,
                     "recursion_allowed": False,
