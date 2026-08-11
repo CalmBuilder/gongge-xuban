@@ -22,9 +22,14 @@ from pathlib import Path
 
 FRONTEND_DIR = Path(__file__).resolve().parents[1]
 BACKEND_DIR = FRONTEND_DIR.parent / "backend"
-E2E_PORT = 5148
+E2E_PORT = int(os.environ.get("FULLSTACK_E2E_PORT", "5148"))
 E2E_SECRET = "fullstack-e2e-isolated-secret-at-least-32-bytes"
-E2E_RUNTIME_DIR = Path(tempfile.gettempdir()) / "gongge-fullstack-e2e-current"
+E2E_RUNTIME_DIR = Path(
+    os.environ.get(
+        "FULLSTACK_E2E_RUNTIME_DIR",
+        str(Path(tempfile.gettempdir()) / "gongge-fullstack-e2e-current"),
+    )
+)
 
 REFUND_BACKEND_BASELINE = """\
 HIGH_AMOUNT_THRESHOLD = 10000
@@ -2579,16 +2584,22 @@ def seed_pagination_browser_fixtures() -> None:
 def main() -> None:
     """启动临时全栈服务，并确保普通与大组织浏览器夹具都可用。"""
 
-    shutil.rmtree(E2E_RUNTIME_DIR, ignore_errors=True)
-    E2E_RUNTIME_DIR.mkdir(mode=0o700)
-    configure_environment(E2E_RUNTIME_DIR / "e2e.sqlite3")
-    seed_e2e_fixtures()
-    seed_managed_workspace_browser_fixture()
-    seed_schedule_dynamic_model()
-    seed_dynamic_task_browser_fixtures()
-    seed_connection_browser_fixtures()
-    seed_pagination_browser_fixtures()
-    seed_large_organization_browser_fixture()
+    reuse_runtime = os.environ.get("FULLSTACK_E2E_REUSE_RUNTIME") == "1"
+    database_path = E2E_RUNTIME_DIR / "e2e.sqlite3"
+    if reuse_runtime and not database_path.is_file():
+        raise RuntimeError("FULLSTACK_E2E_REUSE_RUNTIME requires an existing database")
+    if not reuse_runtime:
+        shutil.rmtree(E2E_RUNTIME_DIR, ignore_errors=True)
+        E2E_RUNTIME_DIR.mkdir(mode=0o700)
+    configure_environment(database_path)
+    if not reuse_runtime:
+        seed_e2e_fixtures()
+        seed_managed_workspace_browser_fixture()
+        seed_schedule_dynamic_model()
+        seed_dynamic_task_browser_fixtures()
+        seed_connection_browser_fixtures()
+        seed_pagination_browser_fixtures()
+        seed_large_organization_browser_fixture()
     install_connection_service_override()
     install_general_skill_remote_fetcher_override()
     install_schedule_llm_override()
