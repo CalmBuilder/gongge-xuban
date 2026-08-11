@@ -19,6 +19,7 @@ from app.config import get_settings
 from app.db import engine
 from app.db.models import ExecutionCommand, ExecutionSignal, ModelConfig, SopInstance, SopWorkItem
 from app.dynamic_tasks.agent import DynamicRunOutcome, DynamicTaskAgent, DynamicTaskAgentError
+from app.dynamic_tasks.capability_catalog import CapabilityAccessDenied
 from app.dynamic_tasks.quotas import (
     DynamicTaskQuotaError,
     DynamicTaskQuotaService,
@@ -252,7 +253,7 @@ def _stable_signal_error_code(exc: Exception) -> str:
     explicit_code = getattr(exc, "code", None)
     if isinstance(explicit_code, str) and explicit_code.strip():
         return explicit_code.strip()[:128]
-    if isinstance(exc, DynamicTaskAgentError) and exc.args:
+    if isinstance(exc, (DynamicTaskAgentError, CapabilityAccessDenied)) and exc.args:
         domain_code = str(exc.args[0]).strip()
         if domain_code:
             return domain_code[:128]

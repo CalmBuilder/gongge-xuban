@@ -27,7 +27,7 @@ const CODE_SKILL_MARKDOWN = [
   'description: S4 代码交付必须先读、审批写入、隔离回归、审批提交并形成证据。',
   'allowed-tools:',
   '  - workspace.refund.read',
-  '  - workspace.refund.apply',
+  '  - workspace.refund.apply-set',
   '  - workspace.refund.check',
   '  - workspace.refund.commit',
   '---',
@@ -35,6 +35,11 @@ const CODE_SKILL_MARKDOWN = [
   'S4-CODE-FULL-GUIDANCE：代码交付必须使用受管工作区工具，不得执行 Skill 包脚本。',
   '',
 ].join('\n');
+const CODE_DENY_SKILL_NAME = 's4-code-deny-guidance';
+const CODE_DENY_SKILL_MARKDOWN = CODE_SKILL_MARKDOWN.replace(
+  `name: ${CODE_SKILL_NAME}`,
+  `name: ${CODE_DENY_SKILL_NAME}`,
+);
 
 async function loginAsMember(page: Page) {
   /** 通过真实认证 API 登录并固定成员自己的数字员工。 */
@@ -103,7 +108,11 @@ async function importDynamicGuidance(page: Page) {
   expect((await confirmed).status()).toBe(200);
 }
 
-async function importCodeGuidance(page: Page) {
+async function importCodeGuidance(
+  page: Page,
+  skillName = CODE_SKILL_NAME,
+  markdown = CODE_SKILL_MARKDOWN,
+) {
   /** 经同一安全导入 UI 固定代码交付 Skill 与四项非扩权工具声明。 */
 
   await page.goto('/enterprise/general-skills');
@@ -113,11 +122,11 @@ async function importCodeGuidance(page: Page) {
   await dialog.locator('input[type="file"]').setInputFiles({
     name: 'SKILL.md',
     mimeType: 'text/markdown',
-    buffer: Buffer.from(CODE_SKILL_MARKDOWN),
+    buffer: Buffer.from(markdown),
   });
   await dialog.getByRole('button', { name: '生成安全预览' }).click();
-  await expect(dialog.getByText(CODE_SKILL_NAME, { exact: true })).toBeVisible();
-  await expect(dialog.getByText(/workspace\.refund\.apply/)).toBeVisible();
+  await expect(dialog.getByText(skillName, { exact: true })).toBeVisible();
+  await expect(dialog.getByText(/workspace\.refund\.apply-set/)).toBeVisible();
   await dialog.getByRole('button', { name: '固定版本并绑定' }).click();
   await expect(dialog).not.toBeVisible();
 }
@@ -213,11 +222,11 @@ test('S4 动态任务从 Skill 目录到人工澄清、知识 Operation 和结�
 
   await page.goto(`/workspace/chat/${sessionId}`);
   await expect(page.getByRole('main').getByText(/S4-DYNAMIC-GUIDED-SUCCESS/)).toBeVisible({ timeout: 30_000 });
-  await expect(page.getByLabel('动态任务控制')).toContainText('已完成');
+  await expect(page.getByLabel('动态任务控制').filter({ hasText: '已完成' }).last()).toBeVisible();
   expect(failures).toEqual([]);
 });
 
-test('S4 研发交付数字员工经三次独立审批完成真实补丁、容器回归和 Git 提交', async ({ page }) => {
+test('S4 研发交付数字员工经五次独立审批完成迁移、后端前端回归和 Git 提交', async ({ page }) => {
   test.setTimeout(120_000);
   const failures: string[] = [];
   page.on('pageerror', (error) => failures.push(error.message));
@@ -273,7 +282,13 @@ test('S4 研发交付数字员工经三次独立审批完成真实补丁、容�
   expect(executionId).not.toBe('');
 
   await loginAsAdmin(page);
-  for (const title of ['批准受管代码工作区变更', '批准受管代码工作区执行检查', '批准受管代码工作区变更']) {
+  for (const title of [
+    '批准受管代码工作区执行检查',
+    '批准受管代码工作区变更',
+    '批准受管代码工作区执行检查',
+    '批准受管代码工作区执行检查',
+    '批准受管代码工作区变更',
+  ]) {
     await page.goto('/enterprise/work-items');
     const card = page.getByRole('button', { name: new RegExp(title) }).first();
     await expect(card).toBeVisible({ timeout: 30_000 });
@@ -296,14 +311,101 @@ test('S4 研发交付数字员工经三次独立审批完成真实补丁、容�
     const response = await fetch(`/api/enterprise/traces/${sessionId}?tenant_id=tenant_demo`, {
       headers: { Authorization: `Bearer ${auth.token}` },
     });
-    const trace = await response.json() as { sop_runtime?: Array<{ instance_id: string }> };
+    const trace = await response.json() as {
+      sop_runtime?: Array<{
+        instance_id: string;
+        operations?: Array<{
+          operation_name: string;
+          request?: Record<string, unknown>;
+          result?: { data?: Record<string, unknown> };
+        }>;
+      }>;
+    };
     return trace.sop_runtime?.find((item) => item.instance_id === executionId);
   }, { sessionId, executionId });
-  expect(JSON.stringify(details)).toContain('commit_sha');
-  expect(JSON.stringify(details)).toContain('backend-unit');
-  expect(JSON.stringify(details)).toContain('"passed":true');
+  const operations = details?.operations || [];
+  const checks = operations.filter((item) => item.operation_name === 'workspace.refund.check');
+  expect(checks.map((item) => item.request?.profile)).toEqual([
+    'backend-red',
+    'backend-unit',
+    'frontend-unit',
+  ]);
+  expect(checks[0]?.result?.data).toMatchObject({
+    exit_code: 1,
+    passed: true,
+    expected_exit_codes: [1],
+  });
+  expect(checks.slice(1).map((item) => item.result?.data?.exit_code)).toEqual([0, 0]);
+  expect(
+    operations.find((item) => item.operation_name === 'workspace.refund.apply-set')?.result?.data,
+  ).toMatchObject({ changed_count: 3, replayed: false });
+  expect(
+    operations.find((item) => item.operation_name === 'workspace.refund.commit')?.result?.data,
+  ).toMatchObject({ replayed: false });
 
   await page.goto(`/workspace/chat/${sessionId}`);
   await expect(page.getByRole('main').getByText(/S4-CODE-DELIVERY-SUCCESS/)).toBeVisible({ timeout: 30_000 });
   expect(failures).toEqual([]);
+});
+
+test('S4 受管代码写入被独立管理员拒绝后零写入并稳定终止', async ({ page }) => {
+  test.setTimeout(90_000);
+  await loginAsMember(page);
+  await importCodeGuidance(page, CODE_DENY_SKILL_NAME, CODE_DENY_SKILL_MARKDOWN);
+  const started = await page.evaluate(async () => {
+    const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
+    const sessionResponse = await fetch('/api/chat/sessions', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${auth.token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        tenant_id: 'tenant_demo',
+        agent_id: 'agent_e2e_member_employee',
+        title: 'S4 受管代码拒绝',
+        origin: 'owned',
+      }),
+    });
+    const session = await sessionResponse.json() as { id: string };
+    const response = await fetch('/api/chat/stream', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${auth.token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        tenant_id: 'tenant_demo',
+        session_id: session.id,
+        agent_id: 'agent_e2e_member_employee',
+        client_turn_id: 'turn_s4_code_denied',
+        message: 'S4代码拒绝：尝试修改高金额退款规则，但本次管理员必须拒绝写入',
+        channel: 'web',
+      }),
+    });
+    const body = await response.text();
+    const executionId = body.match(/"execution_id":\s*"([^"]+)"/)?.[1] || '';
+    return { status: response.status, executionId };
+  });
+  expect(started.status).toBe(200);
+  expect(started.executionId).not.toBe('');
+
+  await loginAsAdmin(page);
+  await page.goto('/enterprise/work-items');
+  const redCheck = page.getByRole('button', { name: /批准受管代码工作区执行检查/ }).first();
+  await expect(redCheck).toBeVisible({ timeout: 30_000 });
+  await redCheck.click();
+  await page.getByRole('dialog').getByRole('button', { name: '仅批准本次操作' }).click();
+  await page.goto('/enterprise/work-items');
+  const card = page.getByRole('button', { name: /批准受管代码工作区变更/ }).first();
+  await expect(card).toBeVisible({ timeout: 30_000 });
+  await card.click();
+  await page.getByRole('dialog').getByRole('button', { name: '拒绝操作' }).click();
+
+  await loginAsMember(page);
+  await expect.poll(async () => page.evaluate(async (executionId) => {
+    const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
+    const response = await fetch(`/api/executions/${executionId}?tenant_id=tenant_demo`, {
+      headers: { Authorization: `Bearer ${auth.token}` },
+    });
+    return response.json();
+  }, started.executionId), { timeout: 30_000 }).toMatchObject({
+    status: 'failed',
+    terminal_reason: { code: 'DYNAMIC_LOCAL_DENIED' },
+    usage: { tool_calls: 2 },
+  });
 });

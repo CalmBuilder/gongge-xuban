@@ -1,3 +1,4 @@
+import subprocess
 import sys
 from pathlib import Path
 
@@ -40,6 +41,95 @@ def _member_user() -> User:
 
 def probe_tool(request: ToolProbeRequest, db: Session):  # noqa: ANN201
     return _probe_tool(request, db, _member_user())
+
+
+def test_managed_workspace_tool_requires_admin_and_valid_local_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证受管多文件工具只能由租户管理员为实际存在的本地仓库发布。"""
+
+    root = tmp_path / "managed"
+    repo = root / "tenant_demo" / "refund-demo"
+    repo.mkdir(parents=True)
+    subprocess.run(["git", "-C", str(repo), "init", "-b", "main"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "robot@example.invalid"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.name", "Workspace Robot"], check=True
+    )
+    (repo / "README.md").write_text("test workspace\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "baseline"], check=True)
+    settings = get_settings()
+    monkeypatch.setattr(settings, "dynamic_task_managed_workspace_root", str(root))
+    request = ToolCreateRequest.model_validate(
+        {
+            "tenant_id": "tenant_demo",
+            "name": "workspace.refund.apply-set",
+            "tool_type": "managed_workspace",
+            "method": "POST",
+            "url": "",
+            "mcp_config": {
+                "workspace_id": "refund-demo",
+                "base_ref": "main",
+                "handler": "apply_files",
+            },
+            "input_schema": {
+                "type": "object",
+                "properties": {"changes": {"type": "array", "items": {"type": "object"}}},
+                "required": ["changes"],
+            },
+            "output_schema": {
+                "type": "object",
+                "properties": {
+                    "files": {"type": "array"},
+                    "changed_count": {"type": "integer"},
+                    "branch": {"type": "string"},
+                },
+            },
+            "reliability_contract": {
+                "risk_class": "local_write",
+                "side_effect": "local",
+                "confirmation_policy": "once",
+                "idempotency": {"mode": "none"},
+                "reconcile": {"supported": False},
+                "model_visibility": {
+                    "allowed_paths": [
+                        "input.changes",
+                        "output.files",
+                        "output.changed_count",
+                        "output.branch",
+                    ],
+                    "user_display_paths": ["output.files", "output.branch"],
+                    "audit_only_paths": [],
+                },
+                "timeout_policy": "failed",
+                "dynamic_task_enabled": True,
+            },
+        }
+    )
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.add(
+            AgentProfile(
+                id="agent_workspace",
+                tenant_id="tenant_demo",
+                owner_user_id="user_member",
+                name="Workspace Agent",
+            )
+        )
+        db.commit()
+        with pytest.raises(HTTPException) as denied:
+            create_tool(request, "agent_workspace", db, current_user=_member_user())
+        db.rollback()
+        created = create_tool(request, "agent_workspace", db, current_user=_admin_user())
+
+        assert denied.value.status_code == 403
+        assert created.tool_type == "managed_workspace"
+        assert created.reliability_contract is not None
+        assert created.reliability_contract.risk_class == "local_write"
 
 
 def test_delete_tool_removes_tenant_tool() -> None:

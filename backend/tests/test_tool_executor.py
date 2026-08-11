@@ -217,6 +217,59 @@ def test_managed_workspace_failed_check_is_not_reported_as_success(monkeypatch) 
         assert result.error.code == "WORKSPACE_CHECK_FAILED"
 
 
+def test_managed_workspace_change_set_rejects_extra_model_arguments(monkeypatch) -> None:
+    """多文件写只能接收冻结 changes，模型不能夹带镜像、命令或工作区根路径。"""
+
+    captured: list[list[dict[str, object]]] = []
+
+    def fake_apply_files(self, **kwargs):  # noqa: ANN001, ANN202
+        """捕获经过执行器严格参数校验后的变更清单。"""
+
+        captured.append(kwargs["changes"])
+        return {"changed_count": 1, "files": [], "branch": "task/exec", "replayed": False}
+
+    monkeypatch.setattr(ManagedCodeWorkspaceService, "apply_files", fake_apply_files)
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_workspace", name="Workspace"))
+        db.add(
+            Tool(
+                tenant_id="tenant_workspace",
+                name="workspace.apply-set",
+                tool_type="managed_workspace",
+                method="POST",
+                url="",
+                config_json={
+                    "workspace_id": "demo",
+                    "base_ref": "main",
+                    "handler": "apply_files",
+                },
+            )
+        )
+        db.commit()
+        executor = ToolExecutor(db)
+        monkeypatch.setattr(executor.settings, "dynamic_task_managed_workspace_enabled", True)
+        changes = [{"path": "a.py", "expected_sha256": None, "content": "A = 1\n"}]
+        accepted = executor.execute(
+            tenant_id="tenant_workspace",
+            tool_call=ToolCall(name="workspace.apply-set", arguments={"changes": changes}),
+            execution_id="exec_workspace_apply_set",
+        )
+        rejected = executor.execute(
+            tenant_id="tenant_workspace",
+            tool_call=ToolCall(
+                name="workspace.apply-set",
+                arguments={"changes": changes, "argv": ["sh", "-c", "id"]},
+            ),
+            execution_id="exec_workspace_apply_set",
+        )
+
+        assert accepted.success is True
+        assert captured == [changes]
+        assert rejected.success is False
+        assert rejected.error is not None
+        assert rejected.error.code == "WORKSPACE_ARGUMENTS_INVALID"
+
+
 def test_execute_stdio_mcp_tool_success() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))

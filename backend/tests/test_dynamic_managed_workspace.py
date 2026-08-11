@@ -19,6 +19,7 @@ from app.agents.branching import ensure_private_resource_binding
 from app.config import get_settings
 from app.db.models import (
     AgentProfile,
+    AgentResourceBinding,
     ChatSession,
     ExecutionSignal,
     ModelConfig,
@@ -29,6 +30,7 @@ from app.db.models import (
     User,
 )
 from app.dynamic_tasks.agent import DynamicTaskAgent
+from app.dynamic_tasks.worker import process_dynamic_task_signal
 from app.dynamic_tasks.capability_catalog import (
     DynamicCapabilityCatalog,
     ToolReliabilityContract,
@@ -483,12 +485,63 @@ def test_dynamic_workspace_write_waits_for_approval_and_resumes_once(
                     ).all()
                     if signal.payload_json.get("attention_id") == attention.id
                 )
-                completed = dynamic.resume_tool_approval_signal(
-                    signal_id=last_signal.id,
-                    model_config=model,
-                    worker_id=f"workspace-dispatch-{index}",
-                    actor_user_id=approver.id,
-                )
+                if index == 0:
+                    dynamic = DynamicTaskAgent(
+                        db,
+                        action_proposer=_WorkspaceProposer(before_sha),
+                    )
+                if index == 1:
+                    check_binding = db.exec(
+                        select(AgentResourceBinding).where(
+                            AgentResourceBinding.tenant_id == tenant.id,
+                            AgentResourceBinding.agent_id == agent.id,
+                            AgentResourceBinding.resource_type == "tool",
+                            AgentResourceBinding.resource_id == tools[2].id,
+                        )
+                    ).one()
+                    check_binding.status = "inactive"
+                    db.add(check_binding)
+                    db.commit()
+                    assert process_dynamic_task_signal(
+                        db,
+                        last_signal,
+                        agent_factory=lambda session: DynamicTaskAgent(
+                            session,
+                            action_proposer=_WorkspaceProposer(before_sha),
+                        ),
+                    ) is None
+                    db.refresh(last_signal)
+                    assert last_signal.status == "pending"
+                    assert last_signal.last_error_json == {
+                        "code": "CAPABILITY_BINDING_REVOKED"
+                    }
+                    ensure_private_resource_binding(
+                        db,
+                        tenant.id,
+                        agent.id,
+                        "tool",
+                        tools[2].id,
+                        "active",
+                    )
+                    last_signal.available_at = SopExecutionStore(db).database_now()
+                    db.add(last_signal)
+                    db.commit()
+                    completed = process_dynamic_task_signal(
+                        db,
+                        last_signal,
+                        agent_factory=lambda session: DynamicTaskAgent(
+                            session,
+                            action_proposer=_WorkspaceProposer(before_sha),
+                        ),
+                    )
+                    assert completed is not None
+                else:
+                    completed = dynamic.resume_tool_approval_signal(
+                        signal_id=last_signal.id,
+                        model_config=model,
+                        worker_id=f"workspace-dispatch-{index}",
+                        actor_user_id=approver.id,
+                    )
                 assert completed.status == ("waiting" if index < 2 else "succeeded")
             assert last_signal is not None
             replay = dynamic.resume_tool_approval_signal(

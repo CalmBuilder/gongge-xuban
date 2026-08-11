@@ -25,6 +25,7 @@ _CONTAINER_IMAGE_PATTERN = re.compile(
 )
 _ALLOWED_CHECK_EXECUTABLES = frozenset({"python", "python3", "pytest", "ruff", "npm", "node"})
 _MAX_TEXT_BYTES = 512 * 1024
+_MAX_CHANGE_SET_BYTES = 2 * 1024 * 1024
 _MAX_CHECK_OUTPUT_BYTES = 128 * 1024
 
 
@@ -139,6 +140,8 @@ class ManagedCodeWorkspaceService:
         image = str(definition.get("image") or "")
         raw_argv = definition.get("argv")
         timeout_seconds = int(definition.get("timeout_seconds") or 0)
+        raw_expected_exit_codes = definition.get("expected_exit_codes", [0])
+        required_output = definition.get("required_output_substrings", [])
         if (
             not _CONTAINER_IMAGE_PATTERN.fullmatch(image)
             or not isinstance(raw_argv, Sequence)
@@ -146,6 +149,19 @@ class ManagedCodeWorkspaceService:
             or not raw_argv
             or timeout_seconds < 1
             or timeout_seconds > 1800
+            or not isinstance(raw_expected_exit_codes, list)
+            or not raw_expected_exit_codes
+            or len(raw_expected_exit_codes) > 16
+            or any(
+                not isinstance(code, int) or isinstance(code, bool) or code < 0 or code > 255
+                for code in raw_expected_exit_codes
+            )
+            or not isinstance(required_output, list)
+            or len(required_output) > 10
+            or any(
+                not isinstance(value, str) or not value or len(value) > 200
+                for value in required_output
+            )
         ):
             raise ManagedCodeWorkspaceError("WORKSPACE_CHECK_PROFILE_INVALID")
         argv = [str(value) for value in raw_argv]
@@ -184,13 +200,104 @@ class ManagedCodeWorkspaceService:
                 raise ManagedCodeWorkspaceError("WORKSPACE_CHECK_TIMEOUT") from exc
             stdout = self._bounded_output(completed.stdout)
             stderr = self._bounded_output(completed.stderr)
+            expected_exit_codes = sorted(set(raw_expected_exit_codes))
+            output = f"{stdout}\n{stderr}"
             return {
                 "profile": profile,
                 "branch": branch,
                 "exit_code": completed.returncode,
-                "passed": completed.returncode == 0,
+                "passed": completed.returncode in expected_exit_codes
+                and all(value in output for value in required_output),
+                "expected_exit_codes": expected_exit_codes,
+                "required_output_substrings": list(required_output),
                 "stdout": stdout,
                 "stderr": stderr,
+            }
+
+    def apply_files(
+        self,
+        *,
+        tenant_id: str,
+        workspace_id: str,
+        execution_id: str,
+        changes: Sequence[Mapping[str, object]],
+        base_ref: str = "main",
+    ) -> dict[str, object]:
+        """预检整组新增/更新后原子替换，失败时恢复已替换文件且不接受删除。"""
+
+        if (
+            not changes
+            or len(changes) > 50
+            or isinstance(changes, (str, bytes))
+        ):
+            raise ManagedCodeWorkspaceError("WORKSPACE_CHANGE_SET_INVALID")
+        repo = self._repository(tenant_id, workspace_id)
+        with self._exclusive_lock(repo):
+            branch = self._ensure_task_branch(repo, execution_id, base_ref=base_ref)
+            prepared: list[tuple[Path, bytes | None, bytes, int]] = []
+            seen: set[str] = set()
+            total_bytes = 0
+            for raw_change in changes:
+                if not isinstance(raw_change, Mapping) or set(raw_change) != {
+                    "path",
+                    "expected_sha256",
+                    "content",
+                }:
+                    raise ManagedCodeWorkspaceError("WORKSPACE_CHANGE_SET_INVALID")
+                raw_path = str(raw_change.get("path") or "")
+                content = str(raw_change.get("content") or "")
+                expected = raw_change.get("expected_sha256")
+                target = self._safe_file(repo, raw_path, must_exist=False)
+                relative = target.relative_to(repo).as_posix()
+                if relative in seen or not target.parent.is_dir():
+                    raise ManagedCodeWorkspaceError("WORKSPACE_CHANGE_SET_INVALID")
+                seen.add(relative)
+                encoded = content.encode("utf-8")
+                total_bytes += len(encoded)
+                if len(encoded) > _MAX_TEXT_BYTES or total_bytes > _MAX_CHANGE_SET_BYTES:
+                    raise ManagedCodeWorkspaceError("WORKSPACE_FILE_TOO_LARGE")
+                if target.exists():
+                    if not target.is_file():
+                        raise ManagedCodeWorkspaceError("WORKSPACE_FILE_NOT_FOUND")
+                    current = target.read_bytes()
+                    if encoded != current and (
+                        not isinstance(expected, str)
+                        or not re.fullmatch(r"[0-9a-f]{64}", expected)
+                        or hashlib.sha256(current).hexdigest() != expected
+                    ):
+                        raise ManagedCodeWorkspaceError("WORKSPACE_CONTENT_CHANGED")
+                    prepared.append((target, current, encoded, target.stat().st_mode & 0o777))
+                else:
+                    if expected is not None:
+                        raise ManagedCodeWorkspaceError("WORKSPACE_CREATE_PRECONDITION_INVALID")
+                    prepared.append((target, None, encoded, 0o644))
+            replaced: list[tuple[Path, bytes | None, int]] = []
+            try:
+                for target, current, encoded, mode in prepared:
+                    if current == encoded:
+                        continue
+                    self._atomic_replace(target, encoded, mode=mode)
+                    replaced.append((target, current, mode))
+            except (OSError, ManagedCodeWorkspaceError) as exc:
+                for target, current, mode in reversed(replaced):
+                    if current is None:
+                        target.unlink(missing_ok=True)
+                    else:
+                        self._atomic_replace(target, current, mode=mode)
+                raise ManagedCodeWorkspaceError("WORKSPACE_CHANGE_SET_WRITE_FAILED") from exc
+            return {
+                "branch": branch,
+                "files": [
+                    {
+                        "path": target.relative_to(repo).as_posix(),
+                        "sha256": hashlib.sha256(encoded).hexdigest(),
+                        "changed": current != encoded,
+                        "created": current is None,
+                    }
+                    for target, current, encoded, _mode in prepared
+                ],
+                "changed_count": len(replaced),
+                "replayed": not replaced,
             }
 
     def commit(
@@ -258,6 +365,22 @@ class ManagedCodeWorkspaceService:
         if not (resolved / ".git").is_dir():
             raise ManagedCodeWorkspaceError("WORKSPACE_GIT_REQUIRED")
         return resolved
+
+    @staticmethod
+    def _atomic_replace(target: Path, content: bytes, *, mode: int) -> None:
+        """在目标目录落临时文件并 fsync 后替换，避免暴露半写文件。"""
+
+        descriptor, temporary_name = tempfile.mkstemp(prefix=".gongge-write-", dir=target.parent)
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            temporary.chmod(mode)
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def _safe_file(self, repo: Path, raw_path: str, *, must_exist: bool) -> Path:
         """将模型路径限制为普通相对文件，并逐级拒绝符号链接和 `.git`。"""
@@ -373,16 +496,30 @@ class ManagedCodeWorkspaceService:
     def _run_container(
         command: list[str], *, timeout_seconds: int
     ) -> subprocess.CompletedProcess[str]:
-        """执行已完整构造的 Docker argv；调用方不能注入 shell 字符串。"""
+        """把容器输出直接落临时文件并有界读取，防止恶意测试日志耗尽内存。"""
 
-        return subprocess.run(
-            command,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-            env={"PATH": os.environ.get("PATH", "")},
-        )
+        with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+            process = subprocess.Popen(
+                command,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                env={"PATH": os.environ.get("PATH", "")},
+            )
+            try:
+                return_code = process.wait(timeout=timeout_seconds)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+                raise
+            stdout_file.seek(0)
+            stderr_file.seek(0)
+            stdout = stdout_file.read(_MAX_CHECK_OUTPUT_BYTES + 1).decode(
+                "utf-8", errors="replace"
+            )
+            stderr = stderr_file.read(_MAX_CHECK_OUTPUT_BYTES + 1).decode(
+                "utf-8", errors="replace"
+            )
+        return subprocess.CompletedProcess(command, return_code, stdout, stderr)
 
     @staticmethod
     def _bounded_output(value: str) -> str:

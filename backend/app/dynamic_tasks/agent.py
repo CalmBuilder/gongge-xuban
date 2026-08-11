@@ -2111,7 +2111,7 @@ class DynamicTaskAgent:
             self.store.finish_operation(
                 operation,
                 succeeded=result.success,
-                result={"data": result.data} if result.success else None,
+                result={"data": result.data} if result.data is not None else None,
                 error=(result.error.model_dump(mode="json") if result.error else None),
             )
             if result.success:
@@ -4184,6 +4184,7 @@ class DynamicTaskAgent:
         handler = str(managed.get("handler") or "") if isinstance(managed, Mapping) else ""
         expected = {
             "apply_file": {"path", "expected_sha256", "content"},
+            "apply_files": {"changes"},
             "run_check": {"profile"},
             "commit": {"message", "paths"},
         }.get(handler)
@@ -4195,6 +4196,19 @@ class DynamicTaskAgent:
             or not str(arguments.get("expected_sha256") or "")
         ):
             raise DynamicTaskAgentError("DYNAMIC_LOCAL_ARGUMENTS_INVALID")
+        if handler == "apply_files":
+            changes = arguments.get("changes")
+            if (
+                not isinstance(changes, list)
+                or not changes
+                or len(changes) > 50
+                or any(
+                    not isinstance(change, Mapping)
+                    or set(change) != {"path", "expected_sha256", "content"}
+                    for change in changes
+                )
+            ):
+                raise DynamicTaskAgentError("DYNAMIC_LOCAL_ARGUMENTS_INVALID")
         if handler == "run_check":
             names = managed.get("check_profile_names") if isinstance(managed, Mapping) else None
             if not isinstance(names, list) or str(arguments.get("profile") or "") not in names:

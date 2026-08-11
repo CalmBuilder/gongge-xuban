@@ -221,6 +221,19 @@ class ToolExecutor:
                     expected_sha256=str(arguments["expected_sha256"]),
                     content=str(arguments["content"]),
                 )
+            elif handler == "apply_files":
+                self._require_execution(execution_id)
+                self._require_argument_keys(arguments, {"changes"})
+                changes = arguments["changes"]
+                if not isinstance(changes, list):
+                    raise ManagedCodeWorkspaceError("WORKSPACE_CHANGE_SET_INVALID")
+                data = service.apply_files(
+                    tenant_id=tool.tenant_id,
+                    workspace_id=workspace_id,
+                    execution_id=str(execution_id),
+                    base_ref=base_ref,
+                    changes=changes,
+                )
             elif handler == "run_check":
                 self._require_execution(execution_id)
                 self._require_argument_keys(arguments, {"profile"})

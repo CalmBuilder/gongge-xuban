@@ -538,6 +538,7 @@ def _validate_managed_workspace_tool(
         "read_file": ("read", "none", "none"),
         "status": ("read", "none", "none"),
         "apply_file": ("local_write", "once", "local"),
+        "apply_files": ("local_write", "once", "local"),
         "run_check": ("execute", "once", "local"),
         "commit": ("local_write", "once", "local"),
     }.get(handler)

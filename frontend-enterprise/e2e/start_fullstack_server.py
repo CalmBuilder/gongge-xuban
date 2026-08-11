@@ -26,6 +26,40 @@ E2E_PORT = 5148
 E2E_SECRET = "fullstack-e2e-isolated-secret-at-least-32-bytes"
 E2E_RUNTIME_DIR = Path(tempfile.gettempdir()) / "gongge-fullstack-e2e-current"
 
+REFUND_BACKEND_BASELINE = """\
+HIGH_AMOUNT_THRESHOLD = 10000
+
+def request_refund(amount):
+    return {"amount": amount, "status": "ready"}
+"""
+REFUND_BACKEND_PATCHED = """\
+HIGH_AMOUNT_THRESHOLD = 10000
+
+def request_refund(amount, audit):
+    status = "pending_approval" if amount > HIGH_AMOUNT_THRESHOLD else "ready"
+    audit.append({"event": "refund_requested", "amount": amount, "status": status})
+    return {"amount": amount, "status": status}
+
+def approve_refund(refund, audit):
+    if refund["status"] != "pending_approval":
+        raise ValueError("refund is not awaiting approval")
+    refund["status"] = "approved"
+    audit.append({"event": "refund_approved", "amount": refund["amount"]})
+    return refund
+"""
+REFUND_FRONTEND_BASELINE = """\
+export function availableRefundActions(status) {
+  return status === 'ready' ? ['refund'] : [];
+}
+"""
+REFUND_FRONTEND_PATCHED = """\
+export function availableRefundActions(status) {
+  if (status === 'pending_approval') return ['view_approval'];
+  if (status === 'approved' || status === 'ready') return ['refund'];
+  return [];
+}
+"""
+
 
 def legacy_password_hash(password: str) -> str:
     """复现升级前基于应用密钥生成固定盐的密码哈希。"""
@@ -1321,7 +1355,7 @@ def seed_dynamic_task_browser_fixtures() -> None:
 
 
 def seed_managed_workspace_browser_fixture() -> None:
-    """创建真实 Git 演示仓库并把四个固定受管工具只绑定给成员数字员工。"""
+    """创建含后端、迁移、前端和回归的售后仓库，并发布固定受管工具。"""
 
     from sqlmodel import Session
 
@@ -1341,18 +1375,53 @@ def seed_managed_workspace_browser_fixture() -> None:
         ("config", "user.name", "E2E Workspace Robot"),
     ):
         subprocess.run(["git", "-C", str(repo), *argv], check=True)
-    (repo / "refund.py").write_text("STATUS = 'pending'\n", encoding="utf-8")
+    (repo / "backend").mkdir()
+    (repo / "backend" / "__init__.py").write_text("", encoding="utf-8")
+    (repo / "backend" / "refunds.py").write_text(
+        REFUND_BACKEND_BASELINE, encoding="utf-8"
+    )
+    (repo / "frontend").mkdir()
+    (repo / "frontend" / "refund-state.mjs").write_text(
+        REFUND_FRONTEND_BASELINE, encoding="utf-8"
+    )
+    (repo / "frontend" / "refund-state.test.mjs").write_text(
+        "import test from 'node:test';\n"
+        "import assert from 'node:assert/strict';\n"
+        "import { availableRefundActions } from './refund-state.mjs';\n\n"
+        "test('pending approval only exposes approval detail', () => {\n"
+        "  assert.deepEqual(availableRefundActions('pending_approval'), ['view_approval']);\n"
+        "});\n"
+        "test('approved refund exposes refund action', () => {\n"
+        "  assert.deepEqual(availableRefundActions('approved'), ['refund']);\n"
+        "});\n",
+        encoding="utf-8",
+    )
+    (repo / "migrations").mkdir()
     (repo / "tests").mkdir()
     (repo / "tests" / "test_refund.py").write_text(
+        "import sqlite3\n"
         "import unittest\n"
-        "from refund import STATUS\n\n"
+        "from pathlib import Path\n\n"
+        "from backend.refunds import approve_refund, request_refund\n\n"
         "class RefundApprovalTest(unittest.TestCase):\n"
         "    def test_high_refund_requires_approval(self):\n"
-        "        self.assertEqual(STATUS, 'approval_required')\n",
+        "        audit = []\n"
+        "        refund = request_refund(20000, audit)\n"
+        "        self.assertEqual(refund['status'], 'pending_approval')\n"
+        "        approve_refund(refund, audit)\n"
+        "        self.assertEqual(refund['status'], 'approved')\n"
+        "        self.assertEqual([item['event'] for item in audit], "
+        "['refund_requested', 'refund_approved'])\n\n"
+        "    def test_sqlite_migration_is_runnable(self):\n"
+        "        sql = Path('migrations/0002_high_refund_approval.sql').read_text()\n"
+        "        db = sqlite3.connect(':memory:')\n"
+        "        db.executescript(sql)\n"
+        "        columns = [row[1] for row in db.execute('PRAGMA table_info(refund_approvals)')]\n"
+        "        self.assertEqual(columns, ['id', 'amount', 'status', 'created_at'])\n",
         encoding="utf-8",
     )
     subprocess.run(
-        ["git", "-C", str(repo), "add", "refund.py", "tests/test_refund.py"], check=True
+        ["git", "-C", str(repo), "add", "."], check=True
     )
     subprocess.run(
         ["git", "-C", str(repo), "commit", "-m", "baseline"], check=True
@@ -1360,6 +1429,10 @@ def seed_managed_workspace_browser_fixture() -> None:
     image = (
         "python@sha256:"
         "9bffe4353b925a1656688797ebc68f9c525e79b1d377a764d232182a519eeec4"
+    )
+    node_image = (
+        "node@sha256:"
+        "1c18d9ab3af4585870b92e4dbc5cac5a0dc77dd13df1a5905cea89fc720eb05b"
     )
     definitions = (
         (
@@ -1371,20 +1444,24 @@ def seed_managed_workspace_browser_fixture() -> None:
             ["input.path", "output.content", "output.sha256"],
         ),
         (
-            "workspace.refund.apply",
-            "apply_file",
+            "workspace.refund.apply-set",
+            "apply_files",
             "local_write",
             {
-                "path": {"type": "string"},
-                "expected_sha256": {"type": "string"},
-                "content": {"type": "string"},
+                "changes": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                },
             },
-            {"sha256": {"type": "string"}, "branch": {"type": "string"}},
+            {
+                "files": {"type": "array"},
+                "changed_count": {"type": "integer"},
+                "branch": {"type": "string"},
+            },
             [
-                "input.path",
-                "input.expected_sha256",
-                "input.content",
-                "output.sha256",
+                "input.changes",
+                "output.files",
+                "output.changed_count",
                 "output.branch",
             ],
         ),
@@ -1421,6 +1498,21 @@ def seed_managed_workspace_browser_fixture() -> None:
             }
             if handler == "run_check":
                 config["check_profiles"] = {
+                    "backend-red": {
+                        "image": image,
+                        "argv": [
+                            "python",
+                            "-m",
+                            "unittest",
+                            "discover",
+                            "-s",
+                            "tests",
+                            "-v",
+                        ],
+                        "timeout_seconds": 60,
+                        "expected_exit_codes": [1],
+                        "required_output_substrings": ["cannot import name 'approve_refund'"],
+                    },
                     "backend-unit": {
                         "image": image,
                         "argv": [
@@ -1433,7 +1525,14 @@ def seed_managed_workspace_browser_fixture() -> None:
                             "-v",
                         ],
                         "timeout_seconds": 60,
-                    }
+                        "required_output_substrings": ["OK"],
+                    },
+                    "frontend-unit": {
+                        "image": node_image,
+                        "argv": ["node", "--test", "frontend/refund-state.test.mjs"],
+                        "timeout_seconds": 60,
+                        "required_output_substrings": ["pass 2"],
+                    },
                 }
             tool = Tool(
                 tenant_id="tenant_demo",
@@ -1606,7 +1705,9 @@ def install_schedule_llm_override() -> None:
                 if isinstance(item, dict)
             }
             goal = str(user_payload.get("goal") or "")
-            if "S4代码" in goal and "s4-code-guidance" in names:
+            if "S4代码拒绝" in goal and "s4-code-deny-guidance" in names:
+                selected = ["s4-code-deny-guidance"]
+            elif "S4代码" in goal and "s4-code-guidance" in names:
                 selected = ["s4-code-guidance"]
             elif "S4动态" in goal and "s4-dynamic-guidance" in names:
                 selected = ["s4-dynamic-guidance"]
@@ -1621,6 +1722,11 @@ def install_schedule_llm_override() -> None:
         if "受控动态任务规划器" in system_prompt:
             loaded_guidance = user_payload.get("loaded_guidance", [])
             if "S4-CODE-FULL-GUIDANCE" in str(loaded_guidance):
+                code_guidance_name = (
+                    "s4-code-deny-guidance"
+                    if "s4-code-deny-guidance" in str(loaded_guidance)
+                    else "s4-code-guidance"
+                )
                 capability_names = {
                     str(item.get("name") or "")
                     for item in user_payload.get("capabilities", [])
@@ -1628,7 +1734,7 @@ def install_schedule_llm_override() -> None:
                 }
                 required = {
                     "workspace.refund.read",
-                    "workspace.refund.apply",
+                    "workspace.refund.apply-set",
                     "workspace.refund.check",
                     "workspace.refund.commit",
                 }
@@ -1647,17 +1753,27 @@ def install_schedule_llm_override() -> None:
                             "required": True,
                             "depends_on": [],
                             "capability_refs": ["workspace.refund.read"],
-                            "guidance_skill_refs": ["s4-code-guidance"],
+                            "guidance_skill_refs": [code_guidance_name],
+                            "expected_output_schema": {},
+                        },
+                        {
+                            "draft_id": "red",
+                            "title": "证明退款回归在修复前失败",
+                            "kind": "tool.execute",
+                            "required": True,
+                            "depends_on": ["read"],
+                            "capability_refs": ["workspace.refund.check"],
+                            "guidance_skill_refs": [code_guidance_name],
                             "expected_output_schema": {},
                         },
                         {
                             "draft_id": "apply",
-                            "title": "写入退款审批补丁",
+                            "title": "写入退款审批、迁移和前端补丁",
                             "kind": "tool.write",
                             "required": True,
-                            "depends_on": ["read"],
-                            "capability_refs": ["workspace.refund.apply"],
-                            "guidance_skill_refs": ["s4-code-guidance"],
+                            "depends_on": ["red"],
+                            "capability_refs": ["workspace.refund.apply-set"],
+                            "guidance_skill_refs": [code_guidance_name],
                             "expected_output_schema": {},
                         },
                         {
@@ -1667,7 +1783,17 @@ def install_schedule_llm_override() -> None:
                             "required": True,
                             "depends_on": ["apply"],
                             "capability_refs": ["workspace.refund.check"],
-                            "guidance_skill_refs": ["s4-code-guidance"],
+                            "guidance_skill_refs": [code_guidance_name],
+                            "expected_output_schema": {},
+                        },
+                        {
+                            "draft_id": "frontend_check",
+                            "title": "运行退款前端状态回归",
+                            "kind": "tool.execute",
+                            "required": True,
+                            "depends_on": ["check"],
+                            "capability_refs": ["workspace.refund.check"],
+                            "guidance_skill_refs": [code_guidance_name],
                             "expected_output_schema": {},
                         },
                         {
@@ -1675,9 +1801,9 @@ def install_schedule_llm_override() -> None:
                             "title": "提交一次性任务分支",
                             "kind": "tool.write",
                             "required": True,
-                            "depends_on": ["check"],
+                            "depends_on": ["frontend_check"],
                             "capability_refs": ["workspace.refund.commit"],
-                            "guidance_skill_refs": ["s4-code-guidance"],
+                            "guidance_skill_refs": [code_guidance_name],
                             "expected_output_schema": {},
                         },
                         {
@@ -1687,7 +1813,7 @@ def install_schedule_llm_override() -> None:
                             "required": True,
                             "depends_on": ["commit"],
                             "capability_refs": [],
-                            "guidance_skill_refs": ["s4-code-guidance"],
+                            "guidance_skill_refs": [code_guidance_name],
                             "expected_output_schema": {},
                         },
                     ],
@@ -1785,24 +1911,56 @@ def install_schedule_llm_override() -> None:
                 }
                 if step_kind == "tool.read":
                     capability_ref = "workspace.refund.read"
-                    arguments = {"path": "refund.py"}
+                    arguments = {"path": "backend/refunds.py"}
                 elif step_kind == "tool.execute":
                     capability_ref = "workspace.refund.check"
-                    arguments = {"profile": "backend-unit"}
+                    if "修复前" in step_title:
+                        arguments = {"profile": "backend-red"}
+                    elif "前端" in step_title:
+                        arguments = {"profile": "frontend-unit"}
+                    else:
+                        arguments = {"profile": "backend-unit"}
                 elif step_kind == "tool.write" and "提交" in step_title:
                     capability_ref = "workspace.refund.commit"
                     arguments = {
                         "message": "feat: require high refund approval",
-                        "paths": ["refund.py"],
+                        "paths": [
+                            "backend/refunds.py",
+                            "frontend/refund-state.mjs",
+                            "migrations/0002_high_refund_approval.sql",
+                        ],
                     }
                 elif step_kind == "tool.write":
-                    capability_ref = "workspace.refund.apply"
+                    capability_ref = "workspace.refund.apply-set"
                     arguments = {
-                        "path": "refund.py",
-                        "expected_sha256": hashlib.sha256(
-                            b"STATUS = 'pending'\n"
-                        ).hexdigest(),
-                        "content": "STATUS = 'approval_required'\n",
+                        "changes": [
+                            {
+                                "path": "backend/refunds.py",
+                                "expected_sha256": hashlib.sha256(
+                                    REFUND_BACKEND_BASELINE.encode()
+                                ).hexdigest(),
+                                "content": REFUND_BACKEND_PATCHED,
+                            },
+                            {
+                                "path": "frontend/refund-state.mjs",
+                                "expected_sha256": hashlib.sha256(
+                                    REFUND_FRONTEND_BASELINE.encode()
+                                ).hexdigest(),
+                                "content": REFUND_FRONTEND_PATCHED,
+                            },
+                            {
+                                "path": "migrations/0002_high_refund_approval.sql",
+                                "expected_sha256": None,
+                                "content": (
+                                    "CREATE TABLE refund_approvals (\n"
+                                    "  id INTEGER PRIMARY KEY,\n"
+                                    "  amount INTEGER NOT NULL,\n"
+                                    "  status TEXT NOT NULL,\n"
+                                    "  created_at TEXT NOT NULL\n"
+                                    ");\n"
+                                ),
+                            },
+                        ],
                     }
                 else:
                     execution_view = user_payload.get("provider_execution_view", {})

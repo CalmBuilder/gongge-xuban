@@ -172,6 +172,113 @@ def test_commit_rejects_changes_not_named_in_approved_paths(
         )
 
 
+def test_multi_file_change_set_updates_creates_replays_and_commits_exact_paths(
+    managed_repo: tuple[Path, ManagedCodeWorkspaceService],
+) -> None:
+    """验证一条审批可冻结多文件新增/更新，并能幂等重放和限定提交范围。"""
+
+    repo, service = managed_repo
+    before = service.read_file(
+        tenant_id="tenant_a", workspace_id="refund-demo", path="refund.py"
+    )
+    changes = [
+        {
+            "path": "refund.py",
+            "expected_sha256": before["sha256"],
+            "content": "STATUS = 'approval_required'\n",
+        },
+        {
+            "path": "migration.sql",
+            "expected_sha256": None,
+            "content": "ALTER TABLE refunds ADD COLUMN approval_status TEXT;\n",
+        },
+    ]
+    first = service.apply_files(
+        tenant_id="tenant_a",
+        workspace_id="refund-demo",
+        execution_id="exec_change_set",
+        changes=changes,
+    )
+    replay = service.apply_files(
+        tenant_id="tenant_a",
+        workspace_id="refund-demo",
+        execution_id="exec_change_set",
+        changes=changes,
+    )
+    committed = service.commit(
+        tenant_id="tenant_a",
+        workspace_id="refund-demo",
+        execution_id="exec_change_set",
+        message="feat: add governed refund changes",
+        paths=["refund.py", "migration.sql"],
+    )
+
+    assert first["changed_count"] == 2
+    assert [item["created"] for item in first["files"]] == [False, True]
+    assert replay["replayed"] is True
+    assert committed["replayed"] is False
+    assert _git(repo, "show", "--pretty=", "--name-only", "HEAD").splitlines() == [
+        "migration.sql",
+        "refund.py",
+    ]
+
+
+def test_multi_file_change_set_preflight_and_rollback_prevent_partial_writes(
+    managed_repo: tuple[Path, ManagedCodeWorkspaceService],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证任一前置条件或替换失败时，其他文件不会残留半成品。"""
+
+    repo, service = managed_repo
+    original = (repo / "refund.py").read_bytes()
+    with pytest.raises(ManagedCodeWorkspaceError, match="WORKSPACE_CONTENT_CHANGED"):
+        service.apply_files(
+            tenant_id="tenant_a",
+            workspace_id="refund-demo",
+            execution_id="exec_preflight_guard",
+            changes=[
+                {
+                    "path": "refund.py",
+                    "expected_sha256": "0" * 64,
+                    "content": "STATUS = 'wrong'\n",
+                },
+                {"path": "new.py", "expected_sha256": None, "content": "NEW = True\n"},
+            ],
+        )
+    assert (repo / "refund.py").read_bytes() == original
+    assert not (repo / "new.py").exists()
+
+    original_replace = service._atomic_replace
+    calls = 0
+
+    def fail_second_replace(target: Path, content: bytes, *, mode: int) -> None:
+        """只让第二个正式替换失败，随后允许回滚恢复首个文件。"""
+
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected replacement failure")
+        original_replace(target, content, mode=mode)
+
+    monkeypatch.setattr(service, "_atomic_replace", fail_second_replace)
+    with pytest.raises(ManagedCodeWorkspaceError, match="WORKSPACE_CHANGE_SET_WRITE_FAILED"):
+        service.apply_files(
+            tenant_id="tenant_a",
+            workspace_id="refund-demo",
+            execution_id="exec_preflight_guard",
+            changes=[
+                {
+                    "path": "refund.py",
+                    "expected_sha256": hashlib.sha256(original).hexdigest(),
+                    "content": "STATUS = 'updated'\n",
+                },
+                {"path": "new.py", "expected_sha256": None, "content": "NEW = True\n"},
+            ],
+        )
+    assert (repo / "refund.py").read_bytes() == original
+    assert not (repo / "new.py").exists()
+
+
 def test_checks_accept_only_published_profile_and_pinned_container(
     managed_repo: tuple[Path, ManagedCodeWorkspaceService], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -218,6 +325,39 @@ def test_checks_accept_only_published_profile_and_pinned_container(
             profile="model-supplied-command",
             profiles={},
         )
+
+
+def test_check_profile_can_require_a_bounded_red_phase_exit_code(
+    managed_repo: tuple[Path, ManagedCodeWorkspaceService], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证 TDD red 档案只有观察到声明的非零退出码才算检查目标达成。"""
+
+    _repo, service = managed_repo
+    monkeypatch.setattr(
+        service,
+        "_run_container",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 1, "", "expected failure"),
+    )
+    result = service.run_check(
+        tenant_id="tenant_a",
+        workspace_id="refund-demo",
+        execution_id="exec_red_phase",
+        profile="backend-red",
+        profiles={
+            "backend-red": {
+                "image": "python@sha256:" + "a" * 64,
+                "argv": ["python", "-m", "unittest"],
+                "timeout_seconds": 60,
+                "expected_exit_codes": [1],
+                "required_output_substrings": ["expected failure"],
+            }
+        },
+    )
+
+    assert result["passed"] is True
+    assert result["exit_code"] == 1
+    assert result["expected_exit_codes"] == [1]
+    assert result["required_output_substrings"] == ["expected failure"]
 
 
 def test_real_container_check_has_no_network_and_returns_test_receipt(
@@ -277,3 +417,40 @@ def test_real_container_check_has_no_network_and_returns_test_receipt(
     assert result["exit_code"] == 0
     assert "test_status" in str(result["stderr"])
     assert "test_network_is_disabled" in str(result["stderr"])
+
+
+def test_real_container_output_is_bounded_before_persistence(
+    managed_repo: tuple[Path, ManagedCodeWorkspaceService],
+) -> None:
+    """验证容器洪泛日志不会先被完整读入内存，也不会进入结果账本。"""
+
+    repo, service = managed_repo
+    image = (
+        "python@sha256:"
+        "9bffe4353b925a1656688797ebc68f9c525e79b1d377a764d232182a519eeec4"
+    )
+    if subprocess.run(
+        ["docker", "image", "inspect", image], check=False, capture_output=True
+    ).returncode != 0:
+        pytest.skip("pinned Python container image is not available")
+    (repo / "flood.py").write_text("print('x' * 300000)\n", encoding="utf-8")
+    _git(repo, "add", "flood.py")
+    _git(repo, "commit", "-m", "add output flood fixture")
+
+    result = service.run_check(
+        tenant_id="tenant_a",
+        workspace_id="refund-demo",
+        execution_id="exec_output_bound",
+        profile="output-bound",
+        profiles={
+            "output-bound": {
+                "image": image,
+                "argv": ["python", "flood.py"],
+                "timeout_seconds": 60,
+            }
+        },
+    )
+
+    assert result["passed"] is True
+    assert str(result["stdout"]).endswith("[truncated]")
+    assert len(str(result["stdout"]).encode()) < 129 * 1024
