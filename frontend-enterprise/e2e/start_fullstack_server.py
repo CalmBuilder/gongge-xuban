@@ -1685,6 +1685,52 @@ def install_connection_service_override() -> None:
     app.dependency_overrides[get_connection_service] = override_service
 
 
+def install_general_skill_remote_fetcher_override() -> None:
+    """只替换外部 GitHub 下载响应，保留真实 API、解析、对象存储、事务和绑定链。"""
+
+    from io import BytesIO
+    from zipfile import ZIP_DEFLATED, ZipFile
+
+    from app.api.general_skill_imports import get_general_skill_remote_fetcher
+    from app.general_skills.remote_source import RemoteFetchResult
+    from app.main import app
+
+    class BrowserRemoteFetcher:
+        """返回与 mattpocock/skills 目录形态一致的两个固定 Skill 候选。"""
+
+        def fetch(
+            self,
+            source_url: str,
+            *,
+            allowed_hosts: frozenset[str] | None = None,
+        ) -> RemoteFetchResult:
+            """校验固定 GitHub 归档和 allowlist 后生成确定性 provider 响应。"""
+
+            if not source_url.startswith("https://github.com/mattpocock/skills/archive/"):
+                raise RuntimeError("unexpected E2E GitHub archive URL")
+            if not allowed_hosts or "codeload.github.com" not in allowed_hosts:
+                raise RuntimeError("missing E2E GitHub redirect allowlist")
+            payload = BytesIO()
+            with ZipFile(payload, "w", ZIP_DEFLATED) as archive:
+                archive.writestr(
+                    "skills-main/skills/engineering/tdd/SKILL.md",
+                    "---\n"
+                    "name: tdd\n"
+                    "description: Use test-driven development with an explicit red-green-refactor loop.\n"
+                    "---\n# TDD\n",
+                )
+                archive.writestr(
+                    "skills-main/skills/engineering/systematic-debugging/SKILL.md",
+                    "---\n"
+                    "name: systematic-debugging\n"
+                    "description: Diagnose failures by evidence before changing implementation.\n"
+                    "---\n# Systematic debugging\n",
+                )
+            return RemoteFetchResult(source_url, payload.getvalue(), 0)
+
+    app.dependency_overrides[get_general_skill_remote_fetcher] = BrowserRemoteFetcher
+
+
 def seed_pagination_browser_fixtures() -> None:
     """为员工广场、任务箱、档案日志、记忆和定时任务写入跨页数据。"""
 
@@ -1841,6 +1887,7 @@ def main() -> None:
     seed_pagination_browser_fixtures()
     seed_large_organization_browser_fixture()
     install_connection_service_override()
+    install_general_skill_remote_fetcher_override()
     install_schedule_llm_override()
 
     import uvicorn

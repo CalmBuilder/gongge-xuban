@@ -29,6 +29,7 @@ from app.db.models import (
 from app.general_skills.import_schema import GeneralSkillImportConfirm, GeneralSkillImportJobCreate
 from app.general_skills.import_service import GeneralSkillImportError, GeneralSkillImportService
 from app.general_skills.object_store import FileSystemSkillObjectStore, SkillObjectStoreError
+from app.general_skills.remote_source import RemoteFetchResult
 
 
 def _package(*names: str) -> bytes:
@@ -51,6 +52,23 @@ def _package(*names: str) -> bytes:
     return payload.getvalue()
 
 
+def _repository_package(*names: str) -> bytes:
+    """构造带 GitHub 固定根目录和 skills 子树的仓库归档。"""
+
+    payload = BytesIO()
+    with ZipFile(payload, "w") as archive:
+        for name in names:
+            archive.writestr(
+                f"repo-sha/skills/{name}/SKILL.md",
+                "---\n"
+                f"name: {name}\n"
+                f"description: {name} 的生产指导。\n"
+                "---\n"
+                f"# {name}\n",
+            )
+    return payload.getvalue()
+
+
 def _request(payload: bytes) -> GeneralSkillImportJobCreate:
     """把 ZIP 转为上传 API 使用的严格 base64 请求。"""
 
@@ -60,6 +78,27 @@ def _request(payload: bytes) -> GeneralSkillImportJobCreate:
         filename="skills.zip",
         content_base64=base64.b64encode(payload).decode(),
     )
+
+
+class _RemoteFetcherStub:
+    """返回固定 ZIP 并记录服务传入的固定归档 URL 与 host allowlist。"""
+
+    def __init__(self, payload: bytes) -> None:
+        """保存本次远程来源正文。"""
+
+        self.payload = payload
+        self.calls: list[tuple[str, frozenset[str] | None]] = []
+
+    def fetch(
+        self,
+        source_url: str,
+        *,
+        allowed_hosts: frozenset[str] | None = None,
+    ) -> RemoteFetchResult:
+        """记录请求并返回已去敏的固定结果。"""
+
+        self.calls.append((source_url, allowed_hosts))
+        return RemoteFetchResult(source_url, self.payload, 0)
 
 
 def _context(tmp_path: Path) -> tuple[Session, GeneralSkillImportService, User, User]:
@@ -310,3 +349,62 @@ def test_cancel_releases_staging_and_is_idempotent(tmp_path) -> None:
     assert cancelled.row_version == replay.row_version
     assert cancelled.quota_bytes == replay.quota_bytes == 0
     assert not (tmp_path / "staging" / preview.id).exists()
+
+
+def test_github_source_uses_full_revision_and_shared_preview_pipeline(tmp_path) -> None:
+    """验证 GitHub repo 被转换为固定 commit 归档并产生与上传一致的候选预览。"""
+
+    _, service, owner, _ = _context(tmp_path)
+    revision = "84fdeffd12f2ee307994d1eb6feb48173b6e0502"
+    fetcher = _RemoteFetcherStub(_repository_package("tdd"))
+    request = GeneralSkillImportJobCreate(
+        tenant_id="tenant_a",
+        target_agent_id="agent_a",
+        source_kind="github",
+        source_url="https://github.com/mattpocock/skills?token=must-not-persist",
+        revision=revision,
+        source_subpath="skills",
+    )
+    result = service.create_job(
+        request,
+        idempotency_key="github-matt-skills-001",
+        current_user=owner,
+        fetcher=fetcher,
+    )
+    assert result.status == "awaiting_approval"
+    assert [candidate.name for candidate in result.candidates] == ["tdd"]
+    assert result.source_reference_redacted == (
+        f"https://github.com/mattpocock/skills@{revision}#skills"
+    )
+    assert fetcher.calls[0][0] == (
+        f"https://github.com/mattpocock/skills/archive/{revision}.zip"
+    )
+    assert "must-not-persist" not in str(result.model_dump(mode="json"))
+
+
+def test_remote_idempotency_key_cannot_be_reused_for_another_source(tmp_path) -> None:
+    """验证远程作业完成预览后仍保留请求指纹，阻止换 URL 重放同一幂等键。"""
+
+    _, service, owner, _ = _context(tmp_path)
+    fetcher = _RemoteFetcherStub(_package("remote"))
+    first = GeneralSkillImportJobCreate(
+        tenant_id="tenant_a",
+        target_agent_id="agent_a",
+        source_kind="https",
+        source_url="https://packages.example.com/first.zip",
+    )
+    service.create_job(
+        first,
+        idempotency_key="https-source-001",
+        current_user=owner,
+        fetcher=fetcher,
+    )
+    changed = first.model_copy(update={"source_url": "https://packages.example.com/second.zip"})
+    with pytest.raises(GeneralSkillImportError) as captured:
+        service.create_job(
+            changed,
+            idempotency_key="https-source-001",
+            current_user=owner,
+            fetcher=fetcher,
+        )
+    assert captured.value.error_code == "GENERAL_SKILL_STATE_CONFLICT"

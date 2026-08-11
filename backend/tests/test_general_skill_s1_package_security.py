@@ -188,3 +188,53 @@ def test_nested_skill_resources_do_not_leak_into_parent_candidate() -> None:
         "child/SKILL.md",
         "child/private.txt",
     ]
+
+
+def test_repository_subpath_excludes_unrelated_root_symlink_but_not_selected_symlink() -> None:
+    """验证显式子树可避开仓库根无关链接，而候选子树内链接仍整包拒绝。"""
+
+    payload = BytesIO()
+    with ZipFile(payload, "w") as archive:
+        root_link = ZipInfo("repo-sha/AGENTS.md")
+        root_link.create_system = 3
+        root_link.external_attr = 0o120777 << 16
+        archive.writestr(root_link, "README.md")
+        archive.writestr("repo-sha/skills/tdd/SKILL.md", _skill_markdown(name="tdd"))
+    package = normalize_zip_package(payload.getvalue(), source_subpath="skills")
+    assert [candidate.name for candidate in package.candidates] == ["tdd"]
+
+    unsafe = BytesIO()
+    with ZipFile(unsafe, "w") as archive:
+        archive.writestr("repo-sha/skills/tdd/SKILL.md", _skill_markdown(name="tdd"))
+        selected_link = ZipInfo("repo-sha/skills/tdd/reference.md")
+        selected_link.create_system = 3
+        selected_link.external_attr = 0o120777 << 16
+        archive.writestr(selected_link, "../../../secret")
+    with pytest.raises(GeneralSkillPackageError, match="non-regular"):
+        normalize_zip_package(unsafe.getvalue(), source_subpath="skills")
+
+
+@pytest.mark.parametrize(
+    "frontmatter",
+    [
+        "name: first\nname: second\ndescription: duplicate",
+        "name: anchored\ndescription: &shared repeated\nmetadata: *shared",
+        "name: dated\ndescription: invalid type\nreleased: 2026-08-12",
+        "name: number\ndescription: invalid number\nscore: .nan",
+    ],
+)
+def test_manifest_rejects_ambiguous_or_non_json_yaml(frontmatter: str) -> None:
+    """验证重复键、alias、日期隐式类型和非有限数字不能跨过人工审核边界。"""
+
+    markdown = f"---\n{frontmatter}\n---\n# Unsafe\n"
+    with pytest.raises(GeneralSkillPackageError) as captured:
+        normalize_zip_package(_zip([("skill/SKILL.md", markdown.encode())]))
+    assert captured.value.error_code == "GENERAL_SKILL_PACKAGE_INVALID"
+
+
+def test_manifest_requires_an_exact_frontmatter_closing_line() -> None:
+    """验证类似分隔符的正文不会被当成 frontmatter 结束标记。"""
+
+    markdown = "---\nname: unsafe\ndescription: not closed\n---suffix\n# Unsafe\n"
+    with pytest.raises(GeneralSkillPackageError, match="not closed"):
+        normalize_zip_package(_zip([("skill/SKILL.md", markdown.encode())]))

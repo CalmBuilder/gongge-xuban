@@ -10,17 +10,42 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class GeneralSkillImportJobCreate(BaseModel):
-    """创建一次上传来源导入作业，正文中的用户身份不参与授权。"""
+    """创建上传、固定 GitHub revision 或公开 HTTPS ZIP 导入作业。"""
 
     tenant_id: str = Field(min_length=1, max_length=512)
     target_agent_id: str = Field(min_length=1, max_length=512)
-    source_kind: Literal["upload"] = "upload"
-    filename: str = Field(min_length=1, max_length=255)
-    content_base64: str = Field(min_length=1)
+    source_kind: Literal["upload", "github", "https"] = "upload"
+    filename: str | None = Field(default=None, min_length=1, max_length=255)
+    content_base64: str | None = Field(default=None, min_length=1)
+    source_url: str | None = Field(default=None, min_length=1, max_length=2048)
+    revision: str | None = Field(default=None, pattern=r"^[a-fA-F0-9]{40}$")
+    source_subpath: str | None = Field(default=None, min_length=1, max_length=512)
+
+    @model_validator(mode="after")
+    def validate_source_fields(self) -> "GeneralSkillImportJobCreate":
+        """要求上传正文与远程 URL 互斥，GitHub 额外固定完整 commit。"""
+
+        if self.source_kind == "upload":
+            if (
+                not self.filename
+                or not self.content_base64
+                or self.source_url
+                or self.revision
+                or self.source_subpath
+            ):
+                raise ValueError("GENERAL_SKILL_UPLOAD_SOURCE_INVALID")
+            return self
+        if self.filename or self.content_base64 or not self.source_url:
+            raise ValueError("GENERAL_SKILL_REMOTE_SOURCE_INVALID")
+        if self.source_kind == "github" and (not self.revision or not self.source_subpath):
+            raise ValueError("GENERAL_SKILL_GITHUB_REVISION_AND_SUBPATH_REQUIRED")
+        if self.source_kind == "https" and (self.revision or self.source_subpath):
+            raise ValueError("GENERAL_SKILL_HTTPS_REVISION_NOT_ALLOWED")
+        return self
 
 
 class GeneralSkillImportCandidateRead(BaseModel):

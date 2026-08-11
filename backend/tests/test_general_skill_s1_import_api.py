@@ -20,9 +20,11 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from app.config import get_settings
+from app.api.general_skill_imports import get_general_skill_remote_fetcher
 from app.db import get_session
 from app.db.models import AgentProfile, AgentResourceBinding, GeneralSkillRevision, Tenant, User
 from app.main import app
+from app.general_skills.remote_source import RemoteFetchResult
 from app.security.auth import create_access_token
 
 
@@ -76,7 +78,29 @@ def import_api_context(
 
         yield db
 
+    class RemoteFetcherStub:
+        """在 API 契约测试中返回固定 ZIP，不访问真实供应商。"""
+
+        def fetch(
+            self,
+            source_url: str,
+            *,
+            allowed_hosts: frozenset[str] | None = None,
+        ) -> RemoteFetchResult:
+            """验证 GitHub 固定归档 URL 后返回上传用例的同一 ZIP。"""
+
+            assert source_url.startswith("https://github.com/mattpocock/skills/archive/")
+            assert allowed_hosts and "codeload.github.com" in allowed_hosts
+            payload = BytesIO()
+            with ZipFile(payload, "w") as archive:
+                archive.writestr(
+                    "repo-sha/skills/refund/SKILL.md",
+                    "---\nname: refund\ndescription: 固定 GitHub 候选。\n---\n# Refund\n",
+                )
+            return RemoteFetchResult(source_url, payload.getvalue(), 0)
+
     app.dependency_overrides[get_session] = override_session
+    app.dependency_overrides[get_general_skill_remote_fetcher] = RemoteFetcherStub
     tokens = {"owner": create_access_token(owner), "other": create_access_token(other)}
     try:
         yield TestClient(app), db, tokens
@@ -191,3 +215,31 @@ def test_api_feature_flag_defaults_closed(
     )
     assert response.status_code == 404
     assert response.json()["detail"]["error_code"] == "FEATURE_NOT_AVAILABLE"
+
+
+def test_api_github_source_requires_and_persists_fixed_revision(
+    import_api_context: tuple[TestClient, Session, dict[str, str]],
+) -> None:
+    """验证真实 API 经供应商边界形成 GitHub 固定 revision 预览且不保存 query。"""
+
+    client, _, tokens = import_api_context
+    revision = "84fdeffd12f2ee307994d1eb6feb48173b6e0502"
+    response = client.post(
+        "/api/enterprise/general-skill-import-jobs",
+        headers=_auth(tokens["owner"], idempotency_key="api-github-fixed-001"),
+        json={
+            "tenant_id": "tenant_a",
+            "target_agent_id": "agent_owner",
+            "source_kind": "github",
+            "source_url": "https://github.com/mattpocock/skills?secret=removed",
+            "revision": revision,
+            "source_subpath": "skills",
+        },
+    )
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["status"] == "awaiting_approval"
+    assert body["source_reference_redacted"] == (
+        f"https://github.com/mattpocock/skills@{revision}#skills"
+    )
+    assert "secret" not in response.text

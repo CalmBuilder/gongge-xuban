@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import mimetypes
 import re
 import stat
@@ -20,6 +21,7 @@ from typing import Any
 from zipfile import BadZipFile, ZipFile, ZipInfo
 
 import yaml
+from yaml.events import AliasEvent
 
 
 TEXT_EXTENSIONS = frozenset(
@@ -44,6 +46,55 @@ TEXT_EXTENSIONS = frozenset(
     }
 )
 DRIVE_PREFIX = re.compile(r"^[A-Za-z]:")
+FRONTMATTER_END = re.compile(r"^---[ \t]*$", re.MULTILINE)
+
+
+class _StrictManifestLoader(yaml.SafeLoader):
+    """拒绝 YAML 别名和重复键，确保审核投影只有一种确定解释。"""
+
+    def compose_node(self, parent: object, index: object):  # type: ignore[no-untyped-def]
+        """在构建节点图之前拒绝 alias，避免循环、放大和共享引用语义。"""
+
+        if self.check_event(AliasEvent):
+            raise yaml.constructor.ConstructorError(
+                None,
+                None,
+                "YAML aliases are not allowed",
+                self.peek_event().start_mark,
+            )
+        return super().compose_node(parent, index)
+
+    def construct_mapping(self, node: yaml.MappingNode, deep: bool = False) -> dict[object, object]:
+        """逐项构造 mapping，并在后值覆盖前拒绝重复键。"""
+
+        if not isinstance(node, yaml.MappingNode):
+            raise yaml.constructor.ConstructorError(
+                None,
+                None,
+                "expected a mapping node",
+                node.start_mark,
+            )
+        mapping: dict[object, object] = {}
+        for key_node, value_node in node.value:
+            key = self.construct_object(key_node, deep=deep)
+            try:
+                duplicate = key in mapping
+            except TypeError as exc:
+                raise yaml.constructor.ConstructorError(
+                    "while constructing a mapping",
+                    node.start_mark,
+                    "found an unhashable key",
+                    key_node.start_mark,
+                ) from exc
+            if duplicate:
+                raise yaml.constructor.ConstructorError(
+                    "while constructing a mapping",
+                    node.start_mark,
+                    f"found duplicate key {key!r}",
+                    key_node.start_mark,
+                )
+            mapping[key] = self.construct_object(value_node, deep=deep)
+        return mapping
 
 
 class GeneralSkillPackageError(ValueError):
@@ -111,8 +162,9 @@ def normalize_zip_package(
     payload: bytes,
     *,
     limits: PackageLimits | None = None,
+    source_subpath: str | None = None,
 ) -> NormalizedSkillPackage:
-    """严格校验 ZIP 全部成员并返回确定性候选树，任何成员失败则整包失败。"""
+    """严格校验 ZIP 或显式仓库子树并返回候选，选中子树内任一失败则整包失败。"""
 
     policy = limits or PackageLimits()
     if len(payload) > policy.max_raw_bytes:
@@ -120,9 +172,16 @@ def normalize_zip_package(
     try:
         with ZipFile(BytesIO(payload)) as archive:
             entries = [item for item in archive.infolist() if not item.is_dir()]
+            path_overrides: dict[str, str] | None = None
+            if source_subpath is not None:
+                entries, path_overrides = _select_repository_subtree(
+                    entries,
+                    source_subpath,
+                    policy.max_path_depth,
+                )
             if len(entries) > policy.max_files:
                 _reject_limit("archive contains too many files")
-            resources = _read_archive_resources(archive, entries, policy)
+            resources = _read_archive_resources(archive, entries, policy, path_overrides)
     except BadZipFile as exc:
         raise GeneralSkillPackageError(
             "GENERAL_SKILL_PACKAGE_INVALID", "archive is not a valid ZIP package"
@@ -134,13 +193,16 @@ def _read_archive_resources(
     archive: ZipFile,
     entries: list[ZipInfo],
     limits: PackageLimits,
+    path_overrides: dict[str, str] | None = None,
 ) -> tuple[NormalizedResource, ...]:
     """先检查全量元数据预算，再读取成员，避免静默截断和解压炸弹。"""
 
     seen_paths: set[str] = set()
     expanded_bytes = 0
     for entry in entries:
-        path = _validated_member_path(entry.filename, limits.max_path_depth)
+        path = (path_overrides or {}).get(entry.filename) or _validated_member_path(
+            entry.filename, limits.max_path_depth
+        )
         if path in seen_paths:
             raise GeneralSkillPackageError(
                 "GENERAL_SKILL_PACKAGE_INVALID", "archive contains duplicate normalized paths"
@@ -159,7 +221,9 @@ def _read_archive_resources(
             _reject_limit("archive member exceeds configured file byte limit")
     resources: list[NormalizedResource] = []
     for entry in entries:
-        path = _validated_member_path(entry.filename, limits.max_path_depth)
+        path = (path_overrides or {}).get(entry.filename) or _validated_member_path(
+            entry.filename, limits.max_path_depth
+        )
         content = archive.read(entry)
         if len(content) != entry.file_size:
             raise GeneralSkillPackageError(
@@ -169,6 +233,47 @@ def _read_archive_resources(
             _decode_utf8(content)
         resources.append(_normalized_resource(path, content))
     return tuple(sorted(resources, key=lambda item: item.path))
+
+
+def _select_repository_subtree(
+    entries: list[ZipInfo],
+    source_subpath: str,
+    max_path_depth: int,
+) -> tuple[list[ZipInfo], dict[str, str]]:
+    """先验证全归档路径，再剥离 GitHub 根目录并选择用户明确审核的仓库子树。"""
+
+    normalized_subpath = (
+        "" if source_subpath.strip() == "." else _validated_member_path(
+            source_subpath.strip("/"), max_path_depth
+        )
+    )
+    all_paths = {
+        entry.filename: _validated_member_path(entry.filename, max_path_depth + 1)
+        for entry in entries
+    }
+    first_segments = {path.split("/", 1)[0] for path in all_paths.values()}
+    if len(first_segments) != 1:
+        raise GeneralSkillPackageError(
+            "GENERAL_SKILL_PACKAGE_INVALID",
+            "repository archive must have one stable root directory",
+        )
+    archive_root = next(iter(first_segments))
+    prefix = f"{archive_root}/{normalized_subpath}/" if normalized_subpath else f"{archive_root}/"
+    selected: list[ZipInfo] = []
+    overrides: dict[str, str] = {}
+    for entry in entries:
+        path = all_paths[entry.filename]
+        if not path.startswith(prefix):
+            continue
+        relative = path[len(archive_root) + 1 :]
+        _validated_member_path(relative, max_path_depth)
+        selected.append(entry)
+        overrides[entry.filename] = relative
+    if not selected:
+        raise GeneralSkillPackageError(
+            "GENERAL_SKILL_PACKAGE_INVALID", "repository subpath contains no files"
+        )
+    return selected, overrides
 
 
 def _build_package(
@@ -303,13 +408,13 @@ def _parse_manifest(markdown: str) -> dict[str, Any]:
         raise GeneralSkillPackageError(
             "GENERAL_SKILL_PACKAGE_INVALID", "SKILL.md must start with YAML frontmatter"
         )
-    closing = markdown.find("\n---", 4)
-    if closing < 0:
+    closing_match = FRONTMATTER_END.search(markdown, 4)
+    if closing_match is None:
         raise GeneralSkillPackageError(
             "GENERAL_SKILL_PACKAGE_INVALID", "SKILL.md frontmatter is not closed"
         )
     try:
-        parsed = yaml.safe_load(markdown[4:closing])
+        parsed = yaml.load(markdown[4 : closing_match.start()], Loader=_StrictManifestLoader)
     except yaml.YAMLError as exc:
         raise GeneralSkillPackageError(
             "GENERAL_SKILL_PACKAGE_INVALID", "SKILL.md frontmatter is invalid YAML"
@@ -320,6 +425,7 @@ def _parse_manifest(markdown: str) -> dict[str, Any]:
         )
     if len(parsed) > 64 or _value_depth(parsed) > 8:
         _reject_limit("SKILL.md frontmatter exceeds structure limits")
+    _validate_manifest_value(parsed)
     return parsed
 
 
@@ -331,6 +437,31 @@ def _value_depth(value: object, depth: int = 0) -> int:
     if isinstance(value, list):
         return max((_value_depth(item, depth + 1) for item in value), default=depth)
     return depth
+
+
+def _validate_manifest_value(value: object) -> None:
+    """只接受可确定编码为 JSON 的值，并拒绝日期、集合和非有限浮点等 YAML 特性。"""
+
+    if value is None or isinstance(value, (str, bool, int)):
+        return
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return
+        raise GeneralSkillPackageError(
+            "GENERAL_SKILL_PACKAGE_INVALID", "SKILL.md frontmatter contains a non-finite number"
+        )
+    if isinstance(value, list):
+        for item in value:
+            _validate_manifest_value(item)
+        return
+    if isinstance(value, dict) and all(isinstance(key, str) for key in value):
+        for item in value.values():
+            _validate_manifest_value(item)
+        return
+    raise GeneralSkillPackageError(
+        "GENERAL_SKILL_PACKAGE_INVALID",
+        "SKILL.md frontmatter contains a non-JSON value",
+    )
 
 
 def _required_metadata_text(metadata: dict[str, Any], key: str) -> str:

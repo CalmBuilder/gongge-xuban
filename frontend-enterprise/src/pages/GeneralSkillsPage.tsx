@@ -346,7 +346,11 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
   const [deleting, setDeleting] = useState(false);
   const [secureImportAvailable, setSecureImportAvailable] = useState(false);
   const [secureImportOpen, setSecureImportOpen] = useState(false);
+  const [secureImportSourceKind, setSecureImportSourceKind] = useState<'upload' | 'github' | 'https'>('upload');
   const [secureImportFile, setSecureImportFile] = useState<File | null>(null);
+  const [secureImportSourceUrl, setSecureImportSourceUrl] = useState('');
+  const [secureImportRevision, setSecureImportRevision] = useState('');
+  const [secureImportSubpath, setSecureImportSubpath] = useState('skills');
   const [secureImportJob, setSecureImportJob] = useState<GeneralSkillImportJobRead | null>(null);
   const [secureImportSelectedIds, setSecureImportSelectedIds] = useState<string[]>([]);
   const [secureImportLoading, setSecureImportLoading] = useState(false);
@@ -626,7 +630,11 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
   }
 
   function requestSecurePackageImport() {
+    setSecureImportSourceKind('upload');
     setSecureImportFile(null);
+    setSecureImportSourceUrl('');
+    setSecureImportRevision('');
+    setSecureImportSubpath('skills');
     setSecureImportJob(null);
     setSecureImportSelectedIds([]);
     setSecureImportOpen(true);
@@ -637,21 +645,42 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
       notify.warning('请先选择要获得该能力的数字员工');
       return;
     }
-    if (!secureImportFile) {
+    if (secureImportSourceKind === 'upload' && !secureImportFile) {
       notify.warning('请选择一个 ZIP Skill 包');
+      return;
+    }
+    if (secureImportSourceKind !== 'upload' && !secureImportSourceUrl.trim()) {
+      notify.warning('请输入 HTTPS 来源地址');
+      return;
+    }
+    if (secureImportSourceKind === 'github' && !/^[a-f0-9]{40}$/i.test(secureImportRevision.trim())) {
+      notify.warning('请输入完整的 40 位 Git commit SHA');
+      return;
+    }
+    if (secureImportSourceKind === 'github' && !secureImportSubpath.trim()) {
+      notify.warning('请输入仓库内 Skill 目录');
       return;
     }
     setSecureImportLoading(true);
     try {
-      const contentBase64 = await fileToBase64(secureImportFile);
+      const sourcePayload = secureImportSourceKind === 'upload' && secureImportFile
+        ? {
+            source_kind: 'upload',
+            filename: secureImportFile.name,
+            content_base64: await fileToBase64(secureImportFile),
+          }
+        : {
+            source_kind: secureImportSourceKind,
+            source_url: secureImportSourceUrl.trim(),
+            revision: secureImportSourceKind === 'github' ? secureImportRevision.trim() : undefined,
+            source_subpath: secureImportSourceKind === 'github' ? secureImportSubpath.trim() : undefined,
+          };
       const job = await api.postWithHeaders<GeneralSkillImportJobRead>(
         '/api/enterprise/general-skill-import-jobs',
         {
           tenant_id: getRequestTenantId(),
           target_agent_id: agentId,
-          source_kind: 'upload',
-          filename: secureImportFile.name,
-          content_base64: contentBase64,
+          ...sourcePayload,
         },
         { 'Idempotency-Key': `skill-upload-${crypto.randomUUID()}` },
       );
@@ -894,7 +923,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
                   {!isOverallAgent && secureImportAvailable && (
                     <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={requestSecurePackageImport}>
                       <ShieldCheck />
-                      安全导入 Skill 包
+                      安全导入 Skill
                     </DropdownMenuItem>
                   )}
                   {!isOverallAgent && (
@@ -1000,7 +1029,11 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
       <SecureSkillImportDialog
         open={secureImportOpen}
         loading={secureImportLoading}
+        sourceKind={secureImportSourceKind}
         file={secureImportFile}
+        sourceUrl={secureImportSourceUrl}
+        revision={secureImportRevision}
+        sourceSubpath={secureImportSubpath}
         job={secureImportJob}
         selectedIds={secureImportSelectedIds}
         onFileChange={(file) => {
@@ -1008,6 +1041,14 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
           setSecureImportJob(null);
           setSecureImportSelectedIds([]);
         }}
+        onSourceKindChange={(kind) => {
+          setSecureImportSourceKind(kind);
+          setSecureImportJob(null);
+          setSecureImportSelectedIds([]);
+        }}
+        onSourceUrlChange={setSecureImportSourceUrl}
+        onRevisionChange={setSecureImportRevision}
+        onSourceSubpathChange={setSecureImportSubpath}
         onSelectedIdsChange={setSecureImportSelectedIds}
         onPreview={() => void previewSecurePackage()}
         onConfirm={() => void confirmSecurePackage()}
@@ -1130,13 +1171,21 @@ function ClawHubDialog({
   );
 }
 
-function SecureSkillImportDialog({
+export function SecureSkillImportDialog({
   open,
   loading,
+  sourceKind,
   file,
+  sourceUrl,
+  revision,
+  sourceSubpath,
   job,
   selectedIds,
   onFileChange,
+  onSourceKindChange,
+  onSourceUrlChange,
+  onRevisionChange,
+  onSourceSubpathChange,
   onSelectedIdsChange,
   onPreview,
   onConfirm,
@@ -1144,10 +1193,18 @@ function SecureSkillImportDialog({
 }: {
   open: boolean;
   loading: boolean;
+  sourceKind: 'upload' | 'github' | 'https';
   file: File | null;
+  sourceUrl: string;
+  revision: string;
+  sourceSubpath: string;
   job: GeneralSkillImportJobRead | null;
   selectedIds: string[];
   onFileChange: (file: File | null) => void;
+  onSourceKindChange: (kind: 'upload' | 'github' | 'https') => void;
+  onSourceUrlChange: (value: string) => void;
+  onRevisionChange: (value: string) => void;
+  onSourceSubpathChange: (value: string) => void;
   onSelectedIdsChange: (ids: string[]) => void;
   onPreview: () => void;
   onConfirm: () => void;
@@ -1203,27 +1260,95 @@ function SecureSkillImportDialog({
 
         <div className="min-h-0 flex-1 overflow-y-auto px-[24px] py-[20px]">
           {!job ? (
-            <label className="flex min-h-[190px] cursor-pointer flex-col items-center justify-center rounded-[14px] border border-dashed border-[#bfc9dc] bg-[#fbfcff] px-6 text-center transition-colors hover:border-[var(--gg-cobalt)] hover:bg-[#f7f9ff] focus-within:ring-2 focus-within:ring-[#b9c8ff]">
-              <FileArchive className="mb-3 size-8 text-[#5574dc]" />
-              <strong className="text-[14px] font-semibold text-[#252936]">
-                {file ? file.name : '选择 ZIP Skill 包'}
-              </strong>
-              <span className="mt-2 text-[12px] leading-[1.6] text-[#858b9c]">
-                不会直接运行包内内容；路径、编码、压缩比、文件预算和所有 SKILL.md 会先接受完整检查。
-              </span>
-              {file ? (
-                <span className="mt-3 rounded-full bg-[#edf2ff] px-3 py-1 font-mono text-[11px] text-[#3157e8]">
-                  {formatBytes(file.size)}
-                </span>
-              ) : null}
-              <input
-                className="sr-only"
-                type="file"
-                accept=".zip,application/zip"
-                disabled={loading}
-                onChange={(event) => onFileChange(event.target.files?.[0] || null)}
-              />
-            </label>
+            <div className="grid gap-4">
+              <div role="tablist" aria-label="Skill 来源" className="grid grid-cols-3 rounded-[11px] bg-[#f1f3f8] p-1">
+                {([
+                  ['upload', '上传 ZIP'],
+                  ['github', 'GitHub 固定版本'],
+                  ['https', 'HTTPS ZIP'],
+                ] as const).map(([kind, label]) => (
+                  <button
+                    key={kind}
+                    type="button"
+                    role="tab"
+                    aria-selected={sourceKind === kind}
+                    disabled={loading}
+                    onClick={() => onSourceKindChange(kind)}
+                    className={cn(
+                      'h-9 rounded-[8px] text-[12px] font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[var(--gg-cobalt)]',
+                      sourceKind === kind
+                        ? 'bg-white text-[#3157e8] shadow-sm'
+                        : 'text-[#757f9c] hover:text-[#343a4a]',
+                    )}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+
+              {sourceKind === 'upload' ? (
+                <label className="flex min-h-[190px] cursor-pointer flex-col items-center justify-center rounded-[14px] border border-dashed border-[#bfc9dc] bg-[#fbfcff] px-6 text-center transition-colors hover:border-[var(--gg-cobalt)] hover:bg-[#f7f9ff] focus-within:ring-2 focus-within:ring-[#b9c8ff]">
+                  <FileArchive className="mb-3 size-8 text-[#5574dc]" />
+                  <strong className="text-[14px] font-semibold text-[#252936]">
+                    {file ? file.name : '选择 ZIP Skill 包'}
+                  </strong>
+                  <span className="mt-2 text-[12px] leading-[1.6] text-[#858b9c]">
+                    不会直接运行包内内容；路径、编码、压缩比、文件预算和所有 SKILL.md 会先接受完整检查。
+                  </span>
+                  {file ? (
+                    <span className="mt-3 rounded-full bg-[#edf2ff] px-3 py-1 font-mono text-[11px] text-[#3157e8]">
+                      {formatBytes(file.size)}
+                    </span>
+                  ) : null}
+                  <input
+                    className="sr-only"
+                    type="file"
+                    accept=".zip,application/zip"
+                    disabled={loading}
+                    onChange={(event) => onFileChange(event.target.files?.[0] || null)}
+                  />
+                </label>
+              ) : (
+                <section className="grid gap-4 rounded-[14px] border border-[#dfe5f2] bg-[#fbfcff] p-5">
+                  <label className="grid gap-2 text-[12px] font-medium text-[#303747]">
+                    {sourceKind === 'github' ? 'GitHub 仓库地址' : '公开 HTTPS ZIP 地址'}
+                    <Input
+                      value={sourceUrl}
+                      onChange={(event) => onSourceUrlChange(event.target.value)}
+                      placeholder={sourceKind === 'github'
+                        ? 'https://github.com/mattpocock/skills'
+                        : 'https://example.com/skills.zip'}
+                      className="h-10 rounded-[9px] border-[#cfd7e6] bg-white font-mono text-[12px]"
+                    />
+                  </label>
+                  {sourceKind === 'github' ? (
+                    <div className="grid gap-4 sm:grid-cols-[minmax(0,1fr)_180px]">
+                      <label className="grid gap-2 text-[12px] font-medium text-[#303747]">
+                        完整 commit SHA
+                        <Input
+                          value={revision}
+                          onChange={(event) => onRevisionChange(event.target.value)}
+                          placeholder="40 位十六进制 commit，不接受 main 或 tag"
+                          className="h-10 rounded-[9px] border-[#cfd7e6] bg-white font-mono text-[12px]"
+                        />
+                      </label>
+                      <label className="grid gap-2 text-[12px] font-medium text-[#303747]">
+                        仓库内 Skill 目录
+                        <Input
+                          value={sourceSubpath}
+                          onChange={(event) => onSourceSubpathChange(event.target.value)}
+                          placeholder="skills"
+                          className="h-10 rounded-[9px] border-[#cfd7e6] bg-white font-mono text-[12px]"
+                        />
+                      </label>
+                    </div>
+                  ) : null}
+                  <p className="text-[11px] leading-[1.6] text-[#858b9c]">
+                    每次重定向都会重新检查 HTTPS 主机与 DNS；私网、loopback、metadata 地址和漂移版本会在下载前拒绝。
+                  </p>
+                </section>
+              )}
+            </div>
           ) : null}
 
           {job?.status === 'failed' ? (
@@ -1317,7 +1442,11 @@ function SecureSkillImportDialog({
               取消
             </UIButton>
             {!job ? (
-              <UIButton disabled={loading || !file} onClick={onPreview} className={PRIMARY_BUTTON_CLASS}>
+              <UIButton
+                disabled={loading || (sourceKind === 'upload' ? !file : !sourceUrl.trim())}
+                onClick={onPreview}
+                className={PRIMARY_BUTTON_CLASS}
+              >
                 生成安全预览
               </UIButton>
             ) : null}

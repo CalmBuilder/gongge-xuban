@@ -25,6 +25,7 @@ from app.general_skills.import_service import (
     GeneralSkillImportService,
 )
 from app.general_skills.object_store import FileSystemSkillObjectStore
+from app.general_skills.remote_source import RemoteFetcher, SecureHttpsFetcher
 from app.security.auth import get_current_user
 
 
@@ -35,13 +36,21 @@ router = APIRouter(
 )
 
 
+def get_general_skill_remote_fetcher() -> RemoteFetcher:
+    """创建生产 fail-closed HTTPS fetcher，并作为测试可替换的供应商边界。"""
+
+    return SecureHttpsFetcher()
+
+
 @router.get("/capabilities")
 def get_import_capabilities(settings: Settings = Depends(get_settings)) -> dict[str, object]:
     """公开当前部署是否启用新导入流及已达到生产契约的来源类型。"""
 
     return {
         "enabled": settings.general_skill_import_v2_enabled,
-        "source_kinds": ["upload"] if settings.general_skill_import_v2_enabled else [],
+        "source_kinds": ["upload", "github", "https"]
+        if settings.general_skill_import_v2_enabled
+        else [],
     }
 
 
@@ -52,15 +61,17 @@ def create_import_job(
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
     settings: Settings = Depends(get_settings),
+    remote_fetcher: RemoteFetcher = Depends(get_general_skill_remote_fetcher),
 ) -> GeneralSkillImportJobRead:
     """创建上传导入作业并返回可刷新恢复的安全预览或结构化失败终态。"""
 
     service = _service(db, settings)
     try:
-        return service.create_upload_job(
+        return service.create_job(
             request,
             idempotency_key=idempotency_key,
             current_user=current_user,
+            fetcher=remote_fetcher,
         )
     except GeneralSkillImportError as exc:
         raise _http_error(exc) from exc

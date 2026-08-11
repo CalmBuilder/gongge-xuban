@@ -16,6 +16,7 @@ import re
 from datetime import timedelta
 from pathlib import PurePath
 from typing import Any
+from urllib.parse import urlsplit
 
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
@@ -46,6 +47,13 @@ from app.general_skills.package_security import (
     GeneralSkillPackageError,
     SkillCandidate,
     normalize_zip_package,
+)
+from app.general_skills.remote_source import (
+    GITHUB_ARCHIVE_HOSTS,
+    GeneralSkillRemoteSourceError,
+    RemoteFetcher,
+    SecureHttpsFetcher,
+    github_archive_url,
 )
 from app.security.permissions import ensure_agent_scope_manager
 from app.security.tenant import ensure_tenant
@@ -91,6 +99,10 @@ class GeneralSkillImportService:
             current_user,
         )
         key = _validated_idempotency_key(idempotency_key)
+        if request.content_base64 is None or request.filename is None:
+            raise GeneralSkillImportError(
+                "GENERAL_SKILL_PACKAGE_INVALID", "upload source is incomplete", 400
+            )
         payload = _decode_base64(request.content_base64)
         raw_checksum = hashlib.sha256(payload).hexdigest()
         existing = self.db.exec(
@@ -141,6 +153,28 @@ class GeneralSkillImportService:
             self._fail_job(job, "GENERAL_SKILL_STORAGE_UNAVAILABLE", str(exc))
             return import_job_read(job)
 
+    def create_job(
+        self,
+        request: GeneralSkillImportJobCreate,
+        *,
+        idempotency_key: str,
+        current_user: User,
+        fetcher: RemoteFetcher | None = None,
+    ) -> GeneralSkillImportJobRead:
+        """按来源类型进入同一作业状态机，远程来源固定请求后再复用规范化链。"""
+
+        if request.source_kind == "upload":
+            return self.create_upload_job(
+                request,
+                idempotency_key=idempotency_key,
+                current_user=current_user,
+            )
+        return self._create_remote_job(
+            request,
+            idempotency_key=idempotency_key,
+            current_user=current_user,
+            fetcher=fetcher or SecureHttpsFetcher(),
+        )
     def get_job(self, job_id: str, *, current_user: User) -> GeneralSkillImportJobRead:
         """按 tenant/user 双边界读取作业，管理员也不能跨 tenant 枚举。"""
 
@@ -256,8 +290,19 @@ class GeneralSkillImportService:
 
         for target in (ImportJobStatus.FETCHING, ImportJobStatus.FETCHED):
             transition_import_job(job, target, expected_row_version=job.row_version)
+        return self._normalize_fetched(job, payload)
+
+    def _normalize_fetched(
+        self,
+        job: GeneralSkillImportJob,
+        payload: bytes,
+        *,
+        source_subpath: str | None = None,
+    ) -> GeneralSkillImportJobRead:
+        """把已完整抓取的 ZIP 复用到统一规范化、分析、暂存和预览阶段。"""
+
         transition_import_job(job, ImportJobStatus.NORMALIZING, expected_row_version=job.row_version)
-        package = normalize_zip_package(payload)
+        package = normalize_zip_package(payload, source_subpath=source_subpath)
         transition_import_job(job, ImportJobStatus.NORMALIZED, expected_row_version=job.row_version)
         unique_resources = {
             resource.content_checksum: resource
@@ -272,6 +317,9 @@ class GeneralSkillImportService:
             "normalized_checksum": package.normalized_checksum,
             "candidates": candidates,
         }
+        source_request_checksum = job.preview_json.get("source_request_checksum")
+        if isinstance(source_request_checksum, str) and source_request_checksum:
+            preview_payload["source_request_checksum"] = source_request_checksum
         job.normalized_checksum = package.normalized_checksum
         job.preview_json = preview_payload
         job.preview_checksum = _canonical_checksum(preview_payload)
@@ -293,6 +341,98 @@ class GeneralSkillImportService:
         self.db.commit()
         self.db.refresh(job)
         return import_job_read(job)
+
+    def _create_remote_job(
+        self,
+        request: GeneralSkillImportJobCreate,
+        *,
+        idempotency_key: str,
+        current_user: User,
+        fetcher: RemoteFetcher,
+    ) -> GeneralSkillImportJobRead:
+        """创建固定远程来源作业，逐跳安全下载后进入与上传相同的预览链。"""
+
+        if request.source_url is None:
+            raise GeneralSkillImportError(
+                "GENERAL_SKILL_PACKAGE_INVALID", "remote source URL is required", 400
+            )
+        ensure_tenant(self.db, request.tenant_id)
+        ensure_agent_scope_manager(
+            self.db,
+            request.tenant_id,
+            request.target_agent_id,
+            current_user,
+        )
+        key = _validated_idempotency_key(idempotency_key)
+        source_url = request.source_url.strip()
+        allowed_hosts: frozenset[str] | None = None
+        if request.source_kind == "github":
+            source_url = github_archive_url(source_url, request.revision or "")
+            allowed_hosts = GITHUB_ARCHIVE_HOSTS
+        source_reference = _redacted_remote_reference(
+            request.source_url,
+            request.revision,
+            request.source_subpath,
+        )
+        request_checksum = _canonical_checksum(
+            {
+                "source_kind": request.source_kind,
+                "source_reference": source_reference,
+            }
+        )
+        existing = self.db.exec(
+            select(GeneralSkillImportJob).where(
+                GeneralSkillImportJob.tenant_id == request.tenant_id,
+                GeneralSkillImportJob.owner_user_id == current_user.id,
+                GeneralSkillImportJob.idempotency_key == key,
+                GeneralSkillImportJob.attempt == 1,
+            )
+        ).first()
+        if existing:
+            existing_request_checksum = str(
+                existing.preview_json.get("source_request_checksum", "")
+            )
+            if existing_request_checksum and existing_request_checksum != request_checksum:
+                raise GeneralSkillImportError(
+                    "GENERAL_SKILL_STATE_CONFLICT",
+                    "idempotency key was already used for a different remote source",
+                    409,
+                )
+            return import_job_read(existing)
+        now = utc_now()
+        job = GeneralSkillImportJob(
+            tenant_id=request.tenant_id,
+            owner_user_id=current_user.id,
+            target_agent_id=request.target_agent_id,
+            source_kind=request.source_kind,
+            source_reference_redacted=source_reference,
+            idempotency_key=key,
+            preview_json={"source_request_checksum": request_checksum},
+            expires_at=now + timedelta(hours=24),
+            created_at=now,
+            updated_at=now,
+        )
+        self.db.add(job)
+        try:
+            self.db.commit()
+            transition_import_job(job, ImportJobStatus.FETCHING, expected_row_version=job.row_version)
+            result = fetcher.fetch(source_url, allowed_hosts=allowed_hosts)
+            job.raw_checksum = hashlib.sha256(result.payload).hexdigest()
+            transition_import_job(job, ImportJobStatus.FETCHED, expected_row_version=job.row_version)
+            return self._normalize_fetched(
+                job,
+                result.payload,
+                source_subpath=request.source_subpath,
+            )
+        except GeneralSkillRemoteSourceError as exc:
+            self._fail_job(job, exc.error_code, str(exc))
+            return import_job_read(job)
+        except GeneralSkillPackageError as exc:
+            self._fail_job(job, exc.error_code, str(exc))
+            return import_job_read(job)
+        except SkillObjectStoreError as exc:
+            self._fail_job(job, "GENERAL_SKILL_STORAGE_UNAVAILABLE", str(exc))
+            return import_job_read(job)
 
     def _fail_job(self, job: GeneralSkillImportJob, error_code: str, detail: str) -> None:
         """将非终态作业落为失败并清理可能已产生的暂存对象。"""
@@ -541,6 +681,20 @@ def _redacted_filename(value: str) -> str:
 
     normalized = value.replace("\\", "/")
     return PurePath(normalized.rsplit("/", 1)[-1]).name[:255]
+
+
+def _redacted_remote_reference(
+    source_url: str,
+    revision: str | None,
+    source_subpath: str | None,
+) -> str:
+    """移除远程 URL query/fragment，并为 GitHub 来源保留固定 commit 证据。"""
+
+    parsed = urlsplit(source_url.strip())
+    redacted = parsed._replace(query="", fragment="").geturl()
+    if revision:
+        redacted = f"{redacted}@{revision.lower()}"
+    return f"{redacted}#{source_subpath}" if source_subpath else redacted
 
 
 def _relative_candidate_path(path: str, root: str) -> str:

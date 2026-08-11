@@ -57,7 +57,7 @@ function collectBrowserFailures(page: Page): BrowserFailure[] {
 
 async function openSecureImport(page: Page) {
   await page.getByRole('button', { name: /新增/ }).click();
-  await page.getByRole('menuitem', { name: '安全导入 Skill 包' }).click();
+  await page.getByRole('menuitem', { name: '安全导入 Skill' }).click();
   await expect(page.getByRole('dialog', { name: '安全导入 Skill 包' })).toBeVisible();
 }
 
@@ -135,5 +135,35 @@ test('S1 危险路径包在浏览器中进入明确失败终态且不能确认',
 
   await expect(dialog.getByRole('alert')).toContainText('Skill 包未通过安全检查');
   await expect(dialog.getByRole('button', { name: '固定版本并绑定' })).toHaveCount(0);
+  expect(failures).toEqual([]);
+});
+
+test('S1 GitHub 固定 commit 经供应商边界发现多候选并全部绑定', async ({ page }) => {
+  const failures = collectBrowserFailures(page);
+  await page.goto('/enterprise/dashboard');
+  await loginAsMember(page);
+  await page.goto('/enterprise/general-skills');
+  await openSecureImport(page);
+  const dialog = page.getByRole('dialog', { name: '安全导入 Skill 包' });
+  await dialog.getByRole('tab', { name: 'GitHub 固定版本' }).click();
+  await dialog.getByLabel('GitHub 仓库地址').fill('https://github.com/mattpocock/skills');
+  await dialog.getByLabel('完整 commit SHA').fill('84fdeffd12f2ee307994d1eb6feb48173b6e0502');
+  const createResponse = page.waitForResponse((response) => (
+    new URL(response.url()).pathname === '/api/enterprise/general-skill-import-jobs'
+    && response.request().method() === 'POST'
+  ));
+  await dialog.getByRole('button', { name: '生成安全预览' }).click();
+  expect((await createResponse).status()).toBe(202);
+  await expect(dialog.getByText('tdd', { exact: true })).toBeVisible();
+  await expect(dialog.getByText('systematic-debugging', { exact: true })).toBeVisible();
+
+  const confirmResponse = page.waitForResponse((response) => (
+    new URL(response.url()).pathname.endsWith('/confirm')
+    && response.request().method() === 'POST'
+  ));
+  await dialog.getByRole('button', { name: '固定版本并绑定' }).click();
+  expect((await confirmResponse).status()).toBe(200);
+  await expect(page.getByRole('row').filter({ hasText: 'tdd' })).toBeVisible();
+  await expect(page.getByRole('row').filter({ hasText: 'systematic-debugging' })).toBeVisible();
   expect(failures).toEqual([]);
 });
