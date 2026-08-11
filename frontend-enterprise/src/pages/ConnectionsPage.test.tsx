@@ -224,8 +224,8 @@ it('流程节点可点击定位数字员工场景并展示三张真实界面截�
   expect(screen.getByText(/选择本次真实使用的“平台能力演示助手”/)).toBeInTheDocument();
   expect(screen.getByText(/员工继续在企业微信应用会话中用自然语言提问/)).toBeInTheDocument();
   expect(screen.getByAltText('企业微信连接健康后的真实连接卡片')).toBeInTheDocument();
-  expect(screen.getByAltText('在真实数字员工绑定弹窗中授权企业微信连接')).toBeInTheDocument();
-  expect(screen.getByAltText('在真实消息接入弹窗中配置数字员工路由和发送者授权')).toBeInTheDocument();
+  expect(screen.getByAltText('在真实数字员工绑定弹窗中授权企业微信连接')).toHaveClass('w-auto', 'max-w-full');
+  expect(screen.getByAltText('在真实消息接入弹窗中配置数字员工路由和发送者授权')).toHaveClass('w-auto', 'max-w-full');
   expect(screen.getAllByRole('link', { name: /放大查看实际截图/ })).toHaveLength(3);
 });
 

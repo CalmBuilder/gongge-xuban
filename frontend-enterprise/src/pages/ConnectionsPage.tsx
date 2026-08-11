@@ -1046,8 +1046,8 @@ function GuideScreenshot({ src, alt, title, description }: { src: string; alt: s
 
   return (
     <figure className="overflow-hidden rounded-[12px] border border-[#dfe5f0] bg-white">
-      <a href={src} target="_blank" rel="noreferrer" aria-label={`放大查看${title}`} className="group block overflow-hidden bg-[#f3f6fb] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--gg-cobalt)]">
-        <img src={src} alt={alt} className="h-auto w-full transition-transform duration-200 group-hover:scale-[1.015] motion-reduce:transition-none" />
+      <a href={src} target="_blank" rel="noreferrer" aria-label={`放大查看${title}`} className="group flex min-h-[96px] items-center justify-center overflow-hidden bg-[#f3f6fb] p-[10px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--gg-cobalt)]">
+        <img src={src} alt={alt} className="h-auto w-auto max-w-full rounded-[6px] shadow-[0_2px_8px_rgba(35,52,88,0.08)] transition-opacity duration-200 group-hover:opacity-90 motion-reduce:transition-none" />
       </a>
       <figcaption className="border-t border-[#e8ecf3] px-[11px] py-[9px]">
         <strong className="block text-[14px] font-semibold text-[#3a4254]">{title}</strong>

@@ -55,6 +55,14 @@ test('真实 Chromium 从连接价值说明进入完整企业微信示例和建�
   await expect(guide.getByRole('img', { name: '企业微信连接健康后的真实连接卡片' })).toBeVisible();
   await expect(guide.getByRole('img', { name: '在真实数字员工绑定弹窗中授权企业微信连接' })).toBeVisible();
   await expect(guide.getByRole('img', { name: '在真实消息接入弹窗中配置数字员工路由和发送者授权' })).toBeVisible();
+  const guideScreenshots = await guide.getByRole('img').all();
+  for (const screenshot of guideScreenshots) {
+    const dimensions = await screenshot.evaluate((element) => {
+      const image = element as HTMLImageElement;
+      return { renderedWidth: image.getBoundingClientRect().width, naturalWidth: image.naturalWidth };
+    });
+    expect(dimensions.renderedWidth).toBeLessThanOrEqual(dimensions.naturalWidth + 1);
+  }
 
   await guide.getByRole('button', { name: '开始创建连接' }).click();
   const createDialog = page.getByRole('dialog', { name: '连接企业微信' });
