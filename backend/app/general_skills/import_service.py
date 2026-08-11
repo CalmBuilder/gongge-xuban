@@ -44,6 +44,7 @@ from app.general_skills.import_schema import (
     GeneralSkillImportJobRead,
     GeneralSkillUploadFile,
 )
+from app.general_skills.governance import bump_general_skill_authorization_revision
 from app.general_skills.lifecycle import (
     GeneralSkillLifecycleError,
     IMPORT_JOB_TERMINAL_STATUSES,
@@ -377,6 +378,16 @@ class GeneralSkillImportService:
                 current_user,
             )
             revision_ids = [installed[candidate_id].revision_id for candidate_id in candidate_ids]
+            bump_general_skill_authorization_revision(
+                self.db,
+                job.tenant_id,
+                event_type="import_installed",
+                resource_id=job.id,
+                payload={
+                    "agent_id": job.target_agent_id,
+                    "revision_ids": revision_ids,
+                },
+            )
             transition_import_job(
                 job,
                 ImportJobStatus.INSTALLED,

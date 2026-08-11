@@ -200,6 +200,85 @@ def test_api_preview_refresh_and_confirm_are_real_persisted_operations(
     assert binding.metadata_json["pinned_revision_id"] == revision.id
 
 
+def test_s2_governance_api_lists_revisions_and_updates_binding_atomically(
+    import_api_context: tuple[TestClient, Session, dict[str, str]],
+) -> None:
+    """验证用户经公开 API 查询修订并原子切换为停用的 follow-latest 绑定。"""
+
+    client, db, tokens = import_api_context
+    preview = client.post(
+        "/api/enterprise/general-skill-import-jobs",
+        headers=_auth(tokens["owner"], idempotency_key="api-governance-001"),
+        json=_upload_json(),
+    ).json()
+    confirmed = client.post(
+        f"/api/enterprise/general-skill-import-jobs/{preview['id']}/confirm",
+        headers=_auth(tokens["owner"]),
+        json={
+            "preview_checksum": preview["preview_checksum"],
+            "candidate_ids": [preview["candidates"][0]["candidate_id"]],
+            "expected_row_version": preview["row_version"],
+        },
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    revision = db.exec(select(GeneralSkillRevision)).one()
+    binding = db.exec(select(AgentResourceBinding)).one()
+
+    revisions = client.get(
+        f"/api/enterprise/general-skill-governance/skills/{revision.skill_id}/revisions",
+        params={"tenant_id": "tenant_a"},
+        headers=_auth(tokens["owner"]),
+    )
+    assert revisions.status_code == 200, revisions.text
+    assert revisions.json()[0]["id"] == revision.id
+    updated = client.patch(
+        f"/api/enterprise/general-skill-governance/bindings/{binding.id}",
+        headers=_auth(tokens["owner"]),
+        json={
+            "agent_id": "agent_owner",
+            "status": "inactive",
+            "revision_policy": "follow_latest",
+            "pinned_revision_id": None,
+            "invocation_policy": "user_only",
+            "expected_row_version": binding.row_version,
+        },
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["status"] == "inactive"
+    assert updated.json()["revision_policy"] == "follow_latest"
+    assert updated.json()["invocation_policy"] == "user_only"
+
+
+def test_s2_governance_api_hides_owner_revision_from_other_user(
+    import_api_context: tuple[TestClient, Session, dict[str, str]],
+) -> None:
+    """验证同租户其他普通用户不能借稳定 Skill ID 枚举私有修订。"""
+
+    client, db, tokens = import_api_context
+    preview = client.post(
+        "/api/enterprise/general-skill-import-jobs",
+        headers=_auth(tokens["owner"], idempotency_key="api-governance-private-001"),
+        json=_upload_json(),
+    ).json()
+    client.post(
+        f"/api/enterprise/general-skill-import-jobs/{preview['id']}/confirm",
+        headers=_auth(tokens["owner"]),
+        json={
+            "preview_checksum": preview["preview_checksum"],
+            "candidate_ids": [preview["candidates"][0]["candidate_id"]],
+            "expected_row_version": preview["row_version"],
+        },
+    )
+    revision = db.exec(select(GeneralSkillRevision)).one()
+
+    hidden = client.get(
+        f"/api/enterprise/general-skill-governance/skills/{revision.skill_id}/revisions",
+        params={"tenant_id": "tenant_a"},
+        headers=_auth(tokens["other"]),
+    )
+    assert hidden.status_code == 403
+
+
 def test_api_hides_owner_job_from_another_user(
     import_api_context: tuple[TestClient, Session, dict[str, str]],
 ) -> None:

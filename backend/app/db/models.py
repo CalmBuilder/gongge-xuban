@@ -2030,6 +2030,51 @@ class GeneralSkillDependency(SQLModel, table=True):
     created_at: datetime = Field(default_factory=utc_now)
 
 
+class GeneralSkillAuthorizationState(SQLModel, table=True):
+    """保存租户 Skill 授权面的单调 revision，供多实例目录失效与对账。"""
+
+    __tablename__ = "general_skill_authorization_states"
+    __table_args__ = (
+        CheckConstraint("revision >= 1", name="ck_general_skill_authorization_revision"),
+    )
+
+    tenant_id: IdentifierString = Field(primary_key=True)
+    revision: int = Field(default=1, ge=1)
+    last_event_checksum: VersionString
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class GeneralSkillAuthorizationEvent(SQLModel, table=True):
+    """保存与授权 revision 一一对应的追加式失效事件，供跨实例对账。"""
+
+    __tablename__ = "general_skill_authorization_events"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "authorization_revision",
+            name="uq_general_skill_authorization_event_revision",
+        ),
+        CheckConstraint(
+            "authorization_revision >= 1",
+            name="ck_general_skill_authorization_event_revision",
+        ),
+        Index(
+            "ix_general_skill_authorization_event_tenant_created",
+            "tenant_id",
+            "created_at",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("gsauth"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    authorization_revision: int = Field(ge=1)
+    event_type: LabelString
+    resource_id: OptionalIdentifierString = Field(default=None, index=True)
+    event_checksum: VersionString = Field(index=True)
+    payload_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    created_at: datetime = Field(default_factory=utc_now)
+
+
 class KnowledgeBase(SQLModel, table=True):
     """保存知识内容及其独立于数字员工绑定的最小治理事实。"""
 

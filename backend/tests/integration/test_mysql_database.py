@@ -161,6 +161,7 @@ def test_alembic_upgrades_empty_mysql_database(mysql_database_url: str) -> None:
     assert "general_skill_dependencies" in tables
     assert "general_skill_import_quotas" in tables
     assert "general_skill_source_credentials" in tables
+    assert "general_skill_authorization_states" in tables
     assert "code_sets" in tables
     assert "code_items" in tables
     assert "organization_units" in tables
@@ -337,7 +338,7 @@ def test_alembic_upgrades_empty_mysql_database(mysql_database_url: str) -> None:
     with engine.connect() as connection:
         assert (
             connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-            == "20260812_0054"
+            == "20260812_0055"
         )
 
 
