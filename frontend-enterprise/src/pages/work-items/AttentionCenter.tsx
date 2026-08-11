@@ -358,13 +358,26 @@ export default function AttentionCenter() {
                 {attentionQuestion(selected)}
               </div>
               {selected.kind === 'tool_approval' ? (
-                <div className="grid gap-[9px] rounded-[12px] border border-[#dce5ff] bg-[#fbfcff] px-[13px] py-[12px]" aria-label="待批准外部写">
-                  <div className="flex items-center justify-between gap-[10px] text-[11px] text-[#68738d]">
-                    <span>目标：当前企业微信会话</span>
-                    <code className="font-mono">{stringPayload(selected, 'content_checksum').slice(0, 12)}</code>
-                  </div>
-                  <pre className="max-h-[220px] overflow-auto whitespace-pre-wrap break-words rounded-[9px] bg-white p-[10px] text-[12px] leading-[1.65] text-[#283044]">{stringPayload(selected, 'content')}</pre>
-                  <p className="text-[11px] leading-[1.6] text-[#6a7388]">批准只绑定本次 Operation、正文、目标、能力与连接修订；任何变化都会重新进入待处理。</p>
+                <div className="grid gap-[9px] rounded-[12px] border border-[#dce5ff] bg-[#fbfcff] px-[13px] py-[12px]" aria-label={isWorkspaceApproval(selected) ? '待批准受管代码操作' : '待批准外部写'}>
+                  {isWorkspaceApproval(selected) ? (
+                    <>
+                      <div className="flex flex-wrap items-center justify-between gap-[10px] text-[11px] text-[#68738d]">
+                        <span>受管工作区：{workspaceField(selected, 'workspace_id') || '未标识'} · 基线 {workspaceField(selected, 'base_ref') || '未标识'}</span>
+                        <code className="font-mono">{workspaceField(selected, 'handler')}</code>
+                      </div>
+                      <pre className="max-h-[260px] overflow-auto whitespace-pre-wrap break-words rounded-[9px] bg-white p-[10px] text-[12px] leading-[1.65] text-[#283044]">{JSON.stringify(selected.payload.arguments || {}, null, 2)}</pre>
+                      <p className="text-[11px] leading-[1.6] text-[#6a7388]">批准只绑定本次 Execution、Operation、参数、工作区与能力修订；路径、内容或工具授权变化后不会沿用。</p>
+                    </>
+                  ) : (
+                    <>
+                      <div className="flex items-center justify-between gap-[10px] text-[11px] text-[#68738d]">
+                        <span>目标：当前企业微信会话</span>
+                        <code className="font-mono">{stringPayload(selected, 'content_checksum').slice(0, 12)}</code>
+                      </div>
+                      <pre className="max-h-[220px] overflow-auto whitespace-pre-wrap break-words rounded-[9px] bg-white p-[10px] text-[12px] leading-[1.65] text-[#283044]">{stringPayload(selected, 'content')}</pre>
+                      <p className="text-[11px] leading-[1.6] text-[#6a7388]">批准只绑定本次 Operation、正文、目标、能力与连接修订；任何变化都会重新进入待处理。</p>
+                    </>
+                  )}
                 </div>
               ) : null}
               {execution?.goal ? (
@@ -422,8 +435,8 @@ export default function AttentionCenter() {
                 <Button variant="outline" disabled={acting} onClick={() => setSelected(null)}>关闭</Button>
                 {selected.available_commands.includes('cancel') ? <Button variant="outline" disabled={acting} onClick={() => void resolve('cancel')}>取消任务</Button> : null}
                 {selected.available_commands.includes('answer') ? <Button disabled={acting} onClick={() => void resolve('answer')} className="bg-[#3157e8] text-white hover:bg-[#244bc7]">补充并继续</Button> : null}
-                {selected.available_commands.includes('deny') ? <Button variant="outline" disabled={acting} onClick={() => void resolve('deny')}>拒绝发送</Button> : null}
-                {selected.available_commands.includes('allow_once') ? <Button disabled={acting} onClick={() => void resolve('allow_once')} className="bg-[#3157e8] text-white hover:bg-[#244bc7]">仅批准本次发送</Button> : null}
+                {selected.available_commands.includes('deny') ? <Button variant="outline" disabled={acting} onClick={() => void resolve('deny')}>{isWorkspaceApproval(selected) ? '拒绝操作' : '拒绝发送'}</Button> : null}
+                {selected.available_commands.includes('allow_once') ? <Button disabled={acting} onClick={() => void resolve('allow_once')} className="bg-[#3157e8] text-white hover:bg-[#244bc7]">{isWorkspaceApproval(selected) ? '仅批准本次操作' : '仅批准本次发送'}</Button> : null}
                 {selected.available_commands.includes('confirm_not_applied') ? <Button variant="outline" disabled={acting} onClick={() => void resolve('confirm_not_applied')}>确认未送达</Button> : null}
                 {selected.available_commands.includes('confirm_applied') ? <Button disabled={acting} onClick={() => void resolve('confirm_applied')} className="bg-[#3157e8] text-white hover:bg-[#244bc7]">确认已送达</Button> : null}
                 {selected.available_commands.includes('reauthorize') ? <Button disabled={acting} onClick={() => void completeReauth()} className="bg-[#3157e8] text-white hover:bg-[#244bc7]">验证并恢复任务</Button> : null}
@@ -477,7 +490,9 @@ function attentionQuestion(item: AttentionItem): string {
     const provider = stringPayload(item, 'provider') === 'wecom' ? '企业微信应用' : 'Slack 账号';
     return `${provider} ${accountId || '未知'} 需要重新授权${reasonCode ? `（${reasonCode}）` : ''}`;
   }
-  if (item.kind === 'tool_approval') return '请核对下方精确正文，并决定是否仅批准本次企业微信发送。';
+  if (item.kind === 'tool_approval') return isWorkspaceApproval(item)
+    ? '请核对受管工作区、固定动作和精确参数，再决定是否批准本次代码操作。'
+    : '请核对下方精确正文，并决定是否仅批准本次企业微信发送。';
   if (item.kind === 'exception') return stringPayload(item, 'instruction') || '外部效果不确定，请依据独立证据人工对账。';
   return typeof item.payload.question === 'string' && item.payload.question.trim()
     ? item.payload.question
@@ -498,6 +513,21 @@ function stringPayload(item: AttentionItem, key: string): string {
   /** 从不可信 Attention payload 中读取非空字符串。 */
 
   const value = item.payload[key];
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function isWorkspaceApproval(item: AttentionItem): boolean {
+  /** 只根据服务端冻结的 workspace 对象切换展示，不从标题或操作名猜测风险类别。 */
+
+  return Boolean(item.payload.workspace && typeof item.payload.workspace === 'object' && !Array.isArray(item.payload.workspace));
+}
+
+function workspaceField(item: AttentionItem, key: string): string {
+  /** 从受管工作区审批投影读取非敏感稳定字段。 */
+
+  const workspace = item.payload.workspace;
+  if (!workspace || typeof workspace !== 'object' || Array.isArray(workspace)) return '';
+  const value = (workspace as Record<string, unknown>)[key];
   return typeof value === 'string' ? value.trim() : '';
 }
 

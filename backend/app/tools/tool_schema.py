@@ -23,7 +23,7 @@ class ToolCreateRequest(BaseModel):
     display_name: Optional[str] = None
     description: Optional[str] = None
     bucket: str = "未分桶"
-    tool_type: Literal["http", "mcp"] = "http"
+    tool_type: Literal["http", "mcp", "managed_workspace"] = "http"
     method: Literal["GET", "POST", "PUT", "PATCH", "DELETE"] = "POST"
     url: str
     headers: dict[str, str] = Field(default_factory=dict)

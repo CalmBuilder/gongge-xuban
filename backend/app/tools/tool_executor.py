@@ -27,6 +27,10 @@ from app.organization.agent_execution import (
 from app.tools.http_request import prepare_get_request
 from app.tools.builtin_tools import execute_builtin_tool
 from app.tools.mcp_client import MCPClientError, execute_mcp_tool
+from app.tools.managed_workspace import (
+    ManagedCodeWorkspaceError,
+    ManagedCodeWorkspaceService,
+)
 from app.tools.tool_schema import ToolCall, ToolError, ToolResult
 from app.security.internal_service import INTERNAL_SERVICE_HEADER, internal_service_token
 
@@ -51,6 +55,7 @@ class ToolExecutor:
         actor_user_id: str | None = None,
         execution_org_unit_id: str | None = None,
         remote_idempotency_key: str | None = None,
+        execution_id: str | None = None,
     ) -> ToolResult:
         """鉴权后执行工具，并仅向 HTTP 非 GET 写请求发送服务端远端幂等键。"""
 
@@ -114,6 +119,11 @@ class ToolExecutor:
                     self._error(tool.name, error_code, str(exc)),
                     authorization,
                 )
+        if (tool.tool_type or "http") == "managed_workspace":
+            return self._with_authorization(
+                self._execute_managed_workspace(tool, tool_call.arguments, execution_id),
+                authorization,
+            )
         if (tool.tool_type or "http") != "http":
             return self._error(
                 tool.name, "UNSUPPORTED_TOOL_TYPE", f"不支持的工具类型：{tool.tool_type}"
@@ -168,6 +178,108 @@ class ToolExecutor:
             return self._with_authorization(
                 self._error(tool.name, "EXECUTION_ERROR", str(exc)), authorization
             )
+
+    def _execute_managed_workspace(
+        self,
+        tool: Tool,
+        arguments: dict[str, Any],
+        execution_id: str | None,
+    ) -> ToolResult:
+        """按工具发布的固定 handler 调用受管工作区，模型不能传入根目录或命令。"""
+
+        if not self.settings.dynamic_task_managed_workspace_enabled:
+            return self._error(tool.name, "WORKSPACE_DISABLED", "受管代码工作区未启用。")
+        config = tool.config_json or {}
+        workspace_id = str(config.get("workspace_id") or "")
+        base_ref = str(config.get("base_ref") or "main")
+        handler = str(config.get("handler") or "")
+        service = ManagedCodeWorkspaceService(
+            root=self.settings.dynamic_task_managed_workspace_root
+        )
+        try:
+            if handler == "read_file":
+                self._require_argument_keys(arguments, {"path"})
+                data = service.read_file(
+                    tenant_id=tool.tenant_id,
+                    workspace_id=workspace_id,
+                    path=str(arguments["path"]),
+                )
+            elif handler == "status":
+                self._require_argument_keys(arguments, set())
+                data = service.status(tenant_id=tool.tenant_id, workspace_id=workspace_id)
+            elif handler == "apply_file":
+                self._require_execution(execution_id)
+                self._require_argument_keys(
+                    arguments, {"path", "expected_sha256", "content"}
+                )
+                data = service.apply_file(
+                    tenant_id=tool.tenant_id,
+                    workspace_id=workspace_id,
+                    execution_id=str(execution_id),
+                    base_ref=base_ref,
+                    path=str(arguments["path"]),
+                    expected_sha256=str(arguments["expected_sha256"]),
+                    content=str(arguments["content"]),
+                )
+            elif handler == "run_check":
+                self._require_execution(execution_id)
+                self._require_argument_keys(arguments, {"profile"})
+                profiles = config.get("check_profiles")
+                if not isinstance(profiles, dict):
+                    raise ManagedCodeWorkspaceError("WORKSPACE_CHECK_PROFILE_INVALID")
+                data = service.run_check(
+                    tenant_id=tool.tenant_id,
+                    workspace_id=workspace_id,
+                    execution_id=str(execution_id),
+                    base_ref=base_ref,
+                    profile=str(arguments["profile"]),
+                    profiles=profiles,
+                )
+                if data.get("passed") is not True:
+                    return ToolResult(
+                        tool_name=tool.name,
+                        success=False,
+                        data=data,
+                        error=ToolError(
+                            code="WORKSPACE_CHECK_FAILED",
+                            message="受管代码检查未通过。",
+                        ),
+                    )
+            elif handler == "commit":
+                self._require_execution(execution_id)
+                self._require_argument_keys(arguments, {"message", "paths"})
+                paths = arguments["paths"]
+                if not isinstance(paths, list) or not all(
+                    isinstance(path, str) for path in paths
+                ):
+                    raise ManagedCodeWorkspaceError("WORKSPACE_COMMIT_PATHS_INVALID")
+                data = service.commit(
+                    tenant_id=tool.tenant_id,
+                    workspace_id=workspace_id,
+                    execution_id=str(execution_id),
+                    base_ref=base_ref,
+                    message=str(arguments["message"]),
+                    paths=paths,
+                )
+            else:
+                raise ManagedCodeWorkspaceError("WORKSPACE_HANDLER_FORBIDDEN")
+            return ToolResult(tool_name=tool.name, success=True, data=data, error=None)
+        except ManagedCodeWorkspaceError as exc:
+            return self._error(tool.name, str(exc), "受管代码工作区操作被拒绝。")
+
+    @staticmethod
+    def _require_argument_keys(arguments: dict[str, Any], expected: set[str]) -> None:
+        """拒绝模型额外注入 workspace、image、argv、网络或其他未发布参数。"""
+
+        if set(arguments) != expected:
+            raise ManagedCodeWorkspaceError("WORKSPACE_ARGUMENTS_INVALID")
+
+    @staticmethod
+    def _require_execution(execution_id: str | None) -> None:
+        """写入、检查和提交必须绑定持久 Execution，禁止管理页试调用旁路。"""
+
+        if not execution_id:
+            raise ManagedCodeWorkspaceError("WORKSPACE_EXECUTION_REQUIRED")
 
     def _with_authorization(
         self, result: ToolResult, decision: AgentExecutionDecision | None

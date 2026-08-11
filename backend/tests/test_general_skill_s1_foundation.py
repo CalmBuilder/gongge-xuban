@@ -363,7 +363,7 @@ def test_0052_migration_constraint_survives_later_heads(tmp_path) -> None:
     assert "uq_general_skill_import_retry_attempt" in constraints
     with engine.connect() as connection:
         assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-            "20260813_0058"
+            "20260813_0059"
         )
     engine.dispose()
 
@@ -404,7 +404,7 @@ def test_0053_migration_adds_idempotent_worker_lease_contract(tmp_path) -> None:
     }
     with engine.connect() as connection:
         assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-            "20260813_0058"
+            "20260813_0059"
         )
     engine.dispose()
 

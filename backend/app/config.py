@@ -50,6 +50,8 @@ class Settings(BaseSettings):
     dynamic_task_external_write_enabled: bool = False
     dynamic_task_standing_approval_enabled: bool = False
     dynamic_task_explore_enabled: bool = False
+    dynamic_task_managed_workspace_enabled: bool = False
+    dynamic_task_managed_workspace_root: str = "./data/managed-code-workspaces"
     dynamic_task_tenant_allowlist: str = ""
     dynamic_task_agent_allowlist: str = ""
     dynamic_task_signal_dispatch_workers: int = Field(default=4, ge=1, le=64)
@@ -194,6 +196,19 @@ class Settings(BaseSettings):
         if not value:
             raise ValueError("PUBLIC_MOCK_API_KEY must be configured")
         return value
+
+    @field_validator("dynamic_task_managed_workspace_root")
+    @classmethod
+    def validate_managed_workspace_root(cls, value: str) -> str:
+        """拒绝空值、文件系统根和用户主目录作为受管代码工作区边界。"""
+
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("DYNAMIC_TASK_MANAGED_WORKSPACE_ROOT must be configured")
+        resolved = Path(normalized).expanduser().resolve()
+        if resolved in {Path("/").resolve(), Path.home().resolve()}:
+            raise ValueError("DYNAMIC_TASK_MANAGED_WORKSPACE_ROOT is too broad")
+        return normalized
 
     @property
     def general_skill_runtime_package_list(self) -> list[str]:

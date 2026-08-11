@@ -277,3 +277,70 @@ def test_planner_rejects_plan_without_terminal_answer() -> None:
             success_criteria=(criterion,),
             capabilities=(_snapshot(),),
         )
+
+
+class _ManagedWorkspacePlanClient:
+    """返回受管代码写入、隔离检查和最终结果的收敛计划。"""
+
+    def generate_json(self, system_prompt: str, user_payload: dict) -> dict:
+        """断言模型只能看到发布视图，并使用风险类别对应的步骤语义。"""
+
+        assert "tool.write" in user_payload["limits"]["allowed_step_kinds"]
+        assert "tool.execute" in user_payload["limits"]["allowed_step_kinds"]
+        return {
+            "goal": user_payload["goal"],
+            "success_criteria": user_payload["success_criteria"],
+            "steps": [
+                {
+                    "draft_id": "patch",
+                    "title": "写入补丁",
+                    "kind": "tool.write",
+                    "capability_refs": ["workspace.apply"],
+                },
+                {
+                    "draft_id": "test",
+                    "title": "运行检查",
+                    "kind": "tool.execute",
+                    "depends_on": ["patch"],
+                    "capability_refs": ["workspace.test"],
+                },
+                {
+                    "draft_id": "answer",
+                    "title": "交付结果",
+                    "kind": "answer",
+                    "depends_on": ["test"],
+                },
+            ],
+        }
+
+
+def test_planner_maps_local_write_and_execute_to_distinct_governed_steps() -> None:
+    """本地修改与执行不得伪装成只读或外部写，二者均进入独立计划语义。"""
+
+    capabilities: list[CapabilitySnapshot] = []
+    for name, risk in (("workspace.apply", "local_write"), ("workspace.test", "execute")):
+        payload = {
+            "capability_type": "tool",
+            "capability_id": f"tool-{risk}",
+            "tenant_id": "tenant_demo",
+            "name": name,
+            "contract": {"risk_class": risk},
+            "model_view": {"name": name, "input_schema": {"type": "object"}},
+            "user_view": {"name": name},
+            "audit_view": {"managed_workspace": {"workspace_id": "demo"}},
+        }
+        capabilities.append(
+            CapabilitySnapshot(
+                **payload,
+                agent_id="agent_demo",
+                checksum=capability_checksum(payload),
+            )
+        )
+    plan = DynamicTaskPlanner(_ManagedWorkspacePlanClient()).create_plan(
+        goal="修改并验证退款能力",
+        success_criteria=(
+            SuccessCriterion(id="verified", type="assertion", spec={"required": True}),
+        ),
+        capabilities=capabilities,
+    )
+    assert [step.kind for step in plan.steps] == ["tool.write", "tool.execute", "answer"]

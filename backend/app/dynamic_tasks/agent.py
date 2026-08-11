@@ -67,6 +67,7 @@ from app.dynamic_tasks.planning import (
     NormalizedPlan,
     PlanReason,
     PlanStep,
+    RuntimeActionProposal,
     SuccessCriterion,
 )
 from app.dynamic_tasks.quotas import DynamicTaskQuotaLimits, DynamicTaskQuotaService
@@ -138,6 +139,7 @@ class DynamicToolExecutor(Protocol):
         actor_user_id: str | None = None,
         execution_org_unit_id: str | None = None,
         remote_idempotency_key: str | None = None,
+        execution_id: str | None = None,
     ) -> ToolResult:
         """执行已经过服务端验证和再授权的现有 ToolCall。"""
 
@@ -336,6 +338,26 @@ class DynamicTaskAgent:
                     )
                 continue
             if step.kind == "tool.write":
+                if self._planned_step_risk(instance, step) == "local_write":
+                    attention = self.advance_next_local_step(
+                        execution_id=instance.id,
+                        model_config=model_config,
+                        worker_id=worker_id,
+                        actor_user_id=actor_user_id,
+                        step_kind="tool.write",
+                    )
+                    if resume_signal_id is not None:
+                        self._consume_resume_signal(
+                            instance,
+                            signal_id=resume_signal_id,
+                            worker_id=signal_worker_id or worker_id,
+                        )
+                    self.db.commit()
+                    return DynamicRunOutcome(
+                        "waiting",
+                        instance.id,
+                        blocking_step_key=step.step_key if attention is not None else None,
+                    )
                 attention = self.advance_next_write_step(
                     execution_id=instance.id,
                     model_config=model_config,
@@ -345,6 +367,26 @@ class DynamicTaskAgent:
                 if attention is None:
                     self.db.commit()
                     continue
+                if resume_signal_id is not None:
+                    self._consume_resume_signal(
+                        instance,
+                        signal_id=resume_signal_id,
+                        worker_id=signal_worker_id or worker_id,
+                    )
+                self.db.commit()
+                return DynamicRunOutcome(
+                    "waiting",
+                    instance.id,
+                    blocking_step_key=step.step_key if attention is not None else None,
+                )
+            if step.kind == "tool.execute":
+                attention = self.advance_next_local_step(
+                    execution_id=instance.id,
+                    model_config=model_config,
+                    worker_id=worker_id,
+                    actor_user_id=actor_user_id,
+                    step_kind="tool.execute",
+                )
                 if resume_signal_id is not None:
                     self._consume_resume_signal(
                         instance,
@@ -748,6 +790,7 @@ class DynamicTaskAgent:
             agent_id=instance.agent_id,
             actor_user_id=actor_user_id,
             execution_org_unit_id=organization_unit_id,
+            execution_id=instance.id,
         )
         self.store.finish_operation(
             operation,
@@ -1212,6 +1255,216 @@ class DynamicTaskAgent:
             recovery_signal=recovery_signal,
         )
 
+    def advance_next_local_step(
+        self,
+        *,
+        execution_id: str,
+        model_config: ModelConfig,
+        worker_id: str,
+        actor_user_id: str,
+        step_kind: str,
+    ) -> SopWorkItem:
+        """冻结受管工作区本地写或隔离检查，并始终创建一次性人工批准。"""
+
+        if not get_settings().dynamic_task_managed_workspace_enabled:
+            raise DynamicTaskAgentError("DYNAMIC_MANAGED_WORKSPACE_DISABLED")
+        if step_kind not in {"tool.write", "tool.execute"}:
+            raise DynamicTaskAgentError("DYNAMIC_LOCAL_STEP_KIND_INVALID")
+        instance = self.db.get(SopInstance, execution_id)
+        if instance is None or instance.kind != "dynamic_task":
+            raise DynamicTaskAgentError("DYNAMIC_EXECUTION_NOT_FOUND")
+        expected_effect = "local_write" if step_kind == "tool.write" else "execute"
+        with self.store.owned(instance, worker_id=worker_id):
+            plan = self._current_plan(instance)
+            completed_keys = self._completed_step_keys(instance)
+            definition = next(
+                (
+                    item
+                    for item in plan.steps
+                    if item.kind == step_kind
+                    and item.step_key not in completed_keys
+                    and set(item.depends_on) <= completed_keys
+                ),
+                None,
+            )
+            if definition is None:
+                raise DynamicTaskAgentError("DYNAMIC_NO_READY_LOCAL_STEP")
+            step = self._step(instance, definition.step_key)
+            action_record: ActionProposalRecord | None = None
+            if step is not None:
+                operation = self.db.exec(
+                    select(SopOperation).where(
+                        SopOperation.tenant_id == instance.tenant_id,
+                        SopOperation.node_execution_id == step.id,
+                        SopOperation.effect_kind == expected_effect,
+                    )
+                ).first()
+                attention = self.db.exec(
+                    select(SopWorkItem)
+                    .where(
+                        SopWorkItem.tenant_id == instance.tenant_id,
+                        SopWorkItem.instance_id == instance.id,
+                        SopWorkItem.node_execution_id == step.id,
+                        SopWorkItem.attention_kind == "tool_approval",
+                    )
+                    .order_by(SopWorkItem.created_at.desc())
+                ).first()
+                if operation is not None and operation.status in {"prepared", "running"}:
+                    if attention is None:
+                        raise DynamicTaskAgentError("DYNAMIC_LOCAL_APPROVAL_MISSING")
+                    return attention
+                if operation is not None or step.status != "running":
+                    raise DynamicTaskAgentError("DYNAMIC_LOCAL_OPERATION_NOT_RETRYABLE")
+                action_record = self.db.exec(
+                    select(ActionProposalRecord).where(
+                        ActionProposalRecord.tenant_id == instance.tenant_id,
+                        ActionProposalRecord.execution_id == instance.id,
+                        ActionProposalRecord.plan_revision_id
+                        == instance.current_plan_revision_id,
+                        ActionProposalRecord.step_key == step.step_key,
+                        ActionProposalRecord.step_attempt == step.attempt,
+                        ActionProposalRecord.status == "validated",
+                    )
+                ).first()
+            else:
+                step = self.store.enter_node(
+                    instance,
+                    definition.step_key,
+                    step_key=definition.step_key,
+                    plan_revision_id=instance.current_plan_revision_id,
+                    step_kind=step_kind,
+                    title=definition.title,
+                    required=definition.required,
+                )
+            if action_record is None:
+                completed = self._propose_action(
+                    instance=instance,
+                    step=definition,
+                    model_config=model_config,
+                    worker_id=worker_id,
+                )
+                proposal = completed.proposal
+                action_record, _ = self.store.record_action_proposal(
+                    instance,
+                    step,
+                    provider=model_config.provider,
+                    model=model_config.model,
+                    model_capability_snapshot=dict(model_config.capability_snapshot_json or {}),
+                    completed_response=completed,
+                )
+            else:
+                try:
+                    proposal = RuntimeActionProposal.model_validate(
+                        action_record.normalized_proposal_json
+                    )
+                except ValidationError as exc:
+                    raise DynamicTaskAgentError(
+                        "DYNAMIC_LOCAL_ACTION_RECORD_INVALID"
+                    ) from exc
+            if proposal.action_kind.value != "call_tool":
+                raise DynamicTaskAgentError("DYNAMIC_LOCAL_ACTION_REQUIRED")
+            capability_ref = str(proposal.capability_ref or "")
+            snapshot = self._frozen_local_snapshot(
+                instance,
+                capability_ref,
+                expected_risk=expected_effect,
+            )
+            arguments = dict(proposal.arguments)
+            self._validate_workspace_arguments(snapshot, arguments)
+            operation, _ = self.store.prepare_operation_from_proposal(
+                instance,
+                step,
+                action_record,
+                operation_name=capability_ref,
+                request=arguments,
+                idempotency_policy=IdempotencyPolicy(),
+                effect_kind=expected_effect,
+                caused_by_skill_use_ids=definition.guidance_skill_use_ids,
+                capability_snapshot=snapshot.model_dump(
+                    mode="json", exclude={"checksum", "agent_id"}
+                ),
+                capability_snapshot_checksum=snapshot.checksum,
+            )
+            attention = self._offer_local_approval(
+                instance=instance,
+                step=step,
+                operation=operation,
+                snapshot=snapshot,
+                arguments=arguments,
+            )
+        self.db.commit()
+        return attention
+
+    def _offer_local_approval(
+        self,
+        *,
+        instance: SopInstance,
+        step: SopNodeExecution,
+        operation: SopOperation,
+        snapshot: CapabilitySnapshot,
+        arguments: Mapping[str, object],
+    ) -> SopWorkItem:
+        """为精确本地动作生成脱敏参数、能力修订和过期时间绑定的一次性审批。"""
+
+        approver_ids = self._workspace_approver_ids(
+            instance.tenant_id,
+            exclude_user_id=instance.initiator_user_id,
+        )
+        if not approver_ids:
+            raise DynamicTaskAgentError("DYNAMIC_LOCAL_APPROVER_UNAVAILABLE")
+        expires_at = self.store.database_now() + timedelta(minutes=15)
+        payload: dict[str, object] = {
+            "operation_id": operation.id,
+            "operation_name": operation.operation_name,
+            "arguments": dict(arguments),
+            "request_fingerprint": operation.request_fingerprint,
+            "capability_checksum": snapshot.checksum,
+            "workspace": dict(snapshot.audit_view.get("managed_workspace") or {}),
+            "execution_id": instance.id,
+            "plan_revision_id": instance.current_plan_revision_id,
+            "expires_at": expires_at.isoformat(),
+        }
+        payload["approval_fingerprint"] = capability_checksum(payload)
+        control = ExecutionControlService(self.db, self.store)
+        attention, created = control.offer_attention(
+            instance,
+            attention_kind="tool_approval",
+            attention_key=f"{step.step_key}:local_approval:{operation.id}",
+            title=(
+                "批准受管代码工作区执行检查"
+                if operation.effect_kind == "execute"
+                else "批准受管代码工作区变更"
+            ),
+            payload=payload,
+            allowed_commands=["allow_once", "deny"],
+            candidate_user_ids=approver_ids,
+            source_type="dynamic_task",
+            source_ref=operation.id,
+            node_execution=step,
+            exclude_initiator=True,
+        )
+        if created:
+            attention.expires_at = expires_at
+            self.db.add(attention)
+        if step.status == "running":
+            self.store.wait_for_work_item(instance, step, work_item_id=attention.id)
+        return attention
+
+    def _workspace_approver_ids(self, tenant_id: str, *, exclude_user_id: str) -> list[str]:
+        """仅允许活动租户管理员审批代码变更，并保持发起人与批准人分离。"""
+
+        return [
+            user.id
+            for user in self.db.exec(
+                select(User).where(
+                    User.tenant_id == tenant_id,
+                    User.membership_status == "active",
+                    User.role == "admin",
+                    User.id != exclude_user_id,
+                )
+            ).all()
+        ]
+
     def _offer_write_approval(
         self,
         *,
@@ -1480,6 +1733,29 @@ class DynamicTaskAgent:
         instance = self.db.get(SopInstance, signal.execution_id)
         if instance is None or instance.kind != "dynamic_task":
             raise DynamicTaskAgentError("DYNAMIC_EXECUTION_NOT_FOUND")
+        attention_probe = self.db.get(
+            SopWorkItem,
+            str(signal.payload_json.get("attention_id") or ""),
+        )
+        operation_probe = (
+            self.db.get(
+                SopOperation,
+                str(attention_probe.payload_json.get("operation_id") or ""),
+            )
+            if attention_probe is not None
+            else None
+        )
+        if operation_probe is not None and operation_probe.effect_kind in {
+            "local_write",
+            "execute",
+        }:
+            return self._resume_local_tool_approval_signal(
+                signal=signal,
+                instance=instance,
+                model_config=model_config,
+                worker_id=worker_id,
+                actor_user_id=actor_user_id,
+            )
         if signal.status == "consumed":
             if instance.status in {"failed", "cancelled", "timed_out"}:
                 return DynamicRunOutcome(instance.status, instance.id)
@@ -1684,6 +1960,189 @@ class DynamicTaskAgent:
             error_code=str(result.error_code or "WECOM_DELIVERY_FAILED"),
             signal=signal,
             control=control,
+        )
+
+    def _resume_local_tool_approval_signal(
+        self,
+        *,
+        signal: ExecutionSignal,
+        instance: SopInstance,
+        model_config: ModelConfig,
+        worker_id: str,
+        actor_user_id: str,
+    ) -> DynamicRunOutcome:
+        """办理或恢复本地一次性审批；running 中断按内容幂等契约安全重派。"""
+
+        if not get_settings().dynamic_task_managed_workspace_enabled:
+            raise DynamicTaskAgentError("DYNAMIC_MANAGED_WORKSPACE_DISABLED")
+        if signal.status == "consumed":
+            if instance.status in {"failed", "cancelled", "timed_out"}:
+                return DynamicRunOutcome(instance.status, instance.id)
+            return self.run_until_blocked_or_complete(
+                execution_id=instance.id,
+                model_config=model_config,
+                worker_id=worker_id,
+                actor_user_id=instance.initiator_user_id,
+            )
+        control = ExecutionControlService(self.db, self.store)
+        control.claim_signal(signal, worker_id=worker_id, ttl_seconds=300)
+        self.db.commit()
+        with self.store.owned(instance, worker_id=worker_id):
+            attention = self.db.get(
+                SopWorkItem,
+                str(signal.payload_json.get("attention_id") or ""),
+            )
+            if (
+                attention is None
+                or attention.instance_id != instance.id
+                or attention.attention_kind != "tool_approval"
+                or attention.status != "completed"
+                or str(attention.resolution_json.get("actor_user_id") or "")
+                != actor_user_id
+            ):
+                raise DynamicTaskAgentError("DYNAMIC_TOOL_APPROVAL_RESOLUTION_INVALID")
+            operation = self.db.get(
+                SopOperation,
+                str(attention.payload_json.get("operation_id") or ""),
+            )
+            step = self.db.get(SopNodeExecution, attention.node_execution_id or "")
+            if (
+                operation is None
+                or step is None
+                or operation.instance_id != instance.id
+                or operation.node_execution_id != step.id
+                or operation.effect_kind not in {"local_write", "execute"}
+            ):
+                raise DynamicTaskAgentError("DYNAMIC_TOOL_APPROVAL_OPERATION_INVALID")
+            if operation.status == "succeeded" and step.status == "succeeded":
+                self.db.commit()
+                return self.run_until_blocked_or_complete(
+                    execution_id=instance.id,
+                    model_config=model_config,
+                    worker_id=worker_id,
+                    actor_user_id=instance.initiator_user_id,
+                    resume_signal_id=signal.id,
+                    signal_worker_id=worker_id,
+                )
+            command = str(attention.resolution_json.get("command") or "")
+            if operation.status == "prepared":
+                if step.status != "waiting":
+                    raise DynamicTaskAgentError("DYNAMIC_TOOL_APPROVAL_OPERATION_INVALID")
+                if command == "deny":
+                    self.store.cancel_prepared_operation(operation)
+                    self.store.resume_waiting_node(instance, step, slots=instance.slots_json or {})
+                    self.store.fail_node(instance, step, error={"code": "DYNAMIC_LOCAL_DENIED"})
+                    control.consume_signal(instance, signal, worker_id=worker_id)
+                    instance.terminal_reason_json = {"code": "DYNAMIC_LOCAL_DENIED"}
+                    self.db.add(instance)
+                    self.store.fail_instance(
+                        instance,
+                        context_patch={"failure_code": "DYNAMIC_LOCAL_DENIED"},
+                    )
+                    self.db.commit()
+                    return DynamicRunOutcome("failed", instance.id)
+                if command != "allow_once":
+                    raise DynamicTaskAgentError("DYNAMIC_TOOL_APPROVAL_COMMAND_INVALID")
+                payload = dict(attention.payload_json or {})
+                frozen_fingerprint = str(payload.pop("approval_fingerprint", ""))
+                if (
+                    not frozen_fingerprint
+                    or capability_checksum(payload) != frozen_fingerprint
+                    or attention.expires_at is None
+                    or attention.expires_at <= self.store.database_now()
+                    or payload.get("request_fingerprint") != operation.request_fingerprint
+                    or payload.get("plan_revision_id") != instance.current_plan_revision_id
+                ):
+                    raise DynamicTaskAgentError("DYNAMIC_TOOL_APPROVAL_FINGERPRINT_INVALID")
+                expected_risk = operation.effect_kind
+                snapshot = self._frozen_local_snapshot(
+                    instance,
+                    operation.operation_name,
+                    expected_risk=expected_risk,
+                )
+                if payload.get("capability_checksum") != snapshot.checksum:
+                    raise DynamicTaskAgentError("DYNAMIC_TOOL_APPROVAL_CAPABILITY_CHANGED")
+                if actor_user_id not in self._workspace_approver_ids(
+                    instance.tenant_id,
+                    exclude_user_id=instance.initiator_user_id,
+                ):
+                    raise DynamicTaskAgentError("DYNAMIC_LOCAL_APPROVER_DENIED")
+                self.catalog.reauthorize_tool(
+                    snapshot,
+                    actor_user_id=instance.initiator_user_id,
+                    organization_unit_id=None,
+                )
+                self.store.resume_waiting_node(instance, step, slots=instance.slots_json or {})
+                self._acquire_tool_quota(operation)
+                self.store.authorize_local_operation_dispatch(
+                    operation,
+                    approval_work_item_id=attention.id,
+                    approval_fingerprint=frozen_fingerprint,
+                    approved_by_user_id=actor_user_id,
+                    authorization_evidence={
+                        "workspace": payload.get("workspace"),
+                        "capability_checksum": snapshot.checksum,
+                        "approved_actor_role": "admin",
+                    },
+                )
+                self._consume_call_budget(instance, "tool_calls")
+            elif operation.status == "running" and step.status == "running":
+                snapshot = self._frozen_local_snapshot(
+                    instance,
+                    operation.operation_name,
+                    expected_risk=operation.effect_kind,
+                )
+                self.catalog.reauthorize_tool(
+                    snapshot,
+                    actor_user_id=instance.initiator_user_id,
+                    organization_unit_id=None,
+                )
+            else:
+                raise DynamicTaskAgentError("DYNAMIC_TOOL_APPROVAL_OPERATION_INVALID")
+        self.db.commit()
+        result = self.tool_executor.execute(
+            instance.tenant_id,
+            ToolCall(name=operation.operation_name, arguments=dict(operation.request_json or {})),
+            agent_id=instance.agent_id,
+            actor_user_id=instance.initiator_user_id,
+            execution_id=instance.id,
+        )
+        with self.store.owned(instance, worker_id=worker_id):
+            self.store.finish_operation(
+                operation,
+                succeeded=result.success,
+                result={"data": result.data} if result.success else None,
+                error=(result.error.model_dump(mode="json") if result.error else None),
+            )
+            if result.success:
+                self.store.complete_node(instance, step, output={"data": result.data})
+            else:
+                self.store.fail_node(
+                    instance,
+                    step,
+                    error=(
+                        result.error.model_dump(mode="json")
+                        if result.error
+                        else {"code": "DYNAMIC_LOCAL_FAILED"}
+                    ),
+                )
+                control.consume_signal(instance, signal, worker_id=worker_id)
+                instance.terminal_reason_json = {"code": "DYNAMIC_LOCAL_FAILED"}
+                self.db.add(instance)
+                self.store.fail_instance(
+                    instance,
+                    context_patch={"failure_code": "DYNAMIC_LOCAL_FAILED"},
+                )
+                self.db.commit()
+                return DynamicRunOutcome("failed", instance.id)
+        self.db.commit()
+        return self.run_until_blocked_or_complete(
+            execution_id=instance.id,
+            model_config=model_config,
+            worker_id=worker_id,
+            actor_user_id=instance.initiator_user_id,
+            resume_signal_id=signal.id,
+            signal_worker_id=worker_id,
         )
 
     def _refresh_write_approval(
@@ -2562,7 +3021,15 @@ class DynamicTaskAgent:
             )
         if any(
             step.kind
-            not in {"tool.read", "tool.write", "knowledge", "explore", "clarification", "answer"}
+            not in {
+                "tool.read",
+                "tool.write",
+                "tool.execute",
+                "knowledge",
+                "explore",
+                "clarification",
+                "answer",
+            }
             for step in plan.steps
         ):
             raise DynamicTaskAgentError("DYNAMIC_PLAN_UNSUPPORTED_STEP")
@@ -2804,6 +3271,7 @@ class DynamicTaskAgent:
                 agent_id=instance.agent_id,
                 actor_user_id=actor_user_id,
                 execution_org_unit_id=organization_unit_id,
+                execution_id=instance.id,
             )
             self.store.finish_operation(
                 operation,
@@ -3653,6 +4121,94 @@ class DynamicTaskAgent:
             return snapshot
         raise DynamicTaskAgentError("DYNAMIC_WRITE_CAPABILITY_NOT_FROZEN")
 
+    def _frozen_local_snapshot(
+        self,
+        instance: SopInstance,
+        capability_ref: str,
+        *,
+        expected_risk: str,
+    ) -> CapabilitySnapshot:
+        """从冻结工具目录解析受管本地动作，并拒绝伪装连接器或缺少目标身份。"""
+
+        tools = (instance.capability_snapshot_json or {}).get("tools")
+        if not isinstance(tools, list):
+            raise DynamicTaskAgentError("DYNAMIC_CAPABILITY_SNAPSHOT_INVALID")
+        for value in tools:
+            if not isinstance(value, dict) or value.get("name") != capability_ref:
+                continue
+            try:
+                snapshot = CapabilitySnapshot.model_validate(value)
+            except ValueError as exc:
+                raise DynamicTaskAgentError("DYNAMIC_CAPABILITY_SNAPSHOT_INVALID") from exc
+            managed = snapshot.audit_view.get("managed_workspace")
+            if (
+                snapshot.capability_type != "tool"
+                or snapshot.agent_id != instance.agent_id
+                or snapshot.tenant_id != instance.tenant_id
+                or snapshot.contract.get("risk_class") != expected_risk
+                or snapshot.contract.get("confirmation_policy") != "once"
+                or not isinstance(managed, Mapping)
+                or not managed.get("workspace_id")
+                or not managed.get("handler")
+            ):
+                raise DynamicTaskAgentError("DYNAMIC_LOCAL_CAPABILITY_INVALID")
+            return snapshot
+        raise DynamicTaskAgentError("DYNAMIC_LOCAL_CAPABILITY_NOT_FROZEN")
+
+    def _planned_step_risk(self, instance: SopInstance, step: PlanStep) -> str:
+        """解析计划步骤唯一能力的冻结风险类别，用于区分本地写和外部写。"""
+
+        if len(step.capability_refs) != 1:
+            raise DynamicTaskAgentError("DYNAMIC_STEP_CAPABILITY_INVALID")
+        ref = step.capability_refs[0]
+        frozen = instance.capability_snapshot_json or {}
+        for group in ("tools", "connectors"):
+            values = frozen.get(group)
+            if not isinstance(values, list):
+                continue
+            for item in values:
+                if isinstance(item, Mapping) and item.get("name") == ref:
+                    contract = item.get("contract")
+                    if isinstance(contract, Mapping):
+                        return str(contract.get("risk_class") or "")
+        raise DynamicTaskAgentError("DYNAMIC_STEP_CAPABILITY_NOT_FROZEN")
+
+    @staticmethod
+    def _validate_workspace_arguments(
+        snapshot: CapabilitySnapshot,
+        arguments: Mapping[str, object],
+    ) -> None:
+        """在创建审批前按固定 handler 校验精确参数集合和关键大小边界。"""
+
+        managed = snapshot.audit_view.get("managed_workspace")
+        handler = str(managed.get("handler") or "") if isinstance(managed, Mapping) else ""
+        expected = {
+            "apply_file": {"path", "expected_sha256", "content"},
+            "run_check": {"profile"},
+            "commit": {"message", "paths"},
+        }.get(handler)
+        if expected is None or set(arguments) != expected:
+            raise DynamicTaskAgentError("DYNAMIC_LOCAL_ARGUMENTS_INVALID")
+        if handler == "apply_file" and (
+            len(str(arguments.get("content") or "").encode("utf-8")) > 512 * 1024
+            or not str(arguments.get("path") or "")
+            or not str(arguments.get("expected_sha256") or "")
+        ):
+            raise DynamicTaskAgentError("DYNAMIC_LOCAL_ARGUMENTS_INVALID")
+        if handler == "run_check":
+            names = managed.get("check_profile_names") if isinstance(managed, Mapping) else None
+            if not isinstance(names, list) or str(arguments.get("profile") or "") not in names:
+                raise DynamicTaskAgentError("DYNAMIC_LOCAL_ARGUMENTS_INVALID")
+        if handler == "commit":
+            paths = arguments.get("paths")
+            if (
+                not str(arguments.get("message") or "").strip()
+                or not isinstance(paths, list)
+                or not paths
+                or not all(isinstance(path, str) and path for path in paths)
+            ):
+                raise DynamicTaskAgentError("DYNAMIC_LOCAL_ARGUMENTS_INVALID")
+
     def _frozen_knowledge_snapshot(self, instance: SopInstance) -> CapabilitySnapshot:
         """从 Execution 冻结目录解析唯一 knowledge.search 能力。"""
 
@@ -3734,7 +4290,10 @@ class DynamicTaskAgent:
         }
         required: dict[str, dict[str, object]] = {}
         for step in plan.steps:
-            if step.kind not in {"tool.read", "tool.write"} or len(step.capability_refs) != 1:
+            if (
+                step.kind not in {"tool.read", "tool.write", "tool.execute"}
+                or len(step.capability_refs) != 1
+            ):
                 continue
             snapshot = snapshots.get(step.capability_refs[0])
             contract = snapshot.get("contract") if isinstance(snapshot, Mapping) else None

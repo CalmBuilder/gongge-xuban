@@ -6,6 +6,7 @@ import httpx
 from app.agents.branching import ensure_private_resource_binding
 from app.tools.tool_executor import ToolExecutor
 from app.tools.tool_schema import ToolCall
+from app.tools.managed_workspace import ManagedCodeWorkspaceService
 from app.db.models import AgentProfile, MCPServer, Tenant, Tool
 from app.security.internal_service import INTERNAL_SERVICE_HEADER, internal_service_token
 from sqlalchemy.pool import StaticPool
@@ -168,6 +169,52 @@ def test_execute_builtin_mcp_tool_unknown_config_returns_error() -> None:
         assert result.success is False
         assert result.error is not None
         assert result.error.code == "MCP_ERROR"
+
+
+def test_managed_workspace_failed_check_is_not_reported_as_success(monkeypatch) -> None:
+    """容器退出非零时保留回执但必须阻断后续提交，不能把调用成功混同测试通过。"""
+
+    monkeypatch.setattr(
+        ManagedCodeWorkspaceService,
+        "run_check",
+        lambda self, **kwargs: {
+            "profile": "backend-unit",
+            "passed": False,
+            "exit_code": 1,
+            "stdout": "",
+            "stderr": "FAILED",
+        },
+    )
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_workspace", name="Workspace"))
+        db.add(
+            Tool(
+                tenant_id="tenant_workspace",
+                name="workspace.check",
+                tool_type="managed_workspace",
+                method="POST",
+                url="",
+                config_json={
+                    "workspace_id": "demo",
+                    "base_ref": "main",
+                    "handler": "run_check",
+                    "check_profiles": {"backend-unit": {}},
+                },
+            )
+        )
+        db.commit()
+        executor = ToolExecutor(db)
+        monkeypatch.setattr(executor.settings, "dynamic_task_managed_workspace_enabled", True)
+        result = executor.execute(
+            tenant_id="tenant_workspace",
+            tool_call=ToolCall(name="workspace.check", arguments={"profile": "backend-unit"}),
+            execution_id="exec_workspace_check",
+        )
+
+        assert result.success is False
+        assert result.data["exit_code"] == 1
+        assert result.error is not None
+        assert result.error.code == "WORKSPACE_CHECK_FAILED"
 
 
 def test_execute_stdio_mcp_tool_success() -> None:

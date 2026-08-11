@@ -143,7 +143,8 @@ class DynamicTaskPlanner:
         executable_capabilities = [
             snapshot
             for snapshot in capabilities
-            if snapshot.contract.get("risk_class") in {"read", "external_write"}
+            if snapshot.contract.get("risk_class")
+            in {"read", "local_write", "execute", "external_write"}
             and snapshot.capability_type in {"tool", "connector", "knowledge"}
         ]
         allowed_step_kinds = ["tool.read", "answer", "clarification"]
@@ -160,6 +161,16 @@ class DynamicTaskPlanner:
             for snapshot in executable_capabilities
         ):
             allowed_step_kinds.insert(-2, "tool.write")
+        if any(
+            snapshot.contract.get("risk_class") == "local_write"
+            for snapshot in executable_capabilities
+        ) and "tool.write" not in allowed_step_kinds:
+            allowed_step_kinds.insert(-2, "tool.write")
+        if any(
+            snapshot.contract.get("risk_class") == "execute"
+            for snapshot in executable_capabilities
+        ):
+            allowed_step_kinds.insert(-2, "tool.execute")
         payload = {
             "goal": goal,
             "success_criteria": [item.model_dump(mode="json") for item in success_criteria],
@@ -172,7 +183,7 @@ class DynamicTaskPlanner:
                 "max_steps": self.max_steps,
                 "max_tool_calls": self.max_tool_calls,
                 "max_tool_calls_semantics": (
-                    "tool.read、tool.write、knowledge 与 explore 内部实际能力调用总和"
+                    "tool.read、tool.write、tool.execute、knowledge 与 explore 内部实际能力调用总和"
                 ),
                 "max_model_calls": self.max_model_calls,
                 "max_input_tokens": self.max_input_tokens,
@@ -220,7 +231,8 @@ class DynamicTaskPlanner:
 
 
 _PLANNER_SYSTEM_PROMPT = """你是共格·序伴的受控动态任务规划器。只输出一个完整 JSON object。
-你只能使用输入中列出的能力；external_write 只能规划为 tool.write，运行时会冻结参数并等待一次性人工批准。
+你只能使用输入中列出的能力；local_write/external_write 只能规划为 tool.write，execute 只能规划为
+tool.execute，运行时会冻结参数并等待一次性人工批准。
 不得提出执行、删除、权限变更或输入中不存在的能力。步骤种类必须来自 limits.allowed_step_kinds。
 draft_id 只用于本次草案依赖，持久 step key 由服务端生成。
 必须严格按 output_contract 输出顶层字段，禁止增加 plan/draft/result 等包装层或使用 id 替代 draft_id。
@@ -241,7 +253,10 @@ _PLANNER_OUTPUT_CONTRACT = {
         {
             "draft_id": "字母开头的本次草案步骤标识",
             "title": "string",
-            "kind": "tool.read | tool.write | knowledge | explore | answer | clarification",
+            "kind": (
+                "tool.read | tool.write | tool.execute | knowledge | explore | answer | "
+                "clarification"
+            ),
             "required": True,
             "depends_on": ["已声明 draft_id"],
             "capability_refs": ["输入 capabilities 中的 name"],
@@ -278,7 +293,12 @@ def _validate_plan_capabilities(
         item.name
         for item in capabilities
         if item.capability_type in {"tool", "connector"}
-        and item.contract.get("risk_class") == "external_write"
+        and item.contract.get("risk_class") in {"local_write", "external_write"}
+    }
+    execute_names = {
+        item.name
+        for item in capabilities
+        if item.capability_type == "tool" and item.contract.get("risk_class") == "execute"
     }
     knowledge_names = {
         item.name for item in capabilities if item.capability_type == "knowledge"
@@ -298,7 +318,11 @@ def _validate_plan_capabilities(
             continue
         if step.kind == "tool.write":
             if not refs or not refs <= write_names:
-                raise ValueError("动态计划引用了未冻结的外部写能力")
+                raise ValueError("动态计划引用了未冻结的写能力")
+            continue
+        if step.kind == "tool.execute":
+            if not refs or not refs <= execute_names:
+                raise ValueError("动态计划引用了未冻结的执行能力")
             continue
         if step.kind == "knowledge":
             if refs != {"knowledge.search"} or not refs <= knowledge_names:

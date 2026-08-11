@@ -1023,7 +1023,8 @@ class SopOperation(SQLModel, table=True):
             name="ck_sop_operation_status",
         ),
         CheckConstraint(
-            "effect_kind IN ('read', 'external_write', 'legacy_unknown')",
+            "effect_kind IN ('read', 'local_write', 'execute', 'external_write', "
+            "'legacy_unknown')",
             name="ck_sop_operation_effect_kind",
         ),
         CheckConstraint(

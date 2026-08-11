@@ -46,6 +46,7 @@ from app.security.tenant import ensure_tenant
 from app.tools import ToolExecutor
 from app.tools.http_request import prepare_get_request
 from app.tools.mcp_client import MCPClientError, execute_mcp_tool, list_mcp_tools
+from app.tools.managed_workspace import ManagedCodeWorkspaceError, ManagedCodeWorkspaceService
 from app.tools.tool_schema import (
     MCPDiscoverRequest,
     MCPDiscoverResponse,
@@ -168,6 +169,8 @@ def create_tool(
     if existing:
         raise HTTPException(status_code=409, detail="Tool name already exists for this tenant")
     agent = ensure_agent_scope_manager(db, request.tenant_id, agent_id, current_user)
+    if request.tool_type == "managed_workspace":
+        ensure_tenant_admin(request.tenant_id, current_user)
     if request.required_permission_code:
         ensure_tenant_admin(request.tenant_id, current_user)
     _validate_required_permission(db, request)
@@ -192,6 +195,7 @@ def create_tool(
     )
     db.add(row)
     db.flush()
+    _validate_managed_workspace_tool(row, request.reliability_contract)
     _validate_reliability_contract(db, row, request.reliability_contract)
     publish_tool_contract(row, request.reliability_contract)
     creator_metadata = user_creator_metadata(current_user)
@@ -325,6 +329,8 @@ def update_tool(
     if (
         (request.required_permission_code or None) != row.required_permission_code
         or request.permission_authorization_mode != row.permission_authorization_mode
+        or request.tool_type == "managed_workspace"
+        or row.tool_type == "managed_workspace"
     ):
         ensure_tenant_admin(request.tenant_id, current_user)
     if agent and not agent.is_overall:
@@ -366,6 +372,7 @@ def update_tool(
             else None
         )
     )
+    _validate_managed_workspace_tool(row, requested_contract)
     _validate_reliability_contract(db, row, requested_contract)
     publish_tool_contract(row, requested_contract)
     db.add(row)
@@ -512,6 +519,49 @@ def _validate_reliability_contract(
         raise HTTPException(status_code=422, detail="RECONCILE_TOOL_NOT_PUBLISHED") from exc
     if not reconcile_contract.dynamic_task_enabled or reconcile_contract.risk_class != "read":
         raise HTTPException(status_code=422, detail="RECONCILE_TOOL_MUST_BE_PUBLISHED_READ")
+
+
+def _validate_managed_workspace_tool(
+    row: Tool,
+    contract: ToolReliabilityContract | None,
+) -> None:
+    """阻止受管工具伪装 HTTP/MCP、切换风险类别或引用根目录外仓库。"""
+
+    if row.tool_type != "managed_workspace":
+        return
+    if row.headers_json or row.auth_json or row.url or row.method != "POST":
+        raise HTTPException(status_code=422, detail="WORKSPACE_TRANSPORT_MUST_BE_LOCAL")
+    config = row.config_json or {}
+    handler = str(config.get("handler") or "")
+    workspace_id = str(config.get("workspace_id") or "")
+    expected = {
+        "read_file": ("read", "none", "none"),
+        "status": ("read", "none", "none"),
+        "apply_file": ("local_write", "once", "local"),
+        "run_check": ("execute", "once", "local"),
+        "commit": ("local_write", "once", "local"),
+    }.get(handler)
+    allowed_keys = {"handler", "workspace_id", "base_ref"}
+    if handler == "run_check":
+        allowed_keys.add("check_profiles")
+    if (
+        expected is None
+        or set(config) != allowed_keys
+        or contract is None
+        or not contract.dynamic_task_enabled
+        or (contract.risk_class, contract.confirmation_policy, contract.side_effect) != expected
+        or contract.timeout_policy != "failed"
+        or contract.reconcile.supported
+    ):
+        raise HTTPException(status_code=422, detail="WORKSPACE_CONTRACT_INVALID")
+    if handler == "run_check" and not isinstance(config.get("check_profiles"), dict):
+        raise HTTPException(status_code=422, detail="WORKSPACE_CHECK_PROFILES_INVALID")
+    try:
+        ManagedCodeWorkspaceService(
+            root=get_settings().dynamic_task_managed_workspace_root
+        ).status(tenant_id=row.tenant_id, workspace_id=workspace_id)
+    except ManagedCodeWorkspaceError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 def _validate_reliability_schema_paths(

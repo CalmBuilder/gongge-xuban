@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -58,6 +59,10 @@ def configure_environment(database_path: Path) -> None:
             "DYNAMIC_TASK_MAX_ACTIVE_PER_AGENT": "8",
             "DYNAMIC_TASK_MAX_ACTIVE_PER_USER": "4",
             "DYNAMIC_TASK_MAX_ACTIVE_PER_TOOL": "4",
+            "DYNAMIC_TASK_MANAGED_WORKSPACE_ENABLED": "true",
+            "DYNAMIC_TASK_MANAGED_WORKSPACE_ROOT": str(
+                E2E_RUNTIME_DIR / "managed-workspaces"
+            ),
             "GENERAL_SKILL_IMPORT_V2_ENABLED": "true",
             "GENERAL_SKILL_IMPORT_ASYNC_ENABLED": "true",
             "GENERAL_SKILL_IMPORT_WORKER_POLL_SECONDS": "0.2",
@@ -1315,6 +1320,171 @@ def seed_dynamic_task_browser_fixtures() -> None:
         db.commit()
 
 
+def seed_managed_workspace_browser_fixture() -> None:
+    """创建真实 Git 演示仓库并把四个固定受管工具只绑定给成员数字员工。"""
+
+    from sqlmodel import Session
+
+    from app.agents.branching import ensure_private_resource_binding
+    from app.db import engine
+    from app.db.models import Tool
+    from app.dynamic_tasks.capability_catalog import (
+        ToolReliabilityContract,
+        publish_tool_contract,
+    )
+
+    repo = E2E_RUNTIME_DIR / "managed-workspaces" / "tenant_demo" / "refund-demo"
+    repo.mkdir(parents=True)
+    for argv in (
+        ("init", "-b", "main"),
+        ("config", "user.email", "robot@example.invalid"),
+        ("config", "user.name", "E2E Workspace Robot"),
+    ):
+        subprocess.run(["git", "-C", str(repo), *argv], check=True)
+    (repo / "refund.py").write_text("STATUS = 'pending'\n", encoding="utf-8")
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_refund.py").write_text(
+        "import unittest\n"
+        "from refund import STATUS\n\n"
+        "class RefundApprovalTest(unittest.TestCase):\n"
+        "    def test_high_refund_requires_approval(self):\n"
+        "        self.assertEqual(STATUS, 'approval_required')\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "refund.py", "tests/test_refund.py"], check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "baseline"], check=True
+    )
+    image = (
+        "python@sha256:"
+        "9bffe4353b925a1656688797ebc68f9c525e79b1d377a764d232182a519eeec4"
+    )
+    definitions = (
+        (
+            "workspace.refund.read",
+            "read_file",
+            "read",
+            {"path": {"type": "string"}},
+            {"content": {"type": "string"}, "sha256": {"type": "string"}},
+            ["input.path", "output.content", "output.sha256"],
+        ),
+        (
+            "workspace.refund.apply",
+            "apply_file",
+            "local_write",
+            {
+                "path": {"type": "string"},
+                "expected_sha256": {"type": "string"},
+                "content": {"type": "string"},
+            },
+            {"sha256": {"type": "string"}, "branch": {"type": "string"}},
+            [
+                "input.path",
+                "input.expected_sha256",
+                "input.content",
+                "output.sha256",
+                "output.branch",
+            ],
+        ),
+        (
+            "workspace.refund.check",
+            "run_check",
+            "execute",
+            {"profile": {"type": "string"}},
+            {
+                "profile": {"type": "string"},
+                "passed": {"type": "boolean"},
+                "exit_code": {"type": "integer"},
+            },
+            ["input.profile", "output.profile", "output.passed", "output.exit_code"],
+        ),
+        (
+            "workspace.refund.commit",
+            "commit",
+            "local_write",
+            {
+                "message": {"type": "string"},
+                "paths": {"type": "array", "items": {"type": "string"}},
+            },
+            {"commit_sha": {"type": "string"}, "branch": {"type": "string"}},
+            ["input.message", "input.paths", "output.commit_sha", "output.branch"],
+        ),
+    )
+    with Session(engine) as db:
+        for name, handler, risk, input_properties, output_properties, paths in definitions:
+            config: dict[str, object] = {
+                "workspace_id": "refund-demo",
+                "base_ref": "main",
+                "handler": handler,
+            }
+            if handler == "run_check":
+                config["check_profiles"] = {
+                    "backend-unit": {
+                        "image": image,
+                        "argv": [
+                            "python",
+                            "-m",
+                            "unittest",
+                            "discover",
+                            "-s",
+                            "tests",
+                            "-v",
+                        ],
+                        "timeout_seconds": 60,
+                    }
+                }
+            tool = Tool(
+                tenant_id="tenant_demo",
+                name=name,
+                display_name=name,
+                tool_type="managed_workspace",
+                method="POST",
+                url="",
+                config_json=config,
+                input_schema={
+                    "type": "object",
+                    "properties": input_properties,
+                    "required": list(input_properties),
+                    "additionalProperties": False,
+                },
+                output_schema={"type": "object", "properties": output_properties},
+            )
+            publish_tool_contract(
+                tool,
+                ToolReliabilityContract.model_validate(
+                    {
+                        "risk_class": risk,
+                        "side_effect": "none" if risk == "read" else "local",
+                        "confirmation_policy": "none" if risk == "read" else "once",
+                        "idempotency": {"mode": "none"},
+                        "reconcile": {"supported": False},
+                        "model_visibility": {
+                            "allowed_paths": paths,
+                            "user_display_paths": [
+                                path for path in paths if path.startswith("output.")
+                            ],
+                            "audit_only_paths": [],
+                        },
+                        "timeout_policy": "failed",
+                        "dynamic_task_enabled": True,
+                    }
+                ),
+            )
+            db.add(tool)
+            db.flush()
+            ensure_private_resource_binding(
+                db,
+                "tenant_demo",
+                "agent_e2e_member_employee",
+                "tool",
+                tool.id,
+                "active",
+            )
+        db.commit()
+
+
 def seed_schedule_dynamic_model() -> None:
     """为 Schedule 全栈回归配置通过 dynamic-v1 预检的隔离默认模型。"""
 
@@ -1435,12 +1605,13 @@ def install_schedule_llm_override() -> None:
                 for item in user_payload.get("skill_catalog", [])
                 if isinstance(item, dict)
             }
-            selected = (
-                ["s4-dynamic-guidance"]
-                if "S4动态" in str(user_payload.get("goal") or "")
-                and "s4-dynamic-guidance" in names
-                else []
-            )
+            goal = str(user_payload.get("goal") or "")
+            if "S4代码" in goal and "s4-code-guidance" in names:
+                selected = ["s4-code-guidance"]
+            elif "S4动态" in goal and "s4-dynamic-guidance" in names:
+                selected = ["s4-dynamic-guidance"]
+            else:
+                selected = []
             if "S4-DYNAMIC-FULL-GUIDANCE" in str(user_payload):
                 raise RuntimeError("S4 selector received full Skill instructions")
             return {
@@ -1449,6 +1620,78 @@ def install_schedule_llm_override() -> None:
             }
         if "受控动态任务规划器" in system_prompt:
             loaded_guidance = user_payload.get("loaded_guidance", [])
+            if "S4-CODE-FULL-GUIDANCE" in str(loaded_guidance):
+                capability_names = {
+                    str(item.get("name") or "")
+                    for item in user_payload.get("capabilities", [])
+                    if isinstance(item, dict)
+                }
+                required = {
+                    "workspace.refund.read",
+                    "workspace.refund.apply",
+                    "workspace.refund.check",
+                    "workspace.refund.commit",
+                }
+                if not required <= capability_names:
+                    raise RuntimeError("S4 code planner did not receive governed workspace tools")
+                return {
+                    "goal": str(user_payload.get("goal") or "完成 S4 代码交付"),
+                    "success_criteria": user_payload.get("success_criteria", []),
+                    "constraints": ["必须先读、审批写入、隔离回归、审批提交"],
+                    "assumptions": [],
+                    "steps": [
+                        {
+                            "draft_id": "read",
+                            "title": "读取退款实现",
+                            "kind": "tool.read",
+                            "required": True,
+                            "depends_on": [],
+                            "capability_refs": ["workspace.refund.read"],
+                            "guidance_skill_refs": ["s4-code-guidance"],
+                            "expected_output_schema": {},
+                        },
+                        {
+                            "draft_id": "apply",
+                            "title": "写入退款审批补丁",
+                            "kind": "tool.write",
+                            "required": True,
+                            "depends_on": ["read"],
+                            "capability_refs": ["workspace.refund.apply"],
+                            "guidance_skill_refs": ["s4-code-guidance"],
+                            "expected_output_schema": {},
+                        },
+                        {
+                            "draft_id": "check",
+                            "title": "运行退款回归",
+                            "kind": "tool.execute",
+                            "required": True,
+                            "depends_on": ["apply"],
+                            "capability_refs": ["workspace.refund.check"],
+                            "guidance_skill_refs": ["s4-code-guidance"],
+                            "expected_output_schema": {},
+                        },
+                        {
+                            "draft_id": "commit",
+                            "title": "提交一次性任务分支",
+                            "kind": "tool.write",
+                            "required": True,
+                            "depends_on": ["check"],
+                            "capability_refs": ["workspace.refund.commit"],
+                            "guidance_skill_refs": ["s4-code-guidance"],
+                            "expected_output_schema": {},
+                        },
+                        {
+                            "draft_id": "answer",
+                            "title": "形成代码交付报告",
+                            "kind": "answer",
+                            "required": True,
+                            "depends_on": ["commit"],
+                            "capability_refs": [],
+                            "guidance_skill_refs": ["s4-code-guidance"],
+                            "expected_output_schema": {},
+                        },
+                    ],
+                }
             if isinstance(loaded_guidance, list) and loaded_guidance:
                 if "S4-DYNAMIC-FULL-GUIDANCE" not in str(loaded_guidance):
                     raise RuntimeError("S4 planner did not receive fixed Skill instructions")
@@ -1528,7 +1771,79 @@ def install_schedule_llm_override() -> None:
         if "受控单步动作提议器" in system_prompt:
             current_step = user_payload.get("current_step", {})
             step_kind = str(current_step.get("kind") or "") if isinstance(current_step, dict) else ""
+            step_title = str(current_step.get("title") or "") if isinstance(current_step, dict) else ""
+            is_s4_code = "S4-CODE-FULL-GUIDANCE" in str(user_payload)
             is_s4 = "S4-DYNAMIC-FULL-GUIDANCE" in str(user_payload)
+            if is_s4_code:
+                client._last_completed_response_metadata = {
+                    "response_id": (
+                        "e2e-s4-code-"
+                        f"{step_kind}-{hashlib.sha256(step_title.encode()).hexdigest()[:12]}"
+                    ),
+                    "finish_reason": "stop",
+                    "usage": {"input_tokens": 12, "output_tokens": 8},
+                }
+                if step_kind == "tool.read":
+                    capability_ref = "workspace.refund.read"
+                    arguments = {"path": "refund.py"}
+                elif step_kind == "tool.execute":
+                    capability_ref = "workspace.refund.check"
+                    arguments = {"profile": "backend-unit"}
+                elif step_kind == "tool.write" and "提交" in step_title:
+                    capability_ref = "workspace.refund.commit"
+                    arguments = {
+                        "message": "feat: require high refund approval",
+                        "paths": ["refund.py"],
+                    }
+                elif step_kind == "tool.write":
+                    capability_ref = "workspace.refund.apply"
+                    arguments = {
+                        "path": "refund.py",
+                        "expected_sha256": hashlib.sha256(
+                            b"STATUS = 'pending'\n"
+                        ).hexdigest(),
+                        "content": "STATUS = 'approval_required'\n",
+                    }
+                else:
+                    execution_view = user_payload.get("provider_execution_view", {})
+                    execution_context = (
+                        execution_view.get("execution_context", {})
+                        if isinstance(execution_view, dict)
+                        else {}
+                    )
+                    completed = [
+                        str(item.get("step_key") or "")
+                        for item in execution_context.get("completed_steps", [])
+                        if isinstance(item, dict) and item.get("step_key")
+                    ]
+                    criteria = [
+                        str(item.get("id") or "")
+                        for item in execution_context.get("success_criteria", [])
+                        if isinstance(item, dict) and item.get("id")
+                    ]
+                    return {
+                        "action_kind": "answer",
+                        "arguments": {
+                            "markdown": (
+                                "S4-CODE-DELIVERY-SUCCESS：补丁已审批写入，固定容器回归通过，"
+                                "并在一次性任务分支形成提交。"
+                            ),
+                            "criterion_evidence": {
+                                criterion: completed for criterion in criteria
+                            },
+                            "pending_questions": [],
+                        },
+                        "capability_ref": None,
+                        "expected_output_schema": {},
+                        "rationale": "依据真实工作区 Operation 回执形成交付报告",
+                    }
+                return {
+                    "action_kind": "call_tool",
+                    "arguments": arguments,
+                    "capability_ref": capability_ref,
+                    "expected_output_schema": {},
+                    "rationale": "按固定代码交付 Skill 调用受管能力",
+                }
             if is_s4 and step_kind == "knowledge":
                 client._last_completed_response_metadata = {
                     "response_id": "e2e-s4-knowledge-response",
@@ -2106,6 +2421,7 @@ def main() -> None:
     E2E_RUNTIME_DIR.mkdir(mode=0o700)
     configure_environment(E2E_RUNTIME_DIR / "e2e.sqlite3")
     seed_e2e_fixtures()
+    seed_managed_workspace_browser_fixture()
     seed_schedule_dynamic_model()
     seed_dynamic_task_browser_fixtures()
     seed_connection_browser_fixtures()

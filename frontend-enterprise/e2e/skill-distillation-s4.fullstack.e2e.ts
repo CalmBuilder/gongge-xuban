@@ -20,6 +20,22 @@ const SKILL_MARKDOWN = [
   '',
 ].join('\n');
 
+const CODE_SKILL_NAME = 's4-code-guidance';
+const CODE_SKILL_MARKDOWN = [
+  '---',
+  `name: ${CODE_SKILL_NAME}`,
+  'description: S4 代码交付必须先读、审批写入、隔离回归、审批提交并形成证据。',
+  'allowed-tools:',
+  '  - workspace.refund.read',
+  '  - workspace.refund.apply',
+  '  - workspace.refund.check',
+  '  - workspace.refund.commit',
+  '---',
+  '# S4 code delivery guidance',
+  'S4-CODE-FULL-GUIDANCE：代码交付必须使用受管工作区工具，不得执行 Skill 包脚本。',
+  '',
+].join('\n');
+
 async function loginAsMember(page: Page) {
   /** 通过真实认证 API 登录并固定成员自己的数字员工。 */
 
@@ -36,6 +52,27 @@ async function loginAsMember(page: Page) {
       localStorage.setItem('gongge_onboarding_guide_seen', '1');
       localStorage.setItem('gongge_quick_start_guide_seen', '1');
       localStorage.setItem('gongge_enterprise_agent_scope', 'agent_e2e_member_employee');
+    }
+    return response.status;
+  });
+  expect(status).toBe(200);
+}
+
+async function loginAsAdmin(page: Page) {
+  /** 切换为独立租户管理员，办理与发起人分离的代码操作审批。 */
+
+  await page.goto('/enterprise/dashboard');
+  const status = await page.evaluate(async () => {
+    const response = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tenant_id: 'tenant_demo', username: 'admin', password: 'admin' }),
+    });
+    const body = await response.json();
+    if (response.ok) {
+      localStorage.setItem('gongge_auth', JSON.stringify(body));
+      localStorage.setItem('gongge_onboarding_guide_seen', '1');
+      localStorage.setItem('gongge_quick_start_guide_seen', '1');
     }
     return response.status;
   });
@@ -64,6 +101,25 @@ async function importDynamicGuidance(page: Page) {
   ));
   await dialog.getByRole('button', { name: '固定版本并绑定' }).click();
   expect((await confirmed).status()).toBe(200);
+}
+
+async function importCodeGuidance(page: Page) {
+  /** 经同一安全导入 UI 固定代码交付 Skill 与四项非扩权工具声明。 */
+
+  await page.goto('/enterprise/general-skills');
+  await page.getByRole('button', { name: /新增/ }).click();
+  await page.getByRole('menuitem', { name: '安全导入 Skill' }).click();
+  const dialog = page.getByRole('dialog', { name: '安全导入 Skill 包' });
+  await dialog.locator('input[type="file"]').setInputFiles({
+    name: 'SKILL.md',
+    mimeType: 'text/markdown',
+    buffer: Buffer.from(CODE_SKILL_MARKDOWN),
+  });
+  await dialog.getByRole('button', { name: '生成安全预览' }).click();
+  await expect(dialog.getByText(CODE_SKILL_NAME, { exact: true })).toBeVisible();
+  await expect(dialog.getByText(/workspace\.refund\.apply/)).toBeVisible();
+  await dialog.getByRole('button', { name: '固定版本并绑定' }).click();
+  await expect(dialog).not.toBeVisible();
 }
 
 test('S4 动态任务从 Skill 目录到人工澄清、知识 Operation 和结果形成真实闭环', async ({ page }) => {
@@ -158,5 +214,96 @@ test('S4 动态任务从 Skill 目录到人工澄清、知识 Operation 和结�
   await page.goto(`/workspace/chat/${sessionId}`);
   await expect(page.getByRole('main').getByText(/S4-DYNAMIC-GUIDED-SUCCESS/)).toBeVisible({ timeout: 30_000 });
   await expect(page.getByLabel('动态任务控制')).toContainText('已完成');
+  expect(failures).toEqual([]);
+});
+
+test('S4 研发交付数字员工经三次独立审批完成真实补丁、容器回归和 Git 提交', async ({ page }) => {
+  test.setTimeout(120_000);
+  const failures: string[] = [];
+  page.on('pageerror', (error) => failures.push(error.message));
+  page.on('response', (response) => {
+    const path = new URL(response.url()).pathname;
+    if (path.startsWith('/api/') && response.status() >= 500) failures.push(`${response.status()} ${path}`);
+  });
+  await loginAsMember(page);
+  await importCodeGuidance(page);
+  const sessionId = await page.evaluate(async () => {
+    const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
+    const response = await fetch('/api/chat/sessions', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${auth.token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        tenant_id: 'tenant_demo',
+        agent_id: 'agent_e2e_member_employee',
+        title: 'S4 受管代码交付',
+        origin: 'owned',
+      }),
+    });
+    const body = await response.json() as { id?: string; detail?: string };
+    if (!response.ok || !body.id) throw new Error(body.detail || 'session creation failed');
+    return body.id;
+  });
+  const started = await page.evaluate(async (id) => {
+    const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
+    const response = await fetch('/api/chat/stream', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${auth.token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        tenant_id: 'tenant_demo',
+        session_id: id,
+        agent_id: 'agent_e2e_member_employee',
+        client_turn_id: 'turn_s4_code_delivery',
+        message: 'S4代码：在受管演示仓库把高金额退款改为必须审批，完成真实测试和提交',
+        channel: 'web',
+      }),
+    });
+    return { status: response.status, body: await response.text() };
+  }, sessionId);
+  expect(started.status).toBe(200);
+  expect(started.body).toContain('event: complete');
+
+  const executionId = await page.evaluate(async (id) => {
+    const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
+    const response = await fetch(`/api/chat/sessions/${id}/events?tenant_id=tenant_demo`, {
+      headers: { Authorization: `Bearer ${auth.token}` },
+    });
+    const events = await response.json() as Array<{ event_type: string; data?: Record<string, unknown> }>;
+    return String(events.find((event) => event.event_type === 'dynamic_task_delegated')?.data?.execution_id || '');
+  }, sessionId);
+  expect(executionId).not.toBe('');
+
+  await loginAsAdmin(page);
+  for (const title of ['批准受管代码工作区变更', '批准受管代码工作区执行检查', '批准受管代码工作区变更']) {
+    await page.goto('/enterprise/work-items');
+    const card = page.getByRole('button', { name: new RegExp(title) }).first();
+    await expect(card).toBeVisible({ timeout: 30_000 });
+    await card.click();
+    const dialog = page.getByRole('dialog');
+    await expect(dialog.getByLabel('待批准受管代码操作')).toContainText('refund-demo');
+    await dialog.getByRole('button', { name: '仅批准本次操作' }).click();
+  }
+
+  await loginAsMember(page);
+  await expect.poll(async () => page.evaluate(async (id) => {
+    const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
+    const response = await fetch(`/api/executions/${id}?tenant_id=tenant_demo`, {
+      headers: { Authorization: `Bearer ${auth.token}` },
+    });
+    return response.json() as Promise<Record<string, unknown>>;
+  }, executionId), { timeout: 45_000 }).toMatchObject({ status: 'succeeded' });
+  const details = await page.evaluate(async ({ sessionId, executionId }) => {
+    const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
+    const response = await fetch(`/api/enterprise/traces/${sessionId}?tenant_id=tenant_demo`, {
+      headers: { Authorization: `Bearer ${auth.token}` },
+    });
+    const trace = await response.json() as { sop_runtime?: Array<{ instance_id: string }> };
+    return trace.sop_runtime?.find((item) => item.instance_id === executionId);
+  }, { sessionId, executionId });
+  expect(JSON.stringify(details)).toContain('commit_sha');
+  expect(JSON.stringify(details)).toContain('backend-unit');
+  expect(JSON.stringify(details)).toContain('"passed":true');
+
+  await page.goto(`/workspace/chat/${sessionId}`);
+  await expect(page.getByRole('main').getByText(/S4-CODE-DELIVERY-SUCCESS/)).toBeVisible({ timeout: 30_000 });
   expect(failures).toEqual([]);
 });

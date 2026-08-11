@@ -1051,8 +1051,8 @@ class SopExecutionStore:
 
         self._assert_execution_owner(instance, execution)
         self._guard_mutation(instance, "operation.prepare")
-        if effect_kind not in {"read", "external_write"}:
-            raise ValueError("effect_kind 必须是 read 或 external_write。")
+        if effect_kind not in {"read", "local_write", "execute", "external_write"}:
+            raise ValueError("effect_kind 必须是 read、local_write、execute 或 external_write。")
         policy = idempotency_policy or IdempotencyPolicy()
         frozen_capability = dict(capability_snapshot or {})
         frozen_checksum = capability_checksum(frozen_capability) if frozen_capability else None
@@ -1353,6 +1353,48 @@ class SopExecutionStore:
         self.db.add(operation)
         self.db.flush()
 
+    def authorize_local_operation_dispatch(
+        self,
+        operation: SopOperation,
+        *,
+        approval_work_item_id: str,
+        approval_fingerprint: str,
+        approved_by_user_id: str,
+        authorization_evidence: Mapping[str, object],
+    ) -> None:
+        """冻结一次性本地写/执行批准并进入 running；中断后可按幂等动作安全重派。"""
+
+        if operation.effect_kind not in {"local_write", "execute"} or operation.status != "prepared":
+            raise SopExecutionConflictError("只有 prepared 本地写或执行可以绑定批准并派发。")
+        self._authorize_skill_caused_operation(operation)
+        if (
+            not approval_work_item_id.strip()
+            or not approval_fingerprint.strip()
+            or not approved_by_user_id.strip()
+            or not authorization_evidence
+        ):
+            raise SopExecutionConflictError("本地动作批准和再授权证据不能为空。")
+        reused = self.db.exec(
+            select(SopOperation).where(
+                SopOperation.tenant_id == operation.tenant_id,
+                SopOperation.approval_work_item_id == approval_work_item_id,
+                SopOperation.id != operation.id,
+            )
+        ).first()
+        if reused is not None:
+            raise SopExecutionConflictError("一次性批准已绑定其他 Operation。")
+        operation.approval_work_item_id = approval_work_item_id
+        operation.approval_fingerprint = approval_fingerprint
+        operation.approved_by_user_id = approved_by_user_id
+        operation.approved_at = utc_now()
+        operation.authorization_evidence_json = dict(authorization_evidence)
+        operation.authorization_source_type = "attention"
+        operation.authorization_source_ref = approval_work_item_id
+        self.start_operation(operation)
+        operation.dispatched_at = operation.started_at
+        self.db.add(operation)
+        self.db.flush()
+
     def finish_operation(
         self,
         operation: SopOperation,
@@ -1388,7 +1430,7 @@ class SopExecutionStore:
             attempt.completed_at = operation.completed_at
             attempt.updated_at = operation.completed_at
             self.db.add(attempt)
-        if operation.effect_kind == "external_write":
+        if operation.effect_kind in {"local_write", "external_write"}:
             operation.effect_state = "complete" if succeeded else "none"
             self._append_operation_effect(
                 operation,

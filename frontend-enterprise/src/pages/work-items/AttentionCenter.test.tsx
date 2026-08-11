@@ -78,6 +78,26 @@ const toolApproval = {
   revision: 5,
 };
 
+const workspaceApproval = {
+  ...toolApproval,
+  id: 'attention_workspace_write',
+  title: '批准受管代码工作区变更',
+  payload: {
+    operation_name: 'workspace.refund.apply',
+    workspace: {
+      workspace_id: 'refund-demo',
+      base_ref: 'main',
+      handler: 'apply_file',
+    },
+    arguments: {
+      path: 'refund.py',
+      expected_sha256: 'a'.repeat(64),
+      content: "STATUS = 'approval_required'\n",
+    },
+  },
+  revision: 7,
+};
+
 const writeException = {
   ...clarification,
   id: 'attention_write_exception',
@@ -284,6 +304,37 @@ it('一次性写审批展示精确正文并仅提交批准命令', async () => {
   });
   expect(body).not.toHaveProperty('content');
   expect(body).not.toHaveProperty('recipient_ref');
+});
+
+it('受管代码审批展示工作区与精确参数并使用通用操作文案', async () => {
+  /** 验证代码审批不会伪装企业微信发送，且浏览器仍只提交 CAS 决定。 */
+
+  vi.mocked(api.get).mockImplementation(async (path: string) => {
+    if (path.startsWith('/api/executions/')) {
+      return { id: 'execution_1', status: 'waiting', revision: 12, effect_state: 'none' };
+    }
+    return { items: [workspaceApproval], total: 1 };
+  });
+  const user = userEvent.setup();
+  renderCenter();
+  await user.click(await screen.findByRole('button', { name: /批准受管代码工作区变更/ }));
+
+  expect(screen.getByLabelText('待批准受管代码操作')).toHaveTextContent('refund-demo');
+  expect(screen.getByLabelText('待批准受管代码操作')).toHaveTextContent('apply_file');
+  expect(screen.getByLabelText('待批准受管代码操作')).toHaveTextContent('refund.py');
+  expect(screen.queryByText('目标：当前企业微信会话')).not.toBeInTheDocument();
+  await user.click(screen.getByRole('button', { name: '仅批准本次操作' }));
+
+  await waitFor(() => expect(api.post).toHaveBeenCalledTimes(1));
+  expect(vi.mocked(api.post).mock.calls[0]).toEqual([
+    '/api/attention-items/attention_workspace_write/resolve',
+    expect.objectContaining({
+      tenant_id: 'tenant_demo',
+      command: 'allow_once',
+      expected_revision: 7,
+    }),
+  ]);
+  expect(vi.mocked(api.post).mock.calls[0][1]).not.toHaveProperty('arguments');
 });
 
 it('未知外部效果必须填写证据后人工收敛且页面不提供重发', async () => {

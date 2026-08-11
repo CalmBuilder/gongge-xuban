@@ -286,6 +286,21 @@ def project_tool_capability(tool: Tool, contract: ToolReliabilityContract) -> Ca
         "input_schema": dict(tool.input_schema or {}),
         "output_schema": dict(tool.output_schema or {}),
     }
+    if tool.tool_type == "managed_workspace":
+        config = tool.config_json or {}
+        audit_view["managed_workspace"] = {
+            "workspace_id": config.get("workspace_id"),
+            "base_ref": config.get("base_ref"),
+            "handler": config.get("handler"),
+            "check_profile_names": sorted(
+                str(name) for name in (config.get("check_profiles") or {})
+            ),
+            "check_profiles_checksum": (
+                capability_checksum(config.get("check_profiles") or {})
+                if config.get("handler") == "run_check"
+                else None
+            ),
+        }
     return CapabilityViews(model=model_view, user=user_view, audit=audit_view)
 
 
@@ -333,7 +348,11 @@ class DynamicCapabilityCatalog:
         snapshots: list[CapabilitySnapshot] = []
         for tool in visible_tool_rows(self.db, tenant_id, agent_id, include_inactive=False):
             contract = self._published_tool_contract(tool)
-            if contract is None or contract.risk_class != "read":
+            if contract is None or contract.risk_class not in {
+                "read",
+                "local_write",
+                "execute",
+            }:
                 continue
             snapshots.append(self._tool_snapshot(tool, agent_id, contract))
         return snapshots
