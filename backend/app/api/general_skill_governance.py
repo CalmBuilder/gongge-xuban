@@ -8,19 +8,23 @@
 
 from __future__ import annotations
 
+from dataclasses import asdict
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlmodel import Session, select
 
 from app.db import get_session
 from app.db.models import AgentResourceBinding, GeneralSkill, GeneralSkillRevision, User
-from app.general_skills.eligibility import GeneralSkillBindingMetadata
+from app.general_skills.eligibility import EffectiveGeneralSkillResolver, GeneralSkillBindingMetadata
 from app.general_skills.governance import (
     GeneralSkillGovernanceError,
     GeneralSkillGovernanceService,
 )
 from app.general_skills.governance_schema import (
     GeneralSkillBindingRead,
+    GeneralSkillBindingCreate,
     GeneralSkillBindingUpdate,
+    EffectiveGeneralSkillCatalogRead,
     GeneralSkillRevisionRead,
     GeneralSkillRevokeRequest,
     GeneralSkillRollbackRequest,
@@ -33,6 +37,28 @@ router = APIRouter(
     tags=["enterprise:general-skill-governance"],
     dependencies=[Depends(get_current_user)],
 )
+
+
+@router.get(
+    "/agents/{agent_id}/catalog",
+    response_model=EffectiveGeneralSkillCatalogRead,
+)
+def effective_catalog(
+    agent_id: str,
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> EffectiveGeneralSkillCatalogRead:
+    """返回当前用户与指定 Agent 的权威 Skill 资格交集，不返回正文。"""
+
+    catalog = EffectiveGeneralSkillResolver(db).resolve(current_user, agent_id)
+    return EffectiveGeneralSkillCatalogRead(
+        tenant_id=catalog.tenant_id,
+        user_id=catalog.user_id,
+        agent_id=catalog.agent_id,
+        authorization_revision=catalog.authorization_revision,
+        eligibility_hash=catalog.eligibility_hash,
+        items=[asdict(item) for item in catalog.items],
+    )
 
 
 def _revision_read(row: GeneralSkillRevision) -> GeneralSkillRevisionRead:
@@ -80,7 +106,11 @@ def list_revisions(
     skill = db.get(GeneralSkill, skill_id)
     if skill is None or skill.tenant_id != tenant_id or tenant_id != current_user.tenant_id:
         raise HTTPException(status_code=404, detail="GENERAL_SKILL_NOT_AVAILABLE")
-    if skill.owner_user_id != current_user.id and current_user.role != "admin":
+    if (
+        skill.owner_user_id != current_user.id
+        and current_user.role != "admin"
+        and skill.visibility_scope != "tenant_gallery"
+    ):
         raise HTTPException(status_code=403, detail="GENERAL_SKILL_FORBIDDEN")
     rows = db.exec(
         select(GeneralSkillRevision)
@@ -115,6 +145,31 @@ def update_binding(
             expected_row_version=request.expected_row_version,
         )
         return _binding_read(binding)
+    except GeneralSkillGovernanceError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"code": exc.error_code, "message": str(exc)},
+        ) from exc
+
+
+@router.post("/bindings", response_model=GeneralSkillBindingRead, status_code=201)
+def create_binding(
+    request: GeneralSkillBindingCreate,
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> GeneralSkillBindingRead:
+    """由用户主动把本人或开放广场 Skill 绑定到本人数字员工。"""
+
+    try:
+        row = GeneralSkillGovernanceService(db).create_binding(
+            current_user=current_user,
+            agent_id=request.agent_id,
+            skill_id=request.skill_id,
+            revision_policy=request.revision_policy,
+            pinned_revision_id=request.pinned_revision_id,
+            invocation_policy=request.invocation_policy,
+        )
+        return _binding_read(row)
     except GeneralSkillGovernanceError as exc:
         raise HTTPException(
             status_code=exc.status_code,

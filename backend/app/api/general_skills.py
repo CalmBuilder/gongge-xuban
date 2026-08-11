@@ -18,6 +18,7 @@ from urllib.request import Request, urlopen
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
+from pydantic import ValidationError
 from sqlmodel import Session, select
 
 from app.agents.branching import (
@@ -45,6 +46,11 @@ from app.general_skills import (
     GeneralSkillRunResponse,
 )
 from app.general_skills.schema import GeneralSkillFile
+from app.general_skills.eligibility import GeneralSkillBindingMetadata
+from app.general_skills.governance import (
+    GeneralSkillGovernanceError,
+    GeneralSkillGovernanceService,
+)
 from app.general_skills.runner import GeneralSkillRunner
 from app.security.auth import get_current_user
 from app.security.permissions import (
@@ -77,7 +83,19 @@ def _agent_id_or_none(agent_id: object | None) -> str | None:
     return agent_id if isinstance(agent_id, str) and agent_id else None
 
 
-def general_skill_read(row: GeneralSkill, status_override: str | None = None) -> GeneralSkillRead:
+def general_skill_read(
+    row: GeneralSkill,
+    status_override: str | None = None,
+    binding: AgentResourceBinding | None = None,
+) -> GeneralSkillRead:
+    """投影 Skill 根与可选严格绑定治理字段，legacy metadata 仅返回空治理字段。"""
+
+    binding_metadata: GeneralSkillBindingMetadata | None = None
+    if binding is not None:
+        try:
+            binding_metadata = GeneralSkillBindingMetadata.model_validate(binding.metadata_json)
+        except ValidationError:
+            binding_metadata = None
     return GeneralSkillRead(
         id=row.id,
         tenant_id=row.tenant_id,
@@ -100,6 +118,16 @@ def general_skill_read(row: GeneralSkill, status_override: str | None = None) ->
             if row.planning_guidance_published_at
             else None
         ),
+        owner_user_id=row.owner_user_id,
+        visibility_scope=row.visibility_scope,
+        current_published_revision_id=row.current_published_revision_id,
+        row_version=row.row_version,
+        binding_id=binding.id if binding else None,
+        binding_status=binding.status if binding else None,
+        binding_row_version=binding.row_version if binding else None,
+        revision_policy=binding_metadata.revision_policy if binding_metadata else None,
+        pinned_revision_id=binding_metadata.pinned_revision_id if binding_metadata else None,
+        invocation_policy=binding_metadata.invocation_policy if binding_metadata else None,
         created_at=row.created_at.isoformat(),
         updated_at=row.updated_at.isoformat(),
     )
@@ -471,6 +499,7 @@ def list_general_skills(
                         if binding.status == "active" and row.status == "published"
                         else "archived"
                     ),
+                    binding=binding,
                 )
             )
         return visible_rows
@@ -521,6 +550,15 @@ def publish_general_skill(
             row.id,
             metadata_json=row.metadata_json or {},
         )
+        governed = _set_governed_binding_status(
+            db,
+            current_user=current_user,
+            agent_id=agent.id,
+            binding=binding,
+            status="active",
+        )
+        if governed is not None:
+            return general_skill_read(row, status_override="published", binding=governed)
         binding.status = "active"
         binding.updated_at = utc_now()
         db.add(binding)
@@ -594,6 +632,15 @@ def archive_general_skill(
     agent = ensure_agent_scope_manager(db, tenant_id, agent_id, current_user)
     if agent and not agent.is_overall:
         binding = _ensure_general_skill_binding(db, tenant_id, agent.id, row.id)
+        governed = _set_governed_binding_status(
+            db,
+            current_user=current_user,
+            agent_id=agent.id,
+            binding=binding,
+            status="inactive",
+        )
+        if governed is not None:
+            return general_skill_read(row, status_override="archived", binding=governed)
         binding.status = "inactive"
         binding.updated_at = utc_now()
         db.add(binding)
@@ -623,6 +670,15 @@ def delete_general_skill(
     agent = ensure_agent_scope_manager(db, tenant_id, agent_id, current_user)
     if agent and not agent.is_overall:
         binding = _ensure_general_skill_binding(db, tenant_id, agent.id, row.id)
+        governed = _set_governed_binding_status(
+            db,
+            current_user=current_user,
+            agent_id=agent.id,
+            binding=binding,
+            status="inactive",
+        )
+        if governed is not None:
+            return {"status": "hidden", "slug": slug}
         binding.status = "deleted"
         binding.updated_at = utc_now()
         db.add(binding)
@@ -810,6 +866,38 @@ def _ensure_general_skill_binding(
     db.add(row)
     db.flush()
     return row
+
+
+def _set_governed_binding_status(
+    db: Session,
+    *,
+    current_user: User,
+    agent_id: str,
+    binding: AgentResourceBinding,
+    status: str,
+) -> AgentResourceBinding | None:
+    """让新版严格绑定走统一授权 revision；legacy metadata 保持兼容路径。"""
+
+    try:
+        metadata = GeneralSkillBindingMetadata.model_validate(binding.metadata_json)
+    except ValidationError:
+        return None
+    try:
+        return GeneralSkillGovernanceService(db).update_binding_configuration(
+            current_user=current_user,
+            agent_id=agent_id,
+            binding_id=binding.id,
+            status=status,
+            revision_policy=metadata.revision_policy,
+            pinned_revision_id=metadata.pinned_revision_id,
+            invocation_policy=metadata.invocation_policy,
+            expected_row_version=binding.row_version,
+        )
+    except GeneralSkillGovernanceError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"code": exc.error_code, "message": str(exc)},
+        ) from exc
 
 
 def _general_skill_editable_by_agent(

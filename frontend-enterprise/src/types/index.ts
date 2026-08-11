@@ -361,8 +361,64 @@ export type GeneralSkillRead = {
   status: 'draft' | 'published' | 'archived';
   permissions: Record<string, unknown>;
   runtime_config: Record<string, unknown>;
+  usage_mode?: 'atomic_execution' | 'planning_guidance';
+  owner_user_id?: string;
+  visibility_scope?: 'user_private' | 'agent_private' | 'tenant_gallery';
+  current_published_revision_id?: string;
+  row_version?: number;
+  binding_id?: string;
+  binding_status?: 'active' | 'inactive' | 'deleted';
+  binding_row_version?: number;
+  revision_policy?: 'pinned' | 'follow_latest';
+  pinned_revision_id?: string;
+  invocation_policy?: 'model_allowed' | 'user_only';
   created_at: string;
   updated_at: string;
+};
+
+export type GeneralSkillRevisionRead = {
+  id: string;
+  skill_id: string;
+  revision_number: number;
+  content_checksum: string;
+  manifest_checksum: string;
+  status: 'draft' | 'reviewing' | 'published' | 'rejected' | 'superseded' | 'revoked';
+  row_version: number;
+  created_at: string;
+  published_at?: string;
+  revoked_at?: string;
+};
+
+export type GeneralSkillBindingRead = {
+  id: string;
+  agent_id: string;
+  skill_id: string;
+  status: 'active' | 'inactive';
+  revision_policy: 'pinned' | 'follow_latest';
+  pinned_revision_id?: string;
+  invocation_policy: 'model_allowed' | 'user_only';
+  row_version: number;
+};
+
+export type EffectiveGeneralSkillCatalogRead = {
+  tenant_id: string;
+  user_id: string;
+  agent_id: string;
+  authorization_revision: number;
+  eligibility_hash: string;
+  items: Array<{
+    binding_id: string;
+    skill_id: string;
+    revision_id: string;
+    revision_number: number;
+    content_checksum: string;
+    manifest_checksum: string;
+    name: string;
+    description: string;
+    usage_mode: string;
+    invocation_policy: 'model_allowed' | 'user_only';
+    revision_policy: 'pinned' | 'follow_latest';
+  }>;
 };
 
 export type GeneralSkillRunResponse = {

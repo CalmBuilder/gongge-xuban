@@ -323,6 +323,57 @@ def test_binding_configuration_is_atomic_audited_and_stale_write_is_rejected() -
         )
 
 
+def test_owner_reuses_skill_across_agents_and_gallery_requires_active_adoption() -> None:
+    """验证本人可多分身复用，其他用户只能把 tenant-gallery Skill 主动绑定到本人分身。"""
+
+    db, owner, adopter, first_agent = _context()
+    skill, _, current, _ = _skill_with_revisions(
+        db,
+        owner,
+        first_agent,
+        visibility_scope="tenant_gallery",
+        revision_policy="pinned",
+    )
+    owner_agent = AgentProfile(
+        id="agent_skill_owner_second",
+        tenant_id=owner.tenant_id,
+        name="Owner Second",
+        owner_user_id=owner.id,
+    )
+    adopter_agent = AgentProfile(
+        id="agent_skill_adopter",
+        tenant_id=adopter.tenant_id,
+        name="Adopter Agent",
+        owner_user_id=adopter.id,
+    )
+    db.add(owner_agent)
+    db.add(adopter_agent)
+    db.commit()
+    service = GeneralSkillGovernanceService(db)
+
+    owner_binding = service.create_binding(
+        current_user=owner,
+        agent_id=owner_agent.id,
+        skill_id=skill.id,
+        revision_policy="pinned",
+        pinned_revision_id=current.id,
+        invocation_policy="model_allowed",
+    )
+    adopter_binding = service.create_binding(
+        current_user=adopter,
+        agent_id=adopter_agent.id,
+        skill_id=skill.id,
+        revision_policy="follow_latest",
+        pinned_revision_id=None,
+        invocation_policy="user_only",
+    )
+
+    assert owner_binding.agent_id == owner_agent.id
+    assert adopter_binding.agent_id == adopter_agent.id
+    assert len(EffectiveGeneralSkillResolver(db).resolve(owner, owner_agent.id).items) == 1
+    assert len(EffectiveGeneralSkillResolver(db).resolve(adopter, adopter_agent.id).items) == 1
+
+
 def test_rollback_changes_only_follow_latest_binding_and_preserves_pinned_revision() -> None:
     """验证回滚切换 current 指针，固定绑定仍保持原目标且事件 revision 单调。"""
 

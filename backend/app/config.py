@@ -96,6 +96,8 @@ class Settings(BaseSettings):
         le=500 * 1024 * 1024,
     )
     general_skill_import_async_enabled: bool = True
+    general_skill_resolver_v2_shadow: bool = False
+    general_skill_resolver_v2_enabled: bool = False
     general_skill_import_worker_poll_seconds: float = Field(default=1.0, ge=0.1, le=60.0)
     general_skill_import_worker_lease_seconds: int = Field(default=300, ge=180, le=1800)
 

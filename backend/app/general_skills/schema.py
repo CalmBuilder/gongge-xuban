@@ -77,6 +77,16 @@ class GeneralSkillRead(BaseModel):
     usage_mode: Literal["atomic_execution", "planning_guidance"] = "atomic_execution"
     capability_checksum: Optional[str] = None
     capability_published_at: Optional[str] = None
+    owner_user_id: Optional[str] = None
+    visibility_scope: str = "tenant_gallery"
+    current_published_revision_id: Optional[str] = None
+    row_version: int = 1
+    binding_id: Optional[str] = None
+    binding_status: Optional[str] = None
+    binding_row_version: Optional[int] = None
+    revision_policy: Optional[Literal["pinned", "follow_latest"]] = None
+    pinned_revision_id: Optional[str] = None
+    invocation_policy: Optional[Literal["model_allowed", "user_only"]] = None
     created_at: str
     updated_at: str
 

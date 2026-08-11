@@ -50,6 +50,7 @@ import {
   formatDateTime,
 } from '@/lib/enterprise-ui';
 import { StatCard } from '@/components/StatCard';
+import { SkillGovernanceDialog } from '@/components/general-skills/SkillGovernanceDialog';
 import { ResourceImportDialog } from '@/components/ResourceImportDialog';
 import PlazaResourceIcon from '@/components/openPlatform/PlazaResourceIcon';
 import CodeBlock, { renderCodeTokens } from '../components/CodeBlock';
@@ -374,6 +375,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
   const [secureImportCredentialName, setSecureImportCredentialName] = useState('');
   const [secureImportCredentialToken, setSecureImportCredentialToken] = useState('');
   const [secureImportCredentialLoading, setSecureImportCredentialLoading] = useState(false);
+  const [governanceTarget, setGovernanceTarget] = useState<GeneralSkillRead | null>(null);
 
   const pageTitle = isOverallAgent ? '技能广场' : '技能';
   const listLabel = isOverallAgent ? '技能广场列表' : '技能列表';
@@ -542,6 +544,22 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
 
   async function setSkillPublished(row: GeneralSkillRead, published: boolean) {
     try {
+      if (!isOverallAgent && row.binding_id && row.binding_row_version && row.revision_policy && row.invocation_policy) {
+        await api.patch(
+          `/api/enterprise/general-skill-governance/bindings/${encodeURIComponent(row.binding_id)}`,
+          {
+            agent_id: agentId,
+            status: published ? 'active' : 'inactive',
+            revision_policy: row.revision_policy,
+            pinned_revision_id: row.revision_policy === 'pinned' ? row.pinned_revision_id : null,
+            invocation_policy: row.invocation_policy,
+            expected_row_version: row.binding_row_version,
+          },
+        );
+        await load();
+        notify.success(published ? '已启用技能' : '已停用技能');
+        return;
+      }
       const agentSuffix = agentId ? `&agent_id=${encodeURIComponent(agentId)}` : '';
       const next = await api.post<GeneralSkillRead>(
         `/api/enterprise/general-skills/${row.slug}/${published ? 'publish' : 'archive'}?tenant_id=${getRequestTenantId()}${agentSuffix}`,
@@ -559,6 +577,23 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
     const branchMode = !isOverallAgent;
     setDeleting(true);
     try {
+      if (branchMode && row.binding_id && row.binding_row_version && row.revision_policy && row.invocation_policy) {
+        await api.patch(
+          `/api/enterprise/general-skill-governance/bindings/${encodeURIComponent(row.binding_id)}`,
+          {
+            agent_id: agentId,
+            status: 'inactive',
+            revision_policy: row.revision_policy,
+            pinned_revision_id: row.revision_policy === 'pinned' ? row.pinned_revision_id : null,
+            invocation_policy: row.invocation_policy,
+            expected_row_version: row.binding_row_version,
+          },
+        );
+        setRows((current) => current.filter((item) => item.id !== row.id));
+        notify.success('已移除技能');
+        setDeleteTarget(null);
+        return;
+      }
       const agentSuffix = agentId ? `&agent_id=${encodeURIComponent(agentId)}` : '';
       await api.delete(`/api/enterprise/general-skills/${row.slug}?tenant_id=${getRequestTenantId()}${agentSuffix}`);
       setRows((current) => current.filter((item) => item.id !== row.id));
@@ -969,6 +1004,12 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
               启用
             </DropdownMenuItem>
           )}
+          {!isOverallAgent && row.binding_id && row.revision_policy ? (
+            <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => setGovernanceTarget(row)}>
+              <ShieldCheck />
+              版本与调用策略
+            </DropdownMenuItem>
+          ) : null}
           <DropdownMenuSeparator className="my-[2px] bg-[#eef0f4]" />
           <DropdownMenuItem
             variant="destructive"
@@ -1341,6 +1382,15 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
         }
         confirmText={isOverallAgent ? '删除' : '移除'}
         onConfirm={() => void confirmDeleteSkill()}
+      />
+
+      <SkillGovernanceDialog
+        row={governanceTarget}
+        agentId={agentId}
+        onClose={() => setGovernanceTarget(null)}
+        onChanged={async () => {
+          await load();
+        }}
       />
     </div>
   );

@@ -177,8 +177,8 @@ class EffectiveGeneralSkillResolver:
             return revision.source_snapshot_json.get("source_kind") == "legacy_backfill"
         normalized: list[dict[str, object]] = []
         for resource in resources:
-            path = resource.get("path")
-            checksum = resource.get("checksum") or resource.get("content_checksum")
+            path = resource.get("relative_path") or resource.get("path")
+            checksum = resource.get("content_checksum") or resource.get("checksum")
             if not isinstance(path, str) or not isinstance(checksum, str):
                 return False
             normalized.append({"path": path, "checksum": checksum})

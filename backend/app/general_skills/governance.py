@@ -125,6 +125,76 @@ class GeneralSkillGovernanceService:
             expected_row_version=expected_row_version,
         )
 
+    def create_binding(
+        self,
+        *,
+        current_user: User,
+        agent_id: str,
+        skill_id: str,
+        revision_policy: str,
+        pinned_revision_id: str | None,
+        invocation_policy: str,
+    ) -> AgentResourceBinding:
+        """把本人 Skill 或开放广场 Skill 主动绑定到本人可管理的数字员工。"""
+
+        self._manageable_agent(current_user, agent_id)
+        skill = self.db.get(GeneralSkill, skill_id)
+        if skill is None or skill.tenant_id != current_user.tenant_id:
+            raise GeneralSkillGovernanceError(
+                "GENERAL_SKILL_NOT_AVAILABLE", "general skill is unavailable", 404
+            )
+        if (
+            skill.owner_user_id != current_user.id
+            and current_user.role != "admin"
+            and skill.visibility_scope != "tenant_gallery"
+        ):
+            raise GeneralSkillGovernanceError(
+                "GENERAL_SKILL_FORBIDDEN", "general skill cannot be adopted", 403
+            )
+        if skill.status != "published":
+            raise GeneralSkillGovernanceError(
+                "GENERAL_SKILL_NOT_AVAILABLE", "general skill is not published", 409
+            )
+        revision = self._binding_revision(skill, revision_policy, pinned_revision_id)
+        existing = self.db.exec(
+            select(AgentResourceBinding).where(
+                AgentResourceBinding.tenant_id == current_user.tenant_id,
+                AgentResourceBinding.agent_id == agent_id,
+                AgentResourceBinding.resource_type == "general_skill",
+                AgentResourceBinding.resource_id == skill.id,
+            )
+        ).first()
+        if existing is not None:
+            raise GeneralSkillGovernanceError(
+                "GENERAL_SKILL_STATE_CONFLICT", "general skill is already bound"
+            )
+        metadata = GeneralSkillBindingMetadata(
+            revision_policy=revision_policy,
+            pinned_revision_id=revision.id if revision_policy == "pinned" else None,
+            invocation_policy=invocation_policy,
+            created_by_user_id=current_user.id,
+        )
+        binding = AgentResourceBinding(
+            tenant_id=current_user.tenant_id,
+            agent_id=agent_id,
+            resource_type="general_skill",
+            resource_id=skill.id,
+            status="active",
+            metadata_json=metadata.model_dump(mode="json"),
+        )
+        self.db.add(binding)
+        self.db.flush()
+        bump_general_skill_authorization_revision(
+            self.db,
+            current_user.tenant_id,
+            event_type="binding_created",
+            resource_id=binding.id,
+            payload={"agent_id": agent_id, "skill_id": skill.id, "revision_id": revision.id},
+        )
+        self.db.commit()
+        self.db.refresh(binding)
+        return binding
+
     def update_binding_configuration(
         self,
         *,
@@ -147,7 +217,7 @@ class GeneralSkillGovernanceService:
                 "GENERAL_SKILL_STATE_CONFLICT", "unsupported binding configuration", 400
             )
         binding = self._manageable_binding(current_user, agent_id, binding_id)
-        skill = self._owned_skill(current_user, binding.resource_id)
+        skill = self._binding_skill_for_manager(current_user, binding.resource_id)
         revision = self._binding_revision(skill, revision_policy, pinned_revision_id)
         current_metadata = GeneralSkillBindingMetadata.model_validate(binding.metadata_json)
         metadata = current_metadata.model_copy(
@@ -378,15 +448,7 @@ class GeneralSkillGovernanceService:
     ) -> AgentResourceBinding:
         """返回当前主体有权管理且属于指定分身的 Skill 绑定。"""
 
-        agent = self.db.get(AgentProfile, agent_id)
-        if (
-            agent is None
-            or agent.tenant_id != current_user.tenant_id
-            or (current_user.role != "admin" and agent_owner_user_id(agent) != current_user.id)
-        ):
-            raise GeneralSkillGovernanceError(
-                "GENERAL_SKILL_FORBIDDEN", "current user cannot manage this agent", 403
-            )
+        self._manageable_agent(current_user, agent_id)
         binding = self.db.get(AgentResourceBinding, binding_id)
         if (
             binding is None
@@ -399,6 +461,21 @@ class GeneralSkillGovernanceService:
             )
         return binding
 
+    def _manageable_agent(self, current_user: User, agent_id: str) -> AgentProfile:
+        """返回当前主体可管理的同租户非开放总览 Agent。"""
+
+        agent = self.db.get(AgentProfile, agent_id)
+        if (
+            agent is None
+            or agent.tenant_id != current_user.tenant_id
+            or agent.is_overall
+            or (current_user.role != "admin" and agent_owner_user_id(agent) != current_user.id)
+        ):
+            raise GeneralSkillGovernanceError(
+                "GENERAL_SKILL_FORBIDDEN", "current user cannot manage this agent", 403
+            )
+        return agent
+
     def _owned_skill(self, current_user: User, skill_id: str) -> GeneralSkill:
         """返回本人或管理员可治理的同租户 Skill，隐藏跨租户存在性。"""
 
@@ -410,6 +487,28 @@ class GeneralSkillGovernanceService:
         if skill.owner_user_id != current_user.id and current_user.role != "admin":
             raise GeneralSkillGovernanceError(
                 "GENERAL_SKILL_FORBIDDEN", "current user does not own this skill", 403
+            )
+        return skill
+
+    def _binding_skill_for_manager(
+        self,
+        current_user: User,
+        skill_id: str,
+    ) -> GeneralSkill:
+        """允许分身管理者配置本人 Skill 或已主动采用的同租户开放 Skill。"""
+
+        skill = self.db.get(GeneralSkill, skill_id)
+        if skill is None or skill.tenant_id != current_user.tenant_id:
+            raise GeneralSkillGovernanceError(
+                "GENERAL_SKILL_NOT_AVAILABLE", "general skill is unavailable", 404
+            )
+        if (
+            skill.owner_user_id != current_user.id
+            and current_user.role != "admin"
+            and skill.visibility_scope != "tenant_gallery"
+        ):
+            raise GeneralSkillGovernanceError(
+                "GENERAL_SKILL_FORBIDDEN", "current user cannot configure this binding", 403
             )
         return skill
 

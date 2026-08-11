@@ -231,6 +231,12 @@ def test_s2_governance_api_lists_revisions_and_updates_binding_atomically(
     )
     assert revisions.status_code == 200, revisions.text
     assert revisions.json()[0]["id"] == revision.id
+    catalog_before = client.get(
+        "/api/enterprise/general-skill-governance/agents/agent_owner/catalog",
+        headers=_auth(tokens["owner"]),
+    )
+    assert catalog_before.status_code == 200, catalog_before.text
+    assert catalog_before.json()["items"][0]["revision_id"] == revision.id
     updated = client.patch(
         f"/api/enterprise/general-skill-governance/bindings/{binding.id}",
         headers=_auth(tokens["owner"]),
@@ -247,6 +253,16 @@ def test_s2_governance_api_lists_revisions_and_updates_binding_atomically(
     assert updated.json()["status"] == "inactive"
     assert updated.json()["revision_policy"] == "follow_latest"
     assert updated.json()["invocation_policy"] == "user_only"
+    catalog_after = client.get(
+        "/api/enterprise/general-skill-governance/agents/agent_owner/catalog",
+        headers=_auth(tokens["owner"]),
+    )
+    assert catalog_after.status_code == 200
+    assert catalog_after.json()["items"] == []
+    assert (
+        catalog_after.json()["authorization_revision"]
+        > catalog_before.json()["authorization_revision"]
+    )
 
 
 def test_s2_governance_api_hides_owner_revision_from_other_user(

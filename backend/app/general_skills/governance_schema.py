@@ -32,6 +32,24 @@ class GeneralSkillBindingUpdate(BaseModel):
         return self
 
 
+class GeneralSkillBindingCreate(BaseModel):
+    """表达用户向本人可管理分身主动采用一个 Skill。"""
+
+    agent_id: str = Field(min_length=1, max_length=128)
+    skill_id: str = Field(min_length=1, max_length=128)
+    revision_policy: Literal["pinned", "follow_latest"] = "pinned"
+    pinned_revision_id: str | None = None
+    invocation_policy: Literal["model_allowed", "user_only"] = "model_allowed"
+
+    @model_validator(mode="after")
+    def validate_pinned_revision(self) -> "GeneralSkillBindingCreate":
+        """要求 pinned 明确修订，follow_latest 不接受潜伏目标。"""
+
+        if (self.revision_policy == "pinned") != bool(self.pinned_revision_id):
+            raise ValueError("GENERAL_SKILL_PINNED_REVISION_INVALID")
+        return self
+
+
 class GeneralSkillBindingRead(BaseModel):
     """返回管理 UI 所需的绑定状态、策略与乐观锁版本。"""
 
@@ -58,6 +76,33 @@ class GeneralSkillRevisionRead(BaseModel):
     created_at: str
     published_at: str | None
     revoked_at: str | None
+
+
+class EffectiveGeneralSkillRead(BaseModel):
+    """返回统一 resolver 的无正文授权目录项。"""
+
+    binding_id: str
+    skill_id: str
+    revision_id: str
+    revision_number: int
+    content_checksum: str
+    manifest_checksum: str
+    name: str
+    description: str
+    usage_mode: str
+    invocation_policy: str
+    revision_policy: str
+
+
+class EffectiveGeneralSkillCatalogRead(BaseModel):
+    """返回用户/分身资格交集及跨实例失效版本。"""
+
+    tenant_id: str
+    user_id: str
+    agent_id: str
+    authorization_revision: int
+    eligibility_hash: str
+    items: list[EffectiveGeneralSkillRead]
 
 
 class GeneralSkillRollbackRequest(BaseModel):
