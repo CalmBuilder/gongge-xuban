@@ -62,6 +62,8 @@ def configure_environment(database_path: Path) -> None:
             "GENERAL_SKILL_IMPORT_WORKER_POLL_SECONDS": "0.2",
             "GENERAL_SKILL_IMPORT_WORKER_LEASE_SECONDS": "300",
             "GENERAL_SKILL_OBJECT_STORE_PATH": str(E2E_RUNTIME_DIR / "general-skill-objects"),
+            "GENERAL_SKILL_RESOLVER_V2_ENABLED": "true",
+            "GENERAL_SKILL_DYNAMIC_GUIDANCE_ENABLED": "true",
             "GONGGE_XUBAN_DATA_DIR": str(E2E_RUNTIME_DIR / "user-data"),
         }
     )
@@ -1361,6 +1363,8 @@ def install_schedule_llm_override() -> None:
     from app.llm.client import LLMClient
     from app.llm.stage_protocol import STAGE_PROTOCOL_KEY
 
+    original_generate_text = LLMClient.generate_text
+
     def deterministic_json(
         client: LLMClient,
         system_prompt: str,
@@ -1378,6 +1382,16 @@ def install_schedule_llm_override() -> None:
                 "reason": "没有匹配正式 SOP，交由非 SOP 能力仲裁",
             }
         if phase == "Router / General Skill Selector":
+            if "S3-AUTO" in str(user_payload.get("user_message") or ""):
+                return {
+                    "use_general_skill": True,
+                    "selected_slug": "s3-browser-auto",
+                    "use_knowledge": False,
+                    "knowledge_query": None,
+                    "knowledge_mode": "disabled",
+                    "confidence": 0.99,
+                    "reason": "自动目录中存在精确匹配的已审核 Skill",
+                }
             return {
                 "use_general_skill": False,
                 "selected_slug": None,
@@ -1447,6 +1461,29 @@ def install_schedule_llm_override() -> None:
         raise RuntimeError(f"Unhandled E2E model stage: {phase or system_prompt[:40]}")
 
     LLMClient.generate_json = deterministic_json
+
+    def deterministic_text(
+        client: LLMClient,
+        system_prompt: str,
+        user_payload: dict[str, object] | str,
+        response_format: dict[str, str] | None = None,
+    ) -> str:
+        """只为真实加载 Skill 的回复固定供应商输出，其余场景保持原链路。"""
+
+        if isinstance(user_payload, dict):
+            context = user_payload.get("conversation_context")
+            loaded = context.get("loaded_general_skills") if isinstance(context, dict) else None
+            if isinstance(loaded, list) and loaded:
+                first = loaded[0] if isinstance(loaded[0], dict) else {}
+                instructions = str(first.get("instructions") or "")
+                if "S3-AUTO-GUIDED" in instructions:
+                    return "S3-AUTO-GUIDED：模型从有预算目录自动选择并消费了固定修订。"
+                if "只返回 S3-GUIDED-SUCCESS" not in instructions:
+                    raise RuntimeError("S3 guidance was not loaded from the fixed revision")
+                return "S3-GUIDED-SUCCESS：已按固定修订的售后核验指南完成本轮处理。"
+        return original_generate_text(client, system_prompt, user_payload, response_format)
+
+    LLMClient.generate_text = deterministic_text
 
 
 def seed_connection_browser_fixtures() -> None:

@@ -57,6 +57,7 @@ from app.db.models import (
     AgentResourceBinding,
     ChatSession,
     GeneralSkill,
+    GeneralSkillRevision,
     HumanHandoffRequest,
     KnowledgeBaseVersion,
     Message,
@@ -78,6 +79,7 @@ from app.dynamic_tasks.quotas import (
 )
 from app.general_skills import GeneralSkillRunner, GeneralSkillSelector
 from app.general_skills.eligibility import EffectiveGeneralSkillResolver
+from app.general_skills.runtime import GeneralSkillRuntimeError, GeneralSkillRuntimeService
 from app.general_skills.schema import GeneralSkillRunResponse, GeneralSkillSelection
 from app.knowledge import KnowledgeService
 from app.knowledge.access import (
@@ -688,18 +690,55 @@ class AgentLoop:
     ) -> ChatTurnResponse | None:
         if not self._scene_router_deferred_to_general(router_decision):
             return None
-        capability = capability or self._route_non_sop_capability(
-            request.message,
-            model_config,
-            chat_session,
-            chat_session.agent_id,
-            conversation_context,
-            memory_context,
-            user_id=request.user_id,
-            user_message_id=user_message_id,
-        )
+        if (
+            get_settings().general_skill_dynamic_guidance_enabled
+            and request.user_id
+            and chat_session.agent_id
+        ):
+            current_user = self.db.get(User, request.user_id)
+            if current_user is not None:
+                invalidated = GeneralSkillRuntimeService(self.db).invalidate_unavailable(
+                    current_user,
+                    session_id=chat_session.id,
+                    agent_id=chat_session.agent_id,
+                )
+                for use in invalidated:
+                    self.events.record(
+                        request.tenant_id,
+                        chat_session.id,
+                        "skill_countermanded",
+                        self._turn_payload(
+                            {
+                                "skill_use_id": use.id,
+                                "skill_id": use.skill_id,
+                                "reason": use.invalidation_reason,
+                            },
+                            user_message_id,
+                        ),
+                    )
+        if request.forced_general_skill_id and get_settings().general_skill_dynamic_guidance_enabled:
+            capability = self._forced_general_skill_capability(request, chat_session)
+        else:
+            capability = capability or self._route_non_sop_capability(
+                request.message,
+                model_config,
+                chat_session,
+                chat_session.agent_id,
+                conversation_context,
+                memory_context,
+                user_id=request.user_id,
+                user_message_id=user_message_id,
+            )
         skill, selection = capability
         if skill is None:
+            if request.forced_general_skill_id:
+                return self._general_skill_load_rejected_response(
+                    request,
+                    chat_session,
+                    router_decision,
+                    user_message_id,
+                    "GENERAL_SKILL_NOT_AVAILABLE",
+                )
             return None
         self.events.record(
             request.tenant_id,
@@ -731,6 +770,21 @@ class AgentLoop:
                 user_message_id,
             ),
         )
+        if (
+            skill.usage_mode == "planning_guidance"
+            and get_settings().general_skill_dynamic_guidance_enabled
+        ):
+            return self._answer_with_loaded_general_skill(
+                request=request,
+                chat_session=chat_session,
+                model_config=model_config,
+                router_decision=router_decision,
+                skill=skill,
+                selection=selection,
+                memory_context=memory_context or [],
+                conversation_context=conversation_context or {},
+                user_message_id=user_message_id,
+            )
         run_response = self.general_skill_runner.run(
             skill,
             request.message,
@@ -796,6 +850,190 @@ class AgentLoop:
             session_state=public_session(chat_session),
         )
 
+    def _answer_with_loaded_general_skill(
+        self,
+        *,
+        request: ChatTurnRequest,
+        chat_session: ChatSession,
+        model_config: ModelConfig,
+        router_decision: RouterDecision,
+        skill: GeneralSkill,
+        selection: GeneralSkillSelection,
+        memory_context: list[dict[str, object]],
+        conversation_context: dict[str, object],
+        user_message_id: str | None,
+    ) -> ChatTurnResponse:
+        """在回复模型运行前确定性加载指导型 revision，并用 Use 账本闭合本轮。"""
+
+        if not request.user_id or not chat_session.agent_id or not user_message_id:
+            return self._general_skill_load_rejected_response(
+                request,
+                chat_session,
+                router_decision,
+                user_message_id,
+                "GENERAL_SKILL_CONTEXT_INCOMPLETE",
+            )
+        current_user = self.db.get(User, request.user_id)
+        if current_user is None:
+            return self._general_skill_load_rejected_response(
+                request,
+                chat_session,
+                router_decision,
+                user_message_id,
+                "GENERAL_SKILL_NOT_AVAILABLE",
+            )
+        mode = "forced" if request.forced_general_skill_id else "auto"
+        runtime = GeneralSkillRuntimeService(self.db)
+        self.events.record(
+            request.tenant_id,
+            chat_session.id,
+            "skill_load_started",
+            self._turn_payload(
+                {"skill_id": skill.id, "selection_mode": mode}, user_message_id
+            ),
+        )
+        try:
+            loaded_bundle = runtime.load_bundle(
+                current_user,
+                session_id=chat_session.id,
+                agent_id=chat_session.agent_id,
+                turn_id=request.client_turn_id or user_message_id,
+                skill_id=skill.id,
+                selection_mode=mode,
+            )
+        except GeneralSkillRuntimeError as exc:
+            return self._general_skill_load_rejected_response(
+                request,
+                chat_session,
+                router_decision,
+                user_message_id,
+                exc.code,
+            )
+        for loaded in loaded_bundle:
+            self.events.record(
+                request.tenant_id,
+                chat_session.id,
+                "skill_loaded",
+                self._turn_payload(
+                    {
+                        "skill_use_id": loaded.use_id,
+                        "skill_id": loaded.skill_id,
+                        "revision_id": loaded.revision_id,
+                        "revision_number": loaded.revision_number,
+                        "selection_mode": loaded.selection_mode,
+                    },
+                    user_message_id,
+                ),
+            )
+        guided_context = {
+            **conversation_context,
+            "loaded_general_skills": [loaded.prompt_block() for loaded in loaded_bundle],
+        }
+        step_result = StepAgentResult(is_step_completed=True)
+        reply = self._generate_reply_segment(
+            request.message,
+            chat_session,
+            None,
+            router_decision,
+            step_result,
+            None,
+            model_config,
+            self._get_persona_prompt(request.tenant_id, chat_session.agent_id),
+            memory_context,
+            guided_context,
+        )
+        reply = self._finalize_turn(
+            chat_session,
+            request.tenant_id,
+            reply,
+            step_result,
+            request.message,
+            user_message_id=user_message_id,
+        )
+        for loaded in loaded_bundle:
+            runtime.complete(loaded.use_id, summary={"reply_generated": True})
+            self.events.record(
+                request.tenant_id,
+                chat_session.id,
+                "skill_use_completed",
+                self._turn_payload(
+                    {"skill_use_id": loaded.use_id, "skill_id": loaded.skill_id},
+                    user_message_id,
+                ),
+            )
+        self.db.commit()
+        self.db.refresh(chat_session)
+        self._enqueue_memory_capture(request, chat_session, step_result, None, model_config)
+        return ChatTurnResponse(
+            reply=reply,
+            session_id=chat_session.id,
+            router_decision=router_decision,
+            step_result=step_result,
+            tool_result=None,
+            session_state=public_session(chat_session),
+        )
+
+    def _general_skill_load_rejected_response(
+        self,
+        request: ChatTurnRequest,
+        chat_session: ChatSession,
+        router_decision: RouterDecision,
+        user_message_id: str | None,
+        code: str,
+    ) -> ChatTurnResponse:
+        """持久记录明确拒绝并返回可理解终态，禁止静默退回普通问答。"""
+
+        reply = "所选 Skill 当前不可用或已被停用，本轮没有继续使用其指导内容。"
+        self.events.record(
+            request.tenant_id,
+            chat_session.id,
+            "skill_load_rejected",
+            self._turn_payload({"code": code}, user_message_id),
+        )
+        step_result = StepAgentResult(reply=reply, is_step_completed=False)
+        reply = self._finalize_turn(
+            chat_session,
+            request.tenant_id,
+            reply,
+            step_result,
+            request.message,
+            user_message_id=user_message_id,
+        )
+        self.db.commit()
+        self.db.refresh(chat_session)
+        return ChatTurnResponse(
+            reply=reply,
+            session_id=chat_session.id,
+            router_decision=router_decision,
+            step_result=step_result,
+            tool_result=None,
+            session_state=public_session(chat_session),
+        )
+
+    def _stream_completed_response(
+        self,
+        chat_session: ChatSession,
+        response: ChatTurnResponse,
+        user_message_id: str | None,
+    ) -> Iterator[dict[str, object]]:
+        """把已持久完成的确定性响应投影为标准 SSE 终态，不再次执行业务逻辑。"""
+
+        for chunk in self.response_generator.chunk_text(response.reply):
+            yield self._stream_event(
+                "stream_delta",
+                chat_session,
+                self._turn_payload({"content": chunk}, user_message_id),
+            )
+            self._pace_stream()
+        yield self._stream_event(
+            "stream_end", chat_session, self._turn_payload({}, user_message_id)
+        )
+        yield self._stream_event(
+            "complete",
+            chat_session,
+            self._turn_payload(response.model_dump(mode="json"), user_message_id),
+        )
+
     def _general_skill_agent_outputs(
         self, run_response: GeneralSkillRunResponse
     ) -> tuple[StepAgentResult, ToolResult]:
@@ -852,6 +1090,42 @@ class AgentLoop:
             "answer_only",
             "clarify",
         }
+
+    def _forced_general_skill_capability(
+        self,
+        request: ChatTurnRequest,
+        chat_session: ChatSession,
+    ) -> tuple[GeneralSkill | None, GeneralSkillSelection]:
+        """只从当前用户与会话 Agent 的权威目录解析结构化强制 Skill。"""
+
+        if request.channel != "web":
+            return (
+                None,
+                GeneralSkillSelection(
+                    use_general_skill=False,
+                    confidence=1.0,
+                    reason="外部消息入口不能直接声明结构化强制 Skill。",
+                ),
+            )
+        forced_skill = next(
+            (
+                row
+                for row in self._list_published_general_skills(
+                    request.tenant_id, chat_session.agent_id, request.user_id
+                )
+                if row.id == request.forced_general_skill_id
+            ),
+            None,
+        )
+        return (
+            forced_skill,
+            GeneralSkillSelection(
+                use_general_skill=forced_skill is not None,
+                selected_slug=forced_skill.slug if forced_skill is not None else None,
+                confidence=1.0,
+                reason="用户通过结构化会话入口显式选择 Skill。",
+            ),
+        )
 
     def _should_run_step_agent(
         self, router_decision: RouterDecision, active_skill: Skill | None
@@ -952,6 +1226,47 @@ class AgentLoop:
                 user_message_id,
             ),
         )
+        if (
+            skill.usage_mode == "planning_guidance"
+            and get_settings().general_skill_dynamic_guidance_enabled
+        ):
+            if is_cancelled and is_cancelled():
+                return
+            response = self._answer_with_loaded_general_skill(
+                request=request,
+                chat_session=chat_session,
+                model_config=model_config,
+                router_decision=router_decision
+                or RouterDecision(decision="answer_only", reason="结构化强制 Skill。"),
+                skill=skill,
+                selection=selection,
+                memory_context=memory_context or [],
+                conversation_context=conversation_context or {},
+                user_message_id=user_message_id,
+            )
+            yield self._stream_status(
+                chat_session,
+                "responding",
+                "正在依据已审核 Skill 生成回复",
+                {"skill_id": skill.id, "execution_mode": "planning_guidance"},
+                user_message_id=user_message_id,
+            )
+            for chunk in self.response_generator.chunk_text(response.reply):
+                yield self._stream_event(
+                    "stream_delta",
+                    chat_session,
+                    self._turn_payload({"content": chunk}, user_message_id),
+                )
+                self._pace_stream()
+            yield self._stream_event(
+                "stream_end", chat_session, self._turn_payload({}, user_message_id)
+            )
+            yield self._stream_event(
+                "complete",
+                chat_session,
+                self._turn_payload(response.model_dump(mode="json"), user_message_id),
+            )
+            return
         yield self._stream_status(
             chat_session,
             "general_skill_running",
@@ -1752,6 +2067,25 @@ class AgentLoop:
                     capability_route.selected_general_skill,
                     capability_route.general_selection,
                 )
+                if (
+                    request.forced_general_skill_id
+                    and get_settings().general_skill_dynamic_guidance_enabled
+                ):
+                    capability = self._forced_general_skill_capability(request, chat_session)
+                    if capability[0] is None:
+                        rejected = self._general_skill_load_rejected_response(
+                            request,
+                            chat_session,
+                            RouterDecision(
+                                decision="answer_only", reason="结构化强制 Skill 不可用。"
+                            ),
+                            user_message.id,
+                            "GENERAL_SKILL_NOT_AVAILABLE",
+                        )
+                        yield from self._stream_completed_response(
+                            chat_session, rejected, user_message.id
+                        )
+                        return
                 if capability[0] is not None:
                     yield from self._stream_general_skill_response(
                         request,
@@ -1955,6 +2289,23 @@ class AgentLoop:
                     capability_route.selected_general_skill,
                     capability_route.general_selection,
                 )
+                if (
+                    request.forced_general_skill_id
+                    and get_settings().general_skill_dynamic_guidance_enabled
+                ):
+                    capability = self._forced_general_skill_capability(request, chat_session)
+                    if capability[0] is None:
+                        rejected = self._general_skill_load_rejected_response(
+                            request,
+                            chat_session,
+                            router_decision,
+                            user_message.id,
+                            "GENERAL_SKILL_NOT_AVAILABLE",
+                        )
+                        yield from self._stream_completed_response(
+                            chat_session, rejected, user_message.id
+                        )
+                        return
                 capability_selection = capability[1]
                 if capability[0] is not None:
                     yield from self._stream_general_skill_response(
@@ -6664,7 +7015,9 @@ class AgentLoop:
                 if is_open_gallery_resource(self.db, tenant_id, "general_skill", row)
             ]
             self._shadow_general_skill_catalog(tenant_id, agent_id, user_id, legacy)
-            return legacy
+            return self._effective_general_skill_rows(
+                tenant_id, agent_id, user_id, legacy
+            )
 
         bindings = self.db.exec(
             select(AgentResourceBinding).where(
@@ -6688,7 +7041,50 @@ class AgentLoop:
             ):
                 visible.append(row)
         self._shadow_general_skill_catalog(tenant_id, agent_id, user_id, visible)
-        return visible
+        return self._effective_general_skill_rows(tenant_id, agent_id, user_id, visible)
+
+    def _effective_general_skill_rows(
+        self,
+        tenant_id: str,
+        agent_id: str | None,
+        user_id: str | None,
+        legacy: list[GeneralSkill],
+    ) -> list[GeneralSkill]:
+        """开关开启时以 resolver 过滤旧根，并把指导型 Skill 固定到所选 revision。"""
+
+        if not get_settings().general_skill_resolver_v2_enabled or not agent_id or not user_id:
+            return legacy
+        user = self.db.get(User, user_id)
+        if user is None or user.tenant_id != tenant_id:
+            return []
+        catalog = EffectiveGeneralSkillResolver(self.db).resolve(user, agent_id)
+        resolved = {item.skill_id: item for item in catalog.items}
+        rows: list[GeneralSkill] = []
+        for root in legacy:
+            item = resolved.get(root.id)
+            if item is None:
+                continue
+            if root.usage_mode != "planning_guidance":
+                rows.append(root)
+                continue
+            revision = self.db.get(GeneralSkillRevision, item.revision_id)
+            if revision is None:
+                continue
+            materialized = GeneralSkill.model_validate(root.model_dump())
+            materialized.skill_markdown = revision.normalized_skill_markdown
+            materialized.permissions_json = {
+                "requested_tools": list(
+                    revision.requested_capabilities_json.get("allowed_tools", [])
+                )
+            }
+            materialized.metadata_json = {
+                **dict(root.metadata_json or {}),
+                "resolved_revision_id": revision.id,
+                "resolved_revision_number": revision.revision_number,
+                "resolved_content_checksum": revision.content_checksum,
+            }
+            rows.append(materialized)
+        return rows
 
     def _shadow_general_skill_catalog(
         self,
@@ -6783,6 +7179,26 @@ class AgentLoop:
         general_skills = self._list_published_general_skills(
             model_config.tenant_id, agent_id, user_id
         )
+        if (
+            get_settings().general_skill_dynamic_guidance_enabled
+            and user_id
+            and agent_id
+            and chat_session.id
+        ):
+            current_user = self.db.get(User, user_id)
+            if current_user is not None:
+                projected = GeneralSkillRuntimeService(self.db).projected_catalog(
+                        current_user,
+                        session_id=chat_session.id,
+                        agent_id=agent_id,
+                        query=message,
+                    )
+                rows_by_id = {skill.id: skill for skill in general_skills}
+                general_skills = [
+                    rows_by_id[item.skill_id]
+                    for item in projected
+                    if item.skill_id in rows_by_id
+                ]
         knowledge_capability = self._knowledge_capability_payload(
             model_config.tenant_id,
             user_id,
@@ -6816,6 +7232,8 @@ class AgentLoop:
     ) -> ChatTurnResponse | None:
         """只在独立 kill switch 生效且路由通过时委托 DynamicTaskAgent 完整执行。"""
 
+        if request.forced_general_skill_id:
+            return None
         decision = route.effective_decision
         if request.interaction_mode == "scheduled_task":
             decision = NonSopCapabilityDecision(
@@ -7706,6 +8124,8 @@ class AgentLoop:
             metadata["interaction_mode"] = "scheduled_task"
         if request.model_config_id:
             metadata["model_config_id"] = request.model_config_id
+        if request.forced_general_skill_id:
+            metadata["forced_general_skill_id"] = request.forced_general_skill_id
         if request.attachments:
             metadata["attachments"] = [item.model_dump(mode="json") for item in request.attachments]
         return metadata

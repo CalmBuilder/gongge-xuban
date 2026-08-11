@@ -98,6 +98,15 @@ class Settings(BaseSettings):
     general_skill_import_async_enabled: bool = True
     general_skill_resolver_v2_shadow: bool = False
     general_skill_resolver_v2_enabled: bool = False
+    general_skill_dynamic_guidance_enabled: bool = False
+    general_skill_catalog_top_k: int = Field(default=12, ge=1, le=24)
+    general_skill_instruction_char_limit: int = Field(default=48_000, ge=1_000, le=96_000)
+    general_skill_total_instruction_char_limit: int = Field(
+        default=64_000, ge=1_000, le=192_000
+    )
+    general_skill_dependency_max_depth: int = Field(default=4, ge=1, le=8)
+    general_skill_max_loaded_per_turn: int = Field(default=8, ge=1, le=16)
+    general_skill_resource_read_bytes: int = Field(default=64 * 1024, ge=1_024, le=256 * 1024)
     general_skill_import_worker_poll_seconds: float = Field(default=1.0, ge=0.1, le=60.0)
     general_skill_import_worker_lease_seconds: int = Field(default=300, ge=180, le=1800)
 

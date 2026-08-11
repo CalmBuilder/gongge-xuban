@@ -421,6 +421,22 @@ export type EffectiveGeneralSkillCatalogRead = {
   }>;
 };
 
+export type SessionGeneralSkillCatalogRead = {
+  session_id: string;
+  agent_id: string;
+  items: Array<{
+    skill_id: string;
+    revision_id: string;
+    revision_number: number;
+    name: string;
+    description: string;
+    invocation_policy: 'model_allowed' | 'user_only';
+    revision_policy: 'pinned' | 'follow_latest';
+    enabled: boolean;
+    override_row_version?: number;
+  }>;
+};
+
 export type GeneralSkillRunResponse = {
   skill_slug: string;
   execution_trace: Array<Record<string, unknown>>;

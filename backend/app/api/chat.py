@@ -298,6 +298,8 @@ def _user_message_metadata(request: ChatTurnRequest) -> dict[str, object]:
         metadata["interaction_mode"] = "scheduled_task"
     if request.model_config_id:
         metadata["model_config_id"] = request.model_config_id
+    if request.forced_general_skill_id:
+        metadata["forced_general_skill_id"] = request.forced_general_skill_id
     if request.attachments:
         metadata["attachments"] = [item.model_dump(mode="json") for item in request.attachments]
     return metadata

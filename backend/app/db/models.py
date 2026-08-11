@@ -1058,6 +1058,7 @@ class SopOperation(SQLModel, table=True):
     capability_snapshot_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     capability_checksum: OptionalVersionString = Field(default=None, index=True)
     approval_work_item_id: OptionalIdentifierString = Field(default=None, index=True)
+    caused_by_skill_use_id: OptionalIdentifierString = Field(default=None, index=True)
     approval_fingerprint: OptionalVersionString = Field(default=None, index=True)
     approved_by_user_id: OptionalIdentifierString = Field(default=None, index=True)
     approved_at: datetime | None = None
@@ -1827,6 +1828,89 @@ class GeneralSkillRevision(SQLModel, table=True):
     created_at: datetime = Field(default_factory=utc_now)
     published_at: datetime | None = None
     revoked_at: datetime | None = None
+
+
+class SessionGeneralSkillOverride(SQLModel, table=True):
+    """保存会话对当前 Skill 的收窄决定，禁止 override 复活上层停用。"""
+
+    __tablename__ = "session_general_skill_overrides"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "session_id",
+            "user_id",
+            "agent_id",
+            "skill_id",
+            name="uq_session_general_skill_override_scope",
+        ),
+        CheckConstraint("row_version >= 1", name="ck_session_general_skill_override_version"),
+        Index(
+            "ix_session_general_skill_override_lookup",
+            "tenant_id",
+            "session_id",
+            "user_id",
+            "agent_id",
+            "enabled",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("gsoverride"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    session_id: IdentifierString = Field(index=True)
+    user_id: IdentifierString = Field(index=True)
+    agent_id: IdentifierString = Field(index=True)
+    skill_id: IdentifierString = Field(index=True)
+    enabled: bool = Field(default=True, index=True)
+    row_version: int = Field(default=1, ge=1)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class GeneralSkillUse(SQLModel, table=True):
+    """持久记录某轮实际加载的固定 Skill revision 与失效终态。"""
+
+    __tablename__ = "general_skill_uses"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "idempotency_key", name="uq_general_skill_use_idempotency"
+        ),
+        CheckConstraint(
+            "selection_mode IN ('auto', 'forced', 'dependency')",
+            name="ck_general_skill_use_selection_mode",
+        ),
+        CheckConstraint(
+            "status IN ('loading', 'active', 'completed', 'invalidated', 'failed', 'cancelled')",
+            name="ck_general_skill_use_status",
+        ),
+        Index(
+            "ix_general_skill_use_session_status",
+            "tenant_id",
+            "session_id",
+            "status",
+            "created_at",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("gsuse"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    session_id: IdentifierString = Field(index=True)
+    turn_id: IdentifierString = Field(index=True)
+    execution_id: OptionalIdentifierString = Field(default=None, index=True)
+    agent_id: IdentifierString = Field(index=True)
+    user_id: IdentifierString = Field(index=True)
+    skill_id: IdentifierString = Field(index=True)
+    revision_id: IdentifierString = Field(index=True)
+    content_checksum: VersionString = Field(index=True)
+    selection_mode: LabelString = Field(index=True)
+    status: LabelString = Field(default="loading", index=True)
+    parent_skill_use_id: OptionalIdentifierString = Field(default=None, index=True)
+    idempotency_key: VersionString = Field(index=True)
+    loaded_at: datetime | None = None
+    completed_at: datetime | None = None
+    invalidation_reason: OptionalLabelString = None
+    result_summary_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
 
 
 class GeneralSkillImportJob(SQLModel, table=True):

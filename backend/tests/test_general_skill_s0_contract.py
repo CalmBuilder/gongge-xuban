@@ -229,9 +229,10 @@ def test_legacy_dynamic_planner_filters_general_skill() -> None:
     assert client.payload["capabilities"] == []
 
 
-def test_legacy_dynamic_catalog_has_no_actor_user_dimension() -> None:
-    """固定动态 Skill 目录尚未把当前操作者作为显式授权输入的事实。"""
+def test_dynamic_catalog_now_has_actor_user_dimension() -> None:
+    """S2 已补齐动态 Skill 目录的显式操作者授权输入，保留默认值兼容旧调用方。"""
 
     parameters = inspect.signature(DynamicCapabilityCatalog.list_general_skills).parameters
 
-    assert "actor_user_id" not in parameters
+    assert "actor_user_id" in parameters
+    assert parameters["actor_user_id"].default is None

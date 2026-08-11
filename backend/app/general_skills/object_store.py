@@ -81,6 +81,18 @@ class FileSystemSkillObjectStore:
             return promoted.read_bytes()
         raise SkillObjectStoreError("skill object is not available")
 
+    def read_object(self, checksum: str) -> bytes:
+        """按内容 checksum 读取已提升对象，并复核磁盘内容未被替换或损坏。"""
+
+        normalized = self._validated_checksum(checksum)
+        source = self.root / "objects" / normalized[:2] / normalized
+        if not source.is_file() or source.is_symlink():
+            raise SkillObjectStoreError("skill object is not available")
+        payload = source.read_bytes()
+        if hashlib.sha256(payload).hexdigest() != normalized:
+            raise SkillObjectStoreError("skill object checksum mismatch")
+        return payload
+
     def release_staging(self, job_id: str) -> None:
         """逐文件移除已终止作业的暂存命名空间并回收配额。"""
 

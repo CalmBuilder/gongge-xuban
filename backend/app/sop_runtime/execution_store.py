@@ -1028,10 +1028,11 @@ class SopExecutionStore:
         idempotency_policy: IdempotencyPolicy | None = None,
         effect_kind: str = "read",
         compensates_operation_id: str | None = None,
+        caused_by_skill_use_id: str | None = None,
         capability_snapshot: Mapping[str, object] | None = None,
         capability_snapshot_checksum: str | None = None,
     ) -> tuple[SopOperation, bool]:
-        """准备稳定逻辑动作；节点重试只追加 attempt，绝不生成第二次远端命令。"""
+        """准备稳定逻辑动作，并保留触发它的固定 Skill Use 因果归属。"""
 
         self._assert_execution_owner(instance, execution)
         self._guard_mutation(instance, "operation.prepare")
@@ -1072,6 +1073,7 @@ class SopExecutionStore:
                 or existing.idempotency_scope != policy.scope.value
                 or tuple(existing.idempotency_key_fields_json or ()) != policy.key_fields
                 or existing.compensates_operation_id != compensates_operation_id
+                or existing.caused_by_skill_use_id != caused_by_skill_use_id
                 or dict(existing.capability_snapshot_json or {}) != frozen_capability
                 or existing.capability_checksum != frozen_checksum
             ):
@@ -1112,6 +1114,7 @@ class SopExecutionStore:
             idempotency_key_fields_json=list(policy.key_fields),
             effect_kind=effect_kind,
             compensates_operation_id=compensates_operation_id,
+            caused_by_skill_use_id=caused_by_skill_use_id,
             request_json=dict(request),
             capability_snapshot_json=frozen_capability,
             capability_checksum=frozen_checksum,

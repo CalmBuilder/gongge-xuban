@@ -3900,5 +3900,14 @@
   "固定版本": "Pinned Version",
   "允许自动选择": "Allow Automatic Selection",
   "当前发布": "Currently Published",
-  "导入新修订": "Import New Revision"
+  "导入新修订": "Import New Revision",
+  "选择本轮 Skill": "Select a Skill for this turn",
+  "使用 Skill": "Use Skill",
+  "（已静音）": " (Muted)",
+  "仅手动": "Manual Only",
+  "可自动": "Automatic",
+  "取消并静音 Skill {1}": "Clear and mute Skill {1}",
+  "取消本轮选择并在当前会话静音": "Clear this selection and mute it in this conversation",
+  "Skill 恢复失败": "Failed to unmute the Skill",
+  "Skill 静音失败": "Failed to mute the Skill"
 }

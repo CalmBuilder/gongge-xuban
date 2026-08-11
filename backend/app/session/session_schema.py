@@ -192,6 +192,7 @@ class ChatTurnRequest(BaseModel):
     interaction_mode: Literal["normal", "scheduled_task"] = "normal"
     client_timezone: Optional[str] = None
     debug: bool = False
+    forced_general_skill_id: Optional[str] = None
 
 
 class ChatAttachmentRead(BaseModel):

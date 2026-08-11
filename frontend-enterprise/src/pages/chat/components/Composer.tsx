@@ -59,6 +59,10 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
     setComposerPlusOpen,
     composerIntent,
     setComposerIntent,
+    sessionGeneralSkills,
+    selectedGeneralSkillId,
+    selectSessionGeneralSkill,
+    muteSelectedGeneralSkill,
     readyComposerAttachments,
     uploadingComposerAttachment,
     currentSessionRunning,
@@ -109,6 +113,9 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
 
   const hasSendContent = Boolean(input.trim() || readyComposerAttachments.length > 0);
   const sendDisabled = !hasSendContent || uploadingComposerAttachment;
+  const selectedGeneralSkill = sessionGeneralSkills.find(
+    (item) => item.skill_id === selectedGeneralSkillId,
+  );
 
   const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -349,6 +356,55 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
                     />
                   </span>
                   <span>定时任务</span>
+                </button>
+              )}
+              {sessionGeneralSkills.length > 0 && (
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <button
+                      type="button"
+                      className={CHAT_COMPOSER_MODEL_BTN_CLASS}
+                      aria-label={t('选择本轮 Skill')}
+                    >
+                      <ProductIcon name="spark" size={14} />
+                      <span>{selectedGeneralSkill ? selectedGeneralSkill.name : t('使用 Skill')}</span>
+                    </button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent
+                    align="start"
+                    side="top"
+                    className={cn(CHAT_MENU_CONTENT_CLASS, 'max-h-[320px] min-w-[260px] overflow-y-auto')}
+                  >
+                    {sessionGeneralSkills.map((item) => (
+                      <DropdownMenuItem
+                        key={item.skill_id}
+                        className={CHAT_MODEL_MENU_ITEM_CLASS}
+                        onSelect={() => void selectSessionGeneralSkill(item.skill_id)}
+                      >
+                        <span className={CHAT_MODEL_MENU_COPY_CLASS}>
+                          <span className={CHAT_MODEL_MENU_NAME_CLASS}>
+                            {item.name}{!item.enabled ? t('（已静音）') : ''}
+                          </span>
+                          <span className={CHAT_MODEL_MENU_DETAIL_CLASS}>
+                            v{item.revision_number} · {item.invocation_policy === 'user_only' ? t('仅手动') : t('可自动')}
+                          </span>
+                        </span>
+                        {selectedGeneralSkillId === item.skill_id && <ProductIcon name="check" size={15} />}
+                      </DropdownMenuItem>
+                    ))}
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              )}
+              {selectedGeneralSkill && (
+                <button
+                  type="button"
+                  className={CHAT_COMPOSER_INTENT_CHIP_CLASS}
+                  onClick={() => void muteSelectedGeneralSkill()}
+                  aria-label={t('取消并静音 Skill {1}', { 1: selectedGeneralSkill.name })}
+                  title={t('取消本轮选择并在当前会话静音')}
+                >
+                  <ProductIcon name="close" size={10} />
+                  <span>{selectedGeneralSkill.name}</span>
                 </button>
               )}
               <div className={CHAT_COMPOSER_HINT_CLASS}>Enter 发送 / Shift+Enter 换行</div>

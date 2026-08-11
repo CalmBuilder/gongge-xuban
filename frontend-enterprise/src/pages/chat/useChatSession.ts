@@ -47,6 +47,7 @@ import type {
   ModelConfigRead,
   ScheduledTaskDraftRead,
   ScheduledTaskRead,
+  SessionGeneralSkillCatalogRead,
   TurnTraceRead,
   UIConfigRead,
 } from '@/types';
@@ -334,6 +335,8 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
   const [composerDragActive, setComposerDragActive] = useState(false);
   const [composerPlusOpen, setComposerPlusOpen] = useState(false);
   const [composerIntent, setComposerIntent] = useState<Exclude<ComposerInteractionMode, 'normal'> | null>(null);
+  const [sessionGeneralSkills, setSessionGeneralSkills] = useState<SessionGeneralSkillCatalogRead['items']>([]);
+  const [selectedGeneralSkillId, setSelectedGeneralSkillId] = useState('');
   const [lastTurn, setLastTurn] = useState<ChatTurnResponse | null>(null);
   const [renameSession, setRenameSession] = useState<ChatSession | null>(null);
   const [renameTitle, setRenameTitle] = useState('');
@@ -524,6 +527,78 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     : null;
   const displayedAgent = invalidDraftAgentId || draftAgentLoading ? null : (sessionAgent || draftAgent || defaultAgent);
   const displayedProfile = displayedAgent ? employeeProfile(displayedAgent) : null;
+  useEffect(() => {
+    if (!auth || !sessionId || !displayedAgent?.id || isDraftConversationKey(sessionId)) {
+      setSessionGeneralSkills([]);
+      setSelectedGeneralSkillId('');
+      return;
+    }
+    let cancelled = false;
+    void api.get<SessionGeneralSkillCatalogRead>(
+      `/api/chat/sessions/${encodeURIComponent(sessionId)}/general-skills?agent_id=${encodeURIComponent(displayedAgent.id)}`,
+    ).then((catalog) => {
+      if (cancelled) return;
+      setSessionGeneralSkills(catalog.items);
+      setSelectedGeneralSkillId((current) => (
+        catalog.items.some((item) => item.skill_id === current && item.enabled) ? current : ''
+      ));
+    }).catch((error) => {
+      if (!cancelled && !isAuthError(error)) setSessionGeneralSkills([]);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [auth, displayedAgent?.id, sessionId]);
+
+  const selectSessionGeneralSkill = useCallback(async (skillId: string) => {
+    const item = sessionGeneralSkills.find((candidate) => candidate.skill_id === skillId);
+    if (!item || !sessionId || !displayedAgent?.id) return;
+    try {
+      if (!item.enabled) {
+        const updated = await api.put<{ enabled: boolean; row_version: number }>(
+          `/api/chat/sessions/${encodeURIComponent(sessionId)}/general-skills/${encodeURIComponent(skillId)}`,
+          {
+            agent_id: displayedAgent.id,
+            enabled: true,
+            expected_row_version: item.override_row_version ?? null,
+          },
+        );
+        setSessionGeneralSkills((current) => current.map((candidate) => (
+          candidate.skill_id === skillId
+            ? { ...candidate, enabled: updated.enabled, override_row_version: updated.row_version }
+            : candidate
+        )));
+      }
+      setSelectedGeneralSkillId(skillId);
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : t('Skill 恢复失败'));
+    }
+  }, [displayedAgent?.id, sessionGeneralSkills, sessionId, t]);
+
+  const muteSelectedGeneralSkill = useCallback(async () => {
+    const item = sessionGeneralSkills.find(
+      (candidate) => candidate.skill_id === selectedGeneralSkillId,
+    );
+    if (!item || !sessionId || !displayedAgent?.id) return;
+    try {
+      const updated = await api.put<{ enabled: boolean; row_version: number }>(
+        `/api/chat/sessions/${encodeURIComponent(sessionId)}/general-skills/${encodeURIComponent(item.skill_id)}`,
+        {
+          agent_id: displayedAgent.id,
+          enabled: false,
+          expected_row_version: item.override_row_version ?? null,
+        },
+      );
+      setSessionGeneralSkills((current) => current.map((candidate) => (
+        candidate.skill_id === item.skill_id
+          ? { ...candidate, enabled: updated.enabled, override_row_version: updated.row_version }
+          : candidate
+      )));
+      setSelectedGeneralSkillId('');
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : t('Skill 静音失败'));
+    }
+  }, [displayedAgent?.id, selectedGeneralSkillId, sessionGeneralSkills, sessionId, t]);
   const emptyProfileTags = displayedProfile?.workStyles.length
     ? displayedProfile.workStyles.slice(0, 3)
     : ['结构化整理', '可追溯', '可追溯'];
@@ -2957,6 +3032,9 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       if (!startedAsDraftConversation) {
         requestBody.session_id = currentConversationId;
       }
+      if (prepared.forcedGeneralSkillId) {
+        requestBody.forced_general_skill_id = prepared.forcedGeneralSkillId;
+      }
       armStreamWatchdog();
       await streamChatTurn(requestBody, (item) => {
         if (!controller.signal.aborted) {
@@ -3130,11 +3208,13 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       attachments: readyComposerAttachments.map(toRequestAttachment),
       interactionMode: resolvedInteractionMode,
       modelConfigId: selectedModelConfig?.id,
+      forcedGeneralSkillId: selectedGeneralSkillId || undefined,
       createdAt: new Date().toISOString(),
     };
     setInput('');
     setComposerAttachments([]);
     setComposerIntent(null);
+    setSelectedGeneralSkillId('');
     const stream = getStreamSlot(currentConversationId);
     const hasQueuedTurnForConversation = queuedTurnsRef.current.some(
       (item) => item.conversationId === currentConversationId,
@@ -3166,6 +3246,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     replyToHandoff,
     selectedAgentId,
     selectedModelConfig?.id,
+    selectedGeneralSkillId,
     sessionId,
     sessions,
     sessionsLoading,
@@ -3320,6 +3401,10 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     setComposerPlusOpen,
     composerIntent,
     setComposerIntent,
+    sessionGeneralSkills,
+    selectedGeneralSkillId,
+    selectSessionGeneralSkill,
+    muteSelectedGeneralSkill,
     readyComposerAttachments,
     uploadingComposerAttachment,
     composerActive,

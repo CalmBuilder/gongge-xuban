@@ -43,6 +43,7 @@ from app.db.models import (
     ConnectionProfile,
     ConnectorThreadBinding,
     GeneralSkill,
+    GeneralSkillRevision,
     ModelConfig,
     Tool,
     User,
@@ -703,6 +704,16 @@ class DynamicCapabilityCatalog:
             for row in self._visible_general_skills(tenant_id, agent_id)
             if row.status == "published" and self._valid_general_skill_publication(row)
         ]
+        if get_settings().general_skill_resolver_v2_enabled and actor_user_id:
+            actor = self.db.get(User, actor_user_id)
+            if actor is None or actor.tenant_id != tenant_id:
+                return []
+            catalog = EffectiveGeneralSkillResolver(self.db).resolve(actor, agent_id)
+            return [
+                snapshot
+                for item in catalog.items
+                if (snapshot := self._resolved_general_skill_snapshot(item, agent_id)) is not None
+            ]
         if get_settings().general_skill_resolver_v2_shadow and actor_user_id:
             actor = self.db.get(User, actor_user_id)
             if actor is not None and actor.tenant_id == tenant_id:
@@ -720,6 +731,67 @@ class DynamicCapabilityCatalog:
                     },
                 )
         return snapshots
+
+    def _resolved_general_skill_snapshot(
+        self,
+        item,
+        agent_id: str,
+    ) -> CapabilitySnapshot | None:
+        """从 resolver 固定 revision 构造动态目录快照，不信任可变根正文。"""
+
+        root = self.db.get(GeneralSkill, item.skill_id)
+        revision = self.db.get(GeneralSkillRevision, item.revision_id)
+        if root is None or revision is None:
+            return None
+        model_view: dict[str, Any] = {
+            "id": root.id,
+            "slug": root.slug,
+            "name": item.name,
+            "description": item.description,
+            "usage_mode": item.usage_mode,
+            "revision_id": item.revision_id,
+            "revision_number": item.revision_number,
+        }
+        if item.usage_mode == "planning_guidance":
+            model_view["skill_markdown"] = revision.normalized_skill_markdown
+            model_view["resources"] = [
+                {
+                    "resource_checksum": resource.get("content_checksum")
+                    or resource.get("checksum"),
+                    "path": resource.get("relative_path") or resource.get("path"),
+                    "size": resource.get("size"),
+                    "mime_type": resource.get("media_type"),
+                }
+                for resource in revision.resource_manifest_json
+            ]
+        payload = {
+            "capability_type": "general_skill",
+            "capability_id": root.id,
+            "tenant_id": root.tenant_id,
+            "name": root.slug,
+            "contract": {
+                "usage_mode": item.usage_mode,
+                "revision_id": item.revision_id,
+                "invocation_policy": item.invocation_policy,
+            },
+            "model_view": model_view,
+            "user_view": {
+                key: model_view[key]
+                for key in ("id", "slug", "name", "description", "usage_mode")
+            },
+            "audit_view": {
+                "skill_id": item.skill_id,
+                "revision_id": item.revision_id,
+                "revision_number": item.revision_number,
+                "content_checksum": item.content_checksum,
+                "binding_id": item.binding_id,
+            },
+        }
+        return CapabilitySnapshot(
+            **payload,
+            agent_id=agent_id,
+            checksum=capability_checksum(payload),
+        )
 
     def resolve_general_skill(
         self, tenant_id: str, agent_id: str, slug: str

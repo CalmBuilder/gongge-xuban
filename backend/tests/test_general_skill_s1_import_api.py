@@ -25,7 +25,9 @@ from app.db import get_session
 from app.db.models import (
     AgentProfile,
     AgentResourceBinding,
+    ChatSession,
     ConnectionSecret,
+    GeneralSkillUse,
     GeneralSkillRevision,
     GeneralSkillSourceCredential,
     Tenant,
@@ -79,6 +81,14 @@ def import_api_context(
             tenant_id="tenant_a",
             name="购物售后助手",
             owner_user_id=owner.id,
+        )
+    )
+    db.add(
+        ChatSession(
+            id="session_owner_skill_runtime",
+            tenant_id="tenant_a",
+            user_id=owner.id,
+            agent_id="agent_owner",
         )
     )
     db.add(
@@ -315,6 +325,88 @@ def test_s2_governance_api_lists_revisions_and_updates_binding_atomically(
         catalog_after.json()["authorization_revision"]
         > catalog_before.json()["authorization_revision"]
     )
+
+
+def test_s3_session_catalog_load_and_mute_are_one_authenticated_scope(
+    import_api_context: tuple[TestClient, Session, dict[str, str]],
+) -> None:
+    """公开会话 API 必须以同一用户/Agent/session 完成目录、加载账本和 mute。"""
+
+    client, db, tokens = import_api_context
+    preview = client.post(
+        "/api/enterprise/general-skill-import-jobs",
+        headers=_auth(tokens["owner"], idempotency_key="api-runtime-001"),
+        json=_upload_json(),
+    ).json()
+    confirmed = client.post(
+        f"/api/enterprise/general-skill-import-jobs/{preview['id']}/confirm",
+        headers=_auth(tokens["owner"]),
+        json={
+            "preview_checksum": preview["preview_checksum"],
+            "candidate_ids": [preview["candidates"][0]["candidate_id"]],
+            "expected_row_version": preview["row_version"],
+        },
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    revision = db.exec(select(GeneralSkillRevision)).one()
+
+    catalog = client.get(
+        "/api/chat/sessions/session_owner_skill_runtime/general-skills",
+        params={"agent_id": "agent_owner"},
+        headers=_auth(tokens["owner"]),
+    )
+    assert catalog.status_code == 200, catalog.text
+    assert catalog.json()["items"][0]["revision_id"] == revision.id
+    loaded = client.post(
+        "/api/chat/sessions/session_owner_skill_runtime/general-skill-loads",
+        headers=_auth(tokens["owner"]),
+        json={
+            "agent_id": "agent_owner",
+            "turn_id": "turn_api_runtime_1",
+            "skill_id": revision.skill_id,
+            "selection_mode": "forced",
+        },
+    )
+    assert loaded.status_code == 200, loaded.text
+    replay = client.post(
+        "/api/chat/sessions/session_owner_skill_runtime/general-skill-loads",
+        headers=_auth(tokens["owner"]),
+        json={
+            "agent_id": "agent_owner",
+            "turn_id": "turn_api_runtime_1",
+            "skill_id": revision.skill_id,
+            "selection_mode": "forced",
+        },
+    )
+    assert replay.json()["use_id"] == loaded.json()["use_id"]
+    assert len(db.exec(select(GeneralSkillUse)).all()) == 1
+
+    muted = client.put(
+        f"/api/chat/sessions/session_owner_skill_runtime/general-skills/{revision.skill_id}",
+        headers=_auth(tokens["owner"]),
+        json={"agent_id": "agent_owner", "enabled": False},
+    )
+    assert muted.status_code == 200, muted.text
+    assert muted.json()["enabled"] is False
+    muted_catalog = client.get(
+        "/api/chat/sessions/session_owner_skill_runtime/general-skills",
+        params={"agent_id": "agent_owner"},
+        headers=_auth(tokens["owner"]),
+    ).json()["items"]
+    assert muted_catalog[0]["enabled"] is False
+    assert muted_catalog[0]["override_row_version"] == muted.json()["row_version"]
+    denied = client.post(
+        "/api/chat/sessions/session_owner_skill_runtime/general-skill-loads",
+        headers=_auth(tokens["owner"]),
+        json={
+            "agent_id": "agent_owner",
+            "turn_id": "turn_api_runtime_2",
+            "skill_id": revision.skill_id,
+            "selection_mode": "forced",
+        },
+    )
+    assert denied.status_code == 404
+    assert denied.json()["detail"]["error_code"] == "GENERAL_SKILL_NOT_AVAILABLE"
 
 
 def test_s2_governance_api_hides_owner_revision_from_other_user(
