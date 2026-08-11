@@ -15,6 +15,7 @@ function renderDialog() {
     onRevisionChange: vi.fn(),
     onSourceSubpathChange: vi.fn(),
     onSelectedIdsChange: vi.fn(),
+    onDependencyDecisionChange: vi.fn(),
     onPreview: vi.fn(),
     onConfirm: vi.fn(),
     onClose: vi.fn(),
@@ -31,6 +32,7 @@ function renderDialog() {
         sourceSubpath="skills"
         job={null}
         selectedIds={[]}
+        dependencyDecisions={{}}
         {...callbacks}
       />
     </I18nProvider>,

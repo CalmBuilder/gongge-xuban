@@ -160,6 +160,7 @@ test('S1 GitHub 固定 commit 经供应商边界发现多候选并全部绑定',
   await expect(dialog.getByText('调用提示：Describe the reproducible failure', { exact: true })).toBeVisible();
   await expect(dialog.getByText(/待确认的同包 Skill 引用/)).toBeVisible();
   await expect(dialog.getByText('/systematic-debugging', { exact: true })).toBeVisible();
+  await dialog.getByLabel('依赖 /systematic-debugging 的处理方式').selectOption('required');
 
   const confirmResponse = page.waitForResponse((response) => (
     new URL(response.url()).pathname.endsWith('/confirm')

@@ -13,6 +13,7 @@ import binascii
 import hashlib
 import json
 import re
+from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import PurePath
 from typing import Any
@@ -24,12 +25,14 @@ from sqlmodel import Session, select
 from app.db.models import (
     AgentResourceBinding,
     GeneralSkill,
+    GeneralSkillDependency,
     GeneralSkillImportJob,
     GeneralSkillRevision,
     User,
     utc_now,
 )
 from app.general_skills.import_schema import (
+    GeneralSkillDependencyDecision,
     GeneralSkillImportCandidateRead,
     GeneralSkillImportConfirm,
     GeneralSkillImportJobCreate,
@@ -60,6 +63,15 @@ from app.security.tenant import ensure_tenant
 
 
 SLUG_INVALID = re.compile(r"[^a-z0-9]+")
+
+
+@dataclass(frozen=True, slots=True)
+class _InstalledCandidate:
+    """保存一次 confirm 中候选到新建稳定 Skill/Revision 的映射。"""
+
+    skill_id: str
+    revision_id: str
+    invocation_policy: str
 
 
 class GeneralSkillImportError(RuntimeError):
@@ -248,16 +260,32 @@ class GeneralSkillImportService:
             raise GeneralSkillImportError(
                 "GENERAL_SKILL_PACKAGE_INVALID", "candidate selection is invalid", 400
             )
+        dependency_decisions = _validated_dependency_decisions(
+            candidates,
+            candidate_ids,
+            request.dependency_decisions,
+        )
         try:
             transition_import_job(
                 job,
                 ImportJobStatus.CONFIRMING,
                 expected_row_version=request.expected_row_version,
             )
-            revision_ids = [
-                self._install_candidate(job, candidates[candidate_id], current_user)
+            installed = {
+                candidate_id: self._install_candidate(
+                    job,
+                    candidates[candidate_id],
+                    current_user,
+                )
                 for candidate_id in candidate_ids
-            ]
+            }
+            self._install_dependencies(
+                job,
+                dependency_decisions,
+                installed,
+                current_user,
+            )
+            revision_ids = [installed[candidate_id].revision_id for candidate_id in candidate_ids]
             transition_import_job(
                 job,
                 ImportJobStatus.INSTALLED,
@@ -471,7 +499,7 @@ class GeneralSkillImportService:
         job: GeneralSkillImportJob,
         candidate: dict[str, Any],
         current_user: User,
-    ) -> str:
+    ) -> _InstalledCandidate:
         """创建独立 Skill 根、published revision 和当前 Agent 的 pinned 绑定。"""
 
         resources = candidate.get("resources")
@@ -540,7 +568,9 @@ class GeneralSkillImportService:
             parsed_metadata_json=dict(candidate.get("metadata", {})),
             resource_manifest_json=promoted_manifest,
             requested_capabilities_json={
-                "allowed_tools": list(candidate.get("allowed_tools", []))
+                "allowed_tools": list(candidate.get("allowed_tools", [])),
+                "invocation_policy": str(candidate.get("invocation_policy", "model_allowed")),
+                "argument_hint": candidate.get("argument_hint"),
             },
             source_snapshot_json={
                 "source_kind": job.source_kind,
@@ -568,13 +598,52 @@ class GeneralSkillImportService:
                 "schema_version": 1,
                 "revision_policy": "pinned",
                 "pinned_revision_id": revision.id,
-                "invocation_policy": "model_allowed",
+                "invocation_policy": str(candidate.get("invocation_policy", "model_allowed")),
                 "atomic_execution_allowed": False,
                 "created_by_user_id": current_user.id,
             },
         )
         self.db.add(binding)
-        return revision.id
+        return _InstalledCandidate(
+            skill_id=skill.id,
+            revision_id=revision.id,
+            invocation_policy=str(candidate.get("invocation_policy", "model_allowed")),
+        )
+
+    def _install_dependencies(
+        self,
+        job: GeneralSkillImportJob,
+        decisions: list[tuple[str, str, str]],
+        installed: dict[str, _InstalledCandidate],
+        current_user: User,
+    ) -> None:
+        """把已审核且两端均安装的候选边固定到稳定 Skill/Revision 标识。"""
+
+        for parent_candidate_id, child_candidate_id, dependency_kind in decisions:
+            parent = installed[parent_candidate_id]
+            child = installed[child_candidate_id]
+            edge_payload = {
+                "tenant_id": job.tenant_id,
+                "parent_revision_id": parent.revision_id,
+                "child_revision_id": child.revision_id,
+                "dependency_kind": dependency_kind,
+                "source": "human_confirmed",
+                "allow_user_only": child.invocation_policy == "user_only",
+            }
+            self.db.add(
+                GeneralSkillDependency(
+                    tenant_id=job.tenant_id,
+                    parent_skill_id=parent.skill_id,
+                    parent_revision_id=parent.revision_id,
+                    child_skill_id=child.skill_id,
+                    child_revision_id=child.revision_id,
+                    dependency_kind=dependency_kind,
+                    source="human_confirmed",
+                    allow_user_only=child.invocation_policy == "user_only",
+                    edge_checksum=_canonical_checksum(edge_payload),
+                    created_by=current_user.id,
+                )
+            )
 
     def _unique_slug(self, tenant_id: str, name: str) -> str:
         """生成租户内不覆盖既有 Skill 的稳定可读 slug。"""
@@ -731,3 +800,83 @@ def _state_conflict(exc: Exception) -> GeneralSkillImportError:
     """把内部状态机异常转换为稳定的 409 API 错误。"""
 
     return GeneralSkillImportError("GENERAL_SKILL_STATE_CONFLICT", str(exc), 409)
+
+
+def _validated_dependency_decisions(
+    candidates: dict[str, dict[str, Any]],
+    selected_candidate_ids: list[str],
+    decisions: list[GeneralSkillDependencyDecision],
+) -> list[tuple[str, str, str]]:
+    """要求逐边裁决完整且无环，并返回需持久化的必需/可选稳定候选边。"""
+
+    selected = set(selected_candidate_ids)
+    available: dict[str, tuple[str, str]] = {}
+    for parent_id in selected_candidate_ids:
+        dependency_candidates = candidates[parent_id].get("dependency_candidates", [])
+        if not isinstance(dependency_candidates, list):
+            raise GeneralSkillImportError(
+                "GENERAL_SKILL_DEPENDENCY_INVALID", "dependency preview is invalid", 400
+            )
+        for dependency in dependency_candidates:
+            if not isinstance(dependency, dict):
+                raise GeneralSkillImportError(
+                    "GENERAL_SKILL_DEPENDENCY_INVALID", "dependency preview is invalid", 400
+                )
+            decision_id = str(dependency.get("dependency_candidate_id", ""))
+            child_id = str(dependency.get("referenced_candidate_id", ""))
+            if not decision_id or not child_id or decision_id in available:
+                raise GeneralSkillImportError(
+                    "GENERAL_SKILL_DEPENDENCY_INVALID", "dependency identity is ambiguous", 400
+                )
+            available[decision_id] = (parent_id, child_id)
+    by_id = {decision.dependency_candidate_id: decision.dependency_kind for decision in decisions}
+    if len(by_id) != len(decisions) or set(by_id) != set(available):
+        raise GeneralSkillImportError(
+            "GENERAL_SKILL_DEPENDENCY_INVALID",
+            "every dependency candidate must be explicitly classified",
+            400,
+        )
+    accepted: list[tuple[str, str, str]] = []
+    for decision_id, (parent_id, child_id) in available.items():
+        dependency_kind = by_id[decision_id]
+        if dependency_kind == "ignored":
+            continue
+        if child_id not in selected:
+            raise GeneralSkillImportError(
+                "GENERAL_SKILL_DEPENDENCY_INVALID",
+                "confirmed dependency must be selected for installation",
+                400,
+            )
+        accepted.append((parent_id, child_id, dependency_kind))
+    _validate_dependency_graph(accepted)
+    return accepted
+
+
+def _validate_dependency_graph(edges: list[tuple[str, str, str]]) -> None:
+    """在写库前拒绝依赖环、超深和超量展开，避免把故障推迟到运行时。"""
+
+    if len(edges) > 32:
+        raise GeneralSkillImportError(
+            "GENERAL_SKILL_DEPENDENCY_INVALID", "dependency graph exceeds edge limit", 400
+        )
+    graph: dict[str, set[str]] = {}
+    for parent_id, child_id, _ in edges:
+        graph.setdefault(parent_id, set()).add(child_id)
+
+    def visit(node: str, path: tuple[str, ...]) -> None:
+        """深度优先验证当前候选路径没有回边且深度不超过八层。"""
+
+        if node in path:
+            raise GeneralSkillImportError(
+                "GENERAL_SKILL_DEPENDENCY_INVALID", "dependency graph contains a cycle", 400
+            )
+        if len(path) >= 8:
+            raise GeneralSkillImportError(
+                "GENERAL_SKILL_DEPENDENCY_INVALID", "dependency graph exceeds depth limit", 400
+            )
+        next_path = (*path, node)
+        for child_id in sorted(graph.get(node, set())):
+            visit(child_id, next_path)
+
+    for root in sorted(graph):
+        visit(root, ())

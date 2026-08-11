@@ -87,11 +87,19 @@ class GeneralSkillImportJobRead(BaseModel):
     installed_revision_ids: list[str] = Field(default_factory=list)
 
 
+class GeneralSkillDependencyDecision(BaseModel):
+    """记录用户对正文引用候选的逐边裁决，忽略边不会进入运行依赖图。"""
+
+    dependency_candidate_id: str = Field(pattern=r"^gsdepcand_[a-f0-9]{24}$")
+    dependency_kind: Literal["required", "optional", "ignored"]
+
+
 class GeneralSkillImportConfirm(BaseModel):
-    """以审核过的 preview checksum 原子确认一个或多个候选。"""
+    """以审核过的 preview checksum 原子确认一个或多个候选及逐边依赖裁决。"""
 
     preview_checksum: str = Field(pattern=r"^[a-f0-9]{64}$")
     candidate_ids: list[str] = Field(min_length=1, max_length=50)
+    dependency_decisions: list[GeneralSkillDependencyDecision] = Field(default_factory=list)
     expected_row_version: int = Field(ge=1)
 
 

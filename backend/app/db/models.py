@@ -1895,6 +1895,53 @@ class GeneralSkillImportJob(SQLModel, table=True):
     terminal_at: datetime | None = None
 
 
+class GeneralSkillDependency(SQLModel, table=True):
+    """保存经人工确认、以稳定 Skill 与 Revision 标识表达的不可变依赖边。"""
+
+    __tablename__ = "general_skill_dependencies"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "parent_revision_id",
+            "child_revision_id",
+            name="uq_general_skill_dependency_revision_edge",
+        ),
+        CheckConstraint(
+            "dependency_kind IN ('required', 'optional')",
+            name="ck_general_skill_dependency_kind",
+        ),
+        CheckConstraint(
+            "source IN ('manifest', 'human_confirmed')",
+            name="ck_general_skill_dependency_source",
+        ),
+        CheckConstraint(
+            "status IN ('active', 'disabled')",
+            name="ck_general_skill_dependency_status",
+        ),
+        Index(
+            "ix_general_skill_dependency_parent",
+            "tenant_id",
+            "parent_skill_id",
+            "parent_revision_id",
+            "status",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("gsdep"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    parent_skill_id: IdentifierString = Field(index=True)
+    parent_revision_id: IdentifierString = Field(index=True)
+    child_skill_id: IdentifierString = Field(index=True)
+    child_revision_id: IdentifierString = Field(index=True)
+    dependency_kind: LabelString
+    source: LabelString = Field(default="human_confirmed")
+    allow_user_only: bool = False
+    edge_checksum: VersionString = Field(index=True)
+    status: LabelString = Field(default="active", index=True)
+    created_by: IdentifierString = Field(index=True)
+    created_at: datetime = Field(default_factory=utc_now)
+
+
 class KnowledgeBase(SQLModel, table=True):
     """保存知识内容及其独立于数字员工绑定的最小治理事实。"""
 

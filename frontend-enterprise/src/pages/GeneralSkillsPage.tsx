@@ -200,6 +200,7 @@ type DroppedSkillFile = {
 };
 
 type GeneralSkillImportMode = 'plaza' | 'employee';
+type SkillDependencyDecision = 'required' | 'optional' | 'ignored';
 
 type SkillFileSystemEntry = {
   name: string;
@@ -353,6 +354,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
   const [secureImportSubpath, setSecureImportSubpath] = useState('skills');
   const [secureImportJob, setSecureImportJob] = useState<GeneralSkillImportJobRead | null>(null);
   const [secureImportSelectedIds, setSecureImportSelectedIds] = useState<string[]>([]);
+  const [secureImportDependencyDecisions, setSecureImportDependencyDecisions] = useState<Record<string, SkillDependencyDecision>>({});
   const [secureImportLoading, setSecureImportLoading] = useState(false);
 
   const pageTitle = isOverallAgent ? '技能广场' : '技能';
@@ -407,6 +409,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
         }
         setSecureImportJob(job);
         setSecureImportSelectedIds(job.candidates.map((candidate) => candidate.candidate_id));
+        setSecureImportDependencyDecisions(defaultDependencyDecisions(job));
         setSecureImportOpen(true);
       })
       .catch(() => window.localStorage.removeItem(secureImportStorageKey));
@@ -637,6 +640,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
     setSecureImportSubpath('skills');
     setSecureImportJob(null);
     setSecureImportSelectedIds([]);
+    setSecureImportDependencyDecisions({});
     setSecureImportOpen(true);
   }
 
@@ -686,6 +690,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
       );
       setSecureImportJob(job);
       setSecureImportSelectedIds(job.candidates.map((candidate) => candidate.candidate_id));
+      setSecureImportDependencyDecisions(defaultDependencyDecisions(job));
       if (job.status === 'awaiting_approval') {
         window.localStorage.setItem(secureImportStorageKey, job.id);
       }
@@ -712,6 +717,12 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
         {
           preview_checksum: job.preview_checksum,
           candidate_ids: secureImportSelectedIds,
+          dependency_decisions: job.candidates
+            .filter((candidate) => secureImportSelectedIds.includes(candidate.candidate_id))
+            .flatMap((candidate) => candidate.dependency_candidates.map((dependency) => ({
+              dependency_candidate_id: dependency.dependency_candidate_id,
+              dependency_kind: secureImportDependencyDecisions[dependency.dependency_candidate_id] || 'ignored',
+            }))),
           expected_row_version: job.row_version,
         },
       );
@@ -1036,6 +1047,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
         sourceSubpath={secureImportSubpath}
         job={secureImportJob}
         selectedIds={secureImportSelectedIds}
+        dependencyDecisions={secureImportDependencyDecisions}
         onFileChange={(file) => {
           setSecureImportFile(file);
           setSecureImportJob(null);
@@ -1050,6 +1062,9 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
         onRevisionChange={setSecureImportRevision}
         onSourceSubpathChange={setSecureImportSubpath}
         onSelectedIdsChange={setSecureImportSelectedIds}
+        onDependencyDecisionChange={(candidateId, decision) => setSecureImportDependencyDecisions(
+          (current) => ({ ...current, [candidateId]: decision }),
+        )}
         onPreview={() => void previewSecurePackage()}
         onConfirm={() => void confirmSecurePackage()}
         onClose={() => void cancelSecurePackage()}
@@ -1181,12 +1196,14 @@ export function SecureSkillImportDialog({
   sourceSubpath,
   job,
   selectedIds,
+  dependencyDecisions,
   onFileChange,
   onSourceKindChange,
   onSourceUrlChange,
   onRevisionChange,
   onSourceSubpathChange,
   onSelectedIdsChange,
+  onDependencyDecisionChange,
   onPreview,
   onConfirm,
   onClose,
@@ -1200,12 +1217,14 @@ export function SecureSkillImportDialog({
   sourceSubpath: string;
   job: GeneralSkillImportJobRead | null;
   selectedIds: string[];
+  dependencyDecisions: Record<string, SkillDependencyDecision>;
   onFileChange: (file: File | null) => void;
   onSourceKindChange: (kind: 'upload' | 'github' | 'https') => void;
   onSourceUrlChange: (value: string) => void;
   onRevisionChange: (value: string) => void;
   onSourceSubpathChange: (value: string) => void;
   onSelectedIdsChange: (ids: string[]) => void;
+  onDependencyDecisionChange: (candidateId: string, decision: SkillDependencyDecision) => void;
   onPreview: () => void;
   onConfirm: () => void;
   onClose: () => void;
@@ -1437,12 +1456,33 @@ export function SecureSkillImportDialog({
                         {candidate.dependency_candidates.length ? (
                           <span className="mt-3 block rounded-lg border border-[#e4e8f1] bg-white p-2.5 text-[11px] text-[#626b7d]">
                             <strong className="font-semibold text-[#303747]">待确认的同包 Skill 引用：</strong>{' '}
-                            {candidate.dependency_candidates.map((dependency) => (
-                              <code key={dependency.dependency_candidate_id} className="mr-1 font-mono text-[#3157e8]">
-                                /{dependency.referenced_name}
-                              </code>
-                            ))}
-                            <span className="mt-1 block text-[#969daf]">正文引用不会自动获得依赖或工具权限。</span>
+                            <span className="mt-2 grid gap-2">
+                              {candidate.dependency_candidates.map((dependency) => (
+                                <label
+                                  key={dependency.dependency_candidate_id}
+                                  className="grid gap-1.5 rounded-md bg-[#f8f9fc] p-2 sm:grid-cols-[minmax(0,1fr)_150px] sm:items-center"
+                                >
+                                  <span>
+                                    <code className="font-mono text-[#3157e8]">/{dependency.referenced_name}</code>
+                                    <span className="ml-1 text-[#969daf]">引用 {dependency.reference_count} 次</span>
+                                  </span>
+                                  <select
+                                    aria-label={`依赖 /${dependency.referenced_name} 的处理方式`}
+                                    value={dependencyDecisions[dependency.dependency_candidate_id] || 'ignored'}
+                                    onChange={(event) => onDependencyDecisionChange(
+                                      dependency.dependency_candidate_id,
+                                      event.target.value as SkillDependencyDecision,
+                                    )}
+                                    className="h-8 rounded-md border border-[#cfd7e6] bg-white px-2 text-[11px] text-[#303747] outline-none focus:border-[var(--gg-cobalt)]"
+                                  >
+                                    <option value="ignored">仅正文引用</option>
+                                    <option value="required">建立必需依赖</option>
+                                    <option value="optional">建立可选依赖</option>
+                                  </select>
+                                </label>
+                              ))}
+                            </span>
+                            <span className="mt-1 block text-[#969daf]">必须逐边确认；正文引用本身不会自动获得依赖或工具权限。</span>
                           </span>
                         ) : null}
                         {candidate.platform_commands.length ? (
@@ -1499,6 +1539,17 @@ function formatBytes(value: number): string {
   if (value < 1024) return `${value} B`;
   if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KiB`;
   return `${(value / (1024 * 1024)).toFixed(1)} MiB`;
+}
+
+function defaultDependencyDecisions(
+  job: GeneralSkillImportJobRead,
+): Record<string, SkillDependencyDecision> {
+  return Object.fromEntries(
+    job.candidates.flatMap((candidate) => candidate.dependency_candidates.map((dependency) => [
+      dependency.dependency_candidate_id,
+      'ignored' as const,
+    ])),
+  );
 }
 
 function traceDetail(item: Record<string, unknown>): string {

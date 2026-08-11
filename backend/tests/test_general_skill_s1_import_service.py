@@ -21,6 +21,7 @@ from app.db.models import (
     AgentProfile,
     AgentResourceBinding,
     GeneralSkill,
+    GeneralSkillDependency,
     GeneralSkillImportJob,
     GeneralSkillRevision,
     Tenant,
@@ -66,6 +67,30 @@ def _repository_package(*names: str) -> bytes:
                 "---\n"
                 f"# {name}\n",
             )
+    return payload.getvalue()
+
+
+def _dependency_package(*, cycle: bool = False) -> bytes:
+    """构造父 Skill 引用 user-only 子 Skill 的包，可选形成反向环。"""
+
+    payload = BytesIO()
+    with ZipFile(payload, "w") as archive:
+        archive.writestr(
+            "parent/SKILL.md",
+            "---\nname: parent\ndescription: parent guidance\n---\n"
+            "Use `/child` before completing the task.\n",
+        )
+        child_body = "Use `/parent`.\n" if cycle else "Perform the focused child procedure.\n"
+        archive.writestr(
+            "child/SKILL.md",
+            "---\n"
+            "name: child\n"
+            "description: child guidance\n"
+            "disable-model-invocation: true\n"
+            'argument-hint: "child input"\n'
+            "---\n"
+            f"{child_body}",
+        )
     return payload.getvalue()
 
 
@@ -187,6 +212,118 @@ def test_confirm_creates_published_revision_and_default_pinned_private_binding(t
         for item in revision.resource_manifest_json
     )
     assert not (tmp_path / "staging" / preview.id).exists()
+
+
+def test_dependency_candidate_requires_explicit_decision_and_selected_child(tmp_path) -> None:
+    """验证正文引用既不能静默授权，也不能指向本次未安装的依赖。"""
+
+    db, service, owner, _ = _context(tmp_path)
+    preview = service.create_upload_job(
+        _request(_dependency_package()),
+        idempotency_key="upload-dependency-review-001",
+        current_user=owner,
+    )
+    parent = next(item for item in preview.candidates if item.name == "parent")
+    child = next(item for item in preview.candidates if item.name == "child")
+    edge_id = str(parent.dependency_candidates[0]["dependency_candidate_id"])
+    with pytest.raises(GeneralSkillImportError) as missing:
+        service.confirm_job(
+            preview.id,
+            GeneralSkillImportConfirm(
+                preview_checksum=preview.preview_checksum or "",
+                candidate_ids=[parent.candidate_id, child.candidate_id],
+                expected_row_version=preview.row_version,
+            ),
+            current_user=owner,
+        )
+    assert missing.value.error_code == "GENERAL_SKILL_DEPENDENCY_INVALID"
+    with pytest.raises(GeneralSkillImportError) as unselected:
+        service.confirm_job(
+            preview.id,
+            GeneralSkillImportConfirm(
+                preview_checksum=preview.preview_checksum or "",
+                candidate_ids=[parent.candidate_id],
+                dependency_decisions=[
+                    {"dependency_candidate_id": edge_id, "dependency_kind": "required"}
+                ],
+                expected_row_version=preview.row_version,
+            ),
+            current_user=owner,
+        )
+    assert unselected.value.error_code == "GENERAL_SKILL_DEPENDENCY_INVALID"
+    assert db.exec(select(GeneralSkill)).all() == []
+
+
+def test_confirm_persists_human_dependency_and_user_only_binding_policy(tmp_path) -> None:
+    """验证人工确认边固定到父子修订，且 child 的 user-only 策略进入绑定和修订。"""
+
+    db, service, owner, _ = _context(tmp_path)
+    preview = service.create_upload_job(
+        _request(_dependency_package()),
+        idempotency_key="upload-dependency-install-001",
+        current_user=owner,
+    )
+    parent = next(item for item in preview.candidates if item.name == "parent")
+    child = next(item for item in preview.candidates if item.name == "child")
+    edge_id = str(parent.dependency_candidates[0]["dependency_candidate_id"])
+    confirmed = service.confirm_job(
+        preview.id,
+        GeneralSkillImportConfirm(
+            preview_checksum=preview.preview_checksum or "",
+            candidate_ids=[parent.candidate_id, child.candidate_id],
+            dependency_decisions=[
+                {"dependency_candidate_id": edge_id, "dependency_kind": "required"}
+            ],
+            expected_row_version=preview.row_version,
+        ),
+        current_user=owner,
+    )
+    assert confirmed.status == "installed"
+    dependency = db.exec(select(GeneralSkillDependency)).one()
+    assert dependency.dependency_kind == "required"
+    assert dependency.source == "human_confirmed"
+    assert dependency.allow_user_only is True
+    child_skill = db.exec(select(GeneralSkill).where(GeneralSkill.name == "child")).one()
+    child_revision = db.get(GeneralSkillRevision, child_skill.current_published_revision_id)
+    child_binding = db.exec(
+        select(AgentResourceBinding).where(AgentResourceBinding.resource_id == child_skill.id)
+    ).one()
+    assert child_revision is not None
+    assert child_revision.requested_capabilities_json["invocation_policy"] == "user_only"
+    assert child_revision.requested_capabilities_json["argument_hint"] == "child input"
+    assert child_binding.metadata_json["invocation_policy"] == "user_only"
+
+
+def test_confirm_rejects_human_confirmed_dependency_cycle_before_writes(tmp_path) -> None:
+    """验证双向引用只有经人工标为依赖时才组成环，并在任何安装写入前拒绝。"""
+
+    db, service, owner, _ = _context(tmp_path)
+    preview = service.create_upload_job(
+        _request(_dependency_package(cycle=True)),
+        idempotency_key="upload-dependency-cycle-001",
+        current_user=owner,
+    )
+    decisions = [
+        {
+            "dependency_candidate_id": str(edge["dependency_candidate_id"]),
+            "dependency_kind": "required",
+        }
+        for candidate in preview.candidates
+        for edge in candidate.dependency_candidates
+    ]
+    with pytest.raises(GeneralSkillImportError) as captured:
+        service.confirm_job(
+            preview.id,
+            GeneralSkillImportConfirm(
+                preview_checksum=preview.preview_checksum or "",
+                candidate_ids=[candidate.candidate_id for candidate in preview.candidates],
+                dependency_decisions=decisions,
+                expected_row_version=preview.row_version,
+            ),
+            current_user=owner,
+        )
+    assert captured.value.error_code == "GENERAL_SKILL_DEPENDENCY_INVALID"
+    assert db.exec(select(GeneralSkill)).all() == []
 
 
 def test_create_is_idempotent_and_rejects_same_key_for_different_content(tmp_path) -> None:
