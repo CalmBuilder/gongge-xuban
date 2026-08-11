@@ -44,6 +44,9 @@ import {
   startSlackOAuth,
 } from '@/api/connections';
 import { api, ApiError, getRequestTenantId } from '@/api/client';
+import weComAgentBindingScreenshot from '@/assets/guides/wecom-agent-binding.png';
+import weComConnectionCardScreenshot from '@/assets/guides/wecom-connection-card.png';
+import weComMessageRoutingScreenshot from '@/assets/guides/wecom-message-routing.png';
 import type { EnterpriseAuthUser } from '@/auth';
 import AppHeader from '@/components/AppHeader';
 import { notify } from '@/components/ui/app-toast';
@@ -172,6 +175,17 @@ export default function ConnectionsPage({
     setCallbackToken(callback.token);
     setCallbackEncodingAesKey(callback.encodingAesKey);
     setSecretMode('create');
+  }
+
+  function openGuideAt(sectionId: string) {
+    /** 打开指南并在 Portal 挂载后定位到用户点击的流程阶段。 */
+
+    setGuideOpen(true);
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        document.getElementById(sectionId)?.scrollIntoView?.({ block: 'start' });
+      });
+    });
   }
 
   function openReauthorize(profile: ConnectionProfileRead) {
@@ -478,7 +492,7 @@ export default function ConnectionsPage({
           </p>
         </div>
         <div className="flex gap-[8px]">
-          <Button variant="outline" onClick={() => setGuideOpen(true)}>
+          <Button variant="outline" onClick={() => openGuideAt('connection-purpose-title')}>
             <BookOpen className="size-[14px]" />接入与演示指南
           </Button>
           <Button variant="outline" onClick={() => void load()} disabled={loading}>
@@ -496,16 +510,16 @@ export default function ConnectionsPage({
             <span className="font-mono text-[10px] font-semibold uppercase tracking-[0.16em] text-[var(--gg-cobalt)]">企业微信 × 数字员工</span>
             <h2 className="mt-[7px] text-[18px] font-semibold tracking-[-0.02em] text-[var(--gg-ink)]">让员工在企业微信里发起任务，由受控的数字员工继续处理</h2>
             <p className="mt-[7px] max-w-[760px] text-[12px] leading-[1.75] text-[var(--gg-slate)]">连接负责验证企业应用身份、接收验签消息和提供明确授权的外部能力；它不会自动读取通讯录、开放全部聊天记录，也不会让未绑定的数字员工使用企业账号。</p>
-            <Button variant="outline" className="mt-[13px] border-[#cbd8f8] bg-white text-[var(--gg-cobalt)] hover:bg-[#f5f8ff]" onClick={() => setGuideOpen(true)}>
+            <Button variant="outline" className="mt-[13px] border-[#cbd8f8] bg-white text-[var(--gg-cobalt)] hover:bg-[#f5f8ff]" onClick={() => openGuideAt('connection-setup-title')}>
               查看从创建到测试成功的完整示例<ArrowRight className="size-[14px]" />
             </Button>
           </div>
           <div className="grid grid-cols-[1fr_20px_1fr_20px_1fr] items-center rounded-[15px] border border-[#dfe6f5] bg-white/85 px-[14px] py-[16px] shadow-[0_6px_18px_rgba(45,66,114,0.05)] max-[480px]:grid-cols-1">
-            <GuideFlowStep icon={MessagesSquare} label="员工入口" value="企业微信消息" />
+            <GuideFlowStep icon={MessagesSquare} label="员工入口" value="企业微信消息" onClick={() => openGuideAt('connection-setup-title')} />
             <ArrowRight className="size-[14px] text-[#9aa7c0] max-[480px]:mx-auto max-[480px]:rotate-90" />
-            <GuideFlowStep icon={ShieldCheck} label="安全边界" value="验签、授权、审计" />
+            <GuideFlowStep icon={ShieldCheck} label="安全边界" value="验签、授权、审计" onClick={() => openGuideAt('connection-purpose-title')} />
             <ArrowRight className="size-[14px] text-[#9aa7c0] max-[480px]:mx-auto max-[480px]:rotate-90" />
-            <GuideFlowStep icon={Bot} label="执行主体" value="已绑定数字员工" />
+            <GuideFlowStep icon={Bot} label="执行主体" value="已绑定数字员工" onClick={() => openGuideAt('connection-demo-title')} />
           </div>
         </div>
       </section>
@@ -583,17 +597,73 @@ export default function ConnectionsPage({
             <ol className="grid gap-[9px]">
               <GuideInstruction index="1" title="创建企业微信测试应用">注册测试企业，在“应用管理”创建自建应用，设置可见范围，并记下企业 ID（CorpID）、AgentId 和 Secret。</GuideInstruction>
               <GuideInstruction index="2" title="在本页建立连接">点击“连接企业微信”，填写显示名称和三项身份信息。系统会生成回调 Token 与 43 位 EncodingAESKey；点击“验证并连接”。</GuideInstruction>
-              <GuideInstruction index="3" title="配置消息回调">将建档成功后一次性显示的 URL、Token、EncodingAESKey 填入企业微信“接收消息服务器”，选择需要接收的消息事件并保存验证。</GuideInstruction>
-              <GuideInstruction index="4" title="配置企业可信 IP">将运行本系统的固定公网出口 IP 加入该自建应用的“企业可信 IP”。演示可使用 HTTPS Tunnel，但生产环境应使用稳定入口。</GuideInstruction>
+              <GuideInstruction index="3" title="配置消息回调">先通过公网 HTTPS 地址打开本页面，再创建连接。建档后把一次性显示的 URL、Token、EncodingAESKey 原样填入企业微信“接收消息服务器”，选择需要接收的消息事件并保存验证。</GuideInstruction>
+              <GuideInstruction index="4" title="配置企业可信 IP">在运行后端的同一台机器执行 <code className="font-mono text-[11px] text-[#244bc7]">curl https://api.ipify.org</code>，把结果填入“企业可信 IP”。不要填写内网地址，也不要填写 Tunnel 域名解析出的 IP。</GuideInstruction>
               <GuideInstruction index="5" title="确认连接健康">回到本页点击“健康检查”。卡片显示“连接健康”，并出现 <code className="font-mono text-[11px] text-[#244bc7]">application:read</code>，表示身份和最小读取授权已经验证。</GuideInstruction>
               <GuideInstruction index="6" title="绑定数字员工和消息入口">打开“Agent 绑定”选择数字员工；再打开“消息接入”，把该员工设为唯一接收路由。企业微信成员第一次发消息后，在待授权队列中关联对应的平台用户。</GuideInstruction>
               <GuideInstruction index="7" title="发送验证消息">在企业微信自建应用会话中发送“测试动态任务：查询当前企业微信应用信息”。首次发送者完成授权后原消息会自动恢复，无需重复创建任务。</GuideInstruction>
               <GuideInstruction index="8" title="核对成功标准">企业微信收到一条任务回复；系统内产生一条可追踪 Execution，外部调用有唯一 Operation/回执，页面仍不显示 Secret、原始外部用户标识或消息正文。</GuideInstruction>
             </ol>
+
+            <div className="grid grid-cols-2 gap-[10px] max-[680px]:grid-cols-1" aria-label="当前 Demo 网络配置示例">
+              <div className="rounded-[12px] border border-[#dfe5f0] bg-white px-[13px] py-[12px]">
+                <small className="font-mono text-[10px] font-semibold text-[var(--gg-cobalt)]">企业可信 IP · 出站方向</small>
+                <p className="mt-[7px] text-[11px] leading-[1.65] text-[#59647a]">当前机器内网地址是 <code className="font-mono text-[#3a4254]">192.168.124.236</code>，经网关 NAT 后，企业微信 API 当前看到的公网出口是 <code className="font-mono font-semibold text-[#087a38]">103.62.49.138</code>。因此本次 Demo 应填写后者。</p>
+                <p className="mt-[6px] text-[10px] leading-[1.55] text-[#8a5700]">该值是 2026-08-11 的现场检测结果，不代表运营商保证固定。路由器重拨、宽带迁移或出口切换后要重新执行命令核对。</p>
+              </div>
+              <div className="rounded-[12px] border border-[#dfe5f0] bg-white px-[13px] py-[12px]">
+                <small className="font-mono text-[10px] font-semibold text-[var(--gg-cobalt)]">消息回调 URL · 入站方向</small>
+                <p className="mt-[7px] text-[11px] leading-[1.65] text-[#59647a]">公网 HTTPS 请求通过 Tunnel 转发到 <code className="font-mono text-[#3a4254]">127.0.0.1:5137</code>。上次联调地址 <code className="break-all font-mono text-[#3a4254]">people-elect-dolls-phones.trycloudflare.com</code> 已失效，重新联调必须先取得新的 HTTPS 地址。</p>
+                <p className={cn('mt-[6px] rounded-[8px] px-[9px] py-[7px] text-[10px] leading-[1.55]', isPublicHttpsOrigin() ? 'bg-[#edf8f1] text-[#087a38]' : 'bg-[#fff4df] text-[#8a5700]')}>当前页面来源：<code className="break-all font-mono">{window.location.origin}</code>。{isPublicHttpsOrigin() ? '可用于生成公网回调 URL。' : '不是公网 HTTPS 来源；此时生成的 URL 不能直接交给企业微信。'}</p>
+              </div>
+            </div>
+
+            <div className="rounded-[12px] border border-[#cfdaf5] bg-white px-[13px] py-[12px]" aria-label="回调配置值生成规则">
+              <h4 className="text-[12px] font-semibold text-[var(--gg-ink)]">URL、Token、EncodingAESKey 分别怎么生成</h4>
+              <dl className="mt-[9px] grid gap-[8px] text-[11px] leading-[1.65] text-[#59647a]">
+                <div className="grid grid-cols-[118px_1fr] gap-[8px] max-[520px]:grid-cols-1"><dt className="font-mono font-semibold text-[#3a4254]">URL</dt><dd>系统创建连接档案后取得唯一 Profile ID，再用“当前浏览器公网来源 + <code className="font-mono text-[#244bc7]">/api/connectors/wecom/&#123;profile_id&#125;/callback</code>”组成。它同时接收企业微信首次 GET 验证和后续 POST 消息。</dd></div>
+                <div className="grid grid-cols-[118px_1fr] gap-[8px] max-[520px]:grid-cols-1"><dt className="font-mono font-semibold text-[#3a4254]">Token</dt><dd>浏览器使用密码学安全随机数生成 16 字节，再编码为 32 位小写十六进制字符串。它不是 CorpSecret，也不是访问令牌；双方使用同一个 Token 校验回调签名。</dd></div>
+                <div className="grid grid-cols-[118px_1fr] gap-[8px] max-[520px]:grid-cols-1"><dt className="font-mono font-semibold text-[#3a4254]">EncodingAESKey</dt><dd>浏览器使用密码学安全随机数生成企业微信要求的 43 位字符，服务端补一个 <code className="font-mono">=</code> 后解码为 32 字节 AES-256 密钥，用于解密消息并校验企业 CorpID。</dd></div>
+              </dl>
+              <p className="mt-[9px] rounded-[9px] bg-[#f6f8fc] px-[10px] py-[8px] text-[10px] leading-[1.6] text-[#68738a]">三项值在点击“验证并连接”时一起提交并加密保存。建档后的完整值只在当前浏览器内存中显示一次；企业微信后台必须填写这一组完全相同的值。点击“重新生成”后，旧 Token 和 EncodingAESKey 立即作废，不要混用两轮结果。</p>
+            </div>
+
+            <GuideScreenshot
+              src={weComConnectionCardScreenshot}
+              alt="企业微信连接健康后的真实连接卡片"
+              title="实际截图 1 · 连接健康后"
+              description="卡片同时展示账号身份、application:read、密钥修订、允许动作，以及健康检查、Agent 绑定和消息接入三个后续入口。"
+            />
           </section>
 
           <section className="grid gap-[12px] rounded-[15px] border border-[#cfe8d8] bg-[#f7fcf8] p-[15px]" aria-labelledby="connection-demo-title">
             <GuideSectionTitle index="03" title="演示场景：让数字员工查询企业微信应用信息" id="connection-demo-title" />
+            <div className="rounded-[12px] border border-[#cfe8d8] bg-white px-[13px] py-[12px]">
+              <h4 className="text-[12px] font-semibold text-[var(--gg-ink)]">场景角色与接入方式</h4>
+              <ol className="mt-[9px] grid grid-cols-4 gap-[8px] max-[760px]:grid-cols-2 max-[480px]:grid-cols-1">
+                <ScenarioStep index="1" title="管理员">在“Agent 绑定”选择“序伴动态任务员工”，先授予 application:read；只有需要外发时才开启“审批后发送”。</ScenarioStep>
+                <ScenarioStep index="2" title="消息路由">在“消息接入”选择同一个数字员工作为唯一接收路由，避免入口和工具权限指向不同 Agent。</ScenarioStep>
+                <ScenarioStep index="3" title="员工授权">企业微信成员首次发消息后，管理员在待授权发送者中选择其平台用户；原消息随后自动恢复。</ScenarioStep>
+                <ScenarioStep index="4" title="开始使用">员工继续在企业微信应用会话中用自然语言提问，不需要进入共格·序伴管理端。</ScenarioStep>
+              </ol>
+            </div>
+
+            <div className="grid grid-cols-2 gap-[10px] max-[680px]:grid-cols-1">
+              <GuideScreenshot
+                src={weComAgentBindingScreenshot}
+                alt="在真实数字员工绑定弹窗中授权企业微信连接"
+                title="实际截图 2 · 绑定数字员工"
+                description="绑定不是全局共享：每个数字员工分别获得 application:read；“审批后发送”是独立开关。"
+              />
+              <GuideScreenshot
+                src={weComMessageRoutingScreenshot}
+                alt="在真实消息接入弹窗中配置数字员工路由和发送者授权"
+                title="实际截图 3 · 配置消息入口"
+                description="先指定接收消息的数字员工，再把已验签发送者映射到平台用户；系统不在页面展示原始 UserID 或正文。"
+              />
+            </div>
+            <p className="text-[10px] leading-[1.6] text-[#68776e]">截图来自真实生产构建的隔离自动化验收环境；其中“E2E 数字员工”对应本场景中的“序伴动态任务员工”，操作入口和权限契约与实际环境一致。点击截图可查看原始尺寸。</p>
+
             <div className="grid grid-cols-[minmax(0,0.75fr)_24px_minmax(0,1.25fr)] items-stretch gap-[8px] max-[680px]:grid-cols-1">
               <div className="rounded-[12px] bg-white px-[13px] py-[12px] shadow-[0_4px_14px_rgba(22,96,55,0.06)]">
                 <small className="font-mono text-[10px] text-[#087a38]">员工在企业微信发送</small>
@@ -713,6 +783,7 @@ export default function ConnectionsPage({
               <CopyValue label="EncodingAESKey" value={weComSetup.callbackEncodingAesKey} />
             </div>
           ) : null}
+          {!isPublicHttpsOrigin() ? <div className="rounded-[12px] border border-[#f1d28f] bg-[#fff8e8] px-[12px] py-[10px] text-[11px] leading-[1.6] text-[#76510b]">当前页面不是公网 HTTPS 地址，因此上方 URL 仅能说明回调路径，不能直接保存到企业微信。请先建立新的 HTTPS Tunnel，通过该地址重新打开系统，再创建连接。</div> : null}
           <div className="rounded-[12px] border border-[#f1d28f] bg-[#fff8e8] px-[12px] py-[10px] text-[11px] leading-[1.6] text-[#76510b]">企业微信保存成功后，再回到“企业可信 IP”填写固定公网出口 IP；在此之前连接会保持“连接受限”，不会被数字员工误用。</div>
           <div className="flex justify-end"><Button onClick={() => setWeComSetup(null)}>我已完成配置</Button></div>
         </DialogContent>
@@ -847,15 +918,16 @@ export default function ConnectionsPage({
   );
 }
 
-function GuideFlowStep({ icon: Icon, label, value }: { icon: typeof Bot; label: string; value: string }) {
-  /** 用连接领域的三个真实节点表达外部消息进入数字员工的受控链路。 */
+function GuideFlowStep({ icon: Icon, label, value, onClick }: { icon: typeof Bot; label: string; value: string; onClick: () => void }) {
+  /** 用可点击的真实节点表达外部消息链路，并定位到对应操作指南。 */
 
   return (
-    <span className="grid min-w-0 place-items-center gap-[5px] text-center">
+    <button type="button" onClick={onClick} aria-label={`查看${value}步骤`} className="group grid min-w-0 place-items-center gap-[5px] rounded-[11px] px-[5px] py-[7px] text-center transition-colors hover:bg-[#f1f5ff] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--gg-cobalt)] focus-visible:ring-offset-2">
       <span className="grid size-[32px] place-items-center rounded-[11px] bg-[#edf2ff] text-[var(--gg-cobalt)]"><Icon className="size-[15px]" /></span>
       <small className="text-[9px] text-[#8a93a8]">{label}</small>
       <strong className="text-[11px] font-semibold text-[#3a4254]">{value}</strong>
-    </span>
+      <small className="text-[9px] font-medium text-[var(--gg-cobalt)] opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100">查看步骤</small>
+    </button>
   );
 }
 
@@ -902,6 +974,35 @@ function GuideInstruction({ index, title, children }: { index: string; title: st
       <span className="grid size-[24px] place-items-center rounded-[8px] bg-[#edf2ff] font-mono text-[10px] font-semibold text-[var(--gg-cobalt)]">{index}</span>
       <span><strong className="block text-[11px] font-semibold text-[#3a4254]">{title}</strong><span className="mt-[2px] block text-[11px] leading-[1.65] text-[var(--gg-slate)]">{children}</span></span>
     </li>
+  );
+}
+
+function ScenarioStep({ index, title, children }: { index: string; title: string; children: ReactNode }) {
+  /** 说明数字员工接入和实际使用场景中的一个责任阶段。 */
+
+  return (
+    <li className="rounded-[10px] bg-[#f7faf8] px-[10px] py-[9px]">
+      <span className="font-mono text-[9px] font-semibold text-[#087a38]">STEP {index}</span>
+      <strong className="mt-[3px] block text-[11px] font-semibold text-[#34483b]">{title}</strong>
+      <span className="mt-[3px] block text-[10px] leading-[1.6] text-[#617267]">{children}</span>
+    </li>
+  );
+}
+
+function GuideScreenshot({ src, alt, title, description }: { src: string; alt: string; title: string; description: string }) {
+  /** 在指南中展示可点击放大的真实验收截图及其核对重点。 */
+
+  return (
+    <figure className="overflow-hidden rounded-[12px] border border-[#dfe5f0] bg-white">
+      <a href={src} target="_blank" rel="noreferrer" aria-label={`放大查看${title}`} className="group block overflow-hidden bg-[#f3f6fb] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--gg-cobalt)]">
+        <img src={src} alt={alt} className="h-auto w-full transition-transform duration-200 group-hover:scale-[1.015] motion-reduce:transition-none" />
+      </a>
+      <figcaption className="border-t border-[#e8ecf3] px-[11px] py-[9px]">
+        <strong className="block text-[11px] font-semibold text-[#3a4254]">{title}</strong>
+        <span className="mt-[2px] block text-[10px] leading-[1.55] text-[var(--gg-slate)]">{description}</span>
+        <span className="mt-[4px] block text-[9px] font-medium text-[var(--gg-cobalt)]">点击截图可查看原图</span>
+      </figcaption>
+    </figure>
   );
 }
 
@@ -1039,6 +1140,17 @@ function weComCallbackUrl(profileId: string): string {
   /** 使用当前部署来源生成同源公开回调地址，避免把开发端口写入服务端。 */
 
   return new URL(`/api/connectors/wecom/${profileId}/callback`, window.location.origin).toString();
+}
+
+function isPublicHttpsOrigin(): boolean {
+  /** 判断当前页面来源是否具备企业微信可回拨的公网 HTTPS 基本形态。 */
+
+  if (window.location.protocol !== 'https:') return false;
+  const hostname = window.location.hostname.toLowerCase();
+  if (hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1' || hostname.endsWith('.local')) return false;
+  if (/^10\./.test(hostname) || /^192\.168\./.test(hostname)) return false;
+  const private172 = hostname.match(/^172\.(\d{1,2})\./);
+  return !private172 || Number(private172[1]) < 16 || Number(private172[1]) > 31;
 }
 
 async function copyText(value: string): Promise<void> {

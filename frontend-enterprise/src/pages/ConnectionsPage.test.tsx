@@ -191,10 +191,32 @@ it('用完整指南说明连接边界、接入步骤和数字员工演示场景'
   expect(screen.getByText('演示场景：让数字员工查询企业微信应用信息')).toBeInTheDocument();
   expect(screen.getByText('“测试动态任务：查询当前企业微信应用信息”')).toBeInTheDocument();
   expect(screen.getByText(/验签消息 → 确认发送者映射/)).toBeInTheDocument();
+  expect(screen.getByText(/当前机器内网地址是/)).toHaveTextContent('192.168.124.236');
+  expect(screen.getByText(/当前机器内网地址是/)).toHaveTextContent('103.62.49.138');
+  expect(screen.getByText('URL、Token、EncodingAESKey 分别怎么生成')).toBeInTheDocument();
+  expect(screen.getByText(/生成 16 字节，再编码为 32 位小写十六进制字符串/)).toBeInTheDocument();
+  expect(screen.getByText(/不是公网 HTTPS 来源/)).toBeInTheDocument();
 
   await user.click(screen.getByRole('button', { name: '开始创建连接' }));
   expect(await screen.findByRole('dialog')).toHaveTextContent('连接企业微信');
   expect(screen.getByLabelText('企业 ID（CorpID）')).toBeInTheDocument();
+});
+
+it('流程节点可点击定位数字员工场景并展示三张真实界面截图', async () => {
+  /** 验证首页流程不是静态装饰，用户可进入绑定、路由和使用说明并放大截图。 */
+
+  const user = userEvent.setup();
+  renderPage();
+  await screen.findByText('合同工作区');
+
+  await user.click(screen.getByRole('button', { name: '查看已绑定数字员工步骤' }));
+  expect(await screen.findByText('场景角色与接入方式')).toBeInTheDocument();
+  expect(screen.getByText(/在“Agent 绑定”选择“序伴动态任务员工”/)).toBeInTheDocument();
+  expect(screen.getByText(/员工继续在企业微信应用会话中用自然语言提问/)).toBeInTheDocument();
+  expect(screen.getByAltText('企业微信连接健康后的真实连接卡片')).toBeInTheDocument();
+  expect(screen.getByAltText('在真实数字员工绑定弹窗中授权企业微信连接')).toBeInTheDocument();
+  expect(screen.getByAltText('在真实消息接入弹窗中配置数字员工路由和发送者授权')).toBeInTheDocument();
+  expect(screen.getAllByRole('link', { name: /放大查看实际截图/ })).toHaveLength(3);
 });
 
 it('默认创建企业微信连接并生成档案专属回调配置', async () => {

@@ -36,13 +36,20 @@ test('真实 Chromium 从连接价值说明进入完整企业微信示例和建�
   await page.goto('/enterprise/connections');
 
   await expect(page.getByRole('region', { name: '外部连接用途说明' })).toContainText('让员工在企业微信里发起任务');
-  await page.getByRole('button', { name: '接入与演示指南' }).click();
+  await page.getByRole('button', { name: '查看已绑定数字员工步骤' }).click();
   const guide = page.getByRole('dialog', { name: '企业微信连接：从创建到一次真实任务' });
   await expect(guide.getByText('连接后可以')).toBeVisible();
   await expect(guide.getByText('连接后不会')).toBeVisible();
   await expect(guide.getByText('完整示例：创建企业微信连接并测试成功')).toBeVisible();
   await expect(guide.getByText('演示场景：让数字员工查询企业微信应用信息')).toBeVisible();
   await expect(guide.getByText(/验签消息 → 确认发送者映射/)).toBeVisible();
+  await expect(guide.getByText(/当前机器内网地址是/)).toContainText('103.62.49.138');
+  await expect(guide.getByText('URL、Token、EncodingAESKey 分别怎么生成')).toBeVisible();
+  await expect(guide.getByText(/当前页面来源：/)).toContainText('不能直接交给企业微信');
+  await expect(guide.getByText('场景角色与接入方式')).toBeVisible();
+  await expect(guide.getByRole('img', { name: '企业微信连接健康后的真实连接卡片' })).toBeVisible();
+  await expect(guide.getByRole('img', { name: '在真实数字员工绑定弹窗中授权企业微信连接' })).toBeVisible();
+  await expect(guide.getByRole('img', { name: '在真实消息接入弹窗中配置数字员工路由和发送者授权' })).toBeVisible();
 
   await guide.getByRole('button', { name: '开始创建连接' }).click();
   const createDialog = page.getByRole('dialog', { name: '连接企业微信' });
