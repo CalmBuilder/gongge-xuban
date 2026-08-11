@@ -33,7 +33,7 @@ def upgrade() -> None:
     columns = {item["name"] for item in inspector.get_columns("general_skill_import_jobs")}
     with op.batch_alter_table("general_skill_import_jobs") as batch_op:
         if "worker_id" not in columns:
-            batch_op.add_column(sa.Column("worker_id", sa.String(512), nullable=True))
+            batch_op.add_column(sa.Column("worker_id", sa.String(128), nullable=True))
         if "lease_expires_at" not in columns:
             batch_op.add_column(sa.Column("lease_expires_at", sa.DateTime(), nullable=True))
         if "lease_token" not in columns:

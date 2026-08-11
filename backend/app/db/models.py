@@ -1947,12 +1947,6 @@ class GeneralSkillSourceCredential(SQLModel, table=True):
 
     __tablename__ = "general_skill_source_credentials"
     __table_args__ = (
-        UniqueConstraint(
-            "tenant_id",
-            "owner_user_id",
-            "id",
-            name="uq_general_skill_source_credential_owner",
-        ),
         CheckConstraint(
             "source_kind IN ('github', 'https')",
             name="ck_general_skill_source_credential_kind",
@@ -1979,7 +1973,7 @@ class GeneralSkillSourceCredential(SQLModel, table=True):
     owner_user_id: IdentifierString
     display_name: NameString
     source_kind: LabelString
-    allowed_host: PlainTextString
+    allowed_host: str = Field(max_length=253)
     secret_reference_id: IdentifierString = Field(index=True)
     secret_revision: int = Field(default=1, ge=1)
     status: LabelString = "active"

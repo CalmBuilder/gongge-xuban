@@ -32,29 +32,29 @@ def upgrade() -> None:
     if not sa.inspect(bind).has_table("general_skill_import_quotas"):
         op.create_table(
             "general_skill_import_quotas",
-        sa.Column("id", sa.String(128), primary_key=True),
-        sa.Column("tenant_id", sa.String(512), nullable=False),
-        sa.Column("scope_kind", sa.String(64), nullable=False),
-        sa.Column("scope_id", sa.String(512), nullable=False),
-        sa.Column("active_jobs", sa.Integer(), nullable=False, server_default="0"),
-        sa.Column("staged_bytes", sa.BigInteger(), nullable=False, server_default="0"),
-        sa.Column("row_version", sa.Integer(), nullable=False, server_default="1"),
-        sa.Column("created_at", sa.DateTime(), nullable=False),
-        sa.Column("updated_at", sa.DateTime(), nullable=False),
-        sa.CheckConstraint(
-            "scope_kind IN ('tenant', 'user')",
-            name="ck_general_skill_import_quota_scope_kind",
-        ),
-        sa.CheckConstraint(
-            "active_jobs >= 0 AND staged_bytes >= 0 AND row_version >= 1",
-            name="ck_general_skill_import_quota_nonnegative",
-        ),
-        sa.UniqueConstraint(
-            "tenant_id",
-            "scope_kind",
-            "scope_id",
-            name="uq_general_skill_import_quota_scope",
-        ),
+            sa.Column("id", sa.String(128), primary_key=True),
+            sa.Column("tenant_id", sa.String(128), nullable=False),
+            sa.Column("scope_kind", sa.String(64), nullable=False),
+            sa.Column("scope_id", sa.String(128), nullable=False),
+            sa.Column("active_jobs", sa.Integer(), nullable=False, server_default="0"),
+            sa.Column("staged_bytes", sa.BigInteger(), nullable=False, server_default="0"),
+            sa.Column("row_version", sa.Integer(), nullable=False, server_default="1"),
+            sa.Column("created_at", sa.DateTime(), nullable=False),
+            sa.Column("updated_at", sa.DateTime(), nullable=False),
+            sa.CheckConstraint(
+                "scope_kind IN ('tenant', 'user')",
+                name="ck_general_skill_import_quota_scope_kind",
+            ),
+            sa.CheckConstraint(
+                "active_jobs >= 0 AND staged_bytes >= 0 AND row_version >= 1",
+                name="ck_general_skill_import_quota_nonnegative",
+            ),
+            sa.UniqueConstraint(
+                "tenant_id",
+                "scope_kind",
+                "scope_id",
+                name="uq_general_skill_import_quota_scope",
+            ),
         )
     _backfill_active_jobs(bind)
 
