@@ -1897,6 +1897,14 @@ export function SecureSkillImportDialog({
                             <span className="text-[#6f7789]">调用提示：{candidate.argument_hint}</span>
                           ) : null}
                         </span>
+                        {Object.keys(candidate.instruction_contracts).length ? (
+                          <span className="mt-3 block rounded-lg border border-[#e4e8f1] bg-[#f8f9fc] p-2.5 text-[11px] text-[#626b7d]">
+                            <strong className="font-semibold text-[#303747]">已声明运行契约：</strong>{' '}
+                            {Object.entries(candidate.instruction_contracts)
+                              .map(([key, value]) => `${key}=${value}`)
+                              .join(' · ')}
+                          </span>
+                        ) : null}
                         <span className="mt-3 block text-[11px] text-[#969daf]">许可证与静态风险</span>
                         <span className="mt-1 flex flex-wrap gap-1.5">
                           <span className={cn(

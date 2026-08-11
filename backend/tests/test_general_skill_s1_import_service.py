@@ -69,6 +69,26 @@ def _package(*names: str) -> bytes:
     return payload.getvalue()
 
 
+def _contract_package() -> bytes:
+    """构造含本项目命名空间运行契约及无关字段的可审核 Skill 包。"""
+
+    payload = BytesIO()
+    with ZipFile(payload, "w") as archive:
+        archive.writestr(
+            "contract-helper/SKILL.md",
+            "---\n"
+            "name: contract-helper\n"
+            "description: 固定输出和审批要求。\n"
+            "x-gongge-contracts:\n"
+            "  output-format: markdown\n"
+            "  approval-policy: required\n"
+            "  unknown-rule: ignored\n"
+            "---\n"
+            "# Contract helper\n",
+        )
+    return payload.getvalue()
+
+
 def _repository_package(*names: str) -> bytes:
     """构造带 GitHub 固定根目录和 skills 子树的仓库归档。"""
 
@@ -277,6 +297,37 @@ def test_confirm_creates_published_revision_and_default_pinned_private_binding(t
     )
     assert installed_audit.detail_json["revision_ids"] == [revision.id]
     assert installed_audit.correlation_id == preview.id
+
+
+def test_import_preserves_only_reviewed_instruction_contracts(tmp_path: Path) -> None:
+    """预览与发布修订仅保留命名空间内的有限契约，供运行前冲突检查。"""
+
+    db, service, owner, _ = _context(tmp_path)
+    preview = service.create_upload_job(
+        _request(_contract_package()),
+        idempotency_key="upload-contract-001",
+        current_user=owner,
+    )
+    candidate = preview.candidates[0]
+    assert candidate.instruction_contracts == {
+        "approval_policy": "required",
+        "output_format": "markdown",
+    }
+
+    service.confirm_job(
+        preview.id,
+        GeneralSkillImportConfirm(
+            preview_checksum=preview.preview_checksum,
+            candidate_ids=[candidate.candidate_id],
+            expected_row_version=preview.row_version,
+        ),
+        current_user=owner,
+    )
+    revision = db.exec(select(GeneralSkillRevision)).one()
+    assert revision.requested_capabilities_json["instruction_contracts"] == {
+        "approval_policy": "required",
+        "output_format": "markdown",
+    }
 
 
 def test_single_skill_markdown_uses_the_same_secure_preview_pipeline(tmp_path) -> None:

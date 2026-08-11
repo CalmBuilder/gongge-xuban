@@ -457,6 +457,7 @@ export type GeneralSkillImportCandidateRead = {
   allowed_tools: string[];
   invocation_policy: 'model_allowed' | 'user_only';
   argument_hint?: string;
+  instruction_contracts: Record<string, string>;
   dependency_candidates: Array<{
     dependency_candidate_id: string;
     referenced_name: string;

@@ -15,6 +15,9 @@ const SKILL_MARKDOWN = [
   `name: ${SKILL_NAME}`,
   'description: 浏览器强制加载与会话静音验收。',
   'disable-model-invocation: true',
+  'x-gongge-contracts:',
+  '  output-format: markdown',
+  '  approval-policy: required',
   '---',
   '# S3 browser guidance',
   '只返回 S3-GUIDED-SUCCESS，并说明使用了固定修订。',
@@ -63,6 +66,8 @@ async function importGuidanceSkill(page: Page): Promise<string> {
   expect((await createResponse).status()).toBe(202);
   await expect(dialog.getByText(SKILL_NAME, { exact: true })).toBeVisible();
   await expect(dialog.getByText('仅显式调用', { exact: true })).toBeVisible();
+  await expect(dialog.getByText(/output_format=markdown/)).toBeVisible();
+  await expect(dialog.getByText(/approval_policy=required/)).toBeVisible();
   const confirmResponse = page.waitForResponse((response) => (
     new URL(response.url()).pathname.endsWith('/confirm')
     && response.request().method() === 'POST'

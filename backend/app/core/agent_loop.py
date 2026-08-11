@@ -902,6 +902,12 @@ class AgentLoop:
                 selection_mode=mode,
             )
         except GeneralSkillRuntimeError as exc:
+            if exc.code == "GENERAL_SKILL_INSTRUCTION_CONFLICT":
+                return self._general_skill_conflict_response(
+                    request,
+                    chat_session,
+                    user_message_id,
+                )
             return self._general_skill_load_rejected_response(
                 request,
                 chat_session,
@@ -968,6 +974,55 @@ class AgentLoop:
             reply=reply,
             session_id=chat_session.id,
             router_decision=router_decision,
+            step_result=step_result,
+            tool_result=None,
+            session_state=public_session(chat_session),
+        )
+
+    def _general_skill_conflict_response(
+        self,
+        request: ChatTurnRequest,
+        chat_session: ChatSession,
+        user_message_id: str | None,
+    ) -> ChatTurnResponse:
+        """把不可机械合并的已审契约转为明确澄清，不让后载入正文覆盖前者。"""
+
+        reply = (
+            "本轮所选 Skill 与其依赖声明了不能同时满足的运行契约。"
+            "请缩小为一个目标或明确选择所需的输出/审批方式后再继续。"
+        )
+        decision = RouterDecision(
+            decision="clarify",
+            reason="GENERAL_SKILL_INSTRUCTION_CONFLICT",
+            clarification_question=reply,
+        )
+        self.events.record(
+            request.tenant_id,
+            chat_session.id,
+            "skill_instruction_conflict",
+            self._turn_payload(
+                {"code": "GENERAL_SKILL_INSTRUCTION_CONFLICT"}, user_message_id
+            ),
+        )
+        step_result = StepAgentResult(
+            action="clarify",
+            reply=reply,
+            is_step_completed=False,
+        )
+        reply = self._finalize_turn(
+            chat_session,
+            request.tenant_id,
+            reply,
+            step_result,
+            request.message,
+            user_message_id=user_message_id,
+        )
+        self.db.commit()
+        self.db.refresh(chat_session)
+        return ChatTurnResponse(
+            reply=reply,
+            session_id=chat_session.id,
+            router_decision=decision,
             step_result=step_result,
             tool_result=None,
             session_state=public_session(chat_session),

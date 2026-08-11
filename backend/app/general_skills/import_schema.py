@@ -129,6 +129,7 @@ class GeneralSkillImportCandidateRead(BaseModel):
     allowed_tools: list[str] = Field(default_factory=list)
     invocation_policy: Literal["model_allowed", "user_only"] = "model_allowed"
     argument_hint: str | None = None
+    instruction_contracts: dict[str, str] = Field(default_factory=dict)
     dependency_candidates: list[dict[str, object]] = Field(default_factory=list)
     platform_commands: list[str] = Field(default_factory=list)
     license_hint: str | None = None

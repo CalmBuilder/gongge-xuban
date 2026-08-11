@@ -1489,6 +1489,7 @@ class GeneralSkillImportService:
                 "allowed_tools": list(candidate.get("allowed_tools", [])),
                 "invocation_policy": str(candidate.get("invocation_policy", "model_allowed")),
                 "argument_hint": candidate.get("argument_hint"),
+                "instruction_contracts": dict(candidate.get("instruction_contracts", {})),
             },
             source_snapshot_json={
                 "source_kind": job.source_kind,
@@ -1594,6 +1595,7 @@ class GeneralSkillImportService:
                 "allowed_tools": list(candidate.get("allowed_tools", [])),
                 "invocation_policy": str(candidate.get("invocation_policy", "model_allowed")),
                 "argument_hint": candidate.get("argument_hint"),
+                "instruction_contracts": dict(candidate.get("instruction_contracts", {})),
             },
             source_snapshot_json={
                 "source_kind": job.source_kind,
@@ -1777,6 +1779,7 @@ def _candidate_preview(candidate: SkillCandidate) -> dict[str, object]:
         "allowed_tools": list(candidate.allowed_tools),
         "invocation_policy": candidate.invocation_policy,
         "argument_hint": candidate.argument_hint,
+        "instruction_contracts": _instruction_contracts(candidate.metadata),
         "dependency_candidates": [
             {
                 "dependency_candidate_id": dependency.dependency_candidate_id,
@@ -1805,6 +1808,22 @@ def _candidate_license_hint(metadata: dict[str, Any]) -> str | None:
         if isinstance(nested_license, str) and nested_license.strip():
             return nested_license.strip()[:255]
     return None
+
+
+def _instruction_contracts(metadata: dict[str, Any]) -> dict[str, str]:
+    """只接受命名空间内可审计的有限冲突键，不从自由正文猜测安全语义。"""
+
+    raw = metadata.get("x-gongge-contracts")
+    if not isinstance(raw, dict):
+        return {}
+    allowed_keys = {"output_format", "approval_policy", "delivery_mode"}
+    contracts: dict[str, str] = {}
+    for key, value in raw.items():
+        normalized_key = str(key).strip().lower().replace("-", "_")
+        normalized_value = str(value).strip().lower()
+        if normalized_key in allowed_keys and normalized_value:
+            contracts[normalized_key] = normalized_value[:64]
+    return contracts
 
 
 def _decode_base64(value: str, *, allow_empty: bool = False) -> bytes:

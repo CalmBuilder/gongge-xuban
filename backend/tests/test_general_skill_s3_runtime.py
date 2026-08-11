@@ -364,7 +364,9 @@ def test_tool_authorization_only_narrows_agent_baseline() -> None:
     assert baseline.value.code == "GENERAL_SKILL_TOOL_NOT_AUTHORIZED"
 
 
-def test_dependency_load_requires_exact_approved_revision_edge() -> None:
+def test_dependency_load_requires_exact_approved_revision_edge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """依赖模式不能靠 parent ID 扩权，必须命中同域且允许 user-only 的固定修订边。"""
 
     db, owner, agent, chat, parent_skill, parent_revision, _ = _context()
@@ -481,6 +483,65 @@ def test_dependency_load_requires_exact_approved_revision_edge() -> None:
     )
     assert [item.skill_id for item in bundle] == [parent_skill.id, child_skill.id]
     assert [item.selection_mode for item in bundle] == ["forced", "dependency"]
+
+    parent_revision.requested_capabilities_json = {
+        **parent_revision.requested_capabilities_json,
+        "instruction_contracts": {"output_format": "markdown"},
+    }
+    child_revision.requested_capabilities_json = {
+        **child_revision.requested_capabilities_json,
+        "instruction_contracts": {"output_format": "json"},
+    }
+    db.add(parent_revision)
+    db.add(child_revision)
+    db.commit()
+    with pytest.raises(GeneralSkillRuntimeError) as instruction_conflict:
+        service.load_bundle(
+            owner,
+            session_id=chat.id,
+            agent_id=agent.id,
+            turn_id="turn_contract_conflict",
+            skill_id=parent_skill.id,
+            selection_mode="forced",
+        )
+    assert instruction_conflict.value.code == "GENERAL_SKILL_INSTRUCTION_CONFLICT"
+    settings = get_settings()
+    monkeypatch.setattr(settings, "general_skill_resolver_v2_enabled", True)
+    monkeypatch.setattr(settings, "general_skill_dynamic_guidance_enabled", True)
+    conflict_response = AgentLoop(db)._try_handle_general_skill_after_scene_router(
+        ChatTurnRequest(
+            tenant_id=owner.tenant_id,
+            session_id=chat.id,
+            agent_id=agent.id,
+            user_id=owner.id,
+            message="请组合两份冲突指南",
+            forced_general_skill_id=parent_skill.id,
+        ),
+        chat,
+        ModelConfig(
+            id="model_runtime_conflict",
+            tenant_id=owner.tenant_id,
+            name="Runtime Conflict Model",
+            api_key_encrypted="unused",
+        ),
+        RouterDecision(decision="answer_only"),
+        user_message_id="turn_conflict_response",
+    )
+    assert conflict_response is not None
+    assert conflict_response.router_decision.decision == "clarify"
+    assert "不能同时满足" in conflict_response.reply
+
+    parent_revision.requested_capabilities_json = {
+        **parent_revision.requested_capabilities_json,
+        "instruction_contracts": {},
+    }
+    child_revision.requested_capabilities_json = {
+        **child_revision.requested_capabilities_json,
+        "instruction_contracts": {},
+    }
+    db.add(parent_revision)
+    db.add(child_revision)
+    db.commit()
 
     db.add(
         GeneralSkillDependency(

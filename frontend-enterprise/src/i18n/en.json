@@ -3854,6 +3854,7 @@
   "未声明额外工具范围": "No additional tool scope declared",
   "允许模型选择": "Allow Model Selection",
   "调用提示：": "Invocation Guidance:",
+  "已声明运行契约：": "Declared Runtime Contracts:",
   "许可证与静态风险": "License and Static Risks",
   "许可证声明：{1}": "License Declaration: {1}",
   "未声明许可证": "No license declared",

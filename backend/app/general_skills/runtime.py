@@ -224,8 +224,7 @@ class GeneralSkillRuntimeService:
             row.row_version += 1
             row.updated_at = utc_now()
         self.db.add(row)
-        self.db.commit()
-        self.db.refresh(row)
+        self.db.flush()
         if not enabled:
             invalidated = self.invalidate_unavailable(
                 current_user,
@@ -245,8 +244,8 @@ class GeneralSkillRuntimeService:
                         },
                     )
                 )
-            if invalidated:
-                self.db.commit()
+        self.db.commit()
+        self.db.refresh(row)
         return row
 
     def load(
@@ -411,6 +410,7 @@ class GeneralSkillRuntimeService:
         visiting: set[str] = set()
         visited: set[str] = set()
         total_chars = 0
+        instruction_contracts: dict[str, tuple[str, str]] = {}
 
         def visit(item: EffectiveGeneralSkill, depth: int) -> None:
             """按稳定边顺序深度遍历，拒绝同一 Skill 多版本和隐式 user-only 扩权。"""
@@ -437,6 +437,19 @@ class GeneralSkillRuntimeService:
                 raise GeneralSkillRuntimeError(
                     "GENERAL_SKILL_BUDGET_EXCEEDED", "dependency instructions exceed turn budget"
                 )
+            raw_contracts = revision.requested_capabilities_json.get("instruction_contracts", {})
+            if isinstance(raw_contracts, dict):
+                for key, value in sorted(raw_contracts.items()):
+                    normalized = str(value).strip()
+                    if not normalized:
+                        continue
+                    existing = instruction_contracts.get(str(key))
+                    if existing is not None and existing[0] != normalized:
+                        raise GeneralSkillRuntimeError(
+                            "GENERAL_SKILL_INSTRUCTION_CONFLICT",
+                            "loaded skills declare incompatible reviewed contracts",
+                        )
+                    instruction_contracts[str(key)] = (normalized, item.skill_id)
             ordered.append(item)
             if len(ordered) > settings.general_skill_max_loaded_per_turn:
                 raise GeneralSkillRuntimeError(
