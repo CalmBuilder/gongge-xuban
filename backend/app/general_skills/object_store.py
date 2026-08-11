@@ -43,6 +43,12 @@ class FileSystemSkillObjectStore:
             destination = job_dir / self._validated_checksum(resource.content_checksum)
             self._write_once(destination, resource.content)
 
+    def stage_payload(self, job_id: str, payload: bytes, checksum: str) -> None:
+        """按服务端 checksum 暂存原始包，使规范化可在进程重启后确定性重放。"""
+
+        destination = self._job_dir(job_id) / self._validated_checksum(checksum)
+        self._write_once(destination, payload)
+
     def promote(self, job_id: str, checksum: str) -> str:
         """把暂存内容幂等提升到全局内容寻址区并返回不透明 object key。"""
 

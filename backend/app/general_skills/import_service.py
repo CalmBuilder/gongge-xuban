@@ -14,7 +14,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import PurePath
 from typing import Any
 from urllib.parse import urlsplit
@@ -40,6 +40,7 @@ from app.general_skills.import_schema import (
 )
 from app.general_skills.lifecycle import (
     GeneralSkillLifecycleError,
+    IMPORT_JOB_TERMINAL_STATUSES,
     ImportJobStatus,
     RevisionStatus,
     transition_import_job,
@@ -157,7 +158,8 @@ class GeneralSkillImportService:
                 409,
             ) from exc
         try:
-            return self._normalize_upload(job, payload)
+            self._checkpoint_raw_payload(job, payload)
+            return self._normalize_fetched(job, payload)
         except GeneralSkillPackageError as exc:
             self._fail_job(job, exc.error_code, str(exc))
             return import_job_read(job)
@@ -309,16 +311,31 @@ class GeneralSkillImportService:
         self.db.refresh(job)
         return import_job_read(job)
 
-    def _normalize_upload(
+    def _checkpoint_raw_payload(
         self,
         job: GeneralSkillImportJob,
         payload: bytes,
-    ) -> GeneralSkillImportJobRead:
-        """按完整状态主链规范化上传包、写暂存对象并生成 checksum 预览。"""
+    ) -> None:
+        """把原始包与 fetched 状态提交为可恢复检查点，再开始后续分析。"""
 
-        for target in (ImportJobStatus.FETCHING, ImportJobStatus.FETCHED):
-            transition_import_job(job, target, expected_row_version=job.row_version)
-        return self._normalize_fetched(job, payload)
+        if job.status == ImportJobStatus.CREATED:
+            transition_import_job(job, ImportJobStatus.FETCHING, expected_row_version=job.row_version)
+        raw_checksum = hashlib.sha256(payload).hexdigest()
+        self.object_store.stage_payload(job.id, payload, raw_checksum)
+        job.raw_checksum = raw_checksum
+        job.staging_manifest_json = [
+            {
+                "kind": "raw_package",
+                "checksum": raw_checksum,
+                "size": len(payload),
+                "media_type": "application/zip",
+            }
+        ]
+        job.quota_bytes = len(payload)
+        transition_import_job(job, ImportJobStatus.FETCHED, expected_row_version=job.row_version)
+        self.db.add(job)
+        self.db.commit()
+        self.db.refresh(job)
 
     def _normalize_fetched(
         self,
@@ -351,15 +368,21 @@ class GeneralSkillImportService:
         job.normalized_checksum = package.normalized_checksum
         job.preview_json = preview_payload
         job.preview_checksum = _canonical_checksum(preview_payload)
-        job.staging_manifest_json = [
+        raw_entries = [
+            item
+            for item in job.staging_manifest_json
+            if isinstance(item, dict) and item.get("kind") == "raw_package"
+        ]
+        job.staging_manifest_json = raw_entries + [
             {
+                "kind": "normalized_resource",
                 "checksum": resource.content_checksum,
                 "size": resource.size,
                 "media_type": resource.media_type,
             }
             for resource in sorted(unique_resources.values(), key=lambda item: item.content_checksum)
         ]
-        job.quota_bytes = package.expanded_bytes
+        job.quota_bytes = sum(int(item.get("size", 0)) for item in raw_entries) + package.expanded_bytes
         transition_import_job(
             job,
             ImportJobStatus.AWAITING_APPROVAL,
@@ -435,7 +458,10 @@ class GeneralSkillImportService:
             source_kind=request.source_kind,
             source_reference_redacted=source_reference,
             idempotency_key=key,
-            preview_json={"source_request_checksum": request_checksum},
+            preview_json={
+                "source_request_checksum": request_checksum,
+                "source_subpath": request.source_subpath,
+            },
             expires_at=now + timedelta(hours=24),
             created_at=now,
             updated_at=now,
@@ -444,9 +470,11 @@ class GeneralSkillImportService:
         try:
             self.db.commit()
             transition_import_job(job, ImportJobStatus.FETCHING, expected_row_version=job.row_version)
+            self.db.add(job)
+            self.db.commit()
+            self.db.refresh(job)
             result = fetcher.fetch(source_url, allowed_hosts=allowed_hosts)
-            job.raw_checksum = hashlib.sha256(result.payload).hexdigest()
-            transition_import_job(job, ImportJobStatus.FETCHED, expected_row_version=job.row_version)
+            self._checkpoint_raw_payload(job, result.payload)
             return self._normalize_fetched(
                 job,
                 result.payload,
@@ -461,6 +489,97 @@ class GeneralSkillImportService:
         except SkillObjectStoreError as exc:
             self._fail_job(job, "GENERAL_SKILL_STORAGE_UNAVAILABLE", str(exc))
             return import_job_read(job)
+
+    def recover_stale_jobs(
+        self,
+        *,
+        stale_before: datetime,
+        limit: int = 100,
+    ) -> list[GeneralSkillImportJobRead]:
+        """恢复已落 raw 检查点的中断作业，其余陈旧中间态安全失败并回收配额。"""
+
+        active_statuses = [
+            status.value
+            for status in ImportJobStatus
+            if status not in IMPORT_JOB_TERMINAL_STATUSES
+            and status != ImportJobStatus.AWAITING_APPROVAL
+        ]
+        jobs = list(
+            self.db.exec(
+                select(GeneralSkillImportJob)
+                .where(
+                    GeneralSkillImportJob.status.in_(active_statuses),
+                    GeneralSkillImportJob.updated_at <= stale_before,
+                )
+                .order_by(GeneralSkillImportJob.updated_at, GeneralSkillImportJob.id)
+                .limit(limit)
+            ).all()
+        )
+        recovered: list[GeneralSkillImportJobRead] = []
+        for job in jobs:
+            if job.status == ImportJobStatus.FETCHED and job.raw_checksum:
+                try:
+                    payload = self.object_store.read_staged(job.id, job.raw_checksum)
+                    source_subpath = job.preview_json.get("source_subpath")
+                    recovered.append(
+                        self._normalize_fetched(
+                            job,
+                            payload,
+                            source_subpath=(
+                                str(source_subpath) if isinstance(source_subpath, str) else None
+                            ),
+                        )
+                    )
+                    continue
+                except (GeneralSkillPackageError, SkillObjectStoreError) as exc:
+                    code = getattr(exc, "error_code", "GENERAL_SKILL_STORAGE_UNAVAILABLE")
+                    self._fail_job(job, str(code), str(exc))
+            else:
+                self._fail_job(
+                    job,
+                    "GENERAL_SKILL_RECOVERY_REQUIRED",
+                    "interrupted import had no safe replay checkpoint",
+                )
+            recovered.append(import_job_read(job))
+        return recovered
+
+    def expire_jobs(
+        self,
+        *,
+        now: datetime,
+        limit: int = 100,
+    ) -> list[GeneralSkillImportJobRead]:
+        """幂等终止到期非终态作业，并同步清除 raw/规范资源与配额事实。"""
+
+        jobs = list(
+            self.db.exec(
+                select(GeneralSkillImportJob)
+                .where(
+                    GeneralSkillImportJob.status.not_in(
+                        [status.value for status in IMPORT_JOB_TERMINAL_STATUSES]
+                    ),
+                    GeneralSkillImportJob.expires_at <= now,
+                )
+                .order_by(GeneralSkillImportJob.expires_at, GeneralSkillImportJob.id)
+                .limit(limit)
+            ).all()
+        )
+        expired: list[GeneralSkillImportJobRead] = []
+        for job in jobs:
+            transition_import_job(
+                job,
+                ImportJobStatus.EXPIRED,
+                expected_row_version=job.row_version,
+                error_code="GENERAL_SKILL_IMPORT_EXPIRED",
+                error_detail_redacted="import approval window expired",
+            )
+            self.object_store.release_staging(job.id)
+            job.quota_bytes = 0
+            self.db.add(job)
+            self.db.commit()
+            self.db.refresh(job)
+            expired.append(import_job_read(job))
+        return expired
 
     def _fail_job(self, job: GeneralSkillImportJob, error_code: str, detail: str) -> None:
         """将非终态作业落为失败并清理可能已产生的暂存对象。"""

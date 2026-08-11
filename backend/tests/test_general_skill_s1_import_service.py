@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import base64
+from datetime import timedelta
 from io import BytesIO
 from pathlib import Path
 from zipfile import ZipFile
@@ -26,7 +27,9 @@ from app.db.models import (
     GeneralSkillRevision,
     Tenant,
     User,
+    utc_now,
 )
+from app.general_skills import import_service as import_service_module
 from app.general_skills.import_schema import GeneralSkillImportConfirm, GeneralSkillImportJobCreate
 from app.general_skills.import_service import GeneralSkillImportError, GeneralSkillImportService
 from app.general_skills.object_store import FileSystemSkillObjectStore, SkillObjectStoreError
@@ -324,6 +327,74 @@ def test_confirm_rejects_human_confirmed_dependency_cycle_before_writes(tmp_path
         )
     assert captured.value.error_code == "GENERAL_SKILL_DEPENDENCY_INVALID"
     assert db.exec(select(GeneralSkill)).all() == []
+
+
+def test_raw_checkpoint_recovers_after_normalizer_process_crash(tmp_path, monkeypatch) -> None:
+    """验证 raw 与 fetched 已提交后，即使规范化进程崩溃也能由新 service 重放。"""
+
+    db, service, owner, _ = _context(tmp_path)
+    real_normalize = import_service_module.normalize_zip_package
+
+    def crash_normalizer(*_args, **_kwargs):
+        """模拟无法被业务异常捕获的进程级中断。"""
+
+        raise RuntimeError("simulated process crash")
+
+    monkeypatch.setattr(import_service_module, "normalize_zip_package", crash_normalizer)
+    with pytest.raises(RuntimeError, match="simulated process crash"):
+        service.create_upload_job(
+            _request(_package("recoverable")),
+            idempotency_key="upload-recovery-001",
+            current_user=owner,
+        )
+    db.rollback()
+    interrupted = db.exec(select(GeneralSkillImportJob)).one()
+    assert interrupted.status == "fetched"
+    assert interrupted.raw_checksum
+    assert service.object_store.read_staged(interrupted.id, interrupted.raw_checksum)
+    monkeypatch.setattr(import_service_module, "normalize_zip_package", real_normalize)
+
+    recovered = service.recover_stale_jobs(stale_before=utc_now() + timedelta(seconds=1))
+    assert [item.status for item in recovered] == ["awaiting_approval"]
+    assert recovered[0].preview_checksum
+    assert recovered[0].quota_bytes > len(_package("recoverable"))
+
+
+def test_uncheckpointed_stale_job_fails_closed_and_expired_preview_releases_quota(tmp_path) -> None:
+    """验证无 raw 的崩溃态不会猜测恢复，已预览到期后全部暂存和配额均回收。"""
+
+    db, service, owner, _ = _context(tmp_path)
+    stale = GeneralSkillImportJob(
+        tenant_id="tenant_a",
+        owner_user_id=owner.id,
+        target_agent_id="agent_a",
+        source_kind="upload",
+        source_reference_redacted="lost.zip",
+        idempotency_key="upload-lost-001",
+        expires_at=utc_now() + timedelta(hours=1),
+        created_at=utc_now() - timedelta(minutes=10),
+        updated_at=utc_now() - timedelta(minutes=10),
+    )
+    db.add(stale)
+    db.commit()
+    failed = service.recover_stale_jobs(stale_before=utc_now() - timedelta(minutes=5))
+    assert [item.status for item in failed] == ["failed"]
+    assert failed[0].error_code == "GENERAL_SKILL_RECOVERY_REQUIRED"
+
+    preview = service.create_upload_job(
+        _request(_package("expires")),
+        idempotency_key="upload-expires-001",
+        current_user=owner,
+    )
+    preview_row = db.get(GeneralSkillImportJob, preview.id)
+    assert preview_row is not None
+    preview_row.expires_at = utc_now() - timedelta(seconds=1)
+    db.add(preview_row)
+    db.commit()
+    expired = service.expire_jobs(now=utc_now())
+    assert [item.status for item in expired] == ["expired"]
+    assert expired[0].quota_bytes == 0
+    assert not (tmp_path / "staging" / preview.id).exists()
 
 
 def test_create_is_idempotent_and_rejects_same_key_for_different_content(tmp_path) -> None:

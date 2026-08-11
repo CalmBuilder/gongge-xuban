@@ -60,6 +60,10 @@ from app.connectors.worker import (
 )
 from app.db import engine, init_db
 from app.db.seed import seed_demo_data
+from app.general_skills.worker import (
+    start_background_worker as start_general_skill_import_worker,
+    stop_background_worker as stop_general_skill_import_worker,
+)
 from app.public_mock import router as public_mock_router
 from app.scheduled_tasks.worker import start_background_worker, stop_background_worker
 
@@ -72,12 +76,14 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     with Session(engine) as db:
         seed_demo_data(db)
     start_background_worker()
+    start_general_skill_import_worker()
     if settings.app_env != "test":
         start_connector_background_worker()
     try:
         yield
     finally:
         stop_background_worker()
+        stop_general_skill_import_worker()
         stop_connector_background_worker()
         shutdown_async_jobs()
 

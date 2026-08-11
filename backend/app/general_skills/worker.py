@@ -1,0 +1,103 @@
+"""
+@Time       : 2026/08/12 22:35
+@Author     : zhanglp8181
+@File       : worker.py
+@CallChain  : FastAPI lifespan/worker CLI → ImportJob recovery/expiry → object staging cleanup
+@Description: 周期恢复安全检查点并清理到期 Skill 导入作业，避免依赖 Web 请求收尾。
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import threading
+from datetime import timedelta
+
+from sqlmodel import Session
+
+from app.config import get_settings
+from app.db import engine
+from app.db.models import utc_now
+from app.general_skills.import_service import GeneralSkillImportService
+from app.general_skills.object_store import FileSystemSkillObjectStore
+
+
+LOGGER = logging.getLogger(__name__)
+WORKER_POLL_SECONDS = 60.0
+RECOVERY_STALE_SECONDS = 300
+_stop_event = threading.Event()
+_worker_thread: threading.Thread | None = None
+
+
+def run_maintenance_once() -> int:
+    """在独立数据库会话中恢复陈旧检查点并回收到期作业，返回处理数量。"""
+
+    settings = get_settings()
+    if not settings.general_skill_import_v2_enabled:
+        return 0
+    now = utc_now()
+    with Session(engine) as db:
+        service = GeneralSkillImportService(
+            db,
+            FileSystemSkillObjectStore(settings.general_skill_object_store_path),
+        )
+        recovered = service.recover_stale_jobs(
+            stale_before=now - timedelta(seconds=RECOVERY_STALE_SECONDS)
+        )
+        expired = service.expire_jobs(now=now)
+        return len(recovered) + len(expired)
+
+
+def run_worker(*, once: bool = False, poll_seconds: float = WORKER_POLL_SECONDS) -> None:
+    """运行可独立部署的维护循环，并将单轮异常收敛后继续下一轮。"""
+
+    while not _stop_event.is_set():
+        try:
+            run_maintenance_once()
+        except Exception:  # noqa: BLE001 - 后台维护不能因单个坏作业永久退出。
+            LOGGER.exception("general Skill import maintenance failed")
+        if once:
+            return
+        _stop_event.wait(max(poll_seconds, 1.0))
+
+
+def start_background_worker(*, poll_seconds: float = WORKER_POLL_SECONDS) -> None:
+    """在 Web 进程内幂等启动维护线程；生产也可改用独立 CLI worker。"""
+
+    global _worker_thread
+    if not get_settings().general_skill_import_v2_enabled:
+        return
+    if _worker_thread is not None and _worker_thread.is_alive():
+        return
+    _stop_event.clear()
+    _worker_thread = threading.Thread(
+        target=run_worker,
+        kwargs={"poll_seconds": poll_seconds},
+        name="gongge-xuban-general-skill-import-worker",
+        daemon=True,
+    )
+    _worker_thread.start()
+
+
+def stop_background_worker() -> None:
+    """请求维护线程停止并进行有限等待，不阻塞应用无限退出。"""
+
+    global _worker_thread
+    _stop_event.set()
+    if _worker_thread is not None:
+        _worker_thread.join(timeout=5)
+    _worker_thread = None
+
+
+def main() -> None:
+    """解析独立 worker CLI 参数并启动一次或持续维护。"""
+
+    parser = argparse.ArgumentParser(description="Run the general Skill import maintenance worker")
+    parser.add_argument("--once", action="store_true")
+    parser.add_argument("--poll-seconds", type=float, default=WORKER_POLL_SECONDS)
+    args = parser.parse_args()
+    run_worker(once=args.once, poll_seconds=args.poll_seconds)
+
+
+if __name__ == "__main__":
+    main()
