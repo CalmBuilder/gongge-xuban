@@ -1172,6 +1172,22 @@ def _candidate_preview(candidate: SkillCandidate) -> dict[str, object]:
         }
         for resource in candidate.resources
     ]
+    license_hint = _candidate_license_hint(candidate.metadata)
+    risk_findings: list[str] = []
+    if license_hint is None:
+        risk_findings.append("license_not_declared")
+    if candidate.allowed_tools:
+        risk_findings.append("requests_tools")
+    if candidate.invocation_policy == "user_only":
+        risk_findings.append("user_only_invocation")
+    if candidate.dependency_candidates:
+        risk_findings.append("dependency_review_required")
+    if any(
+        PurePath(str(resource["relative_path"])).suffix.lower()
+        in {".py", ".sh", ".js", ".ts", ".ps1", ".bat"}
+        for resource in resources
+    ):
+        risk_findings.append("contains_executable_content")
     return {
         "candidate_id": candidate.candidate_id,
         "manifest_path": candidate.manifest_path,
@@ -1193,8 +1209,24 @@ def _candidate_preview(candidate: SkillCandidate) -> dict[str, object]:
             for dependency in candidate.dependency_candidates
         ],
         "platform_commands": list(candidate.platform_commands),
+        "license_hint": license_hint,
+        "risk_findings": risk_findings,
         "resources": resources,
     }
+
+
+def _candidate_license_hint(metadata: dict[str, Any]) -> str | None:
+    """从常见 frontmatter 位置提取仅供审核的许可证提示，不推断法律结论。"""
+
+    direct = metadata.get("license")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()[:255]
+    nested = metadata.get("metadata")
+    if isinstance(nested, dict):
+        nested_license = nested.get("license")
+        if isinstance(nested_license, str) and nested_license.strip():
+            return nested_license.strip()[:255]
+    return None
 
 
 def _decode_base64(value: str, *, allow_empty: bool = False) -> bytes:

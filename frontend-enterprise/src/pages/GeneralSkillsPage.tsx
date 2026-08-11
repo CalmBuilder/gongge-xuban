@@ -1533,6 +1533,24 @@ export function SecureSkillImportDialog({
                             <span className="text-[#6f7789]">调用提示：{candidate.argument_hint}</span>
                           ) : null}
                         </span>
+                        <span className="mt-3 block text-[11px] text-[#969daf]">许可证与静态风险</span>
+                        <span className="mt-1 flex flex-wrap gap-1.5">
+                          <span className={cn(
+                            'rounded px-2 py-1 text-[10px]',
+                            candidate.license_hint
+                              ? 'bg-[#edf7ef] text-[#23733b]'
+                              : 'bg-[#fff4df] text-[#946200]',
+                          )}>
+                            {candidate.license_hint ? `许可证声明：${candidate.license_hint}` : '未声明许可证'}
+                          </span>
+                          {candidate.risk_findings
+                            .filter((finding) => finding !== 'license_not_declared')
+                            .map((finding) => (
+                              <span key={finding} className="rounded bg-[#fff4df] px-2 py-1 text-[10px] text-[#946200]">
+                                {skillRiskFindingLabel(finding)}
+                              </span>
+                            ))}
+                        </span>
                         {candidate.dependency_candidates.length ? (
                           <span className="mt-3 block rounded-lg border border-[#e4e8f1] bg-white p-2.5 text-[11px] text-[#626b7d]">
                             <strong className="font-semibold text-[#303747]">待确认的同包 Skill 引用：</strong>{' '}
@@ -1634,6 +1652,16 @@ function formatBytes(value: number): string {
   if (value < 1024) return `${value} B`;
   if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KiB`;
   return `${(value / (1024 * 1024)).toFixed(1)} MiB`;
+}
+
+function skillRiskFindingLabel(finding: string): string {
+  const labels: Record<string, string> = {
+    requests_tools: '申请工具能力',
+    user_only_invocation: '仅允许用户显式调用',
+    dependency_review_required: '存在待审核依赖',
+    contains_executable_content: '包含脚本资源（默认不执行）',
+  };
+  return labels[finding] || finding;
 }
 
 function defaultDependencyDecisions(

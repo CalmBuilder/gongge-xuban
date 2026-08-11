@@ -392,6 +392,8 @@ export type GeneralSkillImportCandidateRead = {
     reference_count: number;
   }>;
   platform_commands: string[];
+  license_hint: string | null;
+  risk_findings: string[];
   resources: Array<{
     relative_path: string;
     content_checksum: string;

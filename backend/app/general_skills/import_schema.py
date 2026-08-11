@@ -75,6 +75,8 @@ class GeneralSkillImportCandidateRead(BaseModel):
     argument_hint: str | None = None
     dependency_candidates: list[dict[str, object]] = Field(default_factory=list)
     platform_commands: list[str] = Field(default_factory=list)
+    license_hint: str | None = None
+    risk_findings: list[str] = Field(default_factory=list)
     resources: list[dict[str, object]] = Field(default_factory=list)
 
 

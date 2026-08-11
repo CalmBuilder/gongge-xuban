@@ -92,6 +92,8 @@ test('S1 本人数字员工审核候选后固定修订并自动建立 pinned 绑
   await expect(dialog.getByText('购物售后规则核验', { exact: true })).toBeVisible();
   await expect(dialog.getByText('crm.order.read', { exact: true })).toBeVisible();
   await expect(dialog.getByText('申请工具（不代表已授权）')).toBeVisible();
+  await expect(dialog.getByText('未声明许可证', { exact: true })).toBeVisible();
+  await expect(dialog.getByText('申请工具能力', { exact: true })).toBeVisible();
   await expect(dialog.getByText('规范包 checksum')).toBeVisible();
 
   const confirmResponse = page.waitForResponse((response) => (

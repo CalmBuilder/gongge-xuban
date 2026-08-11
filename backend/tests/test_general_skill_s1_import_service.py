@@ -205,6 +205,11 @@ def test_confirm_creates_published_revision_and_default_pinned_private_binding(t
     assert preview.status == "awaiting_approval"
     assert preview.preview_checksum
     assert len(preview.candidates) == 1
+    assert preview.candidates[0].license_hint is None
+    assert preview.candidates[0].risk_findings == [
+        "license_not_declared",
+        "requests_tools",
+    ]
     assert db.exec(select(GeneralSkill)).all() == []
     confirmed = service.confirm_job(
         preview.id,
@@ -285,6 +290,28 @@ def test_single_skill_markdown_uses_the_same_secure_preview_pipeline(tmp_path) -
     assert result.status == "awaiting_approval"
     assert [candidate.name for candidate in result.candidates] == ["direct-skill"]
     assert result.source_reference_redacted == "SKILL.md"
+
+
+def test_preview_exposes_declared_license_and_non_executing_script_risk(tmp_path) -> None:
+    """验证确认页能看到许可证提示与脚本资源风险，且不把脚本标记为已获执行权。"""
+
+    _, service, owner, _ = _context(tmp_path)
+    payload = BytesIO()
+    with ZipFile(payload, "w") as archive:
+        archive.writestr(
+            "review/SKILL.md",
+            "---\nname: reviewed\ndescription: Reviewed package\nlicense: MIT\n---\nReview.\n",
+        )
+        archive.writestr("review/scripts/check.py", "print('review only')\n")
+    result = service.create_upload_job(
+        _request(payload.getvalue()),
+        idempotency_key="preview-risk-license-001",
+        current_user=owner,
+    )
+
+    candidate = result.candidates[0]
+    assert candidate.license_hint == "MIT"
+    assert candidate.risk_findings == ["contains_executable_content"]
 
 
 def test_single_skill_markdown_replay_is_content_idempotent(tmp_path) -> None:
