@@ -555,12 +555,12 @@ export default function ConnectionsPage({
       </section>
 
       <Dialog open={guideOpen} onOpenChange={setGuideOpen}>
-        <DialogContent aria-describedby={undefined} className="max-h-[88vh] gap-[18px] overflow-y-auto rounded-[18px] sm:max-w-[880px]">
+        <DialogContent aria-describedby={undefined} className="max-h-[92vh] w-[calc(100vw-32px)] gap-[22px] overflow-y-auto rounded-[18px] sm:max-w-[1180px]">
           <div className="flex items-start gap-[12px]">
             <span className="grid size-[42px] shrink-0 place-items-center rounded-[14px] bg-[#eaf0ff] text-[var(--gg-cobalt)]"><BookOpen className="size-[19px]" /></span>
             <div>
-              <DialogTitle className="text-[17px] font-semibold tracking-[-0.02em] text-[var(--gg-ink)]">企业微信连接：从创建到一次真实任务</DialogTitle>
-              <p className="mt-[4px] text-[12px] leading-[1.65] text-[var(--gg-slate)]">以下流程来自“序伴集成测试”真实联调，可按顺序完成应用建档、消息接入、数字员工绑定和最终回复验证。</p>
+              <DialogTitle className="text-[20px] font-semibold tracking-[-0.02em] text-[var(--gg-ink)]">企业微信连接：从创建到一次真实任务</DialogTitle>
+              <p className="mt-[5px] text-[13px] leading-[1.75] text-[var(--gg-slate)]">以下流程来自“共格·序伴企业微信测试”真实联调，可按顺序完成应用建档、消息接入、数字员工绑定和最终回复验证。</p>
             </div>
           </div>
 
@@ -618,6 +618,23 @@ export default function ConnectionsPage({
               </div>
             </div>
 
+            <div className="overflow-hidden rounded-[13px] border border-[#cbd8f4] bg-white" aria-label="当前 Demo 实际填写值">
+              <div className="border-b border-[#dce4f4] bg-[#f4f7ff] px-[15px] py-[11px]">
+                <h4 className="text-[13px] font-semibold text-[var(--gg-ink)]">当前 Demo：命令输出和实际填写值</h4>
+                <p className="mt-[3px] text-[11px] leading-[1.6] text-[var(--gg-slate)]">以下公网 IP 是 2026-08-11 在运行后端的同一台机器上用三个公网服务交叉核对的结果。</p>
+              </div>
+              <dl className="grid grid-cols-[190px_minmax(0,1fr)_minmax(0,1fr)] text-[12px] max-[760px]:grid-cols-1">
+                <DemoValueRow label="执行命令" value="curl -4 https://api.ipify.org" destination="在后端服务器终端执行" code />
+                <DemoValueRow label="本次命令输出" value="103.62.49.138" destination="这是企业微信 API 当前看到的公网出口" code strong />
+                <DemoValueRow label="企业可信 IP 填写" value="103.62.49.138" destination="企业微信应用 → 企业可信 IP" code strong />
+                <DemoValueRow label="本机内网地址" value="192.168.124.236" destination="仅用于内网访问，不能填入企业可信 IP" code />
+                <DemoValueRow label="真实成功回调 URL" value="https://people-elect-dolls-phones.trycloudflare.com/api/connectors/wecom/connprofile_36a56f3b292f49a8/callback" destination="企业微信应用 → 接收消息服务器 → URL；该临时 Tunnel 现已失效，仅作成功案例" code />
+                <DemoValueRow label="回调 Token" value="bbfca6••••••••••••••••••84c3f7" destination="从建档后的一次性弹窗完整复制；真实值不写入长期说明" code />
+                <DemoValueRow label="EncodingAESKey" value="hele5t7•••••••••••••••••••••bfRjAk" destination="从同一次弹窗完整复制，不能与另一轮 Token 混用" code />
+              </dl>
+              <p className="border-t border-[#e2e7f1] bg-[#fff9ec] px-[15px] py-[10px] text-[11px] leading-[1.65] text-[#76510b]">重要：公网 IP 可以按上表直接填写；旧 Tunnel URL 只说明成功时的完整格式，不能再次使用。Token 和 EncodingAESKey 是回调验签/解密密钥，截图中暴露过的值应轮换，页面只展示脱敏结果。新建连接时必须把一次性弹窗当场生成的完整值原样填入企业微信。</p>
+            </div>
+
             <div className="rounded-[12px] border border-[#cfdaf5] bg-white px-[13px] py-[12px]" aria-label="回调配置值生成规则">
               <h4 className="text-[12px] font-semibold text-[var(--gg-ink)]">URL、Token、EncodingAESKey 分别怎么生成</h4>
               <dl className="mt-[9px] grid gap-[8px] text-[11px] leading-[1.65] text-[#59647a]">
@@ -640,15 +657,15 @@ export default function ConnectionsPage({
             <GuideSectionTitle index="03" title="演示场景：让数字员工查询企业微信应用信息" id="connection-demo-title" />
             <div className="rounded-[12px] border border-[#cfe8d8] bg-white px-[13px] py-[12px]">
               <h4 className="text-[12px] font-semibold text-[var(--gg-ink)]">场景角色与接入方式</h4>
-              <ol className="mt-[9px] grid grid-cols-4 gap-[8px] max-[760px]:grid-cols-2 max-[480px]:grid-cols-1">
-                <ScenarioStep index="1" title="管理员">在“Agent 绑定”选择“序伴动态任务员工”，先授予 application:read；只有需要外发时才开启“审批后发送”。</ScenarioStep>
+              <ol className="mt-[10px] grid grid-cols-2 gap-[10px] max-[620px]:grid-cols-1">
+                <ScenarioStep index="1" title="管理员绑定真实数字员工">在连接卡片点击“Agent 绑定”，选择本次真实使用的“平台能力演示助手”。系统授予 application:read；本案例的“审批后发送”已经开启。</ScenarioStep>
                 <ScenarioStep index="2" title="消息路由">在“消息接入”选择同一个数字员工作为唯一接收路由，避免入口和工具权限指向不同 Agent。</ScenarioStep>
                 <ScenarioStep index="3" title="员工授权">企业微信成员首次发消息后，管理员在待授权发送者中选择其平台用户；原消息随后自动恢复。</ScenarioStep>
                 <ScenarioStep index="4" title="开始使用">员工继续在企业微信应用会话中用自然语言提问，不需要进入共格·序伴管理端。</ScenarioStep>
               </ol>
             </div>
 
-            <div className="grid grid-cols-2 gap-[10px] max-[680px]:grid-cols-1">
+            <div className="grid gap-[14px]">
               <GuideScreenshot
                 src={weComAgentBindingScreenshot}
                 alt="在真实数字员工绑定弹窗中授权企业微信连接"
@@ -662,7 +679,7 @@ export default function ConnectionsPage({
                 description="先指定接收消息的数字员工，再把已验签发送者映射到平台用户；系统不在页面展示原始 UserID 或正文。"
               />
             </div>
-            <p className="text-[10px] leading-[1.6] text-[#68776e]">截图来自真实生产构建的隔离自动化验收环境；其中“E2E 数字员工”对应本场景中的“序伴动态任务员工”，操作入口和权限契约与实际环境一致。点击截图可查看原始尺寸。</p>
+            <p className="text-[12px] leading-[1.7] text-[#68776e]">以上截图直接取自当前运行中的真实 Demo：连接“共格·序伴企业微信测试”绑定数字员工“平台能力演示助手”。点击任一截图可查看原始尺寸。</p>
 
             <div className="grid grid-cols-[minmax(0,0.75fr)_24px_minmax(0,1.25fr)] items-stretch gap-[8px] max-[680px]:grid-cols-1">
               <div className="rounded-[12px] bg-white px-[13px] py-[12px] shadow-[0_4px_14px_rgba(22,96,55,0.06)]">
@@ -922,11 +939,11 @@ function GuideFlowStep({ icon: Icon, label, value, onClick }: { icon: typeof Bot
   /** 用可点击的真实节点表达外部消息链路，并定位到对应操作指南。 */
 
   return (
-    <button type="button" onClick={onClick} aria-label={`查看${value}步骤`} className="group grid min-w-0 place-items-center gap-[5px] rounded-[11px] px-[5px] py-[7px] text-center transition-colors hover:bg-[#f1f5ff] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--gg-cobalt)] focus-visible:ring-offset-2">
+    <button type="button" onClick={onClick} aria-label={`查看${value}步骤`} className="group grid min-w-0 cursor-pointer place-items-center gap-[5px] rounded-[11px] border border-transparent px-[5px] py-[7px] text-center transition-colors hover:border-[#d7e1fb] hover:bg-[#f1f5ff] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--gg-cobalt)] focus-visible:ring-offset-2">
       <span className="grid size-[32px] place-items-center rounded-[11px] bg-[#edf2ff] text-[var(--gg-cobalt)]"><Icon className="size-[15px]" /></span>
       <small className="text-[9px] text-[#8a93a8]">{label}</small>
       <strong className="text-[11px] font-semibold text-[#3a4254]">{value}</strong>
-      <small className="text-[9px] font-medium text-[var(--gg-cobalt)] opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100">查看步骤</small>
+      <small className="text-[10px] font-medium text-[var(--gg-cobalt)]">查看步骤 →</small>
     </button>
   );
 }
@@ -972,7 +989,7 @@ function GuideInstruction({ index, title, children }: { index: string; title: st
   return (
     <li className="grid grid-cols-[26px_1fr] gap-[10px] rounded-[11px] border border-[#e5e9f2] bg-white px-[11px] py-[10px]">
       <span className="grid size-[24px] place-items-center rounded-[8px] bg-[#edf2ff] font-mono text-[10px] font-semibold text-[var(--gg-cobalt)]">{index}</span>
-      <span><strong className="block text-[11px] font-semibold text-[#3a4254]">{title}</strong><span className="mt-[2px] block text-[11px] leading-[1.65] text-[var(--gg-slate)]">{children}</span></span>
+      <span><strong className="block text-[13px] font-semibold text-[#3a4254]">{title}</strong><span className="mt-[3px] block text-[12px] leading-[1.75] text-[var(--gg-slate)]">{children}</span></span>
     </li>
   );
 }
@@ -981,10 +998,10 @@ function ScenarioStep({ index, title, children }: { index: string; title: string
   /** 说明数字员工接入和实际使用场景中的一个责任阶段。 */
 
   return (
-    <li className="rounded-[10px] bg-[#f7faf8] px-[10px] py-[9px]">
-      <span className="font-mono text-[9px] font-semibold text-[#087a38]">STEP {index}</span>
-      <strong className="mt-[3px] block text-[11px] font-semibold text-[#34483b]">{title}</strong>
-      <span className="mt-[3px] block text-[10px] leading-[1.6] text-[#617267]">{children}</span>
+    <li className="rounded-[11px] bg-[#f4f9f6] px-[13px] py-[12px]">
+      <span className="font-mono text-[10px] font-semibold text-[#087a38]">STEP {index}</span>
+      <strong className="mt-[4px] block text-[13px] font-semibold text-[#34483b]">{title}</strong>
+      <span className="mt-[4px] block text-[12px] leading-[1.75] text-[#617267]">{children}</span>
     </li>
   );
 }
@@ -998,11 +1015,23 @@ function GuideScreenshot({ src, alt, title, description }: { src: string; alt: s
         <img src={src} alt={alt} className="h-auto w-full transition-transform duration-200 group-hover:scale-[1.015] motion-reduce:transition-none" />
       </a>
       <figcaption className="border-t border-[#e8ecf3] px-[11px] py-[9px]">
-        <strong className="block text-[11px] font-semibold text-[#3a4254]">{title}</strong>
-        <span className="mt-[2px] block text-[10px] leading-[1.55] text-[var(--gg-slate)]">{description}</span>
-        <span className="mt-[4px] block text-[9px] font-medium text-[var(--gg-cobalt)]">点击截图可查看原图</span>
+        <strong className="block text-[14px] font-semibold text-[#3a4254]">{title}</strong>
+        <span className="mt-[4px] block text-[12px] leading-[1.7] text-[var(--gg-slate)]">{description}</span>
+        <span className="mt-[6px] block text-[11px] font-medium text-[var(--gg-cobalt)]">点击截图可查看原图</span>
       </figcaption>
     </figure>
+  );
+}
+
+function DemoValueRow({ label, value, destination, code = false, strong = false }: { label: string; value: string; destination: string; code?: boolean; strong?: boolean }) {
+  /** 将真实联调命令、输出和填写位置按同一行呈现，避免用户自行推断。 */
+
+  return (
+    <div className="contents max-[760px]:block">
+      <dt className="border-b border-r border-[#e5e9f2] bg-[#fafbfe] px-[14px] py-[11px] font-medium text-[#586176] max-[760px]:border-r-0 max-[760px]:pb-[4px]">{label}</dt>
+      <dd className={cn('break-all border-b border-r border-[#e5e9f2] px-[14px] py-[11px] text-[#30384c] max-[760px]:border-r-0 max-[760px]:py-[5px]', code && 'font-mono', strong && 'font-semibold text-[#087a38]')}>{value}</dd>
+      <dd className="border-b border-[#e5e9f2] px-[14px] py-[11px] leading-[1.65] text-[#68738a] max-[760px]:pt-[5px]">{destination}</dd>
+    </div>
   );
 }
 

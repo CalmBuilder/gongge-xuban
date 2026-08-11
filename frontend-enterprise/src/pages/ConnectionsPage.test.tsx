@@ -193,6 +193,10 @@ it('用完整指南说明连接边界、接入步骤和数字员工演示场景'
   expect(screen.getByText(/验签消息 → 确认发送者映射/)).toBeInTheDocument();
   expect(screen.getByText(/当前机器内网地址是/)).toHaveTextContent('192.168.124.236');
   expect(screen.getByText(/当前机器内网地址是/)).toHaveTextContent('103.62.49.138');
+  expect(screen.getByText('curl -4 https://api.ipify.org')).toBeInTheDocument();
+  expect(screen.getAllByText('103.62.49.138')).toHaveLength(3);
+  expect(screen.getByText(/connprofile_36a56f3b292f49a8\/callback/)).toBeInTheDocument();
+  expect(screen.getByText('bbfca6••••••••••••••••••84c3f7')).toBeInTheDocument();
   expect(screen.getByText('URL、Token、EncodingAESKey 分别怎么生成')).toBeInTheDocument();
   expect(screen.getByText(/生成 16 字节，再编码为 32 位小写十六进制字符串/)).toBeInTheDocument();
   expect(screen.getByText(/不是公网 HTTPS 来源/)).toBeInTheDocument();
@@ -211,7 +215,7 @@ it('流程节点可点击定位数字员工场景并展示三张真实界面截�
 
   await user.click(screen.getByRole('button', { name: '查看已绑定数字员工步骤' }));
   expect(await screen.findByText('场景角色与接入方式')).toBeInTheDocument();
-  expect(screen.getByText(/在“Agent 绑定”选择“序伴动态任务员工”/)).toBeInTheDocument();
+  expect(screen.getByText(/选择本次真实使用的“平台能力演示助手”/)).toBeInTheDocument();
   expect(screen.getByText(/员工继续在企业微信应用会话中用自然语言提问/)).toBeInTheDocument();
   expect(screen.getByAltText('企业微信连接健康后的真实连接卡片')).toBeInTheDocument();
   expect(screen.getByAltText('在真实数字员工绑定弹窗中授权企业微信连接')).toBeInTheDocument();
