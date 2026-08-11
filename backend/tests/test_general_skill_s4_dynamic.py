@@ -359,6 +359,43 @@ def test_dynamic_task_selects_loads_and_freezes_guidance_use(
             store.start_operation(operation)
         assert operation.status == "running"
 
+        skill_binding = db.exec(
+            select(AgentResourceBinding).where(
+                AgentResourceBinding.tenant_id == tenant.id,
+                AgentResourceBinding.agent_id == agent.id,
+                AgentResourceBinding.resource_type == "general_skill",
+                AgentResourceBinding.resource_id == skill.id,
+            )
+        ).one()
+        skill_binding.status = "inactive"
+        db.add(skill_binding)
+        db.commit()
+        with store.owned(instance, worker_id="worker_s4_binding_countermand"):
+            revoked_binding_operation = SopOperation(
+                tenant_id=instance.tenant_id,
+                instance_id=instance.id,
+                node_execution_id=node.id,
+                operation_name="crm.order.read",
+                idempotency_key="s4-binding-denied-idempotency",
+                logical_action_id="s4-binding-denied",
+                request_fingerprint="s4-binding-denied-fingerprint",
+                caused_by_skill_use_id=use.id,
+                caused_by_skill_use_ids_json=[use.id],
+                capability_snapshot_json={
+                    "capability_type": "tool",
+                    "name": "crm.order.read",
+                },
+            )
+            db.add(revoked_binding_operation)
+            db.flush()
+            with pytest.raises(SopExecutionSkillAuthorizationError) as revoked_binding:
+                store.start_operation(revoked_binding_operation)
+        assert revoked_binding.value.authorization_code == "GENERAL_SKILL_COUNTERMANDED"
+        assert revoked_binding_operation.status == "prepared"
+        skill_binding.status = "active"
+        db.add(skill_binding)
+        db.commit()
+
         second_use.status = "invalidated"
         second_use.invalidation_reason = "GENERAL_SKILL_COUNTERMANDED"
         db.add(second_use)
@@ -383,7 +420,7 @@ def test_dynamic_task_selects_loads_and_freezes_guidance_use(
             db.flush()
             with pytest.raises(SopExecutionSkillAuthorizationError) as countermanded:
                 store.start_operation(denied)
-        assert countermanded.value.authorization_code == "GENERAL_SKILL_TOOL_CAUSE_INVALID"
+        assert countermanded.value.authorization_code == "GENERAL_SKILL_COUNTERMANDED"
 
         use.status = "invalidated"
         use.invalidation_reason = "GENERAL_SKILL_COUNTERMANDED"

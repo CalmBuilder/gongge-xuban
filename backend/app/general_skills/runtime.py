@@ -762,8 +762,20 @@ class GeneralSkillRuntimeService:
                 "GENERAL_SKILL_TOOL_NOT_AUTHORIZED", "tool is outside the agent baseline", 403
             )
         current = self.db.get(GeneralSkillUse, use_id)
+        if current is None:
+            raise GeneralSkillRuntimeError(
+                "GENERAL_SKILL_TOOL_CAUSE_INVALID", "skill cause chain is unavailable", 403
+            )
         root_session_id = current.session_id if current is not None else ""
         root_agent_id = current.agent_id if current is not None else ""
+        eligible_skill_ids = {
+            item.skill_id
+            for item in self.session_catalog(
+                current_user,
+                session_id=root_session_id,
+                agent_id=root_agent_id,
+            )
+        }
         seen: set[str] = set()
         allowed = set(baseline_tools)
         while current is not None:
@@ -774,13 +786,18 @@ class GeneralSkillRuntimeService:
                 or current.session_id != root_session_id
                 or current.agent_id != root_agent_id
                 or current.status not in {"active", "completed"}
+                or current.skill_id not in eligible_skill_ids
             ):
                 raise GeneralSkillRuntimeError(
-                    "GENERAL_SKILL_TOOL_CAUSE_INVALID", "skill cause chain is unavailable", 403
+                    "GENERAL_SKILL_COUNTERMANDED", "skill cause chain is unavailable", 403
                 )
             seen.add(current.id)
             revision = self.db.get(GeneralSkillRevision, current.revision_id)
-            if revision is None or revision.skill_id != current.skill_id:
+            if (
+                revision is None
+                or revision.skill_id != current.skill_id
+                or revision.content_checksum != current.content_checksum
+            ):
                 raise GeneralSkillRuntimeError(
                     "GENERAL_SKILL_REVISION_CONFLICT", "skill cause revision is unavailable"
                 )

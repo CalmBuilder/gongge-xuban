@@ -1211,7 +1211,7 @@ class SopExecutionStore:
     def start_operation(self, operation: SopOperation) -> None:
         """在真正调用外部工具前把 prepared 操作推进为 running。"""
 
-        self._authorize_skill_caused_operation(operation)
+        self.authorize_operation_skill_causes(operation)
         self._guard_operation_mutation(operation, "operation.start")
         transition = transition_operation(
             OperationStatus(operation.status),
@@ -1229,7 +1229,7 @@ class SopExecutionStore:
         self.db.add(operation)
         self.db.flush()
 
-    def _authorize_skill_caused_operation(self, operation: SopOperation) -> None:
+    def authorize_operation_skill_causes(self, operation: SopOperation) -> None:
         """按 Operation 快照、执行归属和全部 Use 父链执行最后一道收窄授权。"""
 
         explicit_use_ids = tuple(operation.caused_by_skill_use_ids_json or ())
@@ -1275,6 +1275,7 @@ class SopExecutionStore:
             GeneralSkillRuntimeService,
         )
 
+        runtime = GeneralSkillRuntimeService(self.db)
         for use_id in use_ids:
             use = self.db.get(GeneralSkillUse, use_id)
             actor = self.db.get(User, use.user_id) if use is not None else None
@@ -1292,7 +1293,7 @@ class SopExecutionStore:
                     authorization_code="GENERAL_SKILL_TOOL_CAUSE_INVALID",
                 )
             try:
-                GeneralSkillRuntimeService(self.db).authorize_tool_for_use(
+                runtime.authorize_tool_for_use(
                     actor,
                     use_id=use.id,
                     tool_name=action,
@@ -1319,7 +1320,7 @@ class SopExecutionStore:
 
         if operation.effect_kind != "external_write" or operation.status != "prepared":
             raise SopExecutionConflictError("只有 prepared 外部写可以绑定批准并派发。")
-        self._authorize_skill_caused_operation(operation)
+        self.authorize_operation_skill_causes(operation)
         if not approval_fingerprint.strip() or not approved_by_user_id.strip() or not authorization_evidence:
             raise SopExecutionConflictError("外部写批准和再授权证据不能为空。")
         if authorization_source_type == "attention":
@@ -1366,7 +1367,7 @@ class SopExecutionStore:
 
         if operation.effect_kind not in {"local_write", "execute"} or operation.status != "prepared":
             raise SopExecutionConflictError("只有 prepared 本地写或执行可以绑定批准并派发。")
-        self._authorize_skill_caused_operation(operation)
+        self.authorize_operation_skill_causes(operation)
         if (
             not approval_work_item_id.strip()
             or not approval_fingerprint.strip()

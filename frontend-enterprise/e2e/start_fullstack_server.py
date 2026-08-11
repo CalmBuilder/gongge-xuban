@@ -1705,7 +1705,9 @@ def install_schedule_llm_override() -> None:
                 if isinstance(item, dict)
             }
             goal = str(user_payload.get("goal") or "")
-            if "S4代码拒绝" in goal and "s4-code-deny-guidance" in names:
+            if "S4代码撤权" in goal and "s4-code-countermand-guidance" in names:
+                selected = ["s4-code-countermand-guidance"]
+            elif "S4代码拒绝" in goal and "s4-code-deny-guidance" in names:
                 selected = ["s4-code-deny-guidance"]
             elif "S4代码" in goal and "s4-code-guidance" in names:
                 selected = ["s4-code-guidance"]
@@ -1722,11 +1724,13 @@ def install_schedule_llm_override() -> None:
         if "受控动态任务规划器" in system_prompt:
             loaded_guidance = user_payload.get("loaded_guidance", [])
             if "S4-CODE-FULL-GUIDANCE" in str(loaded_guidance):
-                code_guidance_name = (
-                    "s4-code-deny-guidance"
-                    if "s4-code-deny-guidance" in str(loaded_guidance)
-                    else "s4-code-guidance"
-                )
+                loaded_text = str(loaded_guidance)
+                if "s4-code-countermand-guidance" in loaded_text:
+                    code_guidance_name = "s4-code-countermand-guidance"
+                elif "s4-code-deny-guidance" in loaded_text:
+                    code_guidance_name = "s4-code-deny-guidance"
+                else:
+                    code_guidance_name = "s4-code-guidance"
                 capability_names = {
                     str(item.get("name") or "")
                     for item in user_payload.get("capabilities", [])

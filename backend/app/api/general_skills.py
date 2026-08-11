@@ -830,6 +830,8 @@ def _ensure_general_skill_binding(
     general_skill_id: str,
     metadata_json: dict[str, object] | None = None,
 ) -> AgentResourceBinding:
+    """复用现有绑定；严格治理 metadata 不得混入 legacy 可见性扩展字段。"""
+
     row = db.exec(
         select(AgentResourceBinding).where(
             AgentResourceBinding.tenant_id == tenant_id,
@@ -846,6 +848,12 @@ def _ensure_general_skill_binding(
         "created_from_agent": True,
     }
     if row:
+        try:
+            GeneralSkillBindingMetadata.model_validate(row.metadata_json)
+        except ValidationError:
+            pass
+        else:
+            return row
         merged_metadata = {
             **(row.metadata_json or {}),
             **metadata,

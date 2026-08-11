@@ -91,7 +91,10 @@ from app.organization.permissions import user_permission_codes
 from app.security.permissions import can_use_agent_in_chat
 from app.session.managed_resources import ManagedInputResourceService
 from app.sop_runtime.execution_control import ExecutionControlService
-from app.sop_runtime.execution_store import SopExecutionStore
+from app.sop_runtime.execution_store import (
+    SopExecutionSkillAuthorizationError,
+    SopExecutionStore,
+)
 from app.sop_runtime.contracts import IdempotencyPolicy
 from app.tools.tool_executor import ToolExecutor
 from app.tools.tool_schema import ToolCall, ToolError, ToolResult
@@ -1886,15 +1889,36 @@ class DynamicTaskAgent:
                     control=control,
                     error_code=exc.code,
                 )
+            try:
+                self.store.authorize_operation_skill_causes(operation)
+            except SopExecutionSkillAuthorizationError as exc:
+                return self._fail_prepared_write(
+                    instance=instance,
+                    step=step,
+                    operation=operation,
+                    signal=signal,
+                    control=control,
+                    error_code=exc.authorization_code,
+                )
             self.store.resume_waiting_node(instance, step, slots=instance.slots_json or {})
             self._acquire_tool_quota(operation)
-            self.store.authorize_external_operation_dispatch(
-                operation,
-                approval_work_item_id=attention.id,
-                approval_fingerprint=frozen_fingerprint,
-                approved_by_user_id=actor_user_id,
-                authorization_evidence=evidence,
-            )
+            try:
+                self.store.authorize_external_operation_dispatch(
+                    operation,
+                    approval_work_item_id=attention.id,
+                    approval_fingerprint=frozen_fingerprint,
+                    approved_by_user_id=actor_user_id,
+                    authorization_evidence=evidence,
+                )
+            except SopExecutionSkillAuthorizationError as exc:
+                return self._fail_prepared_write(
+                    instance=instance,
+                    step=step,
+                    operation=operation,
+                    signal=signal,
+                    control=control,
+                    error_code=exc.authorization_code,
+                )
             self._consume_call_budget(instance, "tool_calls")
         self.db.commit()
         full_payload = dict(attention.payload_json or {})
@@ -2072,19 +2096,40 @@ class DynamicTaskAgent:
                     actor_user_id=instance.initiator_user_id,
                     organization_unit_id=None,
                 )
+                try:
+                    self.store.authorize_operation_skill_causes(operation)
+                except SopExecutionSkillAuthorizationError as exc:
+                    return self._fail_prepared_write(
+                        instance=instance,
+                        step=step,
+                        operation=operation,
+                        signal=signal,
+                        control=control,
+                        error_code=exc.authorization_code,
+                    )
                 self.store.resume_waiting_node(instance, step, slots=instance.slots_json or {})
                 self._acquire_tool_quota(operation)
-                self.store.authorize_local_operation_dispatch(
-                    operation,
-                    approval_work_item_id=attention.id,
-                    approval_fingerprint=frozen_fingerprint,
-                    approved_by_user_id=actor_user_id,
-                    authorization_evidence={
-                        "workspace": payload.get("workspace"),
-                        "capability_checksum": snapshot.checksum,
-                        "approved_actor_role": "admin",
-                    },
-                )
+                try:
+                    self.store.authorize_local_operation_dispatch(
+                        operation,
+                        approval_work_item_id=attention.id,
+                        approval_fingerprint=frozen_fingerprint,
+                        approved_by_user_id=actor_user_id,
+                        authorization_evidence={
+                            "workspace": payload.get("workspace"),
+                            "capability_checksum": snapshot.checksum,
+                            "approved_actor_role": "admin",
+                        },
+                    )
+                except SopExecutionSkillAuthorizationError as exc:
+                    return self._fail_prepared_write(
+                        instance=instance,
+                        step=step,
+                        operation=operation,
+                        signal=signal,
+                        control=control,
+                        error_code=exc.authorization_code,
+                    )
                 self._consume_call_budget(instance, "tool_calls")
             elif operation.status == "running" and step.status == "running":
                 snapshot = self._frozen_local_snapshot(
@@ -2244,8 +2289,11 @@ class DynamicTaskAgent:
     ) -> DynamicRunOutcome:
         """派发前授权失效时消费批准信号并确定失败，保证远端调用次数仍为零。"""
 
+        if error_code == "GENERAL_SKILL_COUNTERMANDED":
+            self._record_operation_skill_countermand(instance, operation)
         self.store.cancel_prepared_operation(operation)
-        self.store.resume_waiting_node(instance, step, slots=instance.slots_json or {})
+        if step.status == "waiting":
+            self.store.resume_waiting_node(instance, step, slots=instance.slots_json or {})
         self.store.fail_node(instance, step, error={"code": error_code})
         control.consume_signal(instance, signal, worker_id=signal.lease_owner or "")
         instance.terminal_reason_json = {"code": error_code[:128]}
@@ -2256,6 +2304,54 @@ class DynamicTaskAgent:
         )
         self.db.commit()
         return DynamicRunOutcome("failed", instance.id)
+
+    def _record_operation_skill_countermand(
+        self,
+        instance: SopInstance,
+        operation: SopOperation,
+    ) -> None:
+        """失效旧 Use 并记录显式撤权事件，使终止原因可由会话审计还原。"""
+
+        use_ids = tuple(
+            dict.fromkeys(
+                str(value).strip()
+                for value in (
+                    *(operation.caused_by_skill_use_ids_json or ()),
+                    operation.caused_by_skill_use_id or "",
+                )
+                if str(value).strip()
+            )
+        )
+        now = self.store.database_now()
+        for use_id in use_ids:
+            use = self.db.get(GeneralSkillUse, use_id)
+            if (
+                use is None
+                or use.tenant_id != instance.tenant_id
+                or use.session_id != instance.session_id
+                or use.execution_id != instance.id
+                or use.status not in {"active", "completed"}
+            ):
+                continue
+            use.status = "invalidated"
+            use.invalidation_reason = "GENERAL_SKILL_COUNTERMANDED"
+            use.completed_at = now
+            use.updated_at = now
+            self.db.add(use)
+            self.db.add(
+                AgentEvent(
+                    tenant_id=instance.tenant_id,
+                    session_id=instance.session_id,
+                    event_type="skill_countermanded",
+                    payload_json={
+                        "skill_use_id": use.id,
+                        "skill_id": use.skill_id,
+                        "execution_id": instance.id,
+                        "operation_id": operation.id,
+                        "reason": use.invalidation_reason,
+                    },
+                )
+            )
 
     def resume_write_reconciliation_signal(
         self,
