@@ -43,6 +43,7 @@ from app.general_skills.import_schema import (
     GeneralSkillSourceCredentialCreate,
 )
 from app.general_skills.import_service import GeneralSkillImportError, GeneralSkillImportService
+from app.general_skills.lifecycle import ImportJobStatus
 from app.general_skills.object_store import FileSystemSkillObjectStore, SkillObjectStoreError
 from app.general_skills.remote_source import RemoteFetchResult
 from app.general_skills.source_credentials import GeneralSkillSourceCredentialService
@@ -300,6 +301,63 @@ def test_single_skill_markdown_uses_the_same_secure_preview_pipeline(tmp_path) -
     assert result.source_reference_redacted == "SKILL.md"
 
 
+def test_s2_upgrade_reuses_stable_skill_and_supersedes_current_revision(tmp_path) -> None:
+    """验证升级仍经过预览确认，在同一 Skill 根下发布 v2 且不改写 pinned 绑定。"""
+
+    db, service, owner, _ = _context(tmp_path)
+    first_preview = service.create_upload_job(
+        _request(_package("upgrade-guide-v1")),
+        idempotency_key="skill-upgrade-v1-001",
+        current_user=owner,
+    )
+    service.confirm_job(
+        first_preview.id,
+        GeneralSkillImportConfirm(
+            preview_checksum=first_preview.preview_checksum or "",
+            candidate_ids=[first_preview.candidates[0].candidate_id],
+            expected_row_version=first_preview.row_version,
+        ),
+        current_user=owner,
+    )
+    skill = db.exec(select(GeneralSkill)).one()
+    first_revision = db.exec(select(GeneralSkillRevision)).one()
+    binding = db.exec(select(AgentResourceBinding)).one()
+
+    upgrade_request = _request(_package("upgrade-guide-v2"))
+    upgrade_request.target_skill_id = skill.id
+    second_preview = service.create_upload_job(
+        upgrade_request,
+        idempotency_key="skill-upgrade-v2-001",
+        current_user=owner,
+    )
+    assert second_preview.target_skill_id == skill.id
+    service.confirm_job(
+        second_preview.id,
+        GeneralSkillImportConfirm(
+            preview_checksum=second_preview.preview_checksum or "",
+            candidate_ids=[second_preview.candidates[0].candidate_id],
+            expected_row_version=second_preview.row_version,
+        ),
+        current_user=owner,
+    )
+
+    db.refresh(skill)
+    db.refresh(first_revision)
+    db.refresh(binding)
+    revisions = db.exec(
+        select(GeneralSkillRevision)
+        .where(GeneralSkillRevision.skill_id == skill.id)
+        .order_by(GeneralSkillRevision.revision_number)
+    ).all()
+    assert len(db.exec(select(GeneralSkill)).all()) == 1
+    assert [(revision.revision_number, revision.status) for revision in revisions] == [
+        (1, "superseded"),
+        (2, "published"),
+    ]
+    assert skill.current_published_revision_id == revisions[1].id
+    assert binding.metadata_json["pinned_revision_id"] == first_revision.id
+
+
 def test_preview_exposes_declared_license_and_non_executing_script_risk(tmp_path) -> None:
     """验证确认页能看到许可证提示与脚本资源风险，且不把脚本标记为已获执行权。"""
 
@@ -551,6 +609,37 @@ def test_background_worker_claims_and_processes_deferred_upload(tmp_path) -> Non
     assert row.lease_token == 1
     assert row.worker_id is None
     assert row.lease_expires_at is None
+
+
+def test_background_worker_never_claims_upload_before_raw_checkpoint(tmp_path) -> None:
+    """请求线程提交 created 后的竞态窗口中，worker 不得把本地上传误判为远程来源。"""
+
+    db, service, owner, _ = _context(tmp_path)
+    pending = GeneralSkillImportJob(
+        tenant_id="tenant_a",
+        owner_user_id=owner.id,
+        target_agent_id="agent_a",
+        source_kind="upload",
+        source_reference_redacted="pending.zip",
+        status=ImportJobStatus.CREATED.value,
+        idempotency_key="pending-upload-before-checkpoint",
+        expires_at=utc_now() + timedelta(hours=1),
+    )
+    db.add(pending)
+    db.commit()
+
+    processed = service.process_pending_jobs(
+        worker_id="gsworker_upload_race",
+        fetcher=_RemoteFetcherStub(_package("must-not-fetch")),
+        now=utc_now(),
+        lease_seconds=300,
+    )
+
+    assert processed == []
+    db.refresh(pending)
+    assert pending.status == ImportJobStatus.CREATED.value
+    assert pending.lease_token == 0
+    assert pending.worker_id is None
 
 
 def test_background_worker_respects_live_lease_and_takes_over_after_expiry(tmp_path) -> None:

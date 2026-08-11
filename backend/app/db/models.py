@@ -1874,6 +1874,7 @@ class GeneralSkillImportJob(SQLModel, table=True):
     tenant_id: IdentifierString = Field(index=True)
     owner_user_id: IdentifierString = Field(index=True)
     target_agent_id: IdentifierString = Field(index=True)
+    target_skill_id: OptionalIdentifierString = Field(default=None, index=True)
     source_kind: LabelString = Field(index=True)
     source_reference_redacted: OptionalPlainTextString = None
     credential_reference: OptionalIdentifierString = None

@@ -26,9 +26,10 @@ type SkillGovernanceDialogProps = {
   agentId: string;
   onClose: () => void;
   onChanged: () => void | Promise<void>;
+  onUpgrade?: (row: GeneralSkillRead) => void;
 };
 
-export function SkillGovernanceDialog({ row, agentId, onClose, onChanged }: SkillGovernanceDialogProps) {
+export function SkillGovernanceDialog({ row, agentId, onClose, onChanged, onUpgrade }: SkillGovernanceDialogProps) {
   const [revisions, setRevisions] = useState<GeneralSkillRevisionRead[]>([]);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -196,6 +197,7 @@ export function SkillGovernanceDialog({ row, agentId, onClose, onChanged }: Skil
           </section>
         </div>
         <div className="flex justify-end gap-2 border-t border-border px-6 py-4">
+          {row && onUpgrade ? <Button variant="outline" className="mr-auto" onClick={() => onUpgrade(row)}>导入新修订</Button> : null}
           <Button variant="outline" onClick={onClose}>取消</Button>
           <Button disabled={saving || loading || !row?.binding_id} onClick={() => void saveBinding()}>{saving ? '保存中…' : '保存策略'}</Button>
         </div>

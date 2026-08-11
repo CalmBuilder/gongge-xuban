@@ -21,7 +21,7 @@ from typing import Any
 from urllib.parse import urlsplit
 from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
-from sqlalchemy import or_, update
+from sqlalchemy import func, or_, update
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
@@ -151,6 +151,7 @@ class GeneralSkillImportService:
             request.target_agent_id,
             current_user,
         )
+        target_skill = self._validated_upgrade_target(request, current_user)
         key = _validated_idempotency_key(idempotency_key)
         if request.filename is None:
             raise GeneralSkillImportError(
@@ -164,7 +165,10 @@ class GeneralSkillImportService:
             current_user=current_user,
         )
         if existing:
-            if existing.raw_checksum and existing.raw_checksum != raw_checksum:
+            if (
+                (existing.raw_checksum and existing.raw_checksum != raw_checksum)
+                or existing.target_skill_id != request.target_skill_id
+            ):
                 raise GeneralSkillImportError(
                     "GENERAL_SKILL_STATE_CONFLICT",
                     "idempotency key was already used for different content",
@@ -177,12 +181,18 @@ class GeneralSkillImportService:
             tenant_id=request.tenant_id,
             owner_user_id=current_user.id,
             target_agent_id=request.target_agent_id,
+            target_skill_id=request.target_skill_id,
             source_kind=request.source_kind,
             source_reference_redacted=_redacted_filename(request.filename),
             raw_checksum=raw_checksum,
             idempotency_key=key,
             attempt=attempt,
             parent_job_id=parent_job_id,
+            preview_json=(
+                {"target_skill_row_version": target_skill.row_version}
+                if target_skill is not None
+                else {}
+            ),
             expires_at=now + timedelta(hours=24),
             created_at=now,
             updated_at=now,
@@ -351,6 +361,12 @@ class GeneralSkillImportService:
         ):
             raise GeneralSkillImportError(
                 "GENERAL_SKILL_PACKAGE_INVALID", "candidate selection is invalid", 400
+            )
+        if job.target_skill_id and len(candidate_ids) != 1:
+            raise GeneralSkillImportError(
+                "GENERAL_SKILL_PACKAGE_INVALID",
+                "a skill upgrade must select exactly one candidate",
+                400,
             )
         dependency_decisions = _validated_dependency_decisions(
             candidates,
@@ -529,6 +545,9 @@ class GeneralSkillImportService:
         source_request_checksum = job.preview_json.get("source_request_checksum")
         if isinstance(source_request_checksum, str) and source_request_checksum:
             preview_payload["source_request_checksum"] = source_request_checksum
+        target_skill_row_version = job.preview_json.get("target_skill_row_version")
+        if isinstance(target_skill_row_version, int):
+            preview_payload["target_skill_row_version"] = target_skill_row_version
         job.normalized_checksum = package.normalized_checksum
         job.preview_json = preview_payload
         job.preview_checksum = _canonical_checksum(preview_payload)
@@ -594,6 +613,7 @@ class GeneralSkillImportService:
             request.target_agent_id,
             current_user,
         )
+        target_skill = self._validated_upgrade_target(request, current_user)
         key = _validated_idempotency_key(idempotency_key)
         source_url = request.source_url.strip()
         allowed_hosts: frozenset[str] | None = None
@@ -659,6 +679,10 @@ class GeneralSkillImportService:
                 "source_kind": request.source_kind,
                 "source_reference": source_reference,
                 "credential_reference": request.credential_reference,
+                "target_skill_id": request.target_skill_id,
+                "target_skill_row_version": (
+                    target_skill.row_version if target_skill is not None else None
+                ),
             }
         )
         attempt, parent_job_id, existing = self._resolve_import_attempt(
@@ -683,6 +707,7 @@ class GeneralSkillImportService:
             tenant_id=request.tenant_id,
             owner_user_id=current_user.id,
             target_agent_id=request.target_agent_id,
+            target_skill_id=request.target_skill_id,
             source_kind=request.source_kind,
             source_reference_redacted=source_reference,
             credential_reference=request.credential_reference,
@@ -693,6 +718,11 @@ class GeneralSkillImportService:
                 "source_request_checksum": request_checksum,
                 "source_subpath": request.source_subpath,
                 "remote_fetch_descriptor": remote_fetch_descriptor,
+                **(
+                    {"target_skill_row_version": target_skill.row_version}
+                    if target_skill is not None
+                    else {}
+                ),
             },
             expires_at=now + timedelta(hours=24),
             created_at=now,
@@ -821,6 +851,10 @@ class GeneralSkillImportService:
                 .where(
                     GeneralSkillImportJob.status.in_(
                         [ImportJobStatus.CREATED.value, ImportJobStatus.FETCHED.value]
+                    ),
+                    or_(
+                        GeneralSkillImportJob.status == ImportJobStatus.FETCHED.value,
+                        GeneralSkillImportJob.source_kind != "upload",
                     ),
                     or_(
                         GeneralSkillImportJob.lease_expires_at.is_(None),
@@ -1412,6 +1446,15 @@ class GeneralSkillImportService:
             raise GeneralSkillImportError(
                 "GENERAL_SKILL_PACKAGE_INVALID", "selected candidate has no SKILL.md", 400
             )
+        if job.target_skill_id:
+            return self._install_upgrade_candidate(
+                job,
+                candidate,
+                current_user,
+                promoted_manifest=promoted_manifest,
+                legacy_files=legacy_files,
+                markdown=markdown,
+            )
         skill = GeneralSkill(
             tenant_id=job.tenant_id,
             slug=self._unique_slug(job.tenant_id, str(candidate["name"])),
@@ -1485,6 +1528,108 @@ class GeneralSkillImportService:
             invocation_policy=str(candidate.get("invocation_policy", "model_allowed")),
         )
 
+    def _install_upgrade_candidate(
+        self,
+        job: GeneralSkillImportJob,
+        candidate: dict[str, Any],
+        current_user: User,
+        *,
+        promoted_manifest: list[dict[str, object]],
+        legacy_files: list[dict[str, object]],
+        markdown: str,
+    ) -> _InstalledCandidate:
+        """在稳定 Skill 根下发布新不可变修订并原子 supersede 原 current。"""
+
+        skill = self.db.exec(
+            select(GeneralSkill)
+            .where(
+                GeneralSkill.id == job.target_skill_id,
+                GeneralSkill.tenant_id == job.tenant_id,
+            )
+            .with_for_update()
+        ).first()
+        expected_row_version = job.preview_json.get("target_skill_row_version")
+        if (
+            skill is None
+            or not isinstance(expected_row_version, int)
+            or skill.row_version != expected_row_version
+            or (skill.owner_user_id != current_user.id and current_user.role != "admin")
+        ):
+            raise GeneralSkillImportError(
+                "GENERAL_SKILL_STATE_CONFLICT", "upgrade target changed after preview", 409
+            )
+        current = (
+            self.db.get(GeneralSkillRevision, skill.current_published_revision_id)
+            if skill.current_published_revision_id
+            else None
+        )
+        if current is None or current.status != RevisionStatus.PUBLISHED.value:
+            raise GeneralSkillImportError(
+                "GENERAL_SKILL_REVISION_CONFLICT", "upgrade target has no published revision", 409
+            )
+        transition_revision(
+            current,
+            RevisionStatus.SUPERSEDED,
+            expected_row_version=current.row_version,
+        )
+        next_revision_number = int(
+            self.db.exec(
+                select(func.max(GeneralSkillRevision.revision_number)).where(
+                    GeneralSkillRevision.tenant_id == job.tenant_id,
+                    GeneralSkillRevision.skill_id == skill.id,
+                )
+            ).one()
+            or 0
+        ) + 1
+        revision = GeneralSkillRevision(
+            tenant_id=job.tenant_id,
+            skill_id=skill.id,
+            revision_number=next_revision_number,
+            content_checksum=str(candidate["content_checksum"]),
+            manifest_checksum=str(candidate["manifest_checksum"]),
+            normalized_skill_markdown=markdown,
+            parsed_metadata_json=dict(candidate.get("metadata", {})),
+            resource_manifest_json=promoted_manifest,
+            requested_capabilities_json={
+                "allowed_tools": list(candidate.get("allowed_tools", [])),
+                "invocation_policy": str(candidate.get("invocation_policy", "model_allowed")),
+                "argument_hint": candidate.get("argument_hint"),
+            },
+            source_snapshot_json={
+                "source_kind": job.source_kind,
+                "source_reference_redacted": job.source_reference_redacted,
+                "raw_checksum": job.raw_checksum,
+                "normalized_checksum": job.normalized_checksum,
+                "import_job_id": job.id,
+                "upgraded_skill_id": skill.id,
+            },
+            created_by=current_user.id,
+        )
+        transition_revision(revision, RevisionStatus.REVIEWING, expected_row_version=1)
+        transition_revision(revision, RevisionStatus.PUBLISHED, expected_row_version=2)
+        self.db.add(current)
+        self.db.add(revision)
+        self.db.flush()
+        skill.description = str(candidate.get("description") or skill.description or "")
+        skill.skill_markdown = markdown
+        skill.skill_files_json = legacy_files
+        skill.permissions_json = {
+            "requested_tools": list(candidate.get("allowed_tools", []))
+        }
+        skill.current_published_revision_id = revision.id
+        skill.status = "published"
+        skill.planning_guidance_json = {}
+        skill.planning_guidance_checksum = None
+        skill.planning_guidance_published_at = None
+        skill.row_version += 1
+        skill.updated_at = utc_now()
+        self.db.add(skill)
+        return _InstalledCandidate(
+            skill_id=skill.id,
+            revision_id=revision.id,
+            invocation_policy=str(candidate.get("invocation_policy", "model_allowed")),
+        )
+
     def _install_dependencies(
         self,
         job: GeneralSkillImportJob,
@@ -1537,6 +1682,30 @@ class GeneralSkillImportService:
             suffix += 1
         return candidate
 
+    def _validated_upgrade_target(
+        self,
+        request: GeneralSkillImportJobCreate,
+        current_user: User,
+    ) -> GeneralSkill | None:
+        """在预览前固定本人稳定 Skill 与 row_version，拒绝跨租户或共享内容升级。"""
+
+        if not request.target_skill_id:
+            return None
+        skill = self.db.get(GeneralSkill, request.target_skill_id)
+        if skill is None or skill.tenant_id != request.tenant_id:
+            raise GeneralSkillImportError(
+                "GENERAL_SKILL_NOT_AVAILABLE", "upgrade target is unavailable", 404
+            )
+        if skill.owner_user_id != current_user.id and current_user.role != "admin":
+            raise GeneralSkillImportError(
+                "GENERAL_SKILL_FORBIDDEN", "current user cannot upgrade this skill", 403
+            )
+        if skill.current_published_revision_id is None:
+            raise GeneralSkillImportError(
+                "GENERAL_SKILL_REVISION_CONFLICT", "upgrade target is not published", 409
+            )
+        return skill
+
 
 def import_job_read(job: GeneralSkillImportJob) -> GeneralSkillImportJobRead:
     """把持久化作业转换为不暴露 owner、credential 或正文的 API 投影。"""
@@ -1550,6 +1719,7 @@ def import_job_read(job: GeneralSkillImportJob) -> GeneralSkillImportJobRead:
         id=job.id,
         tenant_id=job.tenant_id,
         target_agent_id=job.target_agent_id,
+        target_skill_id=job.target_skill_id,
         source_kind=job.source_kind,
         source_reference_redacted=job.source_reference_redacted,
         status=job.status,

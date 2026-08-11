@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import queue
 import re
 import threading
@@ -76,6 +77,7 @@ from app.dynamic_tasks.quotas import (
     quota_limits_from_settings,
 )
 from app.general_skills import GeneralSkillRunner, GeneralSkillSelector
+from app.general_skills.eligibility import EffectiveGeneralSkillResolver
 from app.general_skills.schema import GeneralSkillRunResponse, GeneralSkillSelection
 from app.knowledge import KnowledgeService
 from app.knowledge.access import (
@@ -112,6 +114,9 @@ from app.sop_runtime.execution_control import ExecutionControlService, canonical
 from app.sop_runtime.scheduler import RuntimeAction
 from app.tools import ToolExecutor
 from app.tools.tool_schema import ToolCall, ToolError, ToolResult
+
+
+logger = logging.getLogger(__name__)
 
 
 StatusCallback = Callable[[str, dict[str, object]], None]
@@ -5889,7 +5894,9 @@ class AgentLoop:
         skill = next(
             (
                 item
-                for item in self._list_published_general_skills(request.tenant_id, agent_id)
+                for item in self._list_published_general_skills(
+                    request.tenant_id, agent_id, request.user_id
+                )
                 if item.slug == slug
             ),
             None,
@@ -6042,7 +6049,9 @@ class AgentLoop:
                     code="GENERAL_SKILL_MISMATCH", message="通用技能调用缺少自然语言任务。"
                 ),
             )
-        candidates = self._list_published_general_skills(request.tenant_id, agent_id)
+        candidates = self._list_published_general_skills(
+            request.tenant_id, agent_id, request.user_id
+        )
         if not candidates:
             return ToolResult(
                 tool_name=tool_call.name,
@@ -6634,8 +6643,13 @@ class AgentLoop:
         return visible_published_skills(self.db, tenant_id, agent_id)
 
     def _list_published_general_skills(
-        self, tenant_id: str, agent_id: str | None = None
+        self,
+        tenant_id: str,
+        agent_id: str | None = None,
+        user_id: str | None = None,
     ) -> list[GeneralSkill]:
+        """返回旧运行目录，并在 S2 shadow 开关下与用户级权威 resolver 对账。"""
+
         agent = self._get_agent_profile(tenant_id, agent_id)
         if not agent or agent.is_overall:
             rows = self.db.exec(
@@ -6644,11 +6658,13 @@ class AgentLoop:
                     GeneralSkill.status == "published",
                 )
             ).all()
-            return [
+            legacy = [
                 row
                 for row in rows
                 if is_open_gallery_resource(self.db, tenant_id, "general_skill", row)
             ]
+            self._shadow_general_skill_catalog(tenant_id, agent_id, user_id, legacy)
+            return legacy
 
         bindings = self.db.exec(
             select(AgentResourceBinding).where(
@@ -6671,7 +6687,39 @@ class AgentLoop:
                 binding,
             ):
                 visible.append(row)
+        self._shadow_general_skill_catalog(tenant_id, agent_id, user_id, visible)
         return visible
+
+    def _shadow_general_skill_catalog(
+        self,
+        tenant_id: str,
+        agent_id: str | None,
+        user_id: str | None,
+        legacy: list[GeneralSkill],
+    ) -> None:
+        """只记录新旧资格集合差异，不改变 S3 前的 Agent Loop 执行内容。"""
+
+        if not get_settings().general_skill_resolver_v2_shadow or not agent_id or not user_id:
+            return
+        user = self.db.get(User, user_id)
+        if user is None or user.tenant_id != tenant_id:
+            return
+        catalog = EffectiveGeneralSkillResolver(self.db).resolve(user, agent_id)
+        legacy_ids = sorted(row.id for row in legacy)
+        effective_ids = sorted(item.skill_id for item in catalog.items)
+        logger.info(
+            "general_skill_resolver_shadow",
+            extra={
+                "tenant_id": tenant_id,
+                "agent_id": agent_id,
+                "user_id": user_id,
+                "authorization_revision": catalog.authorization_revision,
+                "eligibility_hash": catalog.eligibility_hash,
+                "parity": legacy_ids == effective_ids,
+                "legacy_skill_ids": legacy_ids,
+                "effective_skill_ids": effective_ids,
+            },
+        )
 
     def _select_general_skill(
         self,
@@ -6732,7 +6780,9 @@ class AgentLoop:
     ) -> NonSopCapabilityRouteResult:
         """返回完整非 SOP 路由结果，供 B1 委托动态 Agent 且保持旧 tuple 兼容。"""
 
-        general_skills = self._list_published_general_skills(model_config.tenant_id, agent_id)
+        general_skills = self._list_published_general_skills(
+            model_config.tenant_id, agent_id, user_id
+        )
         knowledge_capability = self._knowledge_capability_payload(
             model_config.tenant_id,
             user_id,
@@ -7144,7 +7194,9 @@ class AgentLoop:
     ) -> tuple[GeneralSkill | None, GeneralSkillSelection]:
         """选择通用能力，并向选择器投影服务端验证过的知识可访问事实。"""
 
-        general_skills = self._list_published_general_skills(model_config.tenant_id, agent_id)
+        general_skills = self._list_published_general_skills(
+            model_config.tenant_id, agent_id, user_id
+        )
         selector_context = dict(conversation_context or {})
         selector_context["knowledge_capability"] = self._knowledge_capability_payload(
             model_config.tenant_id,

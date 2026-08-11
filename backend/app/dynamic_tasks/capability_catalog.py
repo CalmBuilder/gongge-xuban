@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import re
 from collections.abc import Mapping, Sequence
@@ -48,6 +49,8 @@ from app.db.models import (
     utc_now,
 )
 from app.organization.agent_execution import AgentExecutionAuthorizer, AgentExecutionDenied
+from app.general_skills.eligibility import EffectiveGeneralSkillResolver
+from app.config import get_settings
 
 
 _SECRET_PATH_PARTS = frozenset(
@@ -63,6 +66,7 @@ _SECRET_PATH_PARTS = frozenset(
     }
 )
 _PATH_PATTERN = re.compile(r"^(input|output)(?:\.[A-Za-z_][A-Za-z0-9_-]*)+$")
+logger = logging.getLogger(__name__)
 
 
 class CapabilityAccessDenied(RuntimeError):
@@ -687,15 +691,35 @@ class DynamicCapabilityCatalog:
         return approved
 
     def list_general_skills(
-        self, tenant_id: str, agent_id: str
+        self,
+        tenant_id: str,
+        agent_id: str,
+        actor_user_id: str | None = None,
     ) -> list[CapabilitySnapshot]:
         """仅返回当前数字员工可见、已发布且 checksum 与快照一致的通用技能。"""
 
-        return [
+        snapshots = [
             self._general_skill_snapshot(row, agent_id)
             for row in self._visible_general_skills(tenant_id, agent_id)
             if row.status == "published" and self._valid_general_skill_publication(row)
         ]
+        if get_settings().general_skill_resolver_v2_shadow and actor_user_id:
+            actor = self.db.get(User, actor_user_id)
+            if actor is not None and actor.tenant_id == tenant_id:
+                catalog = EffectiveGeneralSkillResolver(self.db).resolve(actor, agent_id)
+                logger.info(
+                    "dynamic_general_skill_resolver_shadow",
+                    extra={
+                        "tenant_id": tenant_id,
+                        "agent_id": agent_id,
+                        "user_id": actor_user_id,
+                        "authorization_revision": catalog.authorization_revision,
+                        "eligibility_hash": catalog.eligibility_hash,
+                        "legacy_skill_ids": sorted(item.capability_id for item in snapshots),
+                        "effective_skill_ids": sorted(item.skill_id for item in catalog.items),
+                    },
+                )
+        return snapshots
 
     def resolve_general_skill(
         self, tenant_id: str, agent_id: str, slug: str

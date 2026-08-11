@@ -463,6 +463,7 @@ export type GeneralSkillImportJobRead = {
   id: string;
   tenant_id: string;
   target_agent_id: string;
+  target_skill_id?: string;
   source_kind: string;
   source_reference_redacted?: string;
   status: string;

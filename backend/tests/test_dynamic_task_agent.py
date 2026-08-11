@@ -136,9 +136,15 @@ class _StartCatalog(_Catalog):
 
         return [self.snapshot]
 
-    def list_general_skills(self, tenant_id: str, agent_id: str) -> list[CapabilitySnapshot]:
-        """本测试不提供规划指南。"""
+    def list_general_skills(
+        self,
+        tenant_id: str,
+        agent_id: str,
+        actor_user_id: str | None = None,
+    ) -> list[CapabilitySnapshot]:
+        """本测试不提供规划指南，但校验生产调用已携带当前操作者。"""
 
+        assert actor_user_id
         return []
 
     def list_connector_reads(

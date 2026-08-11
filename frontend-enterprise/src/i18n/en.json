@@ -3899,5 +3899,6 @@
   "保存策略": "Save Policy",
   "固定版本": "Pinned Version",
   "允许自动选择": "Allow Automatic Selection",
-  "当前发布": "Currently Published"
+  "当前发布": "Currently Published",
+  "导入新修订": "Import New Revision"
 }

@@ -131,7 +131,7 @@ def import_api_context(
         engine.dispose()
 
 
-def _upload_json() -> dict[str, str]:
+def _upload_json(*, name: str = "售后退款指南", version: str = "v1") -> dict[str, str]:
     """构造 API 使用的单候选 ZIP base64 请求。"""
 
     payload = BytesIO()
@@ -139,12 +139,12 @@ def _upload_json() -> dict[str, str]:
         archive.writestr(
             "refund/SKILL.md",
             "---\n"
-            "name: 售后退款指南\n"
+            f"name: {name}\n"
             "description: 指导数字员工核验订单并解释退款规则。\n"
             "allowed-tools:\n"
             "  - crm.order.read\n"
             "---\n"
-            "# 售后退款指南\n",
+            f"# 售后退款指南 {version}\n",
         )
     return {
         "tenant_id": "tenant_a",
@@ -153,6 +153,58 @@ def _upload_json() -> dict[str, str]:
         "filename": "refund.zip",
         "content_base64": base64.b64encode(payload.getvalue()).decode(),
     }
+
+
+def test_s2_api_upgrade_publishes_new_revision_under_the_same_skill(
+    import_api_context: tuple[TestClient, Session, dict[str, str]],
+) -> None:
+    """验证公开导入 API 携带 target_skill_id 后仍经预览确认并生成同根 v2。"""
+
+    client, db, tokens = import_api_context
+    first = client.post(
+        "/api/enterprise/general-skill-import-jobs",
+        headers=_auth(tokens["owner"], idempotency_key="api-upgrade-v1-001"),
+        json=_upload_json(version="v1"),
+    ).json()
+    client.post(
+        f"/api/enterprise/general-skill-import-jobs/{first['id']}/confirm",
+        headers=_auth(tokens["owner"]),
+        json={
+            "preview_checksum": first["preview_checksum"],
+            "candidate_ids": [first["candidates"][0]["candidate_id"]],
+            "expected_row_version": first["row_version"],
+        },
+    )
+    first_revision = db.exec(select(GeneralSkillRevision)).one()
+    request = _upload_json(version="v2")
+    request["target_skill_id"] = first_revision.skill_id
+    second = client.post(
+        "/api/enterprise/general-skill-import-jobs",
+        headers=_auth(tokens["owner"], idempotency_key="api-upgrade-v2-001"),
+        json=request,
+    )
+    assert second.status_code == 202, second.text
+    preview = second.json()
+    assert preview["target_skill_id"] == first_revision.skill_id
+    confirmed = client.post(
+        f"/api/enterprise/general-skill-import-jobs/{preview['id']}/confirm",
+        headers=_auth(tokens["owner"]),
+        json={
+            "preview_checksum": preview["preview_checksum"],
+            "candidate_ids": [preview["candidates"][0]["candidate_id"]],
+            "expected_row_version": preview["row_version"],
+        },
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    revisions = db.exec(
+        select(GeneralSkillRevision)
+        .where(GeneralSkillRevision.skill_id == first_revision.skill_id)
+        .order_by(GeneralSkillRevision.revision_number)
+    ).all()
+    assert [(row.revision_number, row.status) for row in revisions] == [
+        (1, "superseded"),
+        (2, "published"),
+    ]
 
 
 def _auth(token: str, *, idempotency_key: str | None = None) -> dict[str, str]:

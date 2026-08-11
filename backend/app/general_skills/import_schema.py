@@ -25,6 +25,7 @@ class GeneralSkillImportJobCreate(BaseModel):
 
     tenant_id: str = Field(min_length=1, max_length=512)
     target_agent_id: str = Field(min_length=1, max_length=512)
+    target_skill_id: str | None = Field(default=None, min_length=1, max_length=128)
     source_kind: Literal["upload", "github", "skillhub", "https"] = "upload"
     filename: str | None = Field(default=None, min_length=1, max_length=255)
     content_base64: str | None = Field(default=None, min_length=1)
@@ -141,6 +142,7 @@ class GeneralSkillImportJobRead(BaseModel):
     id: str
     tenant_id: str
     target_agent_id: str
+    target_skill_id: str | None
     source_kind: str
     source_reference_redacted: str | None
     status: str

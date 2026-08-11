@@ -375,6 +375,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
   const [secureImportCredentialName, setSecureImportCredentialName] = useState('');
   const [secureImportCredentialToken, setSecureImportCredentialToken] = useState('');
   const [secureImportCredentialLoading, setSecureImportCredentialLoading] = useState(false);
+  const [secureImportTargetSkillId, setSecureImportTargetSkillId] = useState<string | null>(null);
   const [governanceTarget, setGovernanceTarget] = useState<GeneralSkillRead | null>(null);
 
   const pageTitle = isOverallAgent ? '技能广场' : '技能';
@@ -729,7 +730,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
     }
   }
 
-  function requestSecurePackageImport() {
+  function requestSecurePackageImport(targetSkillId: string | null = null) {
     setSecureImportSourceKind('upload');
     setSecureImportFile(null);
     setSecureImportFolderFiles([]);
@@ -743,6 +744,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
     setSecureImportCredentialId('');
     setSecureImportCredentialName('');
     setSecureImportCredentialToken('');
+    setSecureImportTargetSkillId(targetSkillId);
     setSecureImportOpen(true);
     void loadSecureImportCredentials();
   }
@@ -895,6 +897,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
         {
           tenant_id: getRequestTenantId(),
           target_agent_id: agentId,
+          target_skill_id: secureImportTargetSkillId || undefined,
           retry_parent_job_id: secureImportRetryParentId || undefined,
           credential_reference: secureImportCredentialId || undefined,
           ...sourcePayload,
@@ -1154,7 +1157,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
                     </DropdownMenuItem>
                   )}
                   {!isOverallAgent && secureImportAvailable && (
-                    <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={requestSecurePackageImport}>
+                    <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => requestSecurePackageImport()}>
                       <ShieldCheck />
                       安全导入 Skill
                     </DropdownMenuItem>
@@ -1390,6 +1393,10 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
         onClose={() => setGovernanceTarget(null)}
         onChanged={async () => {
           await load();
+        }}
+        onUpgrade={(skill) => {
+          setGovernanceTarget(null);
+          requestSecurePackageImport(skill.id);
         }}
       />
     </div>

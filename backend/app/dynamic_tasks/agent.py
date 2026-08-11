@@ -2370,7 +2370,7 @@ class DynamicTaskAgent:
         capabilities = [
             *self.catalog.list_tools(tenant_id, agent_id),
             *self.catalog.list_connector_reads(tenant_id, agent_id, initiator_user_id),
-            *self.catalog.list_general_skills(tenant_id, agent_id),
+            *self.catalog.list_general_skills(tenant_id, agent_id, initiator_user_id),
         ]
         if get_settings().dynamic_task_external_write_enabled:
             capabilities.extend(

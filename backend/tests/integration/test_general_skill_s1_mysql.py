@@ -141,7 +141,7 @@ def test_s1_mysql_head_is_reentrant_and_uses_bounded_index_columns(
     assert credential_columns["allowed_host"].length == 253
     with engine.connect() as connection:
         assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-            "20260812_0055"
+            "20260813_0056"
         )
     engine.dispose()
 
@@ -186,7 +186,7 @@ def test_s1_mysql_historical_active_job_is_backfilled_once_before_head(
             ("user", "user_mysql_history", 1, 321),
         ]
         assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-            "20260812_0055"
+            "20260813_0056"
         )
     engine.dispose()
 
