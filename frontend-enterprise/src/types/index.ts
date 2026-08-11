@@ -375,6 +375,43 @@ export type GeneralSkillRunResponse = {
   reply: string;
 };
 
+export type GeneralSkillImportCandidateRead = {
+  candidate_id: string;
+  manifest_path: string;
+  name: string;
+  description: string;
+  content_checksum: string;
+  manifest_checksum: string;
+  allowed_tools: string[];
+  resources: Array<{
+    relative_path: string;
+    content_checksum: string;
+    size: number;
+    media_type: string;
+    is_text: boolean;
+  }>;
+};
+
+export type GeneralSkillImportJobRead = {
+  id: string;
+  tenant_id: string;
+  target_agent_id: string;
+  source_kind: string;
+  source_reference_redacted?: string;
+  status: string;
+  attempt: number;
+  raw_checksum?: string;
+  normalized_checksum?: string;
+  preview_checksum?: string;
+  quota_bytes: number;
+  error_code?: string;
+  error_detail_redacted?: string;
+  candidates: GeneralSkillImportCandidateRead[];
+  expires_at: string;
+  row_version: number;
+  installed_revision_ids: string[];
+};
+
 export type ModelConfigRead = {
   id: string;
   tenant_id: string;

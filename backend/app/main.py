@@ -27,6 +27,7 @@ from app.api import (
     feedback,
     expert_taxonomy,
     general_skills,
+    general_skill_imports,
     knowledge,
     knowledge_bases,
     management_audit,
@@ -125,6 +126,7 @@ app.include_router(agents.scope_router)
 app.include_router(agents.enterprise_router)
 app.include_router(expert_taxonomy.router)
 app.include_router(general_skills.router)
+app.include_router(general_skill_imports.router)
 app.include_router(knowledge_bases.router)
 app.include_router(knowledge.router)
 app.include_router(management_audit.router)

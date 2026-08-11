@@ -1,14 +1,41 @@
-import { afterEach, expect, it } from 'vitest';
+import { afterEach, expect, it, vi } from 'vitest';
 
 import {
   clearEnterpriseAuthSession,
   setEnterpriseAuthSession,
   type EnterpriseAuthSession,
 } from '../auth';
-import { getRequestTenantId, LOGIN_TENANT_ID } from './client';
+import { api, getRequestTenantId, LOGIN_TENANT_ID } from './client';
 
 afterEach(() => {
   clearEnterpriseAuthSession();
+  vi.restoreAllMocks();
+});
+
+it('keeps the bearer token when a caller adds an idempotency header', async () => {
+  setEnterpriseAuthSession({
+    token: 'token-a',
+    user: {
+      id: 'user-a',
+      tenant_id: 'tenant-a',
+      username: 'member',
+      role: 'member',
+      membership_status: 'active',
+      member_category_code: 'employee',
+    },
+  });
+  const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+    new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } }),
+  );
+
+  await api.postWithHeaders('/test', { value: 1 }, { 'Idempotency-Key': 'request-001' });
+
+  expect(fetchMock).toHaveBeenCalledWith('/test', expect.objectContaining({
+    headers: expect.objectContaining({
+      Authorization: 'Bearer token-a',
+      'Idempotency-Key': 'request-001',
+    }),
+  }));
 });
 
 it('reads the request tenant from the authenticated member instead of the login default', () => {

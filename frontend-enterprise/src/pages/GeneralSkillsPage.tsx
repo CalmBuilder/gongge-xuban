@@ -12,7 +12,7 @@ import {
 import type { ChangeEvent, DragEvent, HTMLAttributes, ReactNode } from 'react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { Ban, CircleCheck, Copy, Users } from 'lucide-react';
+import { Ban, CircleCheck, Copy, FileArchive, ShieldCheck, Users } from 'lucide-react';
 import { ContextMenu } from 'radix-ui';
 
 import { api, streamPost, getRequestTenantId } from '../api/client';
@@ -75,7 +75,13 @@ import {
 import { useClientPagination } from '../hooks/useClientPagination';
 import { StatusBadge } from './scheduled-tasks/StatusBadge';
 import type { BadgeTone } from './scheduled-tasks/shared';
-import type { AgentProfileRead, GeneralSkillRead, GeneralSkillRunResponse, ModelConfigRead } from '../types';
+import type {
+  AgentProfileRead,
+  GeneralSkillImportJobRead,
+  GeneralSkillRead,
+  GeneralSkillRunResponse,
+  ModelConfigRead,
+} from '../types';
 
 const GENERAL_SKILL_PAGE_SIZE = 10;
 const GENERAL_SKILL_RUN_MODEL_STORAGE_KEY = 'general-skill-run-model';
@@ -174,6 +180,7 @@ function TraceDisclosureLabel() {
 }
 
 const ENTERPRISE_AGENT_STORAGE_KEY = 'gongge_enterprise_agent_scope';
+const GENERAL_SKILL_IMPORT_JOB_STORAGE_PREFIX = 'gongge_general_skill_import_job';
 const GENERAL_SKILL_RUN_TIMEOUT_MS = 120_000;
 const FOLDER_INPUT_PROPS = {
   webkitdirectory: '',
@@ -337,6 +344,12 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
   const [agentScopeLoaded, setAgentScopeLoaded] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<GeneralSkillRead | null>(null);
   const [deleting, setDeleting] = useState(false);
+  const [secureImportAvailable, setSecureImportAvailable] = useState(false);
+  const [secureImportOpen, setSecureImportOpen] = useState(false);
+  const [secureImportFile, setSecureImportFile] = useState<File | null>(null);
+  const [secureImportJob, setSecureImportJob] = useState<GeneralSkillImportJobRead | null>(null);
+  const [secureImportSelectedIds, setSecureImportSelectedIds] = useState<string[]>([]);
+  const [secureImportLoading, setSecureImportLoading] = useState(false);
 
   const pageTitle = isOverallAgent ? '技能广场' : '技能';
   const listLabel = isOverallAgent ? '技能广场列表' : '技能列表';
@@ -344,6 +357,12 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
   const canManageCurrentScope = currentAgent
     ? canManageEmployeeAgent(currentAgent, currentUser)
     : isEnterpriseAdmin(currentUser) && isOverallAgent;
+  const secureImportStorageKey = [
+    GENERAL_SKILL_IMPORT_JOB_STORAGE_PREFIX,
+    currentUser?.tenant_id || 'unknown-tenant',
+    currentUser?.id || 'unknown-user',
+    agentId || 'no-agent',
+  ].join(':');
 
   const load = () => {
     const agentSuffix = agentId ? `&agent_id=${encodeURIComponent(agentId)}` : '';
@@ -359,6 +378,35 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
     void load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [agentId]);
+
+  useEffect(() => {
+    api
+      .get<{ enabled: boolean; source_kinds: string[] }>('/api/enterprise/general-skill-import-jobs/capabilities')
+      .then((capabilities) => setSecureImportAvailable(
+        capabilities.enabled && capabilities.source_kinds.includes('upload'),
+      ))
+      .catch(() => setSecureImportAvailable(false));
+  }, []);
+
+  useEffect(() => {
+    if (!secureImportAvailable || !agentId || isOverallAgent) return;
+    const jobId = window.localStorage.getItem(secureImportStorageKey);
+    if (!jobId) return;
+    api
+      .get<GeneralSkillImportJobRead>(
+        `/api/enterprise/general-skill-import-jobs/${encodeURIComponent(jobId)}`,
+      )
+      .then((job) => {
+        if (job.status !== 'awaiting_approval') {
+          window.localStorage.removeItem(secureImportStorageKey);
+          return;
+        }
+        setSecureImportJob(job);
+        setSecureImportSelectedIds(job.candidates.map((candidate) => candidate.candidate_id));
+        setSecureImportOpen(true);
+      })
+      .catch(() => window.localStorage.removeItem(secureImportStorageKey));
+  }, [agentId, isOverallAgent, secureImportAvailable, secureImportStorageKey]);
 
   useEffect(() => {
     api
@@ -577,6 +625,99 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
     }
   }
 
+  function requestSecurePackageImport() {
+    setSecureImportFile(null);
+    setSecureImportJob(null);
+    setSecureImportSelectedIds([]);
+    setSecureImportOpen(true);
+  }
+
+  async function previewSecurePackage() {
+    if (!agentId || isOverallAgent) {
+      notify.warning('请先选择要获得该能力的数字员工');
+      return;
+    }
+    if (!secureImportFile) {
+      notify.warning('请选择一个 ZIP Skill 包');
+      return;
+    }
+    setSecureImportLoading(true);
+    try {
+      const contentBase64 = await fileToBase64(secureImportFile);
+      const job = await api.postWithHeaders<GeneralSkillImportJobRead>(
+        '/api/enterprise/general-skill-import-jobs',
+        {
+          tenant_id: getRequestTenantId(),
+          target_agent_id: agentId,
+          source_kind: 'upload',
+          filename: secureImportFile.name,
+          content_base64: contentBase64,
+        },
+        { 'Idempotency-Key': `skill-upload-${crypto.randomUUID()}` },
+      );
+      setSecureImportJob(job);
+      setSecureImportSelectedIds(job.candidates.map((candidate) => candidate.candidate_id));
+      if (job.status === 'awaiting_approval') {
+        window.localStorage.setItem(secureImportStorageKey, job.id);
+      }
+      if (job.status === 'failed') {
+        notify.error(job.error_detail_redacted || 'Skill 包未通过安全检查');
+      }
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '生成安全预览失败');
+    } finally {
+      setSecureImportLoading(false);
+    }
+  }
+
+  async function confirmSecurePackage() {
+    const job = secureImportJob;
+    if (!job?.preview_checksum || !secureImportSelectedIds.length) {
+      notify.warning('请至少选择一个已通过检查的 Skill');
+      return;
+    }
+    setSecureImportLoading(true);
+    try {
+      const installed = await api.post<GeneralSkillImportJobRead>(
+        `/api/enterprise/general-skill-import-jobs/${encodeURIComponent(job.id)}/confirm`,
+        {
+          preview_checksum: job.preview_checksum,
+          candidate_ids: secureImportSelectedIds,
+          expected_row_version: job.row_version,
+        },
+      );
+      setSecureImportJob(installed);
+      notify.success(`已为当前数字员工安装 ${installed.installed_revision_ids.length} 个 Skill`);
+      window.localStorage.removeItem(secureImportStorageKey);
+      setSecureImportOpen(false);
+      await load();
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '确认安装失败');
+    } finally {
+      setSecureImportLoading(false);
+    }
+  }
+
+  async function cancelSecurePackage() {
+    const job = secureImportJob;
+    if (job && !['installed', 'failed', 'cancelled', 'expired'].includes(job.status)) {
+      setSecureImportLoading(true);
+      try {
+        await api.post(
+          `/api/enterprise/general-skill-import-jobs/${encodeURIComponent(job.id)}/cancel`,
+          { expected_row_version: job.row_version },
+        );
+      } catch (error) {
+        notify.error(error instanceof Error ? error.message : '取消导入失败');
+        setSecureImportLoading(false);
+        return;
+      }
+    }
+    setSecureImportLoading(false);
+    window.localStorage.removeItem(secureImportStorageKey);
+    setSecureImportOpen(false);
+  }
+
   function renderActions(row: GeneralSkillRead) {
     const published = row.status === 'published';
     if (isOverallAgent && !canManageCurrentScope) {
@@ -750,6 +891,12 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
                     <GithubOutlined />
                     从开源平台导入
                   </DropdownMenuItem>
+                  {!isOverallAgent && secureImportAvailable && (
+                    <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={requestSecurePackageImport}>
+                      <ShieldCheck />
+                      安全导入 Skill 包
+                    </DropdownMenuItem>
+                  )}
                   {!isOverallAgent && (
                     <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => void requestAgentImport('employee')}>
                       <Users />
@@ -848,6 +995,23 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
         onSourceChange={setClawhubSource}
         onClose={cancelClawHubImport}
         onSubmit={() => void importClawHubSource()}
+      />
+
+      <SecureSkillImportDialog
+        open={secureImportOpen}
+        loading={secureImportLoading}
+        file={secureImportFile}
+        job={secureImportJob}
+        selectedIds={secureImportSelectedIds}
+        onFileChange={(file) => {
+          setSecureImportFile(file);
+          setSecureImportJob(null);
+          setSecureImportSelectedIds([]);
+        }}
+        onSelectedIdsChange={setSecureImportSelectedIds}
+        onPreview={() => void previewSecurePackage()}
+        onConfirm={() => void confirmSecurePackage()}
+        onClose={() => void cancelSecurePackage()}
       />
 
       <ResourceImportDialog
@@ -964,6 +1128,219 @@ function ClawHubDialog({
       </DialogContent>
     </Dialog>
   );
+}
+
+function SecureSkillImportDialog({
+  open,
+  loading,
+  file,
+  job,
+  selectedIds,
+  onFileChange,
+  onSelectedIdsChange,
+  onPreview,
+  onConfirm,
+  onClose,
+}: {
+  open: boolean;
+  loading: boolean;
+  file: File | null;
+  job: GeneralSkillImportJobRead | null;
+  selectedIds: string[];
+  onFileChange: (file: File | null) => void;
+  onSelectedIdsChange: (ids: string[]) => void;
+  onPreview: () => void;
+  onConfirm: () => void;
+  onClose: () => void;
+}) {
+  const hasPreview = job?.status === 'awaiting_approval';
+  const selectedSet = useMemo(() => new Set(selectedIds), [selectedIds]);
+
+  return (
+    <Dialog open={open} onOpenChange={(next) => !next && !loading && onClose()}>
+      <DialogContent
+        aria-describedby={undefined}
+        className="flex max-h-[88vh] w-[calc(100%-2rem)] flex-col gap-0 overflow-hidden rounded-[18px] border-[#dfe5f2] p-0 sm:max-w-[760px]"
+      >
+        <header className="border-b border-[#e8ebf2] bg-[#f8faff] px-[24px] pt-[22px] pb-[18px]">
+          <div className="flex items-center gap-3">
+            <span className="grid size-10 place-items-center rounded-xl bg-[#eaf0ff] text-[var(--gg-cobalt)]">
+              <ShieldCheck className="size-5" />
+            </span>
+            <div>
+              <DialogTitle className="text-[17px] font-semibold text-[#18181a]">
+                安全导入 Skill 包
+              </DialogTitle>
+              <p className="mt-1 text-[12px] leading-[1.5] text-[#757f9c]">
+                先检查完整文件树和申请能力，确认后才会固定版本并绑定当前数字员工。
+              </p>
+            </div>
+          </div>
+          <ol aria-label="导入进度" className="mt-5 grid grid-cols-3 gap-2">
+            {[
+              ['1', '包校验'],
+              ['2', '候选审核'],
+              ['3', '固定并绑定'],
+            ].map(([step, label], index) => {
+              const active = index === 0 || Boolean(job) && index === 1 || job?.status === 'installed';
+              return (
+                <li
+                  key={step}
+                  className={cn(
+                    'flex items-center gap-2 rounded-lg border px-3 py-2 text-[12px]',
+                    active
+                      ? 'border-[#cbd8ff] bg-white text-[#3157e8]'
+                      : 'border-transparent bg-[#f1f3f8] text-[#9aa1b4]',
+                  )}
+                >
+                  <span className="font-mono font-semibold">{step}</span>
+                  <span>{label}</span>
+                </li>
+              );
+            })}
+          </ol>
+        </header>
+
+        <div className="min-h-0 flex-1 overflow-y-auto px-[24px] py-[20px]">
+          {!job ? (
+            <label className="flex min-h-[190px] cursor-pointer flex-col items-center justify-center rounded-[14px] border border-dashed border-[#bfc9dc] bg-[#fbfcff] px-6 text-center transition-colors hover:border-[var(--gg-cobalt)] hover:bg-[#f7f9ff] focus-within:ring-2 focus-within:ring-[#b9c8ff]">
+              <FileArchive className="mb-3 size-8 text-[#5574dc]" />
+              <strong className="text-[14px] font-semibold text-[#252936]">
+                {file ? file.name : '选择 ZIP Skill 包'}
+              </strong>
+              <span className="mt-2 text-[12px] leading-[1.6] text-[#858b9c]">
+                不会直接运行包内内容；路径、编码、压缩比、文件预算和所有 SKILL.md 会先接受完整检查。
+              </span>
+              {file ? (
+                <span className="mt-3 rounded-full bg-[#edf2ff] px-3 py-1 font-mono text-[11px] text-[#3157e8]">
+                  {formatBytes(file.size)}
+                </span>
+              ) : null}
+              <input
+                className="sr-only"
+                type="file"
+                accept=".zip,application/zip"
+                disabled={loading}
+                onChange={(event) => onFileChange(event.target.files?.[0] || null)}
+              />
+            </label>
+          ) : null}
+
+          {job?.status === 'failed' ? (
+            <section role="alert" className="rounded-[14px] border border-[#f2c7c7] bg-[#fff8f8] p-4">
+              <strong className="text-[13px] font-semibold text-[#a62626]">Skill 包未通过安全检查</strong>
+              <p className="mt-2 text-[12px] leading-[1.6] text-[#7c4a4a]">
+                {job.error_detail_redacted || job.error_code || '请修正文件后重新选择。'}
+              </p>
+            </section>
+          ) : null}
+
+          {hasPreview ? (
+            <div className="grid gap-4">
+              <section className="grid gap-2 rounded-[12px] border border-[#e2e7f2] bg-[#fafbfe] p-4 text-[12px] text-[#60687b] sm:grid-cols-2">
+                <div>
+                  <span className="block text-[11px] text-[#969daf]">规范包 checksum</span>
+                  <code className="mt-1 block truncate font-mono text-[#303747]" title={job.normalized_checksum}>
+                    {job.normalized_checksum}
+                  </code>
+                </div>
+                <div>
+                  <span className="block text-[11px] text-[#969daf]">暂存占用</span>
+                  <span className="mt-1 block font-medium text-[#303747]">{formatBytes(job.quota_bytes)}</span>
+                </div>
+              </section>
+
+              <fieldset className="grid gap-3">
+                <legend className="mb-1 text-[13px] font-semibold text-[#252936]">
+                  选择要固定到当前数字员工的 Skill
+                </legend>
+                {job.candidates.map((candidate) => {
+                  const checked = selectedSet.has(candidate.candidate_id);
+                  return (
+                    <label
+                      key={candidate.candidate_id}
+                      className={cn(
+                        'grid cursor-pointer grid-cols-[auto_minmax(0,1fr)] gap-3 rounded-[14px] border p-4 transition-colors',
+                        checked
+                          ? 'border-[#9db2ff] bg-[#f7f9ff]'
+                          : 'border-[#e2e7f2] bg-white hover:border-[#c7d1e5]',
+                      )}
+                    >
+                      <input
+                        type="checkbox"
+                        className="mt-1 size-4 accent-[var(--gg-cobalt)]"
+                        checked={checked}
+                        onChange={(event) => {
+                          if (event.target.checked) {
+                            onSelectedIdsChange([...selectedIds, candidate.candidate_id]);
+                          } else {
+                            onSelectedIdsChange(selectedIds.filter((id) => id !== candidate.candidate_id));
+                          }
+                        }}
+                      />
+                      <span className="min-w-0">
+                        <span className="flex flex-wrap items-center gap-2">
+                          <strong className="text-[14px] font-semibold text-[#252936]">{candidate.name}</strong>
+                          <span className="rounded-full bg-[#edf2ff] px-2 py-0.5 text-[10px] text-[#3157e8]">
+                            {candidate.resources.length} 个文件
+                          </span>
+                        </span>
+                        <span className="mt-1 block text-[12px] leading-[1.6] text-[#6f7789]">
+                          {candidate.description}
+                        </span>
+                        <span className="mt-3 block text-[11px] text-[#969daf]">申请工具（不代表已授权）</span>
+                        <span className="mt-1 flex flex-wrap gap-1.5">
+                          {candidate.allowed_tools.length ? candidate.allowed_tools.map((tool) => (
+                            <code key={tool} className="rounded bg-[#f0f2f6] px-2 py-1 text-[10px] text-[#4e5668]">
+                              {tool}
+                            </code>
+                          )) : <span className="text-[11px] text-[#858b9c]">未声明额外工具范围</span>}
+                        </span>
+                        <code className="mt-3 block truncate font-mono text-[10px] text-[#9aa1b4]" title={candidate.content_checksum}>
+                          内容：{candidate.content_checksum}
+                        </code>
+                      </span>
+                    </label>
+                  );
+                })}
+              </fieldset>
+            </div>
+          ) : null}
+        </div>
+
+        <footer className="flex items-center justify-between gap-3 border-t border-[#e8ebf2] bg-white px-[24px] py-[16px]">
+          <span className="text-[11px] text-[#858b9c]">
+            {hasPreview ? '默认固定本次修订；后续升级需再次审核。' : '只接受 ZIP；任一文件失败则整包拒绝。'}
+          </span>
+          <div className="flex items-center gap-2">
+            <UIButton variant="outline" disabled={loading} onClick={onClose} className={RETURN_BUTTON_CLASS}>
+              取消
+            </UIButton>
+            {!job ? (
+              <UIButton disabled={loading || !file} onClick={onPreview} className={PRIMARY_BUTTON_CLASS}>
+                生成安全预览
+              </UIButton>
+            ) : null}
+            {hasPreview ? (
+              <UIButton
+                disabled={loading || selectedIds.length === 0}
+                onClick={onConfirm}
+                className={PRIMARY_BUTTON_CLASS}
+              >
+                固定版本并绑定
+              </UIButton>
+            ) : null}
+          </div>
+        </footer>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function formatBytes(value: number): string {
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KiB`;
+  return `${(value / (1024 * 1024)).toFixed(1)} MiB`;
 }
 
 function traceDetail(item: Record<string, unknown>): string {

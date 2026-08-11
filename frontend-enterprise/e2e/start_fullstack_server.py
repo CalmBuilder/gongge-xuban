@@ -1,5 +1,5 @@
 """
-@Time       : 2026/08/10
+@Time       : 2026/08/12
 @Author     : zhanglp8181
 @File       : start_fullstack_server.py
 @CallChain  : Playwright fullstack 配置 → 临时 SQLite → FastAPI 单端口应用
@@ -56,6 +56,8 @@ def configure_environment(database_path: Path) -> None:
             "DYNAMIC_TASK_MAX_ACTIVE_PER_AGENT": "8",
             "DYNAMIC_TASK_MAX_ACTIVE_PER_USER": "4",
             "DYNAMIC_TASK_MAX_ACTIVE_PER_TOOL": "4",
+            "GENERAL_SKILL_IMPORT_V2_ENABLED": "true",
+            "GENERAL_SKILL_OBJECT_STORE_PATH": str(E2E_RUNTIME_DIR / "general-skill-objects"),
             "GONGGE_XUBAN_DATA_DIR": str(E2E_RUNTIME_DIR / "user-data"),
         }
     )

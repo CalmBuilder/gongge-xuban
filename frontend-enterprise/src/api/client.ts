@@ -39,12 +39,12 @@ export function isAuthError(error: unknown): boolean {
 
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
+    ...options,
     headers: {
       'Content-Type': 'application/json',
       ...authHeader(),
       ...(options.headers || {}),
     },
-    ...options,
   });
   if (!response.ok) {
     const text = await response.text();
@@ -82,6 +82,8 @@ export const api = {
     request<T>(path, { method: 'POST', body: body === undefined ? undefined : JSON.stringify(body) }),
   postWithSignal: <T>(path: string, body: unknown, signal?: AbortSignal) =>
     request<T>(path, { method: 'POST', body: JSON.stringify(body), signal }),
+  postWithHeaders: <T>(path: string, body: unknown, headers: Record<string, string>) =>
+    request<T>(path, { method: 'POST', body: JSON.stringify(body), headers }),
   postKeepalive: <T>(path: string, body?: unknown) => keepalivePost<T>(path, body),
   put: <T>(path: string, body: unknown) => request<T>(path, { method: 'PUT', body: JSON.stringify(body) }),
   patch: <T>(path: string, body: unknown) => request<T>(path, { method: 'PATCH', body: JSON.stringify(body) }),
@@ -229,6 +231,10 @@ function parseErrorMessage(text: string): string {
     const payload = JSON.parse(text) as { detail?: unknown; message?: unknown; error?: unknown };
     const detail = payload.detail ?? payload.message ?? payload.error;
     if (typeof detail === 'string') return detail;
+    if (detail && typeof detail === 'object' && !Array.isArray(detail)) {
+      const message = (detail as { message?: unknown }).message;
+      if (typeof message === 'string') return message;
+    }
     if (Array.isArray(detail)) {
       return detail
         .map(formatValidationDetail)

@@ -1,0 +1,567 @@
+"""
+@Time       : 2026/08/12 01:00
+@Author     : zhanglp8181
+@File       : import_service.py
+@CallChain  : GeneralSkill ImportJob API → ImportJobService → normalizer/object store/SQLModel
+@Description: 编排上传暂存、脱敏预览、checksum 确认、不可变修订和默认 pinned 绑定。
+"""
+
+from __future__ import annotations
+
+import base64
+import binascii
+import hashlib
+import json
+import re
+from datetime import timedelta
+from pathlib import PurePath
+from typing import Any
+
+from sqlalchemy.exc import IntegrityError
+from sqlmodel import Session, select
+
+from app.db.models import (
+    AgentResourceBinding,
+    GeneralSkill,
+    GeneralSkillImportJob,
+    GeneralSkillRevision,
+    User,
+    utc_now,
+)
+from app.general_skills.import_schema import (
+    GeneralSkillImportCandidateRead,
+    GeneralSkillImportConfirm,
+    GeneralSkillImportJobCreate,
+    GeneralSkillImportJobRead,
+)
+from app.general_skills.lifecycle import (
+    GeneralSkillLifecycleError,
+    ImportJobStatus,
+    RevisionStatus,
+    transition_import_job,
+    transition_revision,
+)
+from app.general_skills.object_store import FileSystemSkillObjectStore, SkillObjectStoreError
+from app.general_skills.package_security import (
+    GeneralSkillPackageError,
+    SkillCandidate,
+    normalize_zip_package,
+)
+from app.security.permissions import ensure_agent_scope_manager
+from app.security.tenant import ensure_tenant
+
+
+SLUG_INVALID = re.compile(r"[^a-z0-9]+")
+
+
+class GeneralSkillImportError(RuntimeError):
+    """向 API 暴露稳定错误码、HTTP 状态和脱敏摘要的领域错误。"""
+
+    def __init__(self, error_code: str, detail: str, status_code: int) -> None:
+        """保存调用方可安全显示的结构化导入失败。"""
+
+        super().__init__(detail)
+        self.error_code = error_code
+        self.status_code = status_code
+
+
+class GeneralSkillImportService:
+    """在单一事务边界内管理用户私有 Skill 的预览和确认。"""
+
+    def __init__(self, db: Session, object_store: FileSystemSkillObjectStore) -> None:
+        """绑定请求 Session 和部署级内容对象存储。"""
+
+        self.db = db
+        self.object_store = object_store
+
+    def create_upload_job(
+        self,
+        request: GeneralSkillImportJobCreate,
+        *,
+        idempotency_key: str,
+        current_user: User,
+    ) -> GeneralSkillImportJobRead:
+        """鉴权、严格解码并同步形成可跨刷新恢复的 awaiting-approval 作业。"""
+
+        ensure_tenant(self.db, request.tenant_id)
+        ensure_agent_scope_manager(
+            self.db,
+            request.tenant_id,
+            request.target_agent_id,
+            current_user,
+        )
+        key = _validated_idempotency_key(idempotency_key)
+        payload = _decode_base64(request.content_base64)
+        raw_checksum = hashlib.sha256(payload).hexdigest()
+        existing = self.db.exec(
+            select(GeneralSkillImportJob).where(
+                GeneralSkillImportJob.tenant_id == request.tenant_id,
+                GeneralSkillImportJob.owner_user_id == current_user.id,
+                GeneralSkillImportJob.idempotency_key == key,
+                GeneralSkillImportJob.attempt == 1,
+            )
+        ).first()
+        if existing:
+            if existing.raw_checksum and existing.raw_checksum != raw_checksum:
+                raise GeneralSkillImportError(
+                    "GENERAL_SKILL_STATE_CONFLICT",
+                    "idempotency key was already used for different content",
+                    409,
+                )
+            return import_job_read(existing)
+        now = utc_now()
+        job = GeneralSkillImportJob(
+            tenant_id=request.tenant_id,
+            owner_user_id=current_user.id,
+            target_agent_id=request.target_agent_id,
+            source_kind=request.source_kind,
+            source_reference_redacted=_redacted_filename(request.filename),
+            raw_checksum=raw_checksum,
+            idempotency_key=key,
+            expires_at=now + timedelta(hours=24),
+            created_at=now,
+            updated_at=now,
+        )
+        self.db.add(job)
+        try:
+            self.db.commit()
+        except IntegrityError as exc:
+            self.db.rollback()
+            raise GeneralSkillImportError(
+                "GENERAL_SKILL_STATE_CONFLICT",
+                "an import with this idempotency key already exists",
+                409,
+            ) from exc
+        try:
+            return self._normalize_upload(job, payload)
+        except GeneralSkillPackageError as exc:
+            self._fail_job(job, exc.error_code, str(exc))
+            return import_job_read(job)
+        except SkillObjectStoreError as exc:
+            self._fail_job(job, "GENERAL_SKILL_STORAGE_UNAVAILABLE", str(exc))
+            return import_job_read(job)
+
+    def get_job(self, job_id: str, *, current_user: User) -> GeneralSkillImportJobRead:
+        """按 tenant/user 双边界读取作业，管理员也不能跨 tenant 枚举。"""
+
+        job = self._owned_job(job_id, current_user)
+        return import_job_read(job)
+
+    def cancel_job(
+        self,
+        job_id: str,
+        *,
+        expected_row_version: int,
+        current_user: User,
+    ) -> GeneralSkillImportJobRead:
+        """幂等取消未终态作业并同步释放其暂存对象和配额。"""
+
+        job = self._owned_job(job_id, current_user)
+        if job.status == ImportJobStatus.CANCELLED:
+            return import_job_read(job)
+        try:
+            transition_import_job(
+                job,
+                ImportJobStatus.CANCELLED,
+                expected_row_version=expected_row_version,
+            )
+        except GeneralSkillLifecycleError as exc:
+            raise _state_conflict(exc) from exc
+        self.object_store.release_staging(job.id)
+        job.quota_bytes = 0
+        self.db.add(job)
+        self.db.commit()
+        self.db.refresh(job)
+        return import_job_read(job)
+
+    def confirm_job(
+        self,
+        job_id: str,
+        request: GeneralSkillImportConfirm,
+        *,
+        current_user: User,
+    ) -> GeneralSkillImportJobRead:
+        """重新鉴权并原子发布所选候选、不可变修订和默认 pinned 绑定。"""
+
+        job = self._owned_job(job_id, current_user)
+        ensure_agent_scope_manager(
+            self.db,
+            job.tenant_id,
+            job.target_agent_id,
+            current_user,
+        )
+        if job.status == ImportJobStatus.INSTALLED:
+            return import_job_read(job)
+        if job.status != ImportJobStatus.AWAITING_APPROVAL:
+            raise GeneralSkillImportError(
+                "GENERAL_SKILL_STATE_CONFLICT", "import job is not awaiting approval", 409
+            )
+        if job.preview_checksum != request.preview_checksum:
+            raise GeneralSkillImportError(
+                "GENERAL_SKILL_PREVIEW_MISMATCH",
+                "preview checksum no longer matches the reviewed package",
+                422,
+            )
+        candidate_ids = list(dict.fromkeys(request.candidate_ids))
+        candidates = {
+            str(candidate["candidate_id"]): candidate
+            for candidate in job.preview_json.get("candidates", [])
+            if isinstance(candidate, dict) and candidate.get("candidate_id")
+        }
+        if len(candidate_ids) != len(request.candidate_ids) or any(
+            candidate_id not in candidates for candidate_id in candidate_ids
+        ):
+            raise GeneralSkillImportError(
+                "GENERAL_SKILL_PACKAGE_INVALID", "candidate selection is invalid", 400
+            )
+        try:
+            transition_import_job(
+                job,
+                ImportJobStatus.CONFIRMING,
+                expected_row_version=request.expected_row_version,
+            )
+            revision_ids = [
+                self._install_candidate(job, candidates[candidate_id], current_user)
+                for candidate_id in candidate_ids
+            ]
+            transition_import_job(
+                job,
+                ImportJobStatus.INSTALLED,
+                expected_row_version=job.row_version,
+            )
+            job.installed_revision_ids_json = revision_ids
+            self.object_store.release_staging(job.id)
+            job.quota_bytes = 0
+            self.db.add(job)
+            self.db.commit()
+        except GeneralSkillLifecycleError as exc:
+            self.db.rollback()
+            raise _state_conflict(exc) from exc
+        except (IntegrityError, SkillObjectStoreError) as exc:
+            self.db.rollback()
+            raise GeneralSkillImportError(
+                "GENERAL_SKILL_STORAGE_UNAVAILABLE",
+                "confirmed package could not be committed atomically",
+                503,
+            ) from exc
+        self.db.refresh(job)
+        return import_job_read(job)
+
+    def _normalize_upload(
+        self,
+        job: GeneralSkillImportJob,
+        payload: bytes,
+    ) -> GeneralSkillImportJobRead:
+        """按完整状态主链规范化上传包、写暂存对象并生成 checksum 预览。"""
+
+        for target in (ImportJobStatus.FETCHING, ImportJobStatus.FETCHED):
+            transition_import_job(job, target, expected_row_version=job.row_version)
+        transition_import_job(job, ImportJobStatus.NORMALIZING, expected_row_version=job.row_version)
+        package = normalize_zip_package(payload)
+        transition_import_job(job, ImportJobStatus.NORMALIZED, expected_row_version=job.row_version)
+        unique_resources = {
+            resource.content_checksum: resource
+            for candidate in package.candidates
+            for resource in candidate.resources
+        }
+        self.object_store.stage_resources(job.id, tuple(unique_resources.values()))
+        transition_import_job(job, ImportJobStatus.ANALYZING, expected_row_version=job.row_version)
+        candidates = [_candidate_preview(candidate) for candidate in package.candidates]
+        preview_payload = {
+            "schema_version": 1,
+            "normalized_checksum": package.normalized_checksum,
+            "candidates": candidates,
+        }
+        job.normalized_checksum = package.normalized_checksum
+        job.preview_json = preview_payload
+        job.preview_checksum = _canonical_checksum(preview_payload)
+        job.staging_manifest_json = [
+            {
+                "checksum": resource.content_checksum,
+                "size": resource.size,
+                "media_type": resource.media_type,
+            }
+            for resource in sorted(unique_resources.values(), key=lambda item: item.content_checksum)
+        ]
+        job.quota_bytes = package.expanded_bytes
+        transition_import_job(
+            job,
+            ImportJobStatus.AWAITING_APPROVAL,
+            expected_row_version=job.row_version,
+        )
+        self.db.add(job)
+        self.db.commit()
+        self.db.refresh(job)
+        return import_job_read(job)
+
+    def _fail_job(self, job: GeneralSkillImportJob, error_code: str, detail: str) -> None:
+        """将非终态作业落为失败并清理可能已产生的暂存对象。"""
+
+        transition_import_job(
+            job,
+            ImportJobStatus.FAILED,
+            expected_row_version=job.row_version,
+            error_code=error_code,
+            error_detail_redacted=detail,
+        )
+        self.object_store.release_staging(job.id)
+        job.quota_bytes = 0
+        self.db.add(job)
+        self.db.commit()
+        self.db.refresh(job)
+
+    def _owned_job(self, job_id: str, current_user: User) -> GeneralSkillImportJob:
+        """按当前用户 tenant 和 owner 同时定位作业，越权统一表现为不可用。"""
+
+        job = self.db.exec(
+            select(GeneralSkillImportJob).where(
+                GeneralSkillImportJob.id == job_id,
+                GeneralSkillImportJob.tenant_id == current_user.tenant_id,
+                GeneralSkillImportJob.owner_user_id == current_user.id,
+            )
+        ).first()
+        if not job:
+            raise GeneralSkillImportError(
+                "GENERAL_SKILL_NOT_AVAILABLE", "import job is not available", 404
+            )
+        return job
+
+    def _install_candidate(
+        self,
+        job: GeneralSkillImportJob,
+        candidate: dict[str, Any],
+        current_user: User,
+    ) -> str:
+        """创建独立 Skill 根、published revision 和当前 Agent 的 pinned 绑定。"""
+
+        resources = candidate.get("resources")
+        if not isinstance(resources, list):
+            raise GeneralSkillImportError(
+                "GENERAL_SKILL_PACKAGE_INVALID", "candidate resources are invalid", 400
+            )
+        promoted_manifest: list[dict[str, object]] = []
+        legacy_files: list[dict[str, object]] = []
+        markdown = ""
+        for resource in resources:
+            if not isinstance(resource, dict):
+                raise GeneralSkillImportError(
+                    "GENERAL_SKILL_PACKAGE_INVALID", "candidate resource is invalid", 400
+                )
+            checksum = str(resource["content_checksum"])
+            content = self.object_store.read_staged_or_object(job.id, checksum)
+            object_key = self.object_store.promote(job.id, checksum)
+            relative_path = str(resource["relative_path"])
+            is_text = bool(resource["is_text"])
+            promoted_manifest.append({**resource, "object_key": object_key})
+            if is_text:
+                text_content = content.decode("utf-8", errors="strict")
+                legacy_files.append(
+                    {
+                        "path": relative_path,
+                        "content": text_content,
+                        "size": len(content),
+                        "mime_type": str(resource["media_type"]),
+                    }
+                )
+                if relative_path == "SKILL.md":
+                    markdown = text_content
+        if not markdown:
+            raise GeneralSkillImportError(
+                "GENERAL_SKILL_PACKAGE_INVALID", "selected candidate has no SKILL.md", 400
+            )
+        skill = GeneralSkill(
+            tenant_id=job.tenant_id,
+            slug=self._unique_slug(job.tenant_id, str(candidate["name"])),
+            name=str(candidate["name"]),
+            description=str(candidate["description"]),
+            skill_markdown=markdown,
+            skill_files_json=legacy_files,
+            metadata_json={
+                "created_by_user_id": current_user.id,
+                "import_job_id": job.id,
+                "source_kind": job.source_kind,
+            },
+            status="published",
+            permissions_json={"requested_tools": list(candidate.get("allowed_tools", []))},
+            runtime_config_json={},
+            usage_mode="planning_guidance",
+            owner_user_id=current_user.id,
+            visibility_scope="agent_private",
+        )
+        self.db.add(skill)
+        self.db.flush()
+        revision = GeneralSkillRevision(
+            tenant_id=job.tenant_id,
+            skill_id=skill.id,
+            revision_number=1,
+            content_checksum=str(candidate["content_checksum"]),
+            manifest_checksum=str(candidate["manifest_checksum"]),
+            normalized_skill_markdown=markdown,
+            parsed_metadata_json=dict(candidate.get("metadata", {})),
+            resource_manifest_json=promoted_manifest,
+            requested_capabilities_json={
+                "allowed_tools": list(candidate.get("allowed_tools", []))
+            },
+            source_snapshot_json={
+                "source_kind": job.source_kind,
+                "source_reference_redacted": job.source_reference_redacted,
+                "raw_checksum": job.raw_checksum,
+                "normalized_checksum": job.normalized_checksum,
+                "import_job_id": job.id,
+            },
+            created_by=current_user.id,
+        )
+        transition_revision(revision, RevisionStatus.REVIEWING, expected_row_version=1)
+        transition_revision(revision, RevisionStatus.PUBLISHED, expected_row_version=2)
+        self.db.add(revision)
+        self.db.flush()
+        skill.current_published_revision_id = revision.id
+        skill.row_version += 1
+        self.db.add(skill)
+        binding = AgentResourceBinding(
+            tenant_id=job.tenant_id,
+            agent_id=job.target_agent_id,
+            resource_type="general_skill",
+            resource_id=skill.id,
+            status="active",
+            metadata_json={
+                "schema_version": 1,
+                "revision_policy": "pinned",
+                "pinned_revision_id": revision.id,
+                "invocation_policy": "model_allowed",
+                "atomic_execution_allowed": False,
+                "created_by_user_id": current_user.id,
+            },
+        )
+        self.db.add(binding)
+        return revision.id
+
+    def _unique_slug(self, tenant_id: str, name: str) -> str:
+        """生成租户内不覆盖既有 Skill 的稳定可读 slug。"""
+
+        base = SLUG_INVALID.sub("-", name.lower()).strip("-") or "imported-skill"
+        base = base[:160]
+        candidate = base
+        suffix = 2
+        while self.db.exec(
+            select(GeneralSkill.id).where(
+                GeneralSkill.tenant_id == tenant_id,
+                GeneralSkill.slug == candidate,
+            )
+        ).first():
+            candidate = f"{base[:150]}-{suffix}"
+            suffix += 1
+        return candidate
+
+
+def import_job_read(job: GeneralSkillImportJob) -> GeneralSkillImportJobRead:
+    """把持久化作业转换为不暴露 owner、credential 或正文的 API 投影。"""
+
+    candidates = [
+        GeneralSkillImportCandidateRead.model_validate(candidate)
+        for candidate in job.preview_json.get("candidates", [])
+        if isinstance(candidate, dict)
+    ]
+    return GeneralSkillImportJobRead(
+        id=job.id,
+        tenant_id=job.tenant_id,
+        target_agent_id=job.target_agent_id,
+        source_kind=job.source_kind,
+        source_reference_redacted=job.source_reference_redacted,
+        status=job.status,
+        attempt=job.attempt,
+        raw_checksum=job.raw_checksum,
+        normalized_checksum=job.normalized_checksum,
+        preview_checksum=job.preview_checksum,
+        quota_bytes=job.quota_bytes,
+        error_code=job.error_code,
+        error_detail_redacted=job.error_detail_redacted,
+        candidates=candidates,
+        expires_at=job.expires_at.isoformat(),
+        row_version=job.row_version,
+        installed_revision_ids=list(job.installed_revision_ids_json or []),
+    )
+
+
+def _candidate_preview(candidate: SkillCandidate) -> dict[str, object]:
+    """生成不含正文、但足以核验内容树和权限候选的预览。"""
+
+    resources = [
+        {
+            "relative_path": _relative_candidate_path(resource.path, candidate.root),
+            "content_checksum": resource.content_checksum,
+            "size": resource.size,
+            "media_type": resource.media_type,
+            "is_text": resource.is_text,
+        }
+        for resource in candidate.resources
+    ]
+    return {
+        "candidate_id": candidate.candidate_id,
+        "manifest_path": candidate.manifest_path,
+        "name": candidate.name,
+        "description": candidate.description,
+        "content_checksum": candidate.content_checksum,
+        "manifest_checksum": candidate.manifest_checksum,
+        "metadata": candidate.metadata,
+        "allowed_tools": list(candidate.allowed_tools),
+        "resources": resources,
+    }
+
+
+def _decode_base64(value: str) -> bytes:
+    """严格解码上传正文，拒绝非 base64 字符和空包。"""
+
+    try:
+        payload = base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise GeneralSkillImportError(
+            "GENERAL_SKILL_PACKAGE_INVALID", "upload content is not valid base64", 400
+        ) from exc
+    if not payload:
+        raise GeneralSkillImportError(
+            "GENERAL_SKILL_PACKAGE_INVALID", "upload package is empty", 400
+        )
+    return payload
+
+
+def _validated_idempotency_key(value: str) -> str:
+    """限制幂等键长度和字符，避免把凭据或正文误写入索引。"""
+
+    normalized = value.strip()
+    if not re.fullmatch(r"[A-Za-z0-9._:-]{8,128}", normalized):
+        raise GeneralSkillImportError(
+            "GENERAL_SKILL_PACKAGE_INVALID", "Idempotency-Key is invalid", 400
+        )
+    return normalized
+
+
+def _redacted_filename(value: str) -> str:
+    """只保留无路径的上传文件名作为来源展示。"""
+
+    normalized = value.replace("\\", "/")
+    return PurePath(normalized.rsplit("/", 1)[-1]).name[:255]
+
+
+def _relative_candidate_path(path: str, root: str) -> str:
+    """从规范包路径生成候选根内相对路径。"""
+
+    return path[len(root) + 1 :] if root else path
+
+
+def _canonical_checksum(value: object) -> str:
+    """计算 preview 等结构化契约的规范 JSON checksum。"""
+
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _state_conflict(exc: Exception) -> GeneralSkillImportError:
+    """把内部状态机异常转换为稳定的 409 API 错误。"""
+
+    return GeneralSkillImportError("GENERAL_SKILL_STATE_CONFLICT", str(exc), 409)

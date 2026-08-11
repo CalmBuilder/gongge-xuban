@@ -315,10 +315,14 @@ def is_bound_resource_visible_for_agent(
     resource: object,
     binding: AgentResourceBinding,
 ) -> bool:
+    """按绑定状态、显式可见范围和旧 metadata 兼容规则判断 Agent 是否可见资源。"""
+
     if binding.status == "deleted":
         return False
     if getattr(resource, "tenant_id", None) != tenant_id:
         return False
+    if getattr(resource, "visibility_scope", None) in {"user_private", "agent_private"}:
+        return True
     if _binding_is_private(binding) or _metadata_is_private(_resource_metadata(resource)):
         return True
     return is_open_gallery_resource(db, tenant_id, resource_type, resource)

@@ -80,6 +80,8 @@ class Settings(BaseSettings):
     general_skill_pip_index_url: str = ""
     general_skill_pip_timeout_seconds: int = 180
     general_skill_network_install: bool = False
+    general_skill_import_v2_enabled: bool = False
+    general_skill_object_store_path: str = "./data/general-skill-objects"
 
     model_config = SettingsConfigDict(
         env_file=desktop_env_value("DOTENV", str(DEFAULT_DOTENV_PATH)),
