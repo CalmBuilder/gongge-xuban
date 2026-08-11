@@ -3,7 +3,7 @@
  * @Author     : zhanglp8181
  * @File       : ConnectionsPage.test.tsx
  * @CallChain  : Vitest → ConnectionsPage → connection client contracts
- * @Description: 验证连接档案脱敏展示、企业微信/Slack 建档、健康探测和 Agent 绑定撤权。
+ * @Description: 验证连接说明、企业微信完整引导、档案脱敏、健康探测和 Agent 绑定撤权。
  */
 
 import { render, screen, waitFor } from '@testing-library/react';
@@ -171,6 +171,30 @@ it('展示账号身份链但不显示 secret reference 或 token', async () => {
   expect(screen.getByText('channels:read')).toBeInTheDocument();
   expect(screen.queryByText(/xoxb/)).not.toBeInTheDocument();
   expect(screen.queryByText(/secret_ref/)).not.toBeInTheDocument();
+});
+
+it('用完整指南说明连接边界、接入步骤和数字员工演示场景', async () => {
+  /** 验证用户能从页面理解为什么连接，并从指南直接进入企业微信建档。 */
+
+  const user = userEvent.setup();
+  renderPage();
+  await screen.findByText('合同工作区');
+
+  expect(screen.getByText('让员工在企业微信里发起任务，由受控的数字员工继续处理')).toBeInTheDocument();
+  expect(screen.getByText(/不会自动读取通讯录/)).toBeInTheDocument();
+  await user.click(screen.getByRole('button', { name: '接入与演示指南' }));
+
+  expect(await screen.findByText('企业微信连接：从创建到一次真实任务')).toBeInTheDocument();
+  expect(screen.getByText('连接后可以')).toBeInTheDocument();
+  expect(screen.getByText('连接后不会')).toBeInTheDocument();
+  expect(screen.getByText('完整示例：创建企业微信连接并测试成功')).toBeInTheDocument();
+  expect(screen.getByText('演示场景：让数字员工查询企业微信应用信息')).toBeInTheDocument();
+  expect(screen.getByText('“测试动态任务：查询当前企业微信应用信息”')).toBeInTheDocument();
+  expect(screen.getByText(/验签消息 → 确认发送者映射/)).toBeInTheDocument();
+
+  await user.click(screen.getByRole('button', { name: '开始创建连接' }));
+  expect(await screen.findByRole('dialog')).toHaveTextContent('连接企业微信');
+  expect(screen.getByLabelText('企业 ID（CorpID）')).toBeInTheDocument();
 });
 
 it('默认创建企业微信连接并生成档案专属回调配置', async () => {

@@ -3,7 +3,7 @@
  * @Author     : zhanglp8181
  * @File       : connection-profiles.fullstack.e2e.ts
  * @CallChain  : Playwright Chromium → 单端口 FastAPI/SQLite → ConnectionProfile/Attention
- * @Description: 验证连接控制面、显式 Agent 绑定和重授权待办的真实浏览器闭环。
+ * @Description: 验证连接指南、控制面、显式 Agent 绑定和重授权待办的真实浏览器闭环。
  */
 
 import { expect, test, type Page } from '@playwright/test';
@@ -28,6 +28,28 @@ async function login(page: Page) {
   });
   expect(status).toBe(200);
 }
+
+test('真实 Chromium 从连接价值说明进入完整企业微信示例和建档操作', async ({ page }) => {
+  /** 验证产品内指南同时覆盖能力边界、八步接入、数字员工演示及操作衔接。 */
+
+  await login(page);
+  await page.goto('/enterprise/connections');
+
+  await expect(page.getByRole('region', { name: '外部连接用途说明' })).toContainText('让员工在企业微信里发起任务');
+  await page.getByRole('button', { name: '接入与演示指南' }).click();
+  const guide = page.getByRole('dialog', { name: '企业微信连接：从创建到一次真实任务' });
+  await expect(guide.getByText('连接后可以')).toBeVisible();
+  await expect(guide.getByText('连接后不会')).toBeVisible();
+  await expect(guide.getByText('完整示例：创建企业微信连接并测试成功')).toBeVisible();
+  await expect(guide.getByText('演示场景：让数字员工查询企业微信应用信息')).toBeVisible();
+  await expect(guide.getByText(/验签消息 → 确认发送者映射/)).toBeVisible();
+
+  await guide.getByRole('button', { name: '开始创建连接' }).click();
+  const createDialog = page.getByRole('dialog', { name: '连接企业微信' });
+  await expect(createDialog.getByLabel('企业 ID（CorpID）')).toBeVisible();
+  await expect(createDialog.getByLabel('应用 AgentId')).toBeVisible();
+  await expect(createDialog.getByLabel('应用 Secret')).toBeVisible();
+});
 
 test('真实 Chromium 创建连接、显式绑定并停用，响应不泄露凭据', async ({ page }) => {
   const browserErrors: string[] = [];

@@ -3,15 +3,18 @@
  * @Author     : zhanglp8181
  * @File       : ConnectionsPage.tsx
  * @CallChain  : 企业连接管理 → connection API client → ConnectionProfile/Agent binding
- * @Description: 管理企业微信/Slack 多账号身份、最小 scope、Agent 绑定、健康与凭据轮换。
+ * @Description: 管理企业微信/Slack 连接，并提供企业微信从建档、验收到数字员工任务演示的完整引导。
  */
 
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
 import {
   Activity,
+  ArrowRight,
   Bot,
+  BookOpen,
   Cable,
   CheckCircle2,
+  CircleX,
   Copy,
   KeyRound,
   Link2,
@@ -121,6 +124,7 @@ export default function ConnectionsPage({
   const [selectedInboundAgentId, setSelectedInboundAgentId] = useState('');
   const [eventUserSelections, setEventUserSelections] = useState<Record<string, string>>({});
   const [pendingDisable, setPendingDisable] = useState<ConnectionProfileRead | null>(null);
+  const [guideOpen, setGuideOpen] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -474,6 +478,9 @@ export default function ConnectionsPage({
           </p>
         </div>
         <div className="flex gap-[8px]">
+          <Button variant="outline" onClick={() => setGuideOpen(true)}>
+            <BookOpen className="size-[14px]" />接入与演示指南
+          </Button>
           <Button variant="outline" onClick={() => void load()} disabled={loading}>
             <RefreshCw className={cn('size-[14px]', loading && 'animate-spin')} />刷新
           </Button>
@@ -482,6 +489,26 @@ export default function ConnectionsPage({
           </Button>
         </div>
       </div>
+
+      <section className="mt-[18px] overflow-hidden rounded-[18px] border border-[#dbe4fb] bg-[linear-gradient(105deg,#f6f8ff_0%,#ffffff_56%,#f3f8ff_100%)] shadow-[0_10px_30px_rgba(39,71,152,0.06)]" aria-label="外部连接用途说明">
+        <div className="grid grid-cols-[minmax(0,1.25fr)_minmax(340px,0.75fr)] items-center gap-[24px] px-[22px] py-[20px] max-[820px]:grid-cols-1">
+          <div>
+            <span className="font-mono text-[10px] font-semibold uppercase tracking-[0.16em] text-[var(--gg-cobalt)]">企业微信 × 数字员工</span>
+            <h2 className="mt-[7px] text-[18px] font-semibold tracking-[-0.02em] text-[var(--gg-ink)]">让员工在企业微信里发起任务，由受控的数字员工继续处理</h2>
+            <p className="mt-[7px] max-w-[760px] text-[12px] leading-[1.75] text-[var(--gg-slate)]">连接负责验证企业应用身份、接收验签消息和提供明确授权的外部能力；它不会自动读取通讯录、开放全部聊天记录，也不会让未绑定的数字员工使用企业账号。</p>
+            <Button variant="outline" className="mt-[13px] border-[#cbd8f8] bg-white text-[var(--gg-cobalt)] hover:bg-[#f5f8ff]" onClick={() => setGuideOpen(true)}>
+              查看从创建到测试成功的完整示例<ArrowRight className="size-[14px]" />
+            </Button>
+          </div>
+          <div className="grid grid-cols-[1fr_20px_1fr_20px_1fr] items-center rounded-[15px] border border-[#dfe6f5] bg-white/85 px-[14px] py-[16px] shadow-[0_6px_18px_rgba(45,66,114,0.05)] max-[480px]:grid-cols-1">
+            <GuideFlowStep icon={MessagesSquare} label="员工入口" value="企业微信消息" />
+            <ArrowRight className="size-[14px] text-[#9aa7c0] max-[480px]:mx-auto max-[480px]:rotate-90" />
+            <GuideFlowStep icon={ShieldCheck} label="安全边界" value="验签、授权、审计" />
+            <ArrowRight className="size-[14px] text-[#9aa7c0] max-[480px]:mx-auto max-[480px]:rotate-90" />
+            <GuideFlowStep icon={Bot} label="执行主体" value="已绑定数字员工" />
+          </div>
+        </div>
+      </section>
 
       <section className="mt-[18px] grid grid-cols-3 overflow-hidden rounded-[18px] border border-[var(--gg-border)] bg-white shadow-[var(--gg-shadow-card)] max-[720px]:grid-cols-1" aria-label="连接状态概览">
         <ConnectionMetric icon={Cable} label="连接账号" value={profiles.length} />
@@ -512,6 +539,83 @@ export default function ConnectionsPage({
           />
         ))}
       </section>
+
+      <Dialog open={guideOpen} onOpenChange={setGuideOpen}>
+        <DialogContent aria-describedby={undefined} className="max-h-[88vh] gap-[18px] overflow-y-auto rounded-[18px] sm:max-w-[880px]">
+          <div className="flex items-start gap-[12px]">
+            <span className="grid size-[42px] shrink-0 place-items-center rounded-[14px] bg-[#eaf0ff] text-[var(--gg-cobalt)]"><BookOpen className="size-[19px]" /></span>
+            <div>
+              <DialogTitle className="text-[17px] font-semibold tracking-[-0.02em] text-[var(--gg-ink)]">企业微信连接：从创建到一次真实任务</DialogTitle>
+              <p className="mt-[4px] text-[12px] leading-[1.65] text-[var(--gg-slate)]">以下流程来自“序伴集成测试”真实联调，可按顺序完成应用建档、消息接入、数字员工绑定和最终回复验证。</p>
+            </div>
+          </div>
+
+          <section className="grid gap-[12px] rounded-[15px] border border-[var(--gg-border)] p-[15px]" aria-labelledby="connection-purpose-title">
+            <GuideSectionTitle index="01" title="先明确为什么连接" id="connection-purpose-title" />
+            <div className="grid grid-cols-2 gap-[10px] max-[640px]:grid-cols-1">
+              <GuideBoundaryCard
+                icon={CheckCircle2}
+                title="连接后可以"
+                tone="positive"
+                items={[
+                  '验证企业微信自建应用身份，并读取当前应用基础信息。',
+                  '接收企业微信验签消息，交给唯一绑定的数字员工处理。',
+                  '在明确授权和风险确认后，把结果回复到企业微信。',
+                  '执行健康检查、凭据轮换、停用、重试和审计追踪。',
+                ]}
+              />
+              <GuideBoundaryCard
+                icon={CircleX}
+                title="连接后不会"
+                tone="negative"
+                items={[
+                  '不会自动读取企业通讯录、历史聊天或未声明的数据。',
+                  '不会让所有数字员工共享连接，必须逐个显式绑定。',
+                  '不会绕过租户、用户映射、动作白名单和人工确认。',
+                  '临时 HTTPS Tunnel 只能用于联调，不能代替正式生产入口。',
+                ]}
+              />
+            </div>
+          </section>
+
+          <section className="grid gap-[12px] rounded-[15px] border border-[#dbe4fb] bg-[#fbfcff] p-[15px]" aria-labelledby="connection-setup-title">
+            <GuideSectionTitle index="02" title="完整示例：创建企业微信连接并测试成功" id="connection-setup-title" />
+            <ol className="grid gap-[9px]">
+              <GuideInstruction index="1" title="创建企业微信测试应用">注册测试企业，在“应用管理”创建自建应用，设置可见范围，并记下企业 ID（CorpID）、AgentId 和 Secret。</GuideInstruction>
+              <GuideInstruction index="2" title="在本页建立连接">点击“连接企业微信”，填写显示名称和三项身份信息。系统会生成回调 Token 与 43 位 EncodingAESKey；点击“验证并连接”。</GuideInstruction>
+              <GuideInstruction index="3" title="配置消息回调">将建档成功后一次性显示的 URL、Token、EncodingAESKey 填入企业微信“接收消息服务器”，选择需要接收的消息事件并保存验证。</GuideInstruction>
+              <GuideInstruction index="4" title="配置企业可信 IP">将运行本系统的固定公网出口 IP 加入该自建应用的“企业可信 IP”。演示可使用 HTTPS Tunnel，但生产环境应使用稳定入口。</GuideInstruction>
+              <GuideInstruction index="5" title="确认连接健康">回到本页点击“健康检查”。卡片显示“连接健康”，并出现 <code className="font-mono text-[11px] text-[#244bc7]">application:read</code>，表示身份和最小读取授权已经验证。</GuideInstruction>
+              <GuideInstruction index="6" title="绑定数字员工和消息入口">打开“Agent 绑定”选择数字员工；再打开“消息接入”，把该员工设为唯一接收路由。企业微信成员第一次发消息后，在待授权队列中关联对应的平台用户。</GuideInstruction>
+              <GuideInstruction index="7" title="发送验证消息">在企业微信自建应用会话中发送“测试动态任务：查询当前企业微信应用信息”。首次发送者完成授权后原消息会自动恢复，无需重复创建任务。</GuideInstruction>
+              <GuideInstruction index="8" title="核对成功标准">企业微信收到一条任务回复；系统内产生一条可追踪 Execution，外部调用有唯一 Operation/回执，页面仍不显示 Secret、原始外部用户标识或消息正文。</GuideInstruction>
+            </ol>
+          </section>
+
+          <section className="grid gap-[12px] rounded-[15px] border border-[#cfe8d8] bg-[#f7fcf8] p-[15px]" aria-labelledby="connection-demo-title">
+            <GuideSectionTitle index="03" title="演示场景：让数字员工查询企业微信应用信息" id="connection-demo-title" />
+            <div className="grid grid-cols-[minmax(0,0.75fr)_24px_minmax(0,1.25fr)] items-stretch gap-[8px] max-[680px]:grid-cols-1">
+              <div className="rounded-[12px] bg-white px-[13px] py-[12px] shadow-[0_4px_14px_rgba(22,96,55,0.06)]">
+                <small className="font-mono text-[10px] text-[#087a38]">员工在企业微信发送</small>
+                <p className="mt-[6px] text-[13px] font-medium leading-[1.6] text-[var(--gg-ink)]">“测试动态任务：查询当前企业微信应用信息”</p>
+              </div>
+              <ArrowRight className="m-auto size-[15px] text-[#78a98b] max-[680px]:rotate-90" />
+              <div className="rounded-[12px] bg-white px-[13px] py-[12px] shadow-[0_4px_14px_rgba(22,96,55,0.06)]">
+                <small className="font-mono text-[10px] text-[#087a38]">系统执行链</small>
+                <p className="mt-[6px] text-[12px] leading-[1.65] text-[#465267]">验签消息 → 确认发送者映射 → 路由到已绑定数字员工 → DynamicTaskAgent 规划只读查询 → 使用该连接执行 <code className="font-mono text-[11px] text-[#087a38]">wecom.application_info</code> → 将结果回复原会话并记录审计。</p>
+              </div>
+            </div>
+            <div className="rounded-[12px] border border-dashed border-[#b9dac5] px-[13px] py-[10px] text-[11px] leading-[1.65] text-[#446151]">演示通过标准：回复内容来自真实连接而非预置文案；同一消息只形成一次执行和一次外部效果；凭据不进入模型上下文；未绑定 Agent、未授权用户或停用连接均在调用前被拒绝。</div>
+          </section>
+
+          <div className="flex flex-wrap justify-end gap-[8px]">
+            <Button variant="outline" onClick={() => setGuideOpen(false)}>关闭指南</Button>
+            <Button className="bg-[var(--gg-cobalt)] text-white hover:bg-[#244bc7]" onClick={() => { setGuideOpen(false); openCreate(); }}>
+              <Plus className="size-[14px]" />开始创建连接
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={secretMode !== null} onOpenChange={(open) => !open && closeSecretDialog()}>
         <DialogContent aria-describedby={undefined} className="gap-[16px] rounded-[16px] sm:max-w-[520px]">
@@ -740,6 +844,64 @@ export default function ConnectionsPage({
         </DialogContent>
       </Dialog>
     </div>
+  );
+}
+
+function GuideFlowStep({ icon: Icon, label, value }: { icon: typeof Bot; label: string; value: string }) {
+  /** 用连接领域的三个真实节点表达外部消息进入数字员工的受控链路。 */
+
+  return (
+    <span className="grid min-w-0 place-items-center gap-[5px] text-center">
+      <span className="grid size-[32px] place-items-center rounded-[11px] bg-[#edf2ff] text-[var(--gg-cobalt)]"><Icon className="size-[15px]" /></span>
+      <small className="text-[9px] text-[#8a93a8]">{label}</small>
+      <strong className="text-[11px] font-semibold text-[#3a4254]">{value}</strong>
+    </span>
+  );
+}
+
+function GuideSectionTitle({ index, title, id }: { index: string; title: string; id: string }) {
+  /** 用有意义的顺序编号标识指南的理解、接入和演示三个阶段。 */
+
+  return (
+    <div className="flex items-center gap-[9px]">
+      <span className="grid size-[27px] shrink-0 place-items-center rounded-full bg-[var(--gg-cobalt)] font-mono text-[10px] font-semibold text-white">{index}</span>
+      <h3 id={id} className="text-[13px] font-semibold text-[var(--gg-ink)]">{title}</h3>
+    </div>
+  );
+}
+
+function GuideBoundaryCard({
+  icon: Icon,
+  title,
+  tone,
+  items,
+}: {
+  icon: typeof CheckCircle2;
+  title: string;
+  tone: 'positive' | 'negative';
+  items: string[];
+}) {
+  /** 并列说明连接的能力与明确禁区，避免用户把外部连接理解成全量系统授权。 */
+
+  const positive = tone === 'positive';
+  return (
+    <div className={cn('rounded-[12px] border px-[13px] py-[12px]', positive ? 'border-[#cfe8d8] bg-[#f7fcf8]' : 'border-[#ecd9d6] bg-[#fffafa]')}>
+      <h4 className={cn('flex items-center gap-[7px] text-[12px] font-semibold', positive ? 'text-[#087a38]' : 'text-[#a33a31]')}><Icon className="size-[15px]" />{title}</h4>
+      <ul className="mt-[8px] grid gap-[6px]">
+        {items.map((item) => <li key={item} className="grid grid-cols-[8px_1fr] gap-[6px] text-[11px] leading-[1.6] text-[#59647a]"><span aria-hidden="true" className={cn('mt-[7px] size-[4px] rounded-full', positive ? 'bg-[#42a66a]' : 'bg-[#cf756d]')} />{item}</li>)}
+      </ul>
+    </div>
+  );
+}
+
+function GuideInstruction({ index, title, children }: { index: string; title: string; children: ReactNode }) {
+  /** 展示一项可执行且可核对的企业微信接入步骤。 */
+
+  return (
+    <li className="grid grid-cols-[26px_1fr] gap-[10px] rounded-[11px] border border-[#e5e9f2] bg-white px-[11px] py-[10px]">
+      <span className="grid size-[24px] place-items-center rounded-[8px] bg-[#edf2ff] font-mono text-[10px] font-semibold text-[var(--gg-cobalt)]">{index}</span>
+      <span><strong className="block text-[11px] font-semibold text-[#3a4254]">{title}</strong><span className="mt-[2px] block text-[11px] leading-[1.65] text-[var(--gg-slate)]">{children}</span></span>
+    </li>
   );
 }
 
