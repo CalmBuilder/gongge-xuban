@@ -61,6 +61,7 @@ def import_api_context(
         password_hash="unused",
     )
     db.add(Tenant(id="tenant_a", name="Tenant A"))
+    db.add(Tenant(id="tenant_b", name="Tenant B"))
     db.add(owner)
     db.add(other)
     db.add(
@@ -69,6 +70,14 @@ def import_api_context(
             tenant_id="tenant_a",
             name="购物售后助手",
             owner_user_id=owner.id,
+        )
+    )
+    db.add(
+        AgentProfile(
+            id="agent_other",
+            tenant_id="tenant_a",
+            name="Other Agent",
+            owner_user_id=other.id,
         )
     )
     db.commit()
@@ -197,6 +206,29 @@ def test_api_hides_owner_job_from_another_user(
     )
     assert hidden.status_code == 404
     assert hidden.json()["detail"]["error_code"] == "GENERAL_SKILL_NOT_AVAILABLE"
+
+
+@pytest.mark.parametrize(
+    ("tenant_id", "agent_id"),
+    [("tenant_b", "agent_owner"), ("tenant_a", "agent_other")],
+)
+def test_api_rejects_cross_tenant_or_unmanaged_agent_import(
+    import_api_context: tuple[TestClient, Session, dict[str, str]],
+    tenant_id: str,
+    agent_id: str,
+) -> None:
+    """验证请求正文不能把当前用户提升为跨租户或其他用户 Agent 的安装者。"""
+
+    client, _, tokens = import_api_context
+    payload = _upload_json()
+    payload.update({"tenant_id": tenant_id, "target_agent_id": agent_id})
+    response = client.post(
+        "/api/enterprise/general-skill-import-jobs",
+        headers=_auth(tokens["owner"], idempotency_key=f"cross-boundary-{agent_id}"),
+        json=payload,
+    )
+
+    assert response.status_code in {403, 404}
 
 
 def test_api_feature_flag_defaults_closed(

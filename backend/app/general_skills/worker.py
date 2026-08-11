@@ -18,7 +18,7 @@ from sqlmodel import Session, select
 from app.config import get_settings
 from app.db import engine
 from app.db.models import GeneralSkillRevision, utc_now
-from app.general_skills.import_service import GeneralSkillImportService
+from app.general_skills.import_service import GeneralSkillImportService, ImportQuotaPolicy
 from app.general_skills.object_store import FileSystemSkillObjectStore
 
 
@@ -41,6 +41,12 @@ def run_maintenance_once() -> int:
         service = GeneralSkillImportService(
             db,
             FileSystemSkillObjectStore(settings.general_skill_object_store_path),
+            quota_policy=ImportQuotaPolicy(
+                tenant_active_jobs=settings.general_skill_import_tenant_active_limit,
+                user_active_jobs=settings.general_skill_import_user_active_limit,
+                tenant_staged_bytes=settings.general_skill_import_tenant_staged_bytes,
+                user_staged_bytes=settings.general_skill_import_user_staged_bytes,
+            ),
         )
         recovered = service.recover_stale_jobs(
             stale_before=now - timedelta(seconds=RECOVERY_STALE_SECONDS)

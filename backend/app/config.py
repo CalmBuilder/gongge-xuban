@@ -83,6 +83,18 @@ class Settings(BaseSettings):
     general_skill_import_v2_enabled: bool = False
     general_skill_object_store_path: str = "./data/general-skill-objects"
     general_skill_https_allowed_hosts: str = ""
+    general_skill_import_tenant_active_limit: int = Field(default=4, ge=1, le=8)
+    general_skill_import_user_active_limit: int = Field(default=2, ge=1, le=4)
+    general_skill_import_tenant_staged_bytes: int = Field(
+        default=500 * 1024 * 1024,
+        ge=1,
+        le=2 * 1024 * 1024 * 1024,
+    )
+    general_skill_import_user_staged_bytes: int = Field(
+        default=100 * 1024 * 1024,
+        ge=1,
+        le=500 * 1024 * 1024,
+    )
 
     model_config = SettingsConfigDict(
         env_file=desktop_env_value("DOTENV", str(DEFAULT_DOTENV_PATH)),

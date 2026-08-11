@@ -72,10 +72,16 @@ from app.security.tenant import ensure_tenant
 
 
 SLUG_INVALID = re.compile(r"[^a-z0-9]+")
-TENANT_ACTIVE_IMPORT_LIMIT = 4
-USER_ACTIVE_IMPORT_LIMIT = 2
-TENANT_STAGED_BYTE_LIMIT = 500 * 1024 * 1024
-USER_STAGED_BYTE_LIMIT = 100 * 1024 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class ImportQuotaPolicy:
+    """定义部署可收窄但不能超过平台硬上限的导入并发与暂存预算。"""
+
+    tenant_active_jobs: int = 4
+    user_active_jobs: int = 2
+    tenant_staged_bytes: int = 500 * 1024 * 1024
+    user_staged_bytes: int = 100 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,12 +113,14 @@ class GeneralSkillImportService:
         object_store: FileSystemSkillObjectStore,
         *,
         https_allowed_hosts: frozenset[str] | None = None,
+        quota_policy: ImportQuotaPolicy | None = None,
     ) -> None:
         """绑定请求 Session、对象存储和可选的公开 HTTPS 来源白名单。"""
 
         self.db = db
         self.object_store = object_store
         self.https_allowed_hosts = https_allowed_hosts
+        self.quota_policy = quota_policy or ImportQuotaPolicy()
 
     def create_upload_job(
         self,
@@ -820,8 +828,8 @@ class GeneralSkillImportService:
         """以条件更新同时预留 tenant/user 活动作业名额，任一级失败则整体回滚。"""
 
         scopes = (
-            ("tenant", tenant_id, TENANT_ACTIVE_IMPORT_LIMIT),
-            ("user", owner_user_id, USER_ACTIVE_IMPORT_LIMIT),
+            ("tenant", tenant_id, self.quota_policy.tenant_active_jobs),
+            ("user", owner_user_id, self.quota_policy.user_active_jobs),
         )
         for scope_kind, scope_id, _ in scopes:
             self._ensure_quota_row(tenant_id, scope_kind, scope_id)
@@ -888,8 +896,8 @@ class GeneralSkillImportService:
         if delta == 0:
             return
         scopes = (
-            ("tenant", job.tenant_id, TENANT_STAGED_BYTE_LIMIT),
-            ("user", job.owner_user_id, USER_STAGED_BYTE_LIMIT),
+            ("tenant", job.tenant_id, self.quota_policy.tenant_staged_bytes),
+            ("user", job.owner_user_id, self.quota_policy.user_staged_bytes),
         )
         for scope_kind, scope_id, byte_limit in scopes:
             statement = update(GeneralSkillImportQuota).where(

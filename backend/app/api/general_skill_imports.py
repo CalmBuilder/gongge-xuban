@@ -23,6 +23,7 @@ from app.general_skills.import_schema import (
 from app.general_skills.import_service import (
     GeneralSkillImportError,
     GeneralSkillImportService,
+    ImportQuotaPolicy,
 )
 from app.general_skills.object_store import FileSystemSkillObjectStore
 from app.general_skills.remote_source import RemoteFetcher, SecureHttpsFetcher
@@ -143,6 +144,12 @@ def _service(db: Session, settings: Settings) -> GeneralSkillImportService:
         db,
         FileSystemSkillObjectStore(settings.general_skill_object_store_path),
         https_allowed_hosts=settings.general_skill_https_allowed_host_set,
+        quota_policy=ImportQuotaPolicy(
+            tenant_active_jobs=settings.general_skill_import_tenant_active_limit,
+            user_active_jobs=settings.general_skill_import_user_active_limit,
+            tenant_staged_bytes=settings.general_skill_import_tenant_staged_bytes,
+            user_staged_bytes=settings.general_skill_import_user_staged_bytes,
+        ),
     )
 
 

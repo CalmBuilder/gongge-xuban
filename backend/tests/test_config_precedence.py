@@ -288,6 +288,25 @@ def test_connection_secret_backend_rejects_placeholder_or_short_master_key(
     assert settings.connection_secret_backend_configured is configured
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("general_skill_import_tenant_active_limit", 9),
+        ("general_skill_import_user_active_limit", 5),
+        ("general_skill_import_tenant_staged_bytes", 2 * 1024 * 1024 * 1024 + 1),
+        ("general_skill_import_user_staged_bytes", 500 * 1024 * 1024 + 1),
+    ],
+)
+def test_general_skill_import_quota_cannot_exceed_platform_hard_limit(
+    field: str,
+    value: int,
+) -> None:
+    """验证部署只能收窄导入预算，不能用环境变量越过平台安全上限。"""
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, public_mock_api_key="test-key", **{field: value})
+
+
 def test_active_production_tool_base_url_is_reachable_from_the_host() -> None:
     settings = Settings()
     hostname = urlsplit(settings.normalized_tool_base_url).hostname

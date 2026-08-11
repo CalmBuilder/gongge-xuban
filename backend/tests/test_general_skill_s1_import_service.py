@@ -804,6 +804,23 @@ def test_other_user_cannot_read_or_confirm_owner_job(tmp_path) -> None:
     assert db.exec(select(GeneralSkill)).all() == []
 
 
+def test_opaque_job_identifier_never_becomes_an_object_store_path(tmp_path) -> None:
+    """验证攻击者提供的路径片段只进入数据库等值查询，不能触发 staging 文件操作。"""
+
+    _, service, owner, _ = _context(tmp_path)
+    sentinel = tmp_path / "must-remain.txt"
+    sentinel.write_text("safe", encoding="utf-8")
+    with pytest.raises(GeneralSkillImportError) as captured:
+        service.cancel_job(
+            "../../must-remain.txt",
+            expected_row_version=1,
+            current_user=owner,
+        )
+
+    assert captured.value.error_code == "GENERAL_SKILL_NOT_AVAILABLE"
+    assert sentinel.read_text(encoding="utf-8") == "safe"
+
+
 def test_malicious_package_persists_failed_terminal_without_skill(tmp_path) -> None:
     """验证危险路径整包失败、错误可恢复查看且不会残留可运行 Skill。"""
 
