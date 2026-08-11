@@ -52,6 +52,10 @@ class Settings(BaseSettings):
     dynamic_task_explore_enabled: bool = False
     dynamic_task_managed_workspace_enabled: bool = False
     dynamic_task_managed_workspace_root: str = "./data/managed-code-workspaces"
+    general_skill_agent_proposal_enabled: bool = False
+    general_skill_agent_proposal_approval_ttl_seconds: int = Field(
+        default=900, ge=30, le=86_400
+    )
     dynamic_task_tenant_allowlist: str = ""
     dynamic_task_agent_allowlist: str = ""
     dynamic_task_signal_dispatch_workers: int = Field(default=4, ge=1, le=64)

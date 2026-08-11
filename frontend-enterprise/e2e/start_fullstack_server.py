@@ -276,6 +276,7 @@ def configure_environment(database_path: Path) -> None:
             "GENERAL_SKILL_OBJECT_STORE_PATH": str(E2E_RUNTIME_DIR / "general-skill-objects"),
             "GENERAL_SKILL_RESOLVER_V2_ENABLED": "true",
             "GENERAL_SKILL_DYNAMIC_GUIDANCE_ENABLED": "true",
+            "GENERAL_SKILL_AGENT_PROPOSAL_ENABLED": "true",
             "GONGGE_XUBAN_DATA_DIR": str(E2E_RUNTIME_DIR / "user-data"),
         }
     )
@@ -2203,7 +2204,60 @@ def install_schedule_llm_override() -> None:
                 "tdd",
                 "code-review",
             }
-            if full_delivery_names <= loaded_names:
+            loaded_ref_by_base = {
+                base: next(
+                    (
+                        name
+                        for name in loaded_names
+                        if name == base or name.startswith(f"{base}-")
+                    ),
+                    "",
+                )
+                for base in full_delivery_names
+            }
+
+            def delivery_refs(*names: str) -> list[str]:
+                """把展示名映射到本轮实际加载的唯一机器引用，兼容同名 slug 后缀。"""
+
+                return [loaded_ref_by_base[name] for name in names]
+            goal = str(user_payload.get("goal") or "")
+            if "S5创建Skill" in goal:
+                capability_names = {
+                    str(item.get("name") or "")
+                    for item in user_payload.get("capabilities", [])
+                    if isinstance(item, dict)
+                }
+                if "platform.general_skill.propose" not in capability_names:
+                    raise RuntimeError("S5 planner missed governed Skill proposal capability")
+                return {
+                    "goal": goal,
+                    "success_criteria": user_payload.get("success_criteria", []),
+                    "constraints": ["Agent 只能提出候选，发布必须由所有者在待我处理中心批准"],
+                    "assumptions": [],
+                    "steps": [
+                        {
+                            "draft_id": "propose_skill",
+                            "title": "提交 S5 Skill 提案",
+                            "kind": "tool.write",
+                            "required": True,
+                            "depends_on": [],
+                            "capability_refs": ["platform.general_skill.propose"],
+                            "guidance_skill_refs": [],
+                            "expected_output_schema": {},
+                        },
+                        {
+                            "draft_id": "answer",
+                            "title": "报告 S5 Skill 发布结果",
+                            "kind": "answer",
+                            "required": True,
+                            "depends_on": ["propose_skill"],
+                            "capability_refs": [],
+                            "guidance_skill_refs": [],
+                            "expected_output_schema": {},
+                        },
+                    ],
+                }
+            if all(loaded_ref_by_base.values()):
                 capability_names = {
                     str(item.get("name") or "")
                     for item in user_payload.get("capabilities", [])
@@ -2230,12 +2284,12 @@ def install_schedule_llm_override() -> None:
                             "required": True,
                             "depends_on": [],
                             "capability_refs": ["workspace.refund.apply-set"],
-                            "guidance_skill_refs": [
+                            "guidance_skill_refs": delivery_refs(
                                 "setup-matt-pocock-skills",
                                 "grill-with-docs",
                                 "grilling",
                                 "domain-modeling",
-                            ],
+                            ),
                             "expected_output_schema": {},
                         },
                         {
@@ -2245,11 +2299,9 @@ def install_schedule_llm_override() -> None:
                             "required": True,
                             "depends_on": ["setup_domain"],
                             "capability_refs": ["workspace.refund.apply-set"],
-                            "guidance_skill_refs": [
-                                "setup-matt-pocock-skills",
-                                "to-spec",
-                                "to-tickets",
-                            ],
+                            "guidance_skill_refs": delivery_refs(
+                                "setup-matt-pocock-skills", "to-spec", "to-tickets"
+                            ),
                             "expected_output_schema": {},
                         },
                         {
@@ -2259,7 +2311,7 @@ def install_schedule_llm_override() -> None:
                             "required": True,
                             "depends_on": ["spec_tickets"],
                             "capability_refs": ["workspace.refund.read"],
-                            "guidance_skill_refs": ["implement"],
+                            "guidance_skill_refs": delivery_refs("implement"),
                             "expected_output_schema": {},
                         },
                         {
@@ -2269,7 +2321,7 @@ def install_schedule_llm_override() -> None:
                             "required": True,
                             "depends_on": ["read"],
                             "capability_refs": ["workspace.refund.check"],
-                            "guidance_skill_refs": ["tdd"],
+                            "guidance_skill_refs": delivery_refs("tdd"),
                             "expected_output_schema": {},
                         },
                         {
@@ -2279,7 +2331,7 @@ def install_schedule_llm_override() -> None:
                             "required": True,
                             "depends_on": ["red"],
                             "capability_refs": ["workspace.refund.apply-set"],
-                            "guidance_skill_refs": ["implement", "tdd"],
+                            "guidance_skill_refs": delivery_refs("implement", "tdd"),
                             "expected_output_schema": {},
                         },
                         {
@@ -2289,7 +2341,7 @@ def install_schedule_llm_override() -> None:
                             "required": True,
                             "depends_on": ["apply"],
                             "capability_refs": ["workspace.refund.check"],
-                            "guidance_skill_refs": ["tdd"],
+                            "guidance_skill_refs": delivery_refs("tdd"),
                             "expected_output_schema": {},
                         },
                         {
@@ -2299,7 +2351,7 @@ def install_schedule_llm_override() -> None:
                             "required": True,
                             "depends_on": ["check"],
                             "capability_refs": ["workspace.refund.check"],
-                            "guidance_skill_refs": ["tdd"],
+                            "guidance_skill_refs": delivery_refs("tdd"),
                             "expected_output_schema": {},
                         },
                         {
@@ -2309,7 +2361,7 @@ def install_schedule_llm_override() -> None:
                             "required": True,
                             "depends_on": ["frontend_check"],
                             "capability_refs": ["workspace.refund.check"],
-                            "guidance_skill_refs": ["code-review"],
+                            "guidance_skill_refs": delivery_refs("code-review"),
                             "expected_output_schema": {},
                         },
                         {
@@ -2319,7 +2371,7 @@ def install_schedule_llm_override() -> None:
                             "required": True,
                             "depends_on": ["review"],
                             "capability_refs": ["workspace.refund.commit"],
-                            "guidance_skill_refs": ["implement"],
+                            "guidance_skill_refs": delivery_refs("implement"),
                             "expected_output_schema": {},
                         },
                         {
@@ -2329,7 +2381,7 @@ def install_schedule_llm_override() -> None:
                             "required": True,
                             "depends_on": ["commit"],
                             "capability_refs": [],
-                            "guidance_skill_refs": sorted(full_delivery_names),
+                            "guidance_skill_refs": sorted(loaded_ref_by_base.values()),
                             "expected_output_schema": {},
                         },
                     ],
@@ -2817,6 +2869,61 @@ def install_schedule_llm_override() -> None:
             )
             is_s4_diagnosis = "agent_e2e_diagnosis" in str(user_payload)
             is_s4 = "S4-DYNAMIC-FULL-GUIDANCE" in str(user_payload)
+            if step_title == "提交 S5 Skill 提案":
+                client._last_completed_response_metadata = {
+                    "response_id": "e2e-s5-proposal-response",
+                    "finish_reason": "stop",
+                    "usage": {"input_tokens": 12, "output_tokens": 10},
+                }
+                return {
+                    "action_kind": "call_tool",
+                    "arguments": {
+                        "name": "s5-refund-evidence-review",
+                        "description": "复核退款事实并生成带证据的售后结论。",
+                        "instructions": (
+                            "S5-PROPOSAL-GUIDANCE：先核对订单、物流和退款事实，"
+                            "再区分已证实与待确认事项，最后给出可审计结论。"
+                        ),
+                        "requested_tools": [],
+                        "files": [],
+                    },
+                    "capability_ref": "platform.general_skill.propose",
+                    "expected_output_schema": {},
+                    "rationale": "把当前分身总结的方法提交所有者审核，不自行发布",
+                }
+            if step_title == "报告 S5 Skill 发布结果":
+                execution_view = user_payload.get("provider_execution_view", {})
+                execution_context = (
+                    execution_view.get("execution_context", {})
+                    if isinstance(execution_view, dict)
+                    else {}
+                )
+                completed = [
+                    str(item.get("step_key") or "")
+                    for item in execution_context.get("completed_steps", [])
+                    if isinstance(item, dict) and item.get("step_key")
+                ]
+                criteria = [
+                    str(item.get("id") or "")
+                    for item in execution_context.get("success_criteria", [])
+                    if isinstance(item, dict) and item.get("id")
+                ]
+                client._last_completed_response_metadata = {
+                    "response_id": "e2e-s5-answer-response",
+                    "finish_reason": "stop",
+                    "usage": {"input_tokens": 8, "output_tokens": 8},
+                }
+                return {
+                    "action_kind": "answer",
+                    "arguments": {
+                        "markdown": "S5-PROPOSAL-PUBLISHED：Skill 已由所有者批准并绑定原分身。",
+                        "criterion_evidence": {criterion: completed for criterion in criteria},
+                        "pending_questions": [],
+                    },
+                    "capability_ref": None,
+                    "expected_output_schema": {},
+                    "rationale": "依据发布 Operation 回执报告结果",
+                }
             if is_s4_diagnosis:
                 client._last_completed_response_metadata = {
                     "response_id": (
@@ -3218,6 +3325,8 @@ def install_schedule_llm_override() -> None:
                 instructions = str(first.get("instructions") or "")
                 if "S3-AUTO-GUIDED" in instructions:
                     return "S3-AUTO-GUIDED：模型从有预算目录自动选择并消费了固定修订。"
+                if "S5-PROPOSAL-GUIDANCE" in instructions:
+                    return "S5-CONSUMED-SUCCESS：原分身已加载所有者批准的固定 Skill 修订。"
                 if "只返回 S3-GUIDED-SUCCESS" not in instructions:
                     raise RuntimeError("S3 guidance was not loaded from the fixed revision")
                 return "S3-GUIDED-SUCCESS：已按固定修订的售后核验指南完成本轮处理。"

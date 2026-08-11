@@ -974,17 +974,19 @@ test('S4 疑难诊断分身组合固定上游 Skill、知识、记忆和代码�
     ).then((response) => response.json());
     return { diagnosis, other } as {
       diagnosis: { items: Array<{ name: string; skill_id: string; revision_id: string }> };
-      other: { items: Array<{ name: string }> };
+      other: { items: Array<{ name: string; skill_id: string }> };
     };
   });
   const expectedSkills = ['codebase-design', 'diagnosing-bugs', 'tdd'];
   expect(catalogs.diagnosis.items.map((item) => item.name).sort()).toEqual(expectedSkills);
-  expect(catalogs.other.items.map((item) => item.name)).not.toEqual(expect.arrayContaining(expectedSkills));
   const diagnosisSkillIds = expectedSkills.map((name) => {
     const item = catalogs.diagnosis.items.find((candidate) => candidate.name === name);
     if (!item) throw new Error(`${name} is missing from diagnosis catalog`);
     return item.skill_id;
   });
+  expect(catalogs.other.items.map((item) => item.skill_id)).not.toEqual(
+    expect.arrayContaining(diagnosisSkillIds),
+  );
 
   const started = await page.evaluate(async (forcedSkillIds) => {
     const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };

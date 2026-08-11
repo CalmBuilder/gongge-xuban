@@ -197,6 +197,7 @@ def test_alembic_upgrades_empty_mysql_database(mysql_database_url: str) -> None:
     assert "general_skill_import_quotas" in tables
     assert "general_skill_source_credentials" in tables
     assert "general_skill_authorization_states" in tables
+    assert "general_skill_proposals" in tables
     assert "code_sets" in tables
     assert "code_items" in tables
     assert "organization_units" in tables
@@ -248,6 +249,13 @@ def test_alembic_upgrades_empty_mysql_database(mysql_database_url: str) -> None:
     tool_columns = {item["name"]: item for item in inspector.get_columns("tools")}
     general_skill_columns = {
         item["name"]: item for item in inspector.get_columns("general_skills")
+    }
+    proposal_columns = {
+        item["name"]: item for item in inspector.get_columns("general_skill_proposals")
+    }
+    proposal_constraints = {
+        item["name"]
+        for item in inspector.get_unique_constraints("general_skill_proposals")
     }
     agent_columns = {item["name"]: item for item in inspector.get_columns("agent_profiles")}
     session_columns = {item["name"]: item for item in inspector.get_columns("sessions")}
@@ -331,6 +339,25 @@ def test_alembic_upgrades_empty_mysql_database(mysql_database_url: str) -> None:
         "planning_guidance_checksum",
     }.issubset(general_skill_columns)
     assert {
+        "operation_id",
+        "attention_id",
+        "skill_id",
+        "revision_id",
+        "review_artifact_id",
+        "base_revision_id",
+        "base_content_checksum",
+        "proposal_checksum",
+        "status",
+        "row_version",
+        "published_binding_id",
+        "terminal_at",
+    }.issubset(proposal_columns)
+    assert {
+        "uq_general_skill_proposal_operation",
+        "uq_general_skill_proposal_revision",
+        "uq_general_skill_proposal_artifact",
+    }.issubset(proposal_constraints)
+    assert {
         "capability_snapshot_json",
         "capability_checksum",
         "preflight_status",
@@ -373,7 +400,7 @@ def test_alembic_upgrades_empty_mysql_database(mysql_database_url: str) -> None:
     with engine.connect() as connection:
         assert (
             connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-            == "20260813_0057"
+            == "20260813_0060"
         )
 
 

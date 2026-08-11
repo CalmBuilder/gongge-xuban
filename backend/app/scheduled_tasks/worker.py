@@ -16,12 +16,14 @@ from time import sleep
 from sqlmodel import Session
 
 from app.db import engine, init_db
+from app.db.models import SopWorkItem
 from app.db.seed import seed_demo_data
 from app.dynamic_tasks.worker import (
     due_dynamic_task_signals,
     process_dynamic_task_signal,
     start_dynamic_task_signal_async,
 )
+from app.general_skills.proposals import GeneralSkillProposalService
 from app.scheduled_tasks.service import (
     WORKER_SLEEP_SECONDS,
     due_scheduled_tasks,
@@ -61,9 +63,8 @@ def run_worker(*, once: bool = False, poll_seconds: float = WORKER_SLEEP_SECONDS
             _process_due_dynamic_signals(db, once=once)
             reconcile_scheduled_dynamic_runs(db)
             expired_work_items = SopWorkItemService(db).expire_due()
-            coordinator = DeterministicSopCoordinator(db)
             for work_item in expired_work_items:
-                coordinator.timeout_expired_work_item(work_item)
+                process_expired_work_item(db, work_item)
             db.commit()
         if once:
             return
@@ -81,6 +82,19 @@ def _process_due_dynamic_signals(db: Session, *, once: bool) -> int:
         elif start_dynamic_task_signal_async(dynamic_signal.id):
             dispatched += 1
     return dispatched
+
+
+def process_expired_work_item(db: Session, work_item: SopWorkItem) -> None:
+    """先终止 Skill 提案资源，再用统一协调器收敛超时 Execution。"""
+
+    if work_item.attention_kind == "publication":
+        GeneralSkillProposalService(db).terminate(
+            tenant_id=work_item.tenant_id,
+            operation_id=str(work_item.payload_json.get("operation_id") or ""),
+            outcome="expired",
+            error_code="GENERAL_SKILL_PROPOSAL_EXPIRED",
+        )
+    DeterministicSopCoordinator(db).timeout_expired_work_item(work_item)
 
 
 def start_background_worker(*, poll_seconds: float = WORKER_SLEEP_SECONDS) -> None:

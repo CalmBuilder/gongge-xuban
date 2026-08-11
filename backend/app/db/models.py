@@ -1832,6 +1832,64 @@ class GeneralSkillRevision(SQLModel, table=True):
     revoked_at: datetime | None = None
 
 
+class GeneralSkillProposal(SQLModel, table=True):
+    """保存 Agent 提案、审核 Artifact 与发布结果之间的一对一持久关联。"""
+
+    __tablename__ = "general_skill_proposals"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "operation_id",
+            name="uq_general_skill_proposal_operation",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "revision_id",
+            name="uq_general_skill_proposal_revision",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "review_artifact_id",
+            name="uq_general_skill_proposal_artifact",
+        ),
+        CheckConstraint(
+            "status IN ('staged', 'awaiting_approval', 'publishing', 'published', "
+            "'rejected', 'expired', 'failed')",
+            name="ck_general_skill_proposal_status",
+        ),
+        CheckConstraint("row_version >= 1", name="ck_general_skill_proposal_row_version"),
+        Index(
+            "ix_general_skill_proposal_execution_status",
+            "tenant_id",
+            "execution_id",
+            "status",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("gsproposal"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    execution_id: str = Field(sa_column=Column(String(512), nullable=False, index=True))
+    session_id: IdentifierString = Field(index=True)
+    agent_id: IdentifierString = Field(index=True)
+    initiator_user_id: IdentifierString = Field(index=True)
+    operation_id: IdentifierString = Field(index=True)
+    attention_id: OptionalIdentifierString = Field(default=None, index=True)
+    skill_id: IdentifierString = Field(index=True)
+    revision_id: IdentifierString = Field(index=True)
+    review_artifact_id: IdentifierString = Field(index=True)
+    target_skill_id: OptionalIdentifierString = Field(default=None, index=True)
+    base_revision_id: OptionalIdentifierString = Field(default=None, index=True)
+    base_content_checksum: OptionalVersionString = None
+    proposal_checksum: VersionString = Field(index=True)
+    status: LabelString = Field(default="staged", index=True)
+    row_version: int = Field(default=1, ge=1)
+    error_code: OptionalLabelString = Field(default=None, index=True)
+    published_binding_id: OptionalIdentifierString = Field(default=None, index=True)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+    terminal_at: datetime | None = None
+
+
 class SessionGeneralSkillOverride(SQLModel, table=True):
     """保存会话对当前 Skill 的收窄决定，禁止 override 复活上层停用。"""
 

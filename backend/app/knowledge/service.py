@@ -30,6 +30,8 @@ from app.agents.branching import (
 )
 from app.db import engine
 from app.db.models import (
+    AgentProfile,
+    AgentResourceBinding,
     KnowledgeBucket,
     KnowledgeBase,
     KnowledgeChunk,
@@ -1412,13 +1414,40 @@ class KnowledgeService:
         resource_id: str,
         status: str,
     ) -> None:
-        """根据来源知识库范围绑定已确认的发现资源。"""
+        """按来源知识库的权威绑定与所有者范围绑定已确认资源。"""
         knowledge_base = self.db.get(KnowledgeBase, suggestion.knowledge_base_id)
         knowledge_metadata = (
             knowledge_base.metadata_json
             if knowledge_base and isinstance(knowledge_base.metadata_json, dict)
             else {}
         )
+        private_agent_ids = list(
+            self.db.exec(
+                select(AgentResourceBinding.agent_id)
+                .join(AgentProfile, AgentProfile.id == AgentResourceBinding.agent_id)
+                .where(
+                    AgentResourceBinding.tenant_id == suggestion.tenant_id,
+                    AgentResourceBinding.resource_type == "knowledge_base",
+                    AgentResourceBinding.resource_id == suggestion.knowledge_base_id,
+                    AgentResourceBinding.status != "deleted",
+                    AgentProfile.tenant_id == suggestion.tenant_id,
+                    AgentProfile.is_overall == False,  # noqa: E712
+                    AgentProfile.owner_user_id == (knowledge_base.owner_user_id if knowledge_base else ""),
+                )
+                .order_by(AgentResourceBinding.agent_id)
+            ).all()
+        )
+        for agent_id in private_agent_ids:
+            ensure_private_resource_binding(
+                self.db,
+                suggestion.tenant_id,
+                agent_id,
+                resource_type,
+                resource_id,
+                status,
+            )
+        if private_agent_ids:
+            return
         owner_agent_id = knowledge_metadata.get("owner_agent_id")
         if isinstance(owner_agent_id, str) and owner_agent_id:
             ensure_private_resource_binding(

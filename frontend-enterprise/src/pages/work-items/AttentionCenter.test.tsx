@@ -98,6 +98,25 @@ const workspaceApproval = {
   revision: 7,
 };
 
+const skillPublication = {
+  ...toolApproval,
+  id: 'attention_skill_publication',
+  kind: 'publication',
+  title: '审核并发布当前分身提出的 Skill',
+  payload: {
+    proposal_id: 'proposal_1',
+    skill_id: 'skill_1',
+    revision_id: 'revision_1',
+    review_artifact_id: 'artifact_review_1',
+    name: 'refund-investigator',
+    description: '核对售后凭据并生成可审计结论',
+    requested_tools: ['crm.order.read'],
+    invocation_policy: 'user_only',
+    content_checksum: '1234567890abcdef'.repeat(4),
+  },
+  revision: 8,
+};
+
 const writeException = {
   ...clarification,
   id: 'attention_write_exception',
@@ -335,6 +354,56 @@ it('受管代码审批展示工作区与精确参数并使用通用操作文案'
     }),
   ]);
   expect(vi.mocked(api.post).mock.calls[0][1]).not.toHaveProperty('arguments');
+});
+
+it('Skill 发布审批展示完整审阅 Artifact 且只提交一次性发布决定', async () => {
+  /** 验证审批人能核对来源、权限和完整 diff，浏览器不会重传或改写 Skill 正文。 */
+
+  vi.mocked(api.get).mockImplementation(async (path: string) => {
+    if (path.startsWith('/api/executions/')) {
+      return { id: 'execution_1', status: 'waiting', revision: 13, effect_state: 'none' };
+    }
+    if (path.startsWith('/api/artifacts/artifact_review_1/preview')) {
+      return {
+        artifact: { id: 'artifact_review_1', filename: 'refund-investigator-proposal.md' },
+        content: [
+          '# Skill 提案审核：refund-investigator',
+          '请求工具（仅收窄已有绑定）：`crm.order.read`',
+          '## 受管来源',
+          'Artifact `artifact_source_1`',
+          '## 完整 diff',
+          '+请先核对订单、物流和退款凭据。',
+        ].join('\n'),
+        truncated: false,
+      };
+    }
+    return { items: [skillPublication], total: 1 };
+  });
+  const user = userEvent.setup();
+  renderCenter();
+  await user.click(await screen.findByRole('button', { name: /审核并发布当前分身提出的 Skill/ }));
+
+  const review = screen.getByLabelText('待审核 Skill 提案');
+  expect(review).toHaveTextContent('refund-investigator');
+  expect(review).toHaveTextContent('核对售后凭据并生成可审计结论');
+  expect(review).toHaveTextContent('crm.order.read');
+  expect(review).toHaveTextContent('Artifact `artifact_source_1`');
+  expect(review).toHaveTextContent('+请先核对订单、物流和退款凭据。');
+  expect(api.get).toHaveBeenCalledWith(
+    '/api/artifacts/artifact_review_1/preview?tenant_id=tenant_demo',
+  );
+  await user.click(screen.getByRole('button', { name: '批准并发布' }));
+
+  await waitFor(() => expect(api.post).toHaveBeenCalledTimes(1));
+  const [path, body] = vi.mocked(api.post).mock.calls[0];
+  expect(path).toBe('/api/attention-items/attention_skill_publication/resolve');
+  expect(body).toMatchObject({
+    tenant_id: 'tenant_demo',
+    command: 'allow_once',
+    expected_revision: 8,
+  });
+  expect(body).not.toHaveProperty('instructions');
+  expect(body).not.toHaveProperty('requested_tools');
 });
 
 it('未知外部效果必须填写证据后人工收敛且页面不提供重发', async () => {

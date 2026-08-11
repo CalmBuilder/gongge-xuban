@@ -17,6 +17,7 @@ from sqlmodel import Session, SQLModel, create_engine, select
 
 from app.agents.branching import (
     ensure_open_gallery_binding,
+    ensure_private_resource_binding,
     is_open_gallery_resource,
     visible_skill_rows,
     visible_tool_rows,
@@ -1683,6 +1684,97 @@ def test_confirmed_discovered_skill_is_visible_to_knowledge_owner_agent() -> Non
             include_inactive=True,
         )
         assert [row.skill_id for row in visible_rows] == ["private_discovered_skill"]
+
+
+def test_confirmed_discovery_follows_all_owner_agent_bindings_not_last_metadata_value() -> None:
+    """验证多分身共享私有知识库时不由最后写入的单值 metadata 错绑或跨所有者扩权。"""
+
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        owner = User(
+            id="user_owner",
+            tenant_id="tenant_demo",
+            username="owner",
+            password_hash="unused",
+            role="member",
+        )
+        other = User(
+            id="user_other",
+            tenant_id="tenant_demo",
+            username="other",
+            password_hash="unused",
+            role="member",
+        )
+        db.add(owner)
+        db.add(other)
+        for agent_id, owner_id in (
+            ("agent_owner_a", owner.id),
+            ("agent_owner_b", owner.id),
+            ("agent_other", other.id),
+        ):
+            db.add(
+                AgentProfile(
+                    id=agent_id,
+                    tenant_id="tenant_demo",
+                    name=agent_id,
+                    owner_user_id=owner_id,
+                    status="active",
+                )
+            )
+        knowledge_base = KnowledgeBase(
+            id="kb_multi_agent",
+            tenant_id="tenant_demo",
+            name="多分身私有知识库",
+            owner_user_id=owner.id,
+            metadata_json={
+                "owner_agent_id": "agent_owner_b",
+                "created_from_agent": True,
+            },
+        )
+        db.add(knowledge_base)
+        db.flush()
+        for agent_id in ("agent_owner_a", "agent_owner_b", "agent_other"):
+            ensure_private_resource_binding(
+                db,
+                "tenant_demo",
+                agent_id,
+                "knowledge_base",
+                knowledge_base.id,
+            )
+        suggestion = KnowledgeDiscoverySuggestion(
+            tenant_id="tenant_demo",
+            knowledge_base_id=knowledge_base.id,
+            document_id="doc_multi_agent",
+            suggestion_type="skill",
+            title="多分身发现技能",
+            payload_json={
+                "skill_id": "multi_agent_discovered_skill",
+                "name": "多分身发现技能",
+                "nodes": [
+                    {
+                        "node_id": "finish",
+                        "name": "完成",
+                        "instruction": "验证权威知识库绑定。",
+                    }
+                ],
+                "start_node_id": "finish",
+                "terminal_node_ids": ["finish"],
+            },
+        )
+        db.add(suggestion)
+        db.commit()
+
+        KnowledgeService(db).confirm_discovery(suggestion)
+
+        assert [
+            row.skill_id
+            for row in visible_skill_rows(db, "tenant_demo", "agent_owner_a", True)
+        ] == ["multi_agent_discovered_skill"]
+        assert [
+            row.skill_id
+            for row in visible_skill_rows(db, "tenant_demo", "agent_owner_b", True)
+        ] == ["multi_agent_discovered_skill"]
+        assert visible_skill_rows(db, "tenant_demo", "agent_other", True) == []
 
 
 def test_confirmed_discovered_tool_is_visible_to_knowledge_owner_agent() -> None:

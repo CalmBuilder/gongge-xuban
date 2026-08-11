@@ -25,6 +25,7 @@ from app.agents.branching import (
     is_open_gallery_resource,
     visible_tool_rows,
 )
+from app.agents.identity import agent_owner_user_id
 from app.connectors.service import (
     CONNECTION_READ_PERMISSION_CODE,
     CONNECTION_WRITE_PERMISSION_CODE,
@@ -51,6 +52,7 @@ from app.db.models import (
 )
 from app.organization.agent_execution import AgentExecutionAuthorizer, AgentExecutionDenied
 from app.general_skills.eligibility import EffectiveGeneralSkillResolver
+from app.general_skills.proposals import SKILL_PROPOSAL_TOOL_NAME
 from app.config import get_settings
 
 
@@ -342,7 +344,11 @@ class DynamicCapabilityCatalog:
 
         self.db = db
 
-    def list_tools(self, tenant_id: str, agent_id: str) -> list[CapabilitySnapshot]:
+    def list_tools(
+        self,
+        tenant_id: str,
+        agent_id: str,
+    ) -> list[CapabilitySnapshot]:
         """仅返回已绑定、已启用且显式发布为动态可用的工具。"""
 
         snapshots: list[CapabilitySnapshot] = []
@@ -356,6 +362,28 @@ class DynamicCapabilityCatalog:
                 continue
             snapshots.append(self._tool_snapshot(tool, agent_id, contract))
         return snapshots
+
+    def list_actor_tools(
+        self,
+        tenant_id: str,
+        agent_id: str,
+        actor_user_id: str,
+    ) -> list[CapabilitySnapshot]:
+        """返回必须同时依赖当前用户身份的内建能力，不改变既有工具目录接口。"""
+
+        if not get_settings().general_skill_agent_proposal_enabled:
+            return []
+        actor = self.db.get(User, actor_user_id)
+        agent = get_agent(self.db, tenant_id, agent_id)
+        if (
+            actor is None
+            or actor.tenant_id != tenant_id
+            or actor.membership_status != "active"
+            or agent is None
+            or agent_owner_user_id(agent) != actor.id
+        ):
+            return []
+        return [self._skill_proposal_snapshot(tenant_id, agent_id)]
 
     def list_connector_reads(
         self,
@@ -817,9 +845,25 @@ class DynamicCapabilityCatalog:
         actor_user_id: str | None,
         organization_unit_id: str | None,
         active_skill_id: str | None = None,
-    ) -> Tool:
+    ) -> Tool | None:
         """忽略快照的历史授权含义，重查实时启用、绑定、契约和组织权限。"""
 
+        if snapshot.name == SKILL_PROPOSAL_TOOL_NAME:
+            actor = self.db.get(User, actor_user_id or "")
+            agent = get_agent(self.db, snapshot.tenant_id, snapshot.agent_id)
+            current = self._skill_proposal_snapshot(snapshot.tenant_id, snapshot.agent_id)
+            if (
+                not get_settings().general_skill_agent_proposal_enabled
+                or actor is None
+                or actor.tenant_id != snapshot.tenant_id
+                or actor.membership_status != "active"
+                or agent is None
+                or agent_owner_user_id(agent) != actor.id
+            ):
+                raise CapabilityAccessDenied("GENERAL_SKILL_PROPOSAL_ACTOR_DENIED")
+            if current.checksum != snapshot.checksum:
+                raise CapabilityAccessDenied("CAPABILITY_REVISION_CHANGED")
+            return None
         tool = self.db.get(Tool, snapshot.capability_id)
         if tool is None or tool.tenant_id != snapshot.tenant_id:
             raise CapabilityAccessDenied("CAPABILITY_NOT_FOUND")
@@ -854,6 +898,88 @@ class DynamicCapabilityCatalog:
             except AgentExecutionDenied as exc:
                 raise CapabilityAccessDenied(exc.code) from exc
         return tool
+
+    @staticmethod
+    def _skill_proposal_snapshot(tenant_id: str, agent_id: str) -> CapabilitySnapshot:
+        """构造平台内建的 Agent Skill 提案能力；它只能收窄既有授权且必须逐次人审。"""
+
+        payload = {
+            "capability_type": "tool",
+            "capability_id": SKILL_PROPOSAL_TOOL_NAME,
+            "tenant_id": tenant_id,
+            "name": SKILL_PROPOSAL_TOOL_NAME,
+            "contract": {
+                "risk_class": "local_write",
+                "side_effect": "local",
+                "confirmation_policy": "once",
+                "idempotency": {"mode": "request_key", "remote_scope": "skill_proposal"},
+                "reconcile": {"supported": False},
+                "timeout_policy": "failed",
+                "dynamic_task_enabled": True,
+            },
+            "model_view": {
+                "name": SKILL_PROPOSAL_TOOL_NAME,
+                "display_name": "提议把已完成方法保存为当前分身的 Skill",
+                "description": (
+                    "生成待本人审核的 Skill 草稿；批准前不可见，批准后以 user_only 固定修订绑定当前分身。"
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$"},
+                        "description": {"type": "string", "minLength": 1, "maxLength": 500},
+                        "instructions": {"type": "string", "minLength": 1, "maxLength": 48000},
+                        "requested_tools": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "maxItems": 32,
+                        },
+                        "files": {
+                            "type": "array",
+                            "maxItems": 20,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "artifact_id": {"type": "string"},
+                                    "path": {"type": "string"},
+                                },
+                                "required": ["artifact_id", "path"],
+                                "additionalProperties": False,
+                            },
+                        },
+                        "target_skill_id": {"type": ["string", "null"]},
+                    },
+                    "required": ["name", "description", "instructions", "requested_tools", "files"],
+                    "additionalProperties": False,
+                },
+                "output_schema": {
+                    "type": "object",
+                    "properties": {
+                        "proposal_id": {"type": "string"},
+                        "skill_id": {"type": "string"},
+                        "revision_id": {"type": "string"},
+                        "binding_id": {"type": "string"},
+                        "status": {"const": "published"},
+                    },
+                    "required": ["proposal_id", "skill_id", "revision_id", "binding_id", "status"],
+                    "additionalProperties": True,
+                },
+            },
+            "user_view": {
+                "name": "Agent 创建 Skill 提案",
+                "approval": "每次都需本人审核",
+                "publication_scope": "当前用户的当前分身",
+            },
+            "audit_view": {
+                "platform_capability": "general_skill_proposal",
+                "publication_policy": "review_then_publish_user_only",
+            },
+        }
+        return CapabilitySnapshot(
+            **payload,
+            agent_id=agent_id,
+            checksum=capability_checksum(payload),
+        )
 
     def require_dynamic_model(self, tenant_id: str, model_config_id: str) -> ModelConfig:
         """在创建动态 Execution 前检查模型已启用且通过必需能力预检。"""

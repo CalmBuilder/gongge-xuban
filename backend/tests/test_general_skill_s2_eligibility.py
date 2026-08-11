@@ -459,6 +459,7 @@ def test_0055_backfills_legacy_revision_and_authorization_state_reentrantly(tmp_
     with engine.begin() as connection:
         SQLModel.metadata.create_all(connection)
         connection.execute(text("DROP TABLE general_skill_authorization_states"))
+        connection.execute(text("DROP TABLE general_skill_proposals"))
         connection.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)"))
         connection.execute(text("INSERT INTO alembic_version VALUES ('20260812_0054')"))
         connection.execute(

@@ -61,6 +61,11 @@ type ExecutionState = {
   pending_attention_count?: number;
 };
 
+type ArtifactPreview = {
+  content: string;
+  truncated: boolean;
+};
+
 const VIEW_OPTIONS: Array<{ value: AttentionView; label: string; icon: typeof Clock3 }> = [
   { value: 'active', label: '需要我处理', icon: Clock3 },
   { value: 'resolved', label: '最近已处理', icon: History },
@@ -72,6 +77,7 @@ export default function AttentionCenter() {
   const [loading, setLoading] = useState(false);
   const [selected, setSelected] = useState<AttentionItem | null>(null);
   const [execution, setExecution] = useState<ExecutionState | null>(null);
+  const [proposalReview, setProposalReview] = useState<ArtifactPreview | null>(null);
   const [answer, setAnswer] = useState('');
   const [reauthToken, setReauthToken] = useState('');
   const [reauthCorpId, setReauthCorpId] = useState('');
@@ -113,6 +119,7 @@ export default function AttentionCenter() {
   useEffect(() => {
     if (!selected) {
       setExecution(null);
+      setProposalReview(null);
       return;
     }
     let active = true;
@@ -123,6 +130,20 @@ export default function AttentionCenter() {
     }).catch(() => {
       if (active) setExecution(null);
     });
+    const reviewArtifactId = selected.kind === 'publication'
+      ? stringPayload(selected, 'review_artifact_id')
+      : '';
+    if (reviewArtifactId) {
+      void api.get<ArtifactPreview>(
+        `/api/artifacts/${reviewArtifactId}/preview?tenant_id=${getRequestTenantId()}`,
+      ).then((result) => {
+        if (active) setProposalReview(result);
+      }).catch(() => {
+        if (active) setProposalReview(null);
+      });
+    } else {
+      setProposalReview(null);
+    }
     return () => { active = false; };
   }, [selected]);
 
@@ -320,8 +341,8 @@ export default function AttentionCenter() {
             onClick={() => { setSelected(item); setAnswer(''); setReauthToken(''); }}
             className="group grid grid-cols-[36px_minmax(0,1fr)_auto] items-center gap-[11px] rounded-[12px] border border-[#e7eaf2] px-[12px] py-[11px] text-left transition hover:border-[#bdc9f5] hover:bg-[#fafbff] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#3157e8]/35"
           >
-            <span className={cn('grid size-[36px] place-items-center rounded-[10px]', ['reauth', 'tool_approval'].includes(item.kind) ? 'bg-[#edf2ff] text-[#3157e8]' : 'bg-[#fff4e8] text-[#b55a09]')}>
-              {item.kind === 'reauth' ? <KeyRound className="size-[17px]" /> : item.kind === 'tool_approval' ? <ShieldCheck className="size-[17px]" /> : <CircleHelp className="size-[17px]" />}
+            <span className={cn('grid size-[36px] place-items-center rounded-[10px]', ['reauth', 'tool_approval', 'publication'].includes(item.kind) ? 'bg-[#edf2ff] text-[#3157e8]' : 'bg-[#fff4e8] text-[#b55a09]')}>
+              {item.kind === 'reauth' ? <KeyRound className="size-[17px]" /> : ['tool_approval', 'publication'].includes(item.kind) ? <ShieldCheck className="size-[17px]" /> : <CircleHelp className="size-[17px]" />}
             </span>
             <span className="min-w-0">
               <strong className="block truncate text-[13px] font-semibold text-[#252936]">{item.title || attentionKindLabel(item.kind)}</strong>
@@ -344,7 +365,7 @@ export default function AttentionCenter() {
           setReauthToken('');
         }
       }}>
-        <DialogContent aria-describedby={undefined} className="gap-[16px] rounded-[14px] sm:max-w-[560px]">
+        <DialogContent aria-describedby={undefined} className="max-h-[calc(100vh-32px)] gap-[16px] overflow-y-auto rounded-[14px] sm:max-w-[560px]">
           {selected ? (
             <>
               <div>
@@ -378,6 +399,24 @@ export default function AttentionCenter() {
                       <p className="text-[11px] leading-[1.6] text-[#6a7388]">批准只绑定本次 Operation、正文、目标、能力与连接修订；任何变化都会重新进入待处理。</p>
                     </>
                   )}
+                </div>
+              ) : null}
+              {selected.kind === 'publication' ? (
+                <div className="grid gap-[10px] rounded-[12px] border border-[#dce5ff] bg-[#fbfcff] px-[13px] py-[12px]" aria-label="待审核 Skill 提案">
+                  <div className="grid gap-[5px] text-[12px] text-[#4f5870] sm:grid-cols-2">
+                    <span>Skill：<strong className="text-[#252b3b]">{stringPayload(selected, 'name')}</strong></span>
+                    <span>调用策略：<code>user_only</code></span>
+                    <span className="sm:col-span-2">说明：{stringPayload(selected, 'description')}</span>
+                    <span className="sm:col-span-2">请求工具：{stringArrayPayload(selected, 'requested_tools').join('、') || '无（不会获得新工具授权）'}</span>
+                  </div>
+                  <div className="rounded-[9px] border border-[#e5e9f3] bg-white p-[10px]">
+                    <div className="mb-[7px] flex items-center justify-between text-[11px] text-[#70798f]">
+                      <span>完整 diff、权限与 Artifact 来源</span>
+                      <code>{stringPayload(selected, 'content_checksum').slice(0, 12)}</code>
+                    </div>
+                    <pre className="max-h-[360px] overflow-auto whitespace-pre-wrap break-words text-[12px] leading-[1.65] text-[#283044]">{proposalReview?.content || '正在加载审核 Artifact…'}</pre>
+                  </div>
+                  <p className="text-[11px] leading-[1.6] text-[#6a7388]">批准后才会发布不可变修订，并以仅用户显式调用的方式绑定当前分身；拒绝、过期或基线变化都不会进入 Skill 目录。</p>
                 </div>
               ) : null}
               {execution?.goal ? (
@@ -425,7 +464,7 @@ export default function AttentionCenter() {
                     {selectedReauthProvider === 'wecom' ? '新凭据必须属于同一企业微信自建应用。验证成功后，系统通过持久信号恢复原 Operation。' : '新凭据必须属于同一 Slack 工作区并包含 channels:read。验证成功后，系统通过持久信号恢复原 Operation。'}
                   </div>
                 </div>
-              ) : selected.kind === 'tool_approval' ? null : (
+              ) : ['tool_approval', 'publication'].includes(selected.kind) ? null : (
                 <label className="grid gap-[6px]">
                   <span className="text-[12px] font-medium text-[#464c5e]">{selected.kind === 'exception' ? '外部对账证据（必填）' : '补充信息'}</span>
                   <Textarea value={answer} onChange={(event) => setAnswer(event.target.value)} rows={4} placeholder={selected.kind === 'exception' ? '填写后台记录、客户端核对结果或工单证据；系统不会自动重发' : '填写任务继续执行所需的准确信息'} />
@@ -435,8 +474,8 @@ export default function AttentionCenter() {
                 <Button variant="outline" disabled={acting} onClick={() => setSelected(null)}>关闭</Button>
                 {selected.available_commands.includes('cancel') ? <Button variant="outline" disabled={acting} onClick={() => void resolve('cancel')}>取消任务</Button> : null}
                 {selected.available_commands.includes('answer') ? <Button disabled={acting} onClick={() => void resolve('answer')} className="bg-[#3157e8] text-white hover:bg-[#244bc7]">补充并继续</Button> : null}
-                {selected.available_commands.includes('deny') ? <Button variant="outline" disabled={acting} onClick={() => void resolve('deny')}>{isWorkspaceApproval(selected) ? '拒绝操作' : '拒绝发送'}</Button> : null}
-                {selected.available_commands.includes('allow_once') ? <Button disabled={acting} onClick={() => void resolve('allow_once')} className="bg-[#3157e8] text-white hover:bg-[#244bc7]">{isWorkspaceApproval(selected) ? '仅批准本次操作' : '仅批准本次发送'}</Button> : null}
+                {selected.available_commands.includes('deny') ? <Button variant="outline" disabled={acting} onClick={() => void resolve('deny')}>{selected.kind === 'publication' ? '拒绝提案' : isWorkspaceApproval(selected) ? '拒绝操作' : '拒绝发送'}</Button> : null}
+                {selected.available_commands.includes('allow_once') ? <Button disabled={acting} onClick={() => void resolve('allow_once')} className="bg-[#3157e8] text-white hover:bg-[#244bc7]">{selected.kind === 'publication' ? '批准并发布' : isWorkspaceApproval(selected) ? '仅批准本次操作' : '仅批准本次发送'}</Button> : null}
                 {selected.available_commands.includes('confirm_not_applied') ? <Button variant="outline" disabled={acting} onClick={() => void resolve('confirm_not_applied')}>确认未送达</Button> : null}
                 {selected.available_commands.includes('confirm_applied') ? <Button disabled={acting} onClick={() => void resolve('confirm_applied')} className="bg-[#3157e8] text-white hover:bg-[#244bc7]">确认已送达</Button> : null}
                 {selected.available_commands.includes('reauthorize') ? <Button disabled={acting} onClick={() => void completeReauth()} className="bg-[#3157e8] text-white hover:bg-[#244bc7]">验证并恢复任务</Button> : null}
@@ -493,6 +532,7 @@ function attentionQuestion(item: AttentionItem): string {
   if (item.kind === 'tool_approval') return isWorkspaceApproval(item)
     ? '请核对受管工作区、固定动作和精确参数，再决定是否批准本次代码操作。'
     : '请核对下方精确正文，并决定是否仅批准本次企业微信发送。';
+  if (item.kind === 'publication') return '请核对完整 Skill diff、请求权限和受管 Artifact 来源，再决定是否发布到当前分身。';
   if (item.kind === 'exception') return stringPayload(item, 'instruction') || '外部效果不确定，请依据独立证据人工对账。';
   return typeof item.payload.question === 'string' && item.payload.question.trim()
     ? item.payload.question
@@ -506,7 +546,7 @@ function attentionOptions(item: AttentionItem): string[] {
 }
 
 function attentionKindLabel(kind: string): string {
-  return ({ clarification: '补充任务信息', tool_approval: '批准外部写操作', reauth: '重新授权外部连接', exception: '核对外部效果', publication: '处理结果投递', result_review: '复核执行结果' } as Record<string, string>)[kind] || '处理任务事项';
+  return ({ clarification: '补充任务信息', tool_approval: '批准外部写操作', reauth: '重新授权外部连接', exception: '核对外部效果', publication: '审核 Skill 提案', result_review: '复核执行结果' } as Record<string, string>)[kind] || '处理任务事项';
 }
 
 function stringPayload(item: AttentionItem, key: string): string {
@@ -514,6 +554,15 @@ function stringPayload(item: AttentionItem, key: string): string {
 
   const value = item.payload[key];
   return typeof value === 'string' ? value.trim() : '';
+}
+
+function stringArrayPayload(item: AttentionItem, key: string): string[] {
+  /** 从 Attention payload 提取去空白字符串数组，拒绝对象和隐式字符串化。 */
+
+  const value = item.payload[key];
+  return Array.isArray(value)
+    ? value.filter((entry): entry is string => typeof entry === 'string' && Boolean(entry.trim()))
+    : [];
 }
 
 function isWorkspaceApproval(item: AttentionItem): boolean {

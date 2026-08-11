@@ -814,6 +814,25 @@ class DeterministicSopCoordinator:
         if instance.status in {"succeeded", "failed", "cancelled", "timed_out"}:
             return
         with self._owned(instance):
+            operation_id = str(work_item.payload_json.get("operation_id") or "")
+            operation = self.db.get(SopOperation, operation_id) if operation_id else None
+            if operation is not None:
+                if (
+                    operation.tenant_id != work_item.tenant_id
+                    or operation.instance_id != instance.id
+                    or operation.node_execution_id != execution.id
+                ):
+                    raise WorkItemError(
+                        "WORK_ITEM_OPERATION_MISMATCH",
+                        "工作项引用的操作不属于当前等待节点。",
+                    )
+                if operation.status == "prepared":
+                    self.store.cancel_prepared_operation(operation)
+                elif operation.status in {"running", "unknown"}:
+                    raise WorkItemError(
+                        "WORK_ITEM_OPERATION_EFFECT_UNSETTLED",
+                        "工作项到期时关联操作的效果尚未收敛。",
+                    )
             timeout_error = {
                 "code": "WORK_ITEM_TIMED_OUT",
                 "work_item_id": work_item.id,

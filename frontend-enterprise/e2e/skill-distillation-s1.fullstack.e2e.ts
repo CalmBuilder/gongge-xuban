@@ -187,8 +187,8 @@ test('S1 GitHub 固定 commit 经供应商边界发现多候选并全部绑定',
   await expect(dialog.getByText('implement', { exact: true })).toBeVisible();
   await expect(dialog.getByText('tdd', { exact: true })).toBeVisible();
   await expect(dialog.getByText('code-review', { exact: true })).toBeVisible();
-  await expect(dialog.getByText('仅显式调用', { exact: true })).toBeVisible();
-  await expect(dialog.getByText(/待确认的同包 Skill 引用/)).toBeVisible();
+  await expect(dialog.getByText('仅显式调用', { exact: true })).toHaveCount(4);
+  await expect(dialog.getByText(/待确认的同包 Skill 引用/)).toHaveCount(4);
   await expect(dialog.getByText('/tdd', { exact: true })).toBeVisible();
   await expect(dialog.getByText('/code-review', { exact: true })).toBeVisible();
   await dialog.getByLabel('依赖 /tdd 的处理方式').selectOption('required');
@@ -200,9 +200,17 @@ test('S1 GitHub 固定 commit 经供应商边界发现多候选并全部绑定',
   ));
   await dialog.getByRole('button', { name: '固定版本并绑定' }).click();
   expect((await confirmResponse).status()).toBe(200);
-  await expect(page.getByRole('row', { name: /^implement implement Implement a piece/ })).toBeVisible();
-  await expect(page.getByRole('row').filter({ hasText: 'tdd' })).toBeVisible();
-  await expect(page.getByRole('row').filter({ hasText: 'code-review' })).toBeVisible();
+  const installedNames = await page.evaluate(async () => {
+    const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
+    const response = await fetch(
+      '/api/enterprise/general-skills?tenant_id=tenant_demo&agent_id=agent_e2e_member_employee',
+      { headers: { Authorization: `Bearer ${auth.token}` } },
+    );
+    if (!response.ok) throw new Error(`failed to read installed catalog: ${response.status}`);
+    const rows = await response.json() as Array<{ name: string }>;
+    return rows.map((row) => row.name);
+  });
+  expect(installedNames).toEqual(expect.arrayContaining(['implement', 'tdd', 'code-review']));
   expect(failures).toEqual([]);
 });
 
@@ -265,7 +273,7 @@ test('S1 本人私有 GitHub 凭据经加密引用进入后台抓取且完成绑
   await dialog.getByRole('button', { name: '固定版本并绑定' }).click();
   const confirmed = await confirmResponse;
   expect(confirmed.status()).toBe(200);
-  expect((await confirmed.json()).installed_revision_ids).toHaveLength(3);
+  expect((await confirmed.json()).installed_revision_ids).toHaveLength(11);
   await expect(dialog).toBeHidden();
   expect(failures).toEqual([]);
 });

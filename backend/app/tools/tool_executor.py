@@ -18,7 +18,12 @@ from sqlmodel import Session, select
 
 from app.agents.branching import visible_tool_rows
 from app.config import get_settings
-from app.db.models import MCPServer, Tool
+from app.db.models import MCPServer, SopOperation, Tool
+from app.general_skills.proposals import (
+    GeneralSkillProposalError,
+    GeneralSkillProposalService,
+    SKILL_PROPOSAL_TOOL_NAME,
+)
 from app.organization.agent_execution import (
     AgentExecutionAuthorizer,
     AgentExecutionDecision,
@@ -59,6 +64,13 @@ class ToolExecutor:
     ) -> ToolResult:
         """鉴权后执行工具，并仅向 HTTP 非 GET 写请求发送服务端远端幂等键。"""
 
+        if tool_call.name == SKILL_PROPOSAL_TOOL_NAME:
+            return self._publish_general_skill_proposal(
+                tenant_id=tenant_id,
+                arguments=tool_call.arguments,
+                actor_user_id=actor_user_id,
+                execution_id=execution_id,
+            )
         with self.db.no_autoflush:
             tool = self.db.exec(
                 select(Tool).where(Tool.tenant_id == tenant_id, Tool.name == tool_call.name)
@@ -279,6 +291,62 @@ class ToolExecutor:
             return ToolResult(tool_name=tool.name, success=True, data=data, error=None)
         except ManagedCodeWorkspaceError as exc:
             return self._error(tool.name, str(exc), "受管代码工作区操作被拒绝。")
+
+    def _publish_general_skill_proposal(
+        self,
+        *,
+        tenant_id: str,
+        arguments: dict[str, Any],
+        actor_user_id: str | None,
+        execution_id: str | None,
+    ) -> ToolResult:
+        """只允许已进入 running 且绑定一次性审批的 Operation 发布暂存 Skill。"""
+
+        if not self.settings.general_skill_agent_proposal_enabled:
+            return self._error(
+                SKILL_PROPOSAL_TOOL_NAME,
+                "GENERAL_SKILL_PROPOSAL_DISABLED",
+                "Agent 创建 Skill 功能未启用。",
+            )
+        if not actor_user_id or not execution_id:
+            return self._error(
+                SKILL_PROPOSAL_TOOL_NAME,
+                "GENERAL_SKILL_PROPOSAL_CONTEXT_REQUIRED",
+                "Skill 提案必须绑定发起人和持久执行。",
+            )
+        operation = self.db.exec(
+            select(SopOperation).where(
+                SopOperation.tenant_id == tenant_id,
+                SopOperation.instance_id == execution_id,
+                SopOperation.operation_name == SKILL_PROPOSAL_TOOL_NAME,
+                SopOperation.status == "running",
+            )
+        ).first()
+        if operation is None or dict(operation.request_json or {}) != arguments:
+            return self._error(
+                SKILL_PROPOSAL_TOOL_NAME,
+                "GENERAL_SKILL_PROPOSAL_OPERATION_INVALID",
+                "未找到与冻结参数一致的已批准提案。",
+            )
+        try:
+            data = GeneralSkillProposalService(self.db).publish_approved_operation(
+                tenant_id=tenant_id,
+                execution_id=execution_id,
+                operation_id=operation.id,
+                initiator_user_id=actor_user_id,
+            )
+            return ToolResult(
+                tool_name=SKILL_PROPOSAL_TOOL_NAME,
+                success=True,
+                data=data,
+                error=None,
+            )
+        except GeneralSkillProposalError as exc:
+            return self._error(
+                SKILL_PROPOSAL_TOOL_NAME,
+                exc.code,
+                "Skill 提案发布被拒绝。",
+            )
 
     @staticmethod
     def _require_argument_keys(arguments: dict[str, Any], expected: set[str]) -> None:

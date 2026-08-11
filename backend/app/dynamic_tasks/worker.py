@@ -210,7 +210,10 @@ def process_dynamic_task_signal(
                 worker_id=worker_id,
                 actor_user_id=actor_user_id,
             )
-        if attention is not None and attention.attention_kind == "tool_approval":
+        if attention is not None and attention.attention_kind in {
+            "tool_approval",
+            "publication",
+        }:
             return agent.resume_tool_approval_signal(
                 signal_id=signal.id,
                 model_config=model,

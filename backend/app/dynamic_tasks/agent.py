@@ -56,6 +56,12 @@ from app.dynamic_tasks.capability_catalog import (
 )
 from app.dynamic_tasks.planner_service import DynamicTaskPlanner
 from app.general_skills.runtime import GeneralSkillRuntimeError, GeneralSkillRuntimeService
+from app.general_skills.proposals import (
+    GeneralSkillProposalArguments,
+    GeneralSkillProposalError,
+    GeneralSkillProposalService,
+    SKILL_PROPOSAL_TOOL_NAME,
+)
 from app.dynamic_tasks.execution_context import build_execution_context_projection
 from app.dynamic_tasks.execution_context import project_result_for_model
 from app.dynamic_tasks.explorer import (
@@ -1269,7 +1275,10 @@ class DynamicTaskAgent:
     ) -> SopWorkItem:
         """冻结受管工作区本地写或隔离检查，并始终创建一次性人工批准。"""
 
-        if not get_settings().dynamic_task_managed_workspace_enabled:
+        if not (
+            get_settings().dynamic_task_managed_workspace_enabled
+            or get_settings().general_skill_agent_proposal_enabled
+        ):
             raise DynamicTaskAgentError("DYNAMIC_MANAGED_WORKSPACE_DISABLED")
         if step_kind not in {"tool.write", "tool.execute"}:
             raise DynamicTaskAgentError("DYNAMIC_LOCAL_STEP_KIND_INVALID")
@@ -1308,7 +1317,7 @@ class DynamicTaskAgent:
                         SopWorkItem.tenant_id == instance.tenant_id,
                         SopWorkItem.instance_id == instance.id,
                         SopWorkItem.node_execution_id == step.id,
-                        SopWorkItem.attention_kind == "tool_approval",
+                        SopWorkItem.attention_kind.in_(("tool_approval", "publication")),
                     )
                     .order_by(SopWorkItem.created_at.desc())
                 ).first()
@@ -1409,13 +1418,25 @@ class DynamicTaskAgent:
     ) -> SopWorkItem:
         """为精确本地动作生成脱敏参数、能力修订和过期时间绑定的一次性审批。"""
 
-        approver_ids = self._workspace_approver_ids(
-            instance.tenant_id,
-            exclude_user_id=instance.initiator_user_id,
+        is_skill_proposal = (
+            snapshot.audit_view.get("platform_capability") == "general_skill_proposal"
+        )
+        approver_ids = (
+            [instance.initiator_user_id]
+            if is_skill_proposal
+            else self._workspace_approver_ids(
+                instance.tenant_id,
+                exclude_user_id=instance.initiator_user_id,
+            )
         )
         if not approver_ids:
             raise DynamicTaskAgentError("DYNAMIC_LOCAL_APPROVER_UNAVAILABLE")
-        expires_at = self.store.database_now() + timedelta(minutes=15)
+        approval_ttl = (
+            get_settings().general_skill_agent_proposal_approval_ttl_seconds
+            if is_skill_proposal
+            else 15 * 60
+        )
+        expires_at = self.store.database_now() + timedelta(seconds=approval_ttl)
         payload: dict[str, object] = {
             "operation_id": operation.id,
             "operation_name": operation.operation_name,
@@ -1427,28 +1448,51 @@ class DynamicTaskAgent:
             "plan_revision_id": instance.current_plan_revision_id,
             "expires_at": expires_at.isoformat(),
         }
+        proposal = None
+        if is_skill_proposal:
+            try:
+                proposal_service = GeneralSkillProposalService(
+                    self.db,
+                    artifact_service=self.artifact_service,
+                )
+                proposal = proposal_service.stage(
+                    instance=instance,
+                    step=step,
+                    operation=operation,
+                    arguments=dict(arguments),
+                    reviewer_user_ids=approver_ids,
+                )
+                payload.update(proposal_service.review_payload(proposal))
+            except GeneralSkillProposalError as exc:
+                raise DynamicTaskAgentError(exc.code) from exc
         payload["approval_fingerprint"] = capability_checksum(payload)
         control = ExecutionControlService(self.db, self.store)
         attention, created = control.offer_attention(
             instance,
-            attention_kind="tool_approval",
+            attention_kind="publication" if is_skill_proposal else "tool_approval",
             attention_key=f"{step.step_key}:local_approval:{operation.id}",
             title=(
-                "批准受管代码工作区执行检查"
-                if operation.effect_kind == "execute"
-                else "批准受管代码工作区变更"
+                "审核并发布当前分身提出的 Skill"
+                if is_skill_proposal
+                else (
+                    "批准受管代码工作区执行检查"
+                    if operation.effect_kind == "execute"
+                    else "批准受管代码工作区变更"
+                )
             ),
             payload=payload,
             allowed_commands=["allow_once", "deny"],
             candidate_user_ids=approver_ids,
-            source_type="dynamic_task",
+            source_type="general_skill_proposal" if is_skill_proposal else "dynamic_task",
             source_ref=operation.id,
             node_execution=step,
-            exclude_initiator=True,
+            exclude_initiator=not is_skill_proposal,
         )
         if created:
             attention.expires_at = expires_at
             self.db.add(attention)
+        if proposal is not None:
+            proposal_service.mark_awaiting_approval(proposal, attention_id=attention.id)
         if step.status == "running":
             self.store.wait_for_work_item(instance, step, work_item_id=attention.id)
         return attention
@@ -1779,7 +1823,7 @@ class DynamicTaskAgent:
             if (
                 attention is None
                 or attention.instance_id != instance.id
-                or attention.attention_kind != "tool_approval"
+                or attention.attention_kind not in {"tool_approval", "publication"}
                 or attention.status != "completed"
                 or str(attention.resolution_json.get("actor_user_id") or "")
                 != actor_user_id
@@ -1997,7 +2041,10 @@ class DynamicTaskAgent:
     ) -> DynamicRunOutcome:
         """办理或恢复本地一次性审批；running 中断按内容幂等契约安全重派。"""
 
-        if not get_settings().dynamic_task_managed_workspace_enabled:
+        if not (
+            get_settings().dynamic_task_managed_workspace_enabled
+            or get_settings().general_skill_agent_proposal_enabled
+        ):
             raise DynamicTaskAgentError("DYNAMIC_MANAGED_WORKSPACE_DISABLED")
         if signal.status == "consumed":
             if instance.status in {"failed", "cancelled", "timed_out"}:
@@ -2019,7 +2066,7 @@ class DynamicTaskAgent:
             if (
                 attention is None
                 or attention.instance_id != instance.id
-                or attention.attention_kind != "tool_approval"
+                or attention.attention_kind not in {"tool_approval", "publication"}
                 or attention.status != "completed"
                 or str(attention.resolution_json.get("actor_user_id") or "")
                 != actor_user_id
@@ -2049,10 +2096,18 @@ class DynamicTaskAgent:
                     signal_worker_id=worker_id,
                 )
             command = str(attention.resolution_json.get("command") or "")
+            is_skill_proposal = operation.operation_name == SKILL_PROPOSAL_TOOL_NAME
             if operation.status == "prepared":
                 if step.status != "waiting":
                     raise DynamicTaskAgentError("DYNAMIC_TOOL_APPROVAL_OPERATION_INVALID")
                 if command == "deny":
+                    if is_skill_proposal:
+                        GeneralSkillProposalService(self.db).terminate(
+                            tenant_id=instance.tenant_id,
+                            operation_id=operation.id,
+                            outcome="rejected",
+                            error_code="GENERAL_SKILL_PROPOSAL_REJECTED",
+                        )
                     self.store.cancel_prepared_operation(operation)
                     self.store.resume_waiting_node(instance, step, slots=instance.slots_json or {})
                     self.store.fail_node(instance, step, error={"code": "DYNAMIC_LOCAL_DENIED"})
@@ -2086,7 +2141,10 @@ class DynamicTaskAgent:
                 )
                 if payload.get("capability_checksum") != snapshot.checksum:
                     raise DynamicTaskAgentError("DYNAMIC_TOOL_APPROVAL_CAPABILITY_CHANGED")
-                if actor_user_id not in self._workspace_approver_ids(
+                if is_skill_proposal:
+                    if actor_user_id != instance.initiator_user_id:
+                        raise DynamicTaskAgentError("DYNAMIC_LOCAL_APPROVER_DENIED")
+                elif actor_user_id not in self._workspace_approver_ids(
                     instance.tenant_id,
                     exclude_user_id=instance.initiator_user_id,
                 ):
@@ -2118,7 +2176,11 @@ class DynamicTaskAgent:
                         authorization_evidence={
                             "workspace": payload.get("workspace"),
                             "capability_checksum": snapshot.checksum,
-                            "approved_actor_role": "admin",
+                            "approved_actor_role": (
+                                "skill_owner" if is_skill_proposal else "admin"
+                            ),
+                            "proposal_id": payload.get("proposal_id"),
+                            "review_artifact_id": payload.get("review_artifact_id"),
                         },
                     )
                 except SopExecutionSkillAuthorizationError as exc:
@@ -2162,6 +2224,17 @@ class DynamicTaskAgent:
             if result.success:
                 self.store.complete_node(instance, step, output={"data": result.data})
             else:
+                if operation.operation_name == SKILL_PROPOSAL_TOOL_NAME:
+                    GeneralSkillProposalService(self.db).terminate(
+                        tenant_id=instance.tenant_id,
+                        operation_id=operation.id,
+                        outcome="failed",
+                        error_code=(
+                            result.error.code
+                            if result.error is not None
+                            else "GENERAL_SKILL_PROPOSAL_FAILED"
+                        ),
+                    )
                 self.store.fail_node(
                     instance,
                     step,
@@ -2942,8 +3015,15 @@ class DynamicTaskAgent:
         """经模型 preflight、实时能力目录和有界规划创建或复用统一动态 Execution。"""
 
         verified_model = self.catalog.require_dynamic_model(tenant_id, model_config.id)
+        actor_tool_loader = getattr(self.catalog, "list_actor_tools", None)
+        actor_tools = (
+            actor_tool_loader(tenant_id, agent_id, initiator_user_id)
+            if callable(actor_tool_loader)
+            else []
+        )
         capabilities = [
             *self.catalog.list_tools(tenant_id, agent_id),
+            *actor_tools,
             *self.catalog.list_connector_reads(tenant_id, agent_id, initiator_user_id),
             *self.catalog.list_general_skills(tenant_id, agent_id, initiator_user_id),
         ]
@@ -4302,15 +4382,22 @@ class DynamicTaskAgent:
             except ValueError as exc:
                 raise DynamicTaskAgentError("DYNAMIC_CAPABILITY_SNAPSHOT_INVALID") from exc
             managed = snapshot.audit_view.get("managed_workspace")
+            platform_capability = snapshot.audit_view.get("platform_capability")
+            valid_target = (
+                platform_capability == "general_skill_proposal"
+                or (
+                    isinstance(managed, Mapping)
+                    and bool(managed.get("workspace_id"))
+                    and bool(managed.get("handler"))
+                )
+            )
             if (
                 snapshot.capability_type != "tool"
                 or snapshot.agent_id != instance.agent_id
                 or snapshot.tenant_id != instance.tenant_id
                 or snapshot.contract.get("risk_class") != expected_risk
                 or snapshot.contract.get("confirmation_policy") != "once"
-                or not isinstance(managed, Mapping)
-                or not managed.get("workspace_id")
-                or not managed.get("handler")
+                or not valid_target
             ):
                 raise DynamicTaskAgentError("DYNAMIC_LOCAL_CAPABILITY_INVALID")
             return snapshot
@@ -4341,6 +4428,12 @@ class DynamicTaskAgent:
     ) -> None:
         """在创建审批前按固定 handler 校验精确参数集合和关键大小边界。"""
 
+        if snapshot.audit_view.get("platform_capability") == "general_skill_proposal":
+            try:
+                GeneralSkillProposalArguments.model_validate(arguments)
+            except ValueError as exc:
+                raise DynamicTaskAgentError("DYNAMIC_LOCAL_ARGUMENTS_INVALID") from exc
+            return
         managed = snapshot.audit_view.get("managed_workspace")
         handler = str(managed.get("handler") or "") if isinstance(managed, Mapping) else ""
         expected = {
