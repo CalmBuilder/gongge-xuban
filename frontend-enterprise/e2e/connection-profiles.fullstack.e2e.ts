@@ -44,6 +44,11 @@ test('真实 Chromium 从连接价值说明进入完整企业微信示例和建�
   await expect(guide.getByText('演示场景：让数字员工查询企业微信应用信息')).toBeVisible();
   await expect(guide.getByText(/验签消息 → 确认发送者映射/)).toBeVisible();
   await expect(guide.getByText(/当前机器内网地址是/)).toContainText('103.62.49.138');
+  await expect(guide.getByText('真实成功回调 URL 是这样获得的')).toBeVisible();
+  await expect(guide.getByText('cloudflared tunnel --url http://127.0.0.1:5137')).toBeVisible();
+  await expect(guide.getByText('http://192.168.124.236:5137')).toBeVisible();
+  await expect(guide.getByText(/企业微信显示“保存成功”才表示这个 URL 真实可用/)).toBeVisible();
+  await expect(guide.getByText('本次真实联调最终填写并保存成功的 URL')).toBeVisible();
   await expect(guide.getByText('URL、Token、EncodingAESKey 分别怎么生成')).toBeVisible();
   await expect(guide.getByText(/当前页面来源：/)).toContainText('不能直接交给企业微信');
   await expect(guide.getByText('场景角色与接入方式')).toBeVisible();

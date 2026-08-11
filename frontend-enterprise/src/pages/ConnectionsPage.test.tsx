@@ -194,8 +194,14 @@ it('用完整指南说明连接边界、接入步骤和数字员工演示场景'
   expect(screen.getByText(/当前机器内网地址是/)).toHaveTextContent('192.168.124.236');
   expect(screen.getByText(/当前机器内网地址是/)).toHaveTextContent('103.62.49.138');
   expect(screen.getByText('curl -4 https://api.ipify.org')).toBeInTheDocument();
-  expect(screen.getAllByText('103.62.49.138')).toHaveLength(3);
-  expect(screen.getByText(/connprofile_36a56f3b292f49a8\/callback/)).toBeInTheDocument();
+  expect(screen.getByText('真实成功回调 URL 是这样获得的')).toBeInTheDocument();
+  expect(screen.getByText('cloudflared tunnel --url http://127.0.0.1:5137')).toBeInTheDocument();
+  expect(screen.getByText('http://192.168.124.236:5137')).toBeInTheDocument();
+  expect(screen.getByText('connprofile_36a56f3b292f49a8')).toBeInTheDocument();
+  expect(screen.getByText(/企业微信显示“保存成功”才表示这个 URL 真实可用/)).toBeInTheDocument();
+  expect(screen.getByText(/Quick Tunnel 每次重启通常会得到新域名/)).toHaveTextContent('103.62.49.138');
+  expect(screen.getAllByText('103.62.49.138')).toHaveLength(4);
+  expect(screen.getAllByText(/connprofile_36a56f3b292f49a8\/callback/)).toHaveLength(3);
   expect(screen.getByText('bbfca6••••••••••••••••••84c3f7')).toBeInTheDocument();
   expect(screen.getByText('URL、Token、EncodingAESKey 分别怎么生成')).toBeInTheDocument();
   expect(screen.getByText(/生成 16 字节，再编码为 32 位小写十六进制字符串/)).toBeInTheDocument();

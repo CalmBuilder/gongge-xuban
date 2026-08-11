@@ -618,6 +618,41 @@ export default function ConnectionsPage({
               </div>
             </div>
 
+            <div className="rounded-[14px] border border-[#adc3f4] bg-[#f5f8ff] p-[15px]" aria-label="真实成功回调 URL 获取过程">
+              <div className="flex items-start justify-between gap-[12px] max-[620px]:flex-col">
+                <div>
+                  <small className="font-mono text-[10px] font-semibold tracking-[0.08em] text-[var(--gg-cobalt)]">CALLBACK URL</small>
+                  <h4 className="mt-[4px] text-[14px] font-semibold text-[var(--gg-ink)]">真实成功回调 URL 是这样获得的</h4>
+                  <p className="mt-[5px] max-w-[760px] text-[11px] leading-[1.7] text-[#59647a]">它不是企业微信生成的，也不是把公网 IP 填进 URL。先由 HTTPS Tunnel 提供企业微信能访问的公网来源，再由共格·序伴为连接档案生成唯一 Profile ID，最后由系统自动拼成完整回调地址。</p>
+                </div>
+                <div className="shrink-0 rounded-[9px] border border-[#efd08e] bg-[#fff8e7] px-[10px] py-[8px] text-[10px] leading-[1.55] text-[#81590d]">截至 2026-08-11，本机没有运行 cloudflared；<br />下面的旧临时域名只用于复盘成功过程。</div>
+              </div>
+
+              <ol className="mt-[13px] grid grid-cols-2 gap-[10px] max-[760px]:grid-cols-1">
+                <GuideInstruction index="1" title="启动公网 HTTPS Tunnel">在运行共格·序伴的机器执行 <code className="break-all font-mono text-[#244bc7]">cloudflared tunnel --url http://127.0.0.1:5137</code>，保持该进程运行。本次真实联调时，命令返回的公网来源是 <code className="break-all font-mono text-[#244bc7]">https://people-elect-dolls-phones.trycloudflare.com</code>。</GuideInstruction>
+                <GuideInstruction index="2" title="从 Tunnel 地址进入本系统">浏览器打开 <code className="break-all font-mono text-[#244bc7]">https://people-elect-dolls-phones.trycloudflare.com/enterprise/connections</code>，再点击“连接企业微信”。不能从 <code className="font-mono">http://192.168.124.236:5137</code> 创建，否则浏览器来源仍是内网地址。</GuideInstruction>
+                <GuideInstruction index="3" title="系统创建唯一连接路径">建档成功后，本次真实连接取得 Profile ID <code className="font-mono text-[#244bc7]">connprofile_36a56f3b292f49a8</code>。页面将“公网来源”和固定回调路径自动拼接，不要求用户手写或猜测 ID。</GuideInstruction>
+                <GuideInstruction index="4" title="企业微信完成握手验证">把一次性弹窗中的完整 URL、Token 和 EncodingAESKey 原样填入“接收消息服务器”并保存。企业微信随后携带签名参数访问该 URL；系统验签、解密并返回 echostr，企业微信显示“保存成功”才表示这个 URL 真实可用。</GuideInstruction>
+              </ol>
+
+              <div className="mt-[12px] grid grid-cols-[minmax(0,1fr)_28px_minmax(0,1fr)] items-center gap-[8px] rounded-[11px] border border-[#d7e1f8] bg-white px-[12px] py-[11px] max-[720px]:grid-cols-1">
+                <div>
+                  <div className="text-[10px] font-semibold text-[#66738d]">① Tunnel 返回的公网来源</div>
+                  <code className="mt-[4px] block break-all font-mono text-[11px] leading-[1.6] text-[#244bc7]">https://people-elect-dolls-phones.trycloudflare.com</code>
+                </div>
+                <div className="text-center text-[16px] font-semibold text-[#8ca2d4] max-[720px]:rotate-90">+</div>
+                <div>
+                  <div className="text-[10px] font-semibold text-[#66738d]">② 系统生成的连接回调路径</div>
+                  <code className="mt-[4px] block break-all font-mono text-[11px] leading-[1.6] text-[#244bc7]">/api/connectors/wecom/connprofile_36a56f3b292f49a8/callback</code>
+                </div>
+              </div>
+              <div className="mt-[9px] rounded-[10px] bg-[#e9f0ff] px-[12px] py-[10px]">
+                <div className="text-[10px] font-semibold text-[#53698e]">本次真实联调最终填写并保存成功的 URL</div>
+                <code className="mt-[4px] block break-all font-mono text-[12px] font-semibold leading-[1.65] text-[#173fbd]">https://people-elect-dolls-phones.trycloudflare.com/api/connectors/wecom/connprofile_36a56f3b292f49a8/callback</code>
+              </div>
+              <p className="mt-[9px] text-[10px] leading-[1.6] text-[#6f5b2b]">注意：Quick Tunnel 每次重启通常会得到新域名。新一轮联调必须用新域名重新打开本页并新建或轮换回调配置；不能继续使用上面的历史 URL。企业可信 IP 仍填写出站公网 IP <code className="font-mono font-semibold">103.62.49.138</code>，它与回调 URL 是两个方向、两套配置。</p>
+            </div>
+
             <div className="overflow-hidden rounded-[13px] border border-[#cbd8f4] bg-white" aria-label="当前 Demo 实际填写值">
               <div className="border-b border-[#dce4f4] bg-[#f4f7ff] px-[15px] py-[11px]">
                 <h4 className="text-[13px] font-semibold text-[var(--gg-ink)]">当前 Demo：命令输出和实际填写值</h4>
