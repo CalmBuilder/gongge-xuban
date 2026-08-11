@@ -8,8 +8,10 @@
 
 import { expect, test, type Page } from '@playwright/test';
 import { createHash } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 
 const SKILL_NAME = 's3-browser-guidance';
+const COMBO_FIXTURE_DIR = fileURLToPath(new URL('./fixtures/s3-combo', import.meta.url));
 const SKILL_MARKDOWN = [
   '---',
   `name: ${SKILL_NAME}`,
@@ -353,4 +355,96 @@ test('S3 user-only Skill 经真实 picker 强制加载、静音恢复并完成�
     selection_mode: 'auto',
   });
   expect(failures).toEqual([]);
+});
+
+test('S3 文件夹组合 Skill 固定依赖并跨轮消费同一案例上下文', async ({ page }) => {
+  /** 通过真实 UI 导入父子 Skill，验证 user-only 子项只经依赖边加载且两轮均可审计。 */
+
+  test.setTimeout(90_000);
+  await loginAsMember(page);
+  await page.goto('/enterprise/general-skills');
+  await page.getByRole('button', { name: /新增/ }).click();
+  await page.getByRole('menuitem', { name: '安全导入 Skill' }).click();
+  const dialog = page.getByRole('dialog', { name: '安全导入 Skill 包' });
+  await dialog.getByRole('tab', { name: '选择文件夹' }).click();
+  await dialog.locator('input[webkitdirectory]').setInputFiles(COMBO_FIXTURE_DIR);
+  await dialog.getByRole('button', { name: '生成安全预览' }).click();
+  await expect(dialog.getByText('s3-combo-parent', { exact: true })).toBeVisible();
+  await expect(dialog.getByText('s3-combo-child', { exact: true })).toBeVisible();
+  const dependencyDecision = dialog.getByRole('combobox', {
+    name: '依赖 /s3-combo-child 的处理方式',
+  });
+  await expect(dependencyDecision).toBeVisible();
+  await dependencyDecision.selectOption('required');
+  await expect(dialog.getByText('仅显式调用', { exact: true })).toBeVisible();
+  const confirmResponse = page.waitForResponse((response) => (
+    new URL(response.url()).pathname.endsWith('/confirm')
+    && response.request().method() === 'POST'
+  ));
+  await dialog.getByRole('button', { name: '固定版本并绑定' }).click();
+  expect((await confirmResponse).status()).toBe(200);
+
+  const parentSkillId = await page.evaluate(async () => {
+    const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
+    const response = await fetch(
+      '/api/enterprise/general-skills?tenant_id=tenant_demo&agent_id=agent_e2e_member_employee',
+      { headers: { Authorization: `Bearer ${auth.token}` } },
+    );
+    const rows = await response.json() as Array<{ id: string; name: string }>;
+    const parent = rows.find((item) => item.name === 's3-combo-parent');
+    if (!parent) throw new Error('combo parent was not installed');
+    return parent.id;
+  });
+  const sessionId = await page.evaluate(async () => {
+    const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
+    const response = await fetch('/api/chat/sessions', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${auth.token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        tenant_id: 'tenant_demo',
+        agent_id: 'agent_e2e_member_employee',
+        title: 'S3 组合 Skill 跨轮消费',
+        origin: 'owned',
+      }),
+    });
+    return (await response.json() as { id: string }).id;
+  });
+  await page.goto(`/workspace/chat/${sessionId}`);
+
+  async function selectParentAndSend(message: string): Promise<void> {
+    /** 每轮都通过结构化 picker 明确选择父 Skill，禁止正文伪造 force-run。 */
+
+    await page.getByRole('button', { name: '选择本轮 Skill' }).click();
+    await page.getByRole('menuitem').filter({ hasText: 's3-combo-parent' }).click();
+    await page.getByPlaceholder('输入消息，按 Enter 发送...').fill(message);
+    await page.getByRole('button', { name: '发送', exact: true }).click();
+  }
+
+  await selectParentAndSend('S3 组合任务第一轮：登记案例 CASE-2026-0813');
+  await expect(page.getByRole('paragraph').filter({ hasText: 'S3-COMBO-FIRST' })).toBeVisible({
+    timeout: 30_000,
+  });
+  await selectParentAndSend('S3 组合任务第二轮：继续刚才的案例');
+  await expect(page.getByRole('paragraph').filter({ hasText: 'S3-COMBO-MEMORY' })).toBeVisible({
+    timeout: 30_000,
+  });
+
+  const loadedEvents = await page.evaluate(async (id) => {
+    const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
+    const response = await fetch(`/api/chat/sessions/${id}/events?tenant_id=tenant_demo`, {
+      headers: { Authorization: `Bearer ${auth.token}` },
+    });
+    return (await response.json() as Array<{
+      event_type: string;
+      data?: { selection_mode?: string; skill_id?: string; revision_id?: string };
+    }>).filter((event) => event.event_type === 'skill_loaded');
+  }, sessionId);
+  expect(loadedEvents).toHaveLength(4);
+  expect(loadedEvents.filter((event) => event.data?.selection_mode === 'forced')).toHaveLength(2);
+  expect(loadedEvents.filter((event) => event.data?.selection_mode === 'dependency')).toHaveLength(2);
+  expect(new Set(loadedEvents.map((event) => event.data?.revision_id)).size).toBe(2);
+  expect(loadedEvents.some((event) => event.data?.skill_id === parentSkillId)).toBe(true);
 });

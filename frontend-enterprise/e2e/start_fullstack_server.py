@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import os
 import shutil
 import sys
@@ -1474,6 +1475,21 @@ def install_schedule_llm_override() -> None:
             context = user_payload.get("conversation_context")
             loaded = context.get("loaded_general_skills") if isinstance(context, dict) else None
             if isinstance(loaded, list) and loaded:
+                combined_instructions = "\n".join(
+                    str(item.get("instructions") or "")
+                    for item in loaded
+                    if isinstance(item, dict)
+                )
+                if (
+                    "S3-COMBO-PARENT" in combined_instructions
+                    and "S3-COMBO-CHILD" in combined_instructions
+                ):
+                    history = json.dumps(context, ensure_ascii=False)
+                    if "S3 组合任务第二轮" in str(user_payload.get("user_message") or ""):
+                        if "S3-COMBO-FIRST" not in history:
+                            raise RuntimeError("S3 combo prior turn was absent from conversation context")
+                        return "S3-COMBO-MEMORY：已沿用上一轮 CASE-2026-0813 并再次消费父子固定修订。"
+                    return "S3-COMBO-FIRST：CASE-2026-0813 已同时消费父子固定修订。"
                 first = loaded[0] if isinstance(loaded[0], dict) else {}
                 instructions = str(first.get("instructions") or "")
                 if "S3-AUTO-GUIDED" in instructions:
