@@ -24,6 +24,8 @@ from app.db.models import (
     GeneralSkillRevision,
     GeneralSkillUse,
     ModelConfig,
+    SopInstance,
+    SopOperation,
     Tenant,
     User,
 )
@@ -31,6 +33,10 @@ from app.config import get_settings
 from app.core.agent_loop import AgentLoop
 from app.general_skills.runtime import GeneralSkillRuntimeError, GeneralSkillRuntimeService
 from app.session.session_schema import ChatTurnRequest, RouterDecision
+from app.sop_runtime.execution_store import (
+    SopExecutionSkillAuthorizationError,
+    SopExecutionStore,
+)
 
 
 def _checksum(value: object) -> str:
@@ -328,7 +334,7 @@ def test_resource_read_rejects_unregistered_checksum_and_wrong_session() -> None
 
 
 def test_tool_authorization_only_narrows_agent_baseline() -> None:
-    """Skill allowlist 只收窄 Agent 工具，未归入基线或未声明的动作均 fail-closed。"""
+    """Skill allowlist 既可直接裁决，也在真实 Operation start 前 fail-closed。"""
 
     db, owner, agent, chat, skill, _, _ = _context()
     service = GeneralSkillRuntimeService(db)
@@ -362,6 +368,64 @@ def test_tool_authorization_only_narrows_agent_baseline() -> None:
             baseline_tools={"crm.order.read"},
         )
     assert baseline.value.code == "GENERAL_SKILL_TOOL_NOT_AUTHORIZED"
+
+    instance = SopInstance(
+        id="sopinst_skill_tool_auth",
+        tenant_id=owner.tenant_id,
+        session_id=chat.id,
+        kind="dynamic_task",
+        active_slot_key=f"foreground:{chat.id}",
+        initiator_user_id=owner.id,
+        agent_id=agent.id,
+        goal_snapshot_json={"goal": "读取订单", "success_criteria": []},
+        current_plan_revision_id="execplan_skill_tool_auth",
+        current_plan_checksum="a" * 64,
+        capability_snapshot_json={"model": {"id": "model_runtime"}},
+        capability_checksum="b" * 64,
+        status="running",
+    )
+    allowed_operation = SopOperation(
+        id="sopop_skill_tool_allowed",
+        tenant_id=owner.tenant_id,
+        instance_id=instance.id,
+        node_execution_id="sopnode_skill_tool_auth",
+        operation_name="crm.order.read",
+        idempotency_key="c" * 64,
+        logical_action_id="skill-tool-allowed",
+        request_fingerprint="d" * 64,
+        caused_by_skill_use_id=loaded.use_id,
+        capability_snapshot_json={
+            "capability_type": "tool",
+            "name": "crm.order.read",
+        },
+    )
+    denied_operation = SopOperation(
+        id="sopop_skill_tool_denied",
+        tenant_id=owner.tenant_id,
+        instance_id=instance.id,
+        node_execution_id="sopnode_skill_tool_auth",
+        operation_name="crm.order.write",
+        idempotency_key="e" * 64,
+        logical_action_id="skill-tool-denied",
+        request_fingerprint="f" * 64,
+        caused_by_skill_use_id=loaded.use_id,
+        capability_snapshot_json={
+            "capability_type": "tool",
+            "name": "crm.order.write",
+        },
+    )
+    db.add(instance)
+    db.add(allowed_operation)
+    db.add(denied_operation)
+    db.commit()
+    store = SopExecutionStore(db)
+    with store.owned(instance, worker_id="worker-skill-tool-auth"):
+        store.start_operation(allowed_operation)
+        with pytest.raises(SopExecutionSkillAuthorizationError) as dispatch_denied:
+            store.start_operation(denied_operation)
+    assert allowed_operation.status == "running"
+    assert denied_operation.status == "prepared"
+    assert dispatch_denied.value.authorization_code == "GENERAL_SKILL_TOOL_NOT_AUTHORIZED"
 
 
 def test_dependency_load_requires_exact_approved_revision_edge(

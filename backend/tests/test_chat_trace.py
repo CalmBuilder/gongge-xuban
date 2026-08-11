@@ -1,21 +1,213 @@
 from datetime import datetime, timedelta
+from threading import Thread
+from time import sleep
 
+import pytest
+from fastapi import HTTPException
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from app.api.chat import (
     _build_turn_traces,
     _events_after_cursor,
+    _existing_turn_replay,
     _format_scheduled_task_schedule,
     _message_turn_ids_from_events,
     _persist_chat_turn_cancelled,
     _persist_chat_turn_interrupted,
     _relay_event_payload,
+    _stream_existing_turn,
     list_chat_session_spans,
     message_read,
 )
+from app.api import chat as chat_api
 from app.db.models import AgentEvent, ChatSession, KnowledgeConcept, Message, Tenant, User
 from app.observability.event_log import EventLog
+from app.session.session_schema import ChatTurnRequest
+
+
+def test_completed_client_turn_replays_persisted_stream_without_new_execution() -> None:
+    """同一请求重发只投影原 turn 事件；换正文或 forced Skill 必须冲突。"""
+
+    db = _test_db()
+    session_row = ChatSession(
+        id="session_replay",
+        tenant_id="tenant_demo",
+        user_id="user_demo",
+        agent_id="agent_demo",
+    )
+    user_message = Message(
+        id="msg_replay",
+        tenant_id="tenant_demo",
+        session_id=session_row.id,
+        role="user",
+        content="按指南处理",
+        metadata_json={"client_turn_id": "client_replay", "forced_general_skill_id": "skill_a"},
+    )
+    db.add(session_row)
+    db.add(user_message)
+    for index, (event_type, payload) in enumerate(
+        (
+            (
+                "user_message_received",
+                {
+                    "message_id": user_message.id,
+                    "client_turn_id": "client_replay",
+                    "message": user_message.content,
+                    "channel": "web",
+                },
+            ),
+            (
+                "stream_delta",
+                {
+                    "turn_id": user_message.id,
+                    "client_turn_id": "client_replay",
+                    "content": "完成",
+                },
+            ),
+            (
+                "complete",
+                {
+                    "turn_id": user_message.id,
+                    "client_turn_id": "client_replay",
+                    "reply": "完成",
+                },
+            ),
+        )
+    ):
+        db.add(
+            AgentEvent(
+                id=f"evt_replay_{index}",
+                tenant_id="tenant_demo",
+                session_id=session_row.id,
+                event_type=event_type,
+                payload_json=payload,
+            )
+        )
+    db.commit()
+    request = ChatTurnRequest(
+        tenant_id="tenant_demo",
+        session_id=session_row.id,
+        agent_id="agent_demo",
+        user_id="user_demo",
+        message=user_message.content,
+        client_turn_id="client_replay",
+        channel="web",
+        forced_general_skill_id="skill_a",
+    )
+
+    with Session(db.get_bind()) as recovered_db:
+        replay = _existing_turn_replay(recovered_db, request)
+        assert replay is not None
+        message_id, rows, cursor, terminal = replay
+        assert message_id == user_message.id
+        assert terminal is True
+        stream = "".join(
+            _stream_existing_turn(
+                request,
+                message_id=message_id,
+                initial_rows=rows,
+                initial_cursor=cursor,
+                terminal=terminal,
+            )
+        )
+        assert "event: stream_delta" in stream
+        assert "event: complete" in stream
+
+        with pytest.raises(HTTPException) as mismatch:
+            _existing_turn_replay(
+                recovered_db,
+                request.model_copy(update={"message": "换一个请求"}),
+            )
+    assert mismatch.value.status_code == 409
+
+
+def test_running_client_turn_reattaches_until_original_worker_persists_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """运行中重连只尾随同一 turn 的新增事件，并在原 worker 终态后结束。"""
+
+    db = _test_db()
+    session_row = ChatSession(
+        id="session_reattach",
+        tenant_id="tenant_demo",
+        user_id="user_demo",
+        agent_id="agent_demo",
+    )
+    received = AgentEvent(
+        id="evt_reattach_received",
+        tenant_id="tenant_demo",
+        session_id=session_row.id,
+        event_type="user_message_received",
+        payload_json={
+            "message_id": "msg_reattach",
+            "turn_id": "msg_reattach",
+            "client_turn_id": "client_reattach",
+        },
+    )
+    db.add(session_row)
+    db.add(received)
+    db.commit()
+    test_engine = db.get_bind()
+    monkeypatch.setattr(chat_api, "engine", test_engine)
+    monkeypatch.setattr(chat_api, "STREAM_RELAY_POLL_SECONDS", 0.005)
+    request = ChatTurnRequest(
+        tenant_id="tenant_demo",
+        session_id=session_row.id,
+        agent_id="agent_demo",
+        user_id="user_demo",
+        message="继续原请求",
+        client_turn_id="client_reattach",
+    )
+
+    def finish_original_turn() -> None:
+        """模拟原 worker 在重连后继续写入正文和终态。"""
+
+        sleep(0.02)
+        with Session(test_engine) as worker_db:
+            worker_db.add(
+                AgentEvent(
+                    id="evt_reattach_delta",
+                    tenant_id="tenant_demo",
+                    session_id=session_row.id,
+                    event_type="stream_delta",
+                    payload_json={
+                        "turn_id": "msg_reattach",
+                        "client_turn_id": "client_reattach",
+                        "content": "原 worker 完成",
+                    },
+                )
+            )
+            worker_db.add(
+                AgentEvent(
+                    id="evt_reattach_complete",
+                    tenant_id="tenant_demo",
+                    session_id=session_row.id,
+                    event_type="complete",
+                    payload_json={
+                        "turn_id": "msg_reattach",
+                        "client_turn_id": "client_reattach",
+                        "reply": "原 worker 完成",
+                    },
+                )
+            )
+            worker_db.commit()
+
+    worker = Thread(target=finish_original_turn)
+    worker.start()
+    stream = "".join(
+        _stream_existing_turn(
+            request,
+            message_id="msg_reattach",
+            initial_rows=[received],
+            initial_cursor=(received.created_at, received.id),
+            terminal=False,
+        )
+    )
+    worker.join(timeout=1)
+
+    assert "原 worker 完成" in stream
+    assert "event: complete" in stream
 
 
 def test_event_log_binds_all_execution_events_to_current_turn() -> None:

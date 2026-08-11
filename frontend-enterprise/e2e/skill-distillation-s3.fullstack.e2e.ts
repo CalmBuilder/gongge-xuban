@@ -147,7 +147,8 @@ test('S3 user-only Skill 经真实 picker 强制加载、静音恢复并完成�
     && request.method() === 'POST'
   ));
   await page.getByRole('button', { name: '发送', exact: true }).click();
-  expect((await turnRequest).postDataJSON()).toMatchObject({
+  const originalTurnPayload = (await turnRequest).postDataJSON() as Record<string, unknown>;
+  expect(originalTurnPayload).toMatchObject({
     forced_general_skill_id: skillId,
   });
   await expect(page.getByRole('paragraph').filter({ hasText: 'S3-GUIDED-SUCCESS' })).toBeVisible({
@@ -170,6 +171,58 @@ test('S3 user-only Skill 经真实 picker 强制加载、静音恢复并完成�
   expect(loaded?.data).toMatchObject({ skill_id: skillId, selection_mode: 'forced' });
   const useId = String(loaded?.data?.skill_use_id || '');
   expect(useId).not.toBe('');
+  const messageCountBeforeReplay = await page.evaluate(async (id) => {
+    const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
+    const response = await fetch(`/api/chat/sessions/${id}/messages?tenant_id=tenant_demo`, {
+      headers: { Authorization: `Bearer ${auth.token}` },
+    });
+    return (await response.json() as unknown[]).length;
+  }, sessionId);
+  const replayed = await page.evaluate(async (payload) => {
+    const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
+    const response = await fetch('/api/chat/stream', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${auth.token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    });
+    return { status: response.status, stream: await response.text() };
+  }, originalTurnPayload);
+  expect(replayed.status).toBe(200);
+  expect(replayed.stream).toContain('S3-GUIDED-SUCCESS');
+  expect(replayed.stream).toContain('event: complete');
+  const mismatchedReplayStatus = await page.evaluate(async (payload) => {
+    const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
+    const response = await fetch('/api/chat/stream', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${auth.token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ ...payload, message: '同一个 turn 不能换成另一项任务' }),
+    });
+    return response.status;
+  }, originalTurnPayload);
+  expect(mismatchedReplayStatus).toBe(409);
+  const replayEvidence = await page.evaluate(async (id) => {
+    const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
+    const [eventsResponse, messagesResponse] = await Promise.all([
+      fetch(`/api/chat/sessions/${id}/events?tenant_id=tenant_demo`, {
+        headers: { Authorization: `Bearer ${auth.token}` },
+      }),
+      fetch(`/api/chat/sessions/${id}/messages?tenant_id=tenant_demo`, {
+        headers: { Authorization: `Bearer ${auth.token}` },
+      }),
+    ]);
+    return {
+      events: await eventsResponse.json() as Array<{ event_type: string }>,
+      messageCount: (await messagesResponse.json() as unknown[]).length,
+    };
+  }, sessionId);
+  expect(replayEvidence.events.filter((event) => event.event_type === 'skill_loaded')).toHaveLength(1);
+  expect(replayEvidence.messageCount).toBe(messageCountBeforeReplay);
   const resourceChecksum = createHash('sha256').update(SKILL_MARKDOWN).digest('hex');
   const firstPage = await page.evaluate(async ({ id, use, checksum }) => {
     const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };

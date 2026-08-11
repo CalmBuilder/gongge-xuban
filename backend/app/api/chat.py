@@ -1,3 +1,11 @@
+"""
+@Time       : 2026/08/13
+@Author     : zhanglp8181
+@File       : chat.py
+@CallChain  : React/SSE → FastAPI chat API → AgentLoop → 持久事件中继
+@Description: 提供租户隔离的聊天、可重连流式响应、会话追踪和反馈接口。
+"""
+
 from __future__ import annotations
 
 import json
@@ -991,6 +999,19 @@ def chat_stream(
         _ensure_chat_agent_available(db, request.tenant_id, request.agent_id, current_user)
     if not request.message.strip() and not request.attachments:
         raise HTTPException(status_code=400, detail="Message cannot be empty")
+    replay = _existing_turn_replay(db, request)
+    if replay is not None:
+        message_id, rows, cursor, terminal = replay
+        return StreamingResponse(
+            _stream_existing_turn(
+                request,
+                message_id=message_id,
+                initial_rows=rows,
+                initial_cursor=cursor,
+                terminal=terminal,
+            ),
+            media_type="text/event-stream",
+        )
 
     relay_ready = threading.Event()
     worker_done = threading.Event()
@@ -1728,6 +1749,129 @@ def _latest_event_cursor(db: Session, tenant_id: str, session_id: str) -> tuple[
     if not row:
         return None
     return row.created_at, row.id
+
+
+def _event_turn_ids(row: AgentEvent) -> set[str]:
+    """提取事件可能携带的服务端与客户端 turn 标识，忽略空值。"""
+
+    payload = row.payload_json or {}
+    return {
+        value
+        for value in (
+            str(payload.get("turn_id") or "").strip(),
+            str(payload.get("user_message_id") or "").strip(),
+            str(payload.get("message_id") or "").strip(),
+            str(payload.get("client_turn_id") or "").strip(),
+        )
+        if value
+    }
+
+
+def _existing_turn_replay(
+    db: Session,
+    request: ChatTurnRequest,
+) -> tuple[str, list[AgentEvent], tuple[object, str] | None, bool] | None:
+    """识别已接收的 client turn，校验请求不变并返回可重放的持久事件。"""
+
+    session_id = str(request.session_id or "").strip()
+    client_turn_id = str(request.client_turn_id or "").strip()
+    if not session_id or not client_turn_id:
+        return None
+    all_rows = db.exec(
+        select(AgentEvent)
+        .where(AgentEvent.tenant_id == request.tenant_id, AgentEvent.session_id == session_id)
+        .order_by(AgentEvent.created_at, AgentEvent.id)
+    ).all()
+    received = next(
+        (
+            row
+            for row in reversed(all_rows)
+            if row.event_type == "user_message_received"
+            and str((row.payload_json or {}).get("client_turn_id") or "").strip()
+            == client_turn_id
+        ),
+        None,
+    )
+    if received is None:
+        return None
+    payload = received.payload_json or {}
+    message_id = str(payload.get("message_id") or payload.get("user_message_id") or "").strip()
+    user_message = db.get(Message, message_id) if message_id else None
+    metadata = user_message.metadata_json if user_message is not None else {}
+    expected_attachments = [item.model_dump(mode="json") for item in request.attachments]
+    if (
+        not message_id
+        or user_message is None
+        or user_message.tenant_id != request.tenant_id
+        or user_message.session_id != session_id
+        or user_message.role != "user"
+        or user_message.content != request.message
+        or str(payload.get("user_id") or request.user_id) != str(request.user_id or "")
+        or str(payload.get("channel") or "web") != request.channel
+        or str(metadata.get("forced_general_skill_id") or "")
+        != str(request.forced_general_skill_id or "")
+        or list(metadata.get("attachments") or []) != expected_attachments
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="client_turn_id already belongs to a different request",
+        )
+    turn_ids = {message_id, client_turn_id}
+    rows = [
+        row
+        for row in all_rows
+        if row.event_type not in SPAN_EVENT_TYPES and bool(_event_turn_ids(row) & turn_ids)
+    ]
+    terminal = any(
+        STREAM_RELAY_EVENT_ALIASES.get(row.event_type, row.event_type)
+        in STREAM_RELAY_TERMINAL_EVENTS
+        for row in rows
+    )
+    cursor = (all_rows[-1].created_at, all_rows[-1].id) if all_rows else None
+    return message_id, rows, cursor, terminal
+
+
+def _stream_existing_turn(
+    request: ChatTurnRequest,
+    *,
+    message_id: str,
+    initial_rows: list[AgentEvent],
+    initial_cursor: tuple[object, str] | None,
+    terminal: bool,
+) -> Iterator[str]:
+    """重放既有 turn；仍运行时只挂接事件账本，绝不启动第二个 Agent worker。"""
+
+    turn_ids = {message_id, str(request.client_turn_id or "").strip()}
+    for row in initial_rows:
+        event_name, data = _relay_event_payload(row)
+        yield _sse(event_name, data, row.id)
+    if terminal:
+        return
+    cursor = initial_cursor
+    deadline = time.monotonic() + STREAM_RELAY_IDLE_TIMEOUT_SECONDS
+    while True:
+        emitted = False
+        with Session(engine) as relay_db:
+            scanned = _events_after_cursor(
+                relay_db,
+                request.tenant_id,
+                str(request.session_id or ""),
+                cursor,
+            )
+        for row in scanned:
+            cursor = (row.created_at, row.id)
+            if not (_event_turn_ids(row) & turn_ids):
+                continue
+            event_name, data = _relay_event_payload(row)
+            emitted = True
+            yield _sse(event_name, data, row.id)
+            if event_name in STREAM_RELAY_TERMINAL_EVENTS:
+                return
+        if emitted:
+            deadline = time.monotonic() + STREAM_RELAY_IDLE_TIMEOUT_SECONDS
+        if time.monotonic() > deadline:
+            return
+        time.sleep(STREAM_RELAY_POLL_SECONDS)
 
 
 def _sse(event: object, data: object, event_id: str | None = None) -> str:

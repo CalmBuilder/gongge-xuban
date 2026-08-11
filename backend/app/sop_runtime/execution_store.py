@@ -26,6 +26,7 @@ from app.db.models import (
     ExecutionPlanRevision,
     ExecutionMutationRejection,
     ExecutionSignal,
+    GeneralSkillUse,
     InputResourceSnapshot,
     ManagedInputResource,
     Message,
@@ -35,6 +36,7 @@ from app.db.models import (
     SopOperationAttempt,
     SopOperationEffect,
     SopWorkItem,
+    User,
     utc_now,
 )
 from app.dynamic_tasks.capability_catalog import capability_checksum
@@ -100,6 +102,18 @@ class SopExecutionFencedError(SopExecutionConflictError):
         self.worker_id = worker_id
         self.fencing_token = fencing_token
         self.action = action
+
+
+class SopExecutionSkillAuthorizationError(SopExecutionConflictError):
+    """表示带 Skill 因果的 Operation 未通过实时父链 allowlist。"""
+
+    code = "GENERAL_SKILL_TOOL_NOT_AUTHORIZED"
+
+    def __init__(self, message: str, *, authorization_code: str) -> None:
+        """保留稳定授权错误码，供 Runtime 转为失败回执或重新规划。"""
+
+        super().__init__(message)
+        self.authorization_code = authorization_code
 
 
 @dataclass(frozen=True, slots=True)
@@ -1180,6 +1194,7 @@ class SopExecutionStore:
     def start_operation(self, operation: SopOperation) -> None:
         """在真正调用外部工具前把 prepared 操作推进为 running。"""
 
+        self._authorize_skill_caused_operation(operation)
         self._guard_operation_mutation(operation, "operation.start")
         transition = transition_operation(
             OperationStatus(operation.status),
@@ -1197,6 +1212,61 @@ class SopExecutionStore:
         self.db.add(operation)
         self.db.flush()
 
+    def _authorize_skill_caused_operation(self, operation: SopOperation) -> None:
+        """按 Operation 快照、执行归属和直接 Use 父链执行最后一道收窄授权。"""
+
+        use_id = str(operation.caused_by_skill_use_id or "").strip()
+        if not use_id:
+            return
+        use = self.db.get(GeneralSkillUse, use_id)
+        instance = self.db.get(SopInstance, operation.instance_id)
+        actor = self.db.get(User, use.user_id) if use is not None else None
+        snapshot = dict(operation.capability_snapshot_json or {})
+        snapshot_type = str(snapshot.get("capability_type") or "")
+        if snapshot_type == "tool":
+            action = str(snapshot.get("name") or "").strip()
+        elif snapshot_type == "connector":
+            audit_view = snapshot.get("audit_view")
+            action = (
+                str(audit_view.get("required_action") or "").strip()
+                if isinstance(audit_view, dict)
+                else ""
+            )
+        else:
+            action = ""
+        if (
+            use is None
+            or instance is None
+            or actor is None
+            or use.tenant_id != operation.tenant_id
+            or instance.tenant_id != operation.tenant_id
+            or use.session_id != instance.session_id
+            or use.agent_id != instance.agent_id
+            or use.user_id != instance.initiator_user_id
+            or not action
+        ):
+            raise SopExecutionSkillAuthorizationError(
+                "Skill 因果链、执行归属或能力快照不完整。",
+                authorization_code="GENERAL_SKILL_TOOL_CAUSE_INVALID",
+            )
+        from app.general_skills.runtime import (  # 避免执行存储初始化时形成循环依赖
+            GeneralSkillRuntimeError,
+            GeneralSkillRuntimeService,
+        )
+
+        try:
+            GeneralSkillRuntimeService(self.db).authorize_tool_for_use(
+                actor,
+                use_id=use.id,
+                tool_name=action,
+                baseline_tools={action},
+            )
+        except GeneralSkillRuntimeError as exc:
+            raise SopExecutionSkillAuthorizationError(
+                "Skill 未授权本次工具动作。",
+                authorization_code=exc.code,
+            ) from exc
+
     def authorize_external_operation_dispatch(
         self,
         operation: SopOperation,
@@ -1212,6 +1282,7 @@ class SopExecutionStore:
 
         if operation.effect_kind != "external_write" or operation.status != "prepared":
             raise SopExecutionConflictError("只有 prepared 外部写可以绑定批准并派发。")
+        self._authorize_skill_caused_operation(operation)
         if not approval_fingerprint.strip() or not approved_by_user_id.strip() or not authorization_evidence:
             raise SopExecutionConflictError("外部写批准和再授权证据不能为空。")
         if authorization_source_type == "attention":
