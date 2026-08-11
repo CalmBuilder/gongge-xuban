@@ -235,6 +235,13 @@ def test_confirm_creates_published_revision_and_default_pinned_private_binding(t
         str(item["object_key"]).startswith("sha256:")
         for item in revision.resource_manifest_json
     )
+    referenced = {
+        str(item["content_checksum"]) for item in revision.resource_manifest_json
+    }
+    assert service.object_store.sweep_unreferenced_objects(
+        referenced,
+        older_than=utc_now() + timedelta(seconds=1),
+    ) == []
     assert not (tmp_path / "staging" / preview.id).exists()
 
 
@@ -597,6 +604,14 @@ def test_multi_candidate_confirm_rolls_back_all_database_rows_on_storage_failure
     assert db.exec(select(GeneralSkillRevision)).all() == []
     assert db.exec(select(AgentResourceBinding)).all() == []
     assert db.get(GeneralSkillImportJob, preview.id).status == "awaiting_approval"
+    promoted = list((tmp_path / "objects").glob("*/*"))
+    assert len(promoted) == 1
+    removed = service.object_store.sweep_unreferenced_objects(
+        set(),
+        older_than=utc_now() + timedelta(seconds=1),
+    )
+    assert removed == [promoted[0].name]
+    assert not promoted[0].exists()
 
 
 def test_cancel_releases_staging_and_is_idempotent(tmp_path) -> None:

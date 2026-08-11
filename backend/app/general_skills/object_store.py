@@ -8,9 +8,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
-import hashlib
+from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
@@ -93,6 +94,46 @@ class FileSystemSkillObjectStore:
             job_dir.rmdir()
         except OSError as exc:
             raise SkillObjectStoreError("staging directory contains unexpected entries") from exc
+
+    def sweep_unreferenced_objects(
+        self,
+        referenced_checksums: set[str],
+        *,
+        older_than: datetime,
+    ) -> list[str]:
+        """清理提交失败遗留且超过宽限期的内容对象，保留所有修订仍引用的 checksum。"""
+
+        normalized_references = {
+            self._validated_checksum(checksum) for checksum in referenced_checksums
+        }
+        objects_root = self.root / "objects"
+        if not objects_root.exists():
+            return []
+        removed: list[str] = []
+        cutoff = (
+            older_than.replace(tzinfo=timezone.utc).timestamp()
+            if older_than.tzinfo is None
+            else older_than.timestamp()
+        )
+        for prefix_dir in sorted(objects_root.iterdir()):
+            if not prefix_dir.is_dir() or prefix_dir.is_symlink():
+                continue
+            for candidate in sorted(prefix_dir.iterdir()):
+                if (
+                    not candidate.is_file()
+                    or candidate.is_symlink()
+                    or not CHECKSUM.fullmatch(candidate.name)
+                    or candidate.name in normalized_references
+                    or candidate.stat().st_mtime > cutoff
+                ):
+                    continue
+                candidate.unlink()
+                removed.append(candidate.name)
+            try:
+                prefix_dir.rmdir()
+            except OSError:
+                pass
+        return removed
 
     def _job_dir(self, job_id: str) -> Path:
         """把服务端生成的 opaque job ID 映射为固定 staging 子目录。"""

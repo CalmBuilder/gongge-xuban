@@ -13,11 +13,11 @@ import logging
 import threading
 from datetime import timedelta
 
-from sqlmodel import Session
+from sqlmodel import Session, select
 
 from app.config import get_settings
 from app.db import engine
-from app.db.models import utc_now
+from app.db.models import GeneralSkillRevision, utc_now
 from app.general_skills.import_service import GeneralSkillImportService
 from app.general_skills.object_store import FileSystemSkillObjectStore
 
@@ -25,6 +25,7 @@ from app.general_skills.object_store import FileSystemSkillObjectStore
 LOGGER = logging.getLogger(__name__)
 WORKER_POLL_SECONDS = 60.0
 RECOVERY_STALE_SECONDS = 300
+ORPHAN_GRACE_SECONDS = 3600
 _stop_event = threading.Event()
 _worker_thread: threading.Thread | None = None
 
@@ -45,7 +46,17 @@ def run_maintenance_once() -> int:
             stale_before=now - timedelta(seconds=RECOVERY_STALE_SECONDS)
         )
         expired = service.expire_jobs(now=now)
-        return len(recovered) + len(expired)
+        referenced_checksums = {
+            str(resource["content_checksum"])
+            for revision in db.exec(select(GeneralSkillRevision)).all()
+            for resource in revision.resource_manifest_json
+            if isinstance(resource, dict) and resource.get("content_checksum")
+        }
+        removed = service.object_store.sweep_unreferenced_objects(
+            referenced_checksums,
+            older_than=now - timedelta(seconds=ORPHAN_GRACE_SECONDS),
+        )
+        return len(recovered) + len(expired) + len(removed)
 
 
 def run_worker(*, once: bool = False, poll_seconds: float = WORKER_POLL_SECONDS) -> None:
