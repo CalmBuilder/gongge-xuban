@@ -48,7 +48,10 @@ def get_import_capabilities(settings: Settings = Depends(get_settings)) -> dict[
 
     return {
         "enabled": settings.general_skill_import_v2_enabled,
-        "source_kinds": ["upload", "github", "https"]
+        "source_kinds": (
+            ["upload", "github", "skillhub"]
+            + (["https"] if settings.general_skill_https_allowed_host_set else [])
+        )
         if settings.general_skill_import_v2_enabled
         else [],
     }
@@ -139,6 +142,7 @@ def _service(db: Session, settings: Settings) -> GeneralSkillImportService:
     return GeneralSkillImportService(
         db,
         FileSystemSkillObjectStore(settings.general_skill_object_store_path),
+        https_allowed_hosts=settings.general_skill_https_allowed_host_set,
     )
 
 

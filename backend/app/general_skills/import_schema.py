@@ -25,7 +25,7 @@ class GeneralSkillImportJobCreate(BaseModel):
 
     tenant_id: str = Field(min_length=1, max_length=512)
     target_agent_id: str = Field(min_length=1, max_length=512)
-    source_kind: Literal["upload", "github", "https"] = "upload"
+    source_kind: Literal["upload", "github", "skillhub", "https"] = "upload"
     filename: str | None = Field(default=None, min_length=1, max_length=255)
     content_base64: str | None = Field(default=None, min_length=1)
     files: list[GeneralSkillUploadFile] | None = Field(default=None, min_length=1, max_length=240)
@@ -53,6 +53,8 @@ class GeneralSkillImportJobCreate(BaseModel):
             raise ValueError("GENERAL_SKILL_REMOTE_SOURCE_INVALID")
         if self.source_kind == "github" and (not self.revision or not self.source_subpath):
             raise ValueError("GENERAL_SKILL_GITHUB_REVISION_AND_SUBPATH_REQUIRED")
+        if self.source_kind == "skillhub" and (self.revision or self.source_subpath):
+            raise ValueError("GENERAL_SKILL_SKILLHUB_REVISION_NOT_ALLOWED")
         if self.source_kind == "https" and (self.revision or self.source_subpath):
             raise ValueError("GENERAL_SKILL_HTTPS_REVISION_NOT_ALLOWED")
         return self

@@ -19,6 +19,7 @@ function renderDialog(sourceKind: 'upload' | 'folder' | 'github' | 'https' = 'gi
     onDependencyDecisionChange: vi.fn(),
     onPreview: vi.fn(),
     onConfirm: vi.fn(),
+    onReset: vi.fn(),
     onClose: vi.fn(),
   };
   render(
@@ -72,7 +73,9 @@ it('switches source adapters without hiding the fail-closed network explanation'
 
   await user.click(screen.getByRole('tab', { name: 'HTTPS ZIP' }));
   expect(callbacks.onSourceKindChange).toHaveBeenCalledWith('https');
-  await user.click(screen.getByRole('tab', { name: '上传 ZIP' }));
+  await user.click(screen.getByRole('tab', { name: 'SkillHub' }));
+  expect(callbacks.onSourceKindChange).toHaveBeenCalledWith('skillhub');
+  await user.click(screen.getByRole('tab', { name: '上传文件' }));
   expect(callbacks.onSourceKindChange).toHaveBeenCalledWith('upload');
 });
 
@@ -83,5 +86,36 @@ it('offers a directory picker that uses the same fail-closed preview action', ()
   expect(screen.getByText('选择完整 Skill 文件夹')).toBeVisible();
   expect(document.querySelector('input[webkitdirectory]')).toBeInstanceOf(HTMLInputElement);
   expect(screen.getByRole('button', { name: '生成安全预览' })).toBeDisabled();
-  expect(screen.getByText(/ZIP 与文件夹共用完整检查/)).toBeVisible();
+  expect(screen.getByText(/SKILL.md、ZIP 与文件夹共用完整检查/)).toBeVisible();
+});
+
+it('accepts a single SKILL.md through the reviewed upload adapter', () => {
+  /** 验证单文件 Skill 与 ZIP 共用一个用户入口及安全预览动作。 */
+
+  renderDialog('upload');
+  expect(screen.getByText('选择 SKILL.md 或 ZIP Skill 包')).toBeVisible();
+  const input = document.querySelector('input[type="file"]');
+  expect(input).toHaveAttribute('accept', expect.stringContaining('.md'));
+});
+
+it('hides arbitrary HTTPS when the deployment capability does not allow it', () => {
+  /** 验证生产端未配置主机白名单时不会向用户展示任意 HTTPS 来源入口。 */
+
+  const callbacks = {
+    onFileChange: vi.fn(), onFolderFilesChange: vi.fn(), onSourceKindChange: vi.fn(),
+    onSourceUrlChange: vi.fn(), onRevisionChange: vi.fn(), onSourceSubpathChange: vi.fn(),
+    onSelectedIdsChange: vi.fn(), onDependencyDecisionChange: vi.fn(), onPreview: vi.fn(),
+    onConfirm: vi.fn(), onReset: vi.fn(), onClose: vi.fn(),
+  };
+  render(
+    <I18nProvider>
+      <SecureSkillImportDialog
+        open loading={false} availableSourceKinds={['upload', 'github']} sourceKind="upload"
+        file={null} folderFiles={[]} sourceUrl="" revision="" sourceSubpath="skills"
+        job={null} selectedIds={[]} dependencyDecisions={{}} {...callbacks}
+      />
+    </I18nProvider>,
+  );
+  expect(screen.queryByRole('tab', { name: 'HTTPS ZIP' })).not.toBeInTheDocument();
+  expect(screen.getByRole('tab', { name: '上传文件' })).toBeVisible();
 });

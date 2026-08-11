@@ -82,6 +82,7 @@ class Settings(BaseSettings):
     general_skill_network_install: bool = False
     general_skill_import_v2_enabled: bool = False
     general_skill_object_store_path: str = "./data/general-skill-objects"
+    general_skill_https_allowed_hosts: str = ""
 
     model_config = SettingsConfigDict(
         env_file=desktop_env_value("DOTENV", str(DEFAULT_DOTENV_PATH)),
@@ -172,6 +173,16 @@ class Settings(BaseSettings):
     def general_skill_runtime_package_list(self) -> list[str]:
         """拆分并清理通用技能运行时配置中的非空包名。"""
         return [item.strip() for item in self.general_skill_runtime_packages.split(",") if item.strip()]
+
+    @property
+    def general_skill_https_allowed_host_set(self) -> frozenset[str]:
+        """规范化管理员配置的公开 HTTPS Skill 包主机白名单。"""
+
+        return frozenset(
+            item.strip().lower().rstrip(".")
+            for item in self.general_skill_https_allowed_hosts.split(",")
+            if item.strip()
+        )
 
     @property
     def slack_oauth_configured(self) -> bool:

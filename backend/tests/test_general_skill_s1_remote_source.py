@@ -18,6 +18,7 @@ from app.general_skills.remote_source import (
     SecureHttpsFetcher,
     _ExchangeResult,
     github_archive_url,
+    skillhub_archive_url,
 )
 
 
@@ -58,6 +59,29 @@ def test_github_archive_requires_exact_repository_and_full_commit_sha() -> None:
     ):
         with pytest.raises(GeneralSkillRemoteSourceError):
             github_archive_url(source, invalid_revision)
+
+
+def test_skillhub_adapter_accepts_only_slug_or_known_page_hosts() -> None:
+    """验证 SkillHub 来源只生成固定供应商端点，来源证据不保存下载 query。"""
+
+    download_url, reference = skillhub_archive_url("customer-support")
+    assert download_url == (
+        "https://wry-manatee-359.convex.site/api/v1/download?slug=customer-support"
+    )
+    assert reference == "skillhub:customer-support"
+    page_download, page_reference = skillhub_archive_url(
+        "https://skillhub.ai/acme/customer-support"
+    )
+    assert page_download == download_url
+    assert page_reference == reference
+    for invalid in (
+        "https://evil.example/customer-support",
+        "https://user:secret@skillhub.ai/acme/customer-support",
+        "customer/support",
+        "a",
+    ):
+        with pytest.raises(GeneralSkillRemoteSourceError):
+            skillhub_archive_url(invalid)
 
 
 @pytest.mark.parametrize(

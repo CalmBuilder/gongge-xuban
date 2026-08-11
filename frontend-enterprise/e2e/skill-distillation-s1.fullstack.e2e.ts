@@ -139,6 +139,8 @@ test('S1 危险路径包在浏览器中进入明确失败终态且不能确认',
 
   await expect(dialog.getByRole('alert')).toContainText('Skill 包未通过安全检查');
   await expect(dialog.getByRole('button', { name: '固定版本并绑定' })).toHaveCount(0);
+  await dialog.getByRole('button', { name: '修正来源并重试' }).click();
+  await expect(dialog.getByText('选择 SKILL.md 或 ZIP Skill 包')).toBeVisible();
   expect(failures).toEqual([]);
 });
 
@@ -177,6 +179,32 @@ test('S1 GitHub 固定 commit 经供应商边界发现多候选并全部绑定',
   expect(failures).toEqual([]);
 });
 
+test('S1 SkillHub slug 不经过旧入口而完成预览与固定绑定', async ({ page }) => {
+  const failures = collectBrowserFailures(page);
+  await page.goto('/enterprise/dashboard');
+  await loginAsMember(page);
+  await page.goto('/enterprise/general-skills');
+  await openSecureImport(page);
+  const dialog = page.getByRole('dialog', { name: '安全导入 Skill 包' });
+  await dialog.getByRole('tab', { name: 'SkillHub' }).click();
+  await dialog.getByLabel('SkillHub slug 或页面地址').fill('skillhub-browser-helper');
+  const previewResponse = page.waitForResponse((response) => (
+    new URL(response.url()).pathname === '/api/enterprise/general-skill-import-jobs'
+    && response.request().method() === 'POST'
+  ));
+  await dialog.getByRole('button', { name: '生成安全预览' }).click();
+  expect((await previewResponse).status()).toBe(202);
+  await expect(dialog.getByText('skillhub-browser-helper', { exact: true })).toBeVisible();
+  const confirmResponse = page.waitForResponse((response) => (
+    new URL(response.url()).pathname.endsWith('/confirm')
+    && response.request().method() === 'POST'
+  ));
+  await dialog.getByRole('button', { name: '固定版本并绑定' }).click();
+  expect((await confirmResponse).status()).toBe(200);
+  await expect(page.getByRole('row').filter({ hasText: 'skillhub-browser-helper' })).toBeVisible();
+  expect(failures).toEqual([]);
+});
+
 test('S1 浏览器选择完整文件夹后复用安全预览并固定绑定', async ({ page }) => {
   const failures = collectBrowserFailures(page);
   await page.goto('/enterprise/dashboard');
@@ -204,5 +232,38 @@ test('S1 浏览器选择完整文件夹后复用安全预览并固定绑定', as
   await dialog.getByRole('button', { name: '固定版本并绑定' }).click();
   expect((await confirmResponse).status()).toBe(200);
   await expect(page.getByRole('row').filter({ hasText: 'browser-folder-skill' })).toBeVisible();
+  expect(failures).toEqual([]);
+});
+
+test('S1 窄屏可直接导入单个 SKILL.md 并完成固定绑定', async ({ page }) => {
+  const failures = collectBrowserFailures(page);
+  await page.setViewportSize({ width: 375, height: 760 });
+  await page.goto('/enterprise/dashboard');
+  await loginAsMember(page);
+  await page.goto('/enterprise/general-skills');
+  await openSecureImport(page);
+  const dialog = page.getByRole('dialog', { name: '安全导入 Skill 包' });
+  await expect(dialog.getByRole('tab', { name: 'HTTPS ZIP' })).toHaveCount(0);
+  await dialog.locator('input[type="file"]').setInputFiles({
+    name: 'SKILL.md',
+    mimeType: 'text/markdown',
+    buffer: Buffer.from(
+      '---\nname: narrow-direct-skill\ndescription: 窄屏单文件安全导入。\n---\n# Narrow\n',
+    ),
+  });
+  const previewResponse = page.waitForResponse((response) => (
+    new URL(response.url()).pathname === '/api/enterprise/general-skill-import-jobs'
+    && response.request().method() === 'POST'
+  ));
+  await dialog.getByRole('button', { name: '生成安全预览' }).click();
+  expect((await previewResponse).status()).toBe(202);
+  await expect(dialog.getByText('narrow-direct-skill', { exact: true })).toBeVisible();
+  const confirmResponse = page.waitForResponse((response) => (
+    new URL(response.url()).pathname.endsWith('/confirm')
+    && response.request().method() === 'POST'
+  ));
+  await dialog.getByRole('button', { name: '固定版本并绑定' }).click();
+  expect((await confirmResponse).status()).toBe(200);
+  await expect(page.getByText('narrow-direct-skill', { exact: true }).first()).toBeVisible();
   expect(failures).toEqual([]);
 });

@@ -217,6 +217,27 @@ def test_api_feature_flag_defaults_closed(
     assert response.json()["detail"]["error_code"] == "FEATURE_NOT_AVAILABLE"
 
 
+def test_api_capabilities_hide_https_until_admin_configures_allowlist(
+    import_api_context: tuple[TestClient, Session, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证能力发现不会把尚未配置主机白名单的 HTTPS 来源错误呈现为可用。"""
+
+    client, _, tokens = import_api_context
+    monkeypatch.delenv("GENERAL_SKILL_HTTPS_ALLOWED_HOSTS", raising=False)
+    get_settings.cache_clear()
+    response = client.get(
+        "/api/enterprise/general-skill-import-jobs/capabilities",
+        headers=_auth(tokens["owner"]),
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "enabled": True,
+        "source_kinds": ["upload", "github", "skillhub"],
+    }
+
+
 def test_api_github_source_requires_and_persists_fixed_revision(
     import_api_context: tuple[TestClient, Session, dict[str, str]],
 ) -> None:

@@ -10,14 +10,19 @@ from __future__ import annotations
 
 import http.client
 import ipaddress
+import re
 import socket
 import ssl
 from dataclasses import dataclass
 from typing import Callable, Protocol
 from urllib.parse import urljoin, urlsplit
+from urllib.parse import quote
 
 
 GITHUB_ARCHIVE_HOSTS = frozenset({"github.com", "codeload.github.com"})
+SKILLHUB_PAGE_HOSTS = frozenset({"skillhub.ai", "www.skillhub.ai", "clawhub.ai", "www.clawhub.ai"})
+SKILLHUB_DOWNLOAD_HOSTS = frozenset({"wry-manatee-359.convex.site"})
+SKILLHUB_DOWNLOAD_ENDPOINT = "https://wry-manatee-359.convex.site/api/v1/download"
 REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 
 
@@ -151,6 +156,55 @@ def github_archive_url(repository_url: str, revision: str) -> str:
             "GENERAL_SKILL_PACKAGE_INVALID", "GitHub source requires a full commit SHA"
         )
     return f"https://github.com/{owner}/{repository}/archive/{revision}.zip"
+
+
+def skillhub_archive_url(source: str) -> tuple[str, str]:
+    """把 SkillHub/ClawHub slug 或页面地址转换为受限下载 URL 与无查询来源证据。"""
+
+    cleaned = source.strip()
+    slug = cleaned
+    if cleaned.startswith("https://"):
+        parsed = _validated_https_url(cleaned, SKILLHUB_PAGE_HOSTS)
+        parts = [part for part in parsed.path.split("/") if part]
+        if not parts:
+            raise GeneralSkillRemoteSourceError(
+                "GENERAL_SKILL_PACKAGE_INVALID", "SkillHub source must identify one skill"
+            )
+        slug = parts[-1]
+    if not _valid_skillhub_slug(slug):
+        raise GeneralSkillRemoteSourceError(
+            "GENERAL_SKILL_PACKAGE_INVALID", "SkillHub source must be a valid skill slug"
+        )
+    normalized_slug = slug.removesuffix(".zip").removesuffix(".md")
+    return (
+        f"{SKILLHUB_DOWNLOAD_ENDPOINT}?slug={quote(normalized_slug, safe='')}",
+        f"skillhub:{normalized_slug}",
+    )
+
+
+def _valid_skillhub_slug(value: str) -> bool:
+    """限制供应商 slug 字符集和长度，避免把 URL/query/凭据混入来源标识。"""
+
+    normalized = value.removesuffix(".zip").removesuffix(".md")
+    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{1,127}", normalized))
+
+
+def validated_remote_reference(
+    source_url: str,
+    *,
+    allowed_hosts: frozenset[str] | None,
+) -> str:
+    """在持久化前校验远程 URL，并返回不含 query、fragment 和用户凭据的规范地址。"""
+
+    parsed = _validated_https_url(source_url.strip(), allowed_hosts)
+    hostname = (parsed.hostname or "").lower().rstrip(".")
+    path = parsed.path or "/"
+    return parsed._replace(
+        netloc=hostname,
+        path=path,
+        query="",
+        fragment="",
+    ).geturl()
 
 
 def _validated_https_url(source_url: str, allowed_hosts: frozenset[str] | None):

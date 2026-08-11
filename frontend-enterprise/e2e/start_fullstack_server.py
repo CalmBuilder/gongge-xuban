@@ -1696,7 +1696,7 @@ def install_general_skill_remote_fetcher_override() -> None:
     from app.main import app
 
     class BrowserRemoteFetcher:
-        """返回与 mattpocock/skills 目录形态一致的两个固定 Skill 候选。"""
+        """按 GitHub 或 SkillHub 契约返回固定 Skill 包，不替换内部导入链。"""
 
         def fetch(
             self,
@@ -1704,13 +1704,27 @@ def install_general_skill_remote_fetcher_override() -> None:
             *,
             allowed_hosts: frozenset[str] | None = None,
         ) -> RemoteFetchResult:
-            """校验固定 GitHub 归档和 allowlist 后生成确定性 provider 响应。"""
+            """校验来源专属 URL/allowlist 后生成确定性 provider 响应。"""
 
+            payload = BytesIO()
+            if source_url.startswith(
+                "https://wry-manatee-359.convex.site/api/v1/download?slug="
+            ):
+                if allowed_hosts != frozenset({"wry-manatee-359.convex.site"}):
+                    raise RuntimeError("missing E2E SkillHub host allowlist")
+                with ZipFile(payload, "w", ZIP_DEFLATED) as archive:
+                    archive.writestr(
+                        "SKILL.md",
+                        "---\n"
+                        "name: skillhub-browser-helper\n"
+                        "description: Verify the reviewed SkillHub adapter.\n"
+                        "---\n# SkillHub browser helper\n",
+                    )
+                return RemoteFetchResult(source_url, payload.getvalue(), 0)
             if not source_url.startswith("https://github.com/mattpocock/skills/archive/"):
-                raise RuntimeError("unexpected E2E GitHub archive URL")
+                raise RuntimeError("unexpected E2E remote archive URL")
             if not allowed_hosts or "codeload.github.com" not in allowed_hosts:
                 raise RuntimeError("missing E2E GitHub redirect allowlist")
-            payload = BytesIO()
             with ZipFile(payload, "w", ZIP_DEFLATED) as archive:
                 archive.writestr(
                     "skills-main/skills/engineering/tdd/SKILL.md",

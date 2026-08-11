@@ -201,7 +201,7 @@ type DroppedSkillFile = {
 
 type GeneralSkillImportMode = 'plaza' | 'employee';
 type SkillDependencyDecision = 'required' | 'optional' | 'ignored';
-type SecureSkillImportSourceKind = 'upload' | 'folder' | 'github' | 'https';
+type SecureSkillImportSourceKind = 'upload' | 'folder' | 'github' | 'skillhub' | 'https';
 
 type SkillFileSystemEntry = {
   name: string;
@@ -347,6 +347,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
   const [deleteTarget, setDeleteTarget] = useState<GeneralSkillRead | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [secureImportAvailable, setSecureImportAvailable] = useState(false);
+  const [secureImportSourceKinds, setSecureImportSourceKinds] = useState<SecureSkillImportSourceKind[]>([]);
   const [secureImportOpen, setSecureImportOpen] = useState(false);
   const [secureImportSourceKind, setSecureImportSourceKind] = useState<SecureSkillImportSourceKind>('upload');
   const [secureImportFile, setSecureImportFile] = useState<File | null>(null);
@@ -390,10 +391,17 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
   useEffect(() => {
     api
       .get<{ enabled: boolean; source_kinds: string[] }>('/api/enterprise/general-skill-import-jobs/capabilities')
-      .then((capabilities) => setSecureImportAvailable(
-        capabilities.enabled && capabilities.source_kinds.includes('upload'),
-      ))
-      .catch(() => setSecureImportAvailable(false));
+      .then((capabilities) => {
+        const sourceKinds = capabilities.source_kinds.filter(
+          (kind): kind is SecureSkillImportSourceKind => ['upload', 'github', 'skillhub', 'https'].includes(kind),
+        );
+        setSecureImportSourceKinds(sourceKinds);
+        setSecureImportAvailable(capabilities.enabled && sourceKinds.includes('upload'));
+      })
+      .catch(() => {
+        setSecureImportSourceKinds([]);
+        setSecureImportAvailable(false);
+      });
   }, []);
 
   useEffect(() => {
@@ -653,7 +661,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
       return;
     }
     if (secureImportSourceKind === 'upload' && !secureImportFile) {
-      notify.warning('请选择一个 ZIP Skill 包');
+      notify.warning('请选择 SKILL.md 或 ZIP Skill 包');
       return;
     }
     if (secureImportSourceKind === 'folder' && !secureImportFolderFiles.length) {
@@ -661,7 +669,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
       return;
     }
     if (!['upload', 'folder'].includes(secureImportSourceKind) && !secureImportSourceUrl.trim()) {
-      notify.warning('请输入 HTTPS 来源地址');
+      notify.warning('请输入远程来源地址或 SkillHub slug');
       return;
     }
     if (secureImportSourceKind === 'github' && !/^[a-f0-9]{40}$/i.test(secureImportRevision.trim())) {
@@ -943,10 +951,12 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
                       从广场复制
                     </DropdownMenuItem>
                   )}
-                  <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => requestClawHubImport()}>
-                    <GithubOutlined />
-                    从开源平台导入
-                  </DropdownMenuItem>
+                  {!secureImportAvailable && (
+                    <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => requestClawHubImport()}>
+                      <GithubOutlined />
+                      从开源平台导入
+                    </DropdownMenuItem>
+                  )}
                   {!isOverallAgent && secureImportAvailable && (
                     <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={requestSecurePackageImport}>
                       <ShieldCheck />
@@ -1056,6 +1066,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
       <SecureSkillImportDialog
         open={secureImportOpen}
         loading={secureImportLoading}
+        availableSourceKinds={secureImportSourceKinds}
         sourceKind={secureImportSourceKind}
         file={secureImportFile}
         folderFiles={secureImportFolderFiles}
@@ -1089,6 +1100,13 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
         )}
         onPreview={() => void previewSecurePackage()}
         onConfirm={() => void confirmSecurePackage()}
+        onReset={() => {
+          setSecureImportJob(null);
+          setSecureImportFile(null);
+          setSecureImportFolderFiles([]);
+          setSecureImportSelectedIds([]);
+          setSecureImportDependencyDecisions({});
+        }}
         onClose={() => void cancelSecurePackage()}
       />
 
@@ -1211,6 +1229,7 @@ function ClawHubDialog({
 export function SecureSkillImportDialog({
   open,
   loading,
+  availableSourceKinds = ['upload', 'github', 'skillhub', 'https'],
   sourceKind,
   file,
   folderFiles,
@@ -1230,10 +1249,12 @@ export function SecureSkillImportDialog({
   onDependencyDecisionChange,
   onPreview,
   onConfirm,
+  onReset,
   onClose,
 }: {
   open: boolean;
   loading: boolean;
+  availableSourceKinds?: SecureSkillImportSourceKind[];
   sourceKind: SecureSkillImportSourceKind;
   file: File | null;
   folderFiles: File[];
@@ -1253,6 +1274,7 @@ export function SecureSkillImportDialog({
   onDependencyDecisionChange: (candidateId: string, decision: SkillDependencyDecision) => void;
   onPreview: () => void;
   onConfirm: () => void;
+  onReset: () => void;
   onClose: () => void;
 }) {
   const hasPreview = job?.status === 'awaiting_approval';
@@ -1306,13 +1328,16 @@ export function SecureSkillImportDialog({
         <div className="min-h-0 flex-1 overflow-y-auto px-[24px] py-[20px]">
           {!job ? (
             <div className="grid gap-4">
-              <div role="tablist" aria-label="Skill 来源" className="grid grid-cols-2 rounded-[11px] bg-[#f1f3f8] p-1 sm:grid-cols-4">
+              <div role="tablist" aria-label="Skill 来源" className="grid grid-cols-2 rounded-[11px] bg-[#f1f3f8] p-1 sm:grid-cols-5">
                 {([
-                  ['upload', '上传 ZIP'],
+                  ['upload', '上传文件'],
                   ['folder', '选择文件夹'],
                   ['github', 'GitHub 固定版本'],
+                  ['skillhub', 'SkillHub'],
                   ['https', 'HTTPS ZIP'],
-                ] as const).map(([kind, label]) => (
+                ] as const).filter(([kind]) => (
+                  kind === 'folder' ? availableSourceKinds.includes('upload') : availableSourceKinds.includes(kind)
+                )).map(([kind, label]) => (
                   <button
                     key={kind}
                     type="button"
@@ -1336,7 +1361,7 @@ export function SecureSkillImportDialog({
                 <label className="flex min-h-[190px] cursor-pointer flex-col items-center justify-center rounded-[14px] border border-dashed border-[#bfc9dc] bg-[#fbfcff] px-6 text-center transition-colors hover:border-[var(--gg-cobalt)] hover:bg-[#f7f9ff] focus-within:ring-2 focus-within:ring-[#b9c8ff]">
                   <FileArchive className="mb-3 size-8 text-[#5574dc]" />
                   <strong className="text-[14px] font-semibold text-[#252936]">
-                    {file ? file.name : '选择 ZIP Skill 包'}
+                    {file ? file.name : '选择 SKILL.md 或 ZIP Skill 包'}
                   </strong>
                   <span className="mt-2 text-[12px] leading-[1.6] text-[#858b9c]">
                     不会直接运行包内内容；路径、编码、压缩比、文件预算和所有 SKILL.md 会先接受完整检查。
@@ -1349,7 +1374,7 @@ export function SecureSkillImportDialog({
                   <input
                     className="sr-only"
                     type="file"
-                    accept=".zip,application/zip"
+                    accept=".zip,.md,application/zip,text/markdown"
                     disabled={loading}
                     onChange={(event) => onFileChange(event.target.files?.[0] || null)}
                   />
@@ -1375,13 +1400,19 @@ export function SecureSkillImportDialog({
               ) : (
                 <section className="grid gap-4 rounded-[14px] border border-[#dfe5f2] bg-[#fbfcff] p-5">
                   <label className="grid gap-2 text-[12px] font-medium text-[#303747]">
-                    {sourceKind === 'github' ? 'GitHub 仓库地址' : '公开 HTTPS ZIP 地址'}
+                    {sourceKind === 'github'
+                      ? 'GitHub 仓库地址'
+                      : sourceKind === 'skillhub'
+                        ? 'SkillHub slug 或页面地址'
+                        : '公开 HTTPS ZIP 地址'}
                     <Input
                       value={sourceUrl}
                       onChange={(event) => onSourceUrlChange(event.target.value)}
                       placeholder={sourceKind === 'github'
                         ? 'https://github.com/mattpocock/skills'
-                        : 'https://example.com/skills.zip'}
+                        : sourceKind === 'skillhub'
+                          ? '例如 customer-support 或 https://skillhub.ai/owner/customer-support'
+                          : 'https://example.com/skills.zip'}
                       className="h-10 rounded-[9px] border-[#cfd7e6] bg-white font-mono text-[12px]"
                     />
                   </label>
@@ -1549,7 +1580,7 @@ export function SecureSkillImportDialog({
 
         <footer className="flex items-center justify-between gap-3 border-t border-[#e8ebf2] bg-white px-[24px] py-[16px]">
           <span className="text-[11px] text-[#858b9c]">
-            {hasPreview ? '默认固定本次修订；后续升级需再次审核。' : 'ZIP 与文件夹共用完整检查；任一文件失败则整包拒绝。'}
+            {hasPreview ? '默认固定本次修订；后续升级需再次审核。' : 'SKILL.md、ZIP 与文件夹共用完整检查；任一文件失败则整包拒绝。'}
           </span>
           <div className="flex items-center gap-2">
             <UIButton variant="outline" disabled={loading} onClick={onClose} className={RETURN_BUTTON_CLASS}>
@@ -1577,6 +1608,15 @@ export function SecureSkillImportDialog({
                 className={PRIMARY_BUTTON_CLASS}
               >
                 固定版本并绑定
+              </UIButton>
+            ) : null}
+            {job?.status === 'failed' ? (
+              <UIButton
+                disabled={loading}
+                onClick={onReset}
+                className={PRIMARY_BUTTON_CLASS}
+              >
+                修正来源并重试
               </UIButton>
             ) : null}
           </div>

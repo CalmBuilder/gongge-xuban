@@ -246,6 +246,56 @@ def test_confirm_creates_published_revision_and_default_pinned_private_binding(t
     assert not (tmp_path / "staging" / preview.id).exists()
 
 
+def test_single_skill_markdown_uses_the_same_secure_preview_pipeline(tmp_path) -> None:
+    """验证直接上传 SKILL.md 会封装后进入 ZIP 规范化器，而非走宽松旁路。"""
+
+    _, service, owner, _ = _context(tmp_path)
+    manifest = b"---\nname: direct-skill\ndescription: Direct import\n---\nDo the work safely.\n"
+    result = service.create_upload_job(
+        GeneralSkillImportJobCreate(
+            tenant_id="tenant_a",
+            target_agent_id="agent_a",
+            source_kind="upload",
+            filename="SKILL.md",
+            content_base64=base64.b64encode(manifest).decode(),
+        ),
+        idempotency_key="single-skill-md-001",
+        current_user=owner,
+    )
+
+    assert result.status == "awaiting_approval"
+    assert [candidate.name for candidate in result.candidates] == ["direct-skill"]
+    assert result.source_reference_redacted == "SKILL.md"
+
+
+def test_single_skill_markdown_replay_is_content_idempotent(tmp_path) -> None:
+    """验证服务端封装结果可复现，相同单文件与幂等键不会因 ZIP 时间戳产生冲突。"""
+
+    _, service, owner, _ = _context(tmp_path)
+    request = GeneralSkillImportJobCreate(
+        tenant_id="tenant_a",
+        target_agent_id="agent_a",
+        source_kind="upload",
+        filename="SKILL.md",
+        content_base64=base64.b64encode(
+            b"---\nname: deterministic\ndescription: Stable package\n---\nStable.\n"
+        ).decode(),
+    )
+    first = service.create_upload_job(
+        request,
+        idempotency_key="single-skill-replay-001",
+        current_user=owner,
+    )
+    replay = service.create_upload_job(
+        request,
+        idempotency_key="single-skill-replay-001",
+        current_user=owner,
+    )
+
+    assert replay.id == first.id
+    assert replay.raw_checksum == first.raw_checksum
+
+
 def test_confirm_replay_requires_the_same_semantic_request(tmp_path) -> None:
     """验证同一确认可幂等重放，而改选候选不能借 installed 终态伪装成功。"""
 
@@ -751,6 +801,34 @@ def test_github_source_uses_full_revision_and_shared_preview_pipeline(tmp_path) 
     assert "must-not-persist" not in str(result.model_dump(mode="json"))
 
 
+def test_skillhub_slug_uses_vendor_allowlist_and_shared_preview_pipeline(tmp_path) -> None:
+    """验证 SkillHub slug 经固定供应商适配器下载并进入相同预览、确认和绑定链。"""
+
+    _, service, owner, _ = _context(tmp_path)
+    fetcher = _RemoteFetcherStub(_package("skillhub-helper"))
+    result = service.create_job(
+        GeneralSkillImportJobCreate(
+            tenant_id="tenant_a",
+            target_agent_id="agent_a",
+            source_kind="skillhub",
+            source_url="skillhub-helper",
+        ),
+        idempotency_key="skillhub-helper-001",
+        current_user=owner,
+        fetcher=fetcher,
+    )
+
+    assert result.status == "awaiting_approval"
+    assert result.source_reference_redacted == "skillhub:skillhub-helper"
+    assert [candidate.name for candidate in result.candidates] == ["skillhub-helper"]
+    assert fetcher.calls == [
+        (
+            "https://wry-manatee-359.convex.site/api/v1/download?slug=skillhub-helper",
+            frozenset({"wry-manatee-359.convex.site"}),
+        )
+    ]
+
+
 def test_remote_idempotency_key_cannot_be_reused_for_another_source(tmp_path) -> None:
     """验证远程作业完成预览后仍保留请求指纹，阻止换 URL 重放同一幂等键。"""
 
@@ -777,3 +855,52 @@ def test_remote_idempotency_key_cannot_be_reused_for_another_source(tmp_path) ->
             fetcher=fetcher,
         )
     assert captured.value.error_code == "GENERAL_SKILL_STATE_CONFLICT"
+
+
+def test_https_source_rejects_embedded_credentials_before_job_persistence(tmp_path) -> None:
+    """验证 URL userinfo 在建作业前被拒绝，密码不会进入数据库或 API DTO。"""
+
+    db, service, owner, _ = _context(tmp_path)
+    request = GeneralSkillImportJobCreate(
+        tenant_id="tenant_a",
+        target_agent_id="agent_a",
+        source_kind="https",
+        source_url="https://import-user:must-not-persist@packages.example.com/skill.zip",
+    )
+    with pytest.raises(GeneralSkillImportError) as captured:
+        service.create_job(
+            request,
+            idempotency_key="https-credential-001",
+            current_user=owner,
+            fetcher=_RemoteFetcherStub(_package("credential")),
+        )
+
+    assert captured.value.error_code == "GENERAL_SKILL_PACKAGE_INVALID"
+    assert db.exec(select(GeneralSkillImportJob)).all() == []
+
+
+def test_https_source_requires_deployment_allowlist_when_policy_is_supplied(tmp_path) -> None:
+    """验证生产 API 注入空白名单时关闭任意 HTTPS 来源，而非退化成全网可抓取。"""
+
+    db, _, owner, _ = _context(tmp_path)
+    service = GeneralSkillImportService(
+        db,
+        FileSystemSkillObjectStore(tmp_path),
+        https_allowed_hosts=frozenset(),
+    )
+    request = GeneralSkillImportJobCreate(
+        tenant_id="tenant_a",
+        target_agent_id="agent_a",
+        source_kind="https",
+        source_url="https://packages.example.com/skill.zip",
+    )
+    with pytest.raises(GeneralSkillImportError) as captured:
+        service.create_job(
+            request,
+            idempotency_key="https-no-allowlist-001",
+            current_user=owner,
+            fetcher=_RemoteFetcherStub(_package("allowlist")),
+        )
+
+    assert captured.value.error_code == "GENERAL_SKILL_SOURCE_NOT_CONFIGURED"
+    assert db.exec(select(GeneralSkillImportJob)).all() == []

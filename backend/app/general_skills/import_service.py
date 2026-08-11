@@ -18,8 +18,7 @@ from datetime import datetime, timedelta
 from io import BytesIO
 from pathlib import PurePath
 from typing import Any
-from urllib.parse import urlsplit
-from zipfile import ZIP_DEFLATED, ZipFile
+from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
 from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
@@ -59,10 +58,13 @@ from app.general_skills.package_security import (
 )
 from app.general_skills.remote_source import (
     GITHUB_ARCHIVE_HOSTS,
+    SKILLHUB_DOWNLOAD_HOSTS,
     GeneralSkillRemoteSourceError,
     RemoteFetcher,
     SecureHttpsFetcher,
     github_archive_url,
+    skillhub_archive_url,
+    validated_remote_reference,
 )
 from app.security.permissions import ensure_agent_scope_manager
 from app.security.tenant import ensure_tenant
@@ -98,11 +100,18 @@ class GeneralSkillImportError(RuntimeError):
 class GeneralSkillImportService:
     """在单一事务边界内管理用户私有 Skill 的预览和确认。"""
 
-    def __init__(self, db: Session, object_store: FileSystemSkillObjectStore) -> None:
-        """绑定请求 Session 和部署级内容对象存储。"""
+    def __init__(
+        self,
+        db: Session,
+        object_store: FileSystemSkillObjectStore,
+        *,
+        https_allowed_hosts: frozenset[str] | None = None,
+    ) -> None:
+        """绑定请求 Session、对象存储和可选的公开 HTTPS 来源白名单。"""
 
         self.db = db
         self.object_store = object_store
+        self.https_allowed_hosts = https_allowed_hosts
 
     def create_upload_job(
         self,
@@ -125,11 +134,7 @@ class GeneralSkillImportService:
             raise GeneralSkillImportError(
                 "GENERAL_SKILL_PACKAGE_INVALID", "upload source is incomplete", 400
             )
-        payload = (
-            _decode_base64(request.content_base64)
-            if request.content_base64 is not None
-            else _build_folder_archive(request.files or [])
-        )
+        payload = _prepare_upload_payload(request)
         raw_checksum = hashlib.sha256(payload).hexdigest()
         existing = self.db.exec(
             select(GeneralSkillImportJob).where(
@@ -481,11 +486,34 @@ class GeneralSkillImportService:
         key = _validated_idempotency_key(idempotency_key)
         source_url = request.source_url.strip()
         allowed_hosts: frozenset[str] | None = None
-        if request.source_kind == "github":
-            source_url = github_archive_url(source_url, request.revision or "")
-            allowed_hosts = GITHUB_ARCHIVE_HOSTS
-        source_reference = _redacted_remote_reference(
-            request.source_url,
+        try:
+            if request.source_kind == "github":
+                source_url = github_archive_url(source_url, request.revision or "")
+                allowed_hosts = GITHUB_ARCHIVE_HOSTS
+                validated_reference = validated_remote_reference(
+                    request.source_url,
+                    allowed_hosts=frozenset({"github.com"}),
+                )
+            elif request.source_kind == "skillhub":
+                source_url, validated_reference = skillhub_archive_url(source_url)
+                allowed_hosts = SKILLHUB_DOWNLOAD_HOSTS
+            else:
+                if self.https_allowed_hosts is not None:
+                    if not self.https_allowed_hosts:
+                        raise GeneralSkillImportError(
+                            "GENERAL_SKILL_SOURCE_NOT_CONFIGURED",
+                            "public HTTPS skill sources are not configured for this deployment",
+                            403,
+                        )
+                    allowed_hosts = self.https_allowed_hosts
+                validated_reference = validated_remote_reference(
+                    request.source_url,
+                    allowed_hosts=allowed_hosts,
+                )
+        except GeneralSkillRemoteSourceError as exc:
+            raise GeneralSkillImportError(exc.error_code, str(exc), 400) from exc
+        source_reference = _remote_reference(
+            validated_reference,
             request.revision,
             request.source_subpath,
         )
@@ -1086,8 +1114,11 @@ def _build_folder_archive(files: list[GeneralSkillUploadFile]) -> bytes:
         decoded.append((path, content))
     buffer = BytesIO()
     with ZipFile(buffer, "w", ZIP_DEFLATED) as archive:
-        for path, content in decoded:
-            archive.writestr(path, content)
+        for path, content in sorted(decoded, key=lambda item: item[0]):
+            entry = ZipInfo(path, date_time=(1980, 1, 1, 0, 0, 0))
+            entry.compress_type = ZIP_DEFLATED
+            entry.external_attr = 0o100644 << 16
+            archive.writestr(entry, content)
     return buffer.getvalue()
 
 
@@ -1102,6 +1133,26 @@ def _validated_idempotency_key(value: str) -> str:
     return normalized
 
 
+def _prepare_upload_payload(request: GeneralSkillImportJobCreate) -> bytes:
+    """把单个 SKILL.md 或浏览器文件夹封装为 ZIP，统一复用安全规范化边界。"""
+
+    if request.content_base64 is None:
+        return _build_folder_archive(request.files or [])
+    payload = _decode_base64(request.content_base64)
+    filename = (request.filename or "").lower()
+    if filename.endswith(".zip"):
+        return payload
+    if filename.endswith(".md") and PurePath(filename).name == "skill.md":
+        return _build_folder_archive(
+            [GeneralSkillUploadFile(path="SKILL.md", content_base64=request.content_base64)]
+        )
+    raise GeneralSkillImportError(
+        "GENERAL_SKILL_PACKAGE_INVALID",
+        "upload must be a ZIP package or a file named SKILL.md",
+        400,
+    )
+
+
 def _redacted_filename(value: str) -> str:
     """只保留无路径的上传文件名作为来源展示。"""
 
@@ -1109,15 +1160,14 @@ def _redacted_filename(value: str) -> str:
     return PurePath(normalized.rsplit("/", 1)[-1]).name[:255]
 
 
-def _redacted_remote_reference(
-    source_url: str,
+def _remote_reference(
+    validated_source_url: str,
     revision: str | None,
     source_subpath: str | None,
 ) -> str:
-    """移除远程 URL query/fragment，并为 GitHub 来源保留固定 commit 证据。"""
+    """为已校验、已脱敏的远程 URL 附加固定 revision 和候选子路径证据。"""
 
-    parsed = urlsplit(source_url.strip())
-    redacted = parsed._replace(query="", fragment="").geturl()
+    redacted = validated_source_url
     if revision:
         redacted = f"{redacted}@{revision.lower()}"
     return f"{redacted}#{source_subpath}" if source_subpath else redacted
