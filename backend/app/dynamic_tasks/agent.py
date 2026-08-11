@@ -2936,6 +2936,7 @@ class DynamicTaskAgent:
         input_resource_ids: Sequence[str] = (),
         knowledge_capability: dict[str, object] | None = None,
         forced_general_skill_id: str | None = None,
+        forced_general_skill_ids: Sequence[str] = (),
         memory_context: Sequence[Mapping[str, object]] = (),
     ) -> tuple[SopInstance, bool]:
         """经模型 preflight、实时能力目录和有界规划创建或复用统一动态 Execution。"""
@@ -3024,13 +3025,25 @@ class DynamicTaskAgent:
         guidance_catalog = [
             item for item in capabilities if item.capability_type == "general_skill"
         ]
-        if forced_general_skill_id:
+        requested_forced_ids = tuple(
+            dict.fromkeys(
+                [
+                    *(str(value).strip() for value in forced_general_skill_ids),
+                    str(forced_general_skill_id or "").strip(),
+                ]
+            )
+        )
+        requested_forced_ids = tuple(value for value in requested_forced_ids if value)
+        if len(requested_forced_ids) > 8:
+            raise DynamicTaskAgentError("GENERAL_SKILL_SELECTION_LIMIT_EXCEEDED")
+        if requested_forced_ids:
+            guidance_by_id = {item.capability_id: item for item in guidance_catalog}
             selected_guidance = [
-                item
-                for item in guidance_catalog
-                if item.capability_id == forced_general_skill_id
+                guidance_by_id[value]
+                for value in requested_forced_ids
+                if value in guidance_by_id
             ]
-            if len(selected_guidance) != 1:
+            if len(selected_guidance) != len(requested_forced_ids):
                 raise DynamicTaskAgentError("GENERAL_SKILL_NOT_AVAILABLE")
             guidance_mode = "forced"
         elif guidance_catalog:
@@ -3049,11 +3062,24 @@ class DynamicTaskAgent:
             guidance_mode = "auto"
         loaded_guidance: list[dict[str, object]] = []
         loaded_use_ids: list[str] = []
+        loaded_use_id_set: set[str] = set()
         actor = self.db.get(User, initiator_user_id) if selected_guidance else None
         if selected_guidance and (actor is None or actor.tenant_id != tenant_id):
             raise DynamicTaskAgentError("DYNAMIC_ACTOR_NOT_AVAILABLE")
         runtime = GeneralSkillRuntimeService(self.db)
-        for selected in selected_guidance:
+        composed_bundle = (
+            runtime.load_composed_bundle(
+                actor,
+                session_id=session_id,
+                agent_id=agent_id,
+                turn_id=source_ref or f"dynamic:{session_id}",
+                skill_ids=requested_forced_ids,
+                commit=False,
+            )
+            if len(requested_forced_ids) > 1 and actor is not None
+            else ()
+        )
+        for selected in ([] if composed_bundle else selected_guidance):
             assert actor is not None
             bundle = runtime.load_bundle(
                 actor,
@@ -3064,15 +3090,18 @@ class DynamicTaskAgent:
                 selection_mode=guidance_mode,
                 commit=False,
             )
-            loaded_use_ids.extend(item.use_id for item in bundle)
-            loaded_guidance.append(
-                {
-                    "name": selected.name,
-                    "skill_use_ids": [item.use_id for item in bundle],
-                    "skills": [item.prompt_block() for item in bundle],
-                }
-            )
             for loaded in bundle:
+                if loaded.use_id in loaded_use_id_set:
+                    continue
+                loaded_use_id_set.add(loaded.use_id)
+                loaded_use_ids.append(loaded.use_id)
+                loaded_guidance.append(
+                    {
+                        "name": loaded.name,
+                        "skill_use_ids": [loaded.use_id],
+                        "skills": [loaded.prompt_block()],
+                    }
+                )
                 self.db.add(
                     AgentEvent(
                         tenant_id=tenant_id,
@@ -3089,6 +3118,32 @@ class DynamicTaskAgent:
                         },
                     )
                 )
+        for loaded in composed_bundle:
+            loaded_use_id_set.add(loaded.use_id)
+            loaded_use_ids.append(loaded.use_id)
+            loaded_guidance.append(
+                {
+                    "name": loaded.name,
+                    "skill_use_ids": [loaded.use_id],
+                    "skills": [loaded.prompt_block()],
+                }
+            )
+            self.db.add(
+                AgentEvent(
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                    event_type="skill_loaded",
+                    payload_json={
+                        "turn_id": source_ref or f"dynamic:{session_id}",
+                        "user_message_id": source_ref or None,
+                        "skill_use_id": loaded.use_id,
+                        "skill_id": loaded.skill_id,
+                        "revision_id": loaded.revision_id,
+                        "selection_mode": loaded.selection_mode,
+                        "consumer": "dynamic_task",
+                    },
+                )
+            )
         planning_inputs = tuple(
             {
                 "resource_id": resource.id,

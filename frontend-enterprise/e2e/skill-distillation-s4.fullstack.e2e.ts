@@ -45,6 +45,17 @@ const CODE_COUNTERMAND_SKILL_MARKDOWN = CODE_SKILL_MARKDOWN.replace(
   `name: ${CODE_SKILL_NAME}`,
   `name: ${CODE_COUNTERMAND_SKILL_NAME}`,
 );
+const DELIVERY_SKILLS = [
+  'code-review',
+  'domain-modeling',
+  'grill-with-docs',
+  'grilling',
+  'implement',
+  'setup-matt-pocock-skills',
+  'tdd',
+  'to-spec',
+  'to-tickets',
+];
 
 async function loginAsMember(page: Page, agentId = 'agent_e2e_member_employee') {
   /** 通过真实认证 API 登录并固定成员自己的数字员工。 */
@@ -93,6 +104,175 @@ async function importFixedGitHubSkill(page: Page, skillName: string) {
   await dialog.getByRole('button', { name: '固定版本并绑定' }).click();
   expect((await confirmResponse).status()).toBe(200);
   await expect(dialog).not.toBeVisible();
+}
+
+async function importFixedEngineeringBundle(page: Page) {
+  /** 从固定上游 commit 一次审核九个工程 Skill，并显式确认两组必需依赖。 */
+
+  await page.goto('/enterprise/general-skills');
+  await page.getByRole('button', { name: /新增/ }).click();
+  await page.getByRole('menuitem', { name: '安全导入 Skill' }).click();
+  const dialog = page.getByRole('dialog', { name: '安全导入 Skill 包' });
+  await dialog.getByRole('tab', { name: 'GitHub 固定版本' }).click();
+  await dialog.getByLabel('GitHub 仓库地址').fill('https://github.com/mattpocock/skills');
+  await dialog.getByLabel('完整 commit SHA').fill('84fdeffd12f2ee307994d1eb6feb48173b6e0502');
+  const previewResponse = page.waitForResponse((response) => (
+    new URL(response.url()).pathname === '/api/enterprise/general-skill-import-jobs'
+    && response.request().method() === 'POST'
+  ));
+  await dialog.getByRole('button', { name: '生成安全预览' }).click();
+  expect((await previewResponse).status()).toBe(202);
+  await expect(dialog.getByText('setup-matt-pocock-skills', { exact: true })).toBeVisible({
+    timeout: 30_000,
+  });
+  await dialog.getByLabel(/^diagnosing-bugs/).uncheck();
+  await dialog.getByLabel(/^codebase-design/).uncheck();
+  for (const dependency of ['grilling', 'domain-modeling', 'tdd', 'code-review']) {
+    await dialog.getByLabel(`依赖 /${dependency} 的处理方式`).selectOption('required');
+  }
+  const setupDependencies = dialog.getByLabel(
+    '依赖 /setup-matt-pocock-skills 的处理方式',
+  );
+  expect(await setupDependencies.count()).toBe(2);
+  for (let index = 0; index < await setupDependencies.count(); index += 1) {
+    await setupDependencies.nth(index).selectOption('required');
+  }
+  const confirmResponse = page.waitForResponse((response) => (
+    new URL(response.url()).pathname.endsWith('/confirm')
+    && response.request().method() === 'POST'
+  ));
+  await dialog.getByRole('button', { name: '固定版本并绑定' }).click();
+  expect((await confirmResponse).status()).toBe(200);
+  await expect(dialog).not.toBeVisible();
+}
+
+async function runDeliveryPreparationPhase(
+  page: Page,
+  skillIds: string[],
+  phase: string,
+  expectedSkillIds: string[],
+  expectedPaths: string[],
+) {
+  /** 通过真实动态任务与独立管理员审批，落地一个上游工程工作流阶段。 */
+
+  await loginAsMember(page, 'agent_e2e_delivery');
+  const started = await page.evaluate(async ({ skillIds: forcedSkillIds, phase: phaseName }) => {
+    const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
+    const headers = { Authorization: `Bearer ${auth.token}`, 'Content-Type': 'application/json' };
+    const sessionResponse = await fetch('/api/chat/sessions', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        tenant_id: 'tenant_demo',
+        agent_id: 'agent_e2e_delivery',
+        title: `S4 研发准备 ${phaseName}`,
+        origin: 'owned',
+      }),
+    });
+    const session = await sessionResponse.json() as { id?: string; detail?: string };
+    if (!sessionResponse.ok || !session.id) {
+      throw new Error(session.detail || 'preparation session creation failed');
+    }
+    const streamResponse = await fetch('/api/chat/stream', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        tenant_id: 'tenant_demo',
+        session_id: session.id,
+        agent_id: 'agent_e2e_delivery',
+        client_turn_id: `turn_s4_delivery_${phaseName}`,
+        message: `S4研发准备：显式执行 ${phaseName} 阶段并把产物写入受管仓库`,
+        channel: 'web',
+        forced_general_skill_id: forcedSkillIds[0],
+        forced_general_skill_ids: forcedSkillIds,
+      }),
+    });
+    const streamBody = await streamResponse.text();
+    const events = await fetch(
+      `/api/chat/sessions/${session.id}/events?tenant_id=tenant_demo`,
+      { headers },
+    ).then((response) => response.json()) as Array<{
+      event_type: string;
+      data?: Record<string, unknown>;
+    }>;
+    return {
+      sessionId: session.id,
+      streamStatus: streamResponse.status,
+      streamBody,
+      executionId: String(
+        events.find((event) => event.event_type === 'dynamic_task_delegated')?.data?.execution_id || '',
+      ),
+    };
+  }, { skillIds, phase });
+  expect(started.streamStatus).toBe(200);
+  expect(started.streamBody).toContain('event: complete');
+  expect(started.executionId).not.toBe('');
+
+  await loginAsAdmin(page);
+  for (let index = 0; index < 4; index += 1) {
+    await page.goto('/enterprise/work-items');
+    const card = page.getByRole('button', { name: /批准受管代码工作区变更/ }).first();
+    await expect(card).toBeVisible({ timeout: 30_000 });
+    await card.click();
+    await page.getByRole('dialog').getByRole('button', { name: '仅批准本次操作' }).click();
+  }
+
+  await loginAsMember(page, 'agent_e2e_delivery');
+  await expect.poll(async () => page.evaluate(async (executionId) => {
+    const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
+    return fetch(`/api/executions/${executionId}?tenant_id=tenant_demo`, {
+      headers: { Authorization: `Bearer ${auth.token}` },
+    }).then((response) => response.json()) as Promise<Record<string, unknown>>;
+  }, started.executionId), { timeout: 45_000 }).toMatchObject({ status: 'succeeded' });
+
+  const evidence = await page.evaluate(async ({ sessionId, executionId }) => {
+    const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
+    const headers = { Authorization: `Bearer ${auth.token}` };
+    const events = await fetch(
+      `/api/chat/sessions/${sessionId}/events?tenant_id=tenant_demo`,
+      { headers },
+    ).then((response) => response.json()) as Array<{
+      event_type: string;
+      data?: Record<string, unknown>;
+    }>;
+    const trace = await fetch(
+      `/api/enterprise/traces/${sessionId}?tenant_id=tenant_demo`,
+      { headers },
+    ).then((response) => response.json()) as {
+      sop_runtime?: Array<{
+        instance_id: string;
+        operations?: Array<{
+          operation_name: string;
+          caused_by_skill_use_ids?: string[];
+          result?: { data?: { files?: Array<{ path?: string; changed?: boolean }> } };
+        }>;
+      }>;
+    };
+    return {
+      events,
+      runtime: trace.sop_runtime?.find((item) => item.instance_id === executionId),
+    };
+  }, { sessionId: started.sessionId, executionId: started.executionId });
+  const loaded = evidence.events
+    .filter((event) => event.event_type === 'skill_loaded')
+    .map((event) => String(event.data?.skill_id));
+  expect(loaded.sort()).toEqual([...expectedSkillIds].sort());
+  const operations = evidence.runtime?.operations || [];
+  expect(operations.map((item) => item.operation_name)).toEqual([
+    'workspace.refund.apply-set',
+    'workspace.refund.apply-set',
+    'workspace.refund.apply-set',
+    'workspace.refund.apply-set',
+  ]);
+  expect(new Set(operations.flatMap((item) => item.caused_by_skill_use_ids || [])).size).toBe(
+    expectedSkillIds.length,
+  );
+  expect(operations.flatMap((item) => item.result?.data?.files || []).map((item) => item.path)).toEqual(
+    expect.arrayContaining(expectedPaths),
+  );
+  expect(
+    operations.flatMap((item) => item.result?.data?.files || []).every((item) => item.changed),
+  ).toBe(true);
 }
 
 async function loginAsAdmin(page: Page) {
@@ -258,16 +438,45 @@ test('S4 动态任务从 Skill 目录到人工澄清、知识 Operation 和结�
   expect(failures).toEqual([]);
 });
 
-test('S4 研发交付数字员工经五次独立审批完成迁移、后端前端回归和 Git 提交', async ({ page }) => {
-  test.setTimeout(120_000);
+test('S4 研发交付数字员工组合九个固定 Skill 完成双数据库交付与两轴审查', async ({ page }) => {
+  test.setTimeout(300_000);
   const failures: string[] = [];
   page.on('pageerror', (error) => failures.push(error.message));
   page.on('response', (response) => {
     const path = new URL(response.url()).pathname;
     if (path.startsWith('/api/') && response.status() >= 500) failures.push(`${response.status()} ${path}`);
   });
-  await loginAsMember(page);
-  await importCodeGuidance(page);
+  await loginAsMember(page, 'agent_e2e_delivery');
+  await importFixedEngineeringBundle(page);
+  const deliveryCatalog = await page.evaluate(async () => {
+    const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
+    const response = await fetch(
+      '/api/enterprise/general-skill-governance/agents/agent_e2e_delivery/catalog',
+      { headers: { Authorization: `Bearer ${auth.token}` } },
+    );
+    return response.json() as Promise<{
+      items: Array<{ name: string; skill_id: string }>;
+    }>;
+  });
+  expect(deliveryCatalog.items.map((item) => item.name).sort()).toEqual(DELIVERY_SKILLS);
+  const importedSkillIds = new Map(
+    deliveryCatalog.items.map((item) => [item.name, item.skill_id]),
+  );
+  const implementSkillId = deliveryCatalog.items.find((item) => item.name === 'implement')?.skill_id;
+  expect(implementSkillId).toBeTruthy();
+  if (!implementSkillId) throw new Error('implement Skill is missing from delivery catalog');
+  const ids = (...names: string[]) => names.map((name) => {
+    const skillId = importedSkillIds.get(name);
+    if (!skillId) throw new Error(`${name} Skill is missing from delivery catalog`);
+    return skillId;
+  });
+  const forcedDeliverySkillIds = ids(
+    'implement',
+    'setup-matt-pocock-skills',
+    'grill-with-docs',
+    'to-spec',
+    'to-tickets',
+  );
   const sessionId = await page.evaluate(async () => {
     const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
     const response = await fetch('/api/chat/sessions', {
@@ -275,7 +484,7 @@ test('S4 研发交付数字员工经五次独立审批完成迁移、后端前�
       headers: { Authorization: `Bearer ${auth.token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         tenant_id: 'tenant_demo',
-        agent_id: 'agent_e2e_member_employee',
+        agent_id: 'agent_e2e_delivery',
         title: 'S4 受管代码交付',
         origin: 'owned',
       }),
@@ -284,7 +493,7 @@ test('S4 研发交付数字员工经五次独立审批完成迁移、后端前�
     if (!response.ok || !body.id) throw new Error(body.detail || 'session creation failed');
     return body.id;
   });
-  const started = await page.evaluate(async (id) => {
+  const started = await page.evaluate(async ({ id, forcedSkillIds }) => {
     const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
     const response = await fetch('/api/chat/stream', {
       method: 'POST',
@@ -292,14 +501,16 @@ test('S4 研发交付数字员工经五次独立审批完成迁移、后端前�
       body: JSON.stringify({
         tenant_id: 'tenant_demo',
         session_id: id,
-        agent_id: 'agent_e2e_member_employee',
+        agent_id: 'agent_e2e_delivery',
         client_turn_id: 'turn_s4_code_delivery',
         message: 'S4代码：在受管演示仓库把高金额退款改为必须审批，完成真实测试和提交',
         channel: 'web',
+        forced_general_skill_id: forcedSkillIds[0],
+        forced_general_skill_ids: forcedSkillIds,
       }),
     });
     return { status: response.status, body: await response.text() };
-  }, sessionId);
+  }, { id: sessionId, forcedSkillIds: forcedDeliverySkillIds });
   expect(started.status).toBe(200);
   expect(started.body).toContain('event: complete');
 
@@ -315,8 +526,11 @@ test('S4 研发交付数字员工经五次独立审批完成迁移、后端前�
 
   await loginAsAdmin(page);
   for (const title of [
+    '批准受管代码工作区变更',
+    '批准受管代码工作区变更',
     '批准受管代码工作区执行检查',
     '批准受管代码工作区变更',
+    '批准受管代码工作区执行检查',
     '批准受管代码工作区执行检查',
     '批准受管代码工作区执行检查',
     '批准受管代码工作区变更',
@@ -330,7 +544,7 @@ test('S4 研发交付数字员工经五次独立审批完成迁移、后端前�
     await dialog.getByRole('button', { name: '仅批准本次操作' }).click();
   }
 
-  await loginAsMember(page);
+  await loginAsMember(page, 'agent_e2e_delivery');
   await expect.poll(async () => page.evaluate(async (id) => {
     const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
     const response = await fetch(`/api/executions/${id}?tenant_id=tenant_demo`, {
@@ -343,34 +557,105 @@ test('S4 研发交付数字员工经五次独立审批完成迁移、后端前�
     const response = await fetch(`/api/enterprise/traces/${sessionId}?tenant_id=tenant_demo`, {
       headers: { Authorization: `Bearer ${auth.token}` },
     });
+    const eventsResponse = await fetch(
+      `/api/chat/sessions/${sessionId}/events?tenant_id=tenant_demo`,
+      { headers: { Authorization: `Bearer ${auth.token}` } },
+    );
     const trace = await response.json() as {
       sop_runtime?: Array<{
         instance_id: string;
         operations?: Array<{
           operation_name: string;
+          caused_by_skill_use_id?: string | null;
+          caused_by_skill_use_ids?: string[];
           request?: Record<string, unknown>;
           result?: { data?: Record<string, unknown> };
         }>;
       }>;
     };
-    return trace.sop_runtime?.find((item) => item.instance_id === executionId);
+    const events = await eventsResponse.json() as Array<{
+      event_type: string;
+      data?: Record<string, unknown>;
+    }>;
+    return {
+      runtime: trace.sop_runtime?.find((item) => item.instance_id === executionId),
+      events,
+    };
   }, { sessionId, executionId });
-  const operations = details?.operations || [];
+  const operations = details.runtime?.operations || [];
   const checks = operations.filter((item) => item.operation_name === 'workspace.refund.check');
   expect(checks.map((item) => item.request?.profile)).toEqual([
     'backend-red',
     'backend-unit',
     'frontend-unit',
+    'two-axis-review',
   ]);
   expect(checks[0]?.result?.data).toMatchObject({
     exit_code: 1,
     passed: true,
     expected_exit_codes: [1],
   });
-  expect(checks.slice(1).map((item) => item.result?.data?.exit_code)).toEqual([0, 0]);
-  expect(
-    operations.find((item) => item.operation_name === 'workspace.refund.apply-set')?.result?.data,
-  ).toMatchObject({ changed_count: 3, replayed: false });
+  expect(checks.slice(1).map((item) => item.result?.data?.exit_code)).toEqual([0, 0, 0]);
+  expect(String(checks[3]?.result?.data?.stdout)).toContain(
+    '"standards": {"status": "passed"',
+  );
+  expect(String(checks[3]?.result?.data?.stdout)).toContain('"spec": {"status": "passed"');
+  expect(String(checks[3]?.result?.data?.stdout)).toContain('"unresolved_risks": []');
+  const loadedSkills = details.events
+    .filter((event) => event.event_type === 'skill_loaded')
+    .map((event) => event.data);
+  expect(loadedSkills).toHaveLength(9);
+  expect(loadedSkills.map((item) => item?.selection_mode).sort()).toEqual([
+    'dependency',
+    'dependency',
+    'dependency',
+    'dependency',
+    'forced',
+    'forced',
+    'forced',
+    'forced',
+    'forced',
+  ]);
+  const useIdBySkill = new Map(
+    loadedSkills.map((item) => [String(item?.skill_id), String(item?.skill_use_id)]),
+  );
+  const implementUseId = useIdBySkill.get(importedSkillIds.get('implement') || '');
+  const tddUseId = useIdBySkill.get(importedSkillIds.get('tdd') || '');
+  const reviewUseId = useIdBySkill.get(importedSkillIds.get('code-review') || '');
+  const setupUseId = useIdBySkill.get(importedSkillIds.get('setup-matt-pocock-skills') || '');
+  const grillUseId = useIdBySkill.get(importedSkillIds.get('grill-with-docs') || '');
+  const grillingUseId = useIdBySkill.get(importedSkillIds.get('grilling') || '');
+  const domainUseId = useIdBySkill.get(importedSkillIds.get('domain-modeling') || '');
+  const specUseId = useIdBySkill.get(importedSkillIds.get('to-spec') || '');
+  const ticketsUseId = useIdBySkill.get(importedSkillIds.get('to-tickets') || '');
+  expect([
+    implementUseId,
+    tddUseId,
+    reviewUseId,
+    setupUseId,
+    grillUseId,
+    grillingUseId,
+    domainUseId,
+    specUseId,
+    ticketsUseId,
+  ].every(Boolean)).toBe(true);
+  expect(operations.map((item) => item.caused_by_skill_use_ids)).toEqual([
+    [setupUseId, grillUseId, grillingUseId, domainUseId],
+    [setupUseId, specUseId, ticketsUseId],
+    [implementUseId],
+    [tddUseId],
+    [implementUseId, tddUseId],
+    [tddUseId],
+    [tddUseId],
+    [reviewUseId],
+    [implementUseId],
+  ]);
+  expect(operations.map((item) => item.caused_by_skill_use_id)).toEqual(
+    operations.map((item) => item.caused_by_skill_use_ids?.[0]),
+  );
+  const writes = operations.filter((item) => item.operation_name === 'workspace.refund.apply-set');
+  expect(writes.map((item) => item.result?.data?.changed_count)).toEqual([5, 3, 3]);
+  expect(writes.every((item) => item.result?.data?.replayed === false)).toBe(true);
   expect(
     operations.find((item) => item.operation_name === 'workspace.refund.commit')?.result?.data,
   ).toMatchObject({ replayed: false });
@@ -480,14 +765,15 @@ test('S4 Skill 在审批后解绑会 countermand 零写入且恢复绑定后可�
     const body = await response.text();
     return {
       status: response.status,
+      body,
       sessionId: session.id,
       executionId: body.match(/"execution_id":\s*"([^"]+)"/)?.[1] || '',
       skillName,
     };
   }, CODE_COUNTERMAND_SKILL_NAME);
   expect(started.status).toBe(200);
+  expect(started.body).toContain('event: complete');
   expect(started.executionId).not.toBe('');
-
   await loginAsAdmin(page);
   await page.goto('/enterprise/work-items');
   const redCheck = page.getByRole('button', { name: /批准受管代码工作区执行检查/ }).first();
@@ -632,6 +918,9 @@ test('S4 Skill 在审批后解绑会 countermand 零写入且恢复绑定后可�
     return {
       streamStatus: streamResponse.status,
       selectedSkill: events.find((event) => event.event_type === 'skill_loaded')?.data,
+      executionId: String(
+        events.find((event) => event.event_type === 'dynamic_task_delegated')?.data?.execution_id || '',
+      ),
     };
   });
   expect(replanned.streamStatus).toBe(200);
@@ -649,6 +938,13 @@ test('S4 Skill 在审批后解绑会 countermand 零写入且恢复绑定后可�
   await expect(cleanupApproval).toBeVisible({ timeout: 30_000 });
   await cleanupApproval.click();
   await page.getByRole('dialog').getByRole('button', { name: '拒绝操作' }).click();
+  await loginAsMember(page);
+  await expect.poll(async () => page.evaluate(async (executionId) => {
+    const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
+    return fetch(`/api/executions/${executionId}?tenant_id=tenant_demo`, {
+      headers: { Authorization: `Bearer ${auth.token}` },
+    }).then((response) => response.json()) as Promise<Record<string, unknown>>;
+  }, replanned.executionId), { timeout: 30_000 }).toMatchObject({ status: 'failed' });
 });
 
 test('S4 疑难诊断分身组合固定上游 Skill、知识、记忆和代码工具完成 red-green 闭环', async ({ page }) => {
@@ -684,8 +980,13 @@ test('S4 疑难诊断分身组合固定上游 Skill、知识、记忆和代码�
   const expectedSkills = ['codebase-design', 'diagnosing-bugs', 'tdd'];
   expect(catalogs.diagnosis.items.map((item) => item.name).sort()).toEqual(expectedSkills);
   expect(catalogs.other.items.map((item) => item.name)).not.toEqual(expect.arrayContaining(expectedSkills));
+  const diagnosisSkillIds = expectedSkills.map((name) => {
+    const item = catalogs.diagnosis.items.find((candidate) => candidate.name === name);
+    if (!item) throw new Error(`${name} is missing from diagnosis catalog`);
+    return item.skill_id;
+  });
 
-  const started = await page.evaluate(async () => {
+  const started = await page.evaluate(async (forcedSkillIds) => {
     const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
     const sessionResponse = await fetch('/api/chat/sessions', {
       method: 'POST',
@@ -708,17 +1009,31 @@ test('S4 疑难诊断分身组合固定上游 Skill、知识、记忆和代码�
         client_turn_id: 'turn_s4_diagnosis_scene_b',
         message: 'S4诊断：无 SOP 普通问答忘记当前分身用户偏好，请先复现再修复，不能先猜原因',
         channel: 'web',
+        forced_general_skill_id: forcedSkillIds[0],
+        forced_general_skill_ids: forcedSkillIds,
       }),
     });
     const body = await response.text();
     return {
       status: response.status,
       sessionId: session.id,
+      body,
       executionId: body.match(/"execution_id":\s*"([^"]+)"/)?.[1] || '',
     };
-  });
+  }, diagnosisSkillIds);
   expect(started.status).toBe(200);
+  expect(started.body).toContain('event: complete');
   expect(started.executionId).not.toBe('');
+
+  await expect.poll(async () => page.evaluate(async (executionId) => {
+    const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
+    return fetch(`/api/executions/${executionId}?tenant_id=tenant_demo`, {
+      headers: { Authorization: `Bearer ${auth.token}` },
+    }).then((response) => response.json()) as Promise<Record<string, unknown>>;
+  }, started.executionId), { timeout: 15_000 }).toMatchObject({
+    status: 'waiting',
+    pending_attention_count: 1,
+  });
 
   await loginAsAdmin(page);
   for (const title of [

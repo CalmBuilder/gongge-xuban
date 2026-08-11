@@ -168,6 +168,8 @@ def _sop_runtime_trace(
                         "operation_id": operation.id,
                         "operation_name": operation.operation_name,
                         "idempotency_key": operation.idempotency_key,
+                        "caused_by_skill_use_id": operation.caused_by_skill_use_id,
+                        "caused_by_skill_use_ids": operation.caused_by_skill_use_ids_json,
                         "status": operation.status,
                         "request": operation.request_json,
                         "result": operation.result_json,

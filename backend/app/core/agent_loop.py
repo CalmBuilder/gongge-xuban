@@ -7369,6 +7369,11 @@ class AgentLoop:
                     forced_general_skill_id=(
                         request.forced_general_skill_id if request.channel == "web" else None
                     ),
+                    forced_general_skill_ids=(
+                        tuple(request.forced_general_skill_ids)
+                        if request.channel == "web"
+                        else ()
+                    ),
                     memory_context=memory_context,
                 )
                 if created and quota_limits is not None:

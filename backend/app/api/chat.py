@@ -308,6 +308,8 @@ def _user_message_metadata(request: ChatTurnRequest) -> dict[str, object]:
         metadata["model_config_id"] = request.model_config_id
     if request.forced_general_skill_id:
         metadata["forced_general_skill_id"] = request.forced_general_skill_id
+    if request.forced_general_skill_ids:
+        metadata["forced_general_skill_ids"] = request.forced_general_skill_ids
     if request.attachments:
         metadata["attachments"] = [item.model_dump(mode="json") for item in request.attachments]
     return metadata
@@ -1810,6 +1812,8 @@ def _existing_turn_replay(
         or str(payload.get("channel") or "web") != request.channel
         or str(metadata.get("forced_general_skill_id") or "")
         != str(request.forced_general_skill_id or "")
+        or list(metadata.get("forced_general_skill_ids") or [])
+        != request.forced_general_skill_ids
         or list(metadata.get("attachments") or []) != expected_attachments
     ):
         raise HTTPException(

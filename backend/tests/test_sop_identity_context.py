@@ -221,6 +221,8 @@ def test_member_defaults_to_authenticated_employee_and_audits_source() -> None:
         assert runtime_trace[0]["operations"][0]["request"] == {
             "employee_id": "E001"
         }
+        assert runtime_trace[0]["operations"][0]["caused_by_skill_use_id"] is None
+        assert runtime_trace[0]["operations"][0]["caused_by_skill_use_ids"] == []
 
 
 def test_member_cannot_override_subject_employee() -> None:

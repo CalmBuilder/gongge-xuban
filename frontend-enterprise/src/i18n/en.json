@@ -3910,5 +3910,15 @@
   "取消并静音 Skill {1}": "Clear and mute Skill {1}",
   "取消本轮选择并在当前会话静音": "Clear this selection and mute it in this conversation",
   "Skill 恢复失败": "Failed to unmute the Skill",
-  "Skill 静音失败": "Failed to mute the Skill"
+  "Skill 静音失败": "Failed to mute the Skill",
+  "批准受管代码工作区变更": "Approve managed workspace changes",
+  "受管代码审批展示工作区与精确参数并使用通用操作文案": "Managed code approval shows the workspace and exact parameters with generic action labels",
+  "待批准受管代码操作": "Managed code operation awaiting approval",
+  "受管工作区：": "Managed workspace: ",
+  "仅批准本次操作": "Approve this operation only",
+  "· 基线": " · base ref",
+  "未标识": "Unspecified",
+  "批准只绑定本次 Execution、Operation、参数、工作区与能力修订；路径、内容或工具授权变化后不会沿用。": "Approval is bound only to this execution, operation, parameters, workspace, and capability revision; it is not reused after paths, content, or tool authorization change.",
+  "拒绝操作": "Reject operation",
+  "请核对受管工作区、固定动作和精确参数，再决定是否批准本次代码操作。": "Verify the managed workspace, fixed action, and exact parameters before approving this code operation."
 }

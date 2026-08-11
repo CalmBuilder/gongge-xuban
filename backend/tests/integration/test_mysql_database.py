@@ -105,6 +105,41 @@ def downgrade(url: str, revision: str) -> None:
     command.downgrade(config, revision)
 
 
+def test_refund_delivery_fixture_runs_on_mysql_84(mysql_database_url: str) -> None:
+    """执行场景 C 与浏览器共用的迁移文件，证明产物不是 SQLite 专用 SQL。"""
+
+    migration = (
+        BACKEND_DIR / "tests" / "fixtures" / "refund_approval_mysql.sql"
+    ).read_text(encoding="utf-8")
+    engine = create_engine(mysql_database_url, pool_pre_ping=True)
+    try:
+        with engine.begin() as connection:
+            connection.exec_driver_sql(migration)
+            connection.exec_driver_sql(
+                "INSERT INTO refund_approvals (id, amount, status, created_at) "
+                "VALUES (1, 20000, 'pending_approval', '2026-08-13T00:00:00Z')"
+            )
+            row = connection.exec_driver_sql(
+                "SELECT amount, status FROM refund_approvals WHERE id = 1"
+            ).one()
+            columns = inspect(connection).get_columns("refund_approvals")
+        assert row == (20000, "pending_approval")
+        assert [column["name"] for column in columns] == [
+            "id",
+            "amount",
+            "status",
+            "created_at",
+        ]
+        assert [str(column["type"]) for column in columns] == [
+            "BIGINT",
+            "BIGINT",
+            "VARCHAR(32)",
+            "VARCHAR(64)",
+        ]
+    finally:
+        engine.dispose()
+
+
 def _seed_legacy_published_skills(session: Session) -> None:
     """按 0026 schema 只写入 0027 迁移所需的四条已证明历史 Skill。"""
 

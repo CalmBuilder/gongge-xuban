@@ -193,6 +193,7 @@ class ChatTurnRequest(BaseModel):
     client_timezone: Optional[str] = None
     debug: bool = False
     forced_general_skill_id: Optional[str] = None
+    forced_general_skill_ids: list[str] = Field(default_factory=list, max_length=8)
 
 
 class ChatAttachmentRead(BaseModel):

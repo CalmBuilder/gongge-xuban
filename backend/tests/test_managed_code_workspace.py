@@ -223,6 +223,74 @@ def test_multi_file_change_set_updates_creates_replays_and_commits_exact_paths(
     ]
 
 
+def test_multi_file_change_set_creates_nested_directories(
+    managed_repo: tuple[Path, ManagedCodeWorkspaceService],
+) -> None:
+    """验证受管变更集可创建 Skill 工作流所需的新目录，但仍只返回仓库相对路径。"""
+
+    repo, service = managed_repo
+    result = service.apply_files(
+        tenant_id="tenant_a",
+        workspace_id="refund-demo",
+        execution_id="exec_nested_docs",
+        changes=[
+            {
+                "path": ".scratch/refund/issues/01-request.md",
+                "expected_sha256": None,
+                "content": "# Request refund approval\n",
+            }
+        ],
+    )
+
+    assert result["files"][0]["path"] == ".scratch/refund/issues/01-request.md"
+    assert (repo / ".scratch/refund/issues/01-request.md").read_text() == (
+        "# Request refund approval\n"
+    )
+
+
+def test_nested_directory_creation_rolls_back_with_failed_change_set(
+    managed_repo: tuple[Path, ManagedCodeWorkspaceService],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证嵌套目录写入中途失败时不会残留文件或本轮创建的空目录。"""
+
+    repo, service = managed_repo
+    original_replace = service._atomic_replace
+    calls = 0
+
+    def fail_second_replace(target: Path, content: bytes, *, mode: int) -> None:
+        """注入第二次替换失败，并允许服务执行首个文件回滚。"""
+
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected nested replacement failure")
+        original_replace(target, content, mode=mode)
+
+    monkeypatch.setattr(service, "_atomic_replace", fail_second_replace)
+    with pytest.raises(ManagedCodeWorkspaceError, match="WORKSPACE_CHANGE_SET_WRITE_FAILED"):
+        service.apply_files(
+            tenant_id="tenant_a",
+            workspace_id="refund-demo",
+            execution_id="exec_nested_rollback",
+            changes=[
+                {
+                    "path": "docs/agents/domain.md",
+                    "expected_sha256": None,
+                    "content": "domain\n",
+                },
+                {
+                    "path": ".scratch/refund/issues/01.md",
+                    "expected_sha256": None,
+                    "content": "ticket\n",
+                },
+            ],
+        )
+
+    assert not (repo / "docs").exists()
+    assert not (repo / ".scratch").exists()
+
+
 def test_multi_file_change_set_preflight_and_rollback_prevent_partial_writes(
     managed_repo: tuple[Path, ManagedCodeWorkspaceService],
     monkeypatch: pytest.MonkeyPatch,

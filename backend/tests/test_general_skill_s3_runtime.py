@@ -574,7 +574,35 @@ def test_dependency_load_requires_exact_approved_revision_edge(
         selection_mode="forced",
     )
     assert [item.skill_id for item in bundle] == [parent_skill.id, child_skill.id]
+    assert [item.name for item in bundle] == [parent_skill.slug, child_skill.slug]
     assert [item.selection_mode for item in bundle] == ["forced", "dependency"]
+
+    composed = service.load_composed_bundle(
+        owner,
+        session_id=chat.id,
+        agent_id=agent.id,
+        turn_id="turn_composed_bundle",
+        skill_ids=[parent_skill.id, child_skill.id, parent_skill.id],
+    )
+    assert [item.skill_id for item in composed] == [parent_skill.id, child_skill.id]
+    assert [item.selection_mode for item in composed] == ["forced", "forced"]
+    settings = get_settings()
+    original_loaded_limit = settings.general_skill_max_loaded_per_turn
+    monkeypatch.setattr(settings, "general_skill_max_loaded_per_turn", 1)
+    with pytest.raises(GeneralSkillRuntimeError) as composition_budget:
+        service.load_composed_bundle(
+            owner,
+            session_id=chat.id,
+            agent_id=agent.id,
+            turn_id="turn_composed_over_budget",
+            skill_ids=[parent_skill.id, child_skill.id],
+        )
+    assert composition_budget.value.code == "GENERAL_SKILL_BUDGET_EXCEEDED"
+    monkeypatch.setattr(
+        settings,
+        "general_skill_max_loaded_per_turn",
+        original_loaded_limit,
+    )
 
     parent_revision.requested_capabilities_json = {
         **parent_revision.requested_capabilities_json,
@@ -597,7 +625,6 @@ def test_dependency_load_requires_exact_approved_revision_edge(
             selection_mode="forced",
         )
     assert instruction_conflict.value.code == "GENERAL_SKILL_INSTRUCTION_CONFLICT"
-    settings = get_settings()
     monkeypatch.setattr(settings, "general_skill_resolver_v2_enabled", True)
     monkeypatch.setattr(settings, "general_skill_dynamic_guidance_enabled", True)
     conflict_response = AgentLoop(db)._try_handle_general_skill_after_scene_router(

@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Sequence
 
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
@@ -408,6 +408,96 @@ class GeneralSkillRuntimeService:
             raise exc
         return tuple(loaded)
 
+    def load_composed_bundle(
+        self,
+        current_user: User,
+        *,
+        session_id: str,
+        agent_id: str,
+        turn_id: str,
+        skill_ids: Sequence[str],
+        commit: bool = True,
+    ) -> tuple[LoadedGeneralSkill, ...]:
+        """合并加载用户显式选择的多个主 Skill，共享依赖只生成一条可审计 Use。"""
+
+        requested_ids = tuple(dict.fromkeys(str(value).strip() for value in skill_ids))
+        if not requested_ids or any(not value for value in requested_ids):
+            raise GeneralSkillRuntimeError(
+                "GENERAL_SKILL_NOT_AVAILABLE", "composed skills are unavailable", 404
+            )
+        catalog = self.session_catalog(current_user, session_id=session_id, agent_id=agent_id)
+        items = {item.skill_id: item for item in catalog}
+        if any(skill_id not in items for skill_id in requested_ids):
+            raise GeneralSkillRuntimeError(
+                "GENERAL_SKILL_NOT_AVAILABLE", "composed skills are unavailable", 404
+            )
+        ordered: list[EffectiveGeneralSkill] = []
+        parents: dict[str, str] = {}
+        seen: set[str] = set()
+        for skill_id in requested_ids:
+            bundle, bundle_parents = self._required_dependency_plan(
+                current_user,
+                primary=items[skill_id],
+                eligible=items,
+            )
+            for item in bundle:
+                if item.skill_id not in seen:
+                    seen.add(item.skill_id)
+                    ordered.append(item)
+            for child_id, parent_id in bundle_parents.items():
+                parents.setdefault(child_id, parent_id)
+        settings = get_settings()
+        if len(ordered) > settings.general_skill_max_loaded_per_turn:
+            raise GeneralSkillRuntimeError(
+                "GENERAL_SKILL_BUDGET_EXCEEDED", "too many composed skills in one turn"
+            )
+        total_chars = sum(
+            len(revision.normalized_skill_markdown)
+            for item in ordered
+            if (revision := self.db.get(GeneralSkillRevision, item.revision_id)) is not None
+        )
+        if total_chars > settings.general_skill_total_instruction_char_limit:
+            raise GeneralSkillRuntimeError(
+                "GENERAL_SKILL_BUDGET_EXCEEDED", "composed skill instructions exceed turn budget"
+            )
+        loaded: list[LoadedGeneralSkill] = []
+        uses_by_skill_id: dict[str, str] = {}
+        requested = set(requested_ids)
+        try:
+            for item in ordered:
+                parent_skill_id = parents.get(item.skill_id)
+                if item.skill_id in requested:
+                    parent_skill_id = None
+                row = self.load(
+                    current_user,
+                    session_id=session_id,
+                    agent_id=agent_id,
+                    turn_id=turn_id,
+                    skill_id=item.skill_id,
+                    selection_mode=("forced" if item.skill_id in requested else "dependency"),
+                    parent_skill_use_id=(
+                        uses_by_skill_id.get(parent_skill_id) if parent_skill_id else None
+                    ),
+                    commit=commit,
+                )
+                uses_by_skill_id[item.skill_id] = row.use_id
+                loaded.append(row)
+        except GeneralSkillRuntimeError as exc:
+            for row in loaded:
+                use = self.db.get(GeneralSkillUse, row.use_id)
+                if use is None or use.status not in {"active", "completed"}:
+                    continue
+                use.status = "invalidated"
+                use.invalidation_reason = "GENERAL_SKILL_DEPENDENCY_BUNDLE_FAILED"
+                use.updated_at = utc_now()
+                self.db.add(use)
+            if commit:
+                self.db.commit()
+            else:
+                self.db.flush()
+            raise exc
+        return tuple(loaded)
+
     def _required_dependency_plan(
         self,
         current_user: User,
@@ -694,7 +784,7 @@ class GeneralSkillRuntimeService:
             skill_id=item.skill_id,
             revision_id=item.revision_id,
             revision_number=item.revision_number,
-            name=item.name,
+            name=skill.slug,
             description=item.description,
             instructions=instructions,
             requested_tools=requested_tools,

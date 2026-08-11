@@ -30,6 +30,9 @@ E2E_RUNTIME_DIR = Path(
         str(Path(tempfile.gettempdir()) / "gongge-fullstack-e2e-current"),
     )
 )
+REFUND_APPROVAL_MIGRATION = (
+    BACKEND_DIR / "tests" / "fixtures" / "refund_approval_mysql.sql"
+).read_text(encoding="utf-8")
 
 REFUND_BACKEND_BASELINE = """\
 HIGH_AMOUNT_THRESHOLD = 10000
@@ -63,6 +66,134 @@ export function availableRefundActions(status) {
   if (status === 'approved' || status === 'ready') return ['refund'];
   return [];
 }
+"""
+REFUND_SKILL_SETUP = """\
+## Agent skills
+
+### Issue tracker
+
+Issues use repository-local Markdown under `.scratch/`. See `docs/agents/issue-tracker.md`.
+
+### Domain docs
+
+This repository uses one root `CONTEXT.md` and `docs/adr/`.
+"""
+REFUND_ISSUE_TRACKER = """\
+# Issue tracker
+
+Use one Markdown file per ticket under `.scratch/<feature>/issues/`.
+Record blocking ticket numbers explicitly and keep status `ready-for-agent` until implementation starts.
+"""
+REFUND_DOMAIN_GUIDE = """\
+# Domain documentation
+
+Read the root `CONTEXT.md` and relevant records under `docs/adr/` before planning or implementation.
+"""
+REFUND_CONTEXT = """\
+# Refund approval domain
+
+- Refund request: a request to return a captured payment.
+- Approval: an auditable decision required when amount exceeds 10000.
+- Refund execution: the irreversible payment action, permitted only for ready or approved requests.
+- Rejection: a terminal approval decision that forbids refund execution.
+
+Invariants: high-amount requests enter `pending_approval`; only an approver may transition them to
+`approved`; every request and decision appends an audit event.
+"""
+REFUND_ADR = """\
+# ADR 0001: Gate high-amount refund execution
+
+Status: accepted
+
+Refund request and refund execution remain separate actions. Amounts above 10000 create a pending
+approval record. Approval is explicit and auditable; rejection never exposes the refund action.
+"""
+REFUND_SPEC = """\
+# High-amount refund approval specification
+
+## Problem Statement
+High-value refunds can currently execute without an independent approval decision.
+
+## Solution
+Requests above 10000 enter `pending_approval`; approval changes the state to `approved`, after which
+the refund action becomes available. Request and approval transitions are audited.
+
+## User Stories
+1. As an operator, I can request a high-value refund and see that approval is pending.
+2. As an approver, I can approve a pending refund and create an audit event.
+3. As an auditor, I can distinguish request and approval events.
+
+## Implementation Decisions
+Add a portable approval table, backend state transitions, and matching frontend actions.
+
+## Testing Decisions
+Verify public behavior through backend state/audit tests, frontend action tests, and SQLite/MySQL
+migration contract tests.
+
+## Out of Scope
+Payment-provider settlement and production notification delivery.
+"""
+REFUND_TICKETS = {
+    ".scratch/high-refund/issues/01-request-approval.md": """\
+# 01 — Request high-amount approval
+
+**What to build:** A complete schema-to-API-to-UI path that puts high refunds in pending approval.
+
+**Blocked by:** None — can start immediately
+
+**Status:** ready-for-agent
+
+- [ ] Portable approval migration
+- [ ] Request state and audit regression
+""",
+    ".scratch/high-refund/issues/02-approve-and-refund.md": """\
+# 02 — Approve and expose refund action
+
+**What to build:** Approve a pending request and expose refund only after approval.
+
+**Blocked by:** 01 — Request high-amount approval
+
+**Status:** ready-for-agent
+
+- [ ] Approval transition and audit event
+- [ ] Frontend pending/approved actions
+""",
+}
+REFUND_REVIEW_CHECK = """\
+from pathlib import Path
+import json
+
+backend = Path("backend/refunds.py").read_text(encoding="utf-8")
+frontend = Path("frontend/refund-state.mjs").read_text(encoding="utf-8")
+migration = Path("migrations/0002_high_refund_approval.sql").read_text(encoding="utf-8")
+standards_issues = []
+if any(marker in backend + frontend for marker in ("[DEBUG-", "TODO", "FIXME")):
+    standards_issues.append("temporary instrumentation remains")
+if "BIGINT PRIMARY KEY" not in migration or "VARCHAR(32)" not in migration:
+    standards_issues.append("migration is not SQLite/MySQL portable")
+spec_issues = []
+for required in (
+    "pending_approval",
+    "refund_requested",
+    "refund_approved",
+    "approve_refund",
+):
+    if required not in backend:
+        spec_issues.append("backend missing " + required)
+for required in ("pending_approval", "view_approval", "approved"):
+    if required not in frontend:
+        spec_issues.append("frontend missing " + required)
+for required in ("refund_approvals", "amount", "status", "created_at"):
+    if required not in migration:
+        spec_issues.append("migration missing " + required)
+result = {
+    "standards": {"status": "passed" if not standards_issues else "failed", "issues": standards_issues},
+    "spec": {"status": "passed" if not spec_issues else "failed", "issues": spec_issues},
+    "unresolved_risks": [],
+}
+print(json.dumps(result, ensure_ascii=False))
+if standards_issues or spec_issues:
+    raise SystemExit(1)
 """
 DIAGNOSIS_MEMORY_BASELINE = """\
 def build_memory_context(preferences):
@@ -282,6 +413,19 @@ def seed_e2e_fixtures() -> None:
                 id="agent_e2e_diagnosis",
                 tenant_id="tenant_demo",
                 name="E2E 疑难故障诊断分身",
+                status="active",
+                owner_user_id="member_e2e",
+                metadata_json={
+                    "owner_user_id": "member_e2e",
+                    "owner_username": "member",
+                },
+            )
+        )
+        db.add(
+            AgentProfile(
+                id="agent_e2e_delivery",
+                tenant_id="tenant_demo",
+                name="E2E 研发交付数字员工",
                 status="active",
                 owner_user_id="member_e2e",
                 metadata_json={
@@ -1534,6 +1678,11 @@ def seed_managed_workspace_browser_fixture() -> None:
         "});\n",
         encoding="utf-8",
     )
+    (repo / "checks").mkdir()
+    (repo / "checks" / "two_axis_review.py").write_text(
+        REFUND_REVIEW_CHECK,
+        encoding="utf-8",
+    )
     (repo / "migrations").mkdir()
     (repo / "tests").mkdir()
     (repo / "tests" / "test_refund.py").write_text(
@@ -1698,6 +1847,16 @@ def seed_managed_workspace_browser_fixture() -> None:
                         "timeout_seconds": 60,
                         "required_output_substrings": ["pass 2"],
                     },
+                    "two-axis-review": {
+                        "image": image,
+                        "argv": ["python", "checks/two_axis_review.py"],
+                        "timeout_seconds": 60,
+                        "required_output_substrings": [
+                            '"standards": {"status": "passed"',
+                            '"spec": {"status": "passed"',
+                            '"unresolved_risks": []',
+                        ],
+                    },
                 }
             tool = Tool(
                 tenant_id="tenant_demo",
@@ -1742,6 +1901,14 @@ def seed_managed_workspace_browser_fixture() -> None:
                 db,
                 "tenant_demo",
                 "agent_e2e_member_employee",
+                "tool",
+                tool.id,
+                "active",
+            )
+            ensure_private_resource_binding(
+                db,
+                "tenant_demo",
+                "agent_e2e_delivery",
                 "tool",
                 tool.id,
                 "active",
@@ -1994,7 +2161,9 @@ def install_schedule_llm_override() -> None:
                 if isinstance(item, dict)
             }
             goal = str(user_payload.get("goal") or "")
-            if "S4诊断" in goal and {
+            if "S4代码" in goal and {"implement", "tdd", "code-review"} <= names:
+                selected = ["implement", "tdd", "code-review"]
+            elif "S4诊断" in goal and {
                 "diagnosing-bugs",
                 "tdd",
                 "codebase-design",
@@ -2018,6 +2187,267 @@ def install_schedule_llm_override() -> None:
             }
         if "受控动态任务规划器" in system_prompt:
             loaded_guidance = user_payload.get("loaded_guidance", [])
+            loaded_names = {
+                str(item.get("name") or "")
+                for item in loaded_guidance
+                if isinstance(item, dict)
+            }
+            full_delivery_names = {
+                "setup-matt-pocock-skills",
+                "grill-with-docs",
+                "grilling",
+                "domain-modeling",
+                "to-spec",
+                "to-tickets",
+                "implement",
+                "tdd",
+                "code-review",
+            }
+            if full_delivery_names <= loaded_names:
+                capability_names = {
+                    str(item.get("name") or "")
+                    for item in user_payload.get("capabilities", [])
+                    if isinstance(item, dict)
+                }
+                required = {
+                    "workspace.refund.read",
+                    "workspace.refund.apply-set",
+                    "workspace.refund.check",
+                    "workspace.refund.commit",
+                }
+                if not required <= capability_names:
+                    raise RuntimeError("S4 full delivery missed governed workspace tools")
+                return {
+                    "goal": str(user_payload.get("goal") or "完成退款审批研发交付"),
+                    "success_criteria": user_payload.get("success_criteria", []),
+                    "constraints": ["同一任务分支先固化规划产物，再以 TDD 实现并完成两轴审查"],
+                    "assumptions": [],
+                    "steps": [
+                        {
+                            "draft_id": "setup_domain",
+                            "title": "配置工程 Skill 仓库约定并固化退款领域词汇与 ADR",
+                            "kind": "tool.write",
+                            "required": True,
+                            "depends_on": [],
+                            "capability_refs": ["workspace.refund.apply-set"],
+                            "guidance_skill_refs": [
+                                "setup-matt-pocock-skills",
+                                "grill-with-docs",
+                                "grilling",
+                                "domain-modeling",
+                            ],
+                            "expected_output_schema": {},
+                        },
+                        {
+                            "draft_id": "spec_tickets",
+                            "title": "发布退款审批可验证规格与带 blocking edges 的纵向票据",
+                            "kind": "tool.write",
+                            "required": True,
+                            "depends_on": ["setup_domain"],
+                            "capability_refs": ["workspace.refund.apply-set"],
+                            "guidance_skill_refs": [
+                                "setup-matt-pocock-skills",
+                                "to-spec",
+                                "to-tickets",
+                            ],
+                            "expected_output_schema": {},
+                        },
+                        {
+                            "draft_id": "read",
+                            "title": "读取退款实现",
+                            "kind": "tool.read",
+                            "required": True,
+                            "depends_on": ["spec_tickets"],
+                            "capability_refs": ["workspace.refund.read"],
+                            "guidance_skill_refs": ["implement"],
+                            "expected_output_schema": {},
+                        },
+                        {
+                            "draft_id": "red",
+                            "title": "证明退款回归在修复前失败",
+                            "kind": "tool.execute",
+                            "required": True,
+                            "depends_on": ["read"],
+                            "capability_refs": ["workspace.refund.check"],
+                            "guidance_skill_refs": ["tdd"],
+                            "expected_output_schema": {},
+                        },
+                        {
+                            "draft_id": "apply",
+                            "title": "写入退款审批、迁移和前端补丁",
+                            "kind": "tool.write",
+                            "required": True,
+                            "depends_on": ["red"],
+                            "capability_refs": ["workspace.refund.apply-set"],
+                            "guidance_skill_refs": ["implement", "tdd"],
+                            "expected_output_schema": {},
+                        },
+                        {
+                            "draft_id": "check",
+                            "title": "运行退款回归",
+                            "kind": "tool.execute",
+                            "required": True,
+                            "depends_on": ["apply"],
+                            "capability_refs": ["workspace.refund.check"],
+                            "guidance_skill_refs": ["tdd"],
+                            "expected_output_schema": {},
+                        },
+                        {
+                            "draft_id": "frontend_check",
+                            "title": "运行退款前端状态回归",
+                            "kind": "tool.execute",
+                            "required": True,
+                            "depends_on": ["check"],
+                            "capability_refs": ["workspace.refund.check"],
+                            "guidance_skill_refs": ["tdd"],
+                            "expected_output_schema": {},
+                        },
+                        {
+                            "draft_id": "review",
+                            "title": "按 Standards 与 Spec 两轴完成代码审查",
+                            "kind": "tool.execute",
+                            "required": True,
+                            "depends_on": ["frontend_check"],
+                            "capability_refs": ["workspace.refund.check"],
+                            "guidance_skill_refs": ["code-review"],
+                            "expected_output_schema": {},
+                        },
+                        {
+                            "draft_id": "commit",
+                            "title": "提交一次性任务分支",
+                            "kind": "tool.write",
+                            "required": True,
+                            "depends_on": ["review"],
+                            "capability_refs": ["workspace.refund.commit"],
+                            "guidance_skill_refs": ["implement"],
+                            "expected_output_schema": {},
+                        },
+                        {
+                            "draft_id": "answer",
+                            "title": "形成代码交付报告",
+                            "kind": "answer",
+                            "required": True,
+                            "depends_on": ["commit"],
+                            "capability_refs": [],
+                            "guidance_skill_refs": sorted(full_delivery_names),
+                            "expected_output_schema": {},
+                        },
+                    ],
+                }
+            preparation_phase = ""
+            preparation_title = ""
+            if "to-tickets" in loaded_names:
+                preparation_phase = "tickets"
+                preparation_title = "发布带 blocking edges 的纵向票据"
+            elif "to-spec" in loaded_names:
+                preparation_phase = "spec"
+                preparation_title = "发布退款审批可验证规格"
+            elif "grill-with-docs" in loaded_names:
+                preparation_phase = "domain"
+                preparation_title = "固化退款领域词汇与 ADR"
+            elif loaded_names == {"setup-matt-pocock-skills"}:
+                preparation_phase = "setup"
+                preparation_title = "配置工程 Skill 仓库约定"
+            combined_preparation = {
+                "setup-matt-pocock-skills",
+                "grill-with-docs",
+                "grilling",
+                "domain-modeling",
+                "to-spec",
+                "to-tickets",
+            } <= loaded_names
+            if preparation_phase:
+                capability_names = {
+                    str(item.get("name") or "")
+                    for item in user_payload.get("capabilities", [])
+                    if isinstance(item, dict)
+                }
+                if "workspace.refund.apply-set" not in capability_names:
+                    raise RuntimeError("S4 preparation planner missed managed workspace write tool")
+                guidance_refs = sorted(loaded_names)
+                if combined_preparation:
+                    preparation_steps = [
+                        {
+                            "draft_id": "setup",
+                            "title": "配置工程 Skill 仓库约定",
+                            "guidance_skill_refs": ["setup-matt-pocock-skills"],
+                        },
+                        {
+                            "draft_id": "domain",
+                            "title": "固化退款领域词汇与 ADR",
+                            "guidance_skill_refs": [
+                                "grill-with-docs",
+                                "grilling",
+                                "domain-modeling",
+                            ],
+                        },
+                        {
+                            "draft_id": "spec",
+                            "title": "发布退款审批可验证规格",
+                            "guidance_skill_refs": ["to-spec", "setup-matt-pocock-skills"],
+                        },
+                        {
+                            "draft_id": "tickets",
+                            "title": "发布带 blocking edges 的纵向票据",
+                            "guidance_skill_refs": ["to-tickets", "setup-matt-pocock-skills"],
+                        },
+                    ]
+                    previous = ""
+                    steps: list[dict[str, object]] = []
+                    for item in preparation_steps:
+                        steps.append(
+                            {
+                                **item,
+                                "kind": "tool.write",
+                                "required": True,
+                                "depends_on": [previous] if previous else [],
+                                "capability_refs": ["workspace.refund.apply-set"],
+                                "expected_output_schema": {},
+                            }
+                        )
+                        previous = str(item["draft_id"])
+                    steps.append(
+                        {
+                            "draft_id": "answer",
+                            "title": "确认 preparation 阶段产物",
+                            "kind": "answer",
+                            "required": True,
+                            "depends_on": [previous],
+                            "capability_refs": [],
+                            "guidance_skill_refs": guidance_refs,
+                            "expected_output_schema": {},
+                        }
+                    )
+                else:
+                    steps = [
+                        {
+                            "draft_id": preparation_phase,
+                            "title": preparation_title,
+                            "kind": "tool.write",
+                            "required": True,
+                            "depends_on": [],
+                            "capability_refs": ["workspace.refund.apply-set"],
+                            "guidance_skill_refs": guidance_refs,
+                            "expected_output_schema": {},
+                        },
+                        {
+                            "draft_id": "answer",
+                            "title": f"确认 {preparation_phase} 阶段产物",
+                            "kind": "answer",
+                            "required": True,
+                            "depends_on": [preparation_phase],
+                            "capability_refs": [],
+                            "guidance_skill_refs": guidance_refs,
+                            "expected_output_schema": {},
+                        },
+                    ]
+                return {
+                    "goal": str(user_payload.get("goal") or preparation_title),
+                    "success_criteria": user_payload.get("success_criteria", []),
+                    "constraints": ["只写入受管演示仓库并保留固定 Skill revision 因果链"],
+                    "assumptions": [],
+                    "steps": steps,
+                }
             if "DIAGNOSING-BUGS-FIXED-COMMIT" in str(loaded_guidance):
                 loaded_text = str(loaded_guidance)
                 if (
@@ -2043,7 +2473,27 @@ def install_schedule_llm_override() -> None:
                 }
                 if not required <= capability_names:
                     raise RuntimeError("S4 diagnosis planner missed governed context or tools")
-                all_guidance = ["diagnosing-bugs", "tdd", "codebase-design"]
+                marker_names: dict[str, str] = {}
+                for item in loaded_guidance:
+                    if not isinstance(item, dict):
+                        continue
+                    item_text = str(item.get("skills") or "")
+                    item_name = str(item.get("name") or "")
+                    for marker in (
+                        "DIAGNOSING-BUGS-FIXED-COMMIT",
+                        "# Test-Driven Development",
+                        "CODEBASE-DESIGN-FIXED-COMMIT",
+                    ):
+                        if marker in item_text:
+                            marker_names[marker] = item_name
+                if len(marker_names) != 3 or any(
+                    not value or value not in loaded_names for value in marker_names.values()
+                ):
+                    raise RuntimeError("S4 diagnosis planner received ambiguous Skill references")
+                diagnosing_guidance = marker_names["DIAGNOSING-BUGS-FIXED-COMMIT"]
+                tdd_guidance = marker_names["# Test-Driven Development"]
+                design_guidance = marker_names["CODEBASE-DESIGN-FIXED-COMMIT"]
+                all_guidance = sorted(marker_names.values())
                 return {
                     "goal": str(user_payload.get("goal") or "诊断记忆上下文缺失"),
                     "success_criteria": user_payload.get("success_criteria", []),
@@ -2059,7 +2509,7 @@ def install_schedule_llm_override() -> None:
                             "required": True,
                             "depends_on": [],
                             "capability_refs": ["workspace.memory.read"],
-                            "guidance_skill_refs": ["codebase-design"],
+                            "guidance_skill_refs": [design_guidance],
                             "expected_output_schema": {},
                         },
                         {
@@ -2069,7 +2519,7 @@ def install_schedule_llm_override() -> None:
                             "required": True,
                             "depends_on": ["read"],
                             "capability_refs": ["knowledge.search"],
-                            "guidance_skill_refs": ["diagnosing-bugs"],
+                            "guidance_skill_refs": [diagnosing_guidance],
                             "expected_output_schema": {},
                         },
                         {
@@ -2079,7 +2529,7 @@ def install_schedule_llm_override() -> None:
                             "required": True,
                             "depends_on": ["knowledge"],
                             "capability_refs": ["workspace.memory.apply-set"],
-                            "guidance_skill_refs": ["tdd", "codebase-design"],
+                            "guidance_skill_refs": [tdd_guidance, design_guidance],
                             "expected_output_schema": {},
                         },
                         {
@@ -2089,7 +2539,7 @@ def install_schedule_llm_override() -> None:
                             "required": True,
                             "depends_on": ["test"],
                             "capability_refs": ["workspace.memory.check"],
-                            "guidance_skill_refs": ["diagnosing-bugs", "tdd"],
+                            "guidance_skill_refs": [diagnosing_guidance, tdd_guidance],
                             "expected_output_schema": {},
                         },
                         {
@@ -2099,7 +2549,7 @@ def install_schedule_llm_override() -> None:
                             "required": True,
                             "depends_on": ["red"],
                             "capability_refs": [],
-                            "guidance_skill_refs": ["diagnosing-bugs"],
+                            "guidance_skill_refs": [diagnosing_guidance],
                             "expected_output_schema": {},
                         },
                         {
@@ -2109,7 +2559,7 @@ def install_schedule_llm_override() -> None:
                             "required": True,
                             "depends_on": ["hypotheses"],
                             "capability_refs": ["workspace.memory.apply-set"],
-                            "guidance_skill_refs": ["diagnosing-bugs", "tdd"],
+                            "guidance_skill_refs": [diagnosing_guidance, tdd_guidance],
                             "expected_output_schema": {},
                         },
                         {
@@ -2119,7 +2569,7 @@ def install_schedule_llm_override() -> None:
                             "required": True,
                             "depends_on": ["fix"],
                             "capability_refs": ["workspace.memory.check"],
-                            "guidance_skill_refs": ["diagnosing-bugs", "tdd"],
+                            "guidance_skill_refs": [diagnosing_guidance, tdd_guidance],
                             "expected_output_schema": {},
                         },
                         {
@@ -2134,14 +2584,31 @@ def install_schedule_llm_override() -> None:
                         },
                     ],
                 }
-            if "S4-CODE-FULL-GUIDANCE" in str(loaded_guidance):
+            engineering_delivery = (
+                "# Test-Driven Development" in str(loaded_guidance)
+                and "CODE-REVIEW-FIXED-COMMIT" in str(loaded_guidance)
+                and "Implement the work described" in str(loaded_guidance)
+            )
+            if engineering_delivery or "S4-CODE-FULL-GUIDANCE" in str(loaded_guidance):
                 loaded_text = str(loaded_guidance)
-                if "s4-code-countermand-guidance" in loaded_text:
-                    code_guidance_name = "s4-code-countermand-guidance"
-                elif "s4-code-deny-guidance" in loaded_text:
-                    code_guidance_name = "s4-code-deny-guidance"
+                if engineering_delivery:
+                    read_guidance = ["implement"]
+                    red_guidance = ["tdd"]
+                    apply_guidance = ["implement", "tdd"]
+                    review_guidance = ["code-review"]
+                    answer_guidance = ["implement", "tdd", "code-review"]
                 else:
-                    code_guidance_name = "s4-code-guidance"
+                    if "s4-code-countermand-guidance" in loaded_text:
+                        code_guidance_name = "s4-code-countermand-guidance"
+                    elif "s4-code-deny-guidance" in loaded_text:
+                        code_guidance_name = "s4-code-deny-guidance"
+                    else:
+                        code_guidance_name = "s4-code-guidance"
+                    read_guidance = [code_guidance_name]
+                    red_guidance = [code_guidance_name]
+                    apply_guidance = [code_guidance_name]
+                    review_guidance = [code_guidance_name]
+                    answer_guidance = [code_guidance_name]
                 capability_names = {
                     str(item.get("name") or "")
                     for item in user_payload.get("capabilities", [])
@@ -2168,7 +2635,7 @@ def install_schedule_llm_override() -> None:
                             "required": True,
                             "depends_on": [],
                             "capability_refs": ["workspace.refund.read"],
-                            "guidance_skill_refs": [code_guidance_name],
+                            "guidance_skill_refs": read_guidance,
                             "expected_output_schema": {},
                         },
                         {
@@ -2178,7 +2645,7 @@ def install_schedule_llm_override() -> None:
                             "required": True,
                             "depends_on": ["read"],
                             "capability_refs": ["workspace.refund.check"],
-                            "guidance_skill_refs": [code_guidance_name],
+                            "guidance_skill_refs": red_guidance,
                             "expected_output_schema": {},
                         },
                         {
@@ -2188,7 +2655,7 @@ def install_schedule_llm_override() -> None:
                             "required": True,
                             "depends_on": ["red"],
                             "capability_refs": ["workspace.refund.apply-set"],
-                            "guidance_skill_refs": [code_guidance_name],
+                            "guidance_skill_refs": apply_guidance,
                             "expected_output_schema": {},
                         },
                         {
@@ -2198,7 +2665,7 @@ def install_schedule_llm_override() -> None:
                             "required": True,
                             "depends_on": ["apply"],
                             "capability_refs": ["workspace.refund.check"],
-                            "guidance_skill_refs": [code_guidance_name],
+                            "guidance_skill_refs": red_guidance,
                             "expected_output_schema": {},
                         },
                         {
@@ -2208,17 +2675,35 @@ def install_schedule_llm_override() -> None:
                             "required": True,
                             "depends_on": ["check"],
                             "capability_refs": ["workspace.refund.check"],
-                            "guidance_skill_refs": [code_guidance_name],
+                            "guidance_skill_refs": red_guidance,
                             "expected_output_schema": {},
                         },
+                        *(
+                            [
+                                {
+                                    "draft_id": "review",
+                                    "title": "按 Standards 与 Spec 两轴完成代码审查",
+                                    "kind": "tool.execute",
+                                    "required": True,
+                                    "depends_on": ["frontend_check"],
+                                    "capability_refs": ["workspace.refund.check"],
+                                    "guidance_skill_refs": review_guidance,
+                                    "expected_output_schema": {},
+                                }
+                            ]
+                            if engineering_delivery
+                            else []
+                        ),
                         {
                             "draft_id": "commit",
                             "title": "提交一次性任务分支",
                             "kind": "tool.write",
                             "required": True,
-                            "depends_on": ["frontend_check"],
+                            "depends_on": [
+                                "review" if engineering_delivery else "frontend_check"
+                            ],
                             "capability_refs": ["workspace.refund.commit"],
-                            "guidance_skill_refs": [code_guidance_name],
+                            "guidance_skill_refs": read_guidance,
                             "expected_output_schema": {},
                         },
                         {
@@ -2228,7 +2713,7 @@ def install_schedule_llm_override() -> None:
                             "required": True,
                             "depends_on": ["commit"],
                             "capability_refs": [],
-                            "guidance_skill_refs": [code_guidance_name],
+                            "guidance_skill_refs": answer_guidance,
                             "expected_output_schema": {},
                         },
                     ],
@@ -2313,7 +2798,23 @@ def install_schedule_llm_override() -> None:
             current_step = user_payload.get("current_step", {})
             step_kind = str(current_step.get("kind") or "") if isinstance(current_step, dict) else ""
             step_title = str(current_step.get("title") or "") if isinstance(current_step, dict) else ""
-            is_s4_code = "S4-CODE-FULL-GUIDANCE" in str(user_payload)
+            is_s4_code = (
+                "S4-CODE-FULL-GUIDANCE" in str(user_payload)
+                or "agent_e2e_delivery" in str(user_payload)
+                or "Implement the work described" in str(user_payload)
+                or "# Test-Driven Development" in str(user_payload)
+                or "CODE-REVIEW-FIXED-COMMIT" in str(user_payload)
+                or any(
+                    marker in step_title
+                    for marker in (
+                        "工程 Skill 仓库约定",
+                        "领域词汇与 ADR",
+                        "可验证规格",
+                        "blocking edges",
+                    )
+                )
+                or (step_title.startswith("确认 ") and "阶段产物" in step_title)
+            )
             is_s4_diagnosis = "agent_e2e_diagnosis" in str(user_payload)
             is_s4 = "S4-DYNAMIC-FULL-GUIDANCE" in str(user_payload)
             if is_s4_diagnosis:
@@ -2426,6 +2927,7 @@ def install_schedule_llm_override() -> None:
                     "rationale": "按固定诊断/TDD/模块设计 Skill 调用受管能力",
                 }
             if is_s4_code:
+                full_delivery_execution = "配置工程 Skill 仓库约定" in str(user_payload)
                 client._last_completed_response_metadata = {
                     "response_id": (
                         "e2e-s4-code-"
@@ -2434,7 +2936,93 @@ def install_schedule_llm_override() -> None:
                     "finish_reason": "stop",
                     "usage": {"input_tokens": 12, "output_tokens": 8},
                 }
-                if step_kind == "tool.read":
+                if step_kind == "tool.write" and "并固化退款领域" in step_title:
+                    capability_ref = "workspace.refund.apply-set"
+                    arguments = {
+                        "changes": [
+                            {"path": "AGENTS.md", "expected_sha256": None, "content": REFUND_SKILL_SETUP},
+                            {
+                                "path": "docs/agents/issue-tracker.md",
+                                "expected_sha256": None,
+                                "content": REFUND_ISSUE_TRACKER,
+                            },
+                            {
+                                "path": "docs/agents/domain.md",
+                                "expected_sha256": None,
+                                "content": REFUND_DOMAIN_GUIDE,
+                            },
+                            {"path": "CONTEXT.md", "expected_sha256": None, "content": REFUND_CONTEXT},
+                            {
+                                "path": "docs/adr/0001-high-refund-approval.md",
+                                "expected_sha256": None,
+                                "content": REFUND_ADR,
+                            },
+                        ]
+                    }
+                elif step_kind == "tool.write" and "规格与带 blocking edges" in step_title:
+                    capability_ref = "workspace.refund.apply-set"
+                    arguments = {
+                        "changes": [
+                            {
+                                "path": ".scratch/high-refund/spec.md",
+                                "expected_sha256": None,
+                                "content": REFUND_SPEC,
+                            },
+                            *(
+                                {"path": path, "expected_sha256": None, "content": content}
+                                for path, content in REFUND_TICKETS.items()
+                            ),
+                        ]
+                    }
+                elif step_kind == "tool.write" and "工程 Skill 仓库约定" in step_title:
+                    capability_ref = "workspace.refund.apply-set"
+                    arguments = {
+                        "changes": [
+                            {"path": "AGENTS.md", "expected_sha256": None, "content": REFUND_SKILL_SETUP},
+                            {
+                                "path": "docs/agents/issue-tracker.md",
+                                "expected_sha256": None,
+                                "content": REFUND_ISSUE_TRACKER,
+                            },
+                            {
+                                "path": "docs/agents/domain.md",
+                                "expected_sha256": None,
+                                "content": REFUND_DOMAIN_GUIDE,
+                            },
+                        ]
+                    }
+                elif step_kind == "tool.write" and "领域词汇与 ADR" in step_title:
+                    capability_ref = "workspace.refund.apply-set"
+                    arguments = {
+                        "changes": [
+                            {"path": "CONTEXT.md", "expected_sha256": None, "content": REFUND_CONTEXT},
+                            {
+                                "path": "docs/adr/0001-high-refund-approval.md",
+                                "expected_sha256": None,
+                                "content": REFUND_ADR,
+                            },
+                        ]
+                    }
+                elif step_kind == "tool.write" and "可验证规格" in step_title:
+                    capability_ref = "workspace.refund.apply-set"
+                    arguments = {
+                        "changes": [
+                            {
+                                "path": ".scratch/high-refund/spec.md",
+                                "expected_sha256": None,
+                                "content": REFUND_SPEC,
+                            }
+                        ]
+                    }
+                elif step_kind == "tool.write" and "blocking edges" in step_title:
+                    capability_ref = "workspace.refund.apply-set"
+                    arguments = {
+                        "changes": [
+                            {"path": path, "expected_sha256": None, "content": content}
+                            for path, content in REFUND_TICKETS.items()
+                        ]
+                    }
+                elif step_kind == "tool.read":
                     capability_ref = "workspace.refund.read"
                     arguments = {"path": "backend/refunds.py"}
                 elif step_kind == "tool.execute":
@@ -2443,13 +3031,26 @@ def install_schedule_llm_override() -> None:
                         arguments = {"profile": "backend-red"}
                     elif "前端" in step_title:
                         arguments = {"profile": "frontend-unit"}
+                    elif "Standards" in step_title:
+                        arguments = {"profile": "two-axis-review"}
                     else:
                         arguments = {"profile": "backend-unit"}
                 elif step_kind == "tool.write" and "提交" in step_title:
                     capability_ref = "workspace.refund.commit"
+                    preparation_paths = [
+                        "AGENTS.md",
+                        "CONTEXT.md",
+                        "docs/agents/issue-tracker.md",
+                        "docs/agents/domain.md",
+                        "docs/adr/0001-high-refund-approval.md",
+                        ".scratch/high-refund/spec.md",
+                        ".scratch/high-refund/issues/01-request-approval.md",
+                        ".scratch/high-refund/issues/02-approve-and-refund.md",
+                    ] if full_delivery_execution else []
                     arguments = {
                         "message": "feat: require high refund approval",
                         "paths": [
+                            *preparation_paths,
                             "backend/refunds.py",
                             "frontend/refund-state.mjs",
                             "migrations/0002_high_refund_approval.sql",
@@ -2476,14 +3077,7 @@ def install_schedule_llm_override() -> None:
                             {
                                 "path": "migrations/0002_high_refund_approval.sql",
                                 "expected_sha256": None,
-                                "content": (
-                                    "CREATE TABLE refund_approvals (\n"
-                                    "  id INTEGER PRIMARY KEY,\n"
-                                    "  amount INTEGER NOT NULL,\n"
-                                    "  status TEXT NOT NULL,\n"
-                                    "  created_at TEXT NOT NULL\n"
-                                    ");\n"
-                                ),
+                                "content": REFUND_APPROVAL_MIGRATION,
                             },
                         ],
                     }
@@ -2509,6 +3103,7 @@ def install_schedule_llm_override() -> None:
                         "arguments": {
                             "markdown": (
                                 "S4-CODE-DELIVERY-SUCCESS：补丁已审批写入，固定容器回归通过，"
+                                "Standards 与 Spec 两轴审查均通过，未解决风险为空，"
                                 "并在一次性任务分支形成提交。"
                             ),
                             "criterion_evidence": {
@@ -2933,6 +3528,57 @@ def install_general_skill_remote_fetcher_override() -> None:
                     "Once done, use /code-review to review the work.\n",
                 )
                 archive.writestr(
+                    "skills-main/skills/engineering/setup-matt-pocock-skills/SKILL.md",
+                    "---\n"
+                    "name: setup-matt-pocock-skills\n"
+                    "description: Set up the engineering workflow and local Markdown tracker.\n"
+                    "disable-model-invocation: true\n"
+                    "---\n# Setup Matt Pocock Skills\n"
+                    "Use the repository-local Markdown tracker and preserve fixed Skill versions.\n",
+                )
+                archive.writestr(
+                    "skills-main/skills/engineering/grill-with-docs/SKILL.md",
+                    "---\n"
+                    "name: grill-with-docs\n"
+                    "description: Clarify a feature deeply and preserve the decisions in docs.\n"
+                    "---\n# Grill With Docs\n"
+                    "Use /grilling to surface ambiguity and /domain-modeling to fix shared terms.\n",
+                )
+                archive.writestr(
+                    "skills-main/skills/engineering/grilling/SKILL.md",
+                    "---\n"
+                    "name: grilling\n"
+                    "description: Ask focused questions until consequential ambiguity is resolved.\n"
+                    "---\n# Grilling\nResolve consequential ambiguity before implementation.\n",
+                )
+                archive.writestr(
+                    "skills-main/skills/engineering/domain-modeling/SKILL.md",
+                    "---\n"
+                    "name: domain-modeling\n"
+                    "description: Establish precise domain vocabulary, states, and invariants.\n"
+                    "---\n# Domain Modeling\nDefine states, transitions, actors, and invariants.\n",
+                )
+                archive.writestr(
+                    "skills-main/skills/engineering/to-spec/SKILL.md",
+                    "---\n"
+                    "name: to-spec\n"
+                    "description: Turn agreed decisions into a verifiable implementation spec.\n"
+                    "disable-model-invocation: true\n"
+                    "---\n# To Spec\n"
+                    "Run /setup-matt-pocock-skills if tracker configuration is missing.\n"
+                    "Write observable requirements, exclusions, and acceptance checks.\n",
+                )
+                archive.writestr(
+                    "skills-main/skills/engineering/to-tickets/SKILL.md",
+                    "---\n"
+                    "name: to-tickets\n"
+                    "description: Split a spec into ordered vertical tickets with blocking edges.\n"
+                    "disable-model-invocation: true\n"
+                    "---\n# To Tickets\n"
+                    "Run /setup-matt-pocock-skills if tracker configuration is missing.\n"
+                    "Create independently verifiable vertical slices.\n",
+                )
+                archive.writestr(
                     "skills-main/skills/engineering/tdd/SKILL.md",
                     "---\n"
                     "name: tdd\n"
@@ -2969,7 +3615,9 @@ def install_general_skill_remote_fetcher_override() -> None:
                     "---\n"
                     "name: code-review\n"
                     "description: Review changes along the Standards and Spec axes.\n"
-                    "---\n# Code Review\n",
+                    "---\n# Code Review\n"
+                    "CODE-REVIEW-FIXED-COMMIT: review Standards and Spec separately to a fixed "
+                    "point; aggregate findings without reranking and list unresolved risks.\n",
                 )
             return RemoteFetchResult(source_url, payload.getvalue(), 0)
 

@@ -249,7 +249,11 @@ class ManagedCodeWorkspaceService:
                 expected = raw_change.get("expected_sha256")
                 target = self._safe_file(repo, raw_path, must_exist=False)
                 relative = target.relative_to(repo).as_posix()
-                if relative in seen or not target.parent.is_dir():
+                if relative in seen or any(
+                    parent.exists() and not parent.is_dir()
+                    for parent in target.parents
+                    if parent != repo and parent.is_relative_to(repo)
+                ):
                     raise ManagedCodeWorkspaceError("WORKSPACE_CHANGE_SET_INVALID")
                 seen.add(relative)
                 encoded = content.encode("utf-8")
@@ -272,7 +276,12 @@ class ManagedCodeWorkspaceService:
                         raise ManagedCodeWorkspaceError("WORKSPACE_CREATE_PRECONDITION_INVALID")
                     prepared.append((target, None, encoded, 0o644))
             replaced: list[tuple[Path, bytes | None, int]] = []
+            created_directories: list[Path] = []
             try:
+                for target, _current, _encoded, _mode in prepared:
+                    created_directories.extend(
+                        self._create_missing_directories(repo, target.parent)
+                    )
                 for target, current, encoded, mode in prepared:
                     if current == encoded:
                         continue
@@ -284,6 +293,11 @@ class ManagedCodeWorkspaceService:
                         target.unlink(missing_ok=True)
                     else:
                         self._atomic_replace(target, current, mode=mode)
+                for directory in reversed(created_directories):
+                    try:
+                        directory.rmdir()
+                    except OSError:
+                        pass
                 raise ManagedCodeWorkspaceError("WORKSPACE_CHANGE_SET_WRITE_FAILED") from exc
             return {
                 "branch": branch,
@@ -381,6 +395,25 @@ class ManagedCodeWorkspaceService:
             os.replace(temporary, target)
         finally:
             temporary.unlink(missing_ok=True)
+
+    @staticmethod
+    def _create_missing_directories(repo: Path, parent: Path) -> list[Path]:
+        """在受管仓库内逐级创建缺失父目录，并返回可供失败回滚的创建清单。"""
+
+        missing: list[Path] = []
+        current = parent
+        while current != repo and not current.exists():
+            if not current.is_relative_to(repo):
+                raise ManagedCodeWorkspaceError("WORKSPACE_PATH_FORBIDDEN")
+            missing.append(current)
+            current = current.parent
+        if current != repo and (not current.is_dir() or current.is_symlink()):
+            raise ManagedCodeWorkspaceError("WORKSPACE_CHANGE_SET_INVALID")
+        created: list[Path] = []
+        for directory in reversed(missing):
+            directory.mkdir(mode=0o755)
+            created.append(directory)
+        return created
 
     def _safe_file(self, repo: Path, raw_path: str, *, must_exist: bool) -> Path:
         """将模型路径限制为普通相对文件，并逐级拒绝符号链接和 `.git`。"""
