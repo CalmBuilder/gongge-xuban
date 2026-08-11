@@ -284,10 +284,8 @@ def test_mute_countermands_loaded_use_and_blocks_resource_read() -> None:
         enabled=False,
         expected_row_version=None,
     )
-    invalidated = service.invalidate_unavailable(
-        owner, session_id=chat.id, agent_id=agent.id
-    )
-    assert [row.id for row in invalidated] == [loaded.use_id]
+    assert db.get(GeneralSkillUse, loaded.use_id).status == "invalidated"
+    assert service.invalidate_unavailable(owner, session_id=chat.id, agent_id=agent.id) == []
     with pytest.raises(GeneralSkillRuntimeError) as rejected:
         service.read_resource(
             owner,

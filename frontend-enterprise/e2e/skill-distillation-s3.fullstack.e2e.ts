@@ -178,6 +178,32 @@ test('S3 user-only Skill 经真实 picker 强制加载、静音恢复并完成�
   expect(firstPage.body).toMatchObject({ offset: 0, has_more: true });
   expect(String(firstPage.body.content)).toBe(SKILL_MARKDOWN.slice(0, 20));
 
+  await page.getByRole('button', { name: '选择本轮 Skill' }).click();
+  await page.getByRole('menuitem').filter({ hasText: SKILL_NAME }).click();
+  const countermandResponse = page.waitForResponse((response) => (
+    new URL(response.url()).pathname.endsWith(`/general-skills/${skillId}`)
+    && response.request().method() === 'PUT'
+  ));
+  await page.getByRole('button', { name: `取消并静音 Skill ${SKILL_NAME}` }).click();
+  expect((await countermandResponse).status()).toBe(200);
+  const blockedResource = await page.evaluate(async ({ id, use, checksum }) => {
+    const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
+    const response = await fetch(
+      `/api/chat/sessions/${id}/general-skill-loads/${use}/resources/${checksum}`,
+      { headers: { Authorization: `Bearer ${auth.token}` } },
+    );
+    return response.status;
+  }, { id: sessionId, use: useId, checksum: resourceChecksum });
+  expect(blockedResource).toBe(404);
+  const countermandEvents = await page.evaluate(async (id) => {
+    const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
+    const response = await fetch(`/api/chat/sessions/${id}/events?tenant_id=tenant_demo`, {
+      headers: { Authorization: `Bearer ${auth.token}` },
+    });
+    return response.json() as Promise<Array<{ event_type: string }>>;
+  }, sessionId);
+  expect(countermandEvents.some((event) => event.event_type === 'skill_countermanded')).toBe(true);
+
   const rejected = await page.evaluate(async (id) => {
     const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
     const response = await fetch('/api/chat/stream', {

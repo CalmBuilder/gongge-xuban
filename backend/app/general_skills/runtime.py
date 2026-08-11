@@ -18,6 +18,7 @@ from sqlmodel import Session, select
 
 from app.config import get_settings
 from app.db.models import (
+    AgentEvent,
     ChatSession,
     GeneralSkill,
     GeneralSkillDependency,
@@ -225,6 +226,27 @@ class GeneralSkillRuntimeService:
         self.db.add(row)
         self.db.commit()
         self.db.refresh(row)
+        if not enabled:
+            invalidated = self.invalidate_unavailable(
+                current_user,
+                session_id=session_id,
+                agent_id=agent_id,
+            )
+            for use in invalidated:
+                self.db.add(
+                    AgentEvent(
+                        tenant_id=current_user.tenant_id,
+                        session_id=session_id,
+                        event_type="skill_countermanded",
+                        payload_json={
+                            "skill_use_id": use.id,
+                            "skill_id": use.skill_id,
+                            "reason": use.invalidation_reason,
+                        },
+                    )
+                )
+            if invalidated:
+                self.db.commit()
         return row
 
     def load(

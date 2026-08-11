@@ -172,9 +172,9 @@ def test_s3_mysql_runtime_load_is_idempotent_and_mute_is_durable(
             expected_row_version=None,
         )
         assert runtime.session_catalog(owner, session_id=chat.id, agent_id=agent.id) == ()
-        assert [row.id for row in runtime.invalidate_unavailable(
+        assert runtime.invalidate_unavailable(
             owner, session_id=chat.id, agent_id=agent.id
-        )] == [first[0].use_id]
+        ) == []
         db.commit()
         assert db.get(GeneralSkillUse, first[0].use_id).status == "invalidated"
     engine.dispose()
