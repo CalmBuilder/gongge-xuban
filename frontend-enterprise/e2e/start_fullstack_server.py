@@ -1740,20 +1740,31 @@ def install_general_skill_remote_fetcher_override() -> None:
             time.sleep(0.8)
             with ZipFile(payload, "w", ZIP_DEFLATED) as archive:
                 archive.writestr(
+                    "skills-main/skills/engineering/implement/SKILL.md",
+                    "---\n"
+                    "name: implement\n"
+                    'description: "Implement a piece of work based on a spec or set of tickets."\n'
+                    "disable-model-invocation: true\n"
+                    "---\n"
+                    "Implement the work described by the user in the spec or tickets.\n\n"
+                    "Use /tdd where possible, at pre-agreed seams.\n\n"
+                    "Once done, use /code-review to review the work.\n",
+                )
+                archive.writestr(
                     "skills-main/skills/engineering/tdd/SKILL.md",
                     "---\n"
                     "name: tdd\n"
-                    "description: Use test-driven development with an explicit red-green-refactor loop.\n"
-                    "---\n# TDD\nUse `/systematic-debugging` when the red test is not understood.\n",
+                    "description: Test-driven development. Use when the user wants to build "
+                    'features or fix bugs test-first, mentions "red-green-refactor", or wants '
+                    "integration tests.\n"
+                    "---\n# Test-Driven Development\n",
                 )
                 archive.writestr(
-                    "skills-main/skills/engineering/systematic-debugging/SKILL.md",
+                    "skills-main/skills/engineering/code-review/SKILL.md",
                     "---\n"
-                    "name: systematic-debugging\n"
-                    "description: Diagnose failures by evidence before changing implementation.\n"
-                    "disable-model-invocation: true\n"
-                    'argument-hint: "Describe the reproducible failure"\n'
-                    "---\n# Systematic debugging\n",
+                    "name: code-review\n"
+                    "description: Review changes along the Standards and Spec axes.\n"
+                    "---\n# Code Review\n",
                 )
             return RemoteFetchResult(source_url, payload.getvalue(), 0)
 
