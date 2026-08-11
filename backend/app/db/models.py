@@ -1735,6 +1735,18 @@ class GeneralSkill(SQLModel, table=True):
             "usage_mode IN ('atomic_execution', 'planning_guidance')",
             name="ck_general_skill_usage_mode",
         ),
+        CheckConstraint(
+            "visibility_scope IN ('user_private', 'agent_private', 'tenant_gallery')",
+            name="ck_general_skill_visibility_scope",
+        ),
+        CheckConstraint("row_version >= 1", name="ck_general_skill_row_version"),
+        Index(
+            "ix_general_skill_owner_visibility_status",
+            "tenant_id",
+            "owner_user_id",
+            "visibility_scope",
+            "status",
+        ),
     )
 
     id: PrimaryKeyString = Field(default_factory=lambda: new_id("genskill"), primary_key=True)
@@ -1750,11 +1762,137 @@ class GeneralSkill(SQLModel, table=True):
     permissions_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     runtime_config_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     usage_mode: LabelString = Field(default="atomic_execution", index=True)
+    owner_user_id: OptionalIdentifierString = Field(default=None, index=True)
+    visibility_scope: LabelString = Field(default="tenant_gallery", index=True)
+    current_published_revision_id: OptionalIdentifierString = Field(default=None, index=True)
+    row_version: int = Field(default=1, ge=1)
     planning_guidance_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     planning_guidance_checksum: OptionalVersionString = Field(default=None, index=True)
     planning_guidance_published_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
+
+
+class GeneralSkillRevision(SQLModel, table=True):
+    """保存通用技能经确认后不可覆盖的规范化修订。"""
+
+    __tablename__ = "general_skill_revisions"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "skill_id",
+            "revision_number",
+            name="uq_general_skill_revision_number",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "skill_id",
+            "content_checksum",
+            name="uq_general_skill_revision_checksum",
+        ),
+        CheckConstraint(
+            "status IN ('draft', 'reviewing', 'published', 'rejected', 'superseded', 'revoked')",
+            name="ck_general_skill_revision_status",
+        ),
+        CheckConstraint("revision_number >= 1", name="ck_general_skill_revision_number"),
+        CheckConstraint("row_version >= 1", name="ck_general_skill_revision_row_version"),
+        Index(
+            "ix_general_skill_revision_lookup",
+            "tenant_id",
+            "skill_id",
+            "status",
+            "revision_number",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("gsrev"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    skill_id: IdentifierString = Field(index=True)
+    revision_number: int = Field(ge=1)
+    content_checksum: VersionString = Field(index=True)
+    manifest_checksum: VersionString = Field(index=True)
+    normalized_skill_markdown: LongTextString
+    parsed_metadata_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    resource_manifest_json: list[dict[str, Any]] = Field(
+        default_factory=list, sa_column=Column(JSON)
+    )
+    requested_capabilities_json: dict[str, Any] = Field(
+        default_factory=dict, sa_column=Column(JSON)
+    )
+    source_snapshot_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    status: LabelString = Field(default="draft", index=True)
+    created_by: IdentifierString = Field(index=True)
+    row_version: int = Field(default=1, ge=1)
+    created_at: datetime = Field(default_factory=utc_now)
+    published_at: datetime | None = None
+    revoked_at: datetime | None = None
+
+
+class GeneralSkillImportJob(SQLModel, table=True):
+    """保存一次有身份边界、可恢复且不可原地重试的 Skill 导入作业。"""
+
+    __tablename__ = "general_skill_import_jobs"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "owner_user_id",
+            "idempotency_key",
+            "attempt",
+            name="uq_general_skill_import_attempt",
+        ),
+        CheckConstraint(
+            "source_kind IN ('upload', 'github', 'skillhub', 'https', 'manual', 'agent_copy')",
+            name="ck_general_skill_import_source_kind",
+        ),
+        CheckConstraint(
+            "status IN ('created', 'fetching', 'fetched', 'normalizing', 'normalized', "
+            "'analyzing', 'awaiting_approval', 'confirming', 'installed', 'failed', "
+            "'cancelled', 'expired')",
+            name="ck_general_skill_import_status",
+        ),
+        CheckConstraint("attempt >= 1", name="ck_general_skill_import_attempt"),
+        CheckConstraint("quota_bytes >= 0", name="ck_general_skill_import_quota"),
+        CheckConstraint("row_version >= 1", name="ck_general_skill_import_row_version"),
+        Index(
+            "ix_general_skill_import_owner_status",
+            "tenant_id",
+            "owner_user_id",
+            "status",
+            "expires_at",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("gsjob"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    owner_user_id: IdentifierString = Field(index=True)
+    target_agent_id: IdentifierString = Field(index=True)
+    source_kind: LabelString = Field(index=True)
+    source_reference_redacted: OptionalPlainTextString = None
+    credential_reference: OptionalIdentifierString = None
+    raw_checksum: OptionalVersionString = Field(default=None, index=True)
+    normalized_checksum: OptionalVersionString = Field(default=None, index=True)
+    preview_checksum: OptionalVersionString = Field(default=None, index=True)
+    status: LabelString = Field(default="created", index=True)
+    attempt: int = Field(default=1, ge=1)
+    parent_job_id: OptionalIdentifierString = Field(default=None, index=True)
+    idempotency_key: IdentifierString = Field(index=True)
+    quota_bytes: int = Field(default=0, ge=0)
+    error_code: OptionalLabelString = None
+    error_detail_redacted: OptionalMediumTextString = None
+    staging_manifest_json: list[dict[str, Any]] = Field(
+        default_factory=list, sa_column=Column(JSON)
+    )
+    preview_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    installed_revision_ids_json: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    row_version: int = Field(default=1, ge=1)
+    expires_at: datetime
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+    fetched_at: datetime | None = None
+    normalized_at: datetime | None = None
+    analyzed_at: datetime | None = None
+    confirmed_at: datetime | None = None
+    terminal_at: datetime | None = None
 
 
 class KnowledgeBase(SQLModel, table=True):
@@ -2185,6 +2323,7 @@ class AgentResourceBinding(SQLModel, table=True):
     resource_id: IdentifierString = Field(index=True)
     status: LabelString = Field(default="active", index=True)
     metadata_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    row_version: int = Field(default=1, ge=1)
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
