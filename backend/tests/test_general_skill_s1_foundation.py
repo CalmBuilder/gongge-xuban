@@ -333,3 +333,36 @@ def test_0051_migration_backfills_active_import_quota_without_double_counting(tm
         ("tenant", "tenant_a", 1, 321),
         ("user", "user_a", 1, 321),
     ]
+
+
+def test_0052_migration_adds_idempotent_linear_retry_constraint(tmp_path) -> None:
+    """验证空 SQLite 可升级到 retry head，重复升级后唯一约束仍只有一份。"""
+
+    database_url = f"sqlite:///{tmp_path / 'skill-import-retry.db'}"
+    config = Config(str(BACKEND_DIR / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
+    config.attributes["database_url"] = database_url
+    engine = create_engine(database_url)
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)"))
+        connection.execute(text("INSERT INTO alembic_version VALUES ('20260812_0051')"))
+        connection.execute(
+            text(
+                "CREATE TABLE general_skill_import_jobs ("
+                "id VARCHAR PRIMARY KEY, tenant_id VARCHAR NOT NULL, "
+                "parent_job_id VARCHAR, attempt INTEGER NOT NULL)"
+            )
+        )
+    command.upgrade(config, "head")
+    command.upgrade(config, "head")
+    constraints = {
+        str(item.get("name"))
+        for item in inspect(engine).get_unique_constraints("general_skill_import_jobs")
+    }
+
+    assert "uq_general_skill_import_retry_attempt" in constraints
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
+            "20260812_0052"
+        )
+    engine.dispose()

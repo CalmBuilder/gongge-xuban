@@ -848,6 +848,48 @@ def test_multi_candidate_confirm_rolls_back_all_database_rows_on_storage_failure
     assert not promoted[0].exists()
 
 
+def test_failed_import_retry_creates_one_linear_attempt_with_corrected_content(tmp_path) -> None:
+    """验证失败包可用新正文创建 attempt+1，且同一父作业不能分叉成多个重试。"""
+
+    db, service, owner, _ = _context(tmp_path)
+    unsafe_payload = BytesIO()
+    with ZipFile(unsafe_payload, "w") as archive:
+        archive.writestr("../SKILL.md", b"unsafe")
+    failed = service.create_upload_job(
+        _request(unsafe_payload.getvalue()),
+        idempotency_key="retry-parent-001",
+        current_user=owner,
+    )
+    assert failed.status == "failed"
+    retry_request = _request(_package("corrected-skill")).model_copy(
+        update={"retry_parent_job_id": failed.id}
+    )
+    retried = service.create_upload_job(
+        retry_request,
+        idempotency_key="retry-child-001",
+        current_user=owner,
+    )
+
+    retry_row = db.get(GeneralSkillImportJob, retried.id)
+    assert retry_row is not None
+    assert retried.status == "awaiting_approval"
+    assert retry_row.parent_job_id == failed.id
+    assert retry_row.attempt == 2
+    replay = service.create_upload_job(
+        retry_request,
+        idempotency_key="retry-child-001",
+        current_user=owner,
+    )
+    assert replay.id == retried.id
+    with pytest.raises(GeneralSkillImportError) as captured:
+        service.create_upload_job(
+            retry_request,
+            idempotency_key="retry-child-other-001",
+            current_user=owner,
+        )
+    assert captured.value.error_code == "GENERAL_SKILL_STATE_CONFLICT"
+
+
 def test_cancel_releases_staging_and_is_idempotent(tmp_path) -> None:
     """验证取消回收暂存配额，重复取消不改变终态或行版本。"""
 

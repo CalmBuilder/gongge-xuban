@@ -32,6 +32,7 @@ class GeneralSkillImportJobCreate(BaseModel):
     source_url: str | None = Field(default=None, min_length=1, max_length=2048)
     revision: str | None = Field(default=None, pattern=r"^[a-fA-F0-9]{40}$")
     source_subpath: str | None = Field(default=None, min_length=1, max_length=512)
+    retry_parent_job_id: str | None = Field(default=None, pattern=r"^gsjob_[a-f0-9]{16}$")
 
     @model_validator(mode="after")
     def validate_source_fields(self) -> "GeneralSkillImportJobCreate":

@@ -1841,6 +1841,12 @@ class GeneralSkillImportJob(SQLModel, table=True):
             "attempt",
             name="uq_general_skill_import_attempt",
         ),
+        UniqueConstraint(
+            "tenant_id",
+            "parent_job_id",
+            "attempt",
+            name="uq_general_skill_import_retry_attempt",
+        ),
         CheckConstraint(
             "source_kind IN ('upload', 'github', 'skillhub', 'https', 'manual', 'agent_copy')",
             name="ck_general_skill_import_source_kind",

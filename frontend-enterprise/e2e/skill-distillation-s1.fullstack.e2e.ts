@@ -141,6 +141,26 @@ test('S1 危险路径包在浏览器中进入明确失败终态且不能确认',
   await expect(dialog.getByRole('button', { name: '固定版本并绑定' })).toHaveCount(0);
   await dialog.getByRole('button', { name: '修正来源并重试' }).click();
   await expect(dialog.getByText('选择 SKILL.md 或 ZIP Skill 包')).toBeVisible();
+  await dialog.locator('input[type="file"]').setInputFiles({
+    name: 'corrected-refund-helper.zip',
+    mimeType: 'application/zip',
+    buffer: Buffer.from(VALID_SKILL_ZIP_BASE64, 'base64'),
+  });
+  const retryResponsePromise = page.waitForResponse((response) => (
+    new URL(response.url()).pathname === '/api/enterprise/general-skill-import-jobs'
+    && response.request().method() === 'POST'
+  ));
+  await dialog.getByRole('button', { name: '生成安全预览' }).click();
+  const retryResponse = await retryResponsePromise;
+  expect(retryResponse.status()).toBe(202);
+  expect((await retryResponse.json()).attempt).toBe(2);
+  await expect(dialog.getByText('购物售后规则核验', { exact: true })).toBeVisible();
+  const confirmResponse = page.waitForResponse((response) => (
+    new URL(response.url()).pathname.endsWith('/confirm')
+    && response.request().method() === 'POST'
+  ));
+  await dialog.getByRole('button', { name: '固定版本并绑定' }).click();
+  expect((await confirmResponse).status()).toBe(200);
   expect(failures).toEqual([]);
 });
 

@@ -137,14 +137,11 @@ class GeneralSkillImportService:
             )
         payload = _prepare_upload_payload(request)
         raw_checksum = hashlib.sha256(payload).hexdigest()
-        existing = self.db.exec(
-            select(GeneralSkillImportJob).where(
-                GeneralSkillImportJob.tenant_id == request.tenant_id,
-                GeneralSkillImportJob.owner_user_id == current_user.id,
-                GeneralSkillImportJob.idempotency_key == key,
-                GeneralSkillImportJob.attempt == 1,
-            )
-        ).first()
+        attempt, parent_job_id, existing = self._resolve_import_attempt(
+            request,
+            key=key,
+            current_user=current_user,
+        )
         if existing:
             if existing.raw_checksum and existing.raw_checksum != raw_checksum:
                 raise GeneralSkillImportError(
@@ -163,13 +160,15 @@ class GeneralSkillImportService:
             source_reference_redacted=_redacted_filename(request.filename),
             raw_checksum=raw_checksum,
             idempotency_key=key,
+            attempt=attempt,
+            parent_job_id=parent_job_id,
             expires_at=now + timedelta(hours=24),
             created_at=now,
             updated_at=now,
         )
         self.db.add(job)
-        self._append_job_audit(job, "created", "success")
         try:
+            self._append_job_audit(job, "created", "success")
             self.db.commit()
         except IntegrityError as exc:
             self.db.rollback()
@@ -548,14 +547,11 @@ class GeneralSkillImportService:
                 "source_reference": source_reference,
             }
         )
-        existing = self.db.exec(
-            select(GeneralSkillImportJob).where(
-                GeneralSkillImportJob.tenant_id == request.tenant_id,
-                GeneralSkillImportJob.owner_user_id == current_user.id,
-                GeneralSkillImportJob.idempotency_key == key,
-                GeneralSkillImportJob.attempt == 1,
-            )
-        ).first()
+        attempt, parent_job_id, existing = self._resolve_import_attempt(
+            request,
+            key=key,
+            current_user=current_user,
+        )
         if existing:
             existing_request_checksum = str(
                 existing.preview_json.get("source_request_checksum", "")
@@ -576,6 +572,8 @@ class GeneralSkillImportService:
             source_kind=request.source_kind,
             source_reference_redacted=source_reference,
             idempotency_key=key,
+            attempt=attempt,
+            parent_job_id=parent_job_id,
             preview_json={
                 "source_request_checksum": request_checksum,
                 "source_subpath": request.source_subpath,
@@ -761,6 +759,62 @@ class GeneralSkillImportService:
                 **(detail or {}),
             },
         )
+
+    def _resolve_import_attempt(
+        self,
+        request: GeneralSkillImportJobCreate,
+        *,
+        key: str,
+        current_user: User,
+    ) -> tuple[int, str | None, GeneralSkillImportJob | None]:
+        """校验线性重试链，并解析本次 attempt 与可能存在的幂等作业。"""
+
+        if request.retry_parent_job_id is None:
+            existing = self.db.exec(
+                select(GeneralSkillImportJob).where(
+                    GeneralSkillImportJob.tenant_id == request.tenant_id,
+                    GeneralSkillImportJob.owner_user_id == current_user.id,
+                    GeneralSkillImportJob.idempotency_key == key,
+                    GeneralSkillImportJob.attempt == 1,
+                )
+            ).first()
+            return 1, None, existing
+        parent = self._owned_job(request.retry_parent_job_id, current_user)
+        if parent.status not in {
+            ImportJobStatus.FAILED,
+            ImportJobStatus.CANCELLED,
+            ImportJobStatus.EXPIRED,
+        }:
+            raise GeneralSkillImportError(
+                "GENERAL_SKILL_STATE_CONFLICT",
+                "only a failed, cancelled, or expired import can be retried",
+                409,
+            )
+        if (
+            parent.tenant_id != request.tenant_id
+            or parent.target_agent_id != request.target_agent_id
+            or parent.source_kind != request.source_kind
+        ):
+            raise GeneralSkillImportError(
+                "GENERAL_SKILL_STATE_CONFLICT",
+                "retry must preserve tenant, target agent, and source kind",
+                409,
+            )
+        attempt = parent.attempt + 1
+        existing = self.db.exec(
+            select(GeneralSkillImportJob).where(
+                GeneralSkillImportJob.tenant_id == request.tenant_id,
+                GeneralSkillImportJob.parent_job_id == parent.id,
+                GeneralSkillImportJob.attempt == attempt,
+            )
+        ).first()
+        if existing is not None and existing.idempotency_key != key:
+            raise GeneralSkillImportError(
+                "GENERAL_SKILL_STATE_CONFLICT",
+                "this import already has a retry attempt",
+                409,
+            )
+        return attempt, parent.id, existing
 
     def _reserve_import_quota(self, tenant_id: str, owner_user_id: str) -> None:
         """以条件更新同时预留 tenant/user 活动作业名额，任一级失败则整体回滚。"""

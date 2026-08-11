@@ -358,6 +358,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
   const [secureImportJob, setSecureImportJob] = useState<GeneralSkillImportJobRead | null>(null);
   const [secureImportSelectedIds, setSecureImportSelectedIds] = useState<string[]>([]);
   const [secureImportDependencyDecisions, setSecureImportDependencyDecisions] = useState<Record<string, SkillDependencyDecision>>({});
+  const [secureImportRetryParentId, setSecureImportRetryParentId] = useState<string | null>(null);
   const [secureImportLoading, setSecureImportLoading] = useState(false);
 
   const pageTitle = isOverallAgent ? '技能广场' : '技能';
@@ -652,6 +653,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
     setSecureImportJob(null);
     setSecureImportSelectedIds([]);
     setSecureImportDependencyDecisions({});
+    setSecureImportRetryParentId(null);
     setSecureImportOpen(true);
   }
 
@@ -708,6 +710,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
         {
           tenant_id: getRequestTenantId(),
           target_agent_id: agentId,
+          retry_parent_job_id: secureImportRetryParentId || undefined,
           ...sourcePayload,
         },
         { 'Idempotency-Key': `skill-upload-${crypto.randomUUID()}` },
@@ -1101,6 +1104,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
         onPreview={() => void previewSecurePackage()}
         onConfirm={() => void confirmSecurePackage()}
         onReset={() => {
+          setSecureImportRetryParentId(secureImportJob?.id || null);
           setSecureImportJob(null);
           setSecureImportFile(null);
           setSecureImportFolderFiles([]);
