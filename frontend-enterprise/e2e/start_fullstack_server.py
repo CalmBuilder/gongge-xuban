@@ -64,6 +64,42 @@ export function availableRefundActions(status) {
   return [];
 }
 """
+DIAGNOSIS_MEMORY_BASELINE = """\
+def build_memory_context(preferences):
+    return []
+"""
+DIAGNOSIS_MEMORY_PATCHED = """\
+def build_memory_context(preferences):
+    return [item for item in preferences if item.strip()]
+"""
+DIAGNOSIS_TEST = """\
+import unittest
+
+from app.memory_route import build_memory_context
+
+
+class MemoryContextRegressionTest(unittest.TestCase):
+    def test_no_sop_route_retains_agent_preference(self):
+        actual = build_memory_context(["称呼用户为张工"])
+        self.assertEqual(actual, ["称呼用户为张工"], "remembered preference missing")
+"""
+DIAGNOSIS_CLEAN_CHECK = """\
+from pathlib import Path
+import sys
+import unittest
+
+sys.path.insert(0, str(Path.cwd()))
+suite = unittest.defaultTestLoader.discover("tests")
+if not unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful():
+    raise SystemExit("regression suite failed")
+matches = []
+for path in Path("app").rglob("*.py"):
+    if "[DEBUG-" in path.read_text(encoding="utf-8"):
+        matches.append(str(path))
+if matches:
+    raise SystemExit("debug instrumentation remains: " + ",".join(matches))
+print("GREEN_AND_CLEAN")
+"""
 
 
 def legacy_password_hash(password: str) -> str:
@@ -130,8 +166,12 @@ def seed_e2e_fixtures() -> None:
         EmployeeRoleAssignment,
         KnowledgeBase,
         KnowledgeBaseVersion,
+        KnowledgeBucket,
+        KnowledgeChunk,
         KnowledgeDiscoverySuggestion,
+        KnowledgeDocument,
         KnowledgeIngestJob,
+        MemoryRecord,
         SopInstance,
         SopNodeExecution,
         SopOperation,
@@ -239,6 +279,19 @@ def seed_e2e_fixtures() -> None:
         )
         db.add(
             AgentProfile(
+                id="agent_e2e_diagnosis",
+                tenant_id="tenant_demo",
+                name="E2E 疑难故障诊断分身",
+                status="active",
+                owner_user_id="member_e2e",
+                metadata_json={
+                    "owner_user_id": "member_e2e",
+                    "owner_username": "member",
+                },
+            )
+        )
+        db.add(
+            AgentProfile(
                 id="agent_e2e_member_employee",
                 tenant_id="tenant_demo",
                 name="E2E 成员数字员工",
@@ -323,6 +376,80 @@ def seed_e2e_fixtures() -> None:
                 status="succeeded",
                 stage="done",
                 progress=1,
+            )
+        )
+        db.add(
+            KnowledgeDocument(
+                id="kdoc_e2e_member",
+                tenant_id="tenant_demo",
+                knowledge_base_id="kb_e2e_member",
+                knowledge_base_version_id="kbver_kb_e2e_member_1_0_0",
+                filename="e2e-member-knowledge.md",
+                file_type="markdown",
+                title="Agent Loop 记忆投影手册",
+                status="ready",
+                bucket_count=1,
+                chunk_count=1,
+            )
+        )
+        db.add(
+            KnowledgeBucket(
+                id="kbucket_e2e_member_agent_loop",
+                tenant_id="tenant_demo",
+                knowledge_base_id="kb_e2e_member",
+                knowledge_base_version_id="kbver_kb_e2e_member_1_0_0",
+                document_id="kdoc_e2e_member",
+                bucket_key="agent-loop-memory-context",
+                title="Agent Loop 无 SOP 记忆投影契约",
+                summary="无 SOP 路径仍须保留当前数字员工的 memory_context。",
+                token_estimate=40,
+            )
+        )
+        db.add(
+            KnowledgeChunk(
+                id="kchunk_e2e_member_agent_loop",
+                tenant_id="tenant_demo",
+                knowledge_base_id="kb_e2e_member",
+                knowledge_base_version_id="kbver_kb_e2e_member_1_0_0",
+                document_id="kdoc_e2e_member",
+                bucket_id="kbucket_e2e_member_agent_loop",
+                chunk_index=0,
+                content=(
+                    "Agent Loop 在无 SOP 普通问答和动态任务分流时，必须把当前数字员工隔离召回的 "
+                    "memory_context 原样传给能力路由和 DynamicTaskAgent，禁止替换为空数组。"
+                ),
+                summary="无 SOP 动态任务必须消费 Agent 隔离记忆。",
+                source_ref="e2e-member-knowledge.md#agent-loop-memory-context",
+            )
+        )
+        db.add(
+            MemoryRecord(
+                id="memory_e2e_diagnosis_preference",
+                tenant_id="tenant_demo",
+                user_id="member_e2e",
+                username="member",
+                agent_id="agent_e2e_diagnosis",
+                kind="preference",
+                content="诊断时先给出可复现命令，并称呼我为张工。",
+                metadata_json={
+                    "agent_id": "agent_e2e_diagnosis",
+                    "key": "diagnosis_style",
+                },
+            )
+        )
+        db.add(
+            MemoryRecord(
+                id="memory_e2e_other_agent_preference",
+                tenant_id="tenant_demo",
+                user_id="member_e2e",
+                username="member",
+                agent_id="agent_e2e_member_employee",
+                kind="preference",
+                content="购物售后助手只展示物流摘要。",
+                metadata_json={
+                    "agent_id": "agent_e2e_member_employee",
+                    "key": "after_sales_style",
+                },
             )
         )
         db.add(
@@ -607,6 +734,12 @@ def seed_e2e_fixtures() -> None:
             db,
             "tenant_demo",
             "agent_e2e_member_employee",
+            member_knowledge_base,
+        )
+        ensure_agent_private_knowledge_branch(
+            db,
+            "tenant_demo",
+            "agent_e2e_diagnosis",
             member_knowledge_base,
         )
         db.commit()
@@ -1431,6 +1564,33 @@ def seed_managed_workspace_browser_fixture() -> None:
     subprocess.run(
         ["git", "-C", str(repo), "commit", "-m", "baseline"], check=True
     )
+    diagnosis_repo = (
+        E2E_RUNTIME_DIR / "managed-workspaces" / "tenant_demo" / "memory-diagnosis-demo"
+    )
+    diagnosis_repo.mkdir(parents=True)
+    for argv in (
+        ("init", "-b", "main"),
+        ("config", "user.email", "robot@example.invalid"),
+        ("config", "user.name", "E2E Diagnosis Robot"),
+    ):
+        subprocess.run(["git", "-C", str(diagnosis_repo), *argv], check=True)
+    (diagnosis_repo / "app").mkdir()
+    (diagnosis_repo / "app" / "__init__.py").write_text("", encoding="utf-8")
+    (diagnosis_repo / "app" / "memory_route.py").write_text(
+        DIAGNOSIS_MEMORY_BASELINE,
+        encoding="utf-8",
+    )
+    (diagnosis_repo / "tests").mkdir()
+    (diagnosis_repo / "checks").mkdir()
+    (diagnosis_repo / "checks" / "no_debug.py").write_text(
+        DIAGNOSIS_CLEAN_CHECK,
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "-C", str(diagnosis_repo), "add", "."], check=True)
+    subprocess.run(
+        ["git", "-C", str(diagnosis_repo), "commit", "-m", "baseline"],
+        check=True,
+    )
     image = (
         "python@sha256:"
         "9bffe4353b925a1656688797ebc68f9c525e79b1d377a764d232182a519eeec4"
@@ -1586,6 +1746,130 @@ def seed_managed_workspace_browser_fixture() -> None:
                 tool.id,
                 "active",
             )
+        diagnosis_definitions = (
+            (
+                "workspace.memory.read",
+                "read_file",
+                "read",
+                {"path": {"type": "string"}},
+                {"content": {"type": "string"}, "sha256": {"type": "string"}},
+                ["input.path", "output.content", "output.sha256"],
+            ),
+            (
+                "workspace.memory.apply-set",
+                "apply_files",
+                "local_write",
+                {"changes": {"type": "array", "items": {"type": "object"}}},
+                {
+                    "files": {"type": "array"},
+                    "changed_count": {"type": "integer"},
+                    "branch": {"type": "string"},
+                },
+                ["input.changes", "output.files", "output.changed_count", "output.branch"],
+            ),
+            (
+                "workspace.memory.check",
+                "run_check",
+                "execute",
+                {"profile": {"type": "string"}},
+                {
+                    "profile": {"type": "string"},
+                    "passed": {"type": "boolean"},
+                    "exit_code": {"type": "integer"},
+                },
+                ["input.profile", "output.profile", "output.passed", "output.exit_code"],
+            ),
+            (
+                "workspace.memory.commit",
+                "commit",
+                "local_write",
+                {
+                    "message": {"type": "string"},
+                    "paths": {"type": "array", "items": {"type": "string"}},
+                },
+                {"commit_sha": {"type": "string"}, "branch": {"type": "string"}},
+                ["input.message", "input.paths", "output.commit_sha", "output.branch"],
+            ),
+        )
+        for name, handler, risk, input_properties, output_properties, paths in (
+            diagnosis_definitions
+        ):
+            config = {
+                "workspace_id": "memory-diagnosis-demo",
+                "base_ref": "main",
+                "handler": handler,
+            }
+            if handler == "run_check":
+                config["check_profiles"] = {
+                    "diagnosis-red": {
+                        "image": image,
+                        "argv": [
+                            "python",
+                            "-m",
+                            "unittest",
+                            "discover",
+                            "-s",
+                            "tests",
+                            "-v",
+                        ],
+                        "timeout_seconds": 60,
+                        "expected_exit_codes": [1],
+                        "required_output_substrings": ["remembered preference missing"],
+                    },
+                    "diagnosis-green-clean": {
+                        "image": image,
+                        "argv": ["python", "checks/no_debug.py"],
+                        "timeout_seconds": 60,
+                        "required_output_substrings": ["GREEN_AND_CLEAN"],
+                    },
+                }
+            tool = Tool(
+                tenant_id="tenant_demo",
+                name=name,
+                display_name=name,
+                tool_type="managed_workspace",
+                method="POST",
+                url="",
+                config_json=config,
+                input_schema={
+                    "type": "object",
+                    "properties": input_properties,
+                    "required": list(input_properties),
+                    "additionalProperties": False,
+                },
+                output_schema={"type": "object", "properties": output_properties},
+            )
+            publish_tool_contract(
+                tool,
+                ToolReliabilityContract.model_validate(
+                    {
+                        "risk_class": risk,
+                        "side_effect": "none" if risk == "read" else "local",
+                        "confirmation_policy": "none" if risk == "read" else "once",
+                        "idempotency": {"mode": "none"},
+                        "reconcile": {"supported": False},
+                        "model_visibility": {
+                            "allowed_paths": paths,
+                            "user_display_paths": [
+                                path for path in paths if path.startswith("output.")
+                            ],
+                            "audit_only_paths": [],
+                        },
+                        "timeout_policy": "failed",
+                        "dynamic_task_enabled": True,
+                    }
+                ),
+            )
+            db.add(tool)
+            db.flush()
+            ensure_private_resource_binding(
+                db,
+                "tenant_demo",
+                "agent_e2e_diagnosis",
+                "tool",
+                tool.id,
+                "active",
+            )
         db.commit()
 
 
@@ -1710,7 +1994,13 @@ def install_schedule_llm_override() -> None:
                 if isinstance(item, dict)
             }
             goal = str(user_payload.get("goal") or "")
-            if "S4代码撤权" in goal and "s4-code-countermand-guidance" in names:
+            if "S4诊断" in goal and {
+                "diagnosing-bugs",
+                "tdd",
+                "codebase-design",
+            } <= names:
+                selected = ["diagnosing-bugs", "tdd", "codebase-design"]
+            elif "S4代码撤权" in goal and "s4-code-countermand-guidance" in names:
                 selected = ["s4-code-countermand-guidance"]
             elif "S4代码拒绝" in goal and "s4-code-deny-guidance" in names:
                 selected = ["s4-code-deny-guidance"]
@@ -1728,6 +2018,122 @@ def install_schedule_llm_override() -> None:
             }
         if "受控动态任务规划器" in system_prompt:
             loaded_guidance = user_payload.get("loaded_guidance", [])
+            if "DIAGNOSING-BUGS-FIXED-COMMIT" in str(loaded_guidance):
+                loaded_text = str(loaded_guidance)
+                if (
+                    "# Test-Driven Development" not in loaded_text
+                    or "CODEBASE-DESIGN-FIXED-COMMIT" not in loaded_text
+                ):
+                    raise RuntimeError("S4 diagnosis planner did not receive all fixed Skills")
+                memory_text = str(user_payload.get("memory_context", []))
+                if "称呼我为张工" not in memory_text:
+                    raise RuntimeError("S4 diagnosis planner did not receive agent memory")
+                if "购物售后助手只展示物流摘要" in memory_text:
+                    raise RuntimeError("S4 diagnosis planner received another agent's memory")
+                capability_names = {
+                    str(item.get("name") or "")
+                    for item in user_payload.get("capabilities", [])
+                    if isinstance(item, dict)
+                }
+                required = {
+                    "workspace.memory.read",
+                    "workspace.memory.apply-set",
+                    "workspace.memory.check",
+                    "knowledge.search",
+                }
+                if not required <= capability_names:
+                    raise RuntimeError("S4 diagnosis planner missed governed context or tools")
+                all_guidance = ["diagnosing-bugs", "tdd", "codebase-design"]
+                return {
+                    "goal": str(user_payload.get("goal") or "诊断记忆上下文缺失"),
+                    "success_criteria": user_payload.get("success_criteria", []),
+                    "constraints": [
+                        "先形成 red-capable loop，再给出可证伪假设，最后验证原始症状并清理 instrumentation"
+                    ],
+                    "assumptions": [],
+                    "steps": [
+                        {
+                            "draft_id": "read",
+                            "title": "读取无 SOP 记忆路由实现",
+                            "kind": "tool.read",
+                            "required": True,
+                            "depends_on": [],
+                            "capability_refs": ["workspace.memory.read"],
+                            "guidance_skill_refs": ["codebase-design"],
+                            "expected_output_schema": {},
+                        },
+                        {
+                            "draft_id": "knowledge",
+                            "title": "检索 Agent Loop 模块手册",
+                            "kind": "knowledge",
+                            "required": True,
+                            "depends_on": ["read"],
+                            "capability_refs": ["knowledge.search"],
+                            "guidance_skill_refs": ["diagnosing-bugs"],
+                            "expected_output_schema": {},
+                        },
+                        {
+                            "draft_id": "test",
+                            "title": "在确认的 interface seam 建立原始症状回归测试",
+                            "kind": "tool.write",
+                            "required": True,
+                            "depends_on": ["knowledge"],
+                            "capability_refs": ["workspace.memory.apply-set"],
+                            "guidance_skill_refs": ["tdd", "codebase-design"],
+                            "expected_output_schema": {},
+                        },
+                        {
+                            "draft_id": "red",
+                            "title": "运行快速确定的 red-capable loop",
+                            "kind": "tool.execute",
+                            "required": True,
+                            "depends_on": ["test"],
+                            "capability_refs": ["workspace.memory.check"],
+                            "guidance_skill_refs": ["diagnosing-bugs", "tdd"],
+                            "expected_output_schema": {},
+                        },
+                        {
+                            "draft_id": "hypotheses",
+                            "title": "确认可证伪根因假设",
+                            "kind": "clarification",
+                            "required": True,
+                            "depends_on": ["red"],
+                            "capability_refs": [],
+                            "guidance_skill_refs": ["diagnosing-bugs"],
+                            "expected_output_schema": {},
+                        },
+                        {
+                            "draft_id": "fix",
+                            "title": "按已证伪假设最小修复记忆投影",
+                            "kind": "tool.write",
+                            "required": True,
+                            "depends_on": ["hypotheses"],
+                            "capability_refs": ["workspace.memory.apply-set"],
+                            "guidance_skill_refs": ["diagnosing-bugs", "tdd"],
+                            "expected_output_schema": {},
+                        },
+                        {
+                            "draft_id": "green",
+                            "title": "重跑原始复现并清理调试 instrumentation",
+                            "kind": "tool.execute",
+                            "required": True,
+                            "depends_on": ["fix"],
+                            "capability_refs": ["workspace.memory.check"],
+                            "guidance_skill_refs": ["diagnosing-bugs", "tdd"],
+                            "expected_output_schema": {},
+                        },
+                        {
+                            "draft_id": "answer",
+                            "title": "形成诊断证据报告",
+                            "kind": "answer",
+                            "required": True,
+                            "depends_on": ["green"],
+                            "capability_refs": [],
+                            "guidance_skill_refs": all_guidance,
+                            "expected_output_schema": {},
+                        },
+                    ],
+                }
             if "S4-CODE-FULL-GUIDANCE" in str(loaded_guidance):
                 loaded_text = str(loaded_guidance)
                 if "s4-code-countermand-guidance" in loaded_text:
@@ -1908,7 +2314,117 @@ def install_schedule_llm_override() -> None:
             step_kind = str(current_step.get("kind") or "") if isinstance(current_step, dict) else ""
             step_title = str(current_step.get("title") or "") if isinstance(current_step, dict) else ""
             is_s4_code = "S4-CODE-FULL-GUIDANCE" in str(user_payload)
+            is_s4_diagnosis = "agent_e2e_diagnosis" in str(user_payload)
             is_s4 = "S4-DYNAMIC-FULL-GUIDANCE" in str(user_payload)
+            if is_s4_diagnosis:
+                client._last_completed_response_metadata = {
+                    "response_id": (
+                        "e2e-s4-diagnosis-"
+                        f"{step_kind}-{hashlib.sha256(step_title.encode()).hexdigest()[:12]}"
+                    ),
+                    "finish_reason": "stop",
+                    "usage": {"input_tokens": 14, "output_tokens": 10},
+                }
+                if step_kind == "tool.read":
+                    capability_ref = "workspace.memory.read"
+                    arguments = {"path": "app/memory_route.py"}
+                elif step_kind == "knowledge":
+                    return {
+                        "action_kind": "query_knowledge",
+                        "arguments": {"query": "Agent Loop 无 SOP 路径 memory_context 投影契约"},
+                        "capability_ref": "knowledge.search",
+                        "expected_output_schema": {},
+                        "rationale": "检索当前诊断分身绑定的模块手册证据",
+                    }
+                elif step_kind == "tool.write" and "回归测试" in step_title:
+                    capability_ref = "workspace.memory.apply-set"
+                    arguments = {
+                        "changes": [
+                            {
+                                "path": "tests/test_memory_route.py",
+                                "expected_sha256": None,
+                                "content": DIAGNOSIS_TEST,
+                            }
+                        ]
+                    }
+                elif step_kind == "tool.write":
+                    capability_ref = "workspace.memory.apply-set"
+                    arguments = {
+                        "changes": [
+                            {
+                                "path": "app/memory_route.py",
+                                "expected_sha256": hashlib.sha256(
+                                    DIAGNOSIS_MEMORY_BASELINE.encode()
+                                ).hexdigest(),
+                                "content": DIAGNOSIS_MEMORY_PATCHED,
+                            }
+                        ]
+                    }
+                elif step_kind == "tool.execute":
+                    capability_ref = "workspace.memory.check"
+                    arguments = {
+                        "profile": (
+                            "diagnosis-red"
+                            if "red-capable" in step_title
+                            else "diagnosis-green-clean"
+                        )
+                    }
+                elif step_kind == "clarification":
+                    return {
+                        "action_kind": "wait_input",
+                        "arguments": {
+                            "question": "red 已命中原始症状，请确认优先验证的可证伪假设",
+                            "options": [
+                                "无 SOP 分支把已召回 memory_context 替换为空数组",
+                                "知识检索覆盖了用户偏好",
+                                "Skill 选择器删除了会话记忆",
+                            ],
+                        },
+                        "capability_ref": None,
+                        "expected_output_schema": {},
+                        "rationale": "在修改前展示并确认排序后的可证伪假设",
+                    }
+                else:
+                    execution_view = user_payload.get("provider_execution_view", {})
+                    execution_context = (
+                        execution_view.get("execution_context", {})
+                        if isinstance(execution_view, dict)
+                        else {}
+                    )
+                    completed = [
+                        str(item.get("step_key") or "")
+                        for item in execution_context.get("completed_steps", [])
+                        if isinstance(item, dict) and item.get("step_key")
+                    ]
+                    criteria = [
+                        str(item.get("id") or "")
+                        for item in execution_context.get("success_criteria", [])
+                        if isinstance(item, dict) and item.get("id")
+                    ]
+                    return {
+                        "action_kind": "answer",
+                        "arguments": {
+                            "markdown": (
+                                "S4-DIAGNOSIS-SUCCESS：已先建立命中原始症状的 red loop，"
+                                "结合模块手册与当前分身记忆确认根因，完成最小修复；原始复现转绿，"
+                                "且 [DEBUG-] instrumentation 已清零。"
+                            ),
+                            "criterion_evidence": {
+                                criterion: completed for criterion in criteria
+                            },
+                            "pending_questions": [],
+                        },
+                        "capability_ref": None,
+                        "expected_output_schema": {},
+                        "rationale": "只依据持久 Operation 和已确认假设形成诊断结论",
+                    }
+                return {
+                    "action_kind": "call_tool",
+                    "arguments": arguments,
+                    "capability_ref": capability_ref,
+                    "expected_output_schema": {},
+                    "rationale": "按固定诊断/TDD/模块设计 Skill 调用受管能力",
+                }
             if is_s4_code:
                 client._last_completed_response_metadata = {
                     "response_id": (
@@ -2424,6 +2940,29 @@ def install_general_skill_remote_fetcher_override() -> None:
                     'features or fix bugs test-first, mentions "red-green-refactor", or wants '
                     "integration tests.\n"
                     "---\n# Test-Driven Development\n",
+                )
+                archive.writestr(
+                    "skills-main/skills/engineering/diagnosing-bugs/SKILL.md",
+                    "---\n"
+                    "name: diagnosing-bugs\n"
+                    "description: Diagnosis loop for hard bugs and performance regressions. "
+                    "Use when the user reports something broken, failing, or slow.\n"
+                    "---\n"
+                    "# Diagnosing Bugs\n"
+                    "DIAGNOSING-BUGS-FIXED-COMMIT：先建立快速、确定、可由 Agent 运行且能命中"
+                    "用户原始症状的 red-capable loop；再最小化复现，列出可证伪假设，修复后重跑"
+                    "原始复现，并清理所有 [DEBUG-] instrumentation。\n",
+                )
+                archive.writestr(
+                    "skills-main/skills/engineering/codebase-design/SKILL.md",
+                    "---\n"
+                    "name: codebase-design\n"
+                    "description: Shared vocabulary for designing deep modules and deciding "
+                    "where a test seam belongs.\n"
+                    "---\n"
+                    "# Codebase Design\n"
+                    "CODEBASE-DESIGN-FIXED-COMMIT：测试应位于调用者使用的 interface seam；"
+                    "module 应以小 interface 隐藏较深 implementation，并保持 locality。\n",
                 )
                 archive.writestr(
                     "skills-main/skills/engineering/code-review/SKILL.md",

@@ -801,8 +801,10 @@ class GeneralSkillRuntimeService:
                 raise GeneralSkillRuntimeError(
                     "GENERAL_SKILL_REVISION_CONFLICT", "skill cause revision is unavailable"
                 )
-            declared = revision.requested_capabilities_json.get("allowed_tools")
-            if isinstance(declared, list):
+            requested_capabilities = revision.requested_capabilities_json or {}
+            declared = requested_capabilities.get("allowed_tools")
+            declaration_marker = requested_capabilities.get("allowed_tools_declared")
+            if isinstance(declared, list) and declaration_marker is not False:
                 allowed &= {str(value) for value in declared if isinstance(value, str)}
             current = (
                 self.db.get(GeneralSkillUse, current.parent_skill_use_id)

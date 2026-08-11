@@ -2872,7 +2872,17 @@ class DynamicTaskAgent:
                 return step_definition, self._operation_result(operation)
             if operation.status == "prepared":
                 self._acquire_tool_quota(operation)
-                self.store.start_operation(operation)
+                try:
+                    self.store.start_operation(operation)
+                except SopExecutionSkillAuthorizationError as exc:
+                    self.store.cancel_prepared_operation(operation)
+                    self.store.fail_node(
+                        instance,
+                        step,
+                        error={"code": exc.authorization_code},
+                    )
+                    self.db.commit()
+                    raise DynamicTaskAgentError(exc.authorization_code) from exc
             elif operation.status != "running":
                 raise DynamicTaskAgentError("DYNAMIC_KNOWLEDGE_OPERATION_NOT_RETRYABLE")
             self._consume_call_budget(instance, "tool_calls")

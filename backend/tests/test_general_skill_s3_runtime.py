@@ -428,6 +428,34 @@ def test_tool_authorization_only_narrows_agent_baseline() -> None:
     assert dispatch_denied.value.authorization_code == "GENERAL_SKILL_TOOL_NOT_AUTHORIZED"
 
 
+def test_skill_without_allowed_tools_declaration_uses_agent_tool_baseline() -> None:
+    """未声明 allowed-tools 的方法型 Skill 不得把分身已授权工具误收窄为空集。"""
+
+    db, owner, agent, chat, skill, revision, _ = _context()
+    revision.requested_capabilities_json = {
+        "allowed_tools": [],
+        "allowed_tools_declared": False,
+        "invocation_policy": "model_allowed",
+    }
+    db.add(revision)
+    db.commit()
+    loaded = GeneralSkillRuntimeService(db).load(
+        owner,
+        session_id=chat.id,
+        agent_id=agent.id,
+        turn_id="turn_method_guidance",
+        skill_id=skill.id,
+        selection_mode="forced",
+    )
+
+    GeneralSkillRuntimeService(db).authorize_tool_for_use(
+        owner,
+        use_id=loaded.use_id,
+        tool_name="crm.order.write",
+        baseline_tools={"crm.order.write"},
+    )
+
+
 def test_dependency_load_requires_exact_approved_revision_edge(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

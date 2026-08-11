@@ -16,7 +16,7 @@ from app.core.non_sop_capability import (
     NonSopCapabilityRouter,
 )
 from app.core.skill_runtime import SkillRuntime
-from app.db.models import AgentEvent, ChatSession, Message, Skill, Tool
+from app.db.models import AgentEvent, ChatSession, MemoryRecord, Message, Skill, Tool
 from app.knowledge.schema import KnowledgeSearchResponse
 from app.general_skills.schema import GeneralSkillSelection
 from app.session.session_schema import (
@@ -375,6 +375,7 @@ def _no_sop_stream_with_shadow(
         "accessible_count": 0,
     }
     loop._get_persona_prompt = lambda *_args, **_kwargs: None
+    loop.memory = SimpleNamespace(context_memories=lambda *_args, **_kwargs: [])
     loop._drop_unavailable_skill_state = lambda *_args, **_kwargs: False
     loop._conversation_context = lambda *_args, **_kwargs: {}
     loop._auto_knowledge_step_result = lambda *_args, **_kwargs: StepAgentResult()
@@ -393,6 +394,8 @@ def _no_sop_stream_with_shadow(
 
 def _no_sop_prepared_turn_with_shadow(
     shadow_enabled: bool,
+    *,
+    memories: list[MemoryRecord] | None = None,
 ) -> tuple[PreparedTurn, FakeEvents]:
     """运行同步无 SOP 准备阶段，返回权威结果和领域事件供兼容比较。"""
 
@@ -444,10 +447,36 @@ def _no_sop_prepared_turn_with_shadow(
         "accessible_count": 0,
     }
     loop._drop_unavailable_skill_state = lambda *_args, **_kwargs: False
+    loop.memory = SimpleNamespace(
+        context_memories=lambda *_args, **_kwargs: list(memories or [])
+    )
     loop._conversation_context = lambda *_args, **_kwargs: {}
     loop._auto_knowledge_step_result = lambda *_args, **_kwargs: StepAgentResult()
 
     return loop._prepare_turn(_request("整理两个系统并生成简报")), events
+
+
+def test_no_sop_prepared_turn_keeps_agent_scoped_memory_context() -> None:
+    """无场景 SOP 时仍须把当前数字员工记忆送入路由及后续动态任务上下文。"""
+
+    prepared, events = _no_sop_prepared_turn_with_shadow(
+        False,
+        memories=[
+            MemoryRecord(
+                id="memory_agent_preference",
+                tenant_id="tenant_demo",
+                agent_id="agent_demo",
+                user_id="user_demo",
+                kind="preference",
+                content="称呼用户为张工",
+            )
+        ],
+    )
+
+    assert [item["content"] for item in prepared.memory_context] == ["称呼用户为张工"]
+    recalled = [record for record in events.records if record[2] == "memory_recalled"]
+    assert len(recalled) == 1
+    assert recalled[0][3]["memories"] == prepared.memory_context
 
 
 def test_no_sop_shadow_does_not_change_sse_frames() -> None:

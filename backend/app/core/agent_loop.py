@@ -2059,6 +2059,23 @@ class AgentLoop:
             )
             persona_prompt = self._get_persona_prompt(request.tenant_id, chat_session.agent_id)
             self._drop_unavailable_skill_state(request.tenant_id, chat_session, skills)
+            memory_context = [
+                memory_read(row)
+                for row in self.memory.context_memories(
+                    request.tenant_id,
+                    request.user_id,
+                    agent_id=chat_session.agent_id,
+                )
+            ]
+            if memory_context:
+                self.events.record(
+                    request.tenant_id,
+                    chat_session.id,
+                    "memory_recalled",
+                    {"memories": memory_context},
+                )
+            self.db.commit()
+            self.db.refresh(chat_session)
             if not skills:
                 no_skill_context = self._conversation_context(
                     chat_session, model_config=model_config
@@ -2079,7 +2096,7 @@ class AgentLoop:
                     chat_session,
                     chat_session.agent_id,
                     no_skill_context,
-                    [],
+                    memory_context,
                     user_id=request.user_id,
                     user_message_id=user_message_id,
                 )
@@ -2089,7 +2106,7 @@ class AgentLoop:
                     model_config,
                     capability_route,
                     user_message.id,
-                    memory_context=[],
+                    memory_context=memory_context,
                 )
                 if dynamic_response is not None:
                     yield self._stream_status(
@@ -2149,7 +2166,7 @@ class AgentLoop:
                         model_config,
                         (capability[0], capability[1]),
                         None,
-                        [],
+                        memory_context,
                         no_skill_context,
                         persona_prompt,
                         user_message.id,
@@ -2191,7 +2208,7 @@ class AgentLoop:
                     None,
                     model_config,
                     persona_prompt,
-                    [],
+                    memory_context,
                     no_skill_context,
                 ):
                     reply += chunk
@@ -2232,23 +2249,6 @@ class AgentLoop:
                 )
                 return
             self._finish_stale_completed_skill(request.tenant_id, chat_session, skills)
-            memory_context = [
-                memory_read(row)
-                for row in self.memory.context_memories(
-                    request.tenant_id,
-                    request.user_id,
-                    agent_id=chat_session.agent_id,
-                )
-            ]
-            if memory_context:
-                self.events.record(
-                    request.tenant_id,
-                    chat_session.id,
-                    "memory_recalled",
-                    {"memories": memory_context},
-                )
-            self.db.commit()
-            self.db.refresh(chat_session)
             conversation_context = self._conversation_context(chat_session, model_config=model_config)
             if self._context_compacted_now(conversation_context):
                 yield self._stream_status(
@@ -2957,6 +2957,23 @@ class AgentLoop:
         if not model_config:
             raise AgentLoopPreconditionError("missing_model_config", "没有默认模型配置。")
         self._drop_unavailable_skill_state(request.tenant_id, chat_session, skills)
+        memory_context = [
+            memory_read(row)
+            for row in self.memory.context_memories(
+                request.tenant_id,
+                request.user_id,
+                agent_id=chat_session.agent_id,
+            )
+        ]
+        if memory_context:
+            self.events.record(
+                request.tenant_id,
+                chat_session.id,
+                "memory_recalled",
+                {"memories": memory_context},
+            )
+        self.db.commit()
+        self.db.refresh(chat_session)
         if not skills:
             no_skill_context = self._conversation_context(
                 chat_session, model_config=model_config
@@ -2969,7 +2986,7 @@ class AgentLoop:
                 chat_session,
                 chat_session.agent_id,
                 no_skill_context,
-                [],
+                memory_context,
                 user_id=request.user_id,
                 user_message_id=user_message.id,
             )
@@ -2979,7 +2996,7 @@ class AgentLoop:
                 model_config,
                 capability_route,
                 user_message.id,
-                memory_context=[],
+                memory_context=memory_context,
             )
             if dynamic_response is not None:
                 return PreparedTurn(
@@ -2989,7 +3006,7 @@ class AgentLoop:
                     router_decision=dynamic_response.router_decision or RouterDecision(),
                     step_result=dynamic_response.step_result or StepAgentResult(),
                     tool_result=dynamic_response.tool_result,
-                    memory_context=[],
+                    memory_context=memory_context,
                     conversation_context=no_skill_context,
                     general_response=dynamic_response,
                     user_message_id=user_message.id,
@@ -3007,7 +3024,7 @@ class AgentLoop:
                 chat_session,
                 model_config,
                 router_decision,
-                [],
+                memory_context,
                 no_skill_context,
                 user_message.id,
                 capability,
@@ -3020,7 +3037,7 @@ class AgentLoop:
                     router_decision=router_decision,
                     step_result=StepAgentResult(),
                     tool_result=None,
-                    memory_context=[],
+                    memory_context=memory_context,
                     conversation_context=no_skill_context,
                     general_response=general_response,
                     user_message_id=user_message.id,
@@ -3040,28 +3057,11 @@ class AgentLoop:
                 router_decision=router_decision,
                 step_result=step_result,
                 tool_result=None,
-                memory_context=[],
+                memory_context=memory_context,
                 conversation_context=no_skill_context,
                 user_message_id=user_message.id,
             )
         self._finish_stale_completed_skill(request.tenant_id, chat_session, skills)
-        memory_context = [
-            memory_read(row)
-            for row in self.memory.context_memories(
-                request.tenant_id,
-                request.user_id,
-                agent_id=chat_session.agent_id,
-            )
-        ]
-        if memory_context:
-            self.events.record(
-                request.tenant_id,
-                chat_session.id,
-                "memory_recalled",
-                {"memories": memory_context},
-            )
-        self.db.commit()
-        self.db.refresh(chat_session)
         conversation_context = self._conversation_context(chat_session, model_config=model_config)
         if self._context_compacted_now(conversation_context):
             status("preparing", {"compacted_now": True})

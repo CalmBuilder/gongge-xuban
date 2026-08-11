@@ -1487,6 +1487,8 @@ class GeneralSkillImportService:
             resource_manifest_json=promoted_manifest,
             requested_capabilities_json={
                 "allowed_tools": list(candidate.get("allowed_tools", [])),
+                "allowed_tools_declared": "allowed-tools"
+                in dict(candidate.get("metadata", {})),
                 "invocation_policy": str(candidate.get("invocation_policy", "model_allowed")),
                 "argument_hint": candidate.get("argument_hint"),
                 "instruction_contracts": dict(candidate.get("instruction_contracts", {})),
@@ -1593,6 +1595,8 @@ class GeneralSkillImportService:
             resource_manifest_json=promoted_manifest,
             requested_capabilities_json={
                 "allowed_tools": list(candidate.get("allowed_tools", [])),
+                "allowed_tools_declared": "allowed-tools"
+                in dict(candidate.get("metadata", {})),
                 "invocation_policy": str(candidate.get("invocation_policy", "model_allowed")),
                 "argument_hint": candidate.get("argument_hint"),
                 "instruction_contracts": dict(candidate.get("instruction_contracts", {})),
