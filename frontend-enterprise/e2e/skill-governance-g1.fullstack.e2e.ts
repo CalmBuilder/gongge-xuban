@@ -30,6 +30,12 @@ async function loginAsMember(page: Page) {
 }
 
 test('G1-A 正式 GitHub Skill 导入后从我的 Skill 库原子装配多个数字员工', async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(Crypto.prototype, 'randomUUID', {
+      configurable: true,
+      value: undefined,
+    });
+  });
   const browserFailures: string[] = [];
   page.on('pageerror', (error) => browserFailures.push(error.message));
   page.on('console', (message) => {

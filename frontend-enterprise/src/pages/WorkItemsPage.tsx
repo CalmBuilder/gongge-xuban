@@ -16,6 +16,7 @@ import { Dialog, DialogContent, DialogTitle, Textarea } from '@/components/ui';
 import { notify } from '@/components/ui/app-toast';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
+import { createClientId } from '@/lib/client-id';
 import { formatDateTime } from '@/lib/enterprise-ui';
 
 import { api, getRequestTenantId } from '../api/client';
@@ -153,7 +154,7 @@ export default function WorkItemsPage({
       return;
     }
     setActing(true);
-    const commandId = crypto.randomUUID();
+    const commandId = createClientId();
     try {
       const isOutcome = Boolean(outcomeOption);
       const path = isOutcome

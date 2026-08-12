@@ -41,6 +41,7 @@ import {
 import { Button as UIButton } from '@/components/ui/button';
 import { notify } from '@/components/ui/app-toast';
 import { cn } from '@/lib/utils';
+import { createClientId } from '@/lib/client-id';
 import {
   MENU_CONTENT_CLASS,
   MENU_ITEM_CLASS,
@@ -915,7 +916,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
           credential_reference: secureImportCredentialId || undefined,
           ...sourcePayload,
         },
-        { 'Idempotency-Key': `skill-upload-${crypto.randomUUID()}` },
+        { 'Idempotency-Key': `skill-upload-${createClientId()}` },
       );
       setSecureImportJob(job);
       setSecureImportSelectedIds(job.candidates.map((candidate) => candidate.candidate_id));
@@ -1527,7 +1528,7 @@ function MyGeneralSkillLibraryDialog({
       await api.postWithHeaders(
         '/api/enterprise/general-skill-bindings:batch',
         { skill_id: selectedSkill.id, targets: targets(), preview_checksum: preview.preview_checksum },
-        { 'Idempotency-Key': `skill-binding-${crypto.randomUUID()}` },
+        { 'Idempotency-Key': `skill-binding-${createClientId()}` },
       );
       const refreshed = await api.get<MyGeneralSkillRead[]>('/api/enterprise/my-general-skills');
       setSkills(refreshed);
@@ -1566,7 +1567,7 @@ function MyGeneralSkillLibraryDialog({
     try {
       await api.post(`/api/enterprise/publications/releases/${encodeURIComponent(release.id)}/adopt`, {
         target_agent_id: targetAgentId,
-        idempotency_key: `adopt-${crypto.randomUUID()}`,
+        idempotency_key: `adopt-${createClientId()}`,
       });
       await onChanged();
       notify.success(`已把 ${release.name} 的已审固定版本装配到 ${ownedAgents[0].name}`);

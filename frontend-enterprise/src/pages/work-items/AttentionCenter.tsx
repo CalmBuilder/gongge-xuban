@@ -19,6 +19,7 @@ import { notify } from '@/components/ui/app-toast';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogTitle, Textarea } from '@/components/ui';
 import { cn } from '@/lib/utils';
+import { createClientId } from '@/lib/client-id';
 import { formatDateTime } from '@/lib/enterprise-ui';
 
 type AttentionView = 'active' | 'resolved';
@@ -171,7 +172,7 @@ export default function AttentionCenter() {
         await api.post(
           `/api/enterprise/publications/${encodeURIComponent(stringPayload(selected, 'publication_request_id'))}/review`,
           {
-            command_id: crypto.randomUUID(),
+            command_id: createClientId(),
             command,
             expected_request_row_version: numberPayload(selected, 'request_row_version') || 1,
             expected_attention_revision: selected.revision,
@@ -185,7 +186,7 @@ export default function AttentionCenter() {
       }
       const payload: Record<string, unknown> = {
         tenant_id: getRequestTenantId(),
-        command_id: crypto.randomUUID(),
+        command_id: createClientId(),
         command,
         expected_revision: selected.revision,
       };
@@ -250,7 +251,7 @@ export default function AttentionCenter() {
           corpId: reauthCorpId.trim(),
           agentId: reauthAgentId.trim(),
           corpSecret: reauthCorpSecret.trim(),
-          commandId: crypto.randomUUID(),
+          commandId: createClientId(),
         });
       } else {
         await reauthorizeConnectionAttention({
@@ -259,7 +260,7 @@ export default function AttentionCenter() {
           profileRevision,
           attentionRevision: selected.revision,
           token: reauthToken.trim(),
-          commandId: crypto.randomUUID(),
+          commandId: createClientId(),
         });
       }
       setReauthToken('');

@@ -7,6 +7,7 @@
  */
 
 import { api, getRequestTenantId } from './client';
+import { createClientId } from '@/lib/client-id';
 import type {
   ConnectionBindingRead,
   ConnectionProfileRead,
@@ -30,7 +31,7 @@ export function createSlackConnection(input: {
 
   return api.post('/api/enterprise/connection-profiles', {
     tenant_id: getRequestTenantId(),
-    command_id: crypto.randomUUID(),
+    command_id: createClientId(),
     expected_revision: 0,
     provider: 'slack',
     display_name: input.displayName,
@@ -51,7 +52,7 @@ export function createWeComConnection(input: {
 
   return api.post('/api/enterprise/connection-profiles', {
     tenant_id: getRequestTenantId(),
-    command_id: crypto.randomUUID(),
+    command_id: createClientId(),
     expected_revision: 0,
     provider: 'wecom',
     display_name: input.displayName,
@@ -76,7 +77,7 @@ export function startSlackOAuth(input: {
 
   return api.post('/api/enterprise/connection-profiles/slack/oauth/start', {
     tenant_id: getRequestTenantId(),
-    command_id: crypto.randomUUID(),
+    command_id: createClientId(),
     flow_type: input.flowType,
     display_name: input.displayName,
     profile_id: input.profileId,
@@ -103,7 +104,7 @@ export function reauthorizeConnection(
 
   return api.post(`/api/enterprise/connection-profiles/${profileId}/reauthorize`, {
     tenant_id: getRequestTenantId(),
-    command_id: crypto.randomUUID(),
+    command_id: createClientId(),
     expected_revision: expectedRevision,
     token,
   });
@@ -118,7 +119,7 @@ export function reauthorizeWeComConnection(
 
   return api.post(`/api/enterprise/connection-profiles/${profileId}/reauthorize`, {
     tenant_id: getRequestTenantId(),
-    command_id: crypto.randomUUID(),
+    command_id: createClientId(),
     expected_revision: expectedRevision,
     corp_id: credentials.corpId,
     agent_id: credentials.agentId,
@@ -184,7 +185,7 @@ export function disableConnection(
 
   return api.post(`/api/enterprise/connection-profiles/${profileId}/disable`, {
     tenant_id: getRequestTenantId(),
-    command_id: crypto.randomUUID(),
+    command_id: createClientId(),
     expected_revision: expectedRevision,
   });
 }
@@ -207,7 +208,7 @@ export function createConnectionBinding(
 
   return api.post(`/api/enterprise/connection-profiles/${profileId}/bindings`, {
     tenant_id: getRequestTenantId(),
-    command_id: crypto.randomUUID(),
+    command_id: createClientId(),
     expected_revision: expectedProfileRevision,
     agent_id: agentId,
     allowed_scopes: [provider === 'wecom' ? 'application:read' : 'channels:read'],
@@ -225,7 +226,7 @@ export function setConnectionBindingState(
     `/api/enterprise/connection-profiles/${profileId}/bindings/${binding.id}/state`,
     {
       tenant_id: getRequestTenantId(),
-      command_id: crypto.randomUUID(),
+      command_id: createClientId(),
       expected_revision: binding.revision,
       enabled,
     },
@@ -243,7 +244,7 @@ export function setConnectionBindingActions(
     `/api/enterprise/connection-profiles/${profile.id}/bindings/${binding.id}/actions`,
     {
       tenant_id: getRequestTenantId(),
-      command_id: crypto.randomUUID(),
+      command_id: createClientId(),
       expected_profile_revision: profile.revision,
       expected_binding_revision: binding.revision,
       allowed_actions: enabled ? ['wecom.message_send'] : [],
@@ -270,7 +271,7 @@ export function setConnectorInboundRoute(
 
   return api.post(`/api/enterprise/connection-profiles/${profile.id}/inbound-route`, {
     tenant_id: getRequestTenantId(),
-    command_id: crypto.randomUUID(),
+    command_id: createClientId(),
     expected_revision: profile.revision,
     agent_id: agentId,
   });
@@ -295,7 +296,7 @@ export function bindConnectorPrincipal(
 
   return api.post('/api/enterprise/connection-profiles/inbound/principal-bindings', {
     tenant_id: getRequestTenantId(),
-    command_id: crypto.randomUUID(),
+    command_id: createClientId(),
     event_id: eventId,
     user_id: userId,
   });

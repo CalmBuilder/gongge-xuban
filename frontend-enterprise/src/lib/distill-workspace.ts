@@ -1,8 +1,7 @@
+import { createClientId } from './client-id';
+
 export function createDistillWorkspaceId(): string {
-  if (typeof window.crypto?.randomUUID === 'function') {
-    return window.crypto.randomUUID();
-  }
-  return `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+  return createClientId();
 }
 
 export function createDistillWorkspaceParams(agentId = ''): URLSearchParams {

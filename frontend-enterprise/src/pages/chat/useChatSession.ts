@@ -26,6 +26,7 @@ import { emitAgentScopeChange, persistSharedAgentScope } from '@/lib/agent-scope
 import { BRAND_STORAGE_KEYS } from '@/lib/brand-storage';
 import { PRODUCT_EVENTS } from '@/lib/product-events';
 import { getClientTimeZone } from '@/lib/timezone';
+import { createClientId } from '@/lib/client-id';
 import {
   agentResourceCount,
   employeeDisplayName,
@@ -617,7 +618,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     const intent = await api.postWithHeaders<GeneralSkillInstallIntentRead>(
       `/api/chat/sessions/${encodeURIComponent(sessionId)}/general-skill-install-intents`,
       { agent_id: displayedAgent.id, source_kind: 'github', ...source },
-      { 'Idempotency-Key': `chat-skill-${crypto.randomUUID()}` },
+      { 'Idempotency-Key': `chat-skill-${createClientId()}` },
     );
     setGeneralSkillInstallIntents((current) => [...current, intent]);
     return intent;
@@ -631,7 +632,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     try {
       const updated = await api.post<GeneralSkillInstallIntentRead>(
         `/api/chat/sessions/${encodeURIComponent(sessionId)}/general-skill-install-intents/${encodeURIComponent(intent.id)}/resolve`,
-        { command, expected_row_version: intent.row_version, command_id: crypto.randomUUID() },
+        { command, expected_row_version: intent.row_version, command_id: createClientId() },
       );
       setGeneralSkillInstallIntents((current) => current.map((item) => item.id === updated.id ? updated : item));
       if (command === 'confirm' && displayedAgent?.id) {

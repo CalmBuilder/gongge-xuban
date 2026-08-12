@@ -7,6 +7,7 @@
  */
 
 import { api, getRequestTenantId } from './client';
+import { createClientId } from '@/lib/client-id';
 import type {
   StandingApprovalCandidate,
   StandingApprovalRule,
@@ -47,7 +48,7 @@ export function createStandingApprovalRule(input: {
   const validTo = new Date(validFrom.getTime() + input.validDays * 24 * 60 * 60 * 1000);
   return api.post('/api/standing-approval-rules', {
     tenant_id: getRequestTenantId(),
-    command_id: crypto.randomUUID(),
+    command_id: createClientId(),
     agent_id: input.agentId,
     source_schedule_id: input.scheduleId,
     profile_id: input.candidate.profile_id,
@@ -66,7 +67,7 @@ export function revokeStandingApprovalRule(
 
   return api.post(`/api/standing-approval-rules/${rule.id}/revoke`, {
     tenant_id: getRequestTenantId(),
-    command_id: crypto.randomUUID(),
+    command_id: createClientId(),
     expected_revision: rule.revision,
   });
 }

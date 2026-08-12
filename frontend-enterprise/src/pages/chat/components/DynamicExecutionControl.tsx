@@ -14,6 +14,7 @@ import { notify } from '@/components/ui/app-toast';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogTitle, Textarea } from '@/components/ui';
 import { cn } from '@/lib/utils';
+import { createClientId } from '@/lib/client-id';
 
 type ExecutionState = {
   id: string;
@@ -96,7 +97,7 @@ export default function DynamicExecutionControl({ executionId }: { executionId: 
     try {
       const result = await api.post<CommandState>(`/api/executions/${execution.id}/commands`, {
         tenant_id: getRequestTenantId(),
-        command_id: crypto.randomUUID(),
+        command_id: createClientId(),
         command_type: commandType,
         expected_revision: execution.revision,
         payload: commandType === 'steer' ? { instruction: normalized } : { reason: 'user_requested' },

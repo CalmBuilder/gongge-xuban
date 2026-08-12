@@ -1,5 +1,6 @@
 import { notify } from '@/components/ui/app-toast';
 import { cn } from '@/lib/utils';
+import { createClientId } from '@/lib/client-id';
 
 import { Bot, Clock, ShieldCheck, Star, UserCheck, Users, UserX } from 'lucide-react';
 
@@ -332,7 +333,7 @@ export default function AgentsPage({
     setPublicationBusy(true);
     try {
       await api.post(`/api/enterprise/publications/releases/${encodeURIComponent(release.id)}/adopt`, {
-        idempotency_key: `agent-adopt-${crypto.randomUUID()}`,
+        idempotency_key: `agent-adopt-${createClientId()}`,
       });
       notify.success(`已从冻结发布物创建「${release.name}（采用）」；私人记忆和连接凭据未复制`);
       setPublicationOpen(false);
