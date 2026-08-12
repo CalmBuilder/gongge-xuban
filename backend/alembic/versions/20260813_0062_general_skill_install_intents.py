@@ -32,16 +32,16 @@ def upgrade() -> None:
     op.create_table(
         "general_skill_install_intents",
         sa.Column("id", sa.String(128), primary_key=True),
-        sa.Column("tenant_id", sa.String(512), nullable=False),
-        sa.Column("session_id", sa.String(512), nullable=False),
-        sa.Column("agent_id", sa.String(512), nullable=False),
-        sa.Column("owner_user_id", sa.String(512), nullable=False),
-        sa.Column("import_job_id", sa.String(512), nullable=False),
+        sa.Column("tenant_id", sa.String(128), nullable=False),
+        sa.Column("session_id", sa.String(128), nullable=False),
+        sa.Column("agent_id", sa.String(128), nullable=False),
+        sa.Column("owner_user_id", sa.String(128), nullable=False),
+        sa.Column("import_job_id", sa.String(128), nullable=False),
         sa.Column("idempotency_key", sa.String(128), nullable=False),
         sa.Column("source_kind", sa.String(64), nullable=False),
         sa.Column("status", sa.String(64), nullable=False),
         sa.Column("installed_revision_ids_json", sa.JSON(), nullable=False),
-        sa.Column("error_code", sa.String(512), nullable=True),
+        sa.Column("error_code", sa.String(128), nullable=True),
         sa.Column("row_version", sa.Integer(), nullable=False),
         sa.Column("created_at", sa.DateTime(), nullable=False),
         sa.Column("updated_at", sa.DateTime(), nullable=False),
@@ -60,7 +60,16 @@ def upgrade() -> None:
             name="uq_general_skill_install_intent_idempotency",
         ),
     )
-    for column in ("tenant_id", "session_id", "agent_id", "owner_user_id", "import_job_id", "source_kind", "status", "error_code"):
+    for column in (
+        "tenant_id",
+        "session_id",
+        "agent_id",
+        "owner_user_id",
+        "import_job_id",
+        "source_kind",
+        "status",
+        "error_code",
+    ):
         op.create_index(
             f"ix_general_skill_install_intents_{column}",
             "general_skill_install_intents",

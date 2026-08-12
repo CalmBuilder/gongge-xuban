@@ -1253,6 +1253,11 @@ def test_general_skill_response_keeps_active_scene_context(monkeypatch) -> None:
 
 
 def test_general_skill_and_active_scene_run_in_the_same_turn(monkeypatch) -> None:
+    """验证旧通用 Skill 工具与活动场景同轮续跑，不受 V2 resolver 环境开关影响。"""
+
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "general_skill_resolver_v2_enabled", False)
     selector_calls: list[str] = []
     runner_calls: list[str] = []
     step_calls: list[list[str]] = []

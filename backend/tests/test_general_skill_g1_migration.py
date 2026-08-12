@@ -55,6 +55,7 @@ def test_general_skill_g1_migration_roundtrip(tmp_path: Path) -> None:
         "general_skill_publication_revisions",
         "agent_publication_revisions",
         "publication_releases",
+        "general_skill_binding_batch_commands",
     }
     assert expected <= set(inspector.get_table_names())
     columns = {item["name"] for item in inspector.get_columns("general_skill_proposals")}
@@ -69,6 +70,32 @@ def test_general_skill_g1_migration_roundtrip(tmp_path: Path) -> None:
     assert not (expected & set(inspector.get_table_names()))
     columns = {item["name"] for item in inspector.get_columns("general_skill_proposals")}
     assert "proposal_kind" not in columns
+
+
+def test_g1_indexed_identifier_widths_remain_mysql_utf8mb4_safe(tmp_path: Path) -> None:
+    """确认 0061—0063 联合唯一键只使用 128 字符标识符，避免 MySQL 索引超长。"""
+
+    database_url = f"sqlite:///{tmp_path / 'g1-widths.db'}"
+    config = _config(database_url)
+    command.stamp(config, "20260813_0059")
+    command.upgrade(config, "20260814_0063")
+    engine = sa.create_engine(database_url)
+    inspector = sa.inspect(engine)
+    expected_widths = {
+        "general_skill_binding_batch_commands": {
+            "tenant_id", "owner_user_id", "skill_id", "revision_id"
+        },
+        "general_skill_install_intents": {
+            "tenant_id", "session_id", "agent_id", "owner_user_id", "import_job_id"
+        },
+        "publication_adoption_commands": {
+            "tenant_id", "actor_user_id", "release_id", "target_agent_id", "binding_id",
+            "adopted_agent_id"
+        },
+    }
+    for table_name, column_names in expected_widths.items():
+        columns = {item["name"]: item["type"] for item in inspector.get_columns(table_name)}
+        assert all(columns[name].length == 128 for name in column_names)
 
 
 def test_publication_adoption_command_migration_roundtrip(tmp_path: Path) -> None:

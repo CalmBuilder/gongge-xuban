@@ -3439,6 +3439,8 @@ def install_schedule_llm_override() -> None:
                     return "S5-CONSUMED-SUCCESS：原分身已加载所有者批准的固定 Skill 修订。"
                 if "DIAGNOSING-BUGS-FIXED-COMMIT" in instructions:
                     return "G1-B-CONSUMED-SUCCESS：已按固定 diagnosing-bugs 修订完成可证伪诊断。"
+                if "WRITING-FOR-AGENTS-FIXED-COMMIT" in instructions:
+                    return "G1-A-CONSUMED-SUCCESS：已按固定 writing-for-agents 修订完成可验收文档。"
                 if "# Test-Driven Development" in instructions:
                     return "G1-C1-CONSUMED-SUCCESS：已按固定 TDD 修订先建立失败测试。"
                 if "TO-QUESTIONNAIRE-FIXED-COMMIT" in instructions:
@@ -3742,6 +3744,15 @@ def install_general_skill_remote_fetcher_override() -> None:
             time.sleep(0.8)
             with ZipFile(payload, "w", ZIP_DEFLATED) as archive:
                 archive.writestr(
+                    "skills-main/skills/productivity/writing-for-agents/SKILL.md",
+                    "---\n"
+                    "name: writing-for-agents\n"
+                    "description: Write precise operational documentation for agent consumption.\n"
+                    "---\n# Writing for Agents\n"
+                    "WRITING-FOR-AGENTS-FIXED-COMMIT：使用稳定术语、显式输入输出、"
+                    "可验证步骤和异常边界编写 Agent 可消费文档。\n",
+                )
+                archive.writestr(
                     "skills-main/skills/engineering/implement/SKILL.md",
                     "---\n"
                     "name: implement\n"
@@ -4006,9 +4017,18 @@ def seed_pagination_browser_fixtures() -> None:
                     initiator_user_id="requestor_e2e",
                     created_at=now + timedelta(minutes=index),
                     updated_at=now + timedelta(minutes=index),
-                )
             )
+        )
         db.commit()
+        from app.general_skills.demo_seed import initialize_skill_five_closure_demo
+
+        initialize_skill_five_closure_demo(
+            db,
+            tenant_id="tenant_demo",
+            owner_username="member",
+            adopter_username="member-two",
+            reviewer_username="publication-admin",
+        )
 
 
 def main() -> None:

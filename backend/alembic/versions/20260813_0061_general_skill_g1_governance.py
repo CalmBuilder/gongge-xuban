@@ -99,7 +99,12 @@ def downgrade() -> None:
 def _expand_proposals(bind: sa.Connection) -> None:
     """为 authored 存量回填判别值，再允许 remote_import 使用空 revision/skill 指针。"""
 
-    columns = {str(item["name"]) for item in sa.inspect(bind).get_columns("general_skill_proposals")}
+    inspector = sa.inspect(bind)
+    columns = {str(item["name"]) for item in inspector.get_columns("general_skill_proposals")}
+    existing_checks = {
+        str(item["name"])
+        for item in inspector.get_check_constraints("general_skill_proposals")
+    }
     additions = (
         sa.Column("proposal_kind", sa.String(64), nullable=True),
         sa.Column("import_job_id", sa.String(128), nullable=True),
@@ -136,17 +141,21 @@ def _expand_proposals(bind: sa.Connection) -> None:
         )
         batch.alter_column("skill_id", existing_type=sa.String(128), nullable=True)
         batch.alter_column("revision_id", existing_type=sa.String(128), nullable=True)
-        batch.create_check_constraint(
-            "ck_general_skill_proposal_kind",
-            "proposal_kind IN ('authored', 'remote_import')",
-        )
-        batch.create_check_constraint(
-            "ck_general_skill_proposal_payload",
-            "(proposal_kind = 'authored' AND skill_id IS NOT NULL AND revision_id IS NOT NULL "
-            "AND import_job_id IS NULL AND preview_checksum IS NULL) OR "
-            "(proposal_kind = 'remote_import' AND skill_id IS NULL AND revision_id IS NULL "
-            "AND import_job_id IS NOT NULL AND preview_checksum IS NOT NULL)",
-        )
+        if "ck_general_skill_proposal_kind" not in existing_checks:
+            batch.create_check_constraint(
+                "ck_general_skill_proposal_kind",
+                "proposal_kind IN ('authored', 'remote_import')",
+            )
+        if "ck_general_skill_proposal_payload" not in existing_checks:
+            batch.create_check_constraint(
+                "ck_general_skill_proposal_payload",
+                "(proposal_kind = 'authored' AND skill_id IS NOT NULL "
+                "AND revision_id IS NOT NULL AND import_job_id IS NULL "
+                "AND preview_checksum IS NULL) OR "
+                "(proposal_kind = 'remote_import' AND skill_id IS NULL "
+                "AND revision_id IS NULL AND import_job_id IS NOT NULL "
+                "AND preview_checksum IS NOT NULL)",
+            )
 
 
 def _create_publication_tables(bind: sa.Connection) -> None:
@@ -320,11 +329,11 @@ def _create_binding_batch_command_table(bind: sa.Connection) -> None:
     op.create_table(
         "general_skill_binding_batch_commands",
         sa.Column("id", sa.String(128), primary_key=True),
-        sa.Column("tenant_id", sa.String(512), nullable=False),
-        sa.Column("owner_user_id", sa.String(512), nullable=False),
+        sa.Column("tenant_id", sa.String(128), nullable=False),
+        sa.Column("owner_user_id", sa.String(128), nullable=False),
         sa.Column("idempotency_key", sa.String(128), nullable=False),
-        sa.Column("skill_id", sa.String(512), nullable=False),
-        sa.Column("revision_id", sa.String(512), nullable=False),
+        sa.Column("skill_id", sa.String(128), nullable=False),
+        sa.Column("revision_id", sa.String(128), nullable=False),
         sa.Column("preview_checksum", sa.String(128), nullable=False),
         sa.Column("request_checksum", sa.String(128), nullable=False),
         sa.Column("status", sa.String(64), nullable=False, server_default="committed"),

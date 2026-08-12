@@ -8,7 +8,7 @@
 
 import { expect, test, type Page } from '@playwright/test';
 
-const VALID_SKILL_ZIP_BASE64 = 'UEsDBBQAAAAIAMWqC11jNQ9nvAAAAOwAAAAWAAAAcmVmdW5kLWhlbHBlci9TS0lMTC5tZHWOOwrCQBQA+z3FgvV6gNwmmC2EJCsbwTaIGvNTixgQQUQLP5jYiPgJehh9m03lFVTS2NjPMEMIQaZqUAXLQ5K7G4hSGA3kqgP9iZifim2ANGrVeL3RrDNTwSJwYJ/9suBthOuXrEwXEI6fFx/SGZyPcrUsHK+wbbG7ieieJ/HDbiNV11mLaqTJmG4pCGOCa9yoMq5RXuVU1RD5TFX+DyHo9uX+CsP4t/fKAuiFkI3zaF0mSwmmszyJvuE3UEsDBBQAAAAIAMWqC12C6hQSMwAAADIAAAApAAAAcmVmdW5kLWhlbHBlci9yZWZlcmVuY2VzL3JlZnVuZC1wb2xpY3kubWRTVnjZ0PBszb4Xy1uedszk4no2Z9XT/okvtix/sW7R096pT/vXP+2b/2L7eoiqxw1NXABQSwECFAMUAAAACADFqgtdYzUPZ7wAAADsAAAAFgAAAAAAAAAAAAAAgAEAAAAAcmVmdW5kLWhlbHBlci9TS0lMTC5tZFBLAQIUAxQAAAAIAMWqC12C6hQSMwAAADIAAAApAAAAAAAAAAAAAACAAfAAAAByZWZ1bmQtaGVscGVyL3JlZmVyZW5jZXMvcmVmdW5kLXBvbGljeS5tZFBLBQYAAAAAAgACAJsAAABqAQAAAAA=';
+const FIXED_SKILLS_COMMIT = '84fdeffd12f2ee307994d1eb6feb48173b6e0502';
 
 test.describe.configure({ timeout: 90_000 });
 
@@ -16,7 +16,7 @@ async function loginAsMember(page: Page) {
   const status = await page.evaluate(async () => {
     localStorage.setItem('gongge_onboarding_guide_seen', '1');
     localStorage.setItem('gongge_quick_start_guide_seen', '1');
-    localStorage.setItem('gongge_enterprise_agent_scope', 'agent_e2e_member_employee');
+    localStorage.setItem('gongge_enterprise_agent_scope', 'agent_skill_demo_a_docs');
     const response = await fetch('/api/auth/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -29,7 +29,7 @@ async function loginAsMember(page: Page) {
   expect(status).toBe(200);
 }
 
-test('G1-A 本人导入后从我的 Skill 库原子装配多个数字员工', async ({ page }) => {
+test('G1-A 正式 GitHub Skill 导入后从我的 Skill 库原子装配多个数字员工', async ({ page }) => {
   const browserFailures: string[] = [];
   page.on('pageerror', (error) => browserFailures.push(error.message));
   page.on('console', (message) => {
@@ -37,31 +37,34 @@ test('G1-A 本人导入后从我的 Skill 库原子装配多个数字员工', as
   });
   await page.goto('/enterprise/dashboard');
   await loginAsMember(page);
+  await page.evaluate(() => {
+    localStorage.setItem('gongge_enterprise_agent_scope', 'agent_skill_demo_a_docs');
+  });
   await page.goto('/enterprise/general-skills');
 
   await page.getByRole('button', { name: /新增/ }).click();
   await page.getByRole('menuitem', { name: '安全导入 Skill' }).click();
   const importDialog = page.getByRole('dialog', { name: '安全导入 Skill 包' });
-  await importDialog.locator('input[type="file"]').setInputFiles({
-    name: 'g1-a-writing-helper.zip',
-    mimeType: 'application/zip',
-    buffer: Buffer.from(VALID_SKILL_ZIP_BASE64, 'base64'),
-  });
+  await importDialog.getByRole('tab', { name: 'GitHub 固定版本' }).click();
+  await importDialog.getByLabel('GitHub 仓库地址').fill('https://github.com/mattpocock/skills');
+  await importDialog.getByLabel('完整 commit SHA').fill(FIXED_SKILLS_COMMIT);
+  await importDialog.getByLabel('仓库内 Skill 目录').fill('skills/productivity/writing-for-agents');
   await importDialog.getByRole('button', { name: '生成安全预览' }).click();
-  await expect(importDialog.getByText('购物售后规则核验', { exact: true })).toBeVisible();
+  await expect(importDialog.getByText('writing-for-agents', { exact: true })).toBeVisible();
   await importDialog.getByRole('button', { name: '固定版本并绑定' }).click();
   await expect(importDialog).toBeHidden();
 
   await page.getByRole('button', { name: '我的 Skill 库' }).click();
   const library = page.getByRole('dialog', { name: '我的 Skill 库' });
-  await expect(library.getByText('购物售后规则核验', { exact: true })).toBeVisible();
-  const memberAgent = library.getByLabel('E2E 成员数字员工');
-  const diagnosisAgent = library.getByLabel('E2E 疑难故障诊断分身');
-  await expect(memberAgent).toBeChecked();
+  await expect(library.getByText('writing-for-agents', { exact: true })).toBeVisible();
+  const docsAgent = library.getByLabel('Skill演示A｜文档规范分身');
+  const diagnosisAgent = library.getByLabel('Skill演示B｜故障诊断分身');
+  await expect(docsAgent).toBeChecked();
   await diagnosisAgent.check();
   await library.getByRole('button', { name: '预检装配' }).click();
-  await expect(library.getByRole('region', { name: '装配预检结果' })).toContainText('E2E 疑难故障诊断分身：新建绑定');
+  await expect(library.getByRole('region', { name: '装配预检结果' })).toContainText('Skill演示B｜故障诊断分身：新建绑定');
   await library.getByRole('button', { name: '确认整批生效' }).click();
+  await expect(page.getByText('已原子更新所有数字员工的 Skill 装配')).toBeVisible();
   await expect(diagnosisAgent).toBeChecked();
 
   const facts = await page.evaluate(async () => {
@@ -75,14 +78,43 @@ test('G1-A 本人导入后从我的 Skill 库原子装配多个数字员工', as
       bindings: Array<{ agent_id: string; pinned_revision_id?: string; status: string }>;
     }>>;
   });
-  const skill = facts.find((item) => item.name === '购物售后规则核验');
+  const skill = facts.find((item) => item.name === 'writing-for-agents');
   expect(skill).toBeTruthy();
   const active = skill?.bindings.filter((binding) => binding.status === 'active') || [];
   expect(active.map((binding) => binding.agent_id)).toEqual(expect.arrayContaining([
-    'agent_e2e_member_employee',
-    'agent_e2e_diagnosis',
+    'agent_skill_demo_a_docs',
+    'agent_skill_demo_b_diagnosis',
   ]));
   expect(new Set(active.map((binding) => binding.pinned_revision_id))).toEqual(new Set([skill?.current_revision_id]));
+  const consumed = await page.evaluate(async (skillId) => {
+    const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
+    const headers = { Authorization: `Bearer ${auth.token}`, 'Content-Type': 'application/json' };
+    const session = await fetch('/api/chat/sessions', {
+      method: 'POST', headers,
+      body: JSON.stringify({
+        tenant_id: 'tenant_demo', agent_id: 'agent_skill_demo_a_docs', title: 'G1-A 消费', origin: 'owned',
+      }),
+    }).then((response) => response.json()) as { id: string };
+    const response = await fetch('/api/chat/stream', {
+      method: 'POST', headers,
+      body: JSON.stringify({
+        tenant_id: 'tenant_demo', session_id: session.id,
+        agent_id: 'agent_skill_demo_a_docs', client_turn_id: 'turn_g1_a_consume',
+        message: '使用本轮选定的指南编写售后升级处理文档', channel: 'web',
+        forced_general_skill_id: skillId,
+      }),
+    });
+    const body = await response.text();
+    const events = await fetch(
+      `/api/chat/sessions/${session.id}/events?tenant_id=tenant_demo`, { headers },
+    ).then((eventResponse) => eventResponse.json()) as Array<{ event_type: string }>;
+    return { status: response.status, body, events };
+  }, skill?.id);
+  expect(consumed.status).toBe(200);
+  expect(consumed.body).toContain('G1-A-CONSUMED-SUCCESS');
+  expect(consumed.events.map((event) => event.event_type)).toEqual(expect.arrayContaining([
+    'skill_loaded', 'skill_use_completed',
+  ]));
   expect(browserFailures).toEqual([]);
 });
 
@@ -96,7 +128,7 @@ test('G1-B 对话显式安装固定 GitHub Skill 经持久卡确认后进入使�
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${auth.token}` },
       body: JSON.stringify({
         tenant_id: 'tenant_demo',
-        agent_id: 'agent_e2e_diagnosis',
+        agent_id: 'agent_skill_demo_b_diagnosis',
         title: 'G1-B 对话安装',
         origin: 'direct',
       }),
@@ -165,7 +197,7 @@ test('G1-C1 Agent 建议固定 GitHub Skill，本人批准后原分身真实消�
       headers,
       body: JSON.stringify({
         tenant_id: 'tenant_demo',
-        agent_id: 'agent_e2e_diagnosis',
+        agent_id: 'agent_skill_demo_c_test_first',
         title: 'G1-C1 Agent 远程提案',
         origin: 'owned',
       }),
@@ -177,7 +209,7 @@ test('G1-C1 Agent 建议固定 GitHub Skill，本人批准后原分身真实消�
       body: JSON.stringify({
         tenant_id: 'tenant_demo',
         session_id: session.id,
-        agent_id: 'agent_e2e_diagnosis',
+        agent_id: 'agent_skill_demo_c_test_first',
         client_turn_id: 'turn_g1_c1_remote',
         message: 'C1远程导入Skill：请建议从固定 GitHub commit 安装 TDD Skill，但必须让我确认',
         channel: 'web',
@@ -200,7 +232,7 @@ test('G1-C1 Agent 建议固定 GitHub Skill，本人批准后原分身真实消�
   const before = await page.evaluate(async () => {
     const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
     const response = await fetch(
-      '/api/enterprise/general-skills?tenant_id=tenant_demo&agent_id=agent_e2e_diagnosis',
+      '/api/enterprise/general-skills?tenant_id=tenant_demo&agent_id=agent_skill_demo_c_test_first',
       { headers: { Authorization: `Bearer ${auth.token}` } },
     );
     return response.json() as Promise<Array<{ name: string }>>;
@@ -226,7 +258,7 @@ test('G1-C1 Agent 建议固定 GitHub Skill，本人批准后原分身真实消�
   const skill = await page.evaluate(async () => {
     const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
     const response = await fetch(
-      '/api/enterprise/general-skills?tenant_id=tenant_demo&agent_id=agent_e2e_diagnosis',
+      '/api/enterprise/general-skills?tenant_id=tenant_demo&agent_id=agent_skill_demo_c_test_first',
       { headers: { Authorization: `Bearer ${auth.token}` } },
     );
     const rows = await response.json() as Array<{ id: string; name: string }>;
@@ -240,7 +272,7 @@ test('G1-C1 Agent 建议固定 GitHub Skill，本人批准后原分身真实消�
       method: 'POST',
       headers,
       body: JSON.stringify({
-        tenant_id: 'tenant_demo', agent_id: 'agent_e2e_diagnosis', title: 'G1-C1 消费', origin: 'owned',
+        tenant_id: 'tenant_demo', agent_id: 'agent_skill_demo_c_test_first', title: 'G1-C1 消费', origin: 'owned',
       }),
     });
     const session = await sessionResponse.json() as { id: string };
@@ -250,7 +282,7 @@ test('G1-C1 Agent 建议固定 GitHub Skill，本人批准后原分身真实消�
       body: JSON.stringify({
         tenant_id: 'tenant_demo',
         session_id: session.id,
-        agent_id: 'agent_e2e_diagnosis',
+        agent_id: 'agent_skill_demo_c_test_first',
         client_turn_id: 'turn_g1_c1_consume',
         message: '使用本轮选定的指南处理一个新增功能',
         channel: 'web',
@@ -271,6 +303,93 @@ test('G1-C1 Agent 建议固定 GitHub Skill，本人批准后原分身真实消�
   ]));
 });
 
+test('G1-C2 Agent 自主沉淀 Skill，经所有者确认后原分身真实消费', async ({ page }) => {
+  await page.goto('/enterprise/dashboard');
+  await loginAsMember(page);
+  const executionId = await page.evaluate(async () => {
+    const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
+    const headers = { Authorization: `Bearer ${auth.token}`, 'Content-Type': 'application/json' };
+    const sessionResponse = await fetch('/api/chat/sessions', {
+      method: 'POST', headers,
+      body: JSON.stringify({
+        tenant_id: 'tenant_demo', agent_id: 'agent_skill_demo_c_test_first',
+        title: 'G1-C2 Agent 自创 Skill', origin: 'owned',
+      }),
+    });
+    const session = await sessionResponse.json() as { id?: string; detail?: string };
+    if (!sessionResponse.ok || !session.id) throw new Error(session.detail || 'G1-C2 session failed');
+    const stream = await fetch('/api/chat/stream', {
+      method: 'POST', headers,
+      body: JSON.stringify({
+        tenant_id: 'tenant_demo', session_id: session.id,
+        agent_id: 'agent_skill_demo_c_test_first', client_turn_id: 'turn_g1_c2_authored',
+        message: 'S5创建Skill：沉淀退款证据复核方法并提交我确认，不能自行发布', channel: 'web',
+      }),
+    });
+    const streamBody = await stream.text();
+    if (!stream.ok || !streamBody.includes('event: complete')) throw new Error(streamBody);
+    const events = await fetch(
+      `/api/chat/sessions/${session.id}/events?tenant_id=tenant_demo`, { headers },
+    ).then((response) => response.json()) as Array<{
+      event_type: string; data?: Record<string, unknown>;
+    }>;
+    return String(
+      events.find((event) => event.event_type === 'dynamic_task_delegated')?.data?.execution_id || '',
+    );
+  });
+  expect(executionId).not.toBe('');
+  await page.goto('/enterprise/work-items');
+  await page.getByRole('button', { name: /审核并发布当前分身提出的 Skill/ }).first().click();
+  const review = page.getByLabel('待审核 Skill 提案');
+  await expect(review).toContainText('s5-refund-evidence-review');
+  await expect(review).toContainText('S5-PROPOSAL-GUIDANCE');
+  await expect(review).toContainText('无（不会获得新工具授权）');
+  await page.getByRole('dialog').getByRole('button', { name: '批准并发布' }).click();
+  await expect.poll(async () => page.evaluate(async (id) => {
+    const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
+    return fetch(`/api/executions/${id}?tenant_id=tenant_demo`, {
+      headers: { Authorization: `Bearer ${auth.token}` },
+    }).then((response) => response.json()).then((body: { status: string }) => body.status);
+  }, executionId), { timeout: 45_000 }).toBe('succeeded');
+
+  const consumed = await page.evaluate(async () => {
+    const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
+    const headers = { Authorization: `Bearer ${auth.token}`, 'Content-Type': 'application/json' };
+    const skills = await fetch(
+      '/api/enterprise/general-skills?tenant_id=tenant_demo&agent_id=agent_skill_demo_c_test_first',
+      { headers },
+    ).then((response) => response.json()) as Array<{ id: string; name: string }>;
+    const skill = skills.find((item) => item.name === 's5-refund-evidence-review');
+    if (!skill) throw new Error('G1-C2 published Skill missing');
+    const session = await fetch('/api/chat/sessions', {
+      method: 'POST', headers,
+      body: JSON.stringify({
+        tenant_id: 'tenant_demo', agent_id: 'agent_skill_demo_c_test_first',
+        title: 'G1-C2 消费', origin: 'owned',
+      }),
+    }).then((response) => response.json()) as { id: string };
+    const response = await fetch('/api/chat/stream', {
+      method: 'POST', headers,
+      body: JSON.stringify({
+        tenant_id: 'tenant_demo', session_id: session.id,
+        agent_id: 'agent_skill_demo_c_test_first', client_turn_id: 'turn_g1_c2_consume',
+        message: '使用本轮选定的指南复核 CASE-G1-C2-001', channel: 'web',
+        forced_general_skill_id: skill.id,
+      }),
+    });
+    const body = await response.text();
+    const events = await fetch(
+      `/api/chat/sessions/${session.id}/events?tenant_id=tenant_demo`, { headers },
+    ).then((eventResponse) => eventResponse.json()) as Array<{ event_type: string }>;
+    return { status: response.status, body, events };
+  });
+  expect(consumed.status).toBe(200);
+  expect(consumed.body).toContain('S5-CONSUMED-SUCCESS');
+  expect(consumed.events.map((event) => event.event_type)).toEqual(expect.arrayContaining([
+    'skill_loaded', 'skill_use_completed',
+  ]));
+});
+
 test('G1-D 固定 GitHub Skill 经组织审核后由用户 B 主动采用并消费', async ({ page }) => {
   await page.goto('/enterprise/dashboard');
   await loginAsMember(page);
@@ -282,7 +401,7 @@ test('G1-D 固定 GitHub Skill 经组织审核后由用户 B 主动采用并消�
       headers: { ...headers, 'Idempotency-Key': 'g1-d-import' },
       body: JSON.stringify({
         tenant_id: 'tenant_demo',
-        target_agent_id: 'agent_e2e_member_employee',
+        target_agent_id: 'agent_skill_demo_d_publisher',
         source_kind: 'github',
         source_url: 'https://github.com/mattpocock/skills',
         revision: '84fdeffd12f2ee307994d1eb6feb48173b6e0502',
@@ -352,7 +471,7 @@ test('G1-D 固定 GitHub Skill 经组织审核后由用户 B 主动采用并消�
     });
     const auth = await login.json() as { token: string };
     localStorage.setItem('gongge_auth', JSON.stringify(auth));
-    localStorage.setItem('gongge_enterprise_agent_scope', 'agent_e2e_member_two');
+    localStorage.setItem('gongge_enterprise_agent_scope', 'agent_skill_demo_d_adopter');
     const headers = { Authorization: `Bearer ${auth.token}`, 'Content-Type': 'application/json' };
     const releases = await fetch(
       '/api/enterprise/publications/releases?resource_type=general_skill', { headers },
@@ -365,18 +484,18 @@ test('G1-D 固定 GitHub Skill 经组织审核后由用户 B 主动采用并消�
       method: 'POST',
       headers,
       body: JSON.stringify({
-        target_agent_id: 'agent_e2e_member_two', idempotency_key: 'g1-d-adopt',
+        target_agent_id: 'agent_skill_demo_d_adopter', idempotency_key: 'g1-d-adopt',
       }),
     }).then((response) => response.json()) as { binding_id: string };
     const session = await fetch('/api/chat/sessions', {
       method: 'POST',
       headers,
       body: JSON.stringify({
-        tenant_id: 'tenant_demo', agent_id: 'agent_e2e_member_two', title: 'G1-D 消费', origin: 'owned',
+        tenant_id: 'tenant_demo', agent_id: 'agent_skill_demo_d_adopter', title: 'G1-D 消费', origin: 'owned',
       }),
     }).then((response) => response.json()) as { id: string };
     const catalog = await fetch(
-      `/api/chat/sessions/${session.id}/general-skills?agent_id=agent_e2e_member_two`,
+      `/api/chat/sessions/${session.id}/general-skills?agent_id=agent_skill_demo_d_adopter`,
       { headers },
     ).then((response) => response.json()) as { items?: Array<{ skill_id: string }> };
     const response = await fetch('/api/chat/stream', {
@@ -385,7 +504,7 @@ test('G1-D 固定 GitHub Skill 经组织审核后由用户 B 主动采用并消�
       body: JSON.stringify({
         tenant_id: 'tenant_demo',
         session_id: session.id,
-        agent_id: 'agent_e2e_member_two',
+        agent_id: 'agent_skill_demo_d_adopter',
         client_turn_id: 'turn_g1_d_consume',
         message: '使用本轮选定的指南生成问卷',
         channel: 'web',
@@ -416,7 +535,7 @@ test('G1.4 整 Agent 变更后旧申请失效，B 从已审冻结快照采用第
     const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
     const headers = { Authorization: `Bearer ${auth.token}`, 'Content-Type': 'application/json' };
     const existing = await fetch(
-      '/api/enterprise/general-skills?tenant_id=tenant_demo&agent_id=agent_e2e_diagnosis',
+      '/api/enterprise/general-skills?tenant_id=tenant_demo&agent_id=agent_skill_demo_c_test_first',
       { headers },
     ).then((response) => response.json()) as Array<{ name: string }>;
     if (existing.some((item) => item.name === 'tdd')) return;
@@ -425,7 +544,7 @@ test('G1.4 整 Agent 变更后旧申请失效，B 从已审冻结快照采用第
       headers: { ...headers, 'Idempotency-Key': 'g1-4-tdd-import' },
       body: JSON.stringify({
         tenant_id: 'tenant_demo',
-        target_agent_id: 'agent_e2e_diagnosis',
+        target_agent_id: 'agent_skill_demo_c_test_first',
         source_kind: 'github',
         source_url: 'https://github.com/mattpocock/skills',
         revision: '84fdeffd12f2ee307994d1eb6feb48173b6e0502',
@@ -455,14 +574,14 @@ test('G1.4 整 Agent 变更后旧申请失效，B 从已审冻结快照采用第
     const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
     const headers = { Authorization: `Bearer ${auth.token}`, 'Content-Type': 'application/json' };
     const existing = await fetch(
-      '/api/enterprise/general-skills?tenant_id=tenant_demo&agent_id=agent_e2e_diagnosis',
+      '/api/enterprise/general-skills?tenant_id=tenant_demo&agent_id=agent_skill_demo_c_test_first',
       { headers },
     ).then((response) => response.json()) as Array<{ name: string }>;
     if (existing.some((item) => item.name === 's5-refund-evidence-review')) return '';
     const sessionResponse = await fetch('/api/chat/sessions', {
       method: 'POST', headers,
       body: JSON.stringify({
-        tenant_id: 'tenant_demo', agent_id: 'agent_e2e_diagnosis',
+        tenant_id: 'tenant_demo', agent_id: 'agent_skill_demo_c_test_first',
         title: 'G1.4 Agent 自创 Skill', origin: 'owned',
       }),
     });
@@ -471,7 +590,7 @@ test('G1.4 整 Agent 变更后旧申请失效，B 从已审冻结快照采用第
     const stream = await fetch('/api/chat/stream', {
       method: 'POST', headers,
       body: JSON.stringify({
-        tenant_id: 'tenant_demo', session_id: session.id, agent_id: 'agent_e2e_diagnosis',
+        tenant_id: 'tenant_demo', session_id: session.id, agent_id: 'agent_skill_demo_c_test_first',
         client_turn_id: 'turn_g1_4_authored',
         message: 'S5创建Skill：G1.4整员工发布前，沉淀退款证据复核方法并提交我确认',
         channel: 'web',
@@ -504,18 +623,18 @@ test('G1.4 整 Agent 变更后旧申请失效，B 从已审冻结快照采用第
     }, authoredExecutionId), { timeout: 45_000 }).toBe('succeeded');
   }
   await page.goto('/enterprise/agents');
-  const sourceCard = page.locator('.gongge-employee-card').filter({ hasText: 'E2E 疑难故障诊断分身' });
+  const sourceCard = page.locator('.gongge-employee-card').filter({ hasText: 'Skill演示C｜测试先行分身' });
   await sourceCard.getByRole('button', { name: '员工操作' }).click();
   await page.getByRole('menuitem', { name: '提交组织审核' }).click();
 
   const firstRequest = await page.evaluate(async () => {
     const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
     const headers = { Authorization: `Bearer ${auth.token}`, 'Content-Type': 'application/json' };
-    const agent = await fetch('/api/enterprise/agents/agent_e2e_diagnosis?tenant_id=tenant_demo', { headers })
+    const agent = await fetch('/api/enterprise/agents/agent_skill_demo_c_test_first?tenant_id=tenant_demo', { headers })
       .then((response) => response.json()) as {
         profile_revision: number; metadata: Record<string, unknown>;
       };
-    const changed = await fetch('/api/enterprise/agents/agent_e2e_diagnosis', {
+    const changed = await fetch('/api/enterprise/agents/agent_skill_demo_c_test_first', {
       method: 'PUT',
       headers,
       body: JSON.stringify({
@@ -530,7 +649,7 @@ test('G1.4 整 Agent 变更后旧申请失效，B 从已审冻结快照采用第
     ).then((response) => response.json()) as { items: Array<{
       id: string; revision: number; payload?: Record<string, unknown>;
     }> };
-    const item = pageData.items.find((row) => row.payload?.resource_id === 'agent_e2e_diagnosis');
+    const item = pageData.items.find((row) => row.payload?.resource_id === 'agent_skill_demo_c_test_first');
     if (!item) throw new Error('G1.4 publication work item missing');
     return { item, changed };
   });
@@ -570,7 +689,7 @@ test('G1.4 整 Agent 变更后旧申请失效，B 从已审冻结快照采用第
     localStorage.setItem('gongge_auth', JSON.stringify(await login.json()));
   });
   await page.goto('/enterprise/agents');
-  const changedCard = page.locator('.gongge-employee-card').filter({ hasText: 'E2E 疑难故障诊断分身' });
+  const changedCard = page.locator('.gongge-employee-card').filter({ hasText: 'Skill演示C｜测试先行分身' });
   await changedCard.getByRole('button', { name: '员工操作' }).click();
   await page.getByRole('menuitem', { name: '提交组织审核' }).click();
 
@@ -585,7 +704,7 @@ test('G1.4 整 Agent 变更后旧申请失效，B 从已审冻结快照采用第
     localStorage.setItem('gongge_auth', JSON.stringify(await login.json()));
   });
   await page.goto('/enterprise/work-items');
-  await page.getByRole('button', { name: /审核组织发布：E2E 疑难故障诊断分身/ }).click();
+  await page.getByRole('button', { name: /审核组织发布：Skill演示C｜测试先行分身/ }).click();
   const review = page.getByLabel('组织发布审核');
   await expect(review).toContainText('整 Agent 发布申请');
   await page.getByRole('dialog').getByRole('button', { name: '批准发布到组织广场' }).click();
@@ -601,11 +720,11 @@ test('G1.4 整 Agent 变更后旧申请失效，B 从已审冻结快照采用第
   await page.goto('/enterprise/agents');
   await page.getByRole('button', { name: '组织数字员工发布库' }).click();
   const gallery = page.getByRole('dialog', { name: /组织数字员工发布库/ });
-  const releaseCard = gallery.getByRole('article').filter({ hasText: 'E2E 疑难故障诊断分身' });
+  const releaseCard = gallery.getByRole('article').filter({ hasText: 'Skill演示C｜测试先行分身' });
   await expect(releaseCard).toContainText('已审 Release');
   await releaseCard.getByRole('button', { name: '采用为我的员工' }).click();
   await expect(page.locator('.gongge-employee-card').filter({
-    hasText: 'E2E 疑难故障诊断分身（采用）',
+    hasText: 'Skill演示C｜测试先行分身（采用）',
   })).toBeVisible();
 
   const adoptionFacts = await page.evaluate(async () => {
@@ -621,7 +740,7 @@ test('G1.4 整 Agent 变更后旧申请失效，B 从已审冻结快照采用第
     }) as { items: Array<{
       id: string; name: string; source_agent_id?: string; source_agent_version?: string;
     }> };
-    const adopted = pageData.items.find((item) => item.name === 'E2E 疑难故障诊断分身（采用）');
+    const adopted = pageData.items.find((item) => item.name === 'Skill演示C｜测试先行分身（采用）');
     if (!adopted) throw new Error('G1.4 adopted agent missing');
     const session = await fetch('/api/chat/sessions', {
       method: 'POST', headers,
@@ -664,7 +783,7 @@ test('G1.4 整 Agent 变更后旧申请失效，B 从已审冻结快照采用第
       authoredBody: await authoredResponse.text(),
     };
   });
-  expect(adoptionFacts.adopted.source_agent_id).toBe('agent_e2e_diagnosis');
+  expect(adoptionFacts.adopted.source_agent_id).toBe('agent_skill_demo_c_test_first');
   expect(adoptionFacts.adopted.source_agent_version).toMatch(/^[a-f0-9]{64}$/);
   expect(adoptionFacts.catalog.items.map((item) => item.name)).toContain('tdd');
   expect(adoptionFacts.catalog.items.map((item) => item.name)).toContain('s5-refund-evidence-review');
