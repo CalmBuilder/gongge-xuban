@@ -52,6 +52,7 @@ sop_agent_loop.db
 gongge_xuban.db
 backend/sop_agent_loop.db*
 backend/gongge_xuban.db*
+backend/data/general-skill-objects/
 *.sqlite
 *.sqlite3
 *.db-shm
