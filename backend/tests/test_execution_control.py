@@ -112,6 +112,44 @@ def test_command_event_signal_and_explicit_outbox_share_transaction(db: Session)
     assert db.exec(select(EventOutbox)).all() == []
 
 
+def test_add_skill_command_freezes_structured_identity_and_plan_base(db: Session) -> None:
+    """验证运行中加 Skill 只接受稳定资源 ID，并冻结当前计划修订供 worker 做 CAS。"""
+
+    instance = _instance(db, suffix="add_skill")
+    service = ExecutionControlService(db)
+    command, created = service.issue_command(
+        instance,
+        command_id="add_skill_1",
+        command_type="add_skill",
+        actor_user_id="user_owner",
+        expected_execution_revision=instance.revision,
+        payload={"skill_id": "gskill_writing", "ignored": "client-authority"},
+    )
+
+    assert created is True
+    assert command.payload_json == {"skill_id": "gskill_writing", "trigger": "user"}
+    assert command.result_json == {"base_plan_revision_id": "plan_1"}
+    signal = db.exec(select(ExecutionSignal)).one()
+    assert signal.payload_json["command_type"] == "add_skill"
+
+
+@pytest.mark.parametrize("skill_id", ["", " contains-space", "x" * 129])
+def test_add_skill_command_rejects_invalid_skill_identity(db: Session, skill_id: str) -> None:
+    """验证客户端不能用空值、非稳定标识或超长文本替代服务端 Skill ID。"""
+
+    instance = _instance(db, suffix=f"invalid_{len(skill_id)}")
+    service = ExecutionControlService(db)
+    with pytest.raises(ExecutionControlError) as caught:
+        service.issue_command(
+            instance,
+            command_id=f"add_skill_invalid_{len(skill_id)}",
+            command_type="add_skill",
+            actor_user_id="user_owner",
+            expected_execution_revision=instance.revision,
+            payload={"skill_id": skill_id},
+        )
+
+    assert caught.value.code == "ADD_SKILL_ID_INVALID"
 def test_signal_claim_never_grants_execution_ownership(db: Session) -> None:
     """验证取得 signal lease 后仍必须另取 execution lease 才能推进权威状态。"""
 

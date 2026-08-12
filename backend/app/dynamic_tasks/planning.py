@@ -28,6 +28,8 @@ class PlanReason(StrEnum):
     USER_CONSTRAINT = "user_constraint"
     EVIDENCE_MISSING = "evidence_missing"
     EXTERNAL_CHANGE = "external_change"
+    SKILL_ADDED = "skill_added"
+    SKILL_COUNTERMANDED = "skill_countermanded"
 
 
 class ActionKind(StrEnum):

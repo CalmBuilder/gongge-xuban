@@ -178,6 +178,14 @@ def process_dynamic_task_signal(
                     code=exc.code,
                 )
         if signal.signal_type == "command":
+            if command is not None and command.command_type == "add_skill":
+                return agent.resume_add_skill_signal(
+                    signal_id=signal.id,
+                    model_config=model,
+                    worker_id=worker_id,
+                    actor_user_id=actor_user_id,
+                    skill_loading_enabled=get_settings().dynamic_task_skill_loading_enabled,
+                )
             return agent.resume_steer_signal(
                 signal_id=signal.id,
                 model_config=model,

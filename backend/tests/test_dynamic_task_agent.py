@@ -9,6 +9,8 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import json
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
@@ -29,6 +31,7 @@ from app.config import get_settings
 from app.db.models import (
     ActionProposalRecord,
     AgentProfile,
+    AgentResourceBinding,
     AgentEvent,
     ArtifactInputLink,
     BusinessRole,
@@ -36,6 +39,7 @@ from app.db.models import (
     EmployeeRoleAssignment,
     ConnectorOutboundDelivery,
     ConnectorThreadBinding,
+    ChatSession,
     DynamicTaskQuotaLease,
     ExecutionArtifact,
     ExecutionPlanRevision,
@@ -43,6 +47,8 @@ from app.db.models import (
     ExecutionPublication,
     ExecutionResult,
     GeneralSkillUse,
+    GeneralSkill,
+    GeneralSkillRevision,
     InputResourceSnapshot,
     KnowledgeBase,
     KnowledgeBaseVersion,
@@ -3471,6 +3477,137 @@ def test_steer_appends_constraint_revision_and_preserves_completed_step() -> Non
         assert command.status == "applied"
         assert command.result_plan_revision_id == revisions[1].id
         assert signal.status == "consumed"
+        assert executor.calls == 1
+        assert proposer.calls == 2
+
+
+def test_add_skill_replans_future_steps_and_consumes_fixed_revision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证用户在运行中加入 Skill 后，原子固定 Use、换新步骤身份并用于最终回答。"""
+
+    engine = create_engine("sqlite://", poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as db:
+        agent, instance, model, user, executor, proposer = _steering_execution(db)
+        markdown = "# Writing discipline\nAlways include inputs, steps, errors and acceptance."
+        manifest = [
+            {
+                "path": "SKILL.md",
+                "checksum": hashlib.sha256(markdown.encode()).hexdigest(),
+                "size": len(markdown.encode()),
+                "media_type": "text/markdown",
+                "legacy_inline": True,
+            }
+        ]
+        content_checksum = hashlib.sha256(
+            json.dumps(
+                [{"path": manifest[0]["path"], "checksum": manifest[0]["checksum"]}],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        skill = GeneralSkill(
+            id="genskill_runtime_add",
+            tenant_id=instance.tenant_id,
+            slug="writing-discipline",
+            name="Writing discipline",
+            description="Create complete operating procedures.",
+            skill_markdown=markdown,
+            status="published",
+            usage_mode="planning_guidance",
+            owner_user_id=user.id,
+            visibility_scope="agent_private",
+        )
+        revision = GeneralSkillRevision(
+            id="gsrev_runtime_add",
+            tenant_id=instance.tenant_id,
+            skill_id=skill.id,
+            revision_number=1,
+            content_checksum=content_checksum,
+            manifest_checksum=manifest[0]["checksum"],
+            normalized_skill_markdown=markdown,
+            parsed_metadata_json={"name": skill.name, "description": skill.description},
+            resource_manifest_json=manifest,
+            requested_capabilities_json={"allowed_tools": []},
+            source_snapshot_json={"source_kind": "legacy_backfill"},
+            status="published",
+            created_by=user.id,
+        )
+        skill.current_published_revision_id = revision.id
+        binding = AgentResourceBinding(
+            id="agentres_runtime_add",
+            tenant_id=instance.tenant_id,
+            agent_id=instance.agent_id,
+            resource_type="general_skill",
+            resource_id=skill.id,
+            status="active",
+            metadata_json={
+                "schema_version": 1,
+                "revision_policy": "pinned",
+                "pinned_revision_id": revision.id,
+                "invocation_policy": "model_allowed",
+                "atomic_execution_allowed": False,
+                "created_by_user_id": user.id,
+            },
+        )
+        db.add(skill)
+        db.add(revision)
+        db.add(binding)
+        db.add(
+            ChatSession(
+                id=instance.session_id,
+                tenant_id=instance.tenant_id,
+                user_id=user.id,
+                agent_id=instance.agent_id,
+            )
+        )
+        db.commit()
+        monkeypatch.setattr(get_settings(), "general_skill_resolver_v2_enabled", True)
+        live_snapshot = DynamicCapabilityCatalog(db).list_general_skills(
+            instance.tenant_id,
+            instance.agent_id,
+            actor_user_id=user.id,
+        )[0]
+        agent.catalog.list_general_skills = lambda *args, **kwargs: [live_snapshot]
+        old_plan_id = instance.current_plan_revision_id
+        command, _ = ExecutionControlService(db).issue_command(
+            instance,
+            command_id="add_skill_runtime_1",
+            command_type="add_skill",
+            actor_user_id=user.id,
+            expected_execution_revision=instance.revision,
+            payload={"skill_id": skill.id},
+        )
+        db.commit()
+        signal = db.exec(
+            select(ExecutionSignal).where(ExecutionSignal.causation_id == command.id)
+        ).one()
+
+        outcome = agent.resume_add_skill_signal(
+            signal_id=signal.id,
+            model_config=model,
+            worker_id="worker_add_skill",
+            actor_user_id=user.id,
+            skill_loading_enabled=True,
+        )
+
+        db.refresh(instance)
+        db.refresh(command)
+        use = db.exec(
+            select(GeneralSkillUse).where(GeneralSkillUse.execution_id == instance.id)
+        ).one()
+        current = db.get(ExecutionPlanRevision, instance.current_plan_revision_id)
+        assert outcome.status == "succeeded"
+        assert instance.current_plan_revision_id != old_plan_id
+        assert current is not None and current.reason == "skill_added"
+        answer = next(step for step in current.plan_json["steps"] if step["kind"] == "answer")
+        assert answer["step_key"].startswith("answer__skill_")
+        assert answer["guidance_skill_use_ids"] == [use.id]
+        assert use.revision_id == revision.id
+        assert use.status == "completed"
+        assert command.status == "applied"
         assert executor.calls == 1
         assert proposer.calls == 2
 

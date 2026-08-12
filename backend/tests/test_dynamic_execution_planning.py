@@ -21,6 +21,7 @@ from app.db.models import (
     AgentProfile,
     ExecutionMutationRejection,
     ExecutionPlanRevision,
+    GeneralSkillUse,
     ManagedInputResource,
     Message,
     SopInstance,
@@ -283,6 +284,64 @@ def test_replan_preserves_completed_step_and_requires_new_key_for_changed_step()
     assert completed_identity == ("read_sales", revision_id)
 
 
+def test_replan_rejects_guidance_use_outside_execution_or_frozen_revision() -> None:
+    """验证计划不能伪造其他 Execution 的 Use，也不能绕过固定 revision/checksum。"""
+
+    with _test_session() as db:
+        store = SopExecutionStore(db)
+        instance, _ = _start_dynamic(store)
+        use = GeneralSkillUse(
+            id="gsuse_foreign",
+            tenant_id=instance.tenant_id,
+            session_id=instance.session_id,
+            turn_id="turn_foreign",
+            execution_id="another_execution",
+            agent_id=instance.agent_id,
+            user_id=instance.initiator_user_id,
+            skill_id="genskill_one",
+            revision_id="gsrev_one",
+            content_checksum="b" * 64,
+            selection_mode="forced",
+            idempotency_key="c" * 64,
+            status="active",
+        )
+        db.add(use)
+        db.commit()
+        revised = _plan(
+            PlanStep(
+                step_key="read_sales_skill",
+                title="读取销售数据",
+                kind="tool.read",
+                capability_refs=("sales.read",),
+                guidance_skill_use_ids=(use.id,),
+            ),
+            PlanStep(
+                step_key="summarize_skill",
+                title="形成摘要",
+                kind="answer",
+                depends_on=("read_sales_skill",),
+                guidance_skill_use_ids=(use.id,),
+            ),
+        )
+
+        with pytest.raises(SopExecutionConflictError, match="不属于当前活动 Execution"):
+            with store.owned(instance, worker_id="worker-forged-use"):
+                store.append_plan_revision(
+                    instance,
+                    plan=revised,
+                    reason=PlanReason.SKILL_ADDED,
+                    capability_snapshot={
+                        "tools": [{"id": "sales.read", "checksum": "a" * 64}],
+                        "general_skill_uses": [
+                            {
+                                "use_id": use.id,
+                                "skill_id": use.skill_id,
+                                "revision_id": use.revision_id,
+                                "content_checksum": use.content_checksum,
+                            }
+                        ],
+                    },
+                )
 def test_completed_provider_proposal_is_persisted_and_consumed_idempotently() -> None:
     """验证完整提案落库后恢复复用同一记录，消费不能改绑另一 Operation。"""
 

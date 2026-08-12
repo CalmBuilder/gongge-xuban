@@ -3,7 +3,7 @@
 @Author     : zhanglp8181
 @File       : executions.py
 @CallChain  : 执行卡/Chat 控制 → FastAPI → ExecutionControlService/Execution Store
-@Description: 提供统一 Execution 查询、cancel/steer 命令、Artifact 摘要和不可变结果读取接口。
+@Description: 提供统一 Execution 查询、cancel/steer/add_skill 命令及结果读取接口。
 """
 
 from __future__ import annotations
@@ -36,11 +36,11 @@ router = APIRouter(prefix="/api/executions", tags=["executions"])
 
 
 class ExecutionCommandRequest(BaseModel):
-    """提交 cancel/steer 的 tenant、幂等键和 Execution CAS 信封。"""
+    """提交 cancel/steer/add_skill 的 tenant、幂等键和 Execution CAS 信封。"""
 
     tenant_id: str = Field(min_length=1, max_length=128)
     command_id: str = Field(min_length=1, max_length=128)
-    command_type: str = Field(pattern="^(cancel|steer)$")
+    command_type: str = Field(pattern="^(cancel|steer|add_skill)$")
     expected_revision: int = Field(ge=0)
     payload: dict[str, object] = Field(default_factory=dict)
     source_message_id: str | None = Field(default=None, max_length=512)
@@ -128,11 +128,16 @@ def issue_execution_command(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_session),
 ) -> ExecutionCommandRead:
-    """持久登记命令；cancel 同事务收敛，steer 由持久 worker 异步消费。"""
+    """持久登记命令；cancel 同事务收敛，其余命令由持久 worker 异步消费。"""
 
     instance = _authorized_execution(db, request.tenant_id, execution_id, current_user)
     if request.command_type == "steer" and not get_settings().dynamic_task_steering_enabled:
         raise HTTPException(status_code=409, detail="DYNAMIC_STEERING_DISABLED")
+    if (
+        request.command_type == "add_skill"
+        and not get_settings().dynamic_task_skill_loading_enabled
+    ):
+        raise HTTPException(status_code=409, detail="DYNAMIC_SKILL_LOADING_DISABLED")
     store = SopExecutionStore(db)
     control = ExecutionControlService(db, store)
     try:

@@ -391,3 +391,70 @@ def test_steer_api_rejects_new_command_when_kill_switch_is_off(db: Session) -> N
     assert caught.value.status_code == 409
     assert caught.value.detail == "DYNAMIC_STEERING_DISABLED"
     assert db.exec(select(ExecutionCommand)).first() is None
+
+
+def test_add_skill_api_stays_pending_behind_its_own_kill_switch(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证结构化加 Skill 使用独立灰度开关，开启后由持久 worker 异步消费。"""
+
+    monkeypatch.setattr(
+        "app.api.executions.get_settings",
+        lambda: SimpleNamespace(
+            dynamic_task_steering_enabled=False,
+            dynamic_task_skill_loading_enabled=True,
+        ),
+    )
+    owner, _, instance = _seed_execution(db, suffix="add_skill")
+    assert owner is not None
+    result = issue_execution_command(
+        instance.id,
+        ExecutionCommandRequest(
+            tenant_id="tenant_demo",
+            command_id="add_skill_api_1",
+            command_type="add_skill",
+            expected_revision=instance.revision,
+            payload={"skill_id": "gskill_writing"},
+        ),
+        owner,
+        db,
+    )
+
+    assert result.status == "pending"
+    command = db.exec(select(ExecutionCommand)).one()
+    assert command.payload_json == {"skill_id": "gskill_writing", "trigger": "user"}
+
+
+def test_add_skill_api_rejects_new_command_when_kill_switch_is_off(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证运行中加载默认关闭时不留下半生效命令或 signal。"""
+
+    monkeypatch.setattr(
+        "app.api.executions.get_settings",
+        lambda: SimpleNamespace(
+            dynamic_task_steering_enabled=True,
+            dynamic_task_skill_loading_enabled=False,
+        ),
+    )
+    owner, _, instance = _seed_execution(db, suffix="add_skill_disabled")
+    assert owner is not None
+    with pytest.raises(HTTPException) as caught:
+        issue_execution_command(
+            instance.id,
+            ExecutionCommandRequest(
+                tenant_id="tenant_demo",
+                command_id="add_skill_disabled_1",
+                command_type="add_skill",
+                expected_revision=instance.revision,
+                payload={"skill_id": "gskill_writing"},
+            ),
+            owner,
+            db,
+        )
+
+    assert caught.value.status_code == 409
+    assert caught.value.detail == "DYNAMIC_SKILL_LOADING_DISABLED"
+    assert db.exec(select(ExecutionCommand)).first() is None

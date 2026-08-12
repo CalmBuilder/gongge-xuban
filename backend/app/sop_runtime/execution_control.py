@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
 
@@ -222,8 +223,11 @@ class ExecutionControlService:
         """以 tenant+command_id 幂等登记命令，并在同一事务写领域事件和 signal。"""
 
         self._assert_instance(instance)
-        if command_type not in {"cancel", "steer"}:
-            raise ExecutionControlError("COMMAND_TYPE_INVALID", "仅支持 cancel 或 steer 命令。")
+        if command_type not in {"cancel", "steer", "add_skill"}:
+            raise ExecutionControlError(
+                "COMMAND_TYPE_INVALID",
+                "仅支持 cancel、steer 或 add_skill 命令。",
+            )
         body = dict(payload or {})
         if command_type == "steer":
             instruction = str(body.get("instruction") or body.get("message") or "").strip()
@@ -238,6 +242,19 @@ class ExecutionControlService:
                     "只有活动动态 Execution 可以接受追加约束。",
                 )
             body = {"instruction": instruction}
+        elif command_type == "add_skill":
+            skill_id = str(body.get("skill_id") or "")
+            if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", skill_id) is None:
+                raise ExecutionControlError(
+                    "ADD_SKILL_ID_INVALID",
+                    "add_skill 命令必须包含服务端稳定的 skill_id。",
+                )
+            if instance.kind != "dynamic_task" or instance.status not in {"running", "waiting"}:
+                raise ExecutionControlError(
+                    "ADD_SKILL_EXECUTION_NOT_ACTIVE",
+                    "只有活动动态 Execution 可以接受运行中 Skill。",
+                )
+            body = {"skill_id": skill_id, "trigger": "user"}
         checksum = canonical_checksum(body)
         existing = self.db.exec(
             select(ExecutionCommand).where(
@@ -275,7 +292,7 @@ class ExecutionControlService:
             payload_checksum=checksum,
             result_json=(
                 {"base_plan_revision_id": instance.current_plan_revision_id}
-                if command_type == "steer"
+                if command_type in {"steer", "add_skill"}
                 else {}
             ),
         )

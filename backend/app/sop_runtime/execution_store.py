@@ -452,6 +452,7 @@ class SopExecutionStore:
         if not capability_payload:
             raise SopExecutionConflictError("计划修订必须冻结非空能力快照。")
         self._assert_plan_capabilities_available(plan, capability_payload)
+        self._assert_plan_guidance_uses(instance, plan, capability_payload)
         causal_proposal = None
         if created_by_proposal_id is not None:
             causal_proposal = self.db.get(ActionProposalRecord, created_by_proposal_id)
@@ -2289,6 +2290,44 @@ class SopExecutionStore:
             raise SopExecutionConflictError(
                 "计划引用了未冻结的动态能力：" + ",".join(missing)
             )
+
+    def _assert_plan_guidance_uses(
+        self,
+        instance: SopInstance,
+        plan: NormalizedPlan,
+        capability_snapshot: Mapping[str, object],
+    ) -> None:
+        """机械核对计划引用的 Skill Use 归属、活动终态及固定修订快照。"""
+
+        planned_ids = {
+            use_id for step in plan.steps for use_id in step.guidance_skill_use_ids
+        }
+        if not planned_ids:
+            return
+        uses = self.db.exec(
+            select(GeneralSkillUse).where(
+                GeneralSkillUse.tenant_id == instance.tenant_id,
+                GeneralSkillUse.execution_id == instance.id,
+                GeneralSkillUse.id.in_(planned_ids),
+            )
+        ).all()
+        if {use.id for use in uses} != planned_ids or any(use.status != "active" for use in uses):
+            raise SopExecutionConflictError("计划引用的 Skill Use 不属于当前活动 Execution。")
+        raw_frozen = capability_snapshot.get("general_skill_uses")
+        frozen = {
+            str(item.get("use_id")): item
+            for item in raw_frozen
+            if isinstance(raw_frozen, list) and isinstance(item, Mapping)
+        }
+        for use in uses:
+            item = frozen.get(use.id)
+            if (
+                item is None
+                or item.get("skill_id") != use.skill_id
+                or item.get("revision_id") != use.revision_id
+                or item.get("content_checksum") != use.content_checksum
+            ):
+                raise SopExecutionConflictError("计划 Skill Use 与冻结修订快照不一致。")
 
     @staticmethod
     def _message_references_resource(

@@ -2769,7 +2769,7 @@ class DynamicTaskAgent:
             elif command.status != "pending":
                 raise DynamicTaskAgentError("DYNAMIC_STEER_COMMAND_NOT_PENDING")
             elif not self._steer_actor_authorized(instance, actor_user_id):
-                self._settle_steer_command(
+                self._settle_execution_command(
                     instance,
                     command,
                     status="rejected",
@@ -2780,7 +2780,7 @@ class DynamicTaskAgent:
                 self.db.commit()
                 return DynamicRunOutcome("rejected", instance.id)
             elif not steering_enabled:
-                self._settle_steer_command(
+                self._settle_execution_command(
                     instance,
                     command,
                     status="rejected",
@@ -2795,7 +2795,7 @@ class DynamicTaskAgent:
                     (command.result_json or {}).get("base_plan_revision_id") or ""
                 )
                 if not base_revision_id or instance.current_plan_revision_id != base_revision_id:
-                    self._settle_steer_command(
+                    self._settle_execution_command(
                         instance,
                         command,
                         status="conflicted",
@@ -2821,7 +2821,7 @@ class DynamicTaskAgent:
                         reason=PlanReason.USER_CONSTRAINT,
                         capability_snapshot=dict(current_revision.capability_snapshot_json or {}),
                     )
-                    self._settle_steer_command(
+                    self._settle_execution_command(
                         instance,
                         command,
                         status="applied",
@@ -2838,6 +2838,238 @@ class DynamicTaskAgent:
             resume_signal_id=signal.id,
             signal_worker_id=worker_id,
         )
+
+    def resume_add_skill_signal(
+        self,
+        *,
+        signal_id: str,
+        model_config: ModelConfig,
+        worker_id: str,
+        actor_user_id: str,
+        skill_loading_enabled: bool,
+    ) -> DynamicRunOutcome:
+        """在安全动作边界固定用户选择的 Skill，并原子追加实际消费它的计划修订。"""
+
+        signal = self.db.get(ExecutionSignal, signal_id)
+        command = (
+            self.db.get(ExecutionCommand, signal.causation_id)
+            if signal is not None and signal.signal_type == "command"
+            else None
+        )
+        instance = self.db.get(SopInstance, signal.execution_id) if signal is not None else None
+        if (
+            signal is None
+            or command is None
+            or command.command_type != "add_skill"
+            or command.execution_id != signal.execution_id
+            or instance is None
+            or instance.kind != "dynamic_task"
+        ):
+            raise DynamicTaskAgentError("DYNAMIC_ADD_SKILL_COMMAND_INVALID")
+        if command.actor_user_id != actor_user_id or command.tenant_id != instance.tenant_id:
+            raise DynamicTaskAgentError("DYNAMIC_ADD_SKILL_ACTOR_DENIED")
+        control = ExecutionControlService(self.db, self.store)
+        if signal.status == "consumed":
+            return self.run_until_blocked_or_complete(
+                execution_id=instance.id,
+                model_config=model_config,
+                worker_id=worker_id,
+                actor_user_id=instance.initiator_user_id,
+            )
+        control.claim_signal(signal, worker_id=worker_id, ttl_seconds=300)
+        self.db.commit()
+        with self.store.owned(instance, worker_id=worker_id):
+            self.db.refresh(command)
+            self.db.refresh(instance)
+            if command.status == "applied":
+                pass
+            elif command.status in {"conflicted", "rejected"}:
+                control.consume_signal(instance, signal, worker_id=worker_id)
+                self.db.commit()
+                return DynamicRunOutcome(command.status, instance.id)
+            elif command.status != "pending":
+                raise DynamicTaskAgentError("DYNAMIC_ADD_SKILL_COMMAND_NOT_PENDING")
+            elif actor_user_id != instance.initiator_user_id or not self._steer_actor_authorized(
+                instance, actor_user_id
+            ):
+                self._settle_execution_command(
+                    instance,
+                    command,
+                    status="rejected",
+                    reason_code="DYNAMIC_ADD_SKILL_ACTOR_DENIED",
+                    worker_id=worker_id,
+                )
+                control.consume_signal(instance, signal, worker_id=worker_id)
+                self.db.commit()
+                return DynamicRunOutcome("rejected", instance.id)
+            elif not skill_loading_enabled:
+                self._settle_execution_command(
+                    instance,
+                    command,
+                    status="rejected",
+                    reason_code="DYNAMIC_SKILL_LOADING_DISABLED",
+                    worker_id=worker_id,
+                )
+                control.consume_signal(instance, signal, worker_id=worker_id)
+                self.db.commit()
+                return DynamicRunOutcome("rejected", instance.id)
+            else:
+                base_revision_id = str(
+                    (command.result_json or {}).get("base_plan_revision_id") or ""
+                )
+                if not base_revision_id or instance.current_plan_revision_id != base_revision_id:
+                    self._settle_execution_command(
+                        instance,
+                        command,
+                        status="conflicted",
+                        reason_code="SKILL_LOAD_PLAN_REVISION_CONFLICT",
+                        worker_id=worker_id,
+                    )
+                    control.consume_signal(instance, signal, worker_id=worker_id)
+                    self.db.commit()
+                    return DynamicRunOutcome("conflicted", instance.id)
+                self._assert_steer_safe_boundary(instance)
+                with self.db.begin_nested():
+                    current_revision = self.db.get(ExecutionPlanRevision, base_revision_id)
+                    actor = self.db.get(User, actor_user_id)
+                    if current_revision is None or actor is None:
+                        raise DynamicTaskAgentError("DYNAMIC_PLAN_NOT_FOUND")
+                    skill_id = str(command.payload_json.get("skill_id") or "")
+                    runtime = GeneralSkillRuntimeService(self.db)
+                    loaded = runtime.load_bundle(
+                        actor,
+                        session_id=instance.session_id,
+                        agent_id=instance.agent_id,
+                        turn_id=f"execution:{instance.id}:add-skill:{command.command_id}",
+                        skill_id=skill_id,
+                        selection_mode="forced",
+                        commit=False,
+                    )
+                    for row in loaded:
+                        use = self.db.get(GeneralSkillUse, row.use_id)
+                        if use is None:
+                            raise DynamicTaskAgentError("GENERAL_SKILL_USE_NOT_AVAILABLE")
+                        use.execution_id = instance.id
+                        use.updated_at = self.store.database_now()
+                        self.db.add(use)
+                    current_plan = NormalizedPlan.model_validate(current_revision.plan_json)
+                    completed = self._completed_step_keys(instance)
+                    revised_plan = self._plan_with_added_skill(
+                        current_plan,
+                        completed_step_keys=completed,
+                        guidance_use_ids=tuple(row.use_id for row in loaded),
+                        revision_suffix=command.id[-12:],
+                    )
+                    snapshot = dict(current_revision.capability_snapshot_json or {})
+                    catalog_rows = self.catalog.list_general_skills(
+                        instance.tenant_id,
+                        instance.agent_id,
+                        actor_user_id=actor.id,
+                    )
+                    selected = next(
+                        (row for row in catalog_rows if row.capability_id == skill_id),
+                        None,
+                    )
+                    if selected is None:
+                        raise DynamicTaskAgentError("GENERAL_SKILL_NOT_AVAILABLE")
+                    general_skills = [
+                        row
+                        for row in snapshot.get("general_skills", [])
+                        if isinstance(row, dict) and row.get("capability_id") != skill_id
+                    ]
+                    general_skills.append(selected.model_dump(mode="json"))
+                    snapshot["general_skills"] = general_skills
+                    snapshot["general_skill_uses"] = [
+                        {
+                            "use_id": use.id,
+                            "skill_id": use.skill_id,
+                            "revision_id": use.revision_id,
+                            "content_checksum": use.content_checksum,
+                        }
+                        for use in self.db.exec(
+                            select(GeneralSkillUse).where(
+                                GeneralSkillUse.tenant_id == instance.tenant_id,
+                                GeneralSkillUse.execution_id == instance.id,
+                                GeneralSkillUse.status == "active",
+                            )
+                        ).all()
+                    ]
+                    self._supersede_prepared_dynamic_actions(instance)
+                    revision, _ = self.store.append_plan_revision(
+                        instance,
+                        plan=revised_plan,
+                        reason=PlanReason.SKILL_ADDED,
+                        capability_snapshot=snapshot,
+                    )
+                    for row in loaded:
+                        self.db.add(
+                            AgentEvent(
+                                tenant_id=instance.tenant_id,
+                                session_id=instance.session_id,
+                                event_type="skill_loaded",
+                                payload_json={
+                                    "skill_use_id": row.use_id,
+                                    "skill_id": row.skill_id,
+                                    "revision_id": row.revision_id,
+                                    "selection_mode": row.selection_mode,
+                                    "consumer": "dynamic_task_replan",
+                                    "plan_revision_id": revision.id,
+                                },
+                            )
+                        )
+                    self._settle_execution_command(
+                        instance,
+                        command,
+                        status="applied",
+                        reason_code=None,
+                        worker_id=worker_id,
+                        plan_revision_id=revision.id,
+                    )
+        self.db.commit()
+        return self.run_until_blocked_or_complete(
+            execution_id=instance.id,
+            model_config=model_config,
+            worker_id=worker_id,
+            actor_user_id=instance.initiator_user_id,
+            resume_signal_id=signal.id,
+            signal_worker_id=worker_id,
+        )
+
+    @staticmethod
+    def _plan_with_added_skill(
+        plan: NormalizedPlan,
+        *,
+        completed_step_keys: set[str],
+        guidance_use_ids: tuple[str, ...],
+        revision_suffix: str,
+    ) -> NormalizedPlan:
+        """保留已完成步骤，为未来步骤分配新身份并显式附加新 Skill 指导。"""
+
+        key_map = {
+            step.step_key: (
+                step.step_key
+                if step.step_key in completed_step_keys
+                else f"{step.step_key}__skill_{revision_suffix}"
+            )
+            for step in plan.steps
+        }
+        steps: list[PlanStep] = []
+        for step in plan.steps:
+            if step.step_key in completed_step_keys:
+                steps.append(step)
+                continue
+            steps.append(
+                step.model_copy(
+                    update={
+                        "step_key": key_map[step.step_key],
+                        "depends_on": tuple(key_map[value] for value in step.depends_on),
+                        "guidance_skill_use_ids": tuple(
+                            dict.fromkeys((*step.guidance_skill_use_ids, *guidance_use_ids))
+                        ),
+                    }
+                )
+            )
+        return plan.model_copy(update={"steps": tuple(steps)})
 
     def _steer_actor_authorized(self, instance: SopInstance, actor_user_id: str) -> bool:
         """处理命令时重新验证成员状态和 Execution 管理资格，防止排队期间撤权失效。"""
@@ -2925,7 +3157,7 @@ class DynamicTaskAgent:
                     error={"code": "DYNAMIC_ACTION_SUPERSEDED_BY_STEERING"},
                 )
 
-    def _settle_steer_command(
+    def _settle_execution_command(
         self,
         instance: SopInstance,
         command: ExecutionCommand,
@@ -2935,7 +3167,7 @@ class DynamicTaskAgent:
         worker_id: str,
         plan_revision_id: str | None = None,
     ) -> None:
-        """以当前 fencing token 终结 steer 命令并追加可审计处置事件。"""
+        """以当前 fencing token 终结异步 Execution 命令并追加可审计处置事件。"""
 
         now = self.store.database_now()
         command.status = status
@@ -2954,7 +3186,7 @@ class DynamicTaskAgent:
         self.db.add(command)
         ExecutionControlService(self.db, self.store).append_execution_event(
             instance,
-            event_type=f"execution_steer_{status}",
+            event_type=f"execution_{command.command_type}_{status}",
             causation_id=command.id,
             payload={
                 "command_id": command.command_id,

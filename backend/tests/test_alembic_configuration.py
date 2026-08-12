@@ -21,7 +21,7 @@ def test_alembic_has_single_expected_head_and_baseline() -> None:
     config = Config(str(BACKEND_DIR / "alembic.ini"))
     script = ScriptDirectory.from_config(config)
 
-    assert script.get_heads() == ["20260814_0063"]
+    assert script.get_heads() == ["20260814_0064"]
     member_lifecycle = script.get_revision("20260728_0016")
     assert member_lifecycle.down_revision == "20260727_0015"
     organization_units = script.get_revision("20260728_0017")
@@ -138,6 +138,8 @@ def test_alembic_has_single_expected_head_and_baseline() -> None:
     assert immutable_versions is not None and immutable_versions.down_revision == "20260718_0002"
     assert head is not None and head.down_revision == "20260718_0001"
     assert baseline is not None and baseline.down_revision is None
+    dynamic_skill_loading = script.get_revision("20260814_0064")
+    assert dynamic_skill_loading.down_revision == "20260814_0063"
 
 
 def test_alembic_files_do_not_embed_runtime_credentials() -> None:

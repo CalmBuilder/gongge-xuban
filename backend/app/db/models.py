@@ -1418,13 +1418,13 @@ class SopWorkItemCommandReceipt(SQLModel, table=True):
 
 
 class ExecutionCommand(SQLModel, table=True):
-    """持久保存 cancel/steer 等统一 Execution 命令及其 CAS 结果。"""
+    """持久保存 cancel/steer/add_skill 等统一 Execution 命令及其 CAS 结果。"""
 
     __tablename__ = "execution_commands"
     __table_args__ = (
         UniqueConstraint("tenant_id", "command_id", name="uq_execution_command_id"),
         CheckConstraint(
-            "command_type IN ('cancel', 'steer')",
+            "command_type IN ('cancel', 'steer', 'add_skill')",
             name="ck_execution_command_type",
         ),
         CheckConstraint(
