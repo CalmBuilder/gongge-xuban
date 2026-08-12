@@ -374,6 +374,7 @@ def _goal_authorizes_capability(goal: str, snapshot: CapabilitySnapshot) -> bool
             r"|(?:skill|技能).{0,24}(?:安装|导入|采用)"
             r"|(?:保存|沉淀|创建|新增|提交|发布|提议|建议).{0,40}"
             r"(?:为|成|一个|新的).{0,12}(?:skill|技能)"
+            r"|(?:保存|沉淀|创建|新增|提交|发布|提议|建议).{0,24}(?:skill|技能)"
             r"|(?:propose|install|import|adopt|publish|save as|create)"
             r".{0,40}skill"
             r"|skill.{0,40}(?:proposal|install|import|adoption|publication)"
