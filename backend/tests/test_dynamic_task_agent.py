@@ -12,6 +12,7 @@ import base64
 import hashlib
 import json
 from datetime import datetime
+from contextlib import contextmanager
 from io import BytesIO
 from pathlib import Path
 import sys
@@ -55,6 +56,7 @@ from app.db.models import (
     MCPServer,
     Message,
     ModelConfig,
+    SopInstance,
     SopOperation,
     SopWorkItem,
     Tenant,
@@ -202,9 +204,19 @@ class _Planner:
 
         self.calls = 0
 
-    def create_plan(self, *, goal, success_criteria, capabilities, input_resources=()):
+    def create_plan(
+        self,
+        *,
+        goal,
+        success_criteria,
+        capabilities,
+        input_resources=(),
+        loaded_guidance=(),
+        memory_context=(),
+    ):
         """按入口传入的目标和成功标准构造规范计划。"""
 
+        del loaded_guidance, memory_context
         self.calls += 1
         return NormalizedPlan(
             goal=goal,
@@ -893,6 +905,70 @@ def test_file_sqlite_model_heartbeat_prevents_duplicate_claim_and_then_expires(
                 ttl_seconds=6,
             )
             assert recovered.worker_id == "heartbeat-recovery"
+
+
+def test_file_sqlite_signal_heartbeat_prevents_slow_planner_reclaim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """慢规划跨过初始 signal TTL 时，第二 worker 仍不得重领；停止续租后可恢复。"""
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'signal-heartbeat.db'}",
+        connect_args={"check_same_thread": False, "timeout": 10},
+    )
+    SQLModel.metadata.create_all(engine)
+    monkeypatch.setattr("app.dynamic_tasks.agent._signal_lease_ttl_seconds", lambda: 3)
+    with Session(engine, expire_on_commit=False) as owner_db:
+        instance = SopInstance(
+            id="sopinst_signal_heartbeat",
+            tenant_id="tenant_demo",
+            session_id="session_signal_heartbeat",
+            kind="dynamic_task",
+            initiator_user_id="user_demo",
+            agent_id="agent_demo",
+            goal_snapshot_json={"goal": "slow planning"},
+            active_slot_key="dynamic:signal-heartbeat",
+            current_plan_revision_id="plan_signal_heartbeat",
+            current_plan_checksum="a" * 64,
+            capability_snapshot_json={"capabilities": []},
+            status="running",
+        )
+        owner_db.add(instance)
+        owner_db.commit()
+        control = ExecutionControlService(owner_db)
+        signal = control.enqueue_signal(
+            instance,
+            signal_type="timer",
+            causation_type="timer",
+            causation_id="slow-planner",
+        )
+        control.claim_signal(signal, worker_id="planner-owner", ttl_seconds=3)
+        owner_db.commit()
+        runtime = DynamicTaskAgent(owner_db)
+        with runtime._signal_lease_heartbeat(signal.id, worker_id="planner-owner"):
+            time.sleep(3.6)
+            with Session(engine, expire_on_commit=False) as contender_db:
+                contender = contender_db.get(ExecutionSignal, signal.id)
+                assert contender is not None
+                with pytest.raises(Exception) as caught:
+                    ExecutionControlService(contender_db).claim_signal(
+                        contender,
+                        worker_id="planner-contender",
+                        ttl_seconds=3,
+                    )
+                assert getattr(caught.value, "code", "") == "SIGNAL_ALREADY_CLAIMED"
+        time.sleep(3.2)
+        with Session(engine, expire_on_commit=False) as recovery_db:
+            recoverable = recovery_db.get(ExecutionSignal, signal.id)
+            assert recoverable is not None
+            ExecutionControlService(recovery_db).claim_signal(
+                recoverable,
+                worker_id="planner-recovery",
+                ttl_seconds=3,
+            )
+            assert recoverable.lease_owner == "planner-recovery"
+    engine.dispose()
 
 
 class _ConnectorSlackStub:
@@ -3481,6 +3557,92 @@ def test_steer_appends_constraint_revision_and_preserves_completed_step() -> Non
         assert proposer.calls == 2
 
 
+def _runtime_add_skill_fixture(
+    db: Session,
+    *,
+    instance: SopInstance,
+    user: User,
+) -> tuple[GeneralSkill, GeneralSkillRevision]:
+    """为 add-skill 并发反例建立最小固定修订、绑定和会话。"""
+
+    markdown = "# Runtime add\nApply the reviewed procedure."
+    manifest_checksum = hashlib.sha256(markdown.encode()).hexdigest()
+    content_checksum = hashlib.sha256(
+        json.dumps(
+            [{"path": "SKILL.md", "checksum": manifest_checksum}],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    skill = GeneralSkill(
+        id="genskill_runtime_add_owner_lost",
+        tenant_id=instance.tenant_id,
+        slug="runtime-add-owner-lost",
+        name="Runtime add owner lost",
+        description="Exercise final signal fencing.",
+        skill_markdown=markdown,
+        status="published",
+        usage_mode="planning_guidance",
+        owner_user_id=user.id,
+        visibility_scope="agent_private",
+    )
+    revision = GeneralSkillRevision(
+        id="gsrev_runtime_add_owner_lost",
+        tenant_id=instance.tenant_id,
+        skill_id=skill.id,
+        revision_number=1,
+        content_checksum=content_checksum,
+        manifest_checksum=manifest_checksum,
+        normalized_skill_markdown=markdown,
+        parsed_metadata_json={"name": skill.name, "description": skill.description},
+        resource_manifest_json=[
+            {
+                "path": "SKILL.md",
+                "checksum": manifest_checksum,
+                "size": len(markdown.encode()),
+                "media_type": "text/markdown",
+                "legacy_inline": True,
+            }
+        ],
+        requested_capabilities_json={"allowed_tools": []},
+        source_snapshot_json={"source_kind": "legacy_backfill"},
+        status="published",
+        created_by=user.id,
+    )
+    skill.current_published_revision_id = revision.id
+    db.add(skill)
+    db.add(revision)
+    db.add(
+        AgentResourceBinding(
+            id="agentres_runtime_add_owner_lost",
+            tenant_id=instance.tenant_id,
+            agent_id=instance.agent_id,
+            resource_type="general_skill",
+            resource_id=skill.id,
+            status="active",
+            metadata_json={
+                "schema_version": 1,
+                "revision_policy": "pinned",
+                "pinned_revision_id": revision.id,
+                "invocation_policy": "model_allowed",
+                "atomic_execution_allowed": False,
+                "created_by_user_id": user.id,
+            },
+        )
+    )
+    db.add(
+        ChatSession(
+            id=instance.session_id,
+            tenant_id=instance.tenant_id,
+            user_id=user.id,
+            agent_id=instance.agent_id,
+        )
+    )
+    db.commit()
+    return skill, revision
+
+
 def test_add_skill_replans_future_steps_and_consumes_fixed_revision(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3610,6 +3772,172 @@ def test_add_skill_replans_future_steps_and_consumes_fixed_revision(
         assert command.status == "applied"
         assert executor.calls == 1
         assert proposer.calls == 2
+
+
+def test_add_skill_lost_signal_owner_has_zero_persistent_side_effects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """规划结束前 Signal 被其他 worker 重领时，旧 worker 不得创建 Use 或计划修订。"""
+
+    engine = create_engine("sqlite://", poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as db:
+        agent, instance, model, user, _, _ = _steering_execution(db)
+        skill, revision = _runtime_add_skill_fixture(db, instance=instance, user=user)
+        monkeypatch.setattr(get_settings(), "general_skill_resolver_v2_enabled", True)
+        live_snapshot = DynamicCapabilityCatalog(db).list_general_skills(
+            instance.tenant_id,
+            instance.agent_id,
+            actor_user_id=user.id,
+        )[0]
+        agent.catalog.list_general_skills = lambda *args, **kwargs: [live_snapshot]
+        command, _ = ExecutionControlService(db).issue_command(
+            instance,
+            command_id="add_skill_owner_lost",
+            command_type="add_skill",
+            actor_user_id=user.id,
+            expected_execution_revision=instance.revision,
+            payload={"skill_id": skill.id},
+        )
+        db.commit()
+        signal = db.exec(
+            select(ExecutionSignal).where(ExecutionSignal.causation_id == command.id)
+        ).one()
+        revision_count = len(
+            db.exec(
+                select(ExecutionPlanRevision).where(
+                    ExecutionPlanRevision.execution_id == instance.id
+                )
+            ).all()
+        )
+
+        @contextmanager
+        def steal_signal(_signal_id: str, *, worker_id: str):
+            """在模型调用返回后模拟租约过期并被另一 worker CAS 重领。"""
+
+            del worker_id
+            yield
+            signal.lease_owner = "worker_thief"
+            signal.updated_at = utc_now()
+            db.add(signal)
+            db.commit()
+
+        monkeypatch.setattr(agent, "_signal_lease_heartbeat", steal_signal)
+        with pytest.raises(Exception) as caught:
+            agent.resume_add_skill_signal(
+                signal_id=signal.id,
+                model_config=model,
+                worker_id="worker_stale",
+                actor_user_id=user.id,
+                skill_loading_enabled=True,
+            )
+        assert getattr(caught.value, "code", "") == "SIGNAL_FENCED"
+        db.refresh(command)
+        assert command.status == "pending"
+        assert db.exec(
+            select(GeneralSkillUse).where(GeneralSkillUse.execution_id == instance.id)
+        ).all() == []
+        assert len(
+            db.exec(
+                select(ExecutionPlanRevision).where(
+                    ExecutionPlanRevision.execution_id == instance.id
+                )
+            ).all()
+        ) == revision_count
+        assert revision.id == "gsrev_runtime_add_owner_lost"
+
+
+def test_add_skill_full_resume_heartbeats_signal_across_slow_planner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """完整 add-skill 重规划跨 TTL 时拒绝竞争认领，并只提交一个 Use 与新修订。"""
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'add-skill-slow-planner.db'}",
+        connect_args={"check_same_thread": False, "timeout": 10},
+    )
+    SQLModel.metadata.create_all(engine)
+    monkeypatch.setattr("app.dynamic_tasks.agent._signal_lease_ttl_seconds", lambda: 3)
+    monkeypatch.setattr(get_settings(), "general_skill_resolver_v2_enabled", True)
+    with Session(engine, expire_on_commit=False) as db:
+        agent, instance, model, user, _, _ = _steering_execution(db)
+        skill, _revision = _runtime_add_skill_fixture(db, instance=instance, user=user)
+        live_snapshot = DynamicCapabilityCatalog(db).list_general_skills(
+            instance.tenant_id,
+            instance.agent_id,
+            actor_user_id=user.id,
+        )[0]
+        agent.catalog.list_general_skills = lambda *args, **kwargs: [live_snapshot]
+        command, _ = ExecutionControlService(db).issue_command(
+            instance,
+            command_id="add_skill_slow_planner",
+            command_type="add_skill",
+            actor_user_id=user.id,
+            expected_execution_revision=instance.revision,
+            payload={"skill_id": skill.id},
+        )
+        db.commit()
+        signal = db.exec(
+            select(ExecutionSignal).where(ExecutionSignal.causation_id == command.id)
+        ).one()
+        base_revision_count = len(
+            db.exec(
+                select(ExecutionPlanRevision).where(
+                    ExecutionPlanRevision.execution_id == instance.id
+                )
+            ).all()
+        )
+
+        class SlowPlanner(_Planner):
+            """规划过程中跨过初始 TTL，并让第二数据库会话尝试竞争认领。"""
+
+            def __init__(self) -> None:
+                """初始化竞争结果证据。"""
+
+                super().__init__()
+                self.contender_code = ""
+
+            def create_plan(self, **kwargs):
+                """等待 heartbeat 生效后证明竞争 worker 无法 claim。"""
+
+                time.sleep(3.6)
+                with Session(engine, expire_on_commit=False) as contender_db:
+                    contender = contender_db.get(ExecutionSignal, signal.id)
+                    assert contender is not None
+                    try:
+                        ExecutionControlService(contender_db).claim_signal(
+                            contender,
+                            worker_id="slow-planner-contender",
+                            ttl_seconds=3,
+                        )
+                    except Exception as exc:
+                        self.contender_code = str(getattr(exc, "code", ""))
+                return super().create_plan(**kwargs)
+
+        slow_planner = SlowPlanner()
+        agent.planner = slow_planner
+        outcome = agent.resume_add_skill_signal(
+            signal_id=signal.id,
+            model_config=model,
+            worker_id="slow-planner-owner",
+            actor_user_id=user.id,
+            skill_loading_enabled=True,
+        )
+
+        assert outcome.status == "succeeded"
+        assert slow_planner.contender_code == "SIGNAL_ALREADY_CLAIMED"
+        uses = db.exec(
+            select(GeneralSkillUse).where(GeneralSkillUse.execution_id == instance.id)
+        ).all()
+        revisions = db.exec(
+            select(ExecutionPlanRevision).where(
+                ExecutionPlanRevision.execution_id == instance.id
+            )
+        ).all()
+        assert len(uses) == 1
+        assert len(revisions) == base_revision_count + 1
+    engine.dispose()
 
 
 def test_steer_crash_after_apply_replays_without_duplicate_plan_revision() -> None:

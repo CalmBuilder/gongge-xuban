@@ -9,6 +9,7 @@ from sqlmodel import Session, SQLModel, create_engine, select
 
 from app.api.chat import (
     _build_turn_traces,
+    _cancel_active_dynamic_execution,
     _events_after_cursor,
     _existing_turn_replay,
     _format_scheduled_task_schedule,
@@ -21,7 +22,16 @@ from app.api.chat import (
     message_read,
 )
 from app.api import chat as chat_api
-from app.db.models import AgentEvent, ChatSession, KnowledgeConcept, Message, Tenant, User
+from app.db.models import (
+    AgentEvent,
+    ChatSession,
+    ExecutionCommand,
+    KnowledgeConcept,
+    Message,
+    SopInstance,
+    Tenant,
+    User,
+)
 from app.observability.event_log import EventLog
 from app.session.session_schema import ChatTurnRequest
 
@@ -1131,7 +1141,7 @@ def test_cancel_endpoint_persists_terminal_trace_for_client_turn_id() -> None:
 
     assert _persist_chat_turn_cancelled(db, "tenant_demo", session_row, "turn_local_1", "user_demo")
     db.commit()
-    assert not _persist_chat_turn_cancelled(db, "tenant_demo", session_row, "turn_local_1", "user_demo")
+    assert _persist_chat_turn_cancelled(db, "tenant_demo", session_row, "turn_local_1", "user_demo")
 
     events = db.exec(
         select(AgentEvent)
@@ -1166,13 +1176,17 @@ def test_cancel_endpoint_persists_terminal_trace_for_client_turn_id() -> None:
     )
 
 
-def test_cancel_endpoint_persists_cancel_even_before_user_event_is_visible() -> None:
+def test_cancel_endpoint_rejects_unknown_turn_alias_before_user_event_is_visible() -> None:
+    """未知 client_turn_id 不得预先写入取消事实，避免污染未来同别名 Turn。"""
+
     db = _test_db()
     session_row = ChatSession(id="session_cancel_before_event", tenant_id="tenant_demo", user_id="user_demo")
     db.add(session_row)
     db.commit()
 
-    assert _persist_chat_turn_cancelled(db, "tenant_demo", session_row, "turn_local_pending", "user_demo")
+    assert not _persist_chat_turn_cancelled(
+        db, "tenant_demo", session_row, "turn_local_pending", "user_demo"
+    )
     db.commit()
     assert not _persist_chat_turn_cancelled(db, "tenant_demo", session_row, "turn_local_pending", "user_demo")
 
@@ -1182,16 +1196,151 @@ def test_cancel_endpoint_persists_cancel_even_before_user_event_is_visible() -> 
         .order_by(AgentEvent.created_at)
     ).all()
     cancel_events = [event for event in events if event.event_type == "stream_cancelled"]
-    assert len(cancel_events) == 1
-    assert cancel_events[0].payload_json["turn_id"] == "turn_local_pending"
-    assert cancel_events[0].payload_json["user_message_id"] == "turn_local_pending"
-    assert cancel_events[0].payload_json["client_turn_id"] == "turn_local_pending"
+    assert cancel_events == []
     messages = db.exec(
         select(Message)
         .where(Message.tenant_id == "tenant_demo", Message.session_id == session_row.id)
         .order_by(Message.created_at)
     ).all()
     assert [message.role for message in messages] == []
+
+
+def test_chat_cancel_bridges_to_active_dynamic_execution() -> None:
+    """聊天停止必须复用统一 Execution 取消状态机，而非仅终止 SSE 展示。"""
+
+    db = _test_db()
+    session_row = ChatSession(
+        id="session_dynamic_cancel",
+        tenant_id="tenant_demo",
+        user_id="user_demo",
+        agent_id="agent_demo",
+    )
+    instance = SopInstance(
+        id="execution_dynamic_cancel",
+        tenant_id="tenant_demo",
+        session_id=session_row.id,
+        kind="dynamic_task",
+        active_slot_key="dynamic:session_dynamic_cancel",
+        initiator_user_id="user_demo",
+        agent_id="agent_demo",
+        goal_snapshot_json={"goal": "执行复杂任务"},
+        current_plan_revision_id="plan_dynamic_cancel",
+        current_plan_checksum="a" * 64,
+        capability_snapshot_json={"capabilities": []},
+        status="running",
+        source_ref="msg_dynamic",
+    )
+    db.add(session_row)
+    db.add(instance)
+    db.commit()
+
+    assert _cancel_active_dynamic_execution(db, session_row, "msg_dynamic", "user_demo")
+    db.commit()
+    db.refresh(instance)
+
+    assert instance.status == "cancelled"
+    command = db.exec(
+        select(ExecutionCommand).where(ExecutionCommand.execution_id == instance.id)
+    ).one()
+    assert command.command_type == "cancel"
+    assert command.status == "applied"
+    assert command.source_type == "chat"
+
+
+def test_chat_cancel_does_not_stop_an_unrelated_dynamic_execution() -> None:
+    """普通 Turn 的停止只能收口自身，不能按会话猜测并误杀旧动态任务。"""
+
+    db = _test_db()
+    session_row = ChatSession(
+        id="session_unrelated_cancel", tenant_id="tenant_demo", user_id="user_demo"
+    )
+    instance = SopInstance(
+        id="execution_old_turn",
+        tenant_id="tenant_demo",
+        session_id=session_row.id,
+        kind="dynamic_task",
+        active_slot_key="dynamic:old-turn",
+        initiator_user_id="user_demo",
+        agent_id="agent_demo",
+        goal_snapshot_json={"goal": "旧任务"},
+        current_plan_revision_id="plan_old_turn",
+        current_plan_checksum="a" * 64,
+        capability_snapshot_json={"capabilities": []},
+        status="waiting",
+        source_ref="msg_old_turn",
+    )
+    db.add(session_row)
+    db.add(instance)
+    db.commit()
+
+    assert not _cancel_active_dynamic_execution(db, session_row, "msg_new_turn", "user_demo")
+    db.refresh(instance)
+    assert instance.status == "waiting"
+
+
+def test_cancelled_turn_preserves_persisted_partial_reply() -> None:
+    """取消后的 assistant 消息保留已发送正文，而不被停止占位文案覆盖。"""
+
+    db = _test_db()
+    started_at = datetime(2026, 7, 4, 9, 8, 0)
+    session_row = ChatSession(
+        id="session_cancel_partial", tenant_id="tenant_demo", user_id="user_demo"
+    )
+    db.add(session_row)
+    db.add(
+        Message(
+            id="msg_partial_user",
+            tenant_id="tenant_demo",
+            session_id=session_row.id,
+            role="user",
+            content="请生成长回复",
+            created_at=started_at,
+        )
+    )
+    db.add(
+        AgentEvent(
+            tenant_id="tenant_demo",
+            session_id=session_row.id,
+            event_type="user_message_received",
+            payload_json={
+                "message_id": "msg_partial_user",
+                "client_turn_id": "client_partial",
+            },
+            created_at=started_at,
+        )
+    )
+    for index, content in enumerate(("这是", "已经发送的", "部分回复。"), start=1):
+        db.add(
+            AgentEvent(
+                tenant_id="tenant_demo",
+                session_id=session_row.id,
+                event_type="stream_delta",
+                payload_json={"turn_id": "msg_partial_user", "content": content},
+                created_at=started_at + timedelta(milliseconds=index),
+            )
+        )
+    db.commit()
+
+    assert _persist_chat_turn_cancelled(
+        db, "tenant_demo", session_row, "client_partial", "user_demo"
+    )
+    db.commit()
+
+    assistant = db.exec(
+        select(Message).where(
+            Message.session_id == session_row.id, Message.role == "assistant"
+        )
+    ).one()
+    assert assistant.content == "这是已经发送的部分回复。"
+    assert assistant.metadata_json == {
+        "turn_id": "msg_partial_user",
+        "user_message_id": "msg_partial_user",
+        "client_turn_id": "client_partial",
+        "status": "cancelled",
+        "partial": True,
+        "terminal_reason": "user_cancelled",
+        "last_seq": 3,
+    }
 
 
 def test_stream_interrupted_persists_terminal_trace_and_message() -> None:

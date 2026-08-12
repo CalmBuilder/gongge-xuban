@@ -204,6 +204,30 @@ def test_only_execution_lease_winner_can_consume_distinct_signals(db: Session) -
     assert second.status == "claimed"
 
 
+def test_signal_owner_can_renew_without_increasing_attempt_count(db: Session) -> None:
+    """长外呼续租不得增加处理次数，且旧 owner/过期 owner 不能延长信号。"""
+
+    instance = _instance(db, suffix="signal_renew")
+    service = ExecutionControlService(db)
+    signal = service.enqueue_signal(
+        instance,
+        signal_type="timer",
+        causation_type="timer",
+        causation_id="timer_renew",
+    )
+    service.claim_signal(signal, worker_id="worker_a", ttl_seconds=30)
+    claimed_expires_at = signal.lease_expires_at
+    service.renew_signal(signal, worker_id="worker_a", ttl_seconds=60)
+
+    assert signal.attempt_count == 1
+    assert signal.lease_expires_at is not None
+    assert claimed_expires_at is not None
+    assert signal.lease_expires_at > claimed_expires_at
+    with pytest.raises(ExecutionControlError) as caught:
+        service.renew_signal(signal, worker_id="worker_b", ttl_seconds=60)
+    assert caught.value.code == "SIGNAL_FENCED"
+
+
 def test_cancellation_discards_ordinary_signal_instead_of_resuming(db: Session) -> None:
     """验证取消已登记时普通唤醒只能收敛为 discarded，不能重新推进业务步骤。"""
 

@@ -110,6 +110,26 @@ class DynamicTaskQuotaService:
             holder_id=operation.id,
         )
 
+    def acquire_parallel_contract(
+        self,
+        operation: SopOperation,
+        *,
+        concurrency_key: str,
+        limit: int,
+    ) -> None:
+        """跨进程按 tenant+concurrency_key 取得契约槽，随 Operation 终态统一释放。"""
+
+        if not concurrency_key.strip() or limit <= 0:
+            raise DynamicTaskQuotaError("DYNAMIC_PARALLEL_CONTRACT_INVALID")
+        self._acquire(
+            tenant_id=operation.tenant_id,
+            scope_type="parallel_contract",
+            scope_ref=concurrency_key,
+            limit=limit,
+            holder_type="operation",
+            holder_id=operation.id,
+        )
+
     def release_execution(self, instance: SopInstance) -> None:
         """删除指定 Execution 的临时并发槽；重复终态调用保持幂等。"""
 

@@ -17,7 +17,19 @@ from sqlmodel import Session, select
 
 from app.config import get_settings
 from app.db import engine
-from app.db.models import ExecutionCommand, ExecutionSignal, ModelConfig, SopInstance, SopWorkItem
+from app.db.models import (
+    DynamicReadDispatchBatch,
+    DynamicReadDispatchItem,
+    DynamicReadDispatchResult,
+    ExecutionCommand,
+    ExecutionSignal,
+    ModelConfig,
+    SopInstance,
+    SopNodeExecution,
+    SopOperation,
+    SopOperationAttempt,
+    SopWorkItem,
+)
 from app.dynamic_tasks.agent import DynamicRunOutcome, DynamicTaskAgent, DynamicTaskAgentError
 from app.dynamic_tasks.capability_catalog import CapabilityAccessDenied
 from app.dynamic_tasks.quotas import (
@@ -120,6 +132,153 @@ def due_dynamic_task_signals(db: Session, *, limit: int = 50) -> list[ExecutionS
         ).all()
     }
     return [item for item in candidates if item.execution_id in dynamic_ids]
+
+
+def reconcile_parallel_read_batches(db: Session, *, limit: int = 50) -> int:
+    """接管崩溃遗留波次：结果齐备则结算，逾期则确定性失败并释放全部子事实。"""
+
+    now = SopExecutionStore(db).database_now()
+    batches = db.exec(
+        select(DynamicReadDispatchBatch)
+        .where(DynamicReadDispatchBatch.status.in_(("dispatched", "settling")))
+        .order_by(DynamicReadDispatchBatch.created_at, DynamicReadDispatchBatch.id)
+        .limit(limit)
+    ).all()
+    settled = 0
+    for batch in batches:
+        items = db.exec(
+            select(DynamicReadDispatchItem)
+            .where(DynamicReadDispatchItem.batch_id == batch.id)
+            .order_by(DynamicReadDispatchItem.position)
+        ).all()
+        if not items:
+            batch.status = "failed"
+            batch.updated_at = now
+            db.add(batch)
+            settled += 1
+            continue
+        results = {
+            row.dispatch_token: row
+            for row in db.exec(
+                select(DynamicReadDispatchResult).where(
+                    DynamicReadDispatchResult.tenant_id == batch.tenant_id,
+                    DynamicReadDispatchResult.dispatch_token.in_(
+                        tuple(item.dispatch_token for item in items)
+                    ),
+                )
+            ).all()
+        }
+        expired = batch.deadline_at is not None and batch.deadline_at <= now
+        if not expired and any(item.dispatch_token not in results for item in items):
+            continue
+        instance = db.get(SopInstance, batch.execution_id)
+        if instance is None or instance.status not in {"created", "running", "waiting"}:
+            batch.status = "cancelled" if instance and instance.status == "cancelled" else "failed"
+            batch.updated_at = now
+            for item in items:
+                operation = db.get(SopOperation, item.operation_id)
+                node = db.get(SopNodeExecution, item.node_execution_id)
+                if operation is not None and operation.status == "running":
+                    operation.status = (
+                        "cancelled" if instance and instance.status == "cancelled" else "failed"
+                    )
+                    operation.error_json = {"code": "DYNAMIC_PARALLEL_PARENT_TERMINAL"}
+                    operation.completed_at = now
+                    operation.updated_at = now
+                    operation.revision += 1
+                    db.add(operation)
+                    DynamicTaskQuotaService(db).release_tool_operation(operation)
+                    attempts = db.exec(
+                        select(SopOperationAttempt).where(
+                            SopOperationAttempt.operation_id == operation.id,
+                            SopOperationAttempt.status.in_(("prepared", "running", "retry_wait")),
+                        )
+                    ).all()
+                    for attempt in attempts:
+                        attempt.status = operation.status
+                        attempt.error_json = {"code": "DYNAMIC_PARALLEL_PARENT_TERMINAL"}
+                        attempt.completed_at = now
+                        attempt.updated_at = now
+                        db.add(attempt)
+                if node is not None and node.status == "running":
+                    node.status = (
+                        "cancelled" if instance and instance.status == "cancelled" else "failed"
+                    )
+                    node.error_json = {"code": "DYNAMIC_PARALLEL_PARENT_TERMINAL"}
+                    node.completed_at = now
+                    node.updated_at = now
+                    node.revision += 1
+                    db.add(node)
+                if item.status != "settled":
+                    item.status = "discarded"
+                    item.updated_at = now
+                    db.add(item)
+            db.add(batch)
+            settled += 1
+            continue
+        store = SopExecutionStore(db)
+        worker_id = f"parallel-recovery:{batch.id}"
+        with store.owned(instance, worker_id=worker_id):
+            failed = False
+            batch.status = "settling"
+            db.add(batch)
+            for item in items:
+                operation = db.get(SopOperation, item.operation_id)
+                node = db.get(SopNodeExecution, item.node_execution_id)
+                if operation is None or node is None:
+                    failed = True
+                    item.status = "discarded"
+                    db.add(item)
+                    continue
+                if operation.status != "running":
+                    item.status = "settled" if operation.status in {"succeeded", "failed"} else "discarded"
+                    db.add(item)
+                    failed = failed or operation.status != "succeeded"
+                    continue
+                inbox = results.get(item.dispatch_token)
+                succeeded = inbox is not None and inbox.status == "succeeded"
+                error = (
+                    dict(inbox.error_json or {})
+                    if inbox is not None
+                    else {
+                        "code": "DYNAMIC_PARALLEL_DISPATCH_TIMEOUT",
+                        "message": "纯读派发在恢复期限内没有产生回执。",
+                    }
+                )
+                store.finish_operation(
+                    operation,
+                    succeeded=succeeded,
+                    result=dict(inbox.result_json or {}) if succeeded and inbox else None,
+                    error=error if not succeeded else None,
+                )
+                if node.status == "running":
+                    if succeeded:
+                        store.complete_node(instance, node, output=dict(inbox.result_json or {}))
+                    else:
+                        store.fail_node(instance, node, error=error)
+                item.status = "settled"
+                item.updated_at = now
+                db.add(item)
+                failed = failed or not succeeded
+            batch.status = "failed" if failed else "succeeded"
+            batch.updated_at = now
+            db.add(batch)
+            if failed:
+                store.fail_instance(
+                    instance,
+                    context_patch={"failure_code": "DYNAMIC_PARALLEL_READ_FAILED"},
+                )
+            else:
+                ExecutionControlService(db, store).enqueue_signal(
+                    instance,
+                    signal_type="capacity_retry",
+                    causation_type="parallel_read_batch",
+                    causation_id=batch.id,
+                    payload={"batch_id": batch.id, "reason": "parallel_read_recovered"},
+                )
+        settled += 1
+    db.commit()
+    return settled
 
 
 def process_dynamic_task_signal(

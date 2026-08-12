@@ -41,6 +41,8 @@ def downgrade() -> None:
     """存在运行中 Skill 命令事实时拒绝回退，避免丢失可恢复语义。"""
 
     bind = op.get_bind()
+    if not sa.inspect(bind).has_table(_TABLE):
+        raise RuntimeError("dynamic Skill loading downgrade requires execution_commands")
     count = int(
         bind.execute(
             sa.text(

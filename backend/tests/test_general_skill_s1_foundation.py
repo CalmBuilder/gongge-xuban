@@ -335,8 +335,8 @@ def test_0051_migration_backfills_active_import_quota_without_double_counting(tm
     ]
 
 
-def test_0052_migration_constraint_survives_later_heads(tmp_path) -> None:
-    """验证从 0051 升至当前 head 后，线性重试约束仍存在且重复升级安全。"""
+def test_0052_migration_constraint_is_idempotent_at_its_declared_revision(tmp_path) -> None:
+    """验证人工最小 0051 schema 升至 0052 后约束存在且目标升级可重入。"""
 
     database_url = f"sqlite:///{tmp_path / 'skill-import-retry.db'}"
     config = Config(str(BACKEND_DIR / "alembic.ini"))
@@ -353,8 +353,8 @@ def test_0052_migration_constraint_survives_later_heads(tmp_path) -> None:
                 "parent_job_id VARCHAR, attempt INTEGER NOT NULL)"
             )
         )
-    command.upgrade(config, "head")
-    command.upgrade(config, "head")
+    command.upgrade(config, "20260812_0052")
+    command.upgrade(config, "20260812_0052")
     constraints = {
         str(item.get("name"))
         for item in inspect(engine).get_unique_constraints("general_skill_import_jobs")
@@ -363,7 +363,7 @@ def test_0052_migration_constraint_survives_later_heads(tmp_path) -> None:
     assert "uq_general_skill_import_retry_attempt" in constraints
     with engine.connect() as connection:
         assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-            "20260814_0065"
+            "20260812_0052"
         )
     engine.dispose()
 
@@ -386,8 +386,8 @@ def test_0053_migration_adds_idempotent_worker_lease_contract(tmp_path) -> None:
                 "lease_token INTEGER NOT NULL DEFAULT 0)"
             )
         )
-    command.upgrade(config, "head")
-    command.upgrade(config, "head")
+    command.upgrade(config, "20260812_0053")
+    command.upgrade(config, "20260812_0053")
     inspector = inspect(engine)
 
     assert {item["name"] for item in inspector.get_columns("general_skill_import_jobs")} >= {
@@ -404,7 +404,7 @@ def test_0053_migration_adds_idempotent_worker_lease_contract(tmp_path) -> None:
     }
     with engine.connect() as connection:
         assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-            "20260814_0065"
+            "20260812_0053"
         )
     engine.dispose()
 
@@ -427,7 +427,7 @@ def test_0053_downgrade_refuses_active_worker_lease(tmp_path) -> None:
                 "lease_token INTEGER NOT NULL DEFAULT 0)"
             )
         )
-    command.upgrade(config, "head")
+    command.upgrade(config, "20260812_0053")
     with engine.begin() as connection:
         connection.execute(
             text(

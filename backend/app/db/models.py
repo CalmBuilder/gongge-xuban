@@ -1627,7 +1627,7 @@ class DynamicTaskQuotaLease(SQLModel, table=True):
             name="uq_dynamic_quota_holder_scope",
         ),
         CheckConstraint(
-            "scope_type IN ('tenant', 'agent', 'user', 'tool')",
+            "scope_type IN ('tenant', 'agent', 'user', 'tool', 'parallel_contract')",
             name="ck_dynamic_quota_scope_type",
         ),
         CheckConstraint(

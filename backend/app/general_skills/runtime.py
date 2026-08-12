@@ -51,6 +51,7 @@ class LoadedGeneralSkill:
     skill_id: str
     revision_id: str
     revision_number: int
+    content_checksum: str
     name: str
     description: str
     instructions: str
@@ -359,6 +360,7 @@ class GeneralSkillRuntimeService:
         turn_id: str,
         skill_id: str,
         selection_mode: Literal["auto", "forced"],
+        expected_revisions: Sequence[tuple[str, str, str]] = (),
         commit: bool = True,
     ) -> tuple[LoadedGeneralSkill, ...]:
         """预检并稳定加载主 Skill 及全部已批准 required 依赖，任一缺口整体拒绝。"""
@@ -375,6 +377,18 @@ class GeneralSkillRuntimeService:
             primary=primary,
             eligible=items,
         )
+        expected = {row[0]: (row[1], row[2]) for row in expected_revisions}
+        if expected and (
+            set(expected) != {item.skill_id for item in ordered}
+            or any(
+                expected[item.skill_id] != (item.revision_id, item.content_checksum)
+                for item in ordered
+            )
+        ):
+            raise GeneralSkillRuntimeError(
+                "GENERAL_SKILL_REVISION_CONFLICT",
+                "skill or required dependency changed after planning preview",
+            )
         loaded: list[LoadedGeneralSkill] = []
         uses_by_skill_id: dict[str, str] = {}
         try:
@@ -409,6 +423,72 @@ class GeneralSkillRuntimeService:
                 self.db.flush()
             raise exc
         return self.apply_shared_resource_budget(tuple(loaded))
+
+    def preview_bundle(
+        self,
+        current_user: User,
+        *,
+        session_id: str,
+        agent_id: str,
+        skill_id: str,
+        selection_mode: Literal["auto", "forced"],
+    ) -> tuple[LoadedGeneralSkill, ...]:
+        """只读解析主 Skill 与依赖正文，供长规划外呼使用；不创建可消费的 Use。"""
+
+        catalog = self.session_catalog(current_user, session_id=session_id, agent_id=agent_id)
+        items = {item.skill_id: item for item in catalog}
+        primary = items.get(skill_id)
+        if primary is None:
+            raise GeneralSkillRuntimeError(
+                "GENERAL_SKILL_NOT_AVAILABLE", "skill is not available", 404
+            )
+        if selection_mode == "auto" and primary.invocation_policy != "model_allowed":
+            raise GeneralSkillRuntimeError(
+                "GENERAL_SKILL_USER_ONLY", "skill requires explicit user selection", 409
+            )
+        ordered, parents = self._required_dependency_plan(
+            current_user,
+            primary=primary,
+            eligible=items,
+        )
+        previews: list[LoadedGeneralSkill] = []
+        for item in ordered:
+            revision = self.db.get(GeneralSkillRevision, item.revision_id)
+            skill = self.db.get(GeneralSkill, item.skill_id)
+            if (
+                revision is None
+                or skill is None
+                or revision.content_checksum != item.content_checksum
+            ):
+                raise GeneralSkillRuntimeError(
+                    "GENERAL_SKILL_REVISION_CONFLICT", "resolved revision changed"
+                )
+            instructions = revision.normalized_skill_markdown
+            if len(instructions) > get_settings().general_skill_instruction_char_limit:
+                raise GeneralSkillRuntimeError(
+                    "GENERAL_SKILL_BUDGET_EXCEEDED", "skill instructions exceed turn budget"
+                )
+            requested = revision.requested_capabilities_json.get("allowed_tools", [])
+            previews.append(
+                LoadedGeneralSkill(
+                    use_id=f"preview:{item.skill_id}:{item.revision_id}",
+                    skill_id=item.skill_id,
+                    revision_id=item.revision_id,
+                    revision_number=item.revision_number,
+                    content_checksum=item.content_checksum,
+                    name=skill.slug,
+                    description=item.description,
+                    instructions=instructions,
+                    requested_tools=tuple(
+                        str(value) for value in requested if isinstance(value, str)
+                    ),
+                    selection_mode=(
+                        selection_mode if item.skill_id not in parents else "dependency"
+                    ),
+                    resources=self._reviewed_resource_blocks(revision),
+                )
+            )
+        return self.apply_shared_resource_budget(tuple(previews))
 
     def load_composed_bundle(
         self,
@@ -826,6 +906,7 @@ class GeneralSkillRuntimeService:
             skill_id=skill.id,
             revision_id=revision.id,
             revision_number=revision.revision_number,
+            content_checksum=revision.content_checksum,
             name=skill.slug,
             description=skill.description,
             instructions=instructions,
@@ -897,6 +978,7 @@ class GeneralSkillRuntimeService:
             skill_id=item.skill_id,
             revision_id=item.revision_id,
             revision_number=item.revision_number,
+            content_checksum=item.content_checksum,
             name=skill.slug,
             description=item.description,
             instructions=instructions,

@@ -21,6 +21,7 @@ from app.db.seed import seed_demo_data
 from app.dynamic_tasks.worker import (
     due_dynamic_task_signals,
     process_dynamic_task_signal,
+    reconcile_parallel_read_batches,
     start_dynamic_task_signal_async,
 )
 from app.general_skills.proposals import GeneralSkillProposalService
@@ -61,6 +62,7 @@ def run_worker(*, once: bool = False, poll_seconds: float = WORKER_SLEEP_SECONDS
                 else:
                     start_scheduled_task_async(db, task)
             _process_due_dynamic_signals(db, once=once)
+            reconcile_parallel_read_batches(db)
             reconcile_scheduled_dynamic_runs(db)
             expired_work_items = SopWorkItemService(db).expire_due()
             for work_item in expired_work_items:

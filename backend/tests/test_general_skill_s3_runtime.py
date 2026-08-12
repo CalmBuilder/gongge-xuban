@@ -78,6 +78,7 @@ def test_multiple_loaded_skills_share_one_resource_budget(
             skill_id=f"skill_{index}",
             revision_id=f"revision_{index}",
             revision_number=1,
+            content_checksum=f"{index}" * 64,
             name=f"Skill {index}",
             description="",
             instructions="# Skill",
@@ -681,6 +682,37 @@ def test_dependency_load_requires_exact_approved_revision_edge(
     assert [item.skill_id for item in bundle] == [parent_skill.id, child_skill.id]
     assert [item.name for item in bundle] == [parent_skill.slug, child_skill.slug]
     assert [item.selection_mode for item in bundle] == ["forced", "dependency"]
+    preview = service.preview_bundle(
+        owner,
+        session_id=chat.id,
+        agent_id=agent.id,
+        skill_id=parent_skill.id,
+        selection_mode="forced",
+    )
+    expected_revisions = tuple(
+        (item.skill_id, item.revision_id, item.content_checksum) for item in preview
+    )
+    drifted_expected = (
+        expected_revisions[0],
+        (
+            expected_revisions[1][0],
+            expected_revisions[1][1],
+            "f" * 64,
+        ),
+    )
+    uses_before_conflict = len(db.exec(select(GeneralSkillUse)).all())
+    with pytest.raises(GeneralSkillRuntimeError) as dependency_drift:
+        service.load_bundle(
+            owner,
+            session_id=chat.id,
+            agent_id=agent.id,
+            turn_id="turn_bundle_revision_drift",
+            skill_id=parent_skill.id,
+            selection_mode="forced",
+            expected_revisions=drifted_expected,
+        )
+    assert dependency_drift.value.code == "GENERAL_SKILL_REVISION_CONFLICT"
+    assert len(db.exec(select(GeneralSkillUse)).all()) == uses_before_conflict
 
     composed = service.load_composed_bundle(
         owner,

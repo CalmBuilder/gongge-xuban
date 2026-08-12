@@ -49,6 +49,8 @@ class Settings(BaseSettings):
     dynamic_task_steering_enabled: bool = False
     dynamic_task_skill_loading_enabled: bool = False
     dynamic_task_max_parallel_reads: int = Field(default=1, ge=1, le=8)
+    dynamic_task_parallel_dispatch_workers: int = Field(default=8, ge=1, le=64)
+    dynamic_task_parallel_read_timeout_seconds: int = Field(default=120, ge=5, le=3600)
     dynamic_task_external_write_enabled: bool = False
     dynamic_task_standing_approval_enabled: bool = False
     dynamic_task_explore_enabled: bool = False

@@ -16,7 +16,7 @@ import threading
 import traceback
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from time import sleep
+from time import monotonic, sleep
 from types import SimpleNamespace
 from typing import Any, Literal
 
@@ -33,7 +33,7 @@ from app.agents.branching import (
 from app.agents.session_snapshot import anchor_chat_session
 from app.audit.service import append_user_management_audit
 from app.config import get_settings
-from app.core.cancellation import clear_chat_turn_cancelled, is_chat_turn_cancelled
+from app.core.cancellation import TurnCancellationToken, clear_chat_turn_cancelled
 from app.core.conversation_context import build_conversation_context
 from app.core.non_sop_capability import (
     LlmDynamicTaskShadowSelector,
@@ -72,6 +72,7 @@ from app.db.models import (
     new_id,
     utc_now,
 )
+from app.db.database import engine
 from app.dynamic_tasks.agent import DynamicRunOutcome, DynamicTaskAgent, DynamicTaskAgentError
 from app.dynamic_tasks.quotas import (
     DynamicTaskQuotaError,
@@ -94,6 +95,7 @@ from app.knowledge.citations import (
 )
 from app.knowledge.schema import KnowledgeSearchRequest, KnowledgeSearchResponse
 from app.llm import LLMClient, LLMError
+from app.llm.client import LLMStreamCancelled
 from app.llm.stage_protocol import stage_payload, unified_system_prompt
 from app.observability.spans import llm_operation
 from app.memory.jobs import enqueue_memory_capture
@@ -863,6 +865,7 @@ class AgentLoop:
         memory_context: list[dict[str, object]],
         conversation_context: dict[str, object],
         user_message_id: str | None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> ChatTurnResponse:
         """在回复模型运行前确定性加载指导型 revision，并用 Use 账本闭合本轮。"""
 
@@ -938,19 +941,38 @@ class AgentLoop:
                 "loaded_general_skills": [loaded.prompt_block() for loaded in loaded_bundle],
             }
             step_result = StepAgentResult(is_step_completed=True)
-            reply = self._generate_reply_segment(
-                request.message,
-                chat_session,
-                None,
-                router_decision,
-                step_result,
-                None,
-                model_config,
-                self._get_persona_prompt(request.tenant_id, chat_session.agent_id),
-                memory_context,
-                guided_context,
-                propagate_model_failure=True,
-            )
+            if is_cancelled is None:
+                reply = self._generate_reply_segment(
+                    request.message,
+                    chat_session,
+                    None,
+                    router_decision,
+                    step_result,
+                    None,
+                    model_config,
+                    self._get_persona_prompt(request.tenant_id, chat_session.agent_id),
+                    memory_context,
+                    guided_context,
+                    propagate_model_failure=True,
+                )
+            else:
+                reply = "".join(
+                    self._generate_reply_stream_segment(
+                        request.message,
+                        chat_session,
+                        None,
+                        router_decision,
+                        step_result,
+                        None,
+                        model_config,
+                        self._get_persona_prompt(request.tenant_id, chat_session.agent_id),
+                        memory_context,
+                        guided_context,
+                        is_cancelled=is_cancelled,
+                    )
+                )
+                if is_cancelled():
+                    raise LLMStreamCancelled("general Skill guidance cancelled")
             reply = self._finalize_turn(
                 chat_session,
                 request.tenant_id,
@@ -1323,6 +1345,7 @@ class AgentLoop:
                 memory_context=memory_context or [],
                 conversation_context=conversation_context or {},
                 user_message_id=user_message_id,
+                is_cancelled=is_cancelled,
             )
             yield self._stream_status(
                 chat_session,
@@ -1332,6 +1355,8 @@ class AgentLoop:
                 user_message_id=user_message_id,
             )
             for chunk in self.response_generator.chunk_text(response.reply):
+                if is_cancelled and is_cancelled():
+                    raise LLMStreamCancelled("general Skill reply delivery cancelled")
                 yield self._stream_event(
                     "stream_delta",
                     chat_session,
@@ -1479,6 +1504,7 @@ class AgentLoop:
                 if conversation_context is not None
                 else self._conversation_context(chat_session)
             ),
+            is_cancelled=is_cancelled,
         ):
             reply += chunk
             yield self._stream_event(
@@ -1853,6 +1879,7 @@ class AgentLoop:
         turn_finalized = False
         finalized_turn_reply: str | None = None
         user_message_id: str | None = None
+        cancellation_token: TurnCancellationToken | None = None
 
         def record_current_turn_cancelled(client_turn_id: str | None = None) -> bool:
             nonlocal turn_finalized
@@ -1889,6 +1916,9 @@ class AgentLoop:
                         chat_session,
                         user_message_id,
                         normalized_client_turn_id,
+                        partial_text=self._persisted_turn_partial(
+                            request.tenant_id, chat_session.id, user_message_id
+                        ),
                     )
                     clear_chat_turn_cancelled(chat_session.id, user_message_id)
                     if normalized_client_turn_id:
@@ -1913,6 +1943,9 @@ class AgentLoop:
                 chat_session,
                 user_message_id,
                 normalized_client_turn_id,
+                partial_text=self._persisted_turn_partial(
+                    request.tenant_id, chat_session.id, user_message_id
+                ),
             )
             self.db.commit()
             clear_chat_turn_cancelled(chat_session.id, user_message_id)
@@ -1924,14 +1957,9 @@ class AgentLoop:
         def mark_current_turn_cancelled() -> bool:
             if not chat_session or not user_message_id:
                 return False
-            client_turn_id = (request.client_turn_id or "").strip()
-            server_cancelled = is_chat_turn_cancelled(chat_session.id, user_message_id)
-            client_cancelled = bool(
-                client_turn_id and is_chat_turn_cancelled(chat_session.id, client_turn_id)
-            )
-            if not server_cancelled and not client_cancelled:
+            if cancellation_token is None or not cancellation_token.is_cancelled():
                 return False
-            return record_current_turn_cancelled(client_turn_id)
+            return record_current_turn_cancelled(request.client_turn_id)
 
         def finalize_turn_once(
             target_session: ChatSession,
@@ -2040,6 +2068,48 @@ class AgentLoop:
                 metadata=self._user_message_metadata(request),
             )
             user_message_id = user_message.id
+            cancel_probe_state: dict[str, float | bool] = {
+                "checked_at": 0.0,
+                "cancelled": False,
+            }
+
+            def persistent_cancel_probe() -> bool:
+                """有界轮询跨 worker 取消事件，且不复用模型流所在事务。"""
+
+                if bool(cancel_probe_state["cancelled"]):
+                    return True
+                now = monotonic()
+                if now - float(cancel_probe_state["checked_at"]) < 0.25:
+                    return False
+                cancel_probe_state["checked_at"] = now
+
+                with Session(engine) as cancel_db:
+                    events = cancel_db.exec(
+                        select(AgentEvent).where(
+                            AgentEvent.tenant_id == request.tenant_id,
+                            AgentEvent.session_id == chat_session.id,
+                            AgentEvent.event_type == "stream_cancelled",
+                        )
+                    ).all()
+                turn_ids = {user_message.id, str(request.client_turn_id or "").strip()}
+                for event in events:
+                    payload = event.payload_json or {}
+                    event_turn_ids = {
+                        str(payload.get("turn_id") or "").strip(),
+                        str(payload.get("user_message_id") or "").strip(),
+                        str(payload.get("client_turn_id") or "").strip(),
+                    }
+                    if turn_ids & event_turn_ids:
+                        cancel_probe_state["cancelled"] = True
+                        return True
+                return False
+
+            cancellation_token = TurnCancellationToken(
+                session_id=chat_session.id,
+                server_turn_id=user_message.id,
+                client_turn_id=str(request.client_turn_id or "").strip(),
+                persistent_probe=persistent_cancel_probe,
+            )
             bind_event_turn = getattr(self.events, "bind_turn", None)
             if callable(bind_event_turn):
                 bind_event_turn(user_message.id, request.client_turn_id)
@@ -2238,6 +2308,7 @@ class AgentLoop:
                     persona_prompt,
                     memory_context,
                     no_skill_context,
+                    is_cancelled=(cancellation_token.is_cancelled if cancellation_token else None),
                 ):
                     reply += chunk
                     yield self._stream_event(
@@ -2458,6 +2529,7 @@ class AgentLoop:
                     persona_prompt,
                     memory_context,
                     conversation_context,
+                    is_cancelled=(cancellation_token.is_cancelled if cancellation_token else None),
                 ):
                     reply += chunk
                     yield self._stream_event(
@@ -2751,6 +2823,7 @@ class AgentLoop:
                 memory_context,
                 conversation_context,
                 response_task_results,
+                is_cancelled=(cancellation_token.is_cancelled if cancellation_token else None),
             ):
                 chunks.append(chunk)
                 yield self._stream_event(
@@ -2789,6 +2862,9 @@ class AgentLoop:
                 except Exception:
                     self.db.rollback()
             raise
+        except LLMStreamCancelled:
+            record_current_turn_cancelled(request.client_turn_id)
+            return
         except AgentLoopPreconditionError as exc:
             yield from stream_failure_response(
                 "系统配置错误",
@@ -2894,6 +2970,66 @@ class AgentLoop:
         chat_session: ChatSession,
         payload: dict[str, object],
     ) -> dict[str, object]:
+        """投影单个 SSE 事件，并以持久取消事实阻断迟到正文与序号回退。"""
+
+        if kind == "stream_delta" and (payload.get("turn_id") or payload.get("user_message_id")):
+            turn_id = str(payload.get("turn_id") or payload.get("user_message_id"))
+            lock_result = self.db.exec(
+                select(ChatSession)
+                .where(
+                    ChatSession.id == chat_session.id,
+                    ChatSession.tenant_id == chat_session.tenant_id,
+                )
+                .with_for_update()
+            )
+            lock_one = getattr(lock_result, "one", None)
+            if callable(lock_one):
+                lock_one()
+            cancelled_events = self.db.exec(
+                select(AgentEvent).where(
+                    AgentEvent.tenant_id == chat_session.tenant_id,
+                    AgentEvent.session_id == chat_session.id,
+                    AgentEvent.event_type == "stream_cancelled",
+                )
+            ).all()
+            if any(
+                turn_id
+                in {
+                    str((event.payload_json or {}).get("turn_id") or ""),
+                    str((event.payload_json or {}).get("user_message_id") or ""),
+                }
+                for event in cancelled_events
+            ):
+                raise LLMStreamCancelled("turn already reached cancelled terminal state")
+            sequence_by_turn = getattr(self, "_stream_sequence_by_turn", None)
+            if not isinstance(sequence_by_turn, dict):
+                sequence_by_turn = {}
+                self._stream_sequence_by_turn = sequence_by_turn
+            persisted_sequence = 0
+            if turn_id not in sequence_by_turn:
+                prior_deltas = self.db.exec(
+                    select(AgentEvent).where(
+                        AgentEvent.tenant_id == chat_session.tenant_id,
+                        AgentEvent.session_id == chat_session.id,
+                        AgentEvent.event_type == "stream_delta",
+                    )
+                ).all()
+                persisted_sequence = max(
+                    (
+                        int((event.payload_json or {}).get("seq") or 0)
+                        for event in prior_deltas
+                        if turn_id
+                        == str(
+                            (event.payload_json or {}).get("turn_id")
+                            or (event.payload_json or {}).get("user_message_id")
+                            or ""
+                        )
+                    ),
+                    default=0,
+                )
+            next_sequence = max(int(sequence_by_turn.get(turn_id, 0)), persisted_sequence) + 1
+            sequence_by_turn[turn_id] = next_sequence
+            payload = {**payload, "seq": next_sequence}
         persisted_stream_events = {
             "agent_loop_completed",
             "agent_loop_continued",
@@ -3558,6 +3694,7 @@ class AgentLoop:
         memory_context: list[dict[str, object]],
         conversation_context: dict[str, object],
         task_results: list[dict[str, object]] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> Iterator[str]:
         yield from self.response_generator.generate_stream(
             message,
@@ -3571,6 +3708,7 @@ class AgentLoop:
             memory_context,
             conversation_context,
             task_results,
+            is_cancelled,
         )
 
     def _task_response_context(
@@ -8259,7 +8397,10 @@ class AgentLoop:
         chat_session: ChatSession,
         user_message_id: str,
         client_turn_id: str | None = None,
+        partial_text: str = "",
     ) -> Message | None:
+        """持久取消终态，正文保留已发送部分，停止提示仅作元数据。"""
+
         if not user_message_id:
             return None
         user_message = self.db.get(Message, user_message_id)
@@ -8294,19 +8435,27 @@ class AgentLoop:
             if turn_ids & row_turn_ids:
                 return None
 
+        canonical_partial = partial_text if partial_text.strip() else ""
+        assistant_content = canonical_partial or CANCELLED_ASSISTANT_REPLY
+        last_seq = len(
+            self._persisted_turn_delta_parts(tenant_id, chat_session.id, user_message_id)
+        )
         chat_session.updated_at = utc_now()
         chat_session.status = "active"
-        chat_session.summary = f"最近回复：{CANCELLED_ASSISTANT_REPLY}"
+        chat_session.summary = f"最近回复：{assistant_content}"
         assistant_message = self._append_message(
             tenant_id,
             chat_session.id,
             "assistant",
-            CANCELLED_ASSISTANT_REPLY,
+            assistant_content,
             metadata={
                 "turn_id": user_message_id,
                 "user_message_id": user_message_id,
                 "client_turn_id": normalized_client_turn_id or None,
                 "status": "cancelled",
+                "partial": bool(canonical_partial),
+                "terminal_reason": "user_cancelled",
+                "last_seq": last_seq,
             },
         )
         self.events.record(
@@ -8319,8 +8468,11 @@ class AgentLoop:
                 "user_message_id": user_message_id,
                 "turn_id": user_message_id,
                 "client_turn_id": normalized_client_turn_id or None,
-                "reply": CANCELLED_ASSISTANT_REPLY,
+                "reply": assistant_content,
                 "status": "cancelled",
+                "partial": bool(canonical_partial),
+                "terminal_reason": "user_cancelled",
+                "last_seq": last_seq,
             },
         )
         self.events.record(
@@ -8330,6 +8482,36 @@ class AgentLoop:
             public_session(chat_session).model_dump(),
         )
         return assistant_message
+
+    def _persisted_turn_delta_parts(
+        self, tenant_id: str, session_id: str, turn_id: str
+    ) -> list[str]:
+        """按持久顺序返回指定 Turn 已发送的正文 chunk，忽略其他 Turn 和空块。"""
+
+        events = self.db.exec(
+            select(AgentEvent)
+            .where(
+                AgentEvent.tenant_id == tenant_id,
+                AgentEvent.session_id == session_id,
+                AgentEvent.event_type == "stream_delta",
+            )
+            .order_by(AgentEvent.created_at, AgentEvent.id)
+        ).all()
+        parts: list[str] = []
+        for event in events:
+            payload = event.payload_json or {}
+            event_turn_id = str(
+                payload.get("turn_id") or payload.get("user_message_id") or ""
+            ).strip()
+            content = str(payload.get("content") or "")
+            if event_turn_id == turn_id and content:
+                parts.append(content)
+        return parts
+
+    def _persisted_turn_partial(self, tenant_id: str, session_id: str, turn_id: str) -> str:
+        """组合指定 Turn 已发送且已持久的规范部分输出。"""
+
+        return "".join(self._persisted_turn_delta_parts(tenant_id, session_id, turn_id))
 
     def _user_message_metadata(self, request: ChatTurnRequest) -> dict[str, Any]:
         metadata: dict[str, Any] = {}

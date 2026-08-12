@@ -914,8 +914,9 @@ def test_stream_text_events_are_persisted_for_refresh_recovery() -> None:
 
     assert event["event"] == "stream_delta"
     assert loop.events.records == [
-        ("tenant_demo", "session_test", "stream_delta", payload),
+        ("tenant_demo", "session_test", "stream_delta", {**payload, "seq": 1}),
     ]
+    assert event["data"]["seq"] == 1
     assert db.commits == 1
 
 

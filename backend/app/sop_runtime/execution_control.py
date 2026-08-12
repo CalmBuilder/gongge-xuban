@@ -254,7 +254,15 @@ class ExecutionControlService:
                     "ADD_SKILL_EXECUTION_NOT_ACTIVE",
                     "只有活动动态 Execution 可以接受运行中 Skill。",
                 )
-            body = {"skill_id": skill_id, "trigger": "user"}
+            trigger = str(body.get("trigger") or "user")
+            if trigger not in {"user", "agent"} or (
+                trigger == "agent" and source_type != "runtime"
+            ):
+                raise ExecutionControlError(
+                    "ADD_SKILL_TRIGGER_INVALID",
+                    "Agent 自主加载只能由受控 Runtime 触发。",
+                )
+            body = {"skill_id": skill_id, "trigger": trigger}
         checksum = canonical_checksum(body)
         existing = self.db.exec(
             select(ExecutionCommand).where(
@@ -523,6 +531,39 @@ class ExecutionControlService:
         self.db.refresh(signal)
         if result.rowcount != 1:
             raise ExecutionControlError("SIGNAL_ALREADY_CLAIMED", "signal 已被其他 worker 处理。")
+        return signal
+
+    def renew_signal(
+        self,
+        signal: ExecutionSignal,
+        *,
+        worker_id: str,
+        ttl_seconds: int = 30,
+    ) -> ExecutionSignal:
+        """仅由当前未过期 owner 续租 signal，防止长外呼被另一 worker 重领。"""
+
+        if ttl_seconds < 1 or not worker_id.strip():
+            raise ExecutionControlError("SIGNAL_LEASE_INVALID", "signal worker 和 TTL 必须有效。")
+        now = self.store.database_now()
+        result = self.db.exec(
+            update(ExecutionSignal)
+            .where(
+                ExecutionSignal.id == signal.id,
+                ExecutionSignal.tenant_id == signal.tenant_id,
+                ExecutionSignal.status == "claimed",
+                ExecutionSignal.lease_owner == worker_id,
+                ExecutionSignal.lease_expires_at > now,
+            )
+            .values(
+                lease_expires_at=now + timedelta(seconds=ttl_seconds),
+                updated_at=now,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if result.rowcount != 1:
+            raise ExecutionControlError("SIGNAL_FENCED", "signal 租约无效或已经过期。")
+        self.db.expire(signal)
+        self.db.refresh(signal)
         return signal
 
     def consume_signal(

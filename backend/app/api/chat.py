@@ -40,6 +40,7 @@ from app.db.models import (
     ScheduledTaskRun,
     Skill,
     SkillFeedback,
+    SopInstance,
     User,
     new_id,
     utc_now,
@@ -58,6 +59,8 @@ from app.security.permissions import can_use_agent_in_chat, is_admin_user
 from app.security.tenant import ensure_tenant
 from app.scheduled_tasks.schema import ScheduledTaskDraftRead
 from app.scheduled_tasks.service import DEFAULT_TASK_TIME, detect_scheduled_task_draft
+from app.sop_runtime.execution_control import ExecutionControlError, ExecutionControlService
+from app.sop_runtime.execution_store import SopExecutionConflictError, SopExecutionStore
 from app.session.managed_resources import ManagedInputResourceService
 from app.session.helpers import public_session
 from app.session.session_schema import (
@@ -1347,10 +1350,69 @@ def cancel_chat_turn_endpoint(
 ) -> dict[str, bool]:
     _ensure_request_tenant(request.tenant_id, current_user)
     chat_session = _ensure_chat_session_available(db, request.tenant_id, current_user.id, session_id)
-    cancel_chat_turn(session_id, request.turn_id)
-    _persist_chat_turn_cancelled(db, request.tenant_id, chat_session, request.turn_id, current_user.id)
+    persisted = _persist_chat_turn_cancelled(
+        db,
+        request.tenant_id,
+        chat_session,
+        request.turn_id,
+        current_user.id,
+    )
+    if not persisted:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="CHAT_TURN_NOT_FOUND")
+    message_id, _client_turn_id = _resolve_turn_ids_from_events(
+        db, request.tenant_id, chat_session.id, request.turn_id
+    )
+    _cancel_active_dynamic_execution(db, chat_session, message_id, current_user.id)
     db.commit()
+    cancel_chat_turn(session_id, request.turn_id)
     return {"ok": True}
+
+
+def _cancel_active_dynamic_execution(
+    db: Session,
+    chat_session: ChatSession,
+    requested_turn_id: str,
+    actor_user_id: str,
+) -> bool:
+    """将聊天停止桥接到同一会话的活动动态 Execution，并复用统一取消状态机。"""
+
+    instance = db.exec(
+        select(SopInstance)
+        .where(
+            SopInstance.tenant_id == chat_session.tenant_id,
+            SopInstance.session_id == chat_session.id,
+            SopInstance.kind == "dynamic_task",
+            SopInstance.source_ref == requested_turn_id,
+            SopInstance.status.in_(("created", "running", "waiting")),
+        )
+        .order_by(SopInstance.created_at.desc())
+    ).first()
+    if instance is None:
+        return False
+    if instance.initiator_user_id != actor_user_id:
+        raise HTTPException(status_code=403, detail="EXECUTION_CANCEL_FORBIDDEN")
+    store = SopExecutionStore(db)
+    control = ExecutionControlService(db, store)
+    command_id = f"chat-turn-cancel:{chat_session.id}:{requested_turn_id}"
+    worker_id = f"chat-cancel-{instance.id[-16:]}"
+    try:
+        command, _ = control.issue_command(
+            instance,
+            command_id=command_id,
+            command_type="cancel",
+            actor_user_id=actor_user_id,
+            expected_execution_revision=instance.revision,
+            payload={"reason": "chat_turn_cancelled"},
+            source_type="chat",
+            source_message_id=requested_turn_id,
+        )
+        if command.status == "pending":
+            with store.owned(instance, worker_id=worker_id):
+                control.apply_cancel_command(instance, command, worker_id=worker_id)
+    except (ExecutionControlError, SopExecutionConflictError) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return True
 
 
 def _persist_chat_turn_cancelled(
@@ -1363,6 +1425,14 @@ def _persist_chat_turn_cancelled(
     requested_turn_id = requested_turn_id.strip()
     if not requested_turn_id:
         return False
+    db.exec(
+        select(ChatSession)
+        .where(
+            ChatSession.id == chat_session.id,
+            ChatSession.tenant_id == tenant_id,
+        )
+        .with_for_update()
+    ).one()
 
     events = db.exec(
         select(AgentEvent)
@@ -1382,8 +1452,7 @@ def _persist_chat_turn_cancelled(
             client_turn_id = candidate_client_turn_id
             break
     if not message_id:
-        message_id = requested_turn_id
-        client_turn_id = requested_turn_id
+        return False
 
     turn_ids = {message_id}
     if client_turn_id:
@@ -1403,14 +1472,20 @@ def _persist_chat_turn_cancelled(
         if not matches_message and not matches_client_turn:
             continue
         if event.event_type == "stream_cancelled":
-            return _ensure_cancelled_assistant_message(
+            partial_text, last_seq = _persisted_turn_partial(
+                events, message_id, client_turn_id
+            )
+            _ensure_cancelled_assistant_message(
                 db,
                 tenant_id,
                 chat_session,
                 message_id,
                 client_turn_id,
                 event.created_at + timedelta(microseconds=1),
+                partial_text=partial_text,
+                last_seq=last_seq,
             )
+            return True
         return False
 
     now = utc_now()
@@ -1430,6 +1505,7 @@ def _persist_chat_turn_cancelled(
             created_at=now,
         )
     )
+    partial_text, last_seq = _persisted_turn_partial(events, message_id, client_turn_id)
     _ensure_cancelled_assistant_message(
         db,
         tenant_id,
@@ -1437,6 +1513,8 @@ def _persist_chat_turn_cancelled(
         message_id,
         client_turn_id,
         now + timedelta(microseconds=1),
+        partial_text=partial_text,
+        last_seq=last_seq,
     )
     chat_session.status = "active"
     chat_session.updated_at = now
@@ -1451,7 +1529,11 @@ def _ensure_cancelled_assistant_message(
     user_message_id: str,
     client_turn_id: str,
     created_at,
+    partial_text: str = "",
+    last_seq: int = 0,
 ) -> bool:
+    """为取消 Turn 创建唯一终态消息，优先保留用户已看到的部分正文。"""
+
     user_message = db.get(Message, user_message_id)
     if not user_message or user_message.tenant_id != tenant_id or user_message.session_id != chat_session.id:
         return False
@@ -1476,16 +1558,21 @@ def _ensure_cancelled_assistant_message(
         if turn_ids & row_turn_ids:
             return False
 
+    canonical_partial = partial_text if partial_text.strip() else ""
+    assistant_content = canonical_partial or CANCELLED_ASSISTANT_REPLY
     assistant_message = Message(
         tenant_id=tenant_id,
         session_id=chat_session.id,
         role="assistant",
-        content=CANCELLED_ASSISTANT_REPLY,
+        content=assistant_content,
         metadata_json={
             "turn_id": user_message_id,
             "user_message_id": user_message_id,
             "client_turn_id": client_turn_id or None,
             "status": "cancelled",
+            "partial": bool(canonical_partial),
+            "terminal_reason": "user_cancelled",
+            "last_seq": last_seq,
         },
         created_at=created_at,
     )
@@ -1501,16 +1588,53 @@ def _ensure_cancelled_assistant_message(
                 "user_message_id": user_message_id,
                 "turn_id": user_message_id,
                 "client_turn_id": client_turn_id or None,
-                "reply": CANCELLED_ASSISTANT_REPLY,
+                "reply": assistant_content,
                 "status": "cancelled",
+                "partial": bool(canonical_partial),
+                "terminal_reason": "user_cancelled",
+                "last_seq": last_seq,
             },
             created_at=created_at,
         )
     )
-    chat_session.summary = f"最近回复：{CANCELLED_ASSISTANT_REPLY}"
+    chat_session.summary = f"最近回复：{assistant_content}"
     chat_session.updated_at = created_at
     db.add(chat_session)
     return True
+
+
+def _persisted_turn_partial(
+    events: list[AgentEvent], message_id: str, client_turn_id: str
+) -> tuple[str, int]:
+    """按事件顺序组合 Turn 已持久的 stream_delta，返回正文和最后序号。"""
+
+    aliases = {message_id} - {""}
+    parts: list[str] = []
+    for event in events:
+        if event.event_type != "stream_delta":
+            continue
+        payload = event.payload_json or {}
+        event_aliases = {
+            str(payload.get("turn_id") or "").strip(),
+            str(payload.get("user_message_id") or "").strip(),
+            str(payload.get("client_turn_id") or "").strip(),
+        }
+        content = str(payload.get("content") or "")
+        if aliases & event_aliases and content:
+            parts.append(content)
+    last_seq = 0
+    for event in events:
+        if event.event_type != "stream_delta":
+            continue
+        payload = event.payload_json or {}
+        event_aliases = {
+            str(payload.get("turn_id") or "").strip(),
+            str(payload.get("user_message_id") or "").strip(),
+            str(payload.get("client_turn_id") or "").strip(),
+        }
+        if aliases & event_aliases:
+            last_seq = max(last_seq, int(payload.get("seq") or 0))
+    return "".join(parts), last_seq or len(parts)
 
 
 def _persist_chat_turn_interrupted(

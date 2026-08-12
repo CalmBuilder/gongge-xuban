@@ -77,6 +77,8 @@ def downgrade() -> None:
     """存在并发/重试派发事实时拒绝退回单 attempt 语义。"""
 
     bind = op.get_bind()
+    if not sa.inspect(bind).has_table("sop_operation_attempts"):
+        raise RuntimeError("parallel read downgrade requires sop_operation_attempts")
     active = int(
         bind.execute(
             sa.text(

@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 from app import paths
 from app.core.context_projection import (
@@ -21,6 +21,7 @@ from app.core.context_projection import (
 from app.db.models import ChatSession, ModelConfig, Skill
 from app.knowledge.citations import knowledge_citations_from_results
 from app.llm import LLMClient
+from app.llm.client import LLMStreamCancelled
 from app.llm.stage_protocol import stage_payload, unified_system_prompt
 from app.observability.spans import llm_operation
 from app.session.session_schema import RouterDecision, StepAgentResult
@@ -135,13 +136,18 @@ class ResponseGenerator:
         memory_context: list[dict[str, object]] | None = None,
         conversation_context: dict[str, object] | None = None,
         task_results: list[dict[str, object]] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> Iterator[str]:
+        """流式生成用户回复，并在 provider 首 token 前及每个 chunk 边界响应取消。"""
+
+        if is_cancelled and is_cancelled():
+            raise LLMStreamCancelled("LLM stream cancelled before provider request")
         runtime_control_reply = self._runtime_control_reply(step_result)
         if runtime_control_reply is not None:
-            yield from self.chunk_text(runtime_control_reply)
+            yield from self._cancelable_chunks(runtime_control_reply, is_cancelled)
             return
         if self._can_use_step_reply_directly(step_result, tool_result, task_results):
-            yield from self.chunk_text(step_result.reply or "")
+            yield from self._cancelable_chunks(step_result.reply or "", is_cancelled)
             return
         raw_payload = self._payload(
             message,
@@ -157,14 +163,19 @@ class ResponseGenerator:
         payload = self._stage_payload(raw_payload, persona_prompt)
         try:
             if tool_result and not tool_result.success and not task_results:
-                yield from self.chunk_text(tool_failure_reply(tool_result))
+                yield from self._cancelable_chunks(tool_failure_reply(tool_result), is_cancelled)
                 return
             if router_decision.decision == "clarify" and step_result.reply:
-                yield from self.chunk_text(step_result.reply)
+                yield from self._cancelable_chunks(step_result.reply, is_cancelled)
                 return
             with llm_operation("response.generate_stream"):
-                stream = LLMClient(model_config).generate_text_stream(
-                    unified_system_prompt(), payload
+                client = LLMClient(model_config)
+                stream = (
+                    client.generate_text_stream(
+                        unified_system_prompt(), payload, is_cancelled=is_cancelled
+                    )
+                    if is_cancelled is not None
+                    else client.generate_text_stream(unified_system_prompt(), payload)
                 )
                 reply_parts: list[str] = []
                 has_streamed = False
@@ -188,8 +199,10 @@ class ResponseGenerator:
                 tool_result,
                 skill,
             )
-            yield from self.chunk_text(reply)
+            yield from self._cancelable_chunks(reply, is_cancelled)
             return
+        except LLMStreamCancelled:
+            raise
         except Exception as exc:
             yield from self.chunk_text(
                 format_runtime_failure_reply("模型调用失败", exc, "LLM_ERROR", model_failure_suggestion(exc))
@@ -201,6 +214,18 @@ class ResponseGenerator:
             return
         for index in range(0, len(stripped), chunk_size):
             yield stripped[index : index + chunk_size]
+
+    def _cancelable_chunks(
+        self,
+        text: str,
+        is_cancelled: Callable[[], bool] | None,
+    ) -> Iterator[str]:
+        """分块交付本地回复时在每个 chunk 前重查 Turn 取消。"""
+
+        for chunk in self.chunk_text(text):
+            if is_cancelled and is_cancelled():
+                raise LLMStreamCancelled("local reply delivery cancelled")
+            yield chunk
 
     def _can_use_step_reply_directly(
         self,

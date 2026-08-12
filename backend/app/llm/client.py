@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import ast
 import base64
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 import copy
 import hashlib
 import json
 import math
+from queue import Empty, Full, Queue
 import re
+from threading import Event, Thread
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -35,6 +37,90 @@ from app.security.encryption import decrypt_secret
 
 class LLMError(Exception):
     """Raised when an LLM provider request or response normalization fails."""
+
+
+class LLMStreamCancelled(LLMError):
+    """表示用户已取消模型流，调用方应保留已发送部分而非生成失败文案。"""
+
+
+_STREAM_DONE = object()
+
+
+def _best_effort_close_stream(stream: Any) -> None:
+    """在 daemon 线程中尝试关闭第三方流，禁止其 close 阻塞取消返回。"""
+
+    close = getattr(stream, "close", None)
+    if not callable(close):
+        return
+
+    def invoke() -> None:
+        """隔离 provider close 的阻塞或异常，它们不改变本地取消终态。"""
+
+        try:
+            close()
+        except BaseException:
+            return
+
+    Thread(target=invoke, name="llm-provider-close", daemon=True).start()
+
+
+def _interruptible_provider_stream(
+    stream_factory: Callable[[], Any],
+    is_cancelled: Callable[[], bool] | None,
+) -> Iterator[Any]:
+    """在独立生产线程中等待 provider，使首 token 前与流中取消都能及时返回。"""
+
+    if is_cancelled is None:
+        yield from stream_factory()
+        return
+
+    queue: Queue[object] = Queue(maxsize=64)
+    active_stream: list[Any] = []
+    producer_stop = Event()
+
+    def produce() -> None:
+        """创建并消费 provider 流，将 chunk 或异常传递给可取消消费者。"""
+
+        try:
+            stream = stream_factory()
+            active_stream.append(stream)
+            for item in stream:
+                if producer_stop.is_set():
+                    break
+                while not producer_stop.is_set():
+                    try:
+                        queue.put(item, timeout=0.05)
+                        break
+                    except Full:
+                        continue
+        except BaseException as exc:
+            if not producer_stop.is_set():
+                queue.put(exc)
+        finally:
+            if not producer_stop.is_set():
+                queue.put(_STREAM_DONE)
+
+    producer = Thread(target=produce, name="llm-provider-stream", daemon=True)
+    producer.start()
+    try:
+        while True:
+            if is_cancelled():
+                if active_stream:
+                    _best_effort_close_stream(active_stream[0])
+                raise LLMStreamCancelled("LLM stream cancelled by user")
+            try:
+                item = queue.get(timeout=0.05)
+            except Empty:
+                continue
+            if item is _STREAM_DONE:
+                return
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+    finally:
+        producer_stop.set()
+        if is_cancelled() and active_stream:
+            _best_effort_close_stream(active_stream[0])
 
 
 JSON_REPAIR_ATTEMPTS = 3
@@ -197,7 +283,11 @@ class LLMClient:
             raise LLMError(_provider_failure_detail(self, exc)) from exc
 
     def generate_text_stream(
-        self, system_prompt: str, user_payload: dict[str, Any] | str
+        self,
+        system_prompt: str,
+        user_payload: dict[str, Any] | str,
+        *,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> Iterator[str]:
         """流式生成文本；首个正文发出前若推理长度截断，则扩大配额重新请求。"""
         max_output_tokens = operation_output_tokens(
@@ -244,19 +334,24 @@ class LLMClient:
                 finish_reasons: set[str] = set()
                 response_ids: set[str] = set()
                 try:
-                    stream = self.client.chat.completions.create(
-                        model=self.model,
-                        messages=request_messages,
-                        temperature=self.temperature,
-                        max_tokens=current_max_tokens,
-                        stream=True,
-                        **_thinking_request_kwargs(
-                            getattr(self, "thinking_mode", ""),
-                            getattr(self, "extra_body", {}),
-                        ),
-                    )
-                    provider_setup_ms = span.elapsed_ms()
-                    for chunk in stream:
+                    def create_stream() -> Any:
+                        """创建本次 provider 流，供可取消生产线程调用。"""
+
+                        return self.client.chat.completions.create(
+                            model=self.model,
+                            messages=request_messages,
+                            temperature=self.temperature,
+                            max_tokens=current_max_tokens,
+                            stream=True,
+                            **_thinking_request_kwargs(
+                                getattr(self, "thinking_mode", ""),
+                                getattr(self, "extra_body", {}),
+                            ),
+                        )
+
+                    for chunk in _interruptible_provider_stream(create_stream, is_cancelled):
+                        if provider_setup_ms is None:
+                            provider_setup_ms = span.elapsed_ms()
                         chunk_count += 1
                         chunk_usage_metrics = _usage_span_metrics(getattr(chunk, "usage", None))
                         if chunk_usage_metrics:
@@ -349,6 +444,8 @@ class LLMClient:
                         current_max_tokens
                     )
             raise LLMError(_empty_response_detail(self, empty_diagnostics))
+        except LLMStreamCancelled:
+            raise
         except Exception as exc:
             if isinstance(exc, LLMError):
                 raise

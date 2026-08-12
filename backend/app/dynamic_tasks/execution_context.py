@@ -292,7 +292,13 @@ def _project_result_by_schema(value: object, schema: dict[str, Any], *, depth: i
         projected: dict[str, object] = {}
         if isinstance(properties, dict):
             for key, child_schema in list(properties.items())[:_MAX_RESULT_ITEMS]:
-                if key in value and isinstance(child_schema, dict):
+                normalized = str(key).lower()
+                if (
+                    key in value
+                    and isinstance(child_schema, dict)
+                    and not str(key).startswith("_")
+                    and normalized not in _SENSITIVE_RESULT_KEYS
+                ):
                     projected[str(key)] = _project_result_by_schema(
                         value[key], child_schema, depth=depth + 1
                     )

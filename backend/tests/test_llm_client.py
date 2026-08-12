@@ -6,12 +6,16 @@
 @Description: 验证模型请求协议、输出配额、重试诊断、上下文投影和结构化响应。
 """
 
+from threading import Event, Thread
+from time import monotonic
+
 import pytest
 
 from app.llm.client import (
     PROVIDER_CONTENT_PARTS_KEY,
     LLMClient,
     LLMError,
+    LLMStreamCancelled,
     _prepare_user_input,
     _thinking_mode_for_model,
 )
@@ -643,6 +647,198 @@ def test_generate_text_stream_records_ttft_and_output_volume():
     assert finished["output_chars"] == 2
     assert finished["stream_chunks"] == 2
     assert finished["finish_reasons"] == ["stop"]
+
+
+def test_generate_text_stream_cancels_before_first_token_and_closes_provider() -> None:
+    """验证 provider 首 token 阻塞时取消仍及时生效，并尝试关闭远程流。"""
+
+    client = object.__new__(LLMClient)
+    client.client = _FakeOpenAIClient()
+    client.model = "demo-model"
+    client.base_url = "https://example.test/v1"
+    client.temperature = 0.2
+    client.max_output_tokens = 256
+    cancelled = Event()
+    provider_created = Event()
+    provider_closed = Event()
+
+    class BlockingStream:
+        """模拟在首 token 前永久阻塞且支持 close 的 provider 流。"""
+
+        def __iter__(self):
+            provider_created.set()
+            provider_closed.wait(timeout=5)
+            return iter(())
+
+        def close(self) -> None:
+            """记录上层已尝试关闭 provider 流。"""
+
+            provider_closed.set()
+
+    client.client.chat.completions.create = lambda **_kwargs: BlockingStream()
+    errors: list[BaseException] = []
+
+    def consume() -> None:
+        """在独立线程消费流，便于测试线程触发取消。"""
+
+        try:
+            list(
+                client.generate_text_stream(
+                    "system", {}, is_cancelled=cancelled.is_set
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = Thread(target=consume)
+    started = monotonic()
+    worker.start()
+    assert provider_created.wait(timeout=1)
+    cancelled.set()
+    worker.join(timeout=1)
+
+    assert not worker.is_alive()
+    assert monotonic() - started < 1.5
+    assert provider_closed.is_set()
+    assert len(errors) == 1
+    assert isinstance(errors[0], LLMStreamCancelled)
+
+
+def test_generate_text_stream_cancels_while_generator_is_executing() -> None:
+    """真实 generator 正在另一线程执行时，跨线程 close 失败不得覆盖取消终态。"""
+
+    client = object.__new__(LLMClient)
+    client.client = _FakeOpenAIClient()
+    client.model = "demo-model"
+    client.base_url = "https://example.test/v1"
+    client.temperature = 0.2
+    client.max_output_tokens = 256
+    cancelled = Event()
+    generator_entered = Event()
+    release_generator = Event()
+
+    def blocking_generator():
+        """停在 generator frame 内，复现跨线程 close 的 ValueError 边界。"""
+
+        generator_entered.set()
+        release_generator.wait(timeout=5)
+        if False:
+            yield None
+
+    client.client.chat.completions.create = lambda **_kwargs: blocking_generator()
+    errors: list[BaseException] = []
+
+    def consume() -> None:
+        """消费 provider 流并记录对调用方可见的唯一终态。"""
+
+        try:
+            list(client.generate_text_stream("system", {}, is_cancelled=cancelled.is_set))
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = Thread(target=consume)
+    worker.start()
+    assert generator_entered.wait(timeout=1)
+    cancelled.set()
+    worker.join(timeout=1)
+    release_generator.set()
+
+    assert not worker.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], LLMStreamCancelled)
+
+
+def test_generate_text_stream_cancels_midstream_without_emitting_late_chunk() -> None:
+    """流中取消保留已交付 chunk，provider 稍后返回的内容不得再向上游发送。"""
+
+    client = object.__new__(LLMClient)
+    client.client = _FakeOpenAIClient()
+    client.model = "demo-model"
+    client.base_url = "https://example.test/v1"
+    client.temperature = 0.2
+    client.max_output_tokens = 256
+    cancelled = Event()
+    release_late = Event()
+    closed = Event()
+
+    def chunk(content: str):
+        """构造含正文的 provider chunk。"""
+
+        delta = type("Delta", (), {"content": content, "reasoning_content": None})()
+        choice = type("Choice", (), {"delta": delta, "finish_reason": None})()
+        return type("Chunk", (), {"id": "chunk_demo", "choices": [choice]})()
+
+    class TwoStageStream:
+        """先返回一块正文，再阻塞模拟延迟的下一块。"""
+
+        def __iter__(self):
+            yield chunk("已发送")
+            release_late.wait(timeout=5)
+            yield chunk("不应发送")
+
+        def close(self) -> None:
+            """释放阻塞并记录关闭。"""
+
+            closed.set()
+            release_late.set()
+
+    client.client.chat.completions.create = lambda **_kwargs: TwoStageStream()
+    stream = client.generate_text_stream("system", {}, is_cancelled=cancelled.is_set)
+
+    assert next(stream) == "已发送"
+    cancelled.set()
+    with pytest.raises(LLMStreamCancelled):
+        next(stream)
+    assert closed.is_set()
+
+
+def test_generate_text_stream_does_not_wait_for_blocking_provider_close() -> None:
+    """provider.close 卡死时，本地取消仍必须在有界时间内返回。"""
+
+    client = object.__new__(LLMClient)
+    client.client = _FakeOpenAIClient()
+    client.model = "demo-model"
+    client.base_url = "https://example.test/v1"
+    client.temperature = 0.2
+    client.max_output_tokens = 256
+    cancelled = Event()
+    provider_created = Event()
+    release_close = Event()
+
+    class BlockingCloseStream:
+        """模拟首 token 前阻塞，且 close 本身也阻塞的恶劣 provider。"""
+
+        def __iter__(self):
+            provider_created.set()
+            release_close.wait(timeout=5)
+            return iter(())
+
+        def close(self) -> None:
+            """持续阻塞直到测试显式释放。"""
+
+            release_close.wait(timeout=5)
+
+    client.client.chat.completions.create = lambda **_kwargs: BlockingCloseStream()
+    errors: list[BaseException] = []
+
+    def consume() -> None:
+        """消费模型流并收集取消异常。"""
+
+        try:
+            list(client.generate_text_stream("system", {}, is_cancelled=cancelled.is_set))
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = Thread(target=consume)
+    worker.start()
+    assert provider_created.wait(timeout=1)
+    cancelled.set()
+    worker.join(timeout=0.5)
+    release_close.set()
+
+    assert not worker.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], LLMStreamCancelled)
 
 
 def test_generate_text_projects_conversation_context_messages():

@@ -83,3 +83,22 @@ def test_dynamic_skill_loading_command_constraint_roundtrip(tmp_path: Path) -> N
     }
     assert "add_skill" not in checks["ck_execution_command_type"]
     engine.dispose()
+
+
+def test_dynamic_skill_loading_migration_rejects_partial_historical_fixture(tmp_path: Path) -> None:
+    """历史单表夹具缺失 ExecutionCommand 时 fail-fast，禁止伪造已升级 schema。"""
+
+    database_url = f"sqlite:///{tmp_path / 'partial-history.db'}"
+    config = _config(database_url)
+    engine = sa.create_engine(database_url)
+    with engine.begin() as connection:
+        connection.execute(sa.text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)"))
+        connection.execute(sa.text("INSERT INTO alembic_version VALUES ('20260814_0063')"))
+
+    with pytest.raises(RuntimeError, match="requires execution_commands"):
+        command.upgrade(config, "20260814_0064")
+    with engine.connect() as connection:
+        assert connection.execute(
+            sa.text("SELECT version_num FROM alembic_version")
+        ).scalar_one() == "20260814_0063"
+    engine.dispose()

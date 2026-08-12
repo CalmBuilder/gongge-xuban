@@ -119,6 +119,12 @@ from app.tools.tool_executor import ToolExecutor
 from app.tools.tool_schema import ToolCall, ToolError, ToolResult
 
 
+_PARALLEL_READ_EXECUTOR = ThreadPoolExecutor(
+    max_workers=get_settings().dynamic_task_parallel_dispatch_workers,
+    thread_name_prefix="gongge-xuban-parallel-read",
+)
+
+
 class DynamicTaskAgentError(RuntimeError):
     """表示动态推进在 provider、能力、审批或状态边界被确定性拒绝。"""
 
@@ -218,14 +224,21 @@ class DynamicTaskAgent:
             else explore_enabled
         )
 
-    def _acquire_tool_quota(self, operation: SopOperation) -> None:
+    def _acquire_tool_quota(
+        self,
+        operation: SopOperation,
+        *,
+        contract_limit: int | None = None,
+    ) -> None:
         """生产入口已注入配额时在 dispatch 前占用工具槽，直接领域测试可显式不注入。"""
 
-        if self.quota_limits is None:
+        configured_limit = self.quota_limits.tool if self.quota_limits is not None else 0
+        limits = [value for value in (configured_limit, contract_limit or 0) if value > 0]
+        if not limits:
             return
         DynamicTaskQuotaService(self.db).acquire_tool_operation(
             operation,
-            limit=self.quota_limits.tool,
+            limit=min(limits),
         )
 
     def advance_next_read_step(
@@ -323,7 +336,7 @@ class DynamicTaskAgent:
                 and set(step.depends_on) <= completed
             ]
             candidates: list[tuple[PlanStep, CapabilitySnapshot]] = []
-            used_keys: set[str] = set()
+            key_counts: dict[str, int] = {}
             for step in ready:
                 if len(candidates) >= limit or len(step.capability_refs) != 1:
                     break
@@ -335,7 +348,7 @@ class DynamicTaskAgent:
                     or contract.get("parallel_safe") is not True
                     or int(contract.get("max_in_flight") or 1) < 2
                     or not key
-                    or key in used_keys
+                    or key_counts.get(key, 0) >= int(contract.get("max_in_flight") or 1)
                 ):
                     break
                 self.catalog.reauthorize_tool(
@@ -343,7 +356,7 @@ class DynamicTaskAgent:
                     actor_user_id=actor_user_id,
                     organization_unit_id=organization_unit_id,
                 )
-                used_keys.add(key)
+                key_counts[key] = key_counts.get(key, 0) + 1
                 candidates.append((step, snapshot))
             if len(candidates) < 2:
                 step, result = self.advance_next_read_step(
@@ -355,90 +368,118 @@ class DynamicTaskAgent:
                 )
                 return ((step, result),)
             capabilities = dict(verified_model.capability_snapshot_json or {})
-            prepared: list[tuple[PlanStep, SopNodeExecution, SopOperation, CapabilitySnapshot]] = []
+            proposed: list[
+                tuple[PlanStep, CapabilitySnapshot, CompletedProviderProposal]
+            ] = []
             for step, snapshot in candidates:
-                completed_response = self._propose_action(
-                    instance=instance,
-                    step=step,
-                    model_config=verified_model,
-                    worker_id=worker_id,
+                proposed.append(
+                    (
+                        step,
+                        snapshot,
+                        self._propose_action(
+                            instance=instance,
+                            step=step,
+                            model_config=verified_model,
+                            worker_id=worker_id,
+                        ),
+                    )
                 )
-                proposal = completed_response.proposal
-                node = self.store.enter_node(
-                    instance,
-                    step.step_key,
-                    step_key=step.step_key,
-                    plan_revision_id=instance.current_plan_revision_id,
-                    step_kind=step.kind,
-                    title=step.title,
-                    required=True,
-                )
-                record, _ = self.store.record_action_proposal(
-                    instance,
-                    node,
-                    provider=verified_model.provider,
-                    model=verified_model.model,
-                    model_capability_snapshot=capabilities,
-                    completed_response=completed_response,
-                )
-                operation, _ = self.store.prepare_operation_from_proposal(
-                    instance,
-                    node,
-                    record,
-                    operation_name=str(proposal.capability_ref),
-                    request=proposal.arguments,
-                    effect_kind="read",
-                    caused_by_skill_use_ids=step.guidance_skill_use_ids,
-                    capability_snapshot=snapshot.model_dump(
-                        mode="json", exclude={"checksum", "agent_id"}
-                    ),
-                    capability_snapshot_checksum=snapshot.checksum,
-                )
-                self._acquire_tool_quota(operation)
-                self.store.start_operation(operation)
-                self._consume_call_budget(instance, "tool_calls")
-                prepared.append((step, node, operation, snapshot))
-            wave_checksum = canonical_checksum(
-                {
-                    "execution_id": instance.id,
-                    "plan_revision_id": instance.current_plan_revision_id,
-                    "steps": [item[0].step_key for item in prepared],
-                    "operations": [item[2].id for item in prepared],
-                }
-            )
-            batch = DynamicReadDispatchBatch(
-                tenant_id=instance.tenant_id,
-                execution_id=instance.id,
-                plan_revision_id=str(instance.current_plan_revision_id),
-                wave_checksum=wave_checksum,
-                ordered_step_keys_json=[item[0].step_key for item in prepared],
-                status="dispatched",
-                parallelism=len(prepared),
-            )
-            self.db.add(batch)
-            self.db.flush()
+            prepared: list[tuple[PlanStep, SopNodeExecution, SopOperation, CapabilitySnapshot]] = []
             dispatch: list[tuple[DynamicReadDispatchItem, dict[str, object]]] = []
-            for position, (step, node, operation, snapshot) in enumerate(prepared):
-                token = canonical_checksum(
-                    {"batch_id": batch.id, "operation_id": operation.id, "position": position}
+            with self.db.begin_nested():
+                for step, snapshot, completed_response in proposed:
+                    proposal = completed_response.proposal
+                    node = self.store.enter_node(
+                        instance,
+                        step.step_key,
+                        step_key=step.step_key,
+                        plan_revision_id=instance.current_plan_revision_id,
+                        step_kind=step.kind,
+                        title=step.title,
+                        required=True,
+                    )
+                    record, _ = self.store.record_action_proposal(
+                        instance,
+                        node,
+                        provider=verified_model.provider,
+                        model=verified_model.model,
+                        model_capability_snapshot=capabilities,
+                        completed_response=completed_response,
+                    )
+                    operation, _ = self.store.prepare_operation_from_proposal(
+                        instance,
+                        node,
+                        record,
+                        operation_name=str(proposal.capability_ref),
+                        request=proposal.arguments,
+                        effect_kind="read",
+                        caused_by_skill_use_ids=step.guidance_skill_use_ids,
+                        capability_snapshot=snapshot.model_dump(
+                            mode="json", exclude={"checksum", "agent_id"}
+                        ),
+                        capability_snapshot_checksum=snapshot.checksum,
+                    )
+                    self._acquire_tool_quota(
+                        operation,
+                        contract_limit=int(snapshot.contract.get("max_in_flight") or 1),
+                    )
+                    DynamicTaskQuotaService(self.db).acquire_parallel_contract(
+                        operation,
+                        concurrency_key=str(snapshot.contract.get("concurrency_key") or ""),
+                        limit=int(snapshot.contract.get("max_in_flight") or 1),
+                    )
+                    self.store.start_operation(operation)
+                    self._consume_call_budget(instance, "tool_calls")
+                    prepared.append((step, node, operation, snapshot))
+                wave_checksum = canonical_checksum(
+                    {
+                        "execution_id": instance.id,
+                        "plan_revision_id": instance.current_plan_revision_id,
+                        "steps": [item[0].step_key for item in prepared],
+                        "operations": [item[2].id for item in prepared],
+                    }
                 )
-                item = DynamicReadDispatchItem(
+                batch = DynamicReadDispatchBatch(
                     tenant_id=instance.tenant_id,
-                    batch_id=batch.id,
                     execution_id=instance.id,
                     plan_revision_id=str(instance.current_plan_revision_id),
-                    position=position,
-                    step_key=step.step_key,
-                    node_execution_id=node.id,
-                    operation_id=operation.id,
-                    operation_revision_at_start=operation.revision,
-                    dispatch_token=token,
-                    capability_checksum=str(operation.capability_checksum),
-                    request_fingerprint=operation.request_fingerprint,
+                    wave_checksum=wave_checksum,
+                    ordered_step_keys_json=[item[0].step_key for item in prepared],
                     status="dispatched",
+                    parallelism=len(prepared),
+                    deadline_at=utc_now()
+                    + timedelta(
+                        seconds=get_settings().dynamic_task_parallel_read_timeout_seconds
+                    ),
                 )
-                self.db.add(item)
-                dispatch.append((item, dict(operation.request_json or {})))
+                self.db.add(batch)
+                self.db.flush()
+                for position, (step, node, operation, snapshot) in enumerate(prepared):
+                    token = canonical_checksum(
+                        {
+                            "batch_id": batch.id,
+                            "operation_id": operation.id,
+                            "position": position,
+                        }
+                    )
+                    item = DynamicReadDispatchItem(
+                        tenant_id=instance.tenant_id,
+                        batch_id=batch.id,
+                        execution_id=instance.id,
+                        plan_revision_id=str(instance.current_plan_revision_id),
+                        position=position,
+                        step_key=step.step_key,
+                        node_execution_id=node.id,
+                        operation_id=operation.id,
+                        operation_revision_at_start=operation.revision,
+                        dispatch_token=token,
+                        capability_checksum=str(operation.capability_checksum),
+                        request_fingerprint=operation.request_fingerprint,
+                        status="dispatched",
+                    )
+                    self.db.add(item)
+                    dispatch.append((item, dict(operation.request_json or {})))
+                self.db.flush()
             self.db.commit()
         self.db.commit()
         engine = self.db.get_bind()
@@ -492,29 +533,67 @@ class DynamicTaskAgent:
                             raise DynamicTaskAgentError(
                                 "DYNAMIC_PARALLEL_DISPATCH_CONTEXT_INVALID"
                             )
-                        inbox_db.add(
-                            DynamicReadDispatchResult(
-                            tenant_id=tenant_id,
-                            dispatch_token=token,
-                            status="succeeded" if result.success else "failed",
-                            result_json={"data": result.data} if result.success else {},
-                            error_json=(
-                                result.error.model_dump(mode="json") if result.error else {}
-                            ),
-                            started_at=started_at,
-                            finished_at=utc_now(),
-                        )
-                        )
+                        existing = inbox_db.exec(
+                            select(DynamicReadDispatchResult).where(
+                                DynamicReadDispatchResult.tenant_id == tenant_id,
+                                DynamicReadDispatchResult.dispatch_token == token,
+                            )
+                        ).first()
+                        if existing is None:
+                            snapshot = DynamicTaskAgent(inbox_db)._frozen_read_snapshot(
+                                io_instance, operation.operation_name
+                            )
+                            output_schema = (
+                                snapshot.model_view.get("output_schema")
+                                if isinstance(snapshot.model_view, dict)
+                                else None
+                            )
+                            safe_data = (
+                                project_result_for_model(result.data, output_schema)
+                                if result.success and isinstance(output_schema, dict)
+                                else None
+                            )
+                            inbox_db.add(
+                                DynamicReadDispatchResult(
+                                    tenant_id=tenant_id,
+                                    dispatch_token=token,
+                                    status="succeeded" if result.success else "failed",
+                                    result_json={"data": safe_data} if result.success else {},
+                                    error_json=(
+                                        result.error.model_dump(mode="json")
+                                        if result.error
+                                        else {}
+                                    ),
+                                    started_at=started_at,
+                                    finished_at=utc_now(),
+                                )
+                            )
                         inbox_item.status = "result_ready"
                         inbox_item.updated_at = utc_now()
                         inbox_db.add(inbox_item)
                         inbox_db.commit()
 
-        with ThreadPoolExecutor(max_workers=len(dispatch)) as executor:
-            futures = [executor.submit(execute_one, entry) for entry in dispatch]
-            wait(futures)
-            for future in futures:
+        futures = [_PARALLEL_READ_EXECUTOR.submit(execute_one, entry) for entry in dispatch]
+        timeout_seconds = get_settings().dynamic_task_parallel_read_timeout_seconds
+        done, not_done = wait(futures, timeout=timeout_seconds)
+        for future, (item, _arguments) in zip(futures, dispatch, strict=True):
+            if future in not_done:
+                self._append_parallel_dispatch_failure(
+                    engine,
+                    item,
+                    code="DYNAMIC_PARALLEL_DISPATCH_TIMEOUT",
+                    message="parallel read exceeded dispatch deadline",
+                )
+                continue
+            try:
                 future.result()
+            except BaseException as exc:
+                self._append_parallel_dispatch_failure(
+                    engine,
+                    item,
+                    code="DYNAMIC_PARALLEL_WORKER_FAILED",
+                    message=type(exc).__name__,
+                )
         results: list[tuple[PlanStep, ToolResult]] = []
         self.db.rollback()
         self.db.refresh(instance)
@@ -595,6 +674,43 @@ class DynamicTaskAgent:
         self.db.commit()
         return tuple(results)
 
+    @staticmethod
+    def _append_parallel_dispatch_failure(
+        engine,
+        item: DynamicReadDispatchItem,
+        *,
+        code: str,
+        message: str,
+    ) -> None:
+        """把 I/O worker 异常幂等收进结果 inbox，避免协调器留下 running 孤儿。"""
+
+        with Session(engine, expire_on_commit=False) as failure_db:
+            persisted = failure_db.get(DynamicReadDispatchItem, item.id)
+            if persisted is None or persisted.status not in {"dispatched", "result_ready"}:
+                return
+            existing = failure_db.exec(
+                select(DynamicReadDispatchResult).where(
+                    DynamicReadDispatchResult.tenant_id == persisted.tenant_id,
+                    DynamicReadDispatchResult.dispatch_token == persisted.dispatch_token,
+                )
+            ).first()
+            if existing is None:
+                now = utc_now()
+                failure_db.add(
+                    DynamicReadDispatchResult(
+                        tenant_id=persisted.tenant_id,
+                        dispatch_token=persisted.dispatch_token,
+                        status="failed",
+                        error_json={"code": code, "message": message[:256]},
+                        started_at=now,
+                        finished_at=now,
+                    )
+                )
+            persisted.status = "result_ready"
+            persisted.updated_at = utc_now()
+            failure_db.add(persisted)
+            failure_db.commit()
+
     def run_until_blocked_or_complete(
         self,
         *,
@@ -617,6 +733,24 @@ class DynamicTaskAgent:
             raise DynamicTaskAgentError("DYNAMIC_BUDGET_INVALID")
         for _iteration in range(max_steps + 1):
             self.db.refresh(instance)
+            if resume_signal_id is not None and instance.status in {
+                "succeeded",
+                "failed",
+                "cancelled",
+                "timed_out",
+            }:
+                signal = self.db.get(ExecutionSignal, resume_signal_id)
+                if signal is not None and signal.status == "claimed":
+                    ExecutionControlService(
+                        self.db, self.store
+                    ).settle_claimed_signal_for_terminal_execution(
+                        instance,
+                        signal,
+                        worker_id=signal_worker_id or worker_id,
+                        error={"code": "SIGNAL_EXECUTION_ALREADY_TERMINAL"},
+                    )
+                    self.db.commit()
+                resume_signal_id = None
             if instance.status in {"failed", "cancelled", "timed_out"}:
                 GeneralSkillRuntimeService(self.db).settle_execution_uses(
                     execution_id=instance.id,
@@ -788,6 +922,15 @@ class DynamicTaskAgent:
                 self.db.commit()
                 continue
             if step.kind == "answer":
+                discovered = self._try_runtime_skill_discovery(
+                    instance=instance,
+                    plan=plan,
+                    model_config=model_config,
+                    worker_id=worker_id,
+                    actor_user_id=actor_user_id,
+                )
+                if discovered is not None:
+                    return discovered
                 repair_feedback: dict[str, object] | None = None
                 message: Message | None = None
                 for result_attempt in range(2):
@@ -2146,7 +2289,11 @@ class DynamicTaskAgent:
                 actor_user_id=instance.initiator_user_id,
             )
         control = ExecutionControlService(self.db, self.store)
-        control.claim_signal(signal, worker_id=worker_id, ttl_seconds=300)
+        control.claim_signal(
+            signal,
+            worker_id=worker_id,
+            ttl_seconds=300,
+        )
         self.db.commit()
         operation = self.db.get(
             SopOperation,
@@ -3200,9 +3347,120 @@ class DynamicTaskAgent:
                 worker_id=worker_id,
                 actor_user_id=instance.initiator_user_id,
             )
-        control.claim_signal(signal, worker_id=worker_id, ttl_seconds=300)
+        control.claim_signal(
+            signal,
+            worker_id=worker_id,
+            ttl_seconds=_signal_lease_ttl_seconds(),
+        )
         self.db.commit()
-        with self.store.owned(instance, worker_id=worker_id):
+
+        proposed_plan: NormalizedPlan | None = None
+        preview_revisions: tuple[tuple[str, str, str], ...] = ()
+        if command.status == "pending":
+            self.db.refresh(instance)
+            base_revision_id = str(
+                (command.result_json or {}).get("base_plan_revision_id") or ""
+            )
+            if (
+                actor_user_id == instance.initiator_user_id
+                and self._steer_actor_authorized(instance, actor_user_id)
+                and skill_loading_enabled
+                and base_revision_id
+                and instance.current_plan_revision_id == base_revision_id
+            ):
+                existing_use = self.db.exec(
+                    select(GeneralSkillUse).where(
+                        GeneralSkillUse.tenant_id == instance.tenant_id,
+                        GeneralSkillUse.execution_id == instance.id,
+                        GeneralSkillUse.skill_id
+                        == str(command.payload_json.get("skill_id") or ""),
+                        GeneralSkillUse.status == "active",
+                    )
+                ).first()
+                if existing_use is None:
+                    self._assert_steer_safe_boundary(instance)
+                    actor = self.db.get(User, actor_user_id)
+                    current_revision = self.db.get(ExecutionPlanRevision, base_revision_id)
+                    if actor is None or current_revision is None:
+                        raise DynamicTaskAgentError("DYNAMIC_PLAN_NOT_FOUND")
+                    runtime = GeneralSkillRuntimeService(self.db)
+                    selection_mode = (
+                        "auto"
+                        if str(command.payload_json.get("trigger") or "user") == "agent"
+                        else "forced"
+                    )
+                    preview = runtime.preview_bundle(
+                        actor,
+                        session_id=instance.session_id,
+                        agent_id=instance.agent_id,
+                        skill_id=str(command.payload_json.get("skill_id") or ""),
+                        selection_mode=selection_mode,
+                    )
+                    preview_revisions = tuple(
+                        (row.skill_id, row.revision_id, row.content_checksum)
+                        for row in preview
+                    )
+                    active_loaded = [
+                        runtime.project_use_for_execution(
+                            actor,
+                            use_id=use.id,
+                            session_id=instance.session_id,
+                            agent_id=str(instance.agent_id),
+                            execution_id=instance.id,
+                        )
+                        for use in self.db.exec(
+                            select(GeneralSkillUse).where(
+                                GeneralSkillUse.tenant_id == instance.tenant_id,
+                                GeneralSkillUse.execution_id == instance.id,
+                                GeneralSkillUse.status == "active",
+                            )
+                        ).all()
+                    ]
+                    bounded_loaded = runtime.apply_shared_resource_budget(
+                        tuple((*active_loaded, *preview))
+                    )
+                    planning_guidance = tuple(
+                        {
+                            "name": row.name,
+                            "skill_use_ids": [row.use_id],
+                            "skills": [row.prompt_block()],
+                        }
+                        for row in bounded_loaded
+                    )
+                    snapshot = dict(current_revision.capability_snapshot_json or {})
+                    frozen_capabilities = tuple(
+                        CapabilitySnapshot.model_validate(item)
+                        for group in ("tools", "connectors", "general_skills", "knowledge")
+                        for item in snapshot.get(group, [])
+                        if isinstance(item, dict)
+                    )
+                    current_plan = NormalizedPlan.model_validate(current_revision.plan_json)
+                    with self.store.owned(instance, worker_id=worker_id):
+                        self._consume_call_budget(instance, "model_calls")
+                        self.db.commit()
+                    self.db.commit()
+                    planner = self.planner or DynamicTaskPlanner(
+                        LLMClient(model_config),
+                        explore_enabled=self.explore_enabled,
+                    )
+                    with self._signal_lease_heartbeat(signal.id, worker_id=worker_id):
+                        proposed_plan = planner.create_plan(
+                            goal=current_plan.goal,
+                            success_criteria=current_plan.success_criteria,
+                            capabilities=frozen_capabilities,
+                            loaded_guidance=planning_guidance,
+                        )
+        with self.store.owned(
+            instance,
+            worker_id=worker_id,
+            ttl_seconds=_model_lease_ttl_seconds(),
+        ):
+            self.db.refresh(signal)
+            control.renew_signal(
+                signal,
+                worker_id=worker_id,
+                ttl_seconds=_signal_lease_ttl_seconds(),
+            )
             self.db.refresh(command)
             self.db.refresh(instance)
             if command.status == "applied":
@@ -3260,13 +3518,38 @@ class DynamicTaskAgent:
                         raise DynamicTaskAgentError("DYNAMIC_PLAN_NOT_FOUND")
                     skill_id = str(command.payload_json.get("skill_id") or "")
                     runtime = GeneralSkillRuntimeService(self.db)
+                    existing_use = self.db.exec(
+                        select(GeneralSkillUse).where(
+                            GeneralSkillUse.tenant_id == instance.tenant_id,
+                            GeneralSkillUse.execution_id == instance.id,
+                            GeneralSkillUse.skill_id == skill_id,
+                            GeneralSkillUse.status == "active",
+                        )
+                    ).first()
+                    if existing_use is not None:
+                        self._settle_execution_command(
+                            instance,
+                            command,
+                            status="applied",
+                            reason_code="GENERAL_SKILL_ALREADY_ACTIVE",
+                            worker_id=worker_id,
+                            plan_revision_id=instance.current_plan_revision_id,
+                        )
+                        control.consume_signal(instance, signal, worker_id=worker_id)
+                        self.db.commit()
+                        return DynamicRunOutcome("applied", instance.id)
                     loaded = runtime.load_bundle(
                         actor,
                         session_id=instance.session_id,
                         agent_id=instance.agent_id,
                         turn_id=f"execution:{instance.id}:add-skill:{command.command_id}",
                         skill_id=skill_id,
-                        selection_mode="forced",
+                        selection_mode=(
+                            "auto"
+                            if str(command.payload_json.get("trigger") or "user") == "agent"
+                            else "forced"
+                        ),
+                        expected_revisions=preview_revisions,
                         commit=False,
                     )
                     for row in loaded:
@@ -3278,13 +3561,47 @@ class DynamicTaskAgent:
                         self.db.add(use)
                     current_plan = NormalizedPlan.model_validate(current_revision.plan_json)
                     completed = self._completed_step_keys(instance)
-                    revised_plan = self._plan_with_added_skill(
+                    snapshot = dict(current_revision.capability_snapshot_json or {})
+                    frozen_capabilities = tuple(
+                        CapabilitySnapshot.model_validate(item)
+                        for group in ("tools", "connectors", "general_skills", "knowledge")
+                        for item in snapshot.get(group, [])
+                        if isinstance(item, dict)
+                    )
+                    active_loaded = [
+                        runtime.project_use_for_execution(
+                            actor,
+                            use_id=use.id,
+                            session_id=instance.session_id,
+                            agent_id=str(instance.agent_id),
+                            execution_id=instance.id,
+                        )
+                        for use in self.db.exec(
+                            select(GeneralSkillUse).where(
+                                GeneralSkillUse.tenant_id == instance.tenant_id,
+                                GeneralSkillUse.execution_id == instance.id,
+                                GeneralSkillUse.status == "active",
+                            )
+                        ).all()
+                    ]
+                    bounded_loaded = runtime.apply_shared_resource_budget(tuple(active_loaded))
+                    planning_guidance = tuple(
+                        {
+                            "name": row.name,
+                            "skill_use_ids": [row.use_id],
+                            "skills": [row.prompt_block()],
+                        }
+                        for row in bounded_loaded
+                    )
+                    if proposed_plan is None:
+                        raise DynamicTaskAgentError("DYNAMIC_ADD_SKILL_REPLAN_MISSING")
+                    revised_plan = self._merge_replanned_with_completed(
                         current_plan,
+                        proposed_plan,
                         completed_step_keys=completed,
                         guidance_use_ids=tuple(row.use_id for row in loaded),
                         revision_suffix=command.id[-12:],
                     )
-                    snapshot = dict(current_revision.capability_snapshot_json or {})
                     catalog_rows = self.catalog.list_general_skills(
                         instance.tenant_id,
                         instance.agent_id,
@@ -3360,40 +3677,92 @@ class DynamicTaskAgent:
         )
 
     @staticmethod
-    def _plan_with_added_skill(
-        plan: NormalizedPlan,
+    def _merge_replanned_with_completed(
+        current_plan: NormalizedPlan,
+        proposed_plan: NormalizedPlan,
         *,
         completed_step_keys: set[str],
         guidance_use_ids: tuple[str, ...],
         revision_suffix: str,
     ) -> NormalizedPlan:
-        """保留已完成步骤，为未来步骤分配新身份并显式附加新 Skill 指导。"""
+        """把完整重规划与已成功证据合并，避免重跑且确保新 Skill 被未来步骤消费。"""
 
-        key_map = {
-            step.step_key: (
-                step.step_key
-                if step.step_key in completed_step_keys
-                else f"{step.step_key}__skill_{revision_suffix}"
-            )
-            for step in plan.steps
+        completed_steps = [
+            step for step in current_plan.steps if step.step_key in completed_step_keys
+        ]
+        completed_by_signature = {
+            (
+                step.step_key,
+                step.kind,
+                step.title,
+                tuple(step.capability_refs),
+                tuple(step.depends_on),
+                canonical_checksum(step.expected_output_schema),
+            ): step
+            for step in completed_steps
         }
-        steps: list[PlanStep] = []
-        for step in plan.steps:
-            if step.step_key in completed_step_keys:
-                steps.append(step)
-                continue
+        reused_keys: dict[str, str] = {}
+        future_steps: list[PlanStep] = []
+        for step in proposed_plan.steps:
+            matched = completed_by_signature.get(
+                (
+                    step.step_key,
+                    step.kind,
+                    step.title,
+                    tuple(step.capability_refs),
+                    tuple(step.depends_on),
+                    canonical_checksum(step.expected_output_schema),
+                )
+            )
+            if matched is not None and step.kind != "answer":
+                reused_keys[step.step_key] = matched.step_key
+            else:
+                future_steps.append(step)
+        key_map = {
+            step.step_key: f"{step.step_key}__skill_{revision_suffix}" for step in future_steps
+        }
+        dependency_map = {**reused_keys, **key_map}
+        steps: list[PlanStep] = list(completed_steps)
+        for step in future_steps:
             steps.append(
                 step.model_copy(
                     update={
                         "step_key": key_map[step.step_key],
-                        "depends_on": tuple(key_map[value] for value in step.depends_on),
+                        "depends_on": tuple(
+                            dependency_map[value]
+                            for value in step.depends_on
+                            if value in dependency_map
+                        ),
                         "guidance_skill_use_ids": tuple(
-                            dict.fromkeys((*step.guidance_skill_use_ids, *guidance_use_ids))
+                            dict.fromkeys(
+                                (
+                                    use_id
+                                    for use_id in step.guidance_skill_use_ids
+                                    if not use_id.startswith("preview:")
+                                )
+                            )
+                        )
+                        + tuple(
+                            use_id
+                            for use_id in guidance_use_ids
+                            if use_id
+                            and use_id
+                            not in {
+                                item
+                                for item in step.guidance_skill_use_ids
+                                if not item.startswith("preview:")
+                            }
                         ),
                     }
                 )
             )
-        return plan.model_copy(update={"steps": tuple(steps)})
+        if not any(
+            set(step.guidance_skill_use_ids) & set(guidance_use_ids)
+            for step in steps
+            if step.step_key not in completed_step_keys
+        ):
+            raise DynamicTaskAgentError("DYNAMIC_ADDED_SKILL_NOT_CONSUMED")
+        return proposed_plan.model_copy(update={"steps": tuple(steps)})
 
     def _steer_actor_authorized(self, instance: SopInstance, actor_user_id: str) -> bool:
         """处理命令时重新验证成员状态和 Execution 管理资格，防止排队期间撤权失效。"""
@@ -3517,6 +3886,103 @@ class DynamicTaskAgent:
                 "reason_code": reason_code,
                 "plan_revision_id": plan_revision_id,
             },
+        )
+
+    def _try_runtime_skill_discovery(
+        self,
+        *,
+        instance: SopInstance,
+        plan: NormalizedPlan,
+        model_config: ModelConfig,
+        worker_id: str,
+        actor_user_id: str,
+    ) -> DynamicRunOutcome | None:
+        """在 answer 前以实时无正文目录发现一个新 model-allowed Skill，并走统一重规划。"""
+
+        if not getattr(get_settings(), "dynamic_task_skill_loading_enabled", False):
+            return None
+        planner = self.planner or DynamicTaskPlanner(
+            LLMClient(model_config),
+            explore_enabled=self.explore_enabled,
+        )
+        selector = getattr(planner, "select_guidance_skills", None)
+        if not callable(selector):
+            return None
+        active_skill_ids = {
+            row.skill_id
+            for row in self.db.exec(
+                select(GeneralSkillUse).where(
+                    GeneralSkillUse.tenant_id == instance.tenant_id,
+                    GeneralSkillUse.execution_id == instance.id,
+                    GeneralSkillUse.status == "active",
+                )
+            ).all()
+        }
+        catalog = [
+            row
+            for row in self.catalog.list_general_skills(
+                instance.tenant_id,
+                str(instance.agent_id),
+                actor_user_id=actor_user_id,
+            )
+            if row.capability_id not in active_skill_ids
+            and row.contract.get("invocation_policy") == "model_allowed"
+        ]
+        if not catalog:
+            return None
+        autonomous_count = len(
+            self.db.exec(
+                select(GeneralSkillUse).where(
+                    GeneralSkillUse.tenant_id == instance.tenant_id,
+                    GeneralSkillUse.execution_id == instance.id,
+                    GeneralSkillUse.selection_mode == "auto",
+                )
+            ).all()
+        )
+        if autonomous_count >= 3:
+            return None
+        self._consume_call_budget(instance, "model_calls")
+        self.db.commit()
+        selection = selector(
+            goal=plan.goal,
+            success_criteria=plan.success_criteria,
+            catalog=catalog,
+        )
+        by_name = {row.name: row for row in catalog}
+        selected = next(
+            (
+                by_name[name]
+                for name in selection.selected_skill_names
+                if name in by_name
+            ),
+            None,
+        )
+        if selected is None:
+            return None
+        command_id = (
+            f"agent-add-skill:{instance.id}:{instance.current_plan_revision_id}:"
+            f"{selected.capability_id}"
+        )
+        control = ExecutionControlService(self.db, self.store)
+        command, _ = control.issue_command(
+            instance,
+            command_id=command_id,
+            command_type="add_skill",
+            actor_user_id=actor_user_id,
+            expected_execution_revision=instance.revision,
+            payload={"skill_id": selected.capability_id, "trigger": "agent"},
+            source_type="runtime",
+        )
+        self.db.commit()
+        signal = self.db.exec(
+            select(ExecutionSignal).where(ExecutionSignal.causation_id == command.id)
+        ).one()
+        return self.resume_add_skill_signal(
+            signal_id=signal.id,
+            model_config=model_config,
+            worker_id=f"{worker_id}:skill-discovery",
+            actor_user_id=actor_user_id,
+            skill_loading_enabled=True,
         )
 
     def advance_next_knowledge_step(
@@ -5441,6 +5907,47 @@ class DynamicTaskAgent:
             stop.set()
             thread.join(timeout=max(1.0, interval_seconds))
 
+    @contextmanager
+    def _signal_lease_heartbeat(self, signal_id: str, *, worker_id: str) -> Iterator[None]:
+        """长规划期间独立续租 signal；失权后由最终 owner 校验机械拒绝迟到应用。"""
+
+        stop = threading.Event()
+        interval_seconds = max(1.0, _signal_lease_ttl_seconds() / 3)
+        bind = self.db.get_bind()
+        if bind.dialect.name == "sqlite" and not bind.url.database:
+            yield
+            return
+
+        def heartbeat() -> None:
+            """在独立事务中按 signal owner 续租，任何 fencing 或数据库故障立即停止。"""
+
+            while not stop.wait(interval_seconds):
+                try:
+                    with Session(bind) as heartbeat_db:
+                        row = heartbeat_db.get(ExecutionSignal, signal_id)
+                        if row is None:
+                            return
+                        ExecutionControlService(heartbeat_db).renew_signal(
+                            row,
+                            worker_id=worker_id,
+                            ttl_seconds=_signal_lease_ttl_seconds(),
+                        )
+                        heartbeat_db.commit()
+                except Exception:
+                    return
+
+        thread = threading.Thread(
+            target=heartbeat,
+            name=f"dynamic-signal-lease-{signal_id}",
+            daemon=True,
+        )
+        thread.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            thread.join(timeout=max(1.0, interval_seconds))
+
     def _step_guidance(
         self,
         instance: SopInstance,
@@ -5775,6 +6282,12 @@ def _model_lease_ttl_seconds() -> int:
 
     timeout = float(getattr(get_settings(), "model_api_timeout_seconds", 600.0) or 600.0)
     return max(30, min(180, math.ceil(min(timeout, 120.0)) + 30))
+
+
+def _signal_lease_ttl_seconds() -> int:
+    """返回由独立 heartbeat 续租的短 signal TTL，使崩溃后可有界恢复。"""
+
+    return 30
 
 
 def canonical_result_checksum(result: DynamicTaskResult) -> str:
