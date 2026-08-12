@@ -117,6 +117,25 @@ def test_contract_rejects_overlapping_visibility_paths() -> None:
         )
 
 
+def test_parallel_contract_requires_explicit_safe_read_and_concurrency_key() -> None:
+    """验证并行默认关闭，只有确定失败的纯读契约可声明稳定并发边界。"""
+
+    contract = _contract(
+        parallel_safe=True,
+        concurrency_key="crm-read",
+        max_in_flight=3,
+    )
+    assert contract.parallel_safe is True
+    assert contract.max_in_flight == 3
+
+    with pytest.raises(ValidationError):
+        _contract(parallel_safe=True)
+    with pytest.raises(ValidationError):
+        _contract(concurrency_key="crm-read")
+    with pytest.raises(ValidationError):
+        _contract(parallel_safe=False, max_in_flight=2)
+
+
 def test_capability_snapshot_is_canonical_and_views_do_not_leak_credentials() -> None:
     """验证键顺序不影响 checksum，且模型/用户视图不包含凭据或审计专用数据。"""
 

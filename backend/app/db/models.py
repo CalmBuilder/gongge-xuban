@@ -1019,7 +1019,8 @@ class SopOperation(SQLModel, table=True):
             name="uq_sop_operation_tenant_logical_action",
         ),
         CheckConstraint(
-            "status IN ('prepared', 'running', 'succeeded', 'failed', 'unknown', 'cancelled')",
+            "status IN ('prepared', 'running', 'retry_wait', 'succeeded', 'failed', "
+            "'unknown', 'cancelled')",
             name="ck_sop_operation_status",
         ),
         CheckConstraint(
@@ -1090,9 +1091,8 @@ class SopOperationAttempt(SQLModel, table=True):
     __table_args__ = (
         UniqueConstraint(
             "tenant_id",
-            "operation_id",
-            "node_execution_id",
-            name="uq_sop_operation_attempt_execution",
+            "dispatch_token",
+            name="uq_sop_operation_attempt_dispatch_token",
         ),
         UniqueConstraint(
             "tenant_id",
@@ -1101,7 +1101,7 @@ class SopOperationAttempt(SQLModel, table=True):
             name="uq_sop_operation_attempt_number",
         ),
         CheckConstraint(
-            "status IN ('prepared', 'running', 'succeeded', 'failed', 'unknown', "
+            "status IN ('prepared', 'running', 'retry_wait', 'succeeded', 'failed', 'unknown', "
             "'cancelled', 'reused')",
             name="ck_sop_operation_attempt_status",
         ),
@@ -1113,12 +1113,99 @@ class SopOperationAttempt(SQLModel, table=True):
     operation_id: str = Field(sa_column=Column(String(512), nullable=False, index=True))
     node_execution_id: IdentifierString = Field(index=True)
     attempt_number: int = Field(ge=1)
+    dispatch_token: OptionalVersionString = Field(default=None, index=True)
     status: LabelString = Field(default="prepared", index=True)
     error_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    deadline_at: datetime | None = Field(default=None, index=True)
+    retry_at: datetime | None = Field(default=None, index=True)
     started_at: datetime | None = None
     completed_at: datetime | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
+
+
+class DynamicReadDispatchBatch(SQLModel, table=True):
+    """保存同一 PlanRevision 下已通过全量门禁的有序纯读派发波次。"""
+
+    __tablename__ = "dynamic_read_dispatch_batches"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "wave_checksum", name="uq_dynamic_read_wave"),
+        CheckConstraint(
+            "status IN ('ready', 'dispatched', 'settling', 'succeeded', 'failed', "
+            "'cancelled', 'superseded')",
+            name="ck_dynamic_read_batch_status",
+        ),
+        CheckConstraint("parallelism >= 1 AND revision >= 0", name="ck_dynamic_read_batch_bounds"),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("readbatch"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    execution_id: IdentifierString = Field(index=True)
+    plan_revision_id: IdentifierString = Field(index=True)
+    wave_checksum: VersionString = Field(index=True)
+    ordered_step_keys_json: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    status: LabelString = Field(default="ready", index=True)
+    parallelism: int = Field(default=1, ge=1, le=8)
+    revision: int = Field(default=0, ge=0)
+    deadline_at: datetime | None = Field(default=None, index=True)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class DynamicReadDispatchItem(SQLModel, table=True):
+    """关联波次顺序、Node、Operation 与唯一物理派发 token。"""
+
+    __tablename__ = "dynamic_read_dispatch_items"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "dispatch_token", name="uq_dynamic_read_dispatch_token"),
+        UniqueConstraint("tenant_id", "batch_id", "position", name="uq_dynamic_read_position"),
+        CheckConstraint(
+            "status IN ('dispatch_pending', 'dispatched', 'result_ready', 'settled', "
+            "'discarded')",
+            name="ck_dynamic_read_item_status",
+        ),
+        CheckConstraint("position >= 0", name="ck_dynamic_read_item_position"),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("readitem"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    batch_id: IdentifierString = Field(index=True)
+    execution_id: IdentifierString = Field(index=True)
+    plan_revision_id: IdentifierString = Field(index=True)
+    position: int = Field(ge=0)
+    step_key: IdentifierString = Field(index=True)
+    node_execution_id: IdentifierString = Field(index=True)
+    operation_id: IdentifierString = Field(index=True)
+    operation_revision_at_start: int = Field(ge=0)
+    dispatch_token: VersionString = Field(index=True)
+    capability_checksum: VersionString = Field(index=True)
+    request_fingerprint: VersionString = Field(index=True)
+    status: LabelString = Field(default="dispatch_pending", index=True)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class DynamicReadDispatchResult(SQLModel, table=True):
+    """由 I/O worker append-once 写入的脱敏纯读结果 inbox。"""
+
+    __tablename__ = "dynamic_read_dispatch_results"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "dispatch_token", name="uq_dynamic_read_result_token"),
+        CheckConstraint(
+            "status IN ('succeeded', 'failed')",
+            name="ck_dynamic_read_result_status",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("readresult"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    dispatch_token: VersionString = Field(index=True)
+    status: LabelString = Field(index=True)
+    result_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    error_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    started_at: datetime = Field(index=True)
+    finished_at: datetime = Field(index=True)
+    created_at: datetime = Field(default_factory=utc_now)
 
 
 class SopOperationEffect(SQLModel, table=True):

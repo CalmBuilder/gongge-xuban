@@ -9,13 +9,14 @@
 from __future__ import annotations
 
 import base64
+from concurrent.futures import ThreadPoolExecutor, wait
 import math
 import threading
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Iterator, Protocol
+from typing import Callable, Iterator, Protocol
 
 from pydantic import ValidationError
 from sqlmodel import Session, select
@@ -34,6 +35,9 @@ from app.db.models import (
     ChatSession,
     ConnectionProfile,
     ConnectorThreadBinding,
+    DynamicReadDispatchBatch,
+    DynamicReadDispatchItem,
+    DynamicReadDispatchResult,
     Message,
     InputResourceSnapshot,
     ManagedInputResource,
@@ -44,6 +48,7 @@ from app.db.models import (
     SopOperation,
     SopWorkItem,
     User,
+    utc_now,
 )
 from app.dynamic_tasks.action_proposer import DynamicActionProposer
 from app.dynamic_tasks.artifacts import (
@@ -82,6 +87,7 @@ from app.dynamic_tasks.planning import (
     PlanStep,
     RuntimeActionProposal,
     SuccessCriterion,
+    canonical_checksum,
 )
 from app.dynamic_tasks.quotas import DynamicTaskQuotaLimits, DynamicTaskQuotaService
 from app.dynamic_tasks.provider_view import (
@@ -189,6 +195,7 @@ class DynamicTaskAgent:
         connection_service: ConnectionService | None = None,
         explore_proposer: ReadOnlyExploreProposer | None = None,
         explore_enabled: bool | None = None,
+        parallel_tool_executor_factory: Callable[[Session], DynamicToolExecutor] | None = None,
     ) -> None:
         """绑定统一事务、能力目录和既有工具执行器，禁止创建第二套 Runtime。"""
 
@@ -203,6 +210,7 @@ class DynamicTaskAgent:
         self.artifact_service = artifact_service or ArtifactService(db)
         self.connection_service = connection_service or ConnectionService(db)
         self.explore_proposer = explore_proposer
+        self.parallel_tool_executor_factory = parallel_tool_executor_factory or ToolExecutor
         self.quota_limits: DynamicTaskQuotaLimits | None = None
         self.explore_enabled = (
             getattr(get_settings(), "dynamic_task_explore_enabled", False)
@@ -277,6 +285,315 @@ class DynamicTaskAgent:
                 organization_unit_id=organization_unit_id,
             )
             return step, result
+
+    def advance_ready_parallel_reads(
+        self,
+        *,
+        execution_id: str,
+        model_config: ModelConfig,
+        worker_id: str,
+        actor_user_id: str,
+        organization_unit_id: str | None = None,
+    ) -> tuple[tuple[PlanStep, ToolResult], ...]:
+        """对同一就绪波次先全量授权，再有界并发纯读并按 Plan 顺序结算。"""
+
+        instance = self.db.get(SopInstance, execution_id)
+        if instance is None or instance.kind != "dynamic_task":
+            raise DynamicTaskAgentError("DYNAMIC_EXECUTION_NOT_FOUND")
+        limit = int(get_settings().dynamic_task_max_parallel_reads)
+        if limit <= 1:
+            step, result = self.advance_next_read_step(
+                execution_id=execution_id,
+                model_config=model_config,
+                worker_id=worker_id,
+                actor_user_id=actor_user_id,
+                organization_unit_id=organization_unit_id,
+            )
+            return ((step, result),)
+        verified_model = self.catalog.require_dynamic_model(instance.tenant_id, model_config.id)
+        with self.store.owned(instance, worker_id=worker_id):
+            plan = self._current_plan(instance)
+            completed = self._completed_step_keys(instance)
+            ready = [
+                step
+                for step in plan.steps
+                if step.kind == "tool.read"
+                and step.required
+                and step.step_key not in completed
+                and set(step.depends_on) <= completed
+            ]
+            candidates: list[tuple[PlanStep, CapabilitySnapshot]] = []
+            used_keys: set[str] = set()
+            for step in ready:
+                if len(candidates) >= limit or len(step.capability_refs) != 1:
+                    break
+                snapshot = self._frozen_read_snapshot(instance, step.capability_refs[0])
+                contract = snapshot.contract
+                key = str(contract.get("concurrency_key") or "")
+                if (
+                    snapshot.capability_type != "tool"
+                    or contract.get("parallel_safe") is not True
+                    or int(contract.get("max_in_flight") or 1) < 2
+                    or not key
+                    or key in used_keys
+                ):
+                    break
+                self.catalog.reauthorize_tool(
+                    snapshot,
+                    actor_user_id=actor_user_id,
+                    organization_unit_id=organization_unit_id,
+                )
+                used_keys.add(key)
+                candidates.append((step, snapshot))
+            if len(candidates) < 2:
+                step, result = self.advance_next_read_step(
+                    execution_id=execution_id,
+                    model_config=verified_model,
+                    worker_id=worker_id,
+                    actor_user_id=actor_user_id,
+                    organization_unit_id=organization_unit_id,
+                )
+                return ((step, result),)
+            capabilities = dict(verified_model.capability_snapshot_json or {})
+            prepared: list[tuple[PlanStep, SopNodeExecution, SopOperation, CapabilitySnapshot]] = []
+            for step, snapshot in candidates:
+                completed_response = self._propose_action(
+                    instance=instance,
+                    step=step,
+                    model_config=verified_model,
+                    worker_id=worker_id,
+                )
+                proposal = completed_response.proposal
+                node = self.store.enter_node(
+                    instance,
+                    step.step_key,
+                    step_key=step.step_key,
+                    plan_revision_id=instance.current_plan_revision_id,
+                    step_kind=step.kind,
+                    title=step.title,
+                    required=True,
+                )
+                record, _ = self.store.record_action_proposal(
+                    instance,
+                    node,
+                    provider=verified_model.provider,
+                    model=verified_model.model,
+                    model_capability_snapshot=capabilities,
+                    completed_response=completed_response,
+                )
+                operation, _ = self.store.prepare_operation_from_proposal(
+                    instance,
+                    node,
+                    record,
+                    operation_name=str(proposal.capability_ref),
+                    request=proposal.arguments,
+                    effect_kind="read",
+                    caused_by_skill_use_ids=step.guidance_skill_use_ids,
+                    capability_snapshot=snapshot.model_dump(
+                        mode="json", exclude={"checksum", "agent_id"}
+                    ),
+                    capability_snapshot_checksum=snapshot.checksum,
+                )
+                self._acquire_tool_quota(operation)
+                self.store.start_operation(operation)
+                self._consume_call_budget(instance, "tool_calls")
+                prepared.append((step, node, operation, snapshot))
+            wave_checksum = canonical_checksum(
+                {
+                    "execution_id": instance.id,
+                    "plan_revision_id": instance.current_plan_revision_id,
+                    "steps": [item[0].step_key for item in prepared],
+                    "operations": [item[2].id for item in prepared],
+                }
+            )
+            batch = DynamicReadDispatchBatch(
+                tenant_id=instance.tenant_id,
+                execution_id=instance.id,
+                plan_revision_id=str(instance.current_plan_revision_id),
+                wave_checksum=wave_checksum,
+                ordered_step_keys_json=[item[0].step_key for item in prepared],
+                status="dispatched",
+                parallelism=len(prepared),
+            )
+            self.db.add(batch)
+            self.db.flush()
+            dispatch: list[tuple[DynamicReadDispatchItem, dict[str, object]]] = []
+            for position, (step, node, operation, snapshot) in enumerate(prepared):
+                token = canonical_checksum(
+                    {"batch_id": batch.id, "operation_id": operation.id, "position": position}
+                )
+                item = DynamicReadDispatchItem(
+                    tenant_id=instance.tenant_id,
+                    batch_id=batch.id,
+                    execution_id=instance.id,
+                    plan_revision_id=str(instance.current_plan_revision_id),
+                    position=position,
+                    step_key=step.step_key,
+                    node_execution_id=node.id,
+                    operation_id=operation.id,
+                    operation_revision_at_start=operation.revision,
+                    dispatch_token=token,
+                    capability_checksum=str(operation.capability_checksum),
+                    request_fingerprint=operation.request_fingerprint,
+                    status="dispatched",
+                )
+                self.db.add(item)
+                dispatch.append((item, dict(operation.request_json or {})))
+            self.db.commit()
+        self.db.commit()
+        engine = self.db.get_bind()
+        self.db.rollback()
+        inbox_write_lock = threading.Lock()
+
+        def execute_one(entry: tuple[DynamicReadDispatchItem, dict[str, object]]) -> None:
+            """在独立 Session 中二次授权并 append-once 写入脱敏 inbox。"""
+
+            item, arguments = entry
+            started_at = utc_now()
+            with Session(engine, expire_on_commit=False) as io_db:
+                io_item = io_db.get(DynamicReadDispatchItem, item.id)
+                operation = io_db.get(SopOperation, item.operation_id)
+                io_instance = io_db.get(SopInstance, item.execution_id)
+                if io_item is None or operation is None or io_instance is None:
+                    raise DynamicTaskAgentError("DYNAMIC_PARALLEL_DISPATCH_CONTEXT_INVALID")
+                try:
+                    snapshot = DynamicTaskAgent(io_db)._frozen_read_snapshot(
+                        io_instance, operation.operation_name
+                    )
+                    DynamicCapabilityCatalog(io_db).reauthorize_tool(
+                        snapshot,
+                        actor_user_id=actor_user_id,
+                        organization_unit_id=organization_unit_id,
+                    )
+                    result = self.parallel_tool_executor_factory(io_db).execute(
+                        io_instance.tenant_id,
+                        ToolCall(name=operation.operation_name, arguments=arguments),
+                        agent_id=io_instance.agent_id,
+                        actor_user_id=actor_user_id,
+                        execution_org_unit_id=organization_unit_id,
+                        execution_id=io_instance.id,
+                    )
+                except (CapabilityAccessDenied, DynamicTaskAgentError) as exc:
+                    result = ToolResult(
+                        tool_name=operation.operation_name,
+                        success=False,
+                        error=ToolError(
+                            code=str(getattr(exc, "code", "CAPABILITY_NOT_AVAILABLE")),
+                            message="并行纯读在派发前的实时授权已失效。",
+                        ),
+                    )
+                token = io_item.dispatch_token
+                tenant_id = io_instance.tenant_id
+                io_db.rollback()
+                with inbox_write_lock:
+                    with Session(engine, expire_on_commit=False) as inbox_db:
+                        inbox_item = inbox_db.get(DynamicReadDispatchItem, item.id)
+                        if inbox_item is None or inbox_item.status != "dispatched":
+                            raise DynamicTaskAgentError(
+                                "DYNAMIC_PARALLEL_DISPATCH_CONTEXT_INVALID"
+                            )
+                        inbox_db.add(
+                            DynamicReadDispatchResult(
+                            tenant_id=tenant_id,
+                            dispatch_token=token,
+                            status="succeeded" if result.success else "failed",
+                            result_json={"data": result.data} if result.success else {},
+                            error_json=(
+                                result.error.model_dump(mode="json") if result.error else {}
+                            ),
+                            started_at=started_at,
+                            finished_at=utc_now(),
+                        )
+                        )
+                        inbox_item.status = "result_ready"
+                        inbox_item.updated_at = utc_now()
+                        inbox_db.add(inbox_item)
+                        inbox_db.commit()
+
+        with ThreadPoolExecutor(max_workers=len(dispatch)) as executor:
+            futures = [executor.submit(execute_one, entry) for entry in dispatch]
+            wait(futures)
+            for future in futures:
+                future.result()
+        results: list[tuple[PlanStep, ToolResult]] = []
+        self.db.rollback()
+        self.db.refresh(instance)
+        if instance.status in {"cancelled", "failed", "timed_out"}:
+            for item, _arguments in dispatch:
+                persisted = self.db.get(DynamicReadDispatchItem, item.id)
+                if persisted is not None and persisted.status == "result_ready":
+                    persisted.status = "discarded"
+                    persisted.updated_at = utc_now()
+                    self.db.add(persisted)
+            persisted_batch = self.db.get(DynamicReadDispatchBatch, batch.id)
+            if persisted_batch is not None:
+                persisted_batch.status = (
+                    "cancelled" if instance.status == "cancelled" else "failed"
+                )
+                persisted_batch.updated_at = utc_now()
+                self.db.add(persisted_batch)
+            self.db.commit()
+            return ()
+        with self.store.owned(instance, worker_id=worker_id):
+            self.db.refresh(instance)
+            if instance.current_plan_revision_id != batch.plan_revision_id:
+                batch.status = "superseded"
+                self.db.add(batch)
+                self.db.commit()
+                raise DynamicTaskAgentError("DYNAMIC_PARALLEL_PLAN_REVISION_CONFLICT")
+            for step, node, operation, _snapshot in prepared:
+                item = self.db.exec(
+                    select(DynamicReadDispatchItem).where(
+                        DynamicReadDispatchItem.batch_id == batch.id,
+                        DynamicReadDispatchItem.operation_id == operation.id,
+                    )
+                ).one()
+                inbox = self.db.exec(
+                    select(DynamicReadDispatchResult).where(
+                        DynamicReadDispatchResult.tenant_id == instance.tenant_id,
+                        DynamicReadDispatchResult.dispatch_token == item.dispatch_token,
+                    )
+                ).one()
+                self.db.refresh(operation)
+                if (
+                    operation.status != "running"
+                    or operation.revision != item.operation_revision_at_start
+                    or operation.capability_checksum != item.capability_checksum
+                    or operation.request_fingerprint != item.request_fingerprint
+                ):
+                    item.status = "discarded"
+                    self.db.add(item)
+                    continue
+                succeeded = inbox.status == "succeeded"
+                self.store.finish_operation(
+                    operation,
+                    succeeded=succeeded,
+                    result=inbox.result_json if succeeded else None,
+                    error=inbox.error_json if not succeeded else None,
+                )
+                if succeeded:
+                    self.store.complete_node(instance, node, output=inbox.result_json)
+                else:
+                    self.store.fail_node(instance, node, error=inbox.error_json)
+                item.status = "settled"
+                item.updated_at = utc_now()
+                self.db.add(item)
+                results.append(
+                    (
+                        step,
+                        ToolResult(
+                            tool_name=operation.operation_name,
+                            success=succeeded,
+                            data=inbox.result_json.get("data") if succeeded else None,
+                            error=(ToolError.model_validate(inbox.error_json) if not succeeded else None),
+                        ),
+                    )
+                )
+            batch.status = "succeeded" if all(row[1].success for row in results) else "failed"
+            batch.updated_at = utc_now()
+            self.db.add(batch)
+        self.db.commit()
+        return tuple(results)
 
     def run_until_blocked_or_complete(
         self,
@@ -364,7 +681,7 @@ class DynamicTaskAgent:
                 self.db.commit()
                 return DynamicRunOutcome("failed", instance.id)
             if step.kind == "tool.read":
-                _step, result = self.advance_next_read_step(
+                results = self.advance_ready_parallel_reads(
                     execution_id=instance.id,
                     model_config=model_config,
                     worker_id=worker_id,
@@ -372,14 +689,21 @@ class DynamicTaskAgent:
                     organization_unit_id=organization_unit_id,
                 )
                 self.db.commit()
-                if result.error is not None and result.error.code in {
-                    "DYNAMIC_REAUTH_REQUIRED",
-                    "DYNAMIC_RATE_LIMITED",
-                }:
+                blocked = next(
+                    (
+                        (read_step, result)
+                        for read_step, result in results
+                        if result.error is not None
+                        and result.error.code
+                        in {"DYNAMIC_REAUTH_REQUIRED", "DYNAMIC_RATE_LIMITED"}
+                    ),
+                    None,
+                )
+                if blocked is not None:
                     return DynamicRunOutcome(
                         "blocked",
                         instance.id,
-                        blocking_step_key=step.step_key,
+                        blocking_step_key=blocked[0].step_key,
                     )
                 continue
             if step.kind == "tool.write":

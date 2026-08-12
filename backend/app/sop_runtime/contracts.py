@@ -61,6 +61,7 @@ class OperationStatus(StrEnum):
 
     PREPARED = "prepared"
     RUNNING = "running"
+    RETRY_WAIT = "retry_wait"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     UNKNOWN = "unknown"

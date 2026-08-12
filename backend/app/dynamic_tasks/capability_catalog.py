@@ -172,6 +172,9 @@ class ToolReliabilityContract(BaseModel):
     timeout_policy: Literal["failed", "unknown"]
     dynamic_task_enabled: bool = False
     explore_safe: bool = False
+    parallel_safe: bool = False
+    concurrency_key: str | None = Field(default=None, max_length=128)
+    max_in_flight: int = Field(default=1, ge=1, le=8)
     model_config = ConfigDict(extra="forbid")
 
     @model_validator(mode="after")
@@ -209,6 +212,20 @@ class ToolReliabilityContract(BaseModel):
             or self.confirmation_policy != "none"
         ):
             raise ValueError("Explore 只允许显式启用的无副作用纯读工具")
+        if self.parallel_safe and (
+            not self.dynamic_task_enabled
+            or self.risk_class != "read"
+            or self.side_effect != "none"
+            or self.confirmation_policy != "none"
+            or self.timeout_policy != "failed"
+        ):
+            raise ValueError("并行能力只允许显式启用、超时可确定失败的无副作用纯读工具")
+        if self.parallel_safe and not (self.concurrency_key or "").strip():
+            raise ValueError("并行能力必须声明稳定 concurrency_key")
+        if not self.parallel_safe and (
+            self.concurrency_key is not None or self.max_in_flight != 1
+        ):
+            raise ValueError("未启用并行时不得保留并发键或扩大 in-flight")
         return self
 
 
@@ -255,6 +272,10 @@ def _tool_contract_payload(contract: ToolReliabilityContract) -> dict[str, Any]:
     payload = contract.model_dump(mode="json")
     if payload.get("explore_safe") is False:
         payload.pop("explore_safe", None)
+    if payload.get("parallel_safe") is False:
+        payload.pop("parallel_safe", None)
+        payload.pop("concurrency_key", None)
+        payload.pop("max_in_flight", None)
     return payload
 
 
