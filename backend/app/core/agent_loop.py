@@ -58,6 +58,7 @@ from app.db.models import (
     ChatSession,
     GeneralSkill,
     GeneralSkillRevision,
+    GeneralSkillUse,
     HumanHandoffRequest,
     KnowledgeBaseVersion,
     Message,
@@ -2099,6 +2100,9 @@ class AgentLoop:
                     memory_context,
                     user_id=request.user_id,
                     user_message_id=user_message_id,
+                    forced_general_skill_id=(
+                        request.forced_general_skill_id if request.channel == "web" else None
+                    ),
                 )
                 dynamic_response = self._try_handle_dynamic_task(
                     request,
@@ -2307,6 +2311,9 @@ class AgentLoop:
                     memory_context,
                     user_id=request.user_id,
                     user_message_id=user_message_id,
+                    forced_general_skill_id=(
+                        request.forced_general_skill_id if request.channel == "web" else None
+                    ),
                 )
                 dynamic_response = self._try_handle_dynamic_task(
                     request,
@@ -2989,6 +2996,9 @@ class AgentLoop:
                 memory_context,
                 user_id=request.user_id,
                 user_message_id=user_message.id,
+                forced_general_skill_id=(
+                    request.forced_general_skill_id if request.channel == "web" else None
+                ),
             )
             dynamic_response = self._try_handle_dynamic_task(
                 request,
@@ -3107,6 +3117,9 @@ class AgentLoop:
                 memory_context,
                 user_id=request.user_id,
                 user_message_id=user_message.id,
+                forced_general_skill_id=(
+                    request.forced_general_skill_id if request.channel == "web" else None
+                ),
             )
             dynamic_response = self._try_handle_dynamic_task(
                 request,
@@ -7231,8 +7244,9 @@ class AgentLoop:
         *,
         user_id: str | None = None,
         user_message_id: str | None = None,
+        forced_general_skill_id: str | None = None,
     ) -> NonSopCapabilityRouteResult:
-        """返回完整非 SOP 路由结果，供 B1 委托动态 Agent 且保持旧 tuple 兼容。"""
+        """返回正交的 Skill 与执行模式决策，供 B1 委托且保持旧 tuple 兼容。"""
 
         general_skills = self._list_published_general_skills(
             model_config.tenant_id, agent_id, user_id
@@ -7262,6 +7276,36 @@ class AgentLoop:
             user_id,
             agent_id,
         )
+        forced_general_skill = next(
+            (
+                skill
+                for skill in general_skills
+                if skill.id == str(forced_general_skill_id or "").strip()
+            ),
+            None,
+        )
+        if forced_general_skill_id and forced_general_skill is None:
+            selection = GeneralSkillSelection(
+                use_general_skill=False,
+                confidence=1.0,
+                reason="结构化强制 Skill 不在当前有效目录。",
+                degraded=True,
+                failure_code="GENERAL_SKILL_NOT_AVAILABLE",
+            )
+            return NonSopCapabilityRouteResult(
+                selected_general_skill=None,
+                general_selection=selection,
+                effective_decision=NonSopCapabilityDecision(
+                    mode="answer",
+                    confidence=1.0,
+                    reason=selection.reason,
+                    degraded=True,
+                    failure_code=selection.failure_code,
+                ),
+                shadow_decision=None,
+                shadow_attempted=False,
+                shadow_duration_ms=0.0,
+            )
         route = self.non_sop_capability_router.decide(
             message=message,
             general_skills=general_skills,
@@ -7270,6 +7314,7 @@ class AgentLoop:
             conversation_context=conversation_context,
             memory_context=memory_context,
             knowledge_capability=knowledge_capability,
+            forced_general_skill=forced_general_skill,
         )
         if route.shadow_decision is not None:
             self.events.record(
@@ -7382,6 +7427,12 @@ class AgentLoop:
                     )
         except Exception as exc:
             failure_code = str(getattr(exc, "code", "") or type(exc).__name__)
+            self._fail_unbound_dynamic_skill_uses(
+                request=request,
+                chat_session=chat_session,
+                user_message_id=user_message_id,
+                failure_code=failure_code,
+            )
             self.events.record(
                 request.tenant_id,
                 chat_session.id,
@@ -7558,6 +7609,50 @@ class AgentLoop:
             ),
             session_state=public_session(chat_session),
         )
+
+    def _fail_unbound_dynamic_skill_uses(
+        self,
+        *,
+        request: ChatTurnRequest,
+        chat_session: ChatSession,
+        user_message_id: str,
+        failure_code: str,
+    ) -> None:
+        """规划失败且尚无 Execution 时结算本轮 Use，避免 active 孤儿和假完成。"""
+
+        safe_code = (failure_code or "DYNAMIC_PLAN_FAILED")[:128]
+        uses = self.db.exec(
+            select(GeneralSkillUse).where(
+                GeneralSkillUse.tenant_id == request.tenant_id,
+                GeneralSkillUse.session_id == chat_session.id,
+                GeneralSkillUse.turn_id == user_message_id,
+                GeneralSkillUse.execution_id.is_(None),
+                GeneralSkillUse.status.in_(["loading", "active"]),
+            )
+        ).all()
+        now = utc_now()
+        for use in uses:
+            use.status = "failed"
+            use.invalidation_reason = safe_code
+            use.completed_at = now
+            use.updated_at = now
+            self.db.add(use)
+            self.events.record(
+                request.tenant_id,
+                chat_session.id,
+                "skill_use_failed",
+                self._turn_payload(
+                    {
+                        "skill_use_id": use.id,
+                        "skill_id": use.skill_id,
+                        "code": safe_code,
+                        "consumer": "dynamic_task",
+                    },
+                    user_message_id,
+                ),
+            )
+        if uses:
+            self.db.commit()
 
     def _dynamic_task_source(
         self,

@@ -16,6 +16,7 @@ import pytest
 from app.core.agent_loop import AgentLoop
 from app.core.non_sop_capability import (
     NonSopCapabilityDecision,
+    NonSopCapabilityRouteResult,
     NonSopCapabilityRouter,
 )
 from app.db.models import ChatSession, GeneralSkill, Skill
@@ -133,6 +134,80 @@ def test_existing_general_skill_remains_authoritative() -> None:
     assert result.shadow_decision is not None
     assert result.shadow_decision.mode == "general_skill"
     assert shadow.calls == 0
+
+
+def test_selected_general_skill_and_dynamic_execution_are_orthogonal() -> None:
+    """执行开关开启时，选中 Skill 仍必须继续判断复杂任务而不是短路动态路由。"""
+
+    general = _GeneralSelector(
+        GeneralSkillSelection(
+            use_general_skill=True,
+            selected_slug="weather-zh",
+            confidence=0.96,
+        )
+    )
+    dynamic = _ShadowSelector(
+        NonSopCapabilityDecision(
+            mode="dynamic_task",
+            goal="整理跨系统数据并生成风险简报",
+            success_criteria=["形成可审计简报"],
+            requires_durable_execution=True,
+            requires_artifact=True,
+            confidence=0.93,
+        )
+    )
+
+    result = _route(
+        NonSopCapabilityRouter(
+            shadow_enabled=False,
+            execution_enabled=True,
+            shadow_selector=dynamic,
+        ),
+        general,
+        [_skill()],
+    )
+
+    assert result.selected_general_skill is not None
+    assert result.selected_general_skill.slug == "weather-zh"
+    assert result.effective_decision.mode == "dynamic_task"
+    assert result.shadow_decision is not None
+    assert result.shadow_decision.mode == "dynamic_task"
+    assert dynamic.calls == 1
+
+
+def test_selected_general_skill_keeps_lightweight_answer_for_simple_request() -> None:
+    """Skill 与执行模式拆分后，普通解释请求仍走轻量 guidance 回复。"""
+
+    general = _GeneralSelector(
+        GeneralSkillSelection(
+            use_general_skill=True,
+            selected_slug="weather-zh",
+            confidence=0.96,
+        )
+    )
+    answer = _ShadowSelector(
+        NonSopCapabilityDecision(
+            mode="answer",
+            confidence=0.95,
+            reason="单轮可直接完成，无需持久执行。",
+        )
+    )
+
+    result = _route(
+        NonSopCapabilityRouter(
+            shadow_enabled=False,
+            execution_enabled=True,
+            shadow_selector=answer,
+        ),
+        general,
+        [_skill()],
+    )
+
+    assert result.selected_general_skill is not None
+    assert result.effective_decision.mode == "general_skill"
+    assert result.shadow_decision is not None
+    assert result.shadow_decision.mode == "answer"
+    assert answer.calls == 1
 
 
 def test_dynamic_task_is_shadow_only_in_batch_a() -> None:
@@ -262,6 +337,89 @@ def test_agent_loop_delegates_effective_dynamic_route_without_copying_loop(monke
     assert response is not None
     assert response.reply == "# 风险简报"
     assert calls == ["init", "start", "run"]
+
+
+def test_dynamic_delegation_preserves_forced_general_skill_selection(monkeypatch) -> None:
+    """复杂任务进入 DynamicTaskAgent 时必须携带用户显式选择的固定 Skill。"""
+
+    skill = _skill()
+    route = NonSopCapabilityRouteResult(
+        selected_general_skill=skill,
+        general_selection=GeneralSkillSelection(
+            use_general_skill=True,
+            selected_slug=skill.slug,
+            confidence=1.0,
+        ),
+        effective_decision=NonSopCapabilityDecision(
+            mode="dynamic_task",
+            goal="生成受控操作规范",
+            success_criteria=["包含输入、步骤、异常和验收标准"],
+            requires_artifact=True,
+            confidence=0.95,
+        ),
+        shadow_decision=None,
+        shadow_attempted=True,
+        shadow_duration_ms=1.0,
+    )
+    captured: dict[str, object] = {}
+
+    class _DynamicAgent:
+        """捕获 AgentLoop 传给动态任务的固定 Skill 契约。"""
+
+        def __init__(self, _db) -> None:
+            """兼容生产构造签名。"""
+
+        def start_task(self, **kwargs):
+            """保存委派参数并返回已创建 Execution。"""
+
+            captured.update(kwargs)
+            return SimpleNamespace(id="execution_guided"), True
+
+        def run_until_blocked_or_complete(self, **_kwargs):
+            """返回已经验收的动态任务产物。"""
+
+            return DynamicRunOutcome(
+                status="succeeded",
+                execution_id="execution_guided",
+                message=SimpleNamespace(content="# 售后升级处理规范"),
+            )
+
+    monkeypatch.setattr("app.core.agent_loop.DynamicTaskAgent", _DynamicAgent)
+    loop = object.__new__(AgentLoop)
+    loop.db = SimpleNamespace(
+        refresh=lambda _row: None,
+        commit=lambda: None,
+        begin_nested=lambda: nullcontext(),
+    )
+    loop.events = SimpleNamespace(record=lambda *_args, **_kwargs: None)
+    loop._knowledge_capability_payload = lambda *_args: {"available": False}
+    loop._forced_general_skill_capability = lambda *_args: (
+        skill,
+        route.general_selection,
+    )
+    session = ChatSession(
+        id="session_guided_dynamic",
+        tenant_id="tenant_demo",
+        agent_id="agent_demo",
+    )
+
+    response = loop._try_handle_dynamic_task(
+        ChatTurnRequest(
+            tenant_id="tenant_demo",
+            user_id="user_demo",
+            agent_id="agent_demo",
+            message="生成受控操作规范",
+            forced_general_skill_id=skill.id,
+        ),
+        session,
+        SimpleNamespace(id="model_1"),
+        route,
+        "message_guided_dynamic",
+    )
+
+    assert response is not None
+    assert captured["forced_general_skill_id"] == skill.id
+    assert captured["forced_general_skill_ids"] == ()
 
 
 def test_agent_loop_defers_temporary_tool_quota_exhaustion_without_failing_execution(

@@ -1037,6 +1037,8 @@ def chat_stream(
                 span_turn_id = {"value": ""}
 
                 def persist_span(event_type: str, payload: dict[str, object]) -> None:
+                    """用独立短事务写模型观测事件，禁止提交或关闭业务嵌套事务。"""
+
                     session_id = source_session_id["value"] or request.session_id or ""
                     if not session_id:
                         return
@@ -1047,13 +1049,17 @@ def chat_stream(
                         event_payload.setdefault("user_message_id", turn_id)
                     if request.client_turn_id:
                         event_payload.setdefault("client_turn_id", request.client_turn_id)
-                    _persist_relay_only_event(
-                        worker_db,
-                        request.tenant_id,
-                        session_id,
-                        event_type,
-                        event_payload,
-                    )
+                    try:
+                        with Session(engine) as span_db:
+                            _persist_relay_only_event(
+                                span_db,
+                                request.tenant_id,
+                                session_id,
+                                event_type,
+                                event_payload,
+                            )
+                    except Exception:
+                        logger.exception("chat stream span persistence failed")
 
                 span_sink_token = set_span_sink(persist_span)
                 ensure_tenant(worker_db, request.tenant_id)

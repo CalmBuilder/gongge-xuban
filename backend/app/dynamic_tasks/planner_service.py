@@ -8,9 +8,10 @@
 
 from __future__ import annotations
 
+import re
 from typing import Protocol, Sequence
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from app.dynamic_tasks.capability_catalog import CapabilitySnapshot
 from app.dynamic_tasks.planning import (
@@ -26,6 +27,16 @@ class JsonPlanningClient(Protocol):
 
     def generate_json(self, system_prompt: str, user_payload: dict) -> dict:
         """返回完整且可解析的 JSON object，不暴露流式半包。"""
+
+
+class DynamicTaskPlannerError(ValueError):
+    """表示计划在有界修复后仍无法满足服务端结构或语义契约。"""
+
+    def __init__(self, code: str, message: str) -> None:
+        """保存可跨 Agent Loop 传播的稳定错误码和截断诊断。"""
+
+        super().__init__(message[:1000])
+        self.code = code
 
 
 class DynamicGuidanceSelection(BaseModel):
@@ -146,6 +157,7 @@ class DynamicTaskPlanner:
             if snapshot.contract.get("risk_class")
             in {"read", "local_write", "execute", "external_write"}
             and snapshot.capability_type in {"tool", "connector", "knowledge"}
+            and _goal_authorizes_capability(goal, snapshot)
         ]
         allowed_step_kinds = ["tool.read", "answer", "clarification"]
         if any(snapshot.capability_type == "knowledge" for snapshot in executable_capabilities):
@@ -175,7 +187,10 @@ class DynamicTaskPlanner:
             "goal": goal,
             "success_criteria": [item.model_dump(mode="json") for item in success_criteria],
             "output_contract": _planner_output_contract(allowed_step_kinds),
-            "capabilities": [snapshot.model_view for snapshot in executable_capabilities],
+            "capabilities": [
+                _planner_capability_view(snapshot)
+                for snapshot in executable_capabilities
+            ],
             "loaded_guidance": [dict(item) for item in loaded_guidance],
             "memory_context": [dict(item) for item in memory_context],
             "input_resources": [dict(item) for item in input_resources],
@@ -193,13 +208,6 @@ class DynamicTaskPlanner:
                 "allowed_step_kinds": allowed_step_kinds,
             },
         }
-        raw = self.client.generate_json(_PLANNER_SYSTEM_PROMPT, payload)
-        draft = DynamicPlanDraft.model_validate(raw).model_copy(
-            update={
-                "goal": goal,
-                "success_criteria": tuple(success_criteria),
-            }
-        )
         guidance_use_ids_by_name = {
             str(item.get("name") or ""): tuple(
                 str(use_id)
@@ -209,31 +217,68 @@ class DynamicTaskPlanner:
             for item in loaded_guidance
             if str(item.get("name") or "").strip()
         }
-        plan = normalize_plan_draft(
-            draft,
-            max_steps=self.max_steps,
-            max_tool_calls=self.max_tool_calls,
-            max_model_calls=self.max_model_calls,
-            max_input_tokens=self.max_input_tokens,
-            max_output_tokens=self.max_output_tokens,
-            max_total_tokens=self.max_total_tokens,
-            max_runtime_seconds=self.max_runtime_seconds,
-            guidance_use_ids_by_name=guidance_use_ids_by_name,
-        )
-        referenced_guidance = {
-            reference for step in draft.steps for reference in step.guidance_skill_refs
-        }
-        if referenced_guidance != set(guidance_use_ids_by_name):
-            raise ValueError("已加载指导 Skill 必须且只能由计划步骤显式引用")
-        _validate_plan_capabilities(plan, executable_capabilities)
-        _validate_plan_convergence(plan)
-        return plan
+        repair_payload = dict(payload)
+        last_error: ValueError | ValidationError | None = None
+        for attempt in range(2):
+            raw = _normalize_model_display_fields(
+                self.client.generate_json(_PLANNER_SYSTEM_PROMPT, repair_payload)
+            )
+            try:
+                draft = DynamicPlanDraft.model_validate(raw).model_copy(
+                    update={
+                        "goal": goal,
+                        "success_criteria": tuple(success_criteria),
+                    }
+                )
+                plan = normalize_plan_draft(
+                    draft,
+                    max_steps=self.max_steps,
+                    max_tool_calls=self.max_tool_calls,
+                    max_model_calls=self.max_model_calls,
+                    max_input_tokens=self.max_input_tokens,
+                    max_output_tokens=self.max_output_tokens,
+                    max_total_tokens=self.max_total_tokens,
+                    max_runtime_seconds=self.max_runtime_seconds,
+                    guidance_use_ids_by_name=guidance_use_ids_by_name,
+                )
+                referenced_guidance = {
+                    reference for step in draft.steps for reference in step.guidance_skill_refs
+                }
+                if referenced_guidance != set(guidance_use_ids_by_name):
+                    raise ValueError("已加载指导 Skill 必须且只能由计划步骤显式引用")
+                _validate_plan_capabilities(plan, executable_capabilities)
+                _validate_plan_convergence(plan)
+                return plan
+            except (ValidationError, ValueError) as exc:
+                last_error = exc
+                if attempt == 1:
+                    break
+                repair_payload = {
+                    **payload,
+                    "repair": {
+                        "attempt": 1,
+                        "failure_code": "DYNAMIC_PLAN_SEMANTIC_INVALID",
+                        "failure_message": str(exc)[:1000],
+                        "instruction": (
+                            "重新生成完整计划；只能按 capabilities[].allowed_step_kind 使用能力，"
+                            "非能力步骤的 capability_refs 必须为空，并保持唯一最终 answer。"
+                            "撰写文档、规范、报告属于 answer，不代表调用 tool.write；"
+                            "任务不需要外部事实或副作用时应只规划 answer。"
+                        ),
+                    },
+                }
+        assert last_error is not None
+        raise DynamicTaskPlannerError(
+            "DYNAMIC_PLAN_SEMANTIC_INVALID",
+            str(last_error),
+        ) from last_error
 
 
 _PLANNER_SYSTEM_PROMPT = """你是共格·序伴的受控动态任务规划器。只输出一个完整 JSON object。
 你只能使用输入中列出的能力；local_write/external_write 只能规划为 tool.write，execute 只能规划为
 tool.execute，运行时会冻结参数并等待一次性人工批准。
 不得提出执行、删除、权限变更或输入中不存在的能力。步骤种类必须来自 limits.allowed_step_kinds。
+每项能力只能用于它声明的 allowed_step_kind；“写文档/写方案”是 answer，不是 tool.write。
 draft_id 只用于本次草案依赖，持久 step key 由服务端生成。
 必须严格按 output_contract 输出顶层字段，禁止增加 plan/draft/result 等包装层或使用 id 替代 draft_id。
 不得输出 tenant、agent、授权结论、凭据、URL、header、预算覆盖或未提供的能力。
@@ -252,7 +297,7 @@ _PLANNER_OUTPUT_CONTRACT = {
     "steps": [
         {
             "draft_id": "字母开头的本次草案步骤标识",
-            "title": "string",
+            "title": "简短展示标题，最多 256 个字符；不得把步骤说明或 Skill 正文塞入标题",
             "kind": (
                 "tool.read | tool.write | tool.execute | knowledge | explore | answer | "
                 "clarification"
@@ -275,6 +320,68 @@ def _planner_output_contract(allowed_step_kinds: list[str]) -> dict[str, object]
     steps[0]["kind"] = " | ".join(allowed_step_kinds)
     contract["steps"] = steps
     return contract
+
+
+def _normalize_model_display_fields(raw: dict) -> dict:
+    """只收紧模型控制的展示标题，不修补类型、拓扑、能力或执行语义错误。"""
+
+    normalized = dict(raw)
+    raw_steps = raw.get("steps")
+    if not isinstance(raw_steps, list):
+        return normalized
+    steps: list[object] = []
+    for raw_step in raw_steps:
+        if not isinstance(raw_step, dict):
+            steps.append(raw_step)
+            continue
+        step = dict(raw_step)
+        title = step.get("title")
+        if isinstance(title, str) and len(title) > 256:
+            step["title"] = f"{title[:255].rstrip()}…"
+        steps.append(step)
+    normalized["steps"] = steps
+    return normalized
+
+
+def _planner_capability_view(snapshot: CapabilitySnapshot) -> dict[str, object]:
+    """向规划器披露做出合法步骤选择所需的最小类别，不暴露审计或连接侧带。"""
+
+    risk_class = str(snapshot.contract.get("risk_class") or "")
+    allowed_step_kind = {
+        "read": "knowledge" if snapshot.capability_type == "knowledge" else "tool.read",
+        "local_write": "tool.write",
+        "external_write": "tool.write",
+        "execute": "tool.execute",
+    }.get(risk_class, "")
+    return {
+        **snapshot.model_view,
+        "capability_type": snapshot.capability_type,
+        "risk_class": risk_class,
+        "allowed_step_kind": allowed_step_kind,
+    }
+
+
+def _goal_authorizes_capability(goal: str, snapshot: CapabilitySnapshot) -> bool:
+    """对需显式意图的副作用能力做确定性预过滤，审批不能替代用户授权。"""
+
+    intent = str(snapshot.contract.get("requires_explicit_goal_intent") or "")
+    if not intent:
+        return True
+    normalized = goal.casefold()
+    if intent == "skill_proposal":
+        return bool(
+            re.search(
+                r"(?:安装|导入|采用).{0,24}(?:skill|技能)"
+                r"|(?:skill|技能).{0,24}(?:安装|导入|采用)"
+                r"|(?:保存|沉淀|创建|新增|提交|发布|提议|建议).{0,40}"
+                r"(?:为|成|一个|新的).{0,12}(?:skill|技能)"
+                r"|(?:propose|install|import|adopt|publish|save as|create)"
+                r".{0,40}skill"
+                r"|skill.{0,40}(?:proposal|install|import|adoption|publication)",
+                normalized,
+            )
+        )
+    return False
 
 
 def _validate_plan_capabilities(

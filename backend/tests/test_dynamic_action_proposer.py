@@ -162,5 +162,6 @@ def test_answer_step_receives_exact_dynamic_result_arguments_contract() -> None:
     ]
     assert set(evidence_contract) == {"criterion_01"}
     assert "query_contract" in evidence_contract["criterion_01"]
+    assert "final_answer" in evidence_contract["criterion_01"]
     assert "required_criterion_ids" not in evidence_contract
     assert "value_contract" not in evidence_contract

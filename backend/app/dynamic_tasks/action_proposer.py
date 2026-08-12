@@ -117,6 +117,9 @@ def _action_output_contract(
             for item in view.execution_context.get("completed_steps", [])
             if isinstance(item, dict) and item.get("step_key")
         ]
+        allowed_evidence_step_keys = list(
+            dict.fromkeys([*completed_step_keys, step.step_key])
+        )
         contract["arguments"] = {
             "markdown": (
                 "最终 Markdown 字符串；必须从 completed_steps[].model_output 读取真实字段值，"
@@ -125,7 +128,8 @@ def _action_output_contract(
             "criterion_evidence": {
                 criterion_id: (
                     "字符串数组，至少选择一个且只能使用这些已完成 step_key："
-                    f"{completed_step_keys}"
+                    f"{allowed_evidence_step_keys}；当前 answer step_key 仅能证明"
+                    "本次生成交付物本身，不能替代工具、知识或外部系统回执"
                 )
                 for criterion_id in criterion_ids
             },

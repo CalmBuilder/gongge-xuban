@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import base64
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -108,6 +109,18 @@ from app.tools.tool_schema import ToolCall, ToolError, ToolResult
 
 class DynamicTaskAgentError(RuntimeError):
     """表示动态推进在 provider、能力、审批或状态边界被确定性拒绝。"""
+
+    def __init__(
+        self,
+        code: str,
+        *,
+        details: Mapping[str, object] | None = None,
+    ) -> None:
+        """保存稳定错误码和可供有界修复使用的非敏感机械详情。"""
+
+        super().__init__(code)
+        self.code = code
+        self.details = dict(details or {})
 
 
 _CONNECTION_REAUTH_CODES = frozenset(
@@ -282,6 +295,17 @@ class DynamicTaskAgent:
         for _iteration in range(max_steps + 1):
             self.db.refresh(instance)
             if instance.status in {"failed", "cancelled", "timed_out"}:
+                GeneralSkillRuntimeService(self.db).settle_execution_uses(
+                    execution_id=instance.id,
+                    terminal_status=(
+                        "cancelled" if instance.status == "cancelled" else "failed"
+                    ),
+                    reason_code=str(
+                        (instance.terminal_reason_json or {}).get("code")
+                        or f"DYNAMIC_EXECUTION_{instance.status.upper()}"
+                    ),
+                )
+                self.db.commit()
                 return DynamicRunOutcome(instance.status, instance.id)
             if instance.status == "succeeded":
                 message = self.db.exec(
@@ -325,6 +349,12 @@ class DynamicTaskAgent:
                             "failure_code": "DYNAMIC_PLAN_TERMINAL_STEP_MISSING"
                         },
                     )
+                self.db.commit()
+                GeneralSkillRuntimeService(self.db).settle_execution_uses(
+                    execution_id=instance.id,
+                    terminal_status="failed",
+                    reason_code="DYNAMIC_PLAN_TERMINAL_STEP_MISSING",
+                )
                 self.db.commit()
                 return DynamicRunOutcome("failed", instance.id)
             if step.kind == "tool.read":
@@ -428,23 +458,51 @@ class DynamicTaskAgent:
                 self.db.commit()
                 continue
             if step.kind == "answer":
-                completed = self._propose_action(
-                    instance=instance,
-                    step=step,
-                    model_config=model_config,
-                    worker_id=worker_id,
-                )
-                message = self.complete_with_result_proposal(
-                    execution_id=instance.id,
-                    step_key=step.step_key,
-                    completed_response=completed,
-                    provider=model_config.provider,
-                    model=model_config.model,
-                    model_capabilities=dict(model_config.capability_snapshot_json or {}),
-                    worker_id=worker_id,
-                    resume_signal_id=resume_signal_id,
-                    signal_worker_id=signal_worker_id,
-                )
+                repair_feedback: dict[str, object] | None = None
+                message: Message | None = None
+                for result_attempt in range(2):
+                    completed = self._propose_action(
+                        instance=instance,
+                        step=step,
+                        model_config=model_config,
+                        worker_id=worker_id,
+                        repair_feedback=repair_feedback,
+                    )
+                    try:
+                        message = self.complete_with_result_proposal(
+                            execution_id=instance.id,
+                            step_key=step.step_key,
+                            completed_response=completed,
+                            provider=model_config.provider,
+                            model=model_config.model,
+                            model_capabilities=dict(
+                                model_config.capability_snapshot_json or {}
+                            ),
+                            worker_id=worker_id,
+                            resume_signal_id=resume_signal_id,
+                            signal_worker_id=signal_worker_id,
+                        )
+                        break
+                    except DynamicTaskAgentError as exc:
+                        if (
+                            result_attempt > 0
+                            or exc.code
+                            not in {
+                                "DYNAMIC_RESULT_SCHEMA_INVALID",
+                                "DYNAMIC_RESULT_VERIFICATION_FAILED",
+                            }
+                        ):
+                            raise
+                        repair_feedback = {
+                            "code": exc.code,
+                            "verification": exc.details,
+                            "instruction": (
+                                "只修复最终结果 JSON；逐项满足成功标准，证据引用只能使用"
+                                " output_contract 明列的 step_key，并把所需真实回执值写入正文。"
+                            ),
+                        }
+                if message is None:
+                    raise DynamicTaskAgentError("DYNAMIC_RESULT_REPAIR_EXHAUSTED")
                 self.db.commit()
                 self.db.refresh(instance)
                 if instance.status == "waiting":
@@ -501,6 +559,11 @@ class DynamicTaskAgent:
             self.store.fail_instance(
                 instance,
                 context_patch={"failure_code": safe_code},
+            )
+            GeneralSkillRuntimeService(self.db).settle_execution_uses(
+                execution_id=instance.id,
+                terminal_status="failed",
+                reason_code=safe_code,
             )
         self.db.commit()
 
@@ -4088,14 +4151,69 @@ class DynamicTaskAgent:
         require_dynamic_preflight(model_capabilities)
         if completed_response.proposal.action_kind.value not in {"answer", "complete"}:
             raise DynamicTaskAgentError("DYNAMIC_RESULT_ACTION_REQUIRED")
-        with self.store.owned(instance, worker_id=worker_id), self.db.begin_nested():
-            plan = self._current_plan(instance)
-            step_definition = next(
-                (item for item in plan.steps if item.step_key == step_key),
-                None,
+        plan = self._current_plan(instance)
+        step_definition = next(
+            (item for item in plan.steps if item.step_key == step_key),
+            None,
+        )
+        if step_definition is None or step_definition.kind != "answer":
+            raise DynamicTaskAgentError("DYNAMIC_RESULT_STEP_INVALID")
+        rejected_error: DynamicTaskAgentError | None = None
+        try:
+            candidate_result = DynamicTaskResult.model_validate(
+                completed_response.proposal.arguments
             )
-            if step_definition is None or step_definition.kind != "answer":
-                raise DynamicTaskAgentError("DYNAMIC_RESULT_STEP_INVALID")
+        except ValidationError as exc:
+            rejected_error = DynamicTaskAgentError(
+                "DYNAMIC_RESULT_SCHEMA_INVALID",
+                details={"schema_errors": exc.errors(include_input=False)},
+            )
+        else:
+            candidate_verification = verify_dynamic_result(
+                candidate_result,
+                plan=plan,
+                completed_step_keys=self._completed_step_keys(instance) | {step_key},
+                required_evidence_by_step=self._required_result_evidence(instance, plan),
+            )
+            if candidate_verification.get("passed") is not True:
+                rejected_error = DynamicTaskAgentError(
+                    "DYNAMIC_RESULT_VERIFICATION_FAILED",
+                    details=candidate_verification,
+                )
+        if rejected_error is not None:
+            with self.store.owned(instance, worker_id=worker_id), self.db.begin_nested():
+                step = self._step(instance, step_key)
+                if step is None:
+                    if not set(step_definition.depends_on) <= self._completed_step_keys(instance):
+                        raise DynamicTaskAgentError("DYNAMIC_RESULT_DEPENDENCY_INCOMPLETE")
+                    step = self.store.enter_node(
+                        instance,
+                        step_key,
+                        step_key=step_key,
+                        plan_revision_id=instance.current_plan_revision_id,
+                        step_kind="answer",
+                        title=step_definition.title,
+                        required=step_definition.required,
+                    )
+                proposal, _ = self.store.record_action_proposal(
+                    instance,
+                    step,
+                    provider=provider,
+                    model=model,
+                    model_capability_snapshot=model_capabilities,
+                    completed_response=completed_response,
+                )
+                proposal.status = "superseded"
+                proposal.superseded_at = self.store.database_now()
+                proposal.validation_json = {
+                    **(proposal.validation_json or {}),
+                    "result_validation_code": rejected_error.code,
+                    "result_verification": rejected_error.details,
+                }
+                self.db.add(proposal)
+            self.db.commit()
+            raise rejected_error
+        with self.store.owned(instance, worker_id=worker_id), self.db.begin_nested():
             step = self._step(instance, step_key)
             if step is None:
                 if not set(step_definition.depends_on) <= self._completed_step_keys(instance):
@@ -4124,12 +4242,15 @@ class DynamicTaskAgent:
                 proposal.superseded_at = self.store.database_now()
                 self.db.add(proposal)
                 self.db.flush()
-                raise DynamicTaskAgentError("DYNAMIC_RESULT_SCHEMA_INVALID") from exc
+                raise DynamicTaskAgentError(
+                    "DYNAMIC_RESULT_SCHEMA_INVALID",
+                    details={"schema_errors": exc.errors(include_input=False)},
+                ) from exc
             completed_keys = self._completed_step_keys(instance)
             verification = verify_dynamic_result(
                 result,
                 plan=plan,
-                completed_step_keys=completed_keys,
+                completed_step_keys=completed_keys | {step_key},
                 required_evidence_by_step=self._required_result_evidence(instance, plan),
             )
             if verification.get("passed") is not True:
@@ -4137,7 +4258,10 @@ class DynamicTaskAgent:
                 proposal.superseded_at = self.store.database_now()
                 self.db.add(proposal)
                 self.db.flush()
-                raise DynamicTaskAgentError("DYNAMIC_RESULT_VERIFICATION_FAILED")
+                raise DynamicTaskAgentError(
+                    "DYNAMIC_RESULT_VERIFICATION_FAILED",
+                    details=verification,
+                )
             artifacts = self._register_expected_artifacts(
                 instance=instance,
                 step=step,
@@ -4249,6 +4373,14 @@ class DynamicTaskAgent:
                 )
             if external_publication is None:
                 self.store.complete_instance(instance)
+                GeneralSkillRuntimeService(self.db).settle_execution_uses(
+                    execution_id=instance.id,
+                    terminal_status="completed",
+                    result_summary={
+                        "result_id": result_row.id,
+                        "message_id": message.id,
+                    },
+                )
             else:
                 self.store.wait_for_publication(instance)
         self.db.commit()
@@ -4601,14 +4733,16 @@ class DynamicTaskAgent:
         step: PlanStep,
         model_config: ModelConfig,
         worker_id: str,
+        repair_feedback: Mapping[str, object] | None = None,
     ) -> CompletedProviderProposal:
-        """在 Execution lease 内从机械事实构建 view 并取得当前步骤完整提案。"""
+        """从机械事实生成单步提案，并仅在终态校验失败后携带有界修复事实。"""
 
         verified_model = self.catalog.require_dynamic_model(instance.tenant_id, model_config.id)
-        with self.store.owned(instance, worker_id=worker_id):
+        with self.store.owned(instance, worker_id=worker_id) as lease:
             self._assert_runtime_budget(instance)
             skill_guidance = self._step_guidance(instance, step)
             self._consume_call_budget(instance, "model_calls")
+            self.store.renew(lease, ttl_seconds=_model_lease_ttl_seconds())
             self.db.commit()
             projection = build_execution_context_projection(
                 self.db,
@@ -4632,7 +4766,12 @@ class DynamicTaskAgent:
                     {
                         "role": "user",
                         "content": {
-                            "instruction": "请仅为当前计划步骤生成一个受控动作。",
+                            "instruction": (
+                                "请仅为当前计划步骤生成一个受控动作。"
+                                if repair_feedback is None
+                                else "请依据 result_repair_feedback 修复同一最终动作。"
+                            ),
+                            "result_repair_feedback": dict(repair_feedback or {}),
                             "input_resources": input_resources,
                         },
                     }
@@ -4925,6 +5064,13 @@ def _mapping_path_value(source: Mapping[str, object], path: str) -> tuple[bool, 
             return False, None
         current = current[part]
     return True, current
+
+
+def _model_lease_ttl_seconds() -> int:
+    """使单次模型外呼租约覆盖配置超时与提交余量，同时保留 fencing 上限。"""
+
+    timeout = float(getattr(get_settings(), "model_api_timeout_seconds", 600.0) or 600.0)
+    return max(30, min(900, math.ceil(timeout) + 30))
 
 
 def canonical_result_checksum(result: DynamicTaskResult) -> str:

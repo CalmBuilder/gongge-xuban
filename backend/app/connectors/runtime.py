@@ -861,6 +861,16 @@ class ConnectorRuntimeService:
                     },
                 )
                 store.complete_instance(instance)
+                from app.general_skills.runtime import GeneralSkillRuntimeService
+
+                GeneralSkillRuntimeService(self.db).settle_execution_uses(
+                    execution_id=instance.id,
+                    terminal_status="completed",
+                    result_summary={
+                        "result_id": publication.result_id,
+                        "external_publication_id": publication.id,
+                    },
+                )
             self.db.commit()
         except SopExecutionConflictError:
             self.db.rollback()

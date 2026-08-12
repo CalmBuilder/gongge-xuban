@@ -916,6 +916,7 @@ class DynamicCapabilityCatalog:
                 "reconcile": {"supported": False},
                 "timeout_policy": "failed",
                 "dynamic_task_enabled": True,
+                "requires_explicit_goal_intent": "skill_proposal",
             },
             "model_view": {
                 "name": SKILL_PROPOSAL_TOOL_NAME,

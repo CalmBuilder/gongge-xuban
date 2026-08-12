@@ -659,6 +659,49 @@ class GeneralSkillRuntimeService:
         row.result_summary_json = dict(summary or {})
         self.db.add(row)
 
+    def settle_execution_uses(
+        self,
+        *,
+        execution_id: str,
+        terminal_status: Literal["completed", "failed", "cancelled"],
+        reason_code: str | None = None,
+        result_summary: dict[str, object] | None = None,
+    ) -> tuple[GeneralSkillUse, ...]:
+        """随动态 Execution 终态原子结算其固定 Skill Use，并留下可审计事件。"""
+
+        rows = self.db.exec(
+            select(GeneralSkillUse).where(
+                GeneralSkillUse.execution_id == execution_id,
+                GeneralSkillUse.status.in_(["loading", "active"]),
+            )
+        ).all()
+        now = utc_now()
+        safe_reason = (reason_code or "")[:128] or None
+        for row in rows:
+            row.status = terminal_status
+            row.completed_at = now
+            row.updated_at = now
+            row.invalidation_reason = (
+                safe_reason if terminal_status in {"failed", "cancelled"} else None
+            )
+            row.result_summary_json = dict(result_summary or {})
+            self.db.add(row)
+            self.db.add(
+                AgentEvent(
+                    tenant_id=row.tenant_id,
+                    session_id=row.session_id,
+                    event_type=f"skill_use_{terminal_status}",
+                    payload_json={
+                        "skill_use_id": row.id,
+                        "skill_id": row.skill_id,
+                        "execution_id": execution_id,
+                        "consumer": "dynamic_task",
+                        "code": safe_reason,
+                    },
+                )
+            )
+        return tuple(rows)
+
     def project_use_for_execution(
         self,
         current_user: User,

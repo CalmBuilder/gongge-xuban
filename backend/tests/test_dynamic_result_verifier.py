@@ -92,3 +92,34 @@ def test_result_requires_declared_operation_values_in_markdown() -> None:
     ]
     assert factual["passed"] is True
     assert factual["missing_result_evidence"] == []
+
+
+def test_answer_only_plan_may_cite_its_delivery_step_without_faking_external_evidence() -> None:
+    """纯生成任务可由交付步骤证明正文，但未知步骤仍不能冒充工具或知识回执。"""
+
+    plan = NormalizedPlan(
+        goal="形成操作规范",
+        success_criteria=(
+            SuccessCriterion(id="document_ready", type="assertion", spec={"required": True}),
+        ),
+        steps=(PlanStep(step_key="write_playbook", title="形成规范", kind="answer"),),
+    )
+    accepted = verify_dynamic_result(
+        DynamicTaskResult(
+            markdown="# 售后升级处理\n\n## 输入\n订单号\n\n## 步骤\n核验订单。",
+            criterion_evidence={"document_ready": ("write_playbook",)},
+        ),
+        plan=plan,
+        completed_step_keys={"write_playbook"},
+    )
+    rejected = verify_dynamic_result(
+        DynamicTaskResult(
+            markdown="# 售后升级处理",
+            criterion_evidence={"document_ready": ("invented_tool_receipt",)},
+        ),
+        plan=plan,
+        completed_step_keys={"write_playbook"},
+    )
+
+    assert accepted["passed"] is True
+    assert rejected["invalid_step_refs"] == ["invented_tool_receipt"]

@@ -24,7 +24,9 @@ from app.connectors.service import ConnectionService
 from app.connectors.runtime import ConnectorRuntimeService
 from app.connectors.slack import SlackCallResult
 from app.connectors.wecom import WeComCallResult
+from app.config import get_settings
 from app.db.models import (
+    ActionProposalRecord,
     AgentProfile,
     AgentEvent,
     ArtifactInputLink,
@@ -39,6 +41,7 @@ from app.db.models import (
     ExecutionSignal,
     ExecutionPublication,
     ExecutionResult,
+    GeneralSkillUse,
     InputResourceSnapshot,
     KnowledgeBase,
     KnowledgeBaseVersion,
@@ -52,7 +55,12 @@ from app.db.models import (
     User,
     utc_now,
 )
-from app.dynamic_tasks.agent import DynamicRunOutcome, DynamicTaskAgent, DynamicTaskAgentError
+from app.dynamic_tasks.agent import (
+    DynamicRunOutcome,
+    DynamicTaskAgent,
+    DynamicTaskAgentError,
+    _model_lease_ttl_seconds,
+)
 from app.dynamic_tasks.artifacts import ArtifactAccessDenied, ArtifactService
 from app.dynamic_tasks.capability_catalog import (
     CapabilitySnapshot,
@@ -328,6 +336,36 @@ class _UsageRunProposer(_RunProposer):
         response = super().propose(view=view, step=step)
         return response.model_copy(
             update={"usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}}
+        )
+
+
+class _RepairingRunProposer(_RunProposer):
+    """首次伪造终态证据、收到修复反馈后返回合法证据。"""
+
+    def propose(self, *, view, step):
+        """验证修复轮可见机械失败详情，并为同一 answer 生成新 provider 身份。"""
+
+        if step.kind != "answer":
+            return super().propose(view=view, step=step)
+        self.calls += 1
+        repair_feedback = str(view.messages)
+        repairing = "DYNAMIC_RESULT_VERIFICATION_FAILED" in repair_feedback
+        return CompletedProviderProposal(
+            response_id=("provider_final_repaired" if repairing else "provider_final_invalid"),
+            finish_reason="stop",
+            proposal=RuntimeActionProposal(
+                action_kind=ActionKind.ANSWER,
+                arguments={
+                    "markdown": "# 风险简报\n\n合同证据已核验。",
+                    "criterion_evidence": {
+                        "criterion_01": [
+                            "query_contract" if repairing else "invented_receipt"
+                        ]
+                    },
+                    "pending_questions": [],
+                },
+                rationale="形成最终结果",
+            ),
         )
 
 
@@ -1871,6 +1909,159 @@ def test_run_loop_serially_reaches_verified_terminal_result() -> None:
         assert outcome.message is not None
         assert executor.calls == 1
         assert proposer.calls == 2
+
+
+def test_run_loop_repairs_invalid_result_once_and_settles_skill_use() -> None:
+    """终态证据首次不合格时留痕并仅修复一次，成功后同步结算固定 Skill Use。"""
+
+    engine = create_engine("sqlite://", poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as db:
+        capabilities = _model_capabilities()
+        model = ModelConfig(
+            id="model_result_repair",
+            tenant_id="tenant_demo",
+            name="动态模型",
+            api_key_encrypted="encrypted",
+            model="model-demo",
+            capability_snapshot_json=capabilities,
+            capability_checksum=capability_checksum(capabilities),
+            preflight_status="ready",
+        )
+        db.add(model)
+        db.flush()
+        proposer = _RepairingRunProposer()
+        agent = DynamicTaskAgent(
+            db,
+            catalog=_StartCatalog(model, _snapshot()),
+            tool_executor=_Executor(),
+            planner=_Planner(),
+            action_proposer=proposer,
+        )
+        instance, _ = agent.start_task(
+            tenant_id="tenant_demo",
+            session_id="session_result_repair",
+            agent_id="agent_demo",
+            initiator_user_id="user_demo",
+            goal="生成续约风险简报",
+            success_criteria=("覆盖合同证据",),
+            model_config=model,
+        )
+        use = GeneralSkillUse(
+            id="gsuse_result_repair",
+            tenant_id="tenant_demo",
+            session_id="session_result_repair",
+            turn_id="turn_result_repair",
+            execution_id=instance.id,
+            agent_id="agent_demo",
+            user_id="user_demo",
+            skill_id="skill_demo",
+            revision_id="revision_demo",
+            content_checksum="a" * 64,
+            selection_mode="forced",
+            status="active",
+            idempotency_key="result-repair-use",
+        )
+        db.add(use)
+        db.commit()
+
+        outcome = agent.run_until_blocked_or_complete(
+            execution_id=instance.id,
+            model_config=model,
+            worker_id="worker_result_repair",
+            actor_user_id="user_demo",
+        )
+
+        proposals = db.exec(
+            select(ActionProposalRecord).where(
+                ActionProposalRecord.execution_id == instance.id
+            )
+        ).all()
+        db.refresh(use)
+        assert outcome.status == "succeeded"
+        assert proposer.calls == 3
+        assert [row.status for row in proposals].count("superseded") == 1
+        assert [row.status for row in proposals].count("consumed") == 2
+        assert use.status == "completed"
+        assert use.result_summary_json["message_id"] == outcome.message.id
+
+
+def test_fail_execution_settles_active_skill_use_with_stable_reason() -> None:
+    """动态执行确定性失败时 Skill Use 同步失败，且保留稳定错误码。"""
+
+    engine = create_engine("sqlite://", poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as db:
+        capabilities = _model_capabilities()
+        model = ModelConfig(
+            id="model_failure_settlement",
+            tenant_id="tenant_demo",
+            name="动态模型",
+            api_key_encrypted="encrypted",
+            model="model-demo",
+            capability_snapshot_json=capabilities,
+            capability_checksum=capability_checksum(capabilities),
+            preflight_status="ready",
+        )
+        db.add(model)
+        db.flush()
+        agent = DynamicTaskAgent(
+            db,
+            catalog=_StartCatalog(model, _snapshot()),
+            planner=_Planner(),
+        )
+        instance, _ = agent.start_task(
+            tenant_id="tenant_demo",
+            session_id="session_failure_settlement",
+            agent_id="agent_demo",
+            initiator_user_id="user_demo",
+            goal="生成续约风险简报",
+            success_criteria=("覆盖合同证据",),
+            model_config=model,
+        )
+        use = GeneralSkillUse(
+            tenant_id="tenant_demo",
+            session_id="session_failure_settlement",
+            turn_id="turn_failure_settlement",
+            execution_id=instance.id,
+            agent_id="agent_demo",
+            user_id="user_demo",
+            skill_id="skill_demo",
+            revision_id="revision_demo",
+            content_checksum="b" * 64,
+            selection_mode="forced",
+            status="active",
+            idempotency_key="failure-settlement-use",
+        )
+        db.add(use)
+        db.commit()
+
+        agent.fail_execution(
+            execution_id=instance.id,
+            worker_id="worker_failure_settlement",
+            error_code="DYNAMIC_RESULT_VERIFICATION_FAILED",
+        )
+
+        db.refresh(instance)
+        db.refresh(use)
+        assert instance.status == "failed"
+        assert instance.terminal_reason_json["code"] == "DYNAMIC_RESULT_VERIFICATION_FAILED"
+        assert use.status == "failed"
+        assert use.invalidation_reason == "DYNAMIC_RESULT_VERIFICATION_FAILED"
+
+
+def test_model_lease_covers_provider_timeout_with_bounded_commit_margin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """慢模型租约覆盖配置超时与提交余量，同时不允许无限占有 Execution。"""
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "model_api_timeout_seconds", 600.0)
+    assert _model_lease_ttl_seconds() == 630
+    monkeypatch.setattr(settings, "model_api_timeout_seconds", 15.2)
+    assert _model_lease_ttl_seconds() == 46
+    monkeypatch.setattr(settings, "model_api_timeout_seconds", 3600.0)
+    assert _model_lease_ttl_seconds() == 900
 
 
 def test_persistent_model_and_token_budgets_block_before_unbounded_followup_calls() -> None:

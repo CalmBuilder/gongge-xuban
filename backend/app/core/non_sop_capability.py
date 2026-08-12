@@ -207,28 +207,39 @@ class NonSopCapabilityRouter:
         conversation_context: dict[str, object] | None,
         memory_context: list[dict[str, object]] | None,
         knowledge_capability: dict[str, object],
+        forced_general_skill: GeneralSkill | None = None,
     ) -> NonSopCapabilityRouteResult:
-        """先执行旧 GeneralSkill 决策，再按开关生成不具执行效力的 shadow 结果。"""
+        """分别决定 Skill 与执行模式；结构化强制 Skill 不再短路动态任务判断。"""
 
         selector_context = dict(conversation_context or {})
         selector_context["knowledge_capability"] = knowledge_capability
-        try:
-            selection = general_skill_selector.decide(
-                message,
-                general_skills,
-                model_config,
-                selector_context,
-                memory_context,
-            )
-        except LLMError as exc:
+        if forced_general_skill is not None:
             selection = GeneralSkillSelection(
-                knowledge_mode="auto",
-                reason=f"Capability selection failed: {exc}",
-                degraded=True,
-                failure_code="capability_selection_failed",
+                use_general_skill=True,
+                selected_slug=forced_general_skill.slug,
+                confidence=1.0,
+                reason="用户通过结构化会话入口显式选择 Skill。",
             )
+        else:
+            try:
+                selection = general_skill_selector.decide(
+                    message,
+                    general_skills,
+                    model_config,
+                    selector_context,
+                    memory_context,
+                )
+            except LLMError as exc:
+                selection = GeneralSkillSelection(
+                    knowledge_mode="auto",
+                    reason=f"Capability selection failed: {exc}",
+                    degraded=True,
+                    failure_code="capability_selection_failed",
+                )
 
-        selected_skill = self._resolve_selected_general_skill(selection, general_skills)
+        selected_skill = forced_general_skill or self._resolve_selected_general_skill(
+            selection, general_skills
+        )
         if selection.use_general_skill and selected_skill is None:
             selection = selection.model_copy(
                 update={"use_general_skill": False, "selected_slug": None}
@@ -244,7 +255,7 @@ class NonSopCapabilityRouter:
                 shadow_duration_ms=0.0,
             )
 
-        if selected_skill is not None:
+        if selected_skill is not None and not self.execution_enabled:
             shadow = effective.model_copy()
             return NonSopCapabilityRouteResult(
                 selected_general_skill=selected_skill,
@@ -275,13 +286,10 @@ class NonSopCapabilityRouter:
                 failure_code="dynamic_shadow_failed",
             )
         duration_ms = (perf_counter() - started) * 1000
-        effective = (
-            shadow
-            if self.execution_enabled and shadow.mode == "dynamic_task"
-            else effective
-        )
+        if self.execution_enabled and shadow.mode == "dynamic_task":
+            effective = shadow
         return NonSopCapabilityRouteResult(
-            selected_general_skill=None,
+            selected_general_skill=selected_skill,
             general_selection=selection,
             effective_decision=effective,
             shadow_decision=shadow,

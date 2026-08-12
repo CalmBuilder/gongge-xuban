@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 
 from app.dynamic_tasks.capability_catalog import CapabilitySnapshot, capability_checksum
-from app.dynamic_tasks.planner_service import DynamicTaskPlanner
+from app.dynamic_tasks.planner_service import DynamicTaskPlanner, DynamicTaskPlannerError
 from app.dynamic_tasks.planning import SuccessCriterion
 
 
@@ -169,7 +169,13 @@ def test_planner_only_discloses_model_view_and_freezes_server_contract() -> None
 
     assert client.payload is not None
     assert client.payload["capabilities"] == [
-        {"name": "contract.query", "input_schema": {"partner": "string"}}
+        {
+            "name": "contract.query",
+            "input_schema": {"partner": "string"},
+            "capability_type": "tool",
+            "risk_class": "read",
+            "allowed_step_kind": "tool.read",
+        }
     ]
     assert set(client.payload["output_contract"]) == {
         "goal",
@@ -181,6 +187,7 @@ def test_planner_only_discloses_model_view_and_freezes_server_contract() -> None
     assert "draft_id" in client.payload["output_contract"]["steps"][0]
     assert "internal.invalid" not in str(client.payload)
     assert "authorization" not in str(client.payload)
+    assert "audit_view" not in str(client.payload)
     assert plan.goal == "生成续约风险简报"
     assert plan.success_criteria == (criterion,)
     assert plan.budget == {
@@ -198,11 +205,19 @@ def test_planner_only_discloses_model_view_and_freezes_server_contract() -> None
 class _UnavailableCapabilityClient:
     """模拟模型在无知识目录时仍虚构 knowledge 步骤。"""
 
+    def __init__(self) -> None:
+        """记录有限修复调用次数。"""
+
+        self.calls = 0
+
     def generate_json(self, system_prompt: str, user_payload: dict) -> dict:
         """确认动态 allowed kinds 已移除 knowledge，但仍返回越权草案供服务端拒绝。"""
 
+        self.calls += 1
         assert "knowledge" not in user_payload["limits"]["allowed_step_kinds"]
         assert "knowledge" not in user_payload["output_contract"]["steps"][0]["kind"]
+        if self.calls == 2:
+            assert user_payload["repair"]["failure_code"] == "DYNAMIC_PLAN_SEMANTIC_INVALID"
         return {
             "goal": "生成简报",
             "success_criteria": [
@@ -233,12 +248,157 @@ def test_planner_rejects_knowledge_step_when_capability_is_not_frozen() -> None:
         type="assertion",
         spec={"required": True},
     )
-    with pytest.raises(ValueError, match="未冻结的知识能力"):
-        DynamicTaskPlanner(_UnavailableCapabilityClient()).create_plan(
+    client = _UnavailableCapabilityClient()
+    with pytest.raises(DynamicTaskPlannerError, match="未冻结的知识能力") as rejected:
+        DynamicTaskPlanner(client).create_plan(
             goal="生成简报",
             success_criteria=(criterion,),
             capabilities=(_snapshot(),),
         )
+    assert rejected.value.code == "DYNAMIC_PLAN_SEMANTIC_INVALID"
+    assert client.calls == 2
+
+
+class _LongDisplayTitleClient(_Client):
+    """模拟模型把 Skill 方法说明错误塞入仅用于展示的步骤标题。"""
+
+    def generate_json(self, system_prompt: str, user_payload: dict) -> dict:
+        """返回语义合法但 title 超长的计划，其他字段不得被服务端代修。"""
+
+        raw = super().generate_json(system_prompt, user_payload)
+        raw["steps"][0]["title"] = "核对输入并形成可执行规范。" * 40
+        return raw
+
+
+def test_planner_bounds_model_controlled_display_title_without_weakening_plan_contract() -> None:
+    """超长展示标题由服务端确定性收紧，能力引用和依赖仍按原严格契约验证。"""
+
+    plan = DynamicTaskPlanner(_LongDisplayTitleClient()).create_plan(
+        goal="生成续约风险简报",
+        success_criteria=(
+            SuccessCriterion(id="brief_ready", type="assertion", spec={"required": True}),
+        ),
+        capabilities=(_snapshot(),),
+    )
+
+    assert len(plan.steps[0].title) == 256
+    assert plan.steps[0].title.endswith("…")
+    assert plan.steps[0].capability_refs == ("contract.query",)
+
+
+def test_planner_hides_side_effect_capability_without_explicit_user_intent() -> None:
+    """写报告不授权创建 Skill；只有明确要求沉淀 Skill 时才向规划器披露提案能力。"""
+
+    payload = {
+        "capability_type": "tool",
+        "capability_id": "platform.general_skill.propose",
+        "tenant_id": "tenant_demo",
+        "name": "platform.general_skill.propose",
+        "contract": {
+            "risk_class": "local_write",
+            "requires_explicit_goal_intent": "skill_proposal",
+        },
+        "model_view": {"name": "platform.general_skill.propose", "input_schema": {}},
+        "user_view": {},
+        "audit_view": {},
+    }
+    capability = CapabilitySnapshot(
+        **payload,
+        agent_id="agent_demo",
+        checksum=capability_checksum(payload),
+    )
+    criterion = SuccessCriterion(id="done", type="assertion", spec={"required": True})
+
+    ordinary_client = _Client()
+    with pytest.raises(DynamicTaskPlannerError):
+        DynamicTaskPlanner(ordinary_client).create_plan(
+            goal="写一份售后操作规范",
+            success_criteria=(criterion,),
+            capabilities=(capability,),
+        )
+    assert ordinary_client.payload is not None
+    assert ordinary_client.payload["capabilities"] == []
+
+    selected_client = _Client()
+    with pytest.raises(DynamicTaskPlannerError):
+        DynamicTaskPlanner(selected_client).create_plan(
+            goal="使用 writing-for-agents Skill 创建一份售后操作规范",
+            success_criteria=(criterion,),
+            capabilities=(capability,),
+        )
+    assert selected_client.payload is not None
+    assert selected_client.payload["capabilities"] == []
+
+    explicit_client = _Client()
+    with pytest.raises(DynamicTaskPlannerError):
+        DynamicTaskPlanner(explicit_client).create_plan(
+            goal="把售后方法沉淀为一个 Skill",
+            success_criteria=(criterion,),
+            capabilities=(capability,),
+        )
+    assert explicit_client.payload is not None
+    assert explicit_client.payload["capabilities"][0]["name"] == capability.name
+
+
+class _RepairingCapabilityClient:
+    """首轮虚构工具，收到服务端修复契约后收敛为纯回答计划。"""
+
+    def __init__(self) -> None:
+        """初始化调用记录。"""
+
+        self.payloads: list[dict] = []
+
+    def generate_json(self, system_prompt: str, user_payload: dict) -> dict:
+        """首轮返回越权能力引用，第二轮遵守有限修复提示。"""
+
+        self.payloads.append(user_payload)
+        if len(self.payloads) == 1:
+            return {
+                "goal": user_payload["goal"],
+                "success_criteria": user_payload["success_criteria"],
+                "steps": [
+                    {
+                        "draft_id": "lookup",
+                        "title": "查询未冻结系统",
+                        "kind": "tool.read",
+                        "capability_refs": ["invented.query"],
+                    },
+                    {
+                        "draft_id": "answer",
+                        "title": "形成结果",
+                        "kind": "answer",
+                        "depends_on": ["lookup"],
+                    },
+                ],
+            }
+        assert user_payload["repair"]["failure_code"] == "DYNAMIC_PLAN_SEMANTIC_INVALID"
+        return {
+            "goal": user_payload["goal"],
+            "success_criteria": user_payload["success_criteria"],
+            "steps": [
+                {
+                    "draft_id": "answer",
+                    "title": "形成结果",
+                    "kind": "answer",
+                }
+            ],
+        }
+
+
+def test_planner_repairs_one_semantically_invalid_capability_plan() -> None:
+    """规划器只允许一次受限语义修复，成功后仍由服务端完整校验。"""
+
+    client = _RepairingCapabilityClient()
+    plan = DynamicTaskPlanner(client).create_plan(
+        goal="生成操作规范",
+        success_criteria=(
+            SuccessCriterion(id="spec_ready", type="assertion", spec={"required": True}),
+        ),
+        capabilities=(),
+    )
+
+    assert len(client.payloads) == 2
+    assert [step.kind for step in plan.steps] == ["answer"]
 
 
 class _NonConvergentClient:
