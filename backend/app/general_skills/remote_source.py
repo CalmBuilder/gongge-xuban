@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import http.client
 import ipaddress
+import json
 import re
 import socket
 import ssl
@@ -24,6 +25,8 @@ SKILLHUB_PAGE_HOSTS = frozenset({"skillhub.ai", "www.skillhub.ai", "clawhub.ai",
 SKILLHUB_DOWNLOAD_HOSTS = frozenset({"wry-manatee-359.convex.site"})
 SKILLHUB_DOWNLOAD_ENDPOINT = "https://wry-manatee-359.convex.site/api/v1/download"
 REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+CLOUDFLARE_DOH_ADDRESS = "1.1.1.1"
+CLOUDFLARE_DOH_HOST = "cloudflare-dns.com"
 
 
 class GeneralSkillRemoteSourceError(RuntimeError):
@@ -159,6 +162,17 @@ class SecureHttpsFetcher:
         )
 
 
+def configured_secure_https_fetcher(dns_resolver: str) -> SecureHttpsFetcher:
+    """按部署配置创建抓取器，仅允许系统 DNS 或固定 Cloudflare DoH 两种解析边界。"""
+
+    normalized = dns_resolver.strip().lower()
+    if normalized == "system":
+        return SecureHttpsFetcher()
+    if normalized == "cloudflare_doh":
+        return SecureHttpsFetcher(resolver=_resolve_host_cloudflare_doh)
+    raise ValueError("GENERAL_SKILL_DNS_RESOLVER must be system or cloudflare_doh")
+
+
 def github_archive_url(repository_url: str, revision: str) -> str:
     """把标准 GitHub 仓库 URL 与 40 位 commit SHA 转为不可漂移归档地址。"""
 
@@ -266,6 +280,60 @@ def _resolve_host(hostname: str, port: int) -> tuple[str, ...]:
             "GENERAL_SKILL_PACKAGE_INVALID", "remote source hostname cannot be resolved"
         ) from exc
     return tuple(sorted({str(row[4][0]) for row in rows}))
+
+
+def _resolve_host_cloudflare_doh(hostname: str, port: int) -> tuple[str, ...]:
+    """经固定 Cloudflare DoH 端点解析 A/AAAA，供 Fake-IP 内网显式替代系统 DNS。"""
+
+    if port != 443:
+        raise GeneralSkillRemoteSourceError(
+            "GENERAL_SKILL_PACKAGE_INVALID", "remote source DNS port is invalid"
+        )
+    addresses: set[str] = set()
+    for record_type in ("A", "AAAA"):
+        connection = http.client.HTTPSConnection(
+            CLOUDFLARE_DOH_ADDRESS,
+            443,
+            timeout=10,
+            context=ssl.create_default_context(),
+        )
+        try:
+            connection.request(
+                "GET",
+                f"/dns-query?name={quote(hostname, safe='')}&type={record_type}",
+                headers={"Host": CLOUDFLARE_DOH_HOST, "Accept": "application/dns-json"},
+            )
+            response = connection.getresponse()
+            payload = response.read(64 * 1024 + 1)
+        except (OSError, TimeoutError, ssl.SSLError, http.client.HTTPException) as exc:
+            raise GeneralSkillRemoteSourceError(
+                "GENERAL_SKILL_PACKAGE_INVALID", "remote source DoH lookup failed"
+            ) from exc
+        finally:
+            connection.close()
+        if response.status != 200 or len(payload) > 64 * 1024:
+            raise GeneralSkillRemoteSourceError(
+                "GENERAL_SKILL_PACKAGE_INVALID", "remote source DoH lookup failed"
+            )
+        try:
+            body = json.loads(payload)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise GeneralSkillRemoteSourceError(
+                "GENERAL_SKILL_PACKAGE_INVALID", "remote source DoH response is invalid"
+            ) from exc
+        if body.get("Status") != 0:
+            raise GeneralSkillRemoteSourceError(
+                "GENERAL_SKILL_PACKAGE_INVALID", "remote source hostname cannot be resolved"
+            )
+        expected_type = 1 if record_type == "A" else 28
+        for answer in body.get("Answer") or []:
+            if isinstance(answer, dict) and answer.get("type") == expected_type:
+                addresses.add(str(answer.get("data") or ""))
+    if not addresses:
+        raise GeneralSkillRemoteSourceError(
+            "GENERAL_SKILL_PACKAGE_INVALID", "remote source hostname cannot be resolved"
+        )
+    return tuple(sorted(addresses))
 
 
 def _validated_public_addresses(addresses: tuple[str, ...]) -> tuple[str, ...]:

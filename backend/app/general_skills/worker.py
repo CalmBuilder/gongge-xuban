@@ -21,7 +21,7 @@ from app.db import engine
 from app.db.models import GeneralSkillRevision, utc_now
 from app.general_skills.import_service import GeneralSkillImportService, ImportQuotaPolicy
 from app.general_skills.object_store import FileSystemSkillObjectStore
-from app.general_skills.remote_source import RemoteFetcher, SecureHttpsFetcher
+from app.general_skills.remote_source import RemoteFetcher, configured_secure_https_fetcher
 
 
 LOGGER = logging.getLogger(__name__)
@@ -36,7 +36,7 @@ WORKER_ID = f"gsworker_{uuid4().hex[:16]}"
 def get_remote_fetcher() -> RemoteFetcher:
     """创建后台作业使用的安全远程抓取器，测试可替换供应商边界。"""
 
-    return SecureHttpsFetcher()
+    return configured_secure_https_fetcher(get_settings().general_skill_dns_resolver)
 
 
 def run_maintenance_once() -> int:

@@ -89,6 +89,7 @@ class Settings(BaseSettings):
     general_skill_import_v2_enabled: bool = False
     general_skill_object_store_path: str = "./data/general-skill-objects"
     general_skill_https_allowed_hosts: str = ""
+    general_skill_dns_resolver: str = Field(default="system", pattern="^(system|cloudflare_doh)$")
     general_skill_import_tenant_active_limit: int = Field(default=4, ge=1, le=8)
     general_skill_import_user_active_limit: int = Field(default=2, ge=1, le=4)
     general_skill_import_tenant_staged_bytes: int = Field(

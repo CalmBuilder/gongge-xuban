@@ -30,7 +30,7 @@ from app.general_skills.import_service import (
     ImportQuotaPolicy,
 )
 from app.general_skills.object_store import FileSystemSkillObjectStore
-from app.general_skills.remote_source import RemoteFetcher, SecureHttpsFetcher
+from app.general_skills.remote_source import RemoteFetcher, configured_secure_https_fetcher
 from app.general_skills.source_credentials import (
     GeneralSkillSourceCredentialError,
     GeneralSkillSourceCredentialService,
@@ -45,10 +45,10 @@ router = APIRouter(
 )
 
 
-def get_general_skill_remote_fetcher() -> RemoteFetcher:
+def get_general_skill_remote_fetcher(settings: Settings = Depends(get_settings)) -> RemoteFetcher:
     """创建生产 fail-closed HTTPS fetcher，并作为测试可替换的供应商边界。"""
 
-    return SecureHttpsFetcher()
+    return configured_secure_https_fetcher(settings.general_skill_dns_resolver)
 
 
 @router.get("/capabilities")

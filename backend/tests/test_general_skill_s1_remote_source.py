@@ -18,6 +18,7 @@ from app.general_skills.remote_source import (
     GeneralSkillRemoteSourceError,
     SecureHttpsFetcher,
     _ExchangeResult,
+    configured_secure_https_fetcher,
     github_archive_url,
     skillhub_archive_url,
 )
@@ -44,6 +45,15 @@ class _ExchangeStub:
 
         self.calls.append((source_url, address, max_bytes, timeout_seconds, authorization))
         return self.responses.popleft()
+
+
+def test_fetcher_factory_requires_an_explicit_supported_dns_mode() -> None:
+    """验证部署只能选择系统 DNS 或固定 DoH，拼写错误不会静默削弱网络边界。"""
+
+    assert isinstance(configured_secure_https_fetcher("system"), SecureHttpsFetcher)
+    assert isinstance(configured_secure_https_fetcher("cloudflare_doh"), SecureHttpsFetcher)
+    with pytest.raises(ValueError, match="GENERAL_SKILL_DNS_RESOLVER"):
+        configured_secure_https_fetcher("allow_fake_ip")
 
 
 def test_github_archive_requires_exact_repository_and_full_commit_sha() -> None:

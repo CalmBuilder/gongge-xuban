@@ -55,7 +55,7 @@ from app.general_skills.package_security import (
     normalize_zip_package,
 )
 from app.config import get_settings
-from app.general_skills.remote_source import RemoteFetcher, SecureHttpsFetcher
+from app.general_skills.remote_source import RemoteFetcher, configured_secure_https_fetcher
 
 
 SKILL_PROPOSAL_TOOL_NAME = "platform.general_skill.propose"
@@ -65,7 +65,7 @@ _SLUG_INVALID = re.compile(r"[^a-z0-9]+")
 def get_agent_proposal_remote_fetcher() -> RemoteFetcher:
     """构造 Agent 远程提案使用的安全下载器，并为隔离全栈测试保留 provider seam。"""
 
-    return SecureHttpsFetcher()
+    return configured_secure_https_fetcher(get_settings().general_skill_dns_resolver)
 
 
 class GeneralSkillProposalError(RuntimeError):
