@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import base64
 import math
+import threading
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Protocol
+from typing import Iterator, Protocol
 
 from pydantic import ValidationError
 from sqlmodel import Session, select
@@ -56,7 +58,11 @@ from app.dynamic_tasks.capability_catalog import (
     capability_checksum,
 )
 from app.dynamic_tasks.planner_service import DynamicTaskPlanner
-from app.general_skills.runtime import GeneralSkillRuntimeError, GeneralSkillRuntimeService
+from app.general_skills.runtime import (
+    GeneralSkillRuntimeError,
+    GeneralSkillRuntimeService,
+    LoadedGeneralSkill,
+)
 from app.general_skills.proposals import (
     GeneralSkillProposalArguments,
     GeneralSkillProposalError,
@@ -712,16 +718,22 @@ class DynamicTaskAgent:
                     LLMClient(verified_model)
                 )
                 try:
-                    completed = proposer.propose(
-                        goal=plan.goal,
-                        step=step_definition,
-                        capabilities=tuple(
-                            snapshots[name] for name in step_definition.capability_refs
-                        ),
-                        observations=observations,
-                        remaining_tool_calls=max(0, remaining_tool_calls),
-                        general_skill_guidance=skill_guidance,
+                    lease = self.store.renew(
+                        lease, ttl_seconds=_model_lease_ttl_seconds()
                     )
+                    self.db.commit()
+                    with self._model_lease_heartbeat(lease):
+                        completed = proposer.propose(
+                            goal=plan.goal,
+                            step=step_definition,
+                            capabilities=tuple(
+                                snapshots[name] for name in step_definition.capability_refs
+                            ),
+                            observations=observations,
+                            remaining_tool_calls=max(0, remaining_tool_calls),
+                            general_skill_guidance=skill_guidance,
+                        )
+                    self.db.refresh(instance)
                 except ValueError:
                     self._fail_explore(
                         instance,
@@ -3131,6 +3143,9 @@ class DynamicTaskAgent:
         )
         if knowledge_snapshot is not None:
             capabilities.append(knowledge_snapshot)
+        knowledge_required = bool((knowledge_capability or {}).get("required"))
+        if knowledge_required and knowledge_snapshot is None:
+            raise DynamicTaskAgentError("DYNAMIC_KNOWLEDGE_REQUIRED_UNAVAILABLE")
         criteria = tuple(
             SuccessCriterion(
                 id=f"criterion_{index:02d}",
@@ -3237,6 +3252,7 @@ class DynamicTaskAgent:
             selected_guidance = []
             guidance_mode = "auto"
         loaded_guidance: list[dict[str, object]] = []
+        loaded_guidance_rows: list[LoadedGeneralSkill] = []
         loaded_use_ids: list[str] = []
         loaded_use_id_set: set[str] = set()
         actor = self.db.get(User, initiator_user_id) if selected_guidance else None
@@ -3271,13 +3287,7 @@ class DynamicTaskAgent:
                     continue
                 loaded_use_id_set.add(loaded.use_id)
                 loaded_use_ids.append(loaded.use_id)
-                loaded_guidance.append(
-                    {
-                        "name": loaded.name,
-                        "skill_use_ids": [loaded.use_id],
-                        "skills": [loaded.prompt_block()],
-                    }
-                )
+                loaded_guidance_rows.append(loaded)
                 self.db.add(
                     AgentEvent(
                         tenant_id=tenant_id,
@@ -3297,13 +3307,7 @@ class DynamicTaskAgent:
         for loaded in composed_bundle:
             loaded_use_id_set.add(loaded.use_id)
             loaded_use_ids.append(loaded.use_id)
-            loaded_guidance.append(
-                {
-                    "name": loaded.name,
-                    "skill_use_ids": [loaded.use_id],
-                    "skills": [loaded.prompt_block()],
-                }
-            )
+            loaded_guidance_rows.append(loaded)
             self.db.add(
                 AgentEvent(
                     tenant_id=tenant_id,
@@ -3320,6 +3324,14 @@ class DynamicTaskAgent:
                     },
                 )
             )
+        loaded_guidance = [
+            {
+                "name": loaded.name,
+                "skill_use_ids": [loaded.use_id],
+                "skills": [loaded.prompt_block()],
+            }
+            for loaded in runtime.apply_shared_resource_budget(tuple(loaded_guidance_rows))
+        ]
         planning_inputs = tuple(
             {
                 "resource_id": resource.id,
@@ -3370,6 +3382,9 @@ class DynamicTaskAgent:
             for step in plan.steps
         ):
             raise DynamicTaskAgentError("DYNAMIC_PLAN_UNSUPPORTED_STEP")
+        if knowledge_required:
+            if not _plan_has_required_knowledge_ancestor(plan):
+                raise DynamicTaskAgentError("DYNAMIC_REQUIRED_KNOWLEDGE_STEP_MISSING")
         snapshot = {
             "tools": [
                 item.model_dump(mode="json")
@@ -4787,7 +4802,7 @@ class DynamicTaskAgent:
             self._assert_runtime_budget(instance)
             skill_guidance = self._step_guidance(instance, step)
             self._consume_call_budget(instance, "model_calls")
-            self.store.renew(lease, ttl_seconds=_model_lease_ttl_seconds())
+            lease = self.store.renew(lease, ttl_seconds=_model_lease_ttl_seconds())
             self.db.commit()
             projection = build_execution_context_projection(
                 self.db,
@@ -4825,10 +4840,50 @@ class DynamicTaskAgent:
                 native_input_parts=native_input_parts,
             )
             proposer = self.action_proposer or DynamicActionProposer(LLMClient(verified_model))
-            completed = proposer.propose(view=view, step=step)
+            with self._model_lease_heartbeat(lease):
+                completed = proposer.propose(view=view, step=step)
+            self.db.refresh(instance)
             self._record_model_usage(instance, completed.usage)
             self.db.commit()
             return completed
+
+    @contextmanager
+    def _model_lease_heartbeat(self, lease) -> Iterator[None]:
+        """模型阻塞外呼期间以独立会话短租续约；进程崩溃后最多一个短 TTL 即可恢复。"""
+
+        stop = threading.Event()
+        interval_seconds = max(5.0, _model_lease_ttl_seconds() / 3)
+        bind = self.db.get_bind()
+        if bind.dialect.name == "sqlite" and not bind.url.database:
+            yield
+            return
+
+        def heartbeat() -> None:
+            """按数据库 fencing token 续约，任何失权或数据库错误都停止后台线程。"""
+
+            current = lease
+            while not stop.wait(interval_seconds):
+                try:
+                    with Session(bind) as heartbeat_db:
+                        current = SopExecutionStore(heartbeat_db).renew(
+                            current,
+                            ttl_seconds=_model_lease_ttl_seconds(),
+                        )
+                        heartbeat_db.commit()
+                except Exception:
+                    return
+
+        thread = threading.Thread(
+            target=heartbeat,
+            name=f"dynamic-model-lease-{lease.instance_id}",
+            daemon=True,
+        )
+        thread.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            thread.join(timeout=max(1.0, interval_seconds))
 
     def _step_guidance(
         self,
@@ -4871,10 +4926,16 @@ class DynamicTaskAgent:
                 )
                 for use in execution_uses
             }
+            projected = runtime.apply_shared_resource_budget(
+                tuple(
+                    projected_by_id[use_id]
+                    for use_id in step.guidance_skill_use_ids
+                    if use_id in projected_by_id
+                )
+            )
             return [
-                projected_by_id[use_id].prompt_block()
-                for use_id in step.guidance_skill_use_ids
-                if use_id in projected_by_id
+                loaded.prompt_block()
+                for loaded in projected
             ]
         except GeneralSkillRuntimeError as exc:
             raise DynamicTaskAgentError(exc.code) from exc
@@ -5132,12 +5193,32 @@ def _mapping_path_value(source: Mapping[str, object], path: str) -> tuple[bool, 
     return True, current
 
 
+def _plan_has_required_knowledge_ancestor(plan: NormalizedPlan) -> bool:
+    """确认至少一个必需知识步骤位于最终 answer 的依赖祖先链。"""
+
+    answer = next((step for step in plan.steps if step.kind == "answer"), None)
+    by_key = {step.step_key: step for step in plan.steps}
+    ancestors: set[str] = set()
+    pending = list(answer.depends_on) if answer is not None else []
+    while pending:
+        step_key = pending.pop()
+        if step_key in ancestors:
+            continue
+        ancestors.add(step_key)
+        dependency = by_key.get(step_key)
+        if dependency is not None:
+            pending.extend(dependency.depends_on)
+    return any(
+        step.kind == "knowledge" and step.required and step.step_key in ancestors
+        for step in plan.steps
+    )
+
+
 def _model_lease_ttl_seconds() -> int:
-    """覆盖 JSON 修复与空响应重试的最坏外呼窗口，避免租约中途过期造成重复计费。"""
+    """返回由独立 heartbeat 续租的短 TTL，使 worker 崩溃后可在数分钟内恢复。"""
 
     timeout = float(getattr(get_settings(), "model_api_timeout_seconds", 600.0) or 600.0)
-    max_provider_attempts = 4 * 3  # JSON 初次+3 次修复，每个候选含初次+2 次空响应重试。
-    return max(30, min(14_400, math.ceil(timeout * max_provider_attempts) + 30))
+    return max(30, min(180, math.ceil(min(timeout, 120.0)) + 30))
 
 
 def canonical_result_checksum(result: DynamicTaskResult) -> str:

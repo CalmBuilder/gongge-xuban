@@ -522,6 +522,68 @@ def test_dynamic_delegation_preserves_forced_general_skill_selection(monkeypatch
     assert captured["forced_general_skill_ids"] == ()
 
 
+def test_multiple_forced_general_skills_always_enter_composed_dynamic_runtime(monkeypatch) -> None:
+    """即使分类器判普通回答，多选 Skill 也不得静默丢弃第二项，必须组合委派。"""
+
+    captured: dict[str, object] = {}
+
+    class _DynamicAgent:
+        """捕获多选 Skill 组合参数并返回成功。"""
+
+        def __init__(self, _db) -> None:
+            """兼容生产构造签名。"""
+
+        def start_task(self, **kwargs):
+            """记录创建参数。"""
+
+            captured.update(kwargs)
+            return SimpleNamespace(id="execution_composed"), True
+
+        def run_until_blocked_or_complete(self, **_kwargs):
+            """模拟组合动态任务完成。"""
+
+            return DynamicRunOutcome(
+                status="succeeded",
+                execution_id="execution_composed",
+                message=SimpleNamespace(content="组合结果"),
+            )
+
+    monkeypatch.setattr("app.core.agent_loop.DynamicTaskAgent", _DynamicAgent)
+    loop = object.__new__(AgentLoop)
+    loop.db = SimpleNamespace(
+        refresh=lambda _row: None,
+        commit=lambda: None,
+        begin_nested=lambda: nullcontext(),
+    )
+    loop.events = SimpleNamespace(record=lambda *_args, **_kwargs: None)
+    loop._knowledge_capability_payload = lambda *_args: {"available": False}
+    route = NonSopCapabilityRouteResult(
+        selected_general_skill=None,
+        general_selection=GeneralSkillSelection(),
+        effective_decision=NonSopCapabilityDecision(mode="answer"),
+        shadow_decision=None,
+        shadow_attempted=False,
+        shadow_duration_ms=0.0,
+    )
+    response = loop._try_handle_dynamic_task(
+        ChatTurnRequest(
+            tenant_id="tenant_demo",
+            user_id="user_demo",
+            agent_id="agent_demo",
+            message="综合两个方法形成规范",
+            forced_general_skill_ids=["skill_a", "skill_b"],
+        ),
+        ChatSession(id="session_composed", tenant_id="tenant_demo", agent_id="agent_demo"),
+        SimpleNamespace(id="model_1"),
+        route,
+        "message_composed",
+    )
+
+    assert response is not None and response.reply == "组合结果"
+    assert captured["forced_general_skill_id"] is None
+    assert captured["forced_general_skill_ids"] == ("skill_a", "skill_b")
+
+
 def test_agent_loop_defers_temporary_tool_quota_exhaustion_without_failing_execution(
     monkeypatch,
 ) -> None:
@@ -633,8 +695,8 @@ def test_dynamic_waiting_projection_distinguishes_automatic_and_human_recovery()
     assert "待我处理" in clarification
 
 
-def test_agent_loop_rollout_denial_falls_back_without_creating_execution(monkeypatch) -> None:
-    """tenant 或 Agent 未命中灰度时只记脱敏拒绝事件，不创建动态 Execution。"""
+def test_agent_loop_optional_dynamic_rollout_denial_can_fall_back(monkeypatch) -> None:
+    """非持久、非显式组合的动态建议未命中灰度时可以保留旧普通回答。"""
 
     route = _route(
         NonSopCapabilityRouter(
@@ -685,6 +747,49 @@ def test_agent_loop_rollout_denial_falls_back_without_creating_execution(monkeyp
     assert "生成风险简报" not in str(recorded)
 
 
+def test_durable_dynamic_rollout_denial_fails_instead_of_fake_answer(monkeypatch) -> None:
+    """要求持久执行的复杂任务未命中灰度时必须失败，不能伪装成普通问答。"""
+
+    route = _route(
+        NonSopCapabilityRouter(
+            shadow_enabled=False,
+            execution_enabled=True,
+            shadow_selector=_ShadowSelector(
+                NonSopCapabilityDecision(
+                    mode="dynamic_task",
+                    goal="生成风险简报",
+                    success_criteria=["覆盖合同证据"],
+                    requires_durable_execution=True,
+                    confidence=0.95,
+                )
+            ),
+        ),
+        _GeneralSelector(GeneralSkillSelection()),
+    )
+    loop = object.__new__(AgentLoop)
+    loop.db = SimpleNamespace()
+    loop.events = SimpleNamespace(record=lambda *_args, **_kwargs: None)
+    loop._dynamic_task_rollout_allows = lambda _tenant, _agent: False
+
+    with pytest.raises(DynamicTaskAgentError, match="DYNAMIC_TASK_ROLLOUT_DENIED"):
+        loop._try_handle_dynamic_task(
+            ChatTurnRequest(
+                tenant_id="tenant_demo",
+                user_id="user_demo",
+                agent_id="agent_demo",
+                message="生成风险简报",
+            ),
+            ChatSession(
+                id="session_durable_rollout_denied",
+                tenant_id="tenant_demo",
+                agent_id="agent_demo",
+            ),
+            SimpleNamespace(id="model_1"),
+            route,
+            "message_durable_rollout_denied",
+        )
+
+
 def test_scheduled_dynamic_task_rollout_denial_fails_instead_of_fake_success(
     monkeypatch,
 ) -> None:
@@ -706,6 +811,10 @@ def test_scheduled_dynamic_task_rollout_denial_fails_instead_of_fake_success(
     loop.db = SimpleNamespace()
     loop.events = SimpleNamespace(record=lambda *_args, **_kwargs: None)
     loop._dynamic_task_rollout_allows = lambda _tenant, _agent: False
+    loop._forced_general_skill_capability = lambda *_args, **_kwargs: (
+        SimpleNamespace(id="skill_a"),
+        GeneralSkillSelection(),
+    )
     session = ChatSession(
         id="session_scheduled_rollout_denied",
         tenant_id="tenant_demo",
@@ -725,6 +834,94 @@ def test_scheduled_dynamic_task_rollout_denial_fails_instead_of_fake_success(
             SimpleNamespace(id="model_1"),
             route,
             "message_scheduled_rollout_denied",
+        )
+
+
+def test_multi_skill_rollout_denial_fails_instead_of_consuming_only_first_skill() -> None:
+    """显式多选依赖动态组合运行时，灰度拒绝时必须失败而不是静默只消费首项。"""
+
+    route = _route(
+        NonSopCapabilityRouter(
+            shadow_enabled=False,
+            execution_enabled=True,
+            shadow_selector=_ShadowSelector(NonSopCapabilityDecision(mode="answer")),
+        ),
+        _GeneralSelector(GeneralSkillSelection()),
+    )
+    loop = object.__new__(AgentLoop)
+    loop.db = SimpleNamespace()
+    loop.events = SimpleNamespace(record=lambda *_args, **_kwargs: None)
+    loop._dynamic_task_rollout_allows = lambda _tenant, _agent: False
+    loop._forced_general_skill_capability = lambda *_args, **_kwargs: (
+        SimpleNamespace(id="skill_a"),
+        GeneralSkillSelection(),
+    )
+
+    with pytest.raises(DynamicTaskAgentError, match="DYNAMIC_TASK_ROLLOUT_DENIED"):
+        loop._try_handle_dynamic_task(
+            ChatTurnRequest(
+                tenant_id="tenant_demo",
+                user_id="user_demo",
+                agent_id="agent_demo",
+                message="组合使用两个 Skill",
+                forced_general_skill_id="skill_a",
+                forced_general_skill_ids=("skill_a", "skill_b"),
+            ),
+            ChatSession(
+                id="session_multi_skill_rollout_denied",
+                tenant_id="tenant_demo",
+                agent_id="agent_demo",
+            ),
+            SimpleNamespace(id="model_1"),
+            route,
+            "message_multi_skill_rollout_denied",
+        )
+
+
+def test_required_knowledge_unavailable_fails_before_dynamic_execution() -> None:
+    """用户要求企业知识但没有可用版本时必须明确失败，禁止无证据生成答案。"""
+
+    route = NonSopCapabilityRouteResult(
+        selected_general_skill=None,
+        general_selection=GeneralSkillSelection(
+            use_general_skill=True,
+            selected_slug="policy",
+            use_knowledge=True,
+            knowledge_mode="required",
+        ),
+        effective_decision=NonSopCapabilityDecision(
+            mode="dynamic_task",
+            goal="依据企业制度回答",
+            success_criteria=["引用企业知识证据"],
+        ),
+        shadow_decision=None,
+        shadow_attempted=False,
+        shadow_duration_ms=0,
+    )
+    loop = object.__new__(AgentLoop)
+    loop.db = SimpleNamespace()
+    loop.events = SimpleNamespace(record=lambda *_args, **_kwargs: None)
+    loop._dynamic_task_rollout_allows = lambda _tenant, _agent: True
+    loop._knowledge_capability_payload = lambda *_args, **_kwargs: {"available": False}
+
+    with pytest.raises(
+        DynamicTaskAgentError, match="DYNAMIC_KNOWLEDGE_REQUIRED_UNAVAILABLE"
+    ):
+        loop._try_handle_dynamic_task(
+            ChatTurnRequest(
+                tenant_id="tenant_demo",
+                user_id="user_demo",
+                agent_id="agent_demo",
+                message="依据企业制度回答",
+            ),
+            ChatSession(
+                id="session_required_knowledge_unavailable",
+                tenant_id="tenant_demo",
+                agent_id="agent_demo",
+            ),
+            SimpleNamespace(id="model_1"),
+            route,
+            "message_required_knowledge_unavailable",
         )
 
 

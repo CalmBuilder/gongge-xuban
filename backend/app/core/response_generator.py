@@ -87,6 +87,7 @@ class ResponseGenerator:
         memory_context: list[dict[str, object]] | None = None,
         conversation_context: dict[str, object] | None = None,
         task_results: list[dict[str, object]] | None = None,
+        propagate_model_failure: bool = False,
     ) -> str:
         runtime_control_reply = self._runtime_control_reply(step_result)
         if runtime_control_reply is not None:
@@ -117,6 +118,8 @@ class ResponseGenerator:
                 reply, session, router_decision, step_result, tool_result, skill
             )
         except Exception as exc:
+            if propagate_model_failure:
+                raise
             return format_runtime_failure_reply("模型调用失败", exc, "LLM_ERROR", model_failure_suggestion(exc))
 
     def generate_stream(

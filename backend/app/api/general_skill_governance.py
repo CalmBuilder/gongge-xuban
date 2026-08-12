@@ -158,7 +158,7 @@ def create_binding(
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> GeneralSkillBindingRead:
-    """由用户主动把本人或开放广场 Skill 绑定到本人数字员工。"""
+    """由所有者把本人 Skill 复用到本人数字员工；组织 Skill 必须走发布采用入口。"""
 
     try:
         row = GeneralSkillGovernanceService(db).create_binding(

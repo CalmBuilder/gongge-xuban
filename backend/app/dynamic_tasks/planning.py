@@ -263,7 +263,14 @@ def normalize_plan_draft(
                 guidance_skill_use_ids=(
                     all_guidance_use_ids
                     if step.kind
-                    in {"tool.read", "tool.write", "tool.execute", "knowledge", "explore"}
+                    in {
+                        "tool.read",
+                        "tool.write",
+                        "tool.execute",
+                        "knowledge",
+                        "explore",
+                        "answer",
+                    }
                     else tuple(
                         dict.fromkeys(
                             use_id

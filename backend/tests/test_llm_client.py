@@ -115,6 +115,7 @@ def test_llm_client_uses_600_second_timeout(monkeypatch):
 
     assert client.timeout_seconds == 600.0
     assert captured["timeout"] == 600.0
+    assert captured["max_retries"] == 0
     assert client.extra_body == {
         "thinking": {"type": "disabled"},
         "do_sample": False,
@@ -146,6 +147,7 @@ def test_llm_client_allows_scoped_timeout_override(monkeypatch):
 
     assert client.timeout_seconds == 120
     assert captured["timeout"] == 120
+    assert captured["max_retries"] == 0
 
 
 def test_model_config_create_defaults_to_8192_output_tokens():

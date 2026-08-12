@@ -189,8 +189,8 @@ def test_user_private_skill_is_visible_only_to_owner_even_on_shared_agent() -> N
     assert resolver.resolve(adopter, agent.id).items == ()
 
 
-def test_agent_private_skill_is_shared_only_through_authorized_agent_usage() -> None:
-    """验证 agent_private 可供已采用该分身的用户使用但跨租户主体始终不可见。"""
+def test_agent_private_skill_is_not_shared_without_frozen_release_evidence() -> None:
+    """旧 AgentUsage 不能替代所有者传播授权，私有 Skill 只对所有者可见。"""
 
     db, owner, adopter, agent = _context()
     _skill_with_revisions(
@@ -213,7 +213,7 @@ def test_agent_private_skill_is_shared_only_through_authorized_agent_usage() -> 
     resolver = EffectiveGeneralSkillResolver(db)
 
     assert len(resolver.resolve(owner, agent.id).items) == 1
-    assert len(resolver.resolve(adopter, agent.id).items) == 1
+    assert resolver.resolve(adopter, agent.id).items == ()
     assert resolver.resolve(outsider, agent.id).items == ()
 
 
@@ -323,8 +323,8 @@ def test_binding_configuration_is_atomic_audited_and_stale_write_is_rejected() -
         )
 
 
-def test_owner_reuses_skill_across_agents_and_gallery_requires_active_adoption() -> None:
-    """验证本人可多分身复用，其他用户只能把 tenant-gallery Skill 主动绑定到本人分身。"""
+def test_owner_reuses_skill_across_agents_and_gallery_requires_release_adoption() -> None:
+    """本人可跨分身复用，其他用户不能用治理绑定绕过已审 Release 主动采用。"""
 
     db, owner, adopter, first_agent = _context()
     skill, _, current, _ = _skill_with_revisions(
@@ -359,19 +359,19 @@ def test_owner_reuses_skill_across_agents_and_gallery_requires_active_adoption()
         pinned_revision_id=current.id,
         invocation_policy="model_allowed",
     )
-    adopter_binding = service.create_binding(
-        current_user=adopter,
-        agent_id=adopter_agent.id,
-        skill_id=skill.id,
-        revision_policy="follow_latest",
-        pinned_revision_id=None,
-        invocation_policy="user_only",
-    )
+    with pytest.raises(GeneralSkillGovernanceError, match="approved release"):
+        service.create_binding(
+            current_user=adopter,
+            agent_id=adopter_agent.id,
+            skill_id=skill.id,
+            revision_policy="follow_latest",
+            pinned_revision_id=None,
+            invocation_policy="user_only",
+        )
 
     assert owner_binding.agent_id == owner_agent.id
-    assert adopter_binding.agent_id == adopter_agent.id
     assert len(EffectiveGeneralSkillResolver(db).resolve(owner, owner_agent.id).items) == 1
-    assert len(EffectiveGeneralSkillResolver(db).resolve(adopter, adopter_agent.id).items) == 1
+    assert EffectiveGeneralSkillResolver(db).resolve(adopter, adopter_agent.id).items == ()
 
 
 def test_rollback_changes_only_follow_latest_binding_and_preserves_pinned_revision() -> None:

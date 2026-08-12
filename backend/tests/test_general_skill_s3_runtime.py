@@ -16,6 +16,7 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from app.db.models import (
+    AgentEvent,
     AgentProfile,
     AgentResourceBinding,
     ChatSession,
@@ -31,8 +32,13 @@ from app.db.models import (
 )
 from app.config import get_settings
 from app.core.agent_loop import AgentLoop
-from app.general_skills.runtime import GeneralSkillRuntimeError, GeneralSkillRuntimeService
+from app.general_skills.runtime import (
+    GeneralSkillRuntimeError,
+    GeneralSkillRuntimeService,
+    LoadedGeneralSkill,
+)
 from app.session.session_schema import ChatTurnRequest, RouterDecision
+from app.security.encryption import encrypt_secret
 from app.sop_runtime.execution_store import (
     SopExecutionSkillAuthorizationError,
     SopExecutionStore,
@@ -45,6 +51,52 @@ def _checksum(value: object) -> str:
     return hashlib.sha256(
         json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
+
+
+def test_utf8_resource_budget_never_splits_multibyte_character() -> None:
+    """资源预算落在中文字符中间时应返回完整 UTF-8 前缀，而不是误报修订编码损坏。"""
+
+    content, used_bytes, truncated = GeneralSkillRuntimeService._utf8_prefix(
+        "你" * 30_000,
+        64 * 1024,
+    )
+    assert truncated is True
+    assert used_bytes <= 64 * 1024
+    assert len(content.encode("utf-8")) == used_bytes
+    assert content and set(content) == {"你"}
+
+
+def test_multiple_loaded_skills_share_one_resource_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同一模型动作加载多个 Skill 时，资源总量不得按 Skill 数量成倍放大。"""
+
+    monkeypatch.setattr(get_settings(), "general_skill_resource_read_bytes", 10)
+    rows = tuple(
+        LoadedGeneralSkill(
+            use_id=f"use_{index}",
+            skill_id=f"skill_{index}",
+            revision_id=f"revision_{index}",
+            revision_number=1,
+            name=f"Skill {index}",
+            description="",
+            instructions="# Skill",
+            requested_tools=(),
+            selection_mode="forced",
+            resources=({"path": "guide.md", "content": "你你你你"},),
+        )
+        for index in range(2)
+    )
+
+    bounded = GeneralSkillRuntimeService.apply_shared_resource_budget(
+        object.__new__(GeneralSkillRuntimeService), rows
+    )
+
+    assert sum(
+        len(str(resource["content"]).encode("utf-8"))
+        for row in bounded
+        for resource in row.resources
+    ) <= 10
 
 
 def _context(*, invocation_policy: str = "model_allowed"):
@@ -845,7 +897,7 @@ def test_agent_loop_failed_guidance_reply_settles_loaded_use(
                 id="model_runtime_failure",
                 tenant_id=owner.tenant_id,
                 name="Runtime Failure Model",
-                api_key_encrypted="unused",
+                api_key_encrypted=encrypt_secret("test-key"),
                 model="test-model",
             ),
             RouterDecision(decision="answer_only"),
@@ -855,6 +907,49 @@ def test_agent_loop_failed_guidance_reply_settles_loaded_use(
     use = db.exec(select(GeneralSkillUse)).one()
     assert use.status == "failed"
     assert use.invalidation_reason == "GENERAL_SKILL_CONSUMPTION_FAILED"
+
+
+def test_agent_loop_real_response_generator_failure_settles_loaded_use(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """生产 ResponseGenerator 的模型异常必须向上冒泡，使 Skill Use 失败并留审计终态。"""
+
+    db, owner, agent, chat, skill, _, _ = _context(invocation_policy="user_only")
+    settings = get_settings()
+    monkeypatch.setattr(settings, "general_skill_resolver_v2_enabled", True)
+    monkeypatch.setattr(settings, "general_skill_dynamic_guidance_enabled", True)
+    monkeypatch.setattr(
+        "app.core.response_generator.LLMClient.generate_text",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("provider failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="provider failed"):
+        AgentLoop(db)._try_handle_general_skill_after_scene_router(
+            ChatTurnRequest(
+                tenant_id=owner.tenant_id,
+                session_id=chat.id,
+                agent_id=agent.id,
+                user_id=owner.id,
+                message="请审核这笔退款",
+                client_turn_id="client_turn_real_runtime_failure",
+                forced_general_skill_id=skill.id,
+            ),
+            chat,
+            ModelConfig(
+                id="model_real_runtime_failure",
+                tenant_id=owner.tenant_id,
+                name="Runtime Failure Model",
+                api_key_encrypted=encrypt_secret("test-key"),
+                model="test-model",
+            ),
+            RouterDecision(decision="answer_only"),
+            user_message_id="message_real_runtime_failure",
+        )
+
+    use = db.exec(select(GeneralSkillUse)).one()
+    assert use.status == "failed"
+    events = db.exec(select(AgentEvent).where(AgentEvent.event_type == "skill_use_failed")).all()
+    assert [event.payload_json["skill_use_id"] for event in events] == [use.id]
 
 
 def test_external_channel_cannot_forge_structured_force_field(

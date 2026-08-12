@@ -14,6 +14,7 @@ import threading
 import pytest
 from alembic import command
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy import inspect, text
 from sqlmodel import Session, create_engine, select
@@ -87,6 +88,14 @@ from app.sop_runtime.execution_control import ExecutionControlService
 
 pytestmark = pytest.mark.mysql
 BACKEND_DIR = Path(__file__).resolve().parents[2]
+
+
+def current_head_revision() -> str:
+    """读取仓库当前唯一迁移 head，保证空库测试验证“最新”而非历史常量。"""
+
+    config = Config(str(BACKEND_DIR / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
+    return ScriptDirectory.from_config(config).get_current_head()
 
 
 def upgrade(url: str, revision: str = "head") -> None:
@@ -198,6 +207,7 @@ def test_alembic_upgrades_empty_mysql_database(mysql_database_url: str) -> None:
     assert "general_skill_source_credentials" in tables
     assert "general_skill_authorization_states" in tables
     assert "general_skill_proposals" in tables
+    assert "publication_adoption_commands" in tables
     assert "code_sets" in tables
     assert "code_items" in tables
     assert "organization_units" in tables
@@ -400,7 +410,7 @@ def test_alembic_upgrades_empty_mysql_database(mysql_database_url: str) -> None:
     with engine.connect() as connection:
         assert (
             connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-            == "20260813_0060"
+            == current_head_revision()
         )
 
 

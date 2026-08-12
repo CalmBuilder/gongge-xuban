@@ -143,13 +143,11 @@ class GeneralSkillGovernanceService:
             raise GeneralSkillGovernanceError(
                 "GENERAL_SKILL_NOT_AVAILABLE", "general skill is unavailable", 404
             )
-        if (
-            skill.owner_user_id != current_user.id
-            and current_user.role != "admin"
-            and skill.visibility_scope != "tenant_gallery"
-        ):
+        if skill.owner_user_id != current_user.id:
             raise GeneralSkillGovernanceError(
-                "GENERAL_SKILL_FORBIDDEN", "general skill cannot be adopted", 403
+                "GENERAL_SKILL_FORBIDDEN",
+                "organization skills must be adopted from an approved release",
+                403,
             )
         if skill.status != "published":
             raise GeneralSkillGovernanceError(

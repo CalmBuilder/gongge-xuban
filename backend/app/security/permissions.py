@@ -13,7 +13,7 @@ from sqlmodel import Session, select
 
 from app.agents.identity import agent_is_published, agent_owner_user_id
 from app.db import get_session
-from app.db.models import AgentProfile, AgentUsage, User
+from app.db.models import AgentProfile, AgentUsage, PublicationRelease, User
 from app.security.auth import ensure_current_user_tenant, get_current_user
 
 ADMIN_ROLE = "admin"
@@ -101,6 +101,16 @@ def can_use_agent_in_chat(
 
     if row.tenant_id != user.tenant_id or row.status != "active" or row.is_overall:
         return False
+    adopted_release_id = (row.metadata_json or {}).get("adopted_release_id")
+    if isinstance(adopted_release_id, str):
+        release = db.get(PublicationRelease, adopted_release_id)
+        if (
+            release is None
+            or release.tenant_id != row.tenant_id
+            or release.resource_type != "agent"
+            or release.status == "security_revoked"
+        ):
+            return False
     if agent_owned_by_user(row, user):
         return True
     if not agent_is_published(row):

@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
+import threading
 import pytest
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
@@ -18,6 +20,7 @@ from app.db.models import (
     AgentProfile,
     AgentResourceBinding,
     GeneralSkill,
+    GeneralSkillPublicationRevision,
     GeneralSkillRevision,
     MemoryRecord,
     PublicationRelease,
@@ -27,6 +30,7 @@ from app.db.models import (
 )
 from app.general_skills.publication import PublicationError, PublicationService
 from app.general_skills.eligibility import EffectiveGeneralSkillResolver
+from app.security.permissions import can_use_agent_in_chat
 from app.config import get_settings
 from app.core.agent_loop import AgentLoop
 
@@ -324,6 +328,100 @@ def test_agent_publication_becomes_stale_when_binding_changes_before_review() ->
     assert stale.value.code == "PUBLICATION_SNAPSHOT_STALE"
 
 
+def test_agent_publication_rejects_another_users_private_skill_component() -> None:
+    """证明同租户用户不能把他人的私有 Skill 洗入自己的 Agent 发布快照。"""
+
+    db, service, _admin, _owner, adopter, adopter_agent, skill = _context()
+    db.add(
+        AgentResourceBinding(
+            tenant_id=adopter.tenant_id,
+            agent_id=adopter_agent.id,
+            resource_type="general_skill",
+            resource_id=skill.id,
+            status="active",
+            metadata_json={
+                "revision_policy": "pinned",
+                "pinned_revision_id": skill.current_published_revision_id,
+            },
+        )
+    )
+    db.commit()
+
+    with pytest.raises(PublicationError) as denied:
+        service.submit("agent", adopter_agent.id, adopter_agent.profile_revision, adopter)
+    assert denied.value.code == "PUBLICATION_COMPONENT_DENIED"
+    assert db.exec(select(ResourcePublicationRequest)).all() == []
+
+
+def test_publication_review_rejects_admin_added_after_candidate_snapshot() -> None:
+    """证明提交后新晋管理员不能审批自己不在冻结候选快照中的旧申请。"""
+
+    db, service, _admin, owner, _adopter, _agent, skill = _context()
+    submitted = service.submit("general_skill", skill.id, skill.row_version, owner)
+    late_admin = User(
+        id="late_admin_g1",
+        tenant_id=owner.tenant_id,
+        username="late-admin",
+        role="admin",
+        password_hash="unused",
+    )
+    db.add(late_admin)
+    db.commit()
+
+    with pytest.raises(PublicationError) as denied:
+        service.review(
+            submitted.id,
+            command="approve",
+            command_id="late-admin-review",
+            expected_request_row_version=submitted.row_version,
+            expected_attention_revision=0,
+            reviewer=late_admin,
+            comment=None,
+        )
+    assert denied.value.code == "PUBLICATION_REVIEWER_DENIED"
+    assert db.exec(select(PublicationRelease)).all() == []
+
+
+def test_agent_release_security_revoke_disables_adopted_agent_and_components() -> None:
+    """证明整 Agent 安全撤销会停用采用副本及全部组件，而普通下架语义不混入。"""
+
+    db, service, admin, owner, adopter, _adopter_agent, _skill = _context()
+    owner_agent = db.get(AgentProfile, "agent_g1_owner")
+    assert owner_agent is not None
+    submitted = service.submit("agent", owner_agent.id, owner_agent.profile_revision, owner)
+    service.review(
+        submitted.id,
+        command="approve",
+        command_id="agent-security-review",
+        expected_request_row_version=submitted.row_version,
+        expected_attention_revision=0,
+        reviewer=admin,
+        comment=None,
+    )
+    release = db.exec(
+        select(PublicationRelease).where(PublicationRelease.resource_type == "agent")
+    ).one()
+    adopted = service.adopt(release.id, None, "agent-security-adopt", adopter)
+    clone = db.get(AgentProfile, adopted.adopted_agent_id)
+    assert clone is not None and can_use_agent_in_chat(db, clone, adopter)
+
+    service.transition_release(
+        release.id,
+        command="security_revoke",
+        command_id="agent-security-revoke",
+        expected_row_version=release.row_version,
+        actor=admin,
+        reason="组件供应链事件",
+    )
+    db.refresh(clone)
+    assert clone.status == "inactive"
+    assert not can_use_agent_in_chat(db, clone, adopter)
+    bindings = db.exec(
+        select(AgentResourceBinding).where(AgentResourceBinding.agent_id == clone.id)
+    ).all()
+    assert bindings and {binding.status for binding in bindings} == {"inactive"}
+
+
 def test_release_unpublish_preserves_existing_use_but_security_revoke_fails_closed() -> None:
     """证明普通下架只停止发现/采用，安全撤销则让既有跨用户 Binding 立即失效。"""
 
@@ -387,3 +485,101 @@ def test_release_unpublish_preserves_existing_use_but_security_revoke_fails_clos
         reason="供应链安全事件",
     )
     assert EffectiveGeneralSkillResolver(db).resolve(adopter, adopter_agent.id).items == ()
+
+
+def test_file_sqlite_concurrent_release_transitions_have_one_cas_winner(
+    tmp_path: Path,
+) -> None:
+    """文件 SQLite 双会话竞争同一版本时只能一个成功，版本不得丢失或双终态。"""
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'publication-race.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as seed_db:
+        seed_db.add(Tenant(id="tenant_publication_race", name="Publication Race"))
+        seed_db.add(
+            User(
+                id="admin_publication_race",
+                tenant_id="tenant_publication_race",
+                username="race-admin",
+                role="admin",
+                password_hash="unused",
+            )
+        )
+        seed_db.add(
+            GeneralSkill(
+                id="skill_publication_race",
+                tenant_id="tenant_publication_race",
+                slug="publication-race",
+                name="Publication Race Skill",
+                skill_markdown="# Race",
+                status="published",
+                owner_user_id="admin_publication_race",
+            )
+        )
+        seed_db.add(
+            GeneralSkillPublicationRevision(
+                id="snapshot_publication_race",
+                tenant_id="tenant_publication_race",
+                request_id="request_publication_race",
+                skill_id="skill_publication_race",
+                approved_revision_id="revision_publication_race",
+                content_checksum="b" * 64,
+                manifest_checksum="c" * 64,
+                snapshot_checksum="a" * 64,
+            )
+        )
+        seed_db.add(
+            PublicationRelease(
+                id="release_publication_race",
+                tenant_id="tenant_publication_race",
+                approved_request_id="request_publication_race",
+                resource_type="general_skill",
+                resource_id="skill_publication_race",
+                snapshot_kind="general_skill",
+                snapshot_id="snapshot_publication_race",
+                snapshot_checksum="a" * 64,
+            )
+        )
+        seed_db.commit()
+
+    barrier = threading.Barrier(2)
+    outcomes: list[str] = []
+
+    def transition(command: str) -> None:
+        """让两个独立连接同时提交同一 expected row_version。"""
+
+        with Session(engine) as db:
+            actor = db.get(User, "admin_publication_race")
+            assert actor is not None
+            barrier.wait()
+            try:
+                PublicationService(db).transition_release(
+                    "release_publication_race",
+                    command=command,
+                    command_id=f"race-{command}",
+                    expected_row_version=1,
+                    actor=actor,
+                    reason="并发版本门禁",
+                )
+                outcomes.append("ok")
+            except PublicationError as exc:
+                outcomes.append(exc.code)
+
+    threads = [
+        threading.Thread(target=transition, args=("unpublish",)),
+        threading.Thread(target=transition, args=("security_revoke",)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert sorted(outcomes) == ["PUBLICATION_RELEASE_STALE", "ok"]
+    with Session(engine) as verify_db:
+        release = verify_db.get(PublicationRelease, "release_publication_race")
+        assert release is not None
+        assert release.row_version == 2
+        assert release.status in {"unpublished", "security_revoked"}

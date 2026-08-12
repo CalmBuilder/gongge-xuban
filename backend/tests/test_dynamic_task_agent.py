@@ -13,6 +13,7 @@ from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 import sys
+import time
 
 import pytest
 from pypdf import PdfWriter
@@ -59,6 +60,7 @@ from app.dynamic_tasks.agent import (
     DynamicRunOutcome,
     DynamicTaskAgent,
     DynamicTaskAgentError,
+    _plan_has_required_knowledge_ancestor,
     _model_lease_ttl_seconds,
 )
 from app.dynamic_tasks.artifacts import ArtifactAccessDenied, ArtifactService
@@ -91,7 +93,7 @@ from app.dynamic_tasks.quotas import DynamicTaskQuotaError
 from app.knowledge.schema import KnowledgeSearchResponse
 from app.organization.governance import ensure_builtin_governance_catalog
 from app.organization.permissions import sync_role_permissions
-from app.sop_runtime.execution_store import SopExecutionStore
+from app.sop_runtime.execution_store import SopExecutionConflictError, SopExecutionStore
 from app.sop_runtime.execution_control import ExecutionControlService
 from app.session.managed_resources import ManagedInputResourceService
 from app.tools.tool_schema import ToolResult
@@ -432,6 +434,56 @@ class _KnowledgePlanner:
             ),
             budget={"max_steps": 4},
         )
+
+
+class _OptionalDisconnectedKnowledgePlanner:
+    """构造看似含 knowledge、实际可绕过的计划用于验证 required 契约。"""
+
+    def create_plan(self, *, goal, success_criteria, capabilities, input_resources=()):
+        """返回 optional 且不汇聚到 answer 的知识步骤。"""
+
+        return NormalizedPlan(
+            goal=goal,
+            success_criteria=tuple(success_criteria),
+            steps=(
+                PlanStep(
+                    step_key="optional_search",
+                    title="可选检索",
+                    kind="knowledge",
+                    capability_refs=("knowledge.search",),
+                    required=False,
+                ),
+                PlanStep(
+                    step_key="answer",
+                    title="直接回答",
+                    kind="answer",
+                ),
+            ),
+            budget={"max_steps": 4},
+        )
+
+
+def test_required_knowledge_must_be_required_and_converge_to_answer() -> None:
+    """optional 或断链 knowledge 不得冒充必需企业知识证据。"""
+
+    plan = _OptionalDisconnectedKnowledgePlanner().create_plan(
+        goal="依据企业制度回答",
+        success_criteria=(
+            SuccessCriterion(id="policy", type="assertion", spec={"required": True}),
+        ),
+        capabilities=(),
+    )
+    assert _plan_has_required_knowledge_ancestor(plan) is False
+
+    converged = plan.model_copy(
+        update={
+            "steps": (
+                plan.steps[0].model_copy(update={"required": True}),
+                plan.steps[1].model_copy(update={"depends_on": ("optional_search",)}),
+            )
+        }
+    )
+    assert _plan_has_required_knowledge_ancestor(converged) is True
 
 
 class _KnowledgeProposer:
@@ -791,6 +843,50 @@ def _instance(db: Session, snapshot: CapabilitySnapshot):
         plan=plan,
         capability_snapshot={"tools": [snapshot.model_dump(mode="json")]},
     )[0]
+
+
+def test_file_sqlite_model_heartbeat_prevents_duplicate_claim_and_then_expires(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """文件 SQLite 慢模型期间必须续租，停止心跳后才能由另一 worker 恢复。"""
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'heartbeat.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    SQLModel.metadata.create_all(engine)
+    monkeypatch.setattr("app.dynamic_tasks.agent._model_lease_ttl_seconds", lambda: 6)
+    with Session(engine) as owner_db:
+        instance = _instance(owner_db, _snapshot())
+        lease = SopExecutionStore(owner_db).claim(
+            instance,
+            worker_id="heartbeat-owner",
+            ttl_seconds=6,
+        )
+        owner_db.commit()
+        runtime = DynamicTaskAgent(owner_db)
+        with runtime._model_lease_heartbeat(lease):
+            time.sleep(6.2)
+            with Session(engine) as contender_db:
+                contender = contender_db.get(type(instance), instance.id)
+                assert contender is not None
+                with pytest.raises(SopExecutionConflictError):
+                    SopExecutionStore(contender_db).claim(
+                        contender,
+                        worker_id="heartbeat-contender",
+                        ttl_seconds=6,
+                    )
+        time.sleep(6.1)
+        with Session(engine) as recovery_db:
+            recoverable = recovery_db.get(type(instance), instance.id)
+            assert recoverable is not None
+            recovered = SopExecutionStore(recovery_db).claim(
+                recoverable,
+                worker_id="heartbeat-recovery",
+                ttl_seconds=6,
+            )
+            assert recovered.worker_id == "heartbeat-recovery"
 
 
 class _ConnectorSlackStub:
@@ -2175,15 +2271,15 @@ def test_fail_execution_reentry_settles_skill_use_after_child_already_failed() -
 def test_model_lease_covers_provider_timeout_with_bounded_commit_margin(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """慢模型租约覆盖 JSON 修复和空响应重试的最坏窗口，同时保持有界。"""
+    """模型租约使用 heartbeat 可续的短 TTL，崩溃后恢复上限不随超时无限增长。"""
 
     settings = get_settings()
     monkeypatch.setattr(settings, "model_api_timeout_seconds", 600.0)
-    assert _model_lease_ttl_seconds() == 7230
+    assert _model_lease_ttl_seconds() == 150
     monkeypatch.setattr(settings, "model_api_timeout_seconds", 15.2)
-    assert _model_lease_ttl_seconds() == 213
+    assert _model_lease_ttl_seconds() == 46
     monkeypatch.setattr(settings, "model_api_timeout_seconds", 3600.0)
-    assert _model_lease_ttl_seconds() == 14_400
+    assert _model_lease_ttl_seconds() == 150
 
 
 def test_signal_error_disposition_separates_deterministic_and_transient_failures() -> None:
@@ -2246,6 +2342,58 @@ def test_claimed_signal_deterministic_failure_closes_execution_and_command() -> 
         assert command.reason_code == "DYNAMIC_RUNTIME_BUDGET_EXCEEDED"
         assert instance.status == "failed"
         assert instance.terminal_reason_json == {"code": "DYNAMIC_RUNTIME_BUDGET_EXCEEDED"}
+
+
+def test_claimed_signal_transient_retry_exhaustion_closes_execution_and_command() -> None:
+    """瞬时异常达到最大次数后不能只留下死信，必须终结 Execution 并拒绝命令。"""
+
+    engine = create_engine("sqlite://", poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as db:
+        agent, instance, model, user, _, _ = _steering_execution(db)
+        command, _ = ExecutionControlService(db).issue_command(
+            instance,
+            command_id="steer_transient_exhausted",
+            command_type="steer",
+            actor_user_id=user.id,
+            expected_execution_revision=instance.revision,
+            payload={"instruction": "继续处理"},
+        )
+        db.commit()
+        signal = db.exec(
+            select(ExecutionSignal).where(ExecutionSignal.causation_id == command.id)
+        ).one()
+        signal.max_attempts = 1
+        db.add(signal)
+        db.commit()
+
+        def fail_after_claim(**kwargs):
+            """认领后模拟持续供应商故障，使首次失败即达到测试上限。"""
+
+            ExecutionControlService(db).claim_signal(
+                signal,
+                worker_id=str(kwargs["worker_id"]),
+                ttl_seconds=300,
+            )
+            db.commit()
+            raise RuntimeError("provider unavailable")
+
+        agent.resume_steer_signal = fail_after_claim
+        assert process_dynamic_task_signal(
+            db,
+            signal,
+            agent_factory=lambda _db: agent,
+        ) is None
+
+        db.refresh(instance)
+        db.refresh(signal)
+        db.refresh(command)
+        assert signal.status == "dead_letter"
+        assert signal.last_error_json == {"code": "RuntimeError"}
+        assert command.status == "rejected"
+        assert command.reason_code == "DYNAMIC_SIGNAL_RETRY_EXHAUSTED"
+        assert instance.status == "failed"
+        assert instance.terminal_reason_json == {"code": "DYNAMIC_SIGNAL_RETRY_EXHAUSTED"}
 
 
 def test_persistent_model_and_token_budgets_block_before_unbounded_followup_calls() -> None:
@@ -3731,6 +3879,7 @@ def test_capacity_retry_signal_backfills_quota_and_persistently_backs_off(monkey
             max_attempts=16,
         )
         db.commit()
+        assert [row.id for row in due_dynamic_task_signals(db)] == [signal.id]
         configured = type(
             "Settings",
             (),

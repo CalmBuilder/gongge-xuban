@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime
 from typing import Any
 
+from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
@@ -23,12 +25,15 @@ from app.db.models import (
     GeneralSkill,
     GeneralSkillPublicationRevision,
     GeneralSkillRevision,
+    KnowledgeBase,
     PublicationAdoptionCommand,
     PublicationRelease,
     ResourcePublicationRequest,
     SopInstance,
     SopWorkItem,
     SopWorkItemCandidate,
+    Skill,
+    Tool,
     User,
     new_id,
     utc_now,
@@ -40,6 +45,7 @@ from app.general_skills.publication_schema import (
     PublicationReleaseRead,
     PublicationRequestRead,
 )
+from app.sop_runtime.work_items import SopWorkItemService
 
 
 class PublicationError(RuntimeError):
@@ -141,6 +147,16 @@ class PublicationService:
         attention = self.db.get(SopWorkItem, request.attention_id or "")
         if reviewer.role != "admin" or reviewer.id == request.owner_user_id:
             raise PublicationError("PUBLICATION_REVIEWER_DENIED", "reviewer separation required", 403)
+        if (
+            attention is None
+            or attention.tenant_id != request.tenant_id
+            or attention.source_type != "resource_publication_request"
+            or attention.source_ref != request.id
+            or not SopWorkItemService(self.db).is_current_candidate(attention, reviewer.id)
+        ):
+            raise PublicationError(
+                "PUBLICATION_REVIEWER_DENIED", "reviewer is not a frozen candidate", 403
+            )
         if request.status in {"approved", "rejected"}:
             if attention and attention.resolution_json.get("command_id") == command_id:
                 return self.read_request(request)
@@ -220,7 +236,14 @@ class PublicationService:
     ) -> PublicationReleaseRead:
         """管理员普通下架或安全撤销 Release，并在安全撤销时立即 bump 授权。"""
 
-        release = self.db.get(PublicationRelease, release_id)
+        release = self.db.exec(
+            select(PublicationRelease)
+            .where(
+                PublicationRelease.id == release_id,
+                PublicationRelease.tenant_id == actor.tenant_id,
+            )
+            .with_for_update()
+        ).first()
         if (
             release is None
             or release.tenant_id != actor.tenant_id
@@ -236,16 +259,33 @@ class PublicationService:
         if command not in {"unpublish", "security_revoke"}:
             raise PublicationError("PUBLICATION_COMMAND_INVALID", "unsupported release command", 400)
         now = utc_now()
-        release.status = "unpublished" if command == "unpublish" else "security_revoked"
-        release.active_slot_key = None
-        release.row_version += 1
-        release.terminal_command_id = command_id
-        release.terminal_by_user_id = actor.id
-        release.terminal_reason = reason
-        release.updated_at = now
-        release.terminal_at = now
-        self.db.add(release)
+        transitioned = self.db.exec(
+            update(PublicationRelease)
+            .where(
+                PublicationRelease.id == release.id,
+                PublicationRelease.tenant_id == actor.tenant_id,
+                PublicationRelease.status == "active",
+                PublicationRelease.row_version == expected_row_version,
+            )
+            .values(
+                status="unpublished" if command == "unpublish" else "security_revoked",
+                active_slot_key=None,
+                row_version=PublicationRelease.row_version + 1,
+                terminal_command_id=command_id,
+                terminal_by_user_id=actor.id,
+                terminal_reason=reason,
+                updated_at=now,
+                terminal_at=now,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if transitioned.rowcount != 1:
+            self.db.rollback()
+            raise PublicationError("PUBLICATION_RELEASE_STALE", "release transition is stale")
+        self.db.refresh(release)
         if command == "security_revoke":
+            if release.resource_type == "agent":
+                self._revoke_adopted_agents(release, now=now)
             bump_general_skill_authorization_revision(
                 self.db,
                 actor.tenant_id,
@@ -257,6 +297,31 @@ class PublicationService:
         self.db.refresh(release)
         return self._release_read(release)
 
+    def _revoke_adopted_agents(self, release: PublicationRelease, *, now: datetime) -> None:
+        """安全撤销整 Agent Release 时停用全部采用副本及其资源绑定。"""
+
+        adopted_agents = self.db.exec(
+            select(AgentProfile).where(AgentProfile.tenant_id == release.tenant_id)
+        ).all()
+        for agent in adopted_agents:
+            if (agent.metadata_json or {}).get("adopted_release_id") != release.id:
+                continue
+            agent.status = "inactive"
+            agent.updated_at = now
+            self.db.add(agent)
+            bindings = self.db.exec(
+                select(AgentResourceBinding).where(
+                    AgentResourceBinding.tenant_id == release.tenant_id,
+                    AgentResourceBinding.agent_id == agent.id,
+                    AgentResourceBinding.status == "active",
+                )
+            ).all()
+            for binding in bindings:
+                binding.status = "inactive"
+                binding.row_version += 1
+                binding.updated_at = now
+                self.db.add(binding)
+
     def adopt(
         self,
         release_id: str,
@@ -266,7 +331,14 @@ class PublicationService:
     ) -> PublicationAdoptRead:
         """主动采用 Skill 到本人 Agent，或按 Agent 快照克隆新的本人 Agent。"""
 
-        release = self.db.get(PublicationRelease, release_id)
+        release = self.db.exec(
+            select(PublicationRelease)
+            .where(
+                PublicationRelease.id == release_id,
+                PublicationRelease.tenant_id == actor.tenant_id,
+            )
+            .with_for_update()
+        ).first()
         if release is None or release.tenant_id != actor.tenant_id or release.status != "active":
             raise PublicationError("PUBLICATION_RELEASE_NOT_FOUND", "release unavailable", 404)
         request_checksum = _checksum(
@@ -286,10 +358,31 @@ class PublicationService:
                     "idempotency key was used for another adoption",
                 )
             return self._adoption_read(previous)
+        reserved = self.db.exec(
+            update(PublicationRelease)
+            .where(
+                PublicationRelease.id == release.id,
+                PublicationRelease.tenant_id == actor.tenant_id,
+                PublicationRelease.status == "active",
+                PublicationRelease.row_version == release.row_version,
+            )
+            .values(
+                row_version=PublicationRelease.row_version + 1,
+                updated_at=utc_now(),
+            )
+        )
+        if reserved.rowcount != 1:
+            self.db.rollback()
+            raise PublicationError("PUBLICATION_RELEASE_STALE", "release adoption is stale")
+        self.db.refresh(release)
         if release.resource_type == "general_skill":
             result = self._adopt_skill(release, target_agent_id, actor)
         else:
             result = self._adopt_agent(release, actor)
+        self.db.refresh(release)
+        if release.status != "active":
+            self.db.rollback()
+            raise PublicationError("PUBLICATION_RELEASE_NOT_FOUND", "release unavailable", 404)
         command = PublicationAdoptionCommand(
             tenant_id=actor.tenant_id,
             actor_user_id=actor.id,
@@ -404,7 +497,11 @@ class PublicationService:
             metadata = dict(binding.metadata_json or {})
             if binding.resource_type == "general_skill":
                 skill = self.db.get(GeneralSkill, binding.resource_id)
-                if skill is None or not skill.current_published_revision_id:
+                if (
+                    skill is None
+                    or skill.tenant_id != owner.tenant_id
+                    or not skill.current_published_revision_id
+                ):
                     raise PublicationError(
                         "PUBLICATION_COMPONENT_STALE",
                         "agent contains an unavailable Skill",
@@ -420,12 +517,53 @@ class PublicationService:
                         "PUBLICATION_COMPONENT_STALE",
                         "agent contains an unavailable Skill revision",
                     )
+                if skill.owner_user_id != owner.id and not self._released_component_authorized(
+                    binding, resource_type="general_skill", resource_id=skill.id
+                ):
+                    raise PublicationError(
+                        "PUBLICATION_COMPONENT_DENIED",
+                        "agent contains a private Skill without propagation authorization",
+                        403,
+                    )
                 metadata = {
                     **metadata,
                     "revision_policy": "pinned",
                     "pinned_revision_id": revision.id,
                     "published_content_checksum": revision.content_checksum,
                 }
+            elif binding.resource_type == "knowledge_base":
+                knowledge = self.db.get(KnowledgeBase, binding.resource_id)
+                if (
+                    knowledge is None
+                    or knowledge.tenant_id != owner.tenant_id
+                    or knowledge.status != "active"
+                    or (
+                        knowledge.owner_user_id != owner.id
+                        and knowledge.access_scope != "tenant"
+                        and not self._released_component_authorized(
+                            binding, resource_type="knowledge_base", resource_id=knowledge.id
+                        )
+                    )
+                ):
+                    raise PublicationError(
+                        "PUBLICATION_COMPONENT_DENIED", "agent contains unavailable knowledge", 403
+                    )
+            elif binding.resource_type == "tool":
+                tool = self.db.get(Tool, binding.resource_id)
+                if tool is None or tool.tenant_id != owner.tenant_id or not tool.enabled:
+                    raise PublicationError(
+                        "PUBLICATION_COMPONENT_DENIED", "agent contains an unavailable tool", 403
+                    )
+            elif binding.resource_type == "skill":
+                legacy_skill = self.db.get(Skill, binding.resource_id)
+                if (
+                    legacy_skill is None
+                    or legacy_skill.tenant_id != owner.tenant_id
+                    or legacy_skill.status != "published"
+                ):
+                    raise PublicationError(
+                        "PUBLICATION_COMPONENT_DENIED", "agent contains an unavailable skill", 403
+                    )
             components.append(
                 {
                     "resource_type": binding.resource_type,
@@ -455,6 +593,61 @@ class PublicationService:
         }
         facts["snapshot_checksum"] = _checksum(facts)
         return facts, agent.name
+
+    def _released_component_authorized(
+        self,
+        binding: AgentResourceBinding,
+        *,
+        resource_type: str,
+        resource_id: str,
+    ) -> bool:
+        """只接受仍有效且快照中明确包含该组件的组织 Release 传播证据。"""
+
+        release_id = binding.metadata_json.get("publication_release_id")
+        snapshot_id = binding.metadata_json.get("publication_snapshot_id")
+        if not isinstance(release_id, str) or not isinstance(snapshot_id, str):
+            return False
+        release = self.db.get(PublicationRelease, release_id)
+        if (
+            release is None
+            or release.tenant_id != binding.tenant_id
+            or release.status != "active"
+            or release.snapshot_id != snapshot_id
+        ):
+            return False
+        if release.resource_type == "general_skill" and resource_type == "general_skill":
+            snapshot = self.db.get(GeneralSkillPublicationRevision, snapshot_id)
+            return bool(
+                release.resource_id == resource_id
+                and snapshot is not None
+                and snapshot.tenant_id == binding.tenant_id
+                and snapshot.skill_id == resource_id
+                and snapshot.approved_revision_id
+                == binding.metadata_json.get("pinned_revision_id")
+                and snapshot.content_checksum
+                == binding.metadata_json.get("published_content_checksum")
+            )
+        if release.resource_type != "agent":
+            return False
+        snapshot = self.db.get(AgentPublicationRevision, snapshot_id)
+        if snapshot is None or snapshot.tenant_id != binding.tenant_id:
+            return False
+        for component in snapshot.component_snapshot_json or []:
+            if (
+                component.get("resource_type") != resource_type
+                or component.get("resource_id") != resource_id
+            ):
+                continue
+            frozen_metadata = dict(component.get("metadata") or {})
+            if resource_type != "general_skill":
+                return True
+            return bool(
+                frozen_metadata.get("pinned_revision_id")
+                == binding.metadata_json.get("pinned_revision_id")
+                and frozen_metadata.get("published_content_checksum")
+                == binding.metadata_json.get("published_content_checksum")
+            )
+        return False
 
     def _publication_execution(self, request: ResourcePublicationRequest, owner: User) -> SopInstance:
         """创建只承载组织发布 Attention 的持久 Execution。"""

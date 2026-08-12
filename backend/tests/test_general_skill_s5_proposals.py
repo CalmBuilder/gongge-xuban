@@ -18,6 +18,7 @@ from sqlmodel import Session, SQLModel, create_engine, select
 
 from app.db.models import (
     AgentProfile,
+    AgentResourceBinding,
     ExecutionArtifact,
     GeneralSkill,
     GeneralSkillRevision,
@@ -263,6 +264,36 @@ def test_agent_skill_proposal_is_invisible_until_approved_then_bound_once(tmp_pa
         assert catalog.items[0].revision_id == proposal.revision_id
         assert catalog.items[0].invocation_policy == "user_only"
         assert not staging_dir.exists()
+    finally:
+        db.close()
+
+
+def test_approved_proposal_rechecks_active_owner_before_publication(tmp_path: Path) -> None:
+    """Attention 批准后若所有者被停用，恢复派发必须拒绝发布并保持零绑定。"""
+
+    db, service, owner, agent, instance, step, operation, arguments = _context(tmp_path)
+    try:
+        proposal, _ = _approve(db, service, instance, step, operation, arguments)
+        owner.membership_status = "suspended"
+        db.add(owner)
+        db.commit()
+
+        with pytest.raises(GeneralSkillProposalError) as denied:
+            service.publish_approved_operation(
+                tenant_id=instance.tenant_id,
+                execution_id=instance.id,
+                operation_id=operation.id,
+                initiator_user_id=owner.id,
+            )
+        assert denied.value.code == "GENERAL_SKILL_PROPOSAL_ACTOR_DENIED"
+        db.refresh(proposal)
+        assert proposal.status == "awaiting_approval"
+        assert db.exec(
+            select(AgentResourceBinding).where(
+                AgentResourceBinding.agent_id == agent.id,
+                AgentResourceBinding.resource_type == "general_skill",
+            )
+        ).all() == []
     finally:
         db.close()
 

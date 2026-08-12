@@ -250,6 +250,21 @@ class NonSopCapabilityRouter:
                 update={"use_general_skill": False, "selected_slug": None}
             )
         effective = self._effective_decision(selection, selected_skill)
+        if (
+            self.execution_enabled
+            and selected_skill is not None
+            and selection.knowledge_mode == "required"
+        ):
+            effective = NonSopCapabilityDecision(
+                mode="dynamic_task",
+                goal=message.strip(),
+                success_criteria=["依据当前有权访问的企业知识形成可追溯回答"],
+                requires_durable_execution=True,
+                knowledge_mode="required",
+                knowledge_query=selection.knowledge_query or message.strip(),
+                confidence=1.0,
+                reason="Skill 与必需企业知识必须在受控动态任务中组合消费。",
+            )
         if not self.shadow_enabled and not self.execution_enabled:
             return NonSopCapabilityRouteResult(
                 selected_general_skill=selected_skill,

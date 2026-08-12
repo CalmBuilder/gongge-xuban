@@ -949,6 +949,7 @@ class AgentLoop:
                 self._get_persona_prompt(request.tenant_id, chat_session.agent_id),
                 memory_context,
                 guided_context,
+                propagate_model_failure=True,
             )
             reply = self._finalize_turn(
                 chat_session,
@@ -964,6 +965,20 @@ class AgentLoop:
                 [loaded.use_id for loaded in loaded_bundle],
                 reason_code="GENERAL_SKILL_CONSUMPTION_FAILED",
             )
+            for loaded in loaded_bundle:
+                self.events.record(
+                    request.tenant_id,
+                    chat_session.id,
+                    "skill_use_failed",
+                    self._turn_payload(
+                        {
+                            "skill_use_id": loaded.use_id,
+                            "skill_id": loaded.skill_id,
+                            "code": "GENERAL_SKILL_CONSUMPTION_FAILED",
+                        },
+                        user_message_id,
+                    ),
+                )
             self.db.commit()
             raise
         for loaded in loaded_bundle:
@@ -3513,6 +3528,7 @@ class AgentLoop:
         memory_context: list[dict[str, object]],
         conversation_context: dict[str, object],
         task_results: list[dict[str, object]] | None = None,
+        propagate_model_failure: bool = False,
     ) -> str:
         return self.response_generator.generate(
             message,
@@ -3526,6 +3542,7 @@ class AgentLoop:
             memory_context,
             conversation_context,
             task_results,
+            propagate_model_failure,
         )
 
     def _generate_reply_stream_segment(
@@ -7344,6 +7361,15 @@ class AgentLoop:
         """只在独立 kill switch 生效且路由通过时委托 DynamicTaskAgent 完整执行。"""
 
         decision = route.effective_decision
+        if len(tuple(dict.fromkeys(request.forced_general_skill_ids))) > 1:
+            decision = NonSopCapabilityDecision(
+                mode="dynamic_task",
+                goal=request.message.strip(),
+                success_criteria=["组合消费本轮全部显式 Skill，并形成可审计结果"],
+                requires_durable_execution=True,
+                confidence=1.0,
+                reason="多选 Skill 必须进入组合运行时，禁止静默只消费首项。",
+            )
         if request.interaction_mode == "scheduled_task":
             decision = NonSopCapabilityDecision(
                 mode="dynamic_task",
@@ -7384,7 +7410,16 @@ class AgentLoop:
                     user_message_id,
                 ),
             )
-            if request.interaction_mode == "scheduled_task":
+            requires_dynamic_contract = (
+                request.interaction_mode == "scheduled_task"
+                or decision.requires_durable_execution
+                or len(tuple(dict.fromkeys(request.forced_general_skill_ids))) > 1
+                or (
+                    route.general_selection is not None
+                    and route.general_selection.knowledge_mode == "required"
+                )
+            )
+            if requires_dynamic_contract:
                 raise DynamicTaskAgentError("DYNAMIC_TASK_ROLLOUT_DENIED")
             return None
         dynamic_agent = DynamicTaskAgent(self.db)
@@ -7395,6 +7430,15 @@ class AgentLoop:
             chat_session,
             user_message_id,
         )
+        knowledge_capability = self._knowledge_capability_payload(
+            request.tenant_id,
+            request.user_id,
+            chat_session.agent_id,
+        )
+        if route.general_selection is not None and route.general_selection.knowledge_mode == "required":
+            if not bool(knowledge_capability.get("available")):
+                raise DynamicTaskAgentError("DYNAMIC_KNOWLEDGE_REQUIRED_UNAVAILABLE")
+            knowledge_capability = {**knowledge_capability, "required": True}
         try:
             with self.db.begin_nested():
                 instance, created = dynamic_agent.start_task(
@@ -7412,11 +7456,7 @@ class AgentLoop:
                         for item in request.attachments
                         if item.resource_id is not None
                     ),
-                    knowledge_capability=self._knowledge_capability_payload(
-                        request.tenant_id,
-                        request.user_id,
-                        chat_session.agent_id,
-                    ),
+                    knowledge_capability=knowledge_capability,
                     forced_general_skill_id=(
                         request.forced_general_skill_id if request.channel == "web" else None
                     ),

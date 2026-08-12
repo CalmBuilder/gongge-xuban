@@ -12,7 +12,7 @@ import pytest
 
 from app.dynamic_tasks.capability_catalog import CapabilitySnapshot, capability_checksum
 from app.dynamic_tasks.planner_service import DynamicTaskPlanner, DynamicTaskPlannerError
-from app.dynamic_tasks.planning import SuccessCriterion
+from app.dynamic_tasks.planning import DynamicPlanDraft, SuccessCriterion, normalize_plan_draft
 
 
 class _Client:
@@ -359,6 +359,16 @@ def test_planner_hides_side_effect_capability_without_explicit_user_intent() -> 
     assert negated_client.payload is not None
     assert negated_client.payload["capabilities"] == []
 
+    private_only_client = _Client()
+    with pytest.raises(DynamicTaskPlannerError):
+        DynamicTaskPlanner(private_only_client).create_plan(
+            goal="不要发布到组织广场，但请把方法沉淀为一个私有 Skill",
+            success_criteria=(criterion,),
+            capabilities=(capability,),
+        )
+    assert private_only_client.payload is not None
+    assert private_only_client.payload["capabilities"][0]["name"] == capability.name
+
 
 class _RepairingCapabilityClient:
     """首轮虚构工具，收到服务端修复契约后收敛为纯回答计划。"""
@@ -457,6 +467,46 @@ def test_planner_rejects_plan_without_terminal_answer() -> None:
             success_criteria=(criterion,),
             capabilities=(_snapshot(),),
         )
+
+
+def test_normalization_carries_loaded_guidance_into_final_answer() -> None:
+    """即使模型只在前置读取步骤引用 Skill，最终交付步骤也必须继续消费全部固定指导。"""
+
+    draft = DynamicPlanDraft.model_validate(
+        {
+            "goal": "查询并总结合同",
+            "success_criteria": [
+                {"id": "done", "type": "assertion", "spec": {"required": True}}
+            ],
+            "steps": [
+                {
+                    "draft_id": "read",
+                    "title": "查询合同",
+                    "kind": "tool.read",
+                    "capability_refs": ["contract.query"],
+                    "guidance_skill_refs": ["contract-review"],
+                },
+                {
+                    "draft_id": "answer",
+                    "title": "形成结论",
+                    "kind": "answer",
+                    "depends_on": ["read"],
+                },
+            ],
+        }
+    )
+    plan = normalize_plan_draft(
+        draft,
+        max_steps=10,
+        max_tool_calls=5,
+        max_model_calls=10,
+        guidance_use_ids_by_name={"contract-review": ("gsuse_contract",)},
+    )
+
+    assert [step.guidance_skill_use_ids for step in plan.steps] == [
+        ("gsuse_contract",),
+        ("gsuse_contract",),
+    ]
 
 
 class _ManagedWorkspacePlanClient:

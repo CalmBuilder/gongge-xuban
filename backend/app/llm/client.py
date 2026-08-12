@@ -76,6 +76,7 @@ class LLMClient:
             api_key=api_key,
             base_url=self.base_url,
             timeout=self.timeout_seconds,
+            max_retries=0,
         )
         self.model = model_config.model
         self.temperature = model_config.temperature

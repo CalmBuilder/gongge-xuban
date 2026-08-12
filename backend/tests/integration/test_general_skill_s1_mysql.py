@@ -17,6 +17,7 @@ from zipfile import ZipFile
 
 from alembic import command
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 import pytest
 from sqlalchemy import inspect, text
 from sqlmodel import Session, create_engine, select
@@ -42,6 +43,14 @@ from app.general_skills.object_store import FileSystemSkillObjectStore
 
 pytestmark = pytest.mark.mysql
 BACKEND_DIR = Path(__file__).resolve().parents[2]
+
+
+def _head_revision() -> str:
+    """从当前 Alembic 脚本图读取唯一 head，避免新增迁移后测试仍声称旧 head。"""
+
+    config = Config(str(BACKEND_DIR / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
+    return ScriptDirectory.from_config(config).get_current_head()
 
 
 class _UnusedFetcher:
@@ -141,7 +150,7 @@ def test_s1_mysql_head_is_reentrant_and_uses_bounded_index_columns(
     assert credential_columns["allowed_host"].length == 253
     with engine.connect() as connection:
         assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-            "20260813_0057"
+            _head_revision()
         )
     engine.dispose()
 
@@ -186,7 +195,7 @@ def test_s1_mysql_historical_active_job_is_backfilled_once_before_head(
             ("user", "user_mysql_history", 1, 321),
         ]
         assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-            "20260813_0057"
+            _head_revision()
         )
     engine.dispose()
 

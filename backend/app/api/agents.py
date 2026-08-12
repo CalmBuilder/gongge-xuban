@@ -826,7 +826,7 @@ def update_agent_resources(
     desired_keys: set[tuple[str, str]] = set()
     changed = False
     for item in request.resources:
-        _ensure_resource_exists(db, request.tenant_id, item)
+        _ensure_resource_exists(db, request.tenant_id, item, current_user)
         key = (item.resource_type, item.resource_id)
         desired_keys.add(key)
         row = by_key.get(key)
@@ -2676,7 +2676,14 @@ def _is_empty_default_knowledge_base(db: Session, tenant_id: str, kb: KnowledgeB
     return kb.name == "默认知识库"
 
 
-def _ensure_resource_exists(db: Session, tenant_id: str, item: AgentResourceBindingInput) -> None:
+def _ensure_resource_exists(
+    db: Session,
+    tenant_id: str,
+    item: AgentResourceBindingInput,
+    current_user: User,
+) -> None:
+    """校验资源存在性和调用者传播资格，禁止把他人私有 Skill 洗入自己的 Agent。"""
+
     model = {
         "skill": Skill,
         "general_skill": GeneralSkill,
@@ -2687,6 +2694,11 @@ def _ensure_resource_exists(db: Session, tenant_id: str, item: AgentResourceBind
     if not row or row.tenant_id != tenant_id:
         raise HTTPException(
             status_code=404, detail=f"Resource not found: {item.resource_type}:{item.resource_id}"
+        )
+    if item.resource_type == "general_skill" and row.owner_user_id != current_user.id:
+        raise HTTPException(
+            status_code=403,
+            detail="Organization General Skill must be adopted from its approved release",
         )
 
 

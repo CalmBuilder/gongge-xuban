@@ -179,7 +179,7 @@ class EffectiveGeneralSkillResolver:
         release_id = binding.metadata_json.get("publication_release_id")
         snapshot_id = binding.metadata_json.get("publication_snapshot_id")
         if not isinstance(release_id, str) or not isinstance(snapshot_id, str):
-            return skill.visibility_scope in {"agent_private", "tenant_gallery"}
+            return False
         release = self.db.get(PublicationRelease, release_id)
         if (
             release is None

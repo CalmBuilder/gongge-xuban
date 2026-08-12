@@ -386,10 +386,15 @@ def _goal_authorizes_capability(goal: str, snapshot: CapabilitySnapshot) -> bool
             r"|(?:do not|don't|must not|never|without).{0,32}"
             r"(?:propose|install|import|adopt|publish|save|create).{0,20}skill"
         )
-        if re.search(negative_pattern, normalized):
-            return False
-        return bool(
-            re.search(positive_pattern, normalized)
+        clauses = [
+            item.strip()
+            for item in re.split(r"[，,；;。]|(?:但是|但|however|but)", normalized)
+            if item.strip()
+        ]
+        return any(
+            re.search(positive_pattern, clause)
+            and not re.search(negative_pattern, clause)
+            for clause in clauses
         )
     return False
 

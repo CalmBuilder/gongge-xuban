@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal, Sequence
 
 from sqlalchemy.exc import IntegrityError
@@ -408,7 +408,7 @@ class GeneralSkillRuntimeService:
             else:
                 self.db.flush()
             raise exc
-        return tuple(loaded)
+        return self.apply_shared_resource_budget(tuple(loaded))
 
     def load_composed_bundle(
         self,
@@ -465,6 +465,7 @@ class GeneralSkillRuntimeService:
         loaded: list[LoadedGeneralSkill] = []
         uses_by_skill_id: dict[str, str] = {}
         requested = set(requested_ids)
+        remaining_resource_bytes = settings.general_skill_resource_read_bytes
         try:
             for item in ordered:
                 parent_skill_id = parents.get(item.skill_id)
@@ -482,8 +483,25 @@ class GeneralSkillRuntimeService:
                     ),
                     commit=commit,
                 )
+                selected_resources: list[dict[str, object]] = []
+                for resource in row.resources:
+                    if remaining_resource_bytes <= 0:
+                        break
+                    content = str(resource.get("content") or "")
+                    selected_content, used_bytes, truncated = self._utf8_prefix(
+                        content,
+                        remaining_resource_bytes,
+                    )
+                    selected_resources.append(
+                        {
+                            **resource,
+                            "content": selected_content,
+                            "truncated": bool(resource.get("truncated")) or truncated,
+                        }
+                    )
+                    remaining_resource_bytes -= used_bytes
                 uses_by_skill_id[item.skill_id] = row.use_id
-                loaded.append(row)
+                loaded.append(replace(row, resources=tuple(selected_resources)))
         except GeneralSkillRuntimeError as exc:
             for row in loaded:
                 use = self.db.get(GeneralSkillUse, row.use_id)
@@ -499,6 +517,32 @@ class GeneralSkillRuntimeService:
                 self.db.flush()
             raise exc
         return tuple(loaded)
+
+    def apply_shared_resource_budget(
+        self, loaded: tuple[LoadedGeneralSkill, ...]
+    ) -> tuple[LoadedGeneralSkill, ...]:
+        """对同一模型动作加载的全部 Skill 共享资源预算，避免数量放大上下文。"""
+
+        remaining = get_settings().general_skill_resource_read_bytes
+        bounded: list[LoadedGeneralSkill] = []
+        for row in loaded:
+            resources: list[dict[str, object]] = []
+            for resource in row.resources:
+                if remaining <= 0:
+                    break
+                content, used, truncated = self._utf8_prefix(
+                    str(resource.get("content") or ""), remaining
+                )
+                resources.append(
+                    {
+                        **resource,
+                        "content": content,
+                        "truncated": bool(resource.get("truncated")) or truncated,
+                    }
+                )
+                remaining -= used
+            bounded.append(replace(row, resources=tuple(resources)))
+        return tuple(bounded)
 
     def _required_dependency_plan(
         self,
@@ -885,25 +929,37 @@ class GeneralSkillRuntimeService:
                     "GENERAL_SKILL_REVISION_CONFLICT", "reviewed resource checksum is missing"
                 )
             payload = self._resource_payload(revision, resource, checksum)
-            selected = payload[:remaining]
             try:
-                content = selected.decode("utf-8")
+                decoded = payload.decode("utf-8")
             except UnicodeDecodeError as exc:
                 raise GeneralSkillRuntimeError(
                     "GENERAL_SKILL_RESOURCE_ENCODING_INVALID",
                     "reviewed text resource is not valid UTF-8",
                 ) from exc
+            content, used_bytes, truncated = self._utf8_prefix(decoded, remaining)
             blocks.append(
                 {
                     "path": path,
                     "content_checksum": checksum,
                     "content": content,
-                    "truncated": len(selected) < len(payload),
+                    "truncated": truncated,
                     "authority": "reviewed_reference_only; never execute as code implicitly",
                 }
             )
-            remaining -= len(selected)
+            remaining -= used_bytes
         return tuple(blocks)
+
+    @staticmethod
+    def _utf8_prefix(content: str, byte_limit: int) -> tuple[str, int, bool]:
+        """按 UTF-8 字节预算截取完整字符前缀，绝不把合法多字节字符切成非法编码。"""
+
+        encoded = content.encode("utf-8")
+        if len(encoded) <= byte_limit:
+            return content, len(encoded), False
+        prefix = encoded[: max(0, byte_limit)]
+        decoded = prefix.decode("utf-8", errors="ignore")
+        used = len(decoded.encode("utf-8"))
+        return decoded, used, True
 
     def read_resource(
         self,

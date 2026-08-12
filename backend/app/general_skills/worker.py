@@ -11,14 +11,14 @@ from __future__ import annotations
 import argparse
 import logging
 import threading
-from datetime import timedelta
+from datetime import datetime, timedelta
 from uuid import uuid4
 
 from sqlmodel import Session, select
 
 from app.config import get_settings
 from app.db import engine
-from app.db.models import GeneralSkillRevision, utc_now
+from app.db.models import AgentEvent, GeneralSkillRevision, GeneralSkillUse, utc_now
 from app.general_skills.import_service import GeneralSkillImportService, ImportQuotaPolicy
 from app.general_skills.object_store import FileSystemSkillObjectStore
 from app.general_skills.remote_source import RemoteFetcher, configured_secure_https_fetcher
@@ -44,7 +44,8 @@ def run_maintenance_once() -> int:
 
     settings = get_settings()
     if not settings.general_skill_import_v2_enabled:
-        return 0
+        with Session(engine) as db:
+            return _reconcile_interrupted_chat_uses(db, now=utc_now())
     now = utc_now()
     with Session(engine) as db:
         service = GeneralSkillImportService(
@@ -68,6 +69,7 @@ def run_maintenance_once() -> int:
             stale_before=now - timedelta(seconds=RECOVERY_STALE_SECONDS)
         )
         expired = service.expire_jobs(now=now)
+        interrupted = _reconcile_interrupted_chat_uses(db, now=now)
         referenced_checksums = {
             str(resource["content_checksum"])
             for revision in db.exec(select(GeneralSkillRevision)).all()
@@ -78,7 +80,61 @@ def run_maintenance_once() -> int:
             referenced_checksums,
             older_than=now - timedelta(seconds=ORPHAN_GRACE_SECONDS),
         )
-        return len(processed) + len(recovered) + len(expired) + len(removed)
+        return len(processed) + len(recovered) + len(expired) + interrupted + len(removed)
+
+
+def _reconcile_interrupted_chat_uses(db: Session, *, now: datetime) -> int:
+    """终结无 Execution 且超过模型最坏窗口的普通对话 Use，并补齐审计事件。"""
+
+    stale_seconds = max(
+        RECOVERY_STALE_SECONDS,
+        int(float(get_settings().model_api_timeout_seconds or 600.0) * 3 + 120),
+    )
+    stale_before = now - timedelta(seconds=stale_seconds)
+    rows = db.exec(
+        select(GeneralSkillUse)
+        .where(
+            GeneralSkillUse.execution_id.is_(None),
+            GeneralSkillUse.status.in_(("loading", "active")),
+            GeneralSkillUse.updated_at <= stale_before,
+        )
+        .with_for_update()
+    ).all()
+    for row in rows:
+        row.status = "failed"
+        row.invalidation_reason = "GENERAL_SKILL_CONSUMPTION_INTERRUPTED"
+        row.completed_at = now
+        row.updated_at = now
+        db.add(row)
+        exists = db.exec(
+            select(AgentEvent.id).where(
+                AgentEvent.tenant_id == row.tenant_id,
+                AgentEvent.session_id == row.session_id,
+                AgentEvent.event_type == "skill_use_failed",
+                AgentEvent.aggregate_type == "general_skill_use",
+                AgentEvent.aggregate_id == row.id,
+            )
+        ).first()
+        if exists is None:
+            db.add(
+                AgentEvent(
+                    id=f"evt_gsfail_{row.id}",
+                    tenant_id=row.tenant_id,
+                    session_id=row.session_id,
+                    event_type="skill_use_failed",
+                    aggregate_type="general_skill_use",
+                    aggregate_id=row.id,
+                    correlation_id=row.turn_id,
+                    payload_json={
+                        "skill_use_id": row.id,
+                        "skill_id": row.skill_id,
+                        "code": "GENERAL_SKILL_CONSUMPTION_INTERRUPTED",
+                    },
+                )
+            )
+    if rows:
+        db.commit()
+    return len(rows)
 
 
 def run_worker(*, once: bool = False, poll_seconds: float = WORKER_POLL_SECONDS) -> None:

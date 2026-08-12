@@ -462,6 +462,16 @@ class GeneralSkillProposalService:
             raise GeneralSkillProposalError(
                 "GENERAL_SKILL_PROPOSAL_STATE_CONFLICT", "proposal is not publishable"
             )
+        instance = self.db.get(SopInstance, execution_id)
+        if instance is None:
+            raise GeneralSkillProposalError(
+                "GENERAL_SKILL_PROPOSAL_STATE_CONFLICT", "proposal execution is unavailable"
+            )
+        actor = self._authorized_actor(instance)
+        if actor.id != initiator_user_id:
+            raise GeneralSkillProposalError(
+                "GENERAL_SKILL_PROPOSAL_ACTOR_DENIED", "proposal actor changed after approval"
+            )
         operation = self.db.get(SopOperation, proposal.operation_id)
         attention = self.db.get(SopWorkItem, proposal.attention_id or "")
         if (
@@ -480,7 +490,7 @@ class GeneralSkillProposalService:
                 "GENERAL_SKILL_PROPOSAL_APPROVAL_INVALID", "approval evidence is incomplete"
             )
         if proposal.proposal_kind == "remote_import":
-            return self._publish_remote_import(proposal, initiator_user_id=initiator_user_id)
+            return self._publish_remote_import(proposal, initiator_user_id=actor.id)
         skill = self.db.get(GeneralSkill, proposal.skill_id)
         revision = self.db.get(GeneralSkillRevision, proposal.revision_id)
         if skill is None or revision is None or revision.status != "reviewing":

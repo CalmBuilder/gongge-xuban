@@ -81,7 +81,13 @@ def due_dynamic_task_signals(db: Session, *, limit: int = 50) -> list[ExecutionS
         .where(
             or_(
                 ExecutionSignal.signal_type.in_(
-                    ("attention_decided", "command", "timer", "scheduled_start")
+                    (
+                        "attention_decided",
+                        "command",
+                        "timer",
+                        "scheduled_start",
+                        "capacity_retry",
+                    )
                 ),
                 and_(
                     ExecutionSignal.signal_type == "operation_settled",
@@ -234,7 +240,7 @@ def process_dynamic_task_signal(
             actor_user_id=actor_user_id,
         )
     except Exception as exc:
-        db.commit()
+        db.rollback()
         db.refresh(signal)
         db.refresh(instance)
         if signal.status == "claimed" and signal.lease_owner == worker_id:
@@ -275,11 +281,29 @@ def process_dynamic_task_signal(
                 )
             else:
                 with store.owned(instance, worker_id=worker_id):
-                    control.retry_signal(
+                    retry_status = control.retry_signal(
                         instance,
                         signal,
                         worker_id=worker_id,
                         error=error,
+                    )
+                    if retry_status == "dead_letter" and signal.signal_type == "command":
+                        exhausted_command = db.get(ExecutionCommand, signal.causation_id)
+                        if exhausted_command is not None and exhausted_command.status in {
+                            "pending",
+                            "claimed",
+                        }:
+                            exhausted_command.status = "rejected"
+                            exhausted_command.reason_code = "DYNAMIC_SIGNAL_RETRY_EXHAUSTED"
+                            exhausted_command.consumed_at = store.database_now()
+                            exhausted_command.updated_at = exhausted_command.consumed_at
+                            db.add(exhausted_command)
+                if retry_status == "dead_letter":
+                    db.commit()
+                    agent.fail_execution(
+                        execution_id=instance.id,
+                        worker_id=f"{worker_id}:exhausted",
+                        error_code="DYNAMIC_SIGNAL_RETRY_EXHAUSTED",
                     )
             db.commit()
         return None

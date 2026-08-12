@@ -512,6 +512,8 @@ def test_non_admin_cannot_manage_overall_agent() -> None:
 
 
 def test_resource_binding_requires_agent_manager() -> None:
+    """只有 Agent 管理者可修改资源绑定。"""
+
     with _test_session() as db:
         owner, other, _admin = _seed_users(db)
         agent = AgentProfile(
@@ -543,6 +545,91 @@ def test_resource_binding_requires_agent_manager() -> None:
 
         bindings = update_agent_resources(agent.id, request, db=db, current_user=owner)
         assert [(item.resource_type, item.resource_id) for item in bindings] == [("tool", tool.id)]
+
+
+def test_resource_binding_rejects_another_users_private_general_skill_even_for_admin() -> None:
+    """通用绑定 API 不允许管理员绕过所有者传播授权绑定他人的私有 Skill。"""
+
+    with _test_session() as db:
+        owner, other, admin = _seed_users(db)
+        agent = AgentProfile(
+            id="agent_private_skill_target",
+            tenant_id="tenant_demo",
+            name="私有 Skill 目标员工",
+            owner_user_id=other.id,
+        )
+        skill = GeneralSkill(
+            id="private_skill_other_owner",
+            tenant_id="tenant_demo",
+            slug="private-skill",
+            name="私有 Skill",
+            skill_markdown="# Private",
+            status="published",
+            owner_user_id=owner.id,
+            visibility_scope="user_private",
+        )
+        db.add(agent)
+        db.add(skill)
+        db.commit()
+        request = AgentResourcesUpdateRequest(
+            tenant_id="tenant_demo",
+            resources=[
+                AgentResourceBindingInput(
+                    resource_type="general_skill",
+                    resource_id=skill.id,
+                )
+            ],
+        )
+
+        with pytest.raises(HTTPException) as denied:
+            update_agent_resources(agent.id, request, db=db, current_user=admin)
+        assert denied.value.status_code == 403
+        assert db.exec(select(AgentResourceBinding)).all() == []
+
+
+def test_resource_binding_rejects_gallery_skill_without_release_adoption() -> None:
+    """组织广场 Skill 也必须经发布采用服务生成冻结证据，客户端不能伪造 Binding。"""
+
+    with _test_session() as db:
+        owner, other, _admin = _seed_users(db)
+        agent = AgentProfile(
+            id="agent_gallery_skill_target",
+            tenant_id="tenant_demo",
+            name="广场 Skill 目标员工",
+            owner_user_id=other.id,
+        )
+        skill = GeneralSkill(
+            id="gallery_skill_other_owner",
+            tenant_id="tenant_demo",
+            slug="gallery-skill",
+            name="广场 Skill",
+            skill_markdown="# Gallery",
+            status="published",
+            owner_user_id=owner.id,
+            visibility_scope="tenant_gallery",
+        )
+        db.add_all([agent, skill])
+        db.commit()
+
+        with pytest.raises(HTTPException) as denied:
+            update_agent_resources(
+                agent.id,
+                AgentResourcesUpdateRequest(
+                    tenant_id="tenant_demo",
+                    resources=[
+                        AgentResourceBindingInput(
+                            resource_type="general_skill",
+                            resource_id=skill.id,
+                            metadata={"publication_release_id": "forged"},
+                        )
+                    ],
+                ),
+                db=db,
+                current_user=other,
+            )
+
+        assert denied.value.status_code == 403
+        assert db.exec(select(AgentResourceBinding)).all() == []
 
 
 def test_list_agents_filters_to_visible_agents_for_non_admin() -> None:
