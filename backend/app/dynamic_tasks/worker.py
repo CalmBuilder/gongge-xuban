@@ -239,13 +239,48 @@ def process_dynamic_task_signal(
         db.refresh(instance)
         if signal.status == "claimed" and signal.lease_owner == worker_id:
             store = SopExecutionStore(db)
-            with store.owned(instance, worker_id=worker_id):
-                ExecutionControlService(db, store).retry_signal(
+            control = ExecutionControlService(db, store)
+            error = {"code": _stable_signal_error_code(exc)}
+            if instance.status in {"succeeded", "failed", "timed_out", "cancelled"}:
+                control.settle_claimed_signal_for_terminal_execution(
                     instance,
                     signal,
                     worker_id=worker_id,
-                    error={"code": _stable_signal_error_code(exc)},
+                    error=error,
                 )
+            elif _is_terminal_signal_error(str(error["code"])):
+                with store.owned(instance, worker_id=worker_id):
+                    control.dead_letter_claimed_signal(
+                        instance,
+                        signal,
+                        worker_id=worker_id,
+                        error=error,
+                    )
+                    if signal.signal_type == "command":
+                        terminal_command = db.get(ExecutionCommand, signal.causation_id)
+                        if terminal_command is not None and terminal_command.status in {
+                            "pending",
+                            "claimed",
+                        }:
+                            terminal_command.status = "rejected"
+                            terminal_command.reason_code = str(error["code"])
+                            terminal_command.consumed_at = store.database_now()
+                            terminal_command.updated_at = terminal_command.consumed_at
+                            db.add(terminal_command)
+                db.commit()
+                agent.fail_execution(
+                    execution_id=instance.id,
+                    worker_id=f"{worker_id}:terminal",
+                    error_code=str(error["code"]),
+                )
+            else:
+                with store.owned(instance, worker_id=worker_id):
+                    control.retry_signal(
+                        instance,
+                        signal,
+                        worker_id=worker_id,
+                        error=error,
+                    )
             db.commit()
         return None
 
@@ -261,6 +296,23 @@ def _stable_signal_error_code(exc: Exception) -> str:
         if domain_code:
             return domain_code[:128]
     return type(exc).__name__[:128]
+
+
+def _is_terminal_signal_error(code: str) -> bool:
+    """区分不可通过相同 signal 重试修复的领域错误，未知/基础设施错误继续退避。"""
+
+    return code in {
+        "GENERAL_SKILL_COUNTERMANDED",
+        "DYNAMIC_RESULT_REPAIR_EXHAUSTED",
+        "DYNAMIC_STEP_BUDGET_EXHAUSTED",
+        "DYNAMIC_RUNTIME_BUDGET_EXCEEDED",
+        "DYNAMIC_INPUT_BUDGET_EXCEEDED",
+        "DYNAMIC_TOKEN_BUDGET_EXCEEDED",
+        "DYNAMIC_TOOL_CALLS_BUDGET_EXCEEDED",
+        "DYNAMIC_MODEL_CALLS_BUDGET_EXCEEDED",
+        "DYNAMIC_EXPLORE_TOOL_BUDGET_EXCEEDED",
+        "DYNAMIC_EXPLORE_MODEL_BUDGET_EXCEEDED",
+    }
 
 
 def _retry_unprocessable_signal(

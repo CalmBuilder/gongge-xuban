@@ -124,12 +124,26 @@ test('S3 user-only Skill 经真实 picker 强制加载、静音恢复并完成�
   await page.goto(`/workspace/chat/${sessionId}`);
   await page.getByRole('button', { name: '选择本轮 Skill' }).click();
   await page.getByRole('menuitem').filter({ hasText: SKILL_NAME }).click();
-  const muteResponse = page.waitForResponse((response) => (
-    new URL(response.url()).pathname.endsWith(`/general-skills/${skillId}`)
-    && response.request().method() === 'PUT'
-  ));
-  await page.getByRole('button', { name: `取消并静音 Skill ${SKILL_NAME}` }).click();
-  expect((await muteResponse).status()).toBe(200);
+  await expect(page.getByRole('button', { name: '选择本轮 Skill' })).toContainText('已选 1 个 Skill');
+  await page.getByRole('button', { name: `取消本轮 Skill ${SKILL_NAME}` }).click();
+  const muteStatus = await page.evaluate(async ({ sessionId: id, skillId: selectedId }) => {
+    const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
+    const response = await fetch(
+      `/api/chat/sessions/${encodeURIComponent(id)}/general-skills/${encodeURIComponent(selectedId)}`,
+      {
+        method: 'PUT',
+        headers: { Authorization: `Bearer ${auth.token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          agent_id: 'agent_e2e_member_employee',
+          enabled: false,
+          expected_row_version: null,
+        }),
+      },
+    );
+    return response.status;
+  }, { sessionId, skillId });
+  expect(muteStatus).toBe(200);
+  await page.reload();
   await page.getByRole('button', { name: '选择本轮 Skill' }).click();
   const mutedItem = page.getByRole('menuitem').filter({ hasText: `${SKILL_NAME}（已静音）` });
   await expect(mutedItem).toBeVisible();
@@ -140,7 +154,7 @@ test('S3 user-only Skill 经真实 picker 强制加载、静音恢复并完成�
   await mutedItem.click();
   expect((await unmuteResponse).status()).toBe(200);
   await expect(
-    page.getByRole('button', { name: `取消并静音 Skill ${SKILL_NAME}` }),
+    page.getByRole('button', { name: `取消本轮 Skill ${SKILL_NAME}` }),
   ).toBeVisible();
 
   await page.getByPlaceholder('输入消息，按 Enter 发送...').fill('请按本轮选定的指南处理售后问题');
@@ -152,6 +166,7 @@ test('S3 user-only Skill 经真实 picker 强制加载、静音恢复并完成�
   const originalTurnPayload = (await turnRequest).postDataJSON() as Record<string, unknown>;
   expect(originalTurnPayload).toMatchObject({
     forced_general_skill_id: skillId,
+    forced_general_skill_ids: [skillId],
   });
   await expect(page.getByRole('paragraph').filter({ hasText: 'S3-GUIDED-SUCCESS' })).toBeVisible({
     timeout: 30_000,
@@ -240,12 +255,28 @@ test('S3 user-only Skill 经真实 picker 强制加载、静音恢复并完成�
 
   await page.getByRole('button', { name: '选择本轮 Skill' }).click();
   await page.getByRole('menuitem').filter({ hasText: SKILL_NAME }).click();
-  const countermandResponse = page.waitForResponse((response) => (
-    new URL(response.url()).pathname.endsWith(`/general-skills/${skillId}`)
-    && response.request().method() === 'PUT'
-  ));
-  await page.getByRole('button', { name: `取消并静音 Skill ${SKILL_NAME}` }).click();
-  expect((await countermandResponse).status()).toBe(200);
+  const countermandStatus = await page.evaluate(async ({ sessionId: id, skillId: selectedId }) => {
+    const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
+    const catalog = await fetch(
+      `/api/chat/sessions/${encodeURIComponent(id)}/general-skills?agent_id=agent_e2e_member_employee`,
+      { headers: { Authorization: `Bearer ${auth.token}` } },
+    ).then((response) => response.json()) as { items: Array<{ skill_id: string; override_row_version?: number }> };
+    const item = catalog.items.find((candidate) => candidate.skill_id === selectedId);
+    const response = await fetch(
+      `/api/chat/sessions/${encodeURIComponent(id)}/general-skills/${encodeURIComponent(selectedId)}`,
+      {
+        method: 'PUT',
+        headers: { Authorization: `Bearer ${auth.token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          agent_id: 'agent_e2e_member_employee',
+          enabled: false,
+          expected_row_version: item?.override_row_version ?? null,
+        }),
+      },
+    );
+    return response.status;
+  }, { sessionId, skillId });
+  expect(countermandStatus).toBe(200);
   const blockedResource = await page.evaluate(async ({ id, use, checksum }) => {
     const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
     const response = await fetch(

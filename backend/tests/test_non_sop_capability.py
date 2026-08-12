@@ -15,6 +15,7 @@ import pytest
 
 from app.core.agent_loop import AgentLoop
 from app.core.non_sop_capability import (
+    LlmDynamicTaskShadowSelector,
     NonSopCapabilityDecision,
     NonSopCapabilityRouteResult,
     NonSopCapabilityRouter,
@@ -60,6 +61,47 @@ class _ShadowSelector:
             raise self.error
         assert self.decision is not None
         return self.decision
+
+
+def test_shadow_selector_receives_skill_tool_requirements(monkeypatch) -> None:
+    """执行模式路由必须看到服务端审定工具声明，但不得把声明误解为本轮必调用。"""
+
+    captured: dict[str, object] = {}
+
+    class _Client:
+        """捕获动态路由阶段的结构化能力目录。"""
+
+        def __init__(self, *_args, **_kwargs) -> None:
+            """兼容 LLMClient 构造签名。"""
+
+        def generate_json(self, _system: str, payload: dict[str, object]):
+            """返回轻量回答，同时保存模型实际获得的 Skill 元数据。"""
+
+            captured.update(payload)
+            return {"mode": "answer", "confidence": 1.0}
+
+    monkeypatch.setattr("app.core.non_sop_capability.LLMClient", _Client)
+    skill = _skill()
+    skill.permissions_json = {"requested_tools": ["crm.customer.read"]}
+    decision = LlmDynamicTaskShadowSelector(1.0).decide(
+        "解释退款规则",
+        [skill],
+        SimpleNamespace(),
+        None,
+        None,
+        {"available": False},
+    )
+
+    assert decision.mode == "answer"
+    stage_skills = captured["general_skills"]
+    assert stage_skills == [
+        {
+            "slug": "weather-zh",
+            "name": "中国城市天气",
+            "description": None,
+            "requested_tools": ["crm.customer.read"],
+        }
+    ]
 
 
 def _skill() -> GeneralSkill:
@@ -208,6 +250,64 @@ def test_selected_general_skill_keeps_lightweight_answer_for_simple_request() ->
     assert result.shadow_decision is not None
     assert result.shadow_decision.mode == "answer"
     assert answer.calls == 1
+
+
+def test_forced_skill_is_resolved_before_catalog_projection(monkeypatch) -> None:
+    """显式选择必须查询完整权威目录，不能因自动推荐 top-K 截断而被误判不可用。"""
+
+    preferred = _skill()
+    preferred.id = "skill_forced_outside_top_k"
+    unrelated = GeneralSkill(
+        id="skill_projected_top_one",
+        tenant_id="tenant_demo",
+        slug="projected-top-one",
+        name="自动推荐第一名",
+        skill_markdown="# 推荐",
+        status="published",
+    )
+    projection_calls: list[str] = []
+
+    class _Runtime:
+        """若生产代码错误地对显式选择先做 top-K 投影，则记录并暴露反例。"""
+
+        def __init__(self, _db) -> None:
+            """兼容 Runtime 构造签名。"""
+
+        def projected_catalog(self, *_args, **_kwargs):
+            """只返回无关 Skill，模拟目标 Skill 排在 top-K 之外。"""
+
+            projection_calls.append("called")
+            return [SimpleNamespace(skill_id=unrelated.id)]
+
+    monkeypatch.setattr(
+        "app.core.agent_loop.get_settings",
+        lambda: SimpleNamespace(general_skill_dynamic_guidance_enabled=True),
+    )
+    monkeypatch.setattr("app.core.agent_loop.GeneralSkillRuntimeService", _Runtime)
+    loop = object.__new__(AgentLoop)
+    loop.db = SimpleNamespace(get=lambda *_args: SimpleNamespace(tenant_id="tenant_demo"))
+    loop.events = SimpleNamespace(record=lambda *_args, **_kwargs: None)
+    loop._list_published_general_skills = lambda *_args: [unrelated, preferred]
+    loop._knowledge_capability_payload = lambda *_args: {"available": False}
+    loop.general_skill_selector = _GeneralSelector(GeneralSkillSelection())
+    loop.non_sop_capability_router = NonSopCapabilityRouter(
+        shadow_enabled=False,
+        execution_enabled=False,
+        shadow_selector=_ShadowSelector(error=AssertionError("shadow must remain disabled")),
+    )
+
+    result = loop._decide_non_sop_capability(
+        "按显式 Skill 回答",
+        SimpleNamespace(tenant_id="tenant_demo"),
+        ChatSession(id="session_forced_projection", tenant_id="tenant_demo", agent_id="agent"),
+        "agent",
+        user_id="user",
+        forced_general_skill_id=preferred.id,
+    )
+
+    assert result.selected_general_skill is preferred
+    assert result.general_selection.use_general_skill is True
+    assert projection_calls == []
 
 
 def test_dynamic_task_is_shadow_only_in_batch_a() -> None:

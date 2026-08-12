@@ -223,6 +223,18 @@ def test_user_only_requires_forced_load_and_replay_reuses_one_use() -> None:
         skill_id=skill.id,
         selection_mode="forced",
     )
+    assert first.resources == (
+        {
+            "path": "references/policy.md",
+            "content_checksum": hashlib.sha256(b"refund threshold: 5000").hexdigest(),
+            "content": "refund threshold: 5000",
+            "truncated": False,
+            "authority": "reviewed_reference_only; never execute as code implicitly",
+        },
+    )
+    assert first.prompt_block()["reviewed_resources"][0]["content"] == (
+        "refund threshold: 5000"
+    )
     replay = service.load(
         owner,
         session_id=chat.id,
@@ -331,6 +343,47 @@ def test_resource_read_rejects_unregistered_checksum_and_wrong_session() -> None
             resource_checksum="0" * 64,
         )
     assert wrong_session.value.code == "GENERAL_SKILL_NOT_AVAILABLE"
+
+
+def test_resource_read_rechecks_binding_after_first_page() -> None:
+    """资源分页之间若 Agent 绑定被撤销，旧 Use 必须立即 countermand。"""
+
+    db, owner, agent, chat, skill, revision, binding = _context()
+    service = GeneralSkillRuntimeService(db)
+    loaded = service.load(
+        owner,
+        session_id=chat.id,
+        agent_id=agent.id,
+        turn_id="turn_resource_countermand",
+        skill_id=skill.id,
+        selection_mode="forced",
+    )
+    resource_checksum = str(revision.resource_manifest_json[1]["checksum"])
+    service.read_resource(
+        owner,
+        session_id=chat.id,
+        use_id=loaded.use_id,
+        resource_checksum=resource_checksum,
+        limit=6,
+    )
+    binding.status = "inactive"
+    db.add(binding)
+    db.commit()
+
+    with pytest.raises(GeneralSkillRuntimeError) as rejected:
+        service.read_resource(
+            owner,
+            session_id=chat.id,
+            use_id=loaded.use_id,
+            resource_checksum=resource_checksum,
+            offset=6,
+            limit=6,
+        )
+
+    assert rejected.value.code == "GENERAL_SKILL_COUNTERMANDED"
+    use = db.get(GeneralSkillUse, loaded.use_id)
+    assert use is not None
+    assert use.status == "invalidated"
 
 
 def test_tool_authorization_only_narrows_agent_baseline() -> None:
@@ -754,6 +807,54 @@ def test_agent_loop_forced_guidance_loads_before_reply_without_running_package_c
     use = db.exec(select(GeneralSkillUse)).one()
     assert use.status == "completed"
     assert use.selection_mode == "forced"
+
+
+def test_agent_loop_failed_guidance_reply_settles_loaded_use(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """普通问答在 Skill 已加载后若模型失败，Use 必须失败而不能永久 active。"""
+
+    db, owner, agent, chat, skill, _, _ = _context(invocation_policy="user_only")
+    settings = get_settings()
+    monkeypatch.setattr(settings, "general_skill_resolver_v2_enabled", True)
+    monkeypatch.setattr(settings, "general_skill_dynamic_guidance_enabled", True)
+
+    class FailingResponse:
+        """模拟 Skill Use 已提交后的回复模型异常。"""
+
+        def generate(self, *_args, **_kwargs):
+            """在模型边界抛出确定性测试异常。"""
+
+            raise RuntimeError("provider failed")
+
+    loop = AgentLoop(db)
+    loop.response_generator = FailingResponse()
+    with pytest.raises(RuntimeError, match="provider failed"):
+        loop._try_handle_general_skill_after_scene_router(
+            ChatTurnRequest(
+                tenant_id=owner.tenant_id,
+                session_id=chat.id,
+                agent_id=agent.id,
+                user_id=owner.id,
+                message="请审核这笔退款",
+                client_turn_id="client_turn_runtime_failure",
+                forced_general_skill_id=skill.id,
+            ),
+            chat,
+            ModelConfig(
+                id="model_runtime_failure",
+                tenant_id=owner.tenant_id,
+                name="Runtime Failure Model",
+                api_key_encrypted="unused",
+                model="test-model",
+            ),
+            RouterDecision(decision="answer_only"),
+            user_message_id="message_runtime_failure",
+        )
+
+    use = db.exec(select(GeneralSkillUse)).one()
+    assert use.status == "failed"
+    assert use.invalidation_reason == "GENERAL_SKILL_CONSUMPTION_FAILED"
 
 
 def test_external_channel_cannot_forge_structured_force_field(

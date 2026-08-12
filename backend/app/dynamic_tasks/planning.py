@@ -232,6 +232,13 @@ def normalize_plan_draft(
         for index, step in enumerate(draft.steps, start=1)
     }
     guidance_mapping = guidance_use_ids_by_name or {}
+    all_guidance_use_ids = tuple(
+        dict.fromkeys(
+            use_id
+            for use_ids in guidance_mapping.values()
+            for use_id in use_ids
+        )
+    )
     unknown_guidance = {
         reference
         for step in draft.steps
@@ -253,11 +260,16 @@ def normalize_plan_draft(
                 required=step.required,
                 depends_on=tuple(key_by_draft_id[value] for value in step.depends_on),
                 capability_refs=step.capability_refs,
-                guidance_skill_use_ids=tuple(
-                    dict.fromkeys(
-                        use_id
-                        for name in step.guidance_skill_refs
-                        for use_id in guidance_mapping[name]
+                guidance_skill_use_ids=(
+                    all_guidance_use_ids
+                    if step.kind
+                    in {"tool.read", "tool.write", "tool.execute", "knowledge", "explore"}
+                    else tuple(
+                        dict.fromkeys(
+                            use_id
+                            for name in step.guidance_skill_refs
+                            for use_id in guidance_mapping[name]
+                        )
                     )
                 ),
                 expected_output_schema=step.expected_output_schema,

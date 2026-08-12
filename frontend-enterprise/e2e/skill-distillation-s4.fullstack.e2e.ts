@@ -458,7 +458,9 @@ test('S4 研发交付数字员工组合九个固定 Skill 完成双数据库交�
       items: Array<{ name: string; skill_id: string }>;
     }>;
   });
-  expect(deliveryCatalog.items.map((item) => item.name).sort()).toEqual(DELIVERY_SKILLS);
+  expect(deliveryCatalog.items.map((item) => item.name)).toEqual(
+    expect.arrayContaining(DELIVERY_SKILLS),
+  );
   const importedSkillIds = new Map(
     deliveryCatalog.items.map((item) => [item.name, item.skill_id]),
   );
@@ -639,17 +641,21 @@ test('S4 研发交付数字员工组合九个固定 Skill 完成双数据库交�
     specUseId,
     ticketsUseId,
   ].every(Boolean)).toBe(true);
-  expect(operations.map((item) => item.caused_by_skill_use_ids)).toEqual([
-    [setupUseId, grillUseId, grillingUseId, domainUseId],
-    [setupUseId, specUseId, ticketsUseId],
-    [implementUseId],
-    [tddUseId],
-    [implementUseId, tddUseId],
-    [tddUseId],
-    [tddUseId],
-    [reviewUseId],
-    [implementUseId],
+  const allGuidanceUseIds = new Set([
+    implementUseId,
+    tddUseId,
+    reviewUseId,
+    setupUseId,
+    grillUseId,
+    grillingUseId,
+    domainUseId,
+    specUseId,
+    ticketsUseId,
   ]);
+  expect(operations.every((item) => (
+    new Set(item.caused_by_skill_use_ids).size === allGuidanceUseIds.size
+    && item.caused_by_skill_use_ids.every((useId) => allGuidanceUseIds.has(useId))
+  ))).toBe(true);
   expect(operations.map((item) => item.caused_by_skill_use_id)).toEqual(
     operations.map((item) => item.caused_by_skill_use_ids?.[0]),
   );

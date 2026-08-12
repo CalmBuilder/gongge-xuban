@@ -369,17 +369,26 @@ def _goal_authorizes_capability(goal: str, snapshot: CapabilitySnapshot) -> bool
         return True
     normalized = goal.casefold()
     if intent == "skill_proposal":
+        positive_pattern = (
+            r"(?:安装|导入|采用).{0,24}(?:skill|技能)"
+            r"|(?:skill|技能).{0,24}(?:安装|导入|采用)"
+            r"|(?:保存|沉淀|创建|新增|提交|发布|提议|建议).{0,40}"
+            r"(?:为|成|一个|新的).{0,12}(?:skill|技能)"
+            r"|(?:propose|install|import|adopt|publish|save as|create)"
+            r".{0,40}skill"
+            r"|skill.{0,40}(?:proposal|install|import|adoption|publication)"
+        )
+        negative_pattern = (
+            r"(?:不要|不准|禁止|无需|无须|别|不得|拒绝|取消).{0,12}"
+            r"(?:安装|导入|采用|保存|沉淀|创建|新增|提交|发布|提议|建议)?"
+            r".{0,20}(?:skill|技能)"
+            r"|(?:do not|don't|must not|never|without).{0,32}"
+            r"(?:propose|install|import|adopt|publish|save|create).{0,20}skill"
+        )
+        if re.search(negative_pattern, normalized):
+            return False
         return bool(
-            re.search(
-                r"(?:安装|导入|采用).{0,24}(?:skill|技能)"
-                r"|(?:skill|技能).{0,24}(?:安装|导入|采用)"
-                r"|(?:保存|沉淀|创建|新增|提交|发布|提议|建议).{0,40}"
-                r"(?:为|成|一个|新的).{0,12}(?:skill|技能)"
-                r"|(?:propose|install|import|adopt|publish|save as|create)"
-                r".{0,40}skill"
-                r"|skill.{0,40}(?:proposal|install|import|adoption|publication)",
-                normalized,
-            )
+            re.search(positive_pattern, normalized)
         )
     return False
 

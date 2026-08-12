@@ -24,6 +24,7 @@ from app.api.executions import (
 from app.db.models import (
     ExecutionCommand,
     ExecutionPlanRevision,
+    GeneralSkillUse,
     SopInstance,
     SopNodeExecution,
     SopWorkItem,
@@ -91,6 +92,22 @@ def test_cancel_command_reaches_terminal_result_and_publication(db: Session) -> 
 
     owner, _, instance = _seed_execution(db)
     assert owner is not None
+    use = GeneralSkillUse(
+        tenant_id="tenant_demo",
+        session_id=instance.session_id,
+        turn_id="turn_cancel_1",
+        execution_id=instance.id,
+        agent_id="agent_demo",
+        user_id=owner.id,
+        skill_id="skill_cancel_1",
+        revision_id="revision_cancel_1",
+        content_checksum="c" * 64,
+        selection_mode="forced",
+        status="active",
+        idempotency_key="cancel-use-1",
+    )
+    db.add(use)
+    db.commit()
     command = issue_execution_command(
         instance.id,
         ExecutionCommandRequest(
@@ -106,6 +123,9 @@ def test_cancel_command_reaches_terminal_result_and_publication(db: Session) -> 
     assert command.status == "applied"
     db.refresh(instance)
     assert instance.status == "cancelled"
+    db.refresh(use)
+    assert use.status == "cancelled"
+    assert use.invalidation_reason == "DYNAMIC_EXECUTION_CANCELLED"
     result = get_execution_result(instance.id, "tenant_demo", owner, db)
     assert result.result["status"] == "cancelled"
     assert result.publications[0]["required"] is True

@@ -17,6 +17,7 @@ export type PreparedChatTurn = {
   interactionMode: ComposerInteractionMode;
   modelConfigId?: string;
   forcedGeneralSkillId?: string;
+  forcedGeneralSkillIds?: string[];
   createdAt: string;
 };
 
@@ -49,6 +50,14 @@ function isPreparedChatTurn(value: unknown): value is PreparedChatTurn {
     && INTERACTION_MODES.has(value.interactionMode as ComposerInteractionMode)
     && (value.modelConfigId === undefined || typeof value.modelConfigId === 'string')
     && (value.forcedGeneralSkillId === undefined || typeof value.forcedGeneralSkillId === 'string')
+    && (
+      value.forcedGeneralSkillIds === undefined
+      || (
+        Array.isArray(value.forcedGeneralSkillIds)
+        && value.forcedGeneralSkillIds.length <= 8
+        && value.forcedGeneralSkillIds.every((item) => typeof item === 'string')
+      )
+    )
     && typeof value.createdAt === 'string'
     && Number.isFinite(Date.parse(value.createdAt))
   );

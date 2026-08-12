@@ -501,6 +501,35 @@ def test_signal_and_outbox_exhaust_attempt_budget_into_dead_letter(db: Session) 
     assert outbox.last_error_json["code"] == "DESTINATION_REJECTED"
 
 
+def test_claimed_signal_can_be_settled_after_execution_already_terminal(db: Session) -> None:
+    """恢复逻辑先终结 Execution 时，迟到 signal 仍可凭自身租约收敛且不能被重放。"""
+
+    instance = _instance(db, suffix="terminal_signal")
+    service = ExecutionControlService(db)
+    signal = service.enqueue_signal(
+        instance,
+        signal_type="external_event",
+        causation_type="test",
+        causation_id="terminal_signal",
+    )
+    service.claim_signal(signal, worker_id="signal_worker")
+    instance.status = "failed"
+    instance.active_slot_key = None
+    instance.completed_at = utc_now()
+    db.add(instance)
+    db.flush()
+
+    assert service.settle_claimed_signal_for_terminal_execution(
+        instance,
+        signal,
+        worker_id="signal_worker",
+        error={"code": "DYNAMIC_RUNTIME_BUDGET_EXCEEDED"},
+    ) == "discarded"
+    assert signal.lease_owner is None
+    assert signal.consumed_at is not None
+    assert signal.last_error_json["code"] == "DYNAMIC_RUNTIME_BUDGET_EXCEEDED"
+
+
 def test_cancellation_closes_active_attention_and_discards_all_resume_signals(db: Session) -> None:
     """验证取消在终态前同时处置 Attention 和普通唤醒，不留下可恢复孤儿。"""
 

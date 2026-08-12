@@ -339,6 +339,16 @@ def test_planner_hides_side_effect_capability_without_explicit_user_intent() -> 
     assert explicit_client.payload is not None
     assert explicit_client.payload["capabilities"][0]["name"] == capability.name
 
+    negated_client = _Client()
+    with pytest.raises(DynamicTaskPlannerError):
+        DynamicTaskPlanner(negated_client).create_plan(
+            goal="不要创建或安装任何 Skill，只输出操作规范",
+            success_criteria=(criterion,),
+            capabilities=(capability,),
+        )
+    assert negated_client.payload is not None
+    assert negated_client.payload["capabilities"] == []
+
 
 class _RepairingCapabilityClient:
     """首轮虚构工具，收到服务端修复契约后收敛为纯回答计划。"""

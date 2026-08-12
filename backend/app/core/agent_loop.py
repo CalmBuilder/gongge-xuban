@@ -932,31 +932,40 @@ class AgentLoop:
                     user_message_id,
                 ),
             )
-        guided_context = {
-            **conversation_context,
-            "loaded_general_skills": [loaded.prompt_block() for loaded in loaded_bundle],
-        }
-        step_result = StepAgentResult(is_step_completed=True)
-        reply = self._generate_reply_segment(
-            request.message,
-            chat_session,
-            None,
-            router_decision,
-            step_result,
-            None,
-            model_config,
-            self._get_persona_prompt(request.tenant_id, chat_session.agent_id),
-            memory_context,
-            guided_context,
-        )
-        reply = self._finalize_turn(
-            chat_session,
-            request.tenant_id,
-            reply,
-            step_result,
-            request.message,
-            user_message_id=user_message_id,
-        )
+        try:
+            guided_context = {
+                **conversation_context,
+                "loaded_general_skills": [loaded.prompt_block() for loaded in loaded_bundle],
+            }
+            step_result = StepAgentResult(is_step_completed=True)
+            reply = self._generate_reply_segment(
+                request.message,
+                chat_session,
+                None,
+                router_decision,
+                step_result,
+                None,
+                model_config,
+                self._get_persona_prompt(request.tenant_id, chat_session.agent_id),
+                memory_context,
+                guided_context,
+            )
+            reply = self._finalize_turn(
+                chat_session,
+                request.tenant_id,
+                reply,
+                step_result,
+                request.message,
+                user_message_id=user_message_id,
+            )
+        except Exception:
+            self.db.rollback()
+            runtime.fail_loaded_uses(
+                [loaded.use_id for loaded in loaded_bundle],
+                reason_code="GENERAL_SKILL_CONSUMPTION_FAILED",
+            )
+            self.db.commit()
+            raise
         for loaded in loaded_bundle:
             runtime.complete(loaded.use_id, summary={"reply_generated": True})
             self.events.record(
@@ -7251,11 +7260,17 @@ class AgentLoop:
         general_skills = self._list_published_general_skills(
             model_config.tenant_id, agent_id, user_id
         )
+        normalized_forced_skill_id = str(forced_general_skill_id or "").strip()
+        forced_general_skill = next(
+            (skill for skill in general_skills if skill.id == normalized_forced_skill_id),
+            None,
+        )
         if (
             get_settings().general_skill_dynamic_guidance_enabled
             and user_id
             and agent_id
             and chat_session.id
+            and forced_general_skill is None
         ):
             current_user = self.db.get(User, user_id)
             if current_user is not None:
@@ -7275,14 +7290,6 @@ class AgentLoop:
             model_config.tenant_id,
             user_id,
             agent_id,
-        )
-        forced_general_skill = next(
-            (
-                skill
-                for skill in general_skills
-                if skill.id == str(forced_general_skill_id or "").strip()
-            ),
-            None,
         )
         if forced_general_skill_id and forced_general_skill is None:
             selection = GeneralSkillSelection(
@@ -8294,6 +8301,8 @@ class AgentLoop:
             metadata["model_config_id"] = request.model_config_id
         if request.forced_general_skill_id:
             metadata["forced_general_skill_id"] = request.forced_general_skill_id
+        if request.forced_general_skill_ids:
+            metadata["forced_general_skill_ids"] = list(request.forced_general_skill_ids)
         if request.attachments:
             metadata["attachments"] = [item.model_dump(mode="json") for item in request.attachments]
         return metadata

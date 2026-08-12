@@ -163,6 +163,11 @@ class LlmDynamicTaskShadowSelector:
                         "slug": skill.slug,
                         "name": skill.name,
                         "description": skill.description,
+                        "requested_tools": list(
+                            skill.permissions_json.get("requested_tools", [])
+                            if isinstance(skill.permissions_json, dict)
+                            else []
+                        ),
                     }
                     for skill in general_skills
                     if skill.status == "published"

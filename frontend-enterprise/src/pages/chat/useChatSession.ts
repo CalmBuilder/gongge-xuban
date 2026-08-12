@@ -342,7 +342,8 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
   const [generalSkillInstallIntents, setGeneralSkillInstallIntents] = useState<GeneralSkillInstallIntentRead[]>([]);
   const [generalSkillCatalogLoading, setGeneralSkillCatalogLoading] = useState(false);
   const [generalSkillCatalogError, setGeneralSkillCatalogError] = useState(false);
-  const [selectedGeneralSkillId, setSelectedGeneralSkillId] = useState('');
+  const [selectedGeneralSkillIds, setSelectedGeneralSkillIds] = useState<string[]>([]);
+  const selectedGeneralSkillId = selectedGeneralSkillIds[0] || '';
   const [lastTurn, setLastTurn] = useState<ChatTurnResponse | null>(null);
   const [renameSession, setRenameSession] = useState<ChatSession | null>(null);
   const [renameTitle, setRenameTitle] = useState('');
@@ -536,7 +537,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
   useEffect(() => {
     if (!auth || !sessionId || !displayedAgent?.id || isDraftConversationKey(sessionId)) {
       setSessionGeneralSkills([]);
-      setSelectedGeneralSkillId('');
+      setSelectedGeneralSkillIds([]);
       setGeneralSkillCatalogLoading(false);
       setGeneralSkillCatalogError(false);
       setGeneralSkillInstallIntents([]);
@@ -556,9 +557,9 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       if (cancelled) return;
       setSessionGeneralSkills(catalog.items);
       setGeneralSkillInstallIntents(intents);
-      setSelectedGeneralSkillId((current) => (
-        catalog.items.some((item) => item.skill_id === current && item.enabled) ? current : ''
-      ));
+      setSelectedGeneralSkillIds((current) => current.filter((skillId) => (
+        catalog.items.some((item) => item.skill_id === skillId && item.enabled)
+      )));
     }).catch((error) => {
       if (!cancelled && !isAuthError(error)) {
         setSessionGeneralSkills([]);
@@ -591,13 +592,22 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
             : candidate
         )));
       }
-      setSelectedGeneralSkillId(skillId);
+      setSelectedGeneralSkillIds((current) => (
+        current.includes(skillId)
+          ? current.filter((value) => value !== skillId)
+          : [...current, skillId].slice(0, 8)
+      ));
     } catch (error) {
       notify.error(error instanceof Error ? error.message : t('Skill 恢复失败'));
     }
   }, [displayedAgent?.id, sessionGeneralSkills, sessionId, t]);
 
-  const clearSelectedGeneralSkill = useCallback(() => setSelectedGeneralSkillId(''), []);
+  const clearSelectedGeneralSkill = useCallback(
+    (skillId?: string) => setSelectedGeneralSkillIds((current) => (
+      skillId ? current.filter((value) => value !== skillId) : []
+    )),
+    [],
+  );
 
   const refreshGeneralSkillInstallIntents = useCallback(async () => {
     if (!sessionId) return;
@@ -3082,6 +3092,9 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       if (prepared.forcedGeneralSkillId) {
         requestBody.forced_general_skill_id = prepared.forcedGeneralSkillId;
       }
+      if (prepared.forcedGeneralSkillIds?.length) {
+        requestBody.forced_general_skill_ids = prepared.forcedGeneralSkillIds;
+      }
       armStreamWatchdog();
       await streamChatTurn(requestBody, (item) => {
         if (!controller.signal.aborted) {
@@ -3256,12 +3269,13 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       interactionMode: resolvedInteractionMode,
       modelConfigId: selectedModelConfig?.id,
       forcedGeneralSkillId: selectedGeneralSkillId || undefined,
+      forcedGeneralSkillIds: selectedGeneralSkillIds.length ? selectedGeneralSkillIds : undefined,
       createdAt: new Date().toISOString(),
     };
     setInput('');
     setComposerAttachments([]);
     setComposerIntent(null);
-    setSelectedGeneralSkillId('');
+    setSelectedGeneralSkillIds([]);
     const stream = getStreamSlot(currentConversationId);
     const hasQueuedTurnForConversation = queuedTurnsRef.current.some(
       (item) => item.conversationId === currentConversationId,
@@ -3294,6 +3308,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     selectedAgentId,
     selectedModelConfig?.id,
     selectedGeneralSkillId,
+    selectedGeneralSkillIds,
     sessionId,
     sessions,
     sessionsLoading,
@@ -3452,6 +3467,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     generalSkillCatalogLoading,
     generalSkillCatalogError,
     selectedGeneralSkillId,
+    selectedGeneralSkillIds,
     selectSessionGeneralSkill,
     clearSelectedGeneralSkill,
     generalSkillInstallOpen,

@@ -1171,12 +1171,6 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
                       从广场复制
                     </DropdownMenuItem>
                   )}
-                  {!secureImportAvailable && (
-                    <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => requestClawHubImport()}>
-                      <GithubOutlined />
-                      从开源平台导入
-                    </DropdownMenuItem>
-                  )}
                   {!isOverallAgent && secureImportAvailable && (
                     <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => requestSecurePackageImport()}>
                       <ShieldCheck />
@@ -3345,10 +3339,6 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
             从广场复制
           </DropdownMenuItem>
         )}
-        <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => requestClawHubImport()}>
-          <GithubOutlined />
-          从开源平台导入
-        </DropdownMenuItem>
         {!isOverallAgent && (
           <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => requestAgentImport('employee')}>
             <TeamOutlined />

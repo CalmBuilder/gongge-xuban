@@ -533,6 +533,56 @@ class ExecutionControlService:
         self.db.flush()
         return status
 
+    def settle_claimed_signal_for_terminal_execution(
+        self,
+        instance: SopInstance,
+        signal: ExecutionSignal,
+        *,
+        worker_id: str,
+        error: Mapping[str, object],
+    ) -> str:
+        """Execution 已终态时以 signal 自身租约清算迟到唤醒，避免无法再取得 Execution lease。"""
+
+        self._assert_signal_owner(instance, signal, worker_id)
+        if instance.status not in {"succeeded", "failed", "timed_out", "cancelled"}:
+            raise ExecutionControlError(
+                "SIGNAL_TERMINAL_EXECUTION_REQUIRED",
+                "只有已经进入权威终态的 Execution 才能脱离 Execution lease 清算 signal。",
+            )
+        now = self.store.database_now()
+        signal.status = "discarded"
+        signal.lease_owner = None
+        signal.lease_expires_at = None
+        signal.consumed_at = now
+        signal.last_error_json = dict(error)
+        signal.updated_at = now
+        self.db.add(signal)
+        self.db.flush()
+        return signal.status
+
+    def dead_letter_claimed_signal(
+        self,
+        instance: SopInstance,
+        signal: ExecutionSignal,
+        *,
+        worker_id: str,
+        error: Mapping[str, object],
+    ) -> str:
+        """在 Execution lease 内把确定性失败 signal 一次性死信，供同事务终结聚合。"""
+
+        self._assert_signal_owner(instance, signal, worker_id)
+        self.store.authorize_mutation(instance, "signal.dead_letter")
+        now = self.store.database_now()
+        signal.status = "dead_letter"
+        signal.available_at = now
+        signal.lease_owner = None
+        signal.lease_expires_at = None
+        signal.last_error_json = dict(error)
+        signal.updated_at = now
+        self.db.add(signal)
+        self.db.flush()
+        return signal.status
+
     def retry_signal(
         self,
         instance: SopInstance,

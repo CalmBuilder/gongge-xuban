@@ -15,6 +15,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import Literal
 
 from sqlalchemy import func, or_, update
 from sqlalchemy.orm.attributes import set_committed_value
@@ -1721,6 +1722,8 @@ class SopExecutionStore:
         instance.completed_at = utc_now()
         self.db.add(instance)
         if instance.kind == "dynamic_task":
+            # 成功路径的 Skill Use 由持有最终 result/message 证据的 DynamicTaskAgent
+            # 结算；这里只释放配额，避免先写入一个缺少交付证据的 completed 摘要。
             DynamicTaskQuotaService(self.db).release_execution(instance)
         self.db.flush()
 
@@ -1759,6 +1762,15 @@ class SopExecutionStore:
         instance.completed_at = utc_now()
         self.db.add(instance)
         if instance.kind == "dynamic_task":
+            self._settle_dynamic_skill_uses(
+                instance,
+                terminal_status="failed",
+                reason_code=str(
+                    (instance.terminal_reason_json or {}).get("code")
+                    or (context_patch or {}).get("failure_code")
+                    or "DYNAMIC_EXECUTION_FAILED"
+                ),
+            )
             DynamicTaskQuotaService(self.db).release_execution(instance)
         self.db.flush()
 
@@ -1797,6 +1809,15 @@ class SopExecutionStore:
         instance.completed_at = utc_now()
         self.db.add(instance)
         if instance.kind == "dynamic_task":
+            self._settle_dynamic_skill_uses(
+                instance,
+                terminal_status="failed",
+                reason_code=str(
+                    (instance.terminal_reason_json or {}).get("code")
+                    or (context_patch or {}).get("failure_code")
+                    or "DYNAMIC_EXECUTION_TIMED_OUT"
+                ),
+            )
             DynamicTaskQuotaService(self.db).release_execution(instance)
         self.db.flush()
 
@@ -2119,9 +2140,33 @@ class SopExecutionStore:
         instance.completed_at = utc_now()
         self.db.add(instance)
         if instance.kind == "dynamic_task":
+            self._settle_dynamic_skill_uses(
+                instance,
+                terminal_status="cancelled",
+                reason_code="DYNAMIC_EXECUTION_CANCELLED",
+            )
             DynamicTaskQuotaService(self.db).release_execution(instance)
         self.db.flush()
         return True
+
+    def _settle_dynamic_skill_uses(
+        self,
+        instance: SopInstance,
+        *,
+        terminal_status: Literal["completed", "failed", "cancelled"],
+        reason_code: str | None = None,
+    ) -> None:
+        """在动态 Execution 的权威终态事务内结算全部 Skill Use，避免调用方遗漏。"""
+
+        if instance.kind != "dynamic_task":
+            return
+        from app.general_skills.runtime import GeneralSkillRuntimeService
+
+        GeneralSkillRuntimeService(self.db).settle_execution_uses(
+            execution_id=instance.id,
+            terminal_status=terminal_status,
+            reason_code=reason_code,
+        )
 
     def _active_instance(self, tenant_id: str, session_id: str) -> SopInstance | None:
         """在租户和会话范围内查找唯一活动实例。"""

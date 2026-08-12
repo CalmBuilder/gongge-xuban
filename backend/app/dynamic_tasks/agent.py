@@ -461,6 +461,7 @@ class DynamicTaskAgent:
                 repair_feedback: dict[str, object] | None = None
                 message: Message | None = None
                 for result_attempt in range(2):
+                    expected_plan_revision_id = instance.current_plan_revision_id
                     completed = self._propose_action(
                         instance=instance,
                         step=step,
@@ -481,6 +482,7 @@ class DynamicTaskAgent:
                             worker_id=worker_id,
                             resume_signal_id=resume_signal_id,
                             signal_worker_id=signal_worker_id,
+                            expected_plan_revision_id=expected_plan_revision_id,
                         )
                         break
                     except DynamicTaskAgentError as exc:
@@ -551,6 +553,27 @@ class DynamicTaskAgent:
         if instance is None or instance.kind != "dynamic_task":
             raise DynamicTaskAgentError("DYNAMIC_EXECUTION_NOT_FOUND")
         if instance.status in {"succeeded", "failed", "cancelled", "timed_out"}:
+            terminal_status = (
+                "completed"
+                if instance.status == "succeeded"
+                else "cancelled"
+                if instance.status == "cancelled"
+                else "failed"
+            )
+            GeneralSkillRuntimeService(self.db).settle_execution_uses(
+                execution_id=instance.id,
+                terminal_status=terminal_status,
+                reason_code=(
+                    None
+                    if terminal_status == "completed"
+                    else str(
+                        (instance.terminal_reason_json or {}).get("code")
+                        or error_code
+                        or f"DYNAMIC_EXECUTION_{instance.status.upper()}"
+                    )[:128]
+                ),
+            )
+            self.db.commit()
             return
         safe_code = (error_code or "DYNAMIC_EXECUTION_FAILED")[:128]
         with self.store.owned(instance, worker_id=worker_id):
@@ -3119,6 +3142,18 @@ class DynamicTaskAgent:
         )
         if not goal.strip() or not criteria:
             raise DynamicTaskAgentError("DYNAMIC_TASK_CONTRACT_INCOMPLETE")
+        requested_forced_ids = tuple(
+            dict.fromkeys(
+                value
+                for value in (
+                    *(str(item).strip() for item in forced_general_skill_ids),
+                    str(forced_general_skill_id or "").strip(),
+                )
+                if value
+            )
+        )
+        if len(requested_forced_ids) > 8:
+            raise DynamicTaskAgentError("GENERAL_SKILL_SELECTION_LIMIT_EXCEEDED")
         memory_projection = self._memory_projection(memory_context)
         resources: list[ManagedInputResource] = []
         for resource_id in dict.fromkeys(input_resource_ids):
@@ -3158,6 +3193,15 @@ class DynamicTaskAgent:
                 and frozen_model.get("model_config_id") == verified_model.id
                 and frozen_model.get("checksum") == verified_model.capability_checksum
                 and frozen_resource_ids == {item.id for item in resources}
+                and tuple(
+                    sorted(
+                        str(value)
+                        for value in (existing.context_json or {}).get(
+                            "forced_general_skill_ids", []
+                        )
+                    )
+                )
+                == tuple(sorted(requested_forced_ids))
             ):
                 return existing, False
             raise DynamicTaskAgentError("DYNAMIC_ACTIVE_EXECUTION_CONFLICT")
@@ -3168,17 +3212,6 @@ class DynamicTaskAgent:
         guidance_catalog = [
             item for item in capabilities if item.capability_type == "general_skill"
         ]
-        requested_forced_ids = tuple(
-            dict.fromkeys(
-                [
-                    *(str(value).strip() for value in forced_general_skill_ids),
-                    str(forced_general_skill_id or "").strip(),
-                ]
-            )
-        )
-        requested_forced_ids = tuple(value for value in requested_forced_ids if value)
-        if len(requested_forced_ids) > 8:
-            raise DynamicTaskAgentError("GENERAL_SKILL_SELECTION_LIMIT_EXCEEDED")
         if requested_forced_ids:
             guidance_by_id = {item.capability_id: item for item in guidance_catalog}
             selected_guidance = [
@@ -3391,6 +3424,7 @@ class DynamicTaskAgent:
                 "total_tokens": 0,
             },
             "memory_context": list(memory_projection),
+            "forced_general_skill_ids": list(requested_forced_ids),
         }
         self.db.add(instance)
         self.db.flush()
@@ -4142,6 +4176,7 @@ class DynamicTaskAgent:
         worker_id: str,
         resume_signal_id: str | None = None,
         signal_worker_id: str | None = None,
+        expected_plan_revision_id: str | None = None,
     ) -> Message:
         """逐项验证最终结果，并原子写消息、publication 与 Execution 成功终态。"""
 
@@ -4182,6 +4217,11 @@ class DynamicTaskAgent:
                 )
         if rejected_error is not None:
             with self.store.owned(instance, worker_id=worker_id), self.db.begin_nested():
+                if (
+                    expected_plan_revision_id is not None
+                    and instance.current_plan_revision_id != expected_plan_revision_id
+                ):
+                    raise DynamicTaskAgentError("DYNAMIC_PLAN_REVISION_CHANGED")
                 step = self._step(instance, step_key)
                 if step is None:
                     if not set(step_definition.depends_on) <= self._completed_step_keys(instance):
@@ -4214,6 +4254,11 @@ class DynamicTaskAgent:
             self.db.commit()
             raise rejected_error
         with self.store.owned(instance, worker_id=worker_id), self.db.begin_nested():
+            if (
+                expected_plan_revision_id is not None
+                and instance.current_plan_revision_id != expected_plan_revision_id
+            ):
+                raise DynamicTaskAgentError("DYNAMIC_PLAN_REVISION_CHANGED")
             step = self._step(instance, step_key)
             if step is None:
                 if not set(step_definition.depends_on) <= self._completed_step_keys(instance):
@@ -4792,23 +4837,44 @@ class DynamicTaskAgent:
     ) -> list[dict[str, object]]:
         """在每次模型动作前重授权固定 Use，并投影不具有越权能力的指导块。"""
 
-        if not step.guidance_skill_use_ids:
+        plan = self._current_plan(instance)
+        planned_use_ids = tuple(
+            dict.fromkeys(
+                use_id
+                for planned_step in plan.steps
+                for use_id in planned_step.guidance_skill_use_ids
+            )
+        )
+        if not planned_use_ids:
             return []
         actor = self.db.get(User, instance.initiator_user_id)
+        execution_uses = self.db.exec(
+            select(GeneralSkillUse).where(
+                GeneralSkillUse.tenant_id == instance.tenant_id,
+                GeneralSkillUse.execution_id == instance.id,
+                GeneralSkillUse.id.in_(planned_use_ids),
+            )
+        ).all()
+        if {use.id for use in execution_uses} != set(planned_use_ids):
+            raise DynamicTaskAgentError("GENERAL_SKILL_COUNTERMANDED")
         if actor is None or actor.tenant_id != instance.tenant_id:
             raise DynamicTaskAgentError("DYNAMIC_SKILL_ACTOR_NOT_FOUND")
         try:
-            return [
-                GeneralSkillRuntimeService(self.db)
-                .project_use_for_execution(
+            runtime = GeneralSkillRuntimeService(self.db)
+            projected_by_id = {
+                use.id: runtime.project_use_for_execution(
                     actor,
-                    use_id=use_id,
+                    use_id=use.id,
                     session_id=instance.session_id,
                     agent_id=instance.agent_id,
                     execution_id=instance.id,
                 )
-                .prompt_block()
+                for use in execution_uses
+            }
+            return [
+                projected_by_id[use_id].prompt_block()
                 for use_id in step.guidance_skill_use_ids
+                if use_id in projected_by_id
             ]
         except GeneralSkillRuntimeError as exc:
             raise DynamicTaskAgentError(exc.code) from exc
@@ -5067,10 +5133,11 @@ def _mapping_path_value(source: Mapping[str, object], path: str) -> tuple[bool, 
 
 
 def _model_lease_ttl_seconds() -> int:
-    """使单次模型外呼租约覆盖配置超时与提交余量，同时保留 fencing 上限。"""
+    """覆盖 JSON 修复与空响应重试的最坏外呼窗口，避免租约中途过期造成重复计费。"""
 
     timeout = float(getattr(get_settings(), "model_api_timeout_seconds", 600.0) or 600.0)
-    return max(30, min(900, math.ceil(timeout) + 30))
+    max_provider_attempts = 4 * 3  # JSON 初次+3 次修复，每个候选含初次+2 次空响应重试。
+    return max(30, min(14_400, math.ceil(timeout * max_provider_attempts) + 30))
 
 
 def canonical_result_checksum(result: DynamicTaskResult) -> str:

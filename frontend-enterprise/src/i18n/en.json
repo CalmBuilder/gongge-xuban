@@ -3903,6 +3903,7 @@
   "当前发布": "Currently Published",
   "导入新修订": "Import New Revision",
   "选择本轮 Skill": "Select a Skill for this turn",
+  "已选 {1} 个 Skill": "{1} Skills selected",
   "使用 Skill": "Use Skill",
   "（已静音）": " (Muted)",
   "仅手动": "Manual Only",

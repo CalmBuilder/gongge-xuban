@@ -1,3 +1,11 @@
+"""
+@Time       : 2026/08/12 19:40
+@Author     : zhanglp8181
+@File       : general_skills.py
+@CallChain  : FastAPI router → Skill governance/import/runtime services
+@Description: 提供通用 Skill 管理 API，并封闭已废弃的不安全远程导入入口。
+"""
+
 from __future__ import annotations
 
 import json
@@ -285,11 +293,31 @@ def import_general_skill(
 
 
 @router.post("/import-skillhub", response_model=GeneralSkillRead)
-def import_skillhub_skill(
+@router.post("/import-clawhub", response_model=GeneralSkillRead)
+def reject_legacy_remote_skill_import(
     request: GeneralSkillClawHubImportRequest,
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> GeneralSkillRead:
+    """拒绝旧远程直导语义，强制使用带预览、确认与固定修订的 V2 作业。"""
+
+    del db, current_user
+    raise HTTPException(
+        status_code=410,
+        detail={
+            "code": "GENERAL_SKILL_IMPORT_V2_REQUIRED",
+            "message": "远程 Skill 必须通过安全导入作业完成预览、确认和固定修订。",
+        },
+    )
+
+
+def import_skillhub_skill(
+    request: GeneralSkillClawHubImportRequest,
+    db: Session,
+    current_user: User,
+) -> GeneralSkillRead:
+    """仅供 legacy 单元解析测试复用；没有 HTTP 路由，生产入口不得调用。"""
+
     ensure_tenant(db, request.tenant_id)
     raw_files = _load_clawhub_source(request.source)
     files = _normalize_skill_files(raw_files, None)
@@ -308,12 +336,13 @@ def import_skillhub_skill(
     )
 
 
-@router.post("/import-clawhub", response_model=GeneralSkillRead)
 def import_clawhub_skill(
     request: GeneralSkillClawHubImportRequest,
-    db: Session = Depends(get_session),
-    current_user: User = Depends(get_current_user),
+    db: Session,
+    current_user: User,
 ) -> GeneralSkillRead:
+    """兼容 legacy 测试名称；该函数不再暴露为 HTTP 路由。"""
+
     return import_skillhub_skill(request, db, current_user)
 
 

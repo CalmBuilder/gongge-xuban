@@ -70,7 +70,11 @@ from app.dynamic_tasks.capability_catalog import (
     publish_tool_contract,
 )
 from app.dynamic_tasks.execution_context import build_execution_context_projection
-from app.dynamic_tasks.worker import due_dynamic_task_signals, process_dynamic_task_signal
+from app.dynamic_tasks.worker import (
+    _is_terminal_signal_error,
+    due_dynamic_task_signals,
+    process_dynamic_task_signal,
+)
 from app.security.encryption import encrypt_secret
 from app.dynamic_tasks.planning import (
     ActionKind,
@@ -1368,6 +1372,43 @@ def test_plan_budget_counts_knowledge_and_tools_as_capability_calls() -> None:
     assert accepted.budget["max_tool_calls"] == 3
 
 
+def test_plan_attaches_every_loaded_skill_cause_to_capability_steps() -> None:
+    """模型即使只在回答步骤引用 Skill，所有能力外呼仍必须携带全部固定 Use 因果。"""
+
+    draft = DynamicPlanDraft(
+        goal="读取订单并形成受 Skill 约束的答复",
+        success_criteria=(
+            SuccessCriterion(id="done", type="assertion", spec={"required": True}),
+        ),
+        steps=(
+            DynamicPlanDraftStep(
+                draft_id="read",
+                title="读取订单",
+                kind="tool.read",
+                capability_refs=("crm.order.read",),
+            ),
+            DynamicPlanDraftStep(
+                draft_id="answer",
+                title="形成答复",
+                kind="answer",
+                depends_on=("read",),
+                guidance_skill_refs=("writing",),
+            ),
+        ),
+    )
+
+    normalized = normalize_plan_draft(
+        draft,
+        max_steps=4,
+        max_tool_calls=2,
+        max_model_calls=4,
+        guidance_use_ids_by_name={"writing": ("use_a", "use_b")},
+    )
+
+    assert normalized.steps[0].guidance_skill_use_ids == ("use_a", "use_b")
+    assert normalized.steps[1].guidance_skill_use_ids == ("use_a", "use_b")
+
+
 def test_start_task_uses_preflight_catalog_and_reuses_same_active_execution() -> None:
     """验证动态入口只从已验证模型/实时目录建计划，相同请求不会产生第二个活动实例。"""
 
@@ -1640,6 +1681,20 @@ def test_verified_result_message_publication_and_terminal_state_commit_together(
             ),
         )
 
+        proposal_count_before_stale_result = len(db.exec(select(ActionProposalRecord)).all())
+        with pytest.raises(DynamicTaskAgentError, match="DYNAMIC_PLAN_REVISION_CHANGED"):
+            agent.complete_with_result_proposal(
+                execution_id=instance.id,
+                step_key="answer",
+                completed_response=response,
+                provider="openai_compatible",
+                model="model-demo",
+                model_capabilities=capabilities,
+                worker_id="worker_stale_result",
+                expected_plan_revision_id="stale-plan-revision",
+            )
+        assert len(db.exec(select(ActionProposalRecord)).all()) == proposal_count_before_stale_result
+
         message = agent.complete_with_result_proposal(
             execution_id=instance.id,
             step_key="answer",
@@ -1648,6 +1703,7 @@ def test_verified_result_message_publication_and_terminal_state_commit_together(
             model="model-demo",
             model_capabilities=capabilities,
             worker_id="worker_result",
+            expected_plan_revision_id=instance.current_plan_revision_id,
         )
 
         db.refresh(instance)
@@ -2050,18 +2106,146 @@ def test_fail_execution_settles_active_skill_use_with_stable_reason() -> None:
         assert use.invalidation_reason == "DYNAMIC_RESULT_VERIFICATION_FAILED"
 
 
+def test_fail_execution_reentry_settles_skill_use_after_child_already_failed() -> None:
+    """子流程先结束 Execution 后，统一失败收口仍必须结算遗留的 active Skill Use。"""
+
+    engine = create_engine("sqlite://", poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as db:
+        model = ModelConfig(
+            id="model_failure_reentry",
+            tenant_id="tenant_demo",
+            name="动态模型",
+            api_key_encrypted="encrypted",
+            model="model-demo",
+            capability_snapshot_json=_model_capabilities(),
+            capability_checksum=capability_checksum(_model_capabilities()),
+            preflight_status="ready",
+        )
+        db.add(model)
+        db.flush()
+        agent = DynamicTaskAgent(
+            db,
+            catalog=_StartCatalog(model, _snapshot()),
+            planner=_Planner(),
+        )
+        instance, _ = agent.start_task(
+            tenant_id="tenant_demo",
+            session_id="session_failure_reentry",
+            agent_id="agent_demo",
+            initiator_user_id="user_demo",
+            goal="生成续约风险简报",
+            success_criteria=("覆盖合同证据",),
+            model_config=model,
+        )
+        with agent.store.owned(instance, worker_id="child_failure"):
+            instance.terminal_reason_json = {"code": "DYNAMIC_CHILD_FAILED"}
+            agent.store.fail_instance(
+                instance,
+                context_patch={"failure_code": "DYNAMIC_CHILD_FAILED"},
+            )
+        use = GeneralSkillUse(
+            tenant_id="tenant_demo",
+            session_id=instance.session_id,
+            turn_id="turn_failure_reentry",
+            execution_id=instance.id,
+            agent_id="agent_demo",
+            user_id="user_demo",
+            skill_id="skill_demo",
+            revision_id="revision_demo",
+            content_checksum="d" * 64,
+            selection_mode="forced",
+            status="active",
+            idempotency_key="failure-reentry-use",
+        )
+        db.add(use)
+        db.commit()
+
+        agent.fail_execution(
+            execution_id=instance.id,
+            worker_id="failure_reentry_settler",
+            error_code="DYNAMIC_CHILD_FAILED",
+        )
+
+        db.refresh(use)
+        assert use.status == "failed"
+        assert use.invalidation_reason == "DYNAMIC_CHILD_FAILED"
+
+
 def test_model_lease_covers_provider_timeout_with_bounded_commit_margin(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """慢模型租约覆盖配置超时与提交余量，同时不允许无限占有 Execution。"""
+    """慢模型租约覆盖 JSON 修复和空响应重试的最坏窗口，同时保持有界。"""
 
     settings = get_settings()
     monkeypatch.setattr(settings, "model_api_timeout_seconds", 600.0)
-    assert _model_lease_ttl_seconds() == 630
+    assert _model_lease_ttl_seconds() == 7230
     monkeypatch.setattr(settings, "model_api_timeout_seconds", 15.2)
-    assert _model_lease_ttl_seconds() == 46
+    assert _model_lease_ttl_seconds() == 213
     monkeypatch.setattr(settings, "model_api_timeout_seconds", 3600.0)
-    assert _model_lease_ttl_seconds() == 900
+    assert _model_lease_ttl_seconds() == 14_400
+
+
+def test_signal_error_disposition_separates_deterministic_and_transient_failures() -> None:
+    """预算耗尽与 Skill 撤权必须一次终结，未知网络/供应商错误仍允许指数退避。"""
+
+    assert _is_terminal_signal_error("GENERAL_SKILL_COUNTERMANDED") is True
+    assert _is_terminal_signal_error("DYNAMIC_RESULT_REPAIR_EXHAUSTED") is True
+    assert _is_terminal_signal_error("DYNAMIC_RUNTIME_BUDGET_EXCEEDED") is True
+    assert _is_terminal_signal_error("TimeoutError") is False
+    assert _is_terminal_signal_error("LLM_PROVIDER_UNAVAILABLE") is False
+
+
+def test_claimed_signal_deterministic_failure_closes_execution_and_command() -> None:
+    """Signal 恢复遇到确定性预算错误时必须一次性死信，并同步终结 Execution 与命令。"""
+
+    engine = create_engine("sqlite://", poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as db:
+        agent, instance, model, user, _, _ = _steering_execution(db)
+        command, _ = ExecutionControlService(db).issue_command(
+            instance,
+            command_id="steer_terminal_budget",
+            command_type="steer",
+            actor_user_id=user.id,
+            expected_execution_revision=instance.revision,
+            payload={"instruction": "继续处理，但不得突破预算"},
+        )
+        db.commit()
+        signal = db.exec(
+            select(ExecutionSignal).where(ExecutionSignal.causation_id == command.id)
+        ).one()
+
+        def fail_after_claim(**kwargs):
+            """模拟恢复函数已经持久认领 signal，随后发现确定性运行预算耗尽。"""
+
+            worker_id = str(kwargs["worker_id"])
+            ExecutionControlService(db).claim_signal(
+                signal,
+                worker_id=worker_id,
+                ttl_seconds=300,
+            )
+            db.commit()
+            raise DynamicTaskAgentError("DYNAMIC_RUNTIME_BUDGET_EXCEEDED")
+
+        agent.resume_steer_signal = fail_after_claim
+
+        outcome = process_dynamic_task_signal(
+            db,
+            signal,
+            agent_factory=lambda _db: agent,
+        )
+
+        db.refresh(instance)
+        db.refresh(signal)
+        db.refresh(command)
+        assert outcome is None
+        assert signal.status == "dead_letter"
+        assert signal.last_error_json == {"code": "DYNAMIC_RUNTIME_BUDGET_EXCEEDED"}
+        assert command.status == "rejected"
+        assert command.reason_code == "DYNAMIC_RUNTIME_BUDGET_EXCEEDED"
+        assert instance.status == "failed"
+        assert instance.terminal_reason_json == {"code": "DYNAMIC_RUNTIME_BUDGET_EXCEEDED"}
 
 
 def test_persistent_model_and_token_budgets_block_before_unbounded_followup_calls() -> None:

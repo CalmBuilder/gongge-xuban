@@ -12,6 +12,9 @@ import inspect
 from io import BytesIO
 from zipfile import ZipFile
 
+import pytest
+from fastapi import HTTPException
+
 from app.api import general_skills
 from app.dynamic_tasks.capability_catalog import (
     CapabilitySnapshot,
@@ -211,6 +214,28 @@ def test_legacy_downloader_opens_loopback_without_address_gate(monkeypatch) -> N
 
     assert general_skills._download_url("http://127.0.0.1/internal") == (b"ok", "text/plain")
     assert opened == ["http://127.0.0.1/internal"]
+
+
+def test_legacy_remote_import_endpoint_rejects_before_network_access(monkeypatch) -> None:
+    """旧 HTTP 入口必须在任何 DNS/下载前返回 410，不能绕过 V2 安全作业。"""
+
+    monkeypatch.setattr(
+        general_skills,
+        "_load_clawhub_source",
+        lambda _source: (_ for _ in ()).throw(AssertionError("network must not be reached")),
+    )
+    with pytest.raises(HTTPException) as raised:
+        general_skills.reject_legacy_remote_skill_import(
+            GeneralSkillClawHubImportRequest(
+                tenant_id="tenant_demo",
+                source="http://169.254.169.254/latest/meta-data",
+            ),
+            db=object(),
+            current_user=object(),
+        )
+
+    assert raised.value.status_code == 410
+    assert raised.value.detail["code"] == "GENERAL_SKILL_IMPORT_V2_REQUIRED"
 
 
 def test_legacy_dynamic_planner_filters_general_skill() -> None:
