@@ -18,7 +18,7 @@ from typing import Literal
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import func
 from sqlmodel import Session, select
 
@@ -28,6 +28,7 @@ from app.db.models import (
     AgentResourceBinding,
     ExecutionArtifact,
     GeneralSkill,
+    GeneralSkillImportJob,
     GeneralSkillProposal,
     GeneralSkillRevision,
     SopInstance,
@@ -40,6 +41,12 @@ from app.db.models import (
 from app.dynamic_tasks.artifacts import ArtifactAccessDenied, ArtifactService
 from app.general_skills.eligibility import GeneralSkillBindingMetadata
 from app.general_skills.governance import bump_general_skill_authorization_revision
+from app.general_skills.import_schema import GeneralSkillImportConfirm, GeneralSkillImportJobCreate
+from app.general_skills.import_service import (
+    GeneralSkillImportError,
+    GeneralSkillImportService,
+    import_job_read,
+)
 from app.general_skills.lifecycle import RevisionStatus, transition_revision
 from app.general_skills.object_store import FileSystemSkillObjectStore
 from app.general_skills.package_security import (
@@ -48,10 +55,17 @@ from app.general_skills.package_security import (
     normalize_zip_package,
 )
 from app.config import get_settings
+from app.general_skills.remote_source import RemoteFetcher, SecureHttpsFetcher
 
 
 SKILL_PROPOSAL_TOOL_NAME = "platform.general_skill.propose"
 _SLUG_INVALID = re.compile(r"[^a-z0-9]+")
+
+
+def get_agent_proposal_remote_fetcher() -> RemoteFetcher:
+    """构造 Agent 远程提案使用的安全下载器，并为隔离全栈测试保留 provider seam。"""
+
+    return SecureHttpsFetcher()
 
 
 class GeneralSkillProposalError(RuntimeError):
@@ -91,19 +105,25 @@ class ProposedSkillFile(BaseModel):
 class GeneralSkillProposalArguments(BaseModel):
     """校验模型可提出但无权自行发布的 Skill 完整候选。"""
 
-    name: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
-    description: str = Field(min_length=1, max_length=500)
-    instructions: str = Field(min_length=1, max_length=48_000)
+    proposal_kind: Literal["authored", "remote_import"] = "authored"
+    name: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
+    description: str | None = Field(default=None, max_length=500)
+    instructions: str | None = Field(default=None, max_length=48_000)
     requested_tools: list[str] = Field(default_factory=list, max_length=32)
     files: list[ProposedSkillFile] = Field(default_factory=list, max_length=20)
     target_skill_id: str | None = Field(default=None, max_length=128)
+    source_url: str | None = Field(default=None, max_length=2048)
+    revision: str | None = Field(default=None, pattern=r"^[a-fA-F0-9]{40}$")
+    source_subpath: str | None = Field(default=None, max_length=512)
     model_config = ConfigDict(extra="forbid")
 
     @field_validator("description", "instructions")
     @classmethod
-    def reject_blank_text(cls, value: str) -> str:
+    def reject_blank_text(cls, value: str | None) -> str | None:
         """去除外层空白并拒绝仅包含空白的候选文本。"""
 
+        if value is None:
+            return None
         normalized = value.strip()
         if not normalized:
             raise ValueError("proposed skill text is blank")
@@ -120,6 +140,27 @@ class GeneralSkillProposalArguments(BaseModel):
         if len(normalized) != len(set(normalized)):
             raise ValueError("duplicate requested tool")
         return normalized
+
+    @model_validator(mode="after")
+    def validate_discriminated_payload(self) -> "GeneralSkillProposalArguments":
+        """要求 authored 正文与固定 GitHub remote_import 来源严格互斥。"""
+
+        authored = (self.name, self.description, self.instructions)
+        remote = (self.source_url, self.revision, self.source_subpath)
+        if self.proposal_kind == "authored":
+            if any(value is None for value in authored) or any(value is not None for value in remote):
+                raise ValueError("invalid authored proposal payload")
+            return self
+        if (
+            any(value is not None for value in authored)
+            or not all(remote)
+            or self.requested_tools
+            or self.files
+            or self.target_skill_id
+            or self.source_url != "https://github.com/mattpocock/skills"
+        ):
+            raise ValueError("invalid remote import proposal payload")
+        return self
 
 
 class GeneralSkillProposalService:
@@ -148,6 +189,7 @@ class GeneralSkillProposalService:
         operation: SopOperation,
         arguments: dict[str, object],
         reviewer_user_ids: list[str],
+        remote_fetcher: RemoteFetcher | None = None,
     ) -> GeneralSkillProposal:
         """在审批前生成不可见 reviewing revision 和包含完整 diff/来源/权限的 Artifact。"""
 
@@ -165,6 +207,17 @@ class GeneralSkillProposalService:
             raise GeneralSkillProposalError(
                 "GENERAL_SKILL_PROPOSAL_INVALID", "proposal arguments are invalid"
             ) from exc
+        if request.proposal_kind == "remote_import":
+            return self._stage_remote_import(
+                instance=instance,
+                step=step,
+                operation=operation,
+                request=request,
+                arguments=arguments,
+                reviewer_user_ids=reviewer_user_ids,
+                actor=actor,
+                fetcher=remote_fetcher or get_agent_proposal_remote_fetcher(),
+            )
         visible_tools = {
             row.name
             for row in visible_tool_rows(
@@ -177,7 +230,7 @@ class GeneralSkillProposalService:
             )
         attachments = self._resolve_attachments(instance, actor, request.files)
         markdown = self._skill_markdown(request)
-        candidate = self._normalize_candidate(request.name, markdown, attachments)
+        candidate = self._normalize_candidate(str(request.name), markdown, attachments)
         target, base_revision = self._target(instance, actor, request.target_skill_id)
         if base_revision is not None and base_revision.content_checksum == candidate.content_checksum:
             raise GeneralSkillProposalError(
@@ -185,9 +238,9 @@ class GeneralSkillProposalService:
             )
         skill = target or GeneralSkill(
             tenant_id=instance.tenant_id,
-            slug=self._unique_slug(instance.tenant_id, request.name),
-            name=request.name,
-            description=request.description,
+            slug=self._unique_slug(instance.tenant_id, str(request.name)),
+            name=str(request.name),
+            description=str(request.description),
             skill_markdown=markdown,
             skill_files_json=[],
             metadata_json={
@@ -199,7 +252,7 @@ class GeneralSkillProposalService:
             runtime_config_json={},
             usage_mode="planning_guidance",
             owner_user_id=actor.id,
-            visibility_scope="agent_private",
+            visibility_scope="user_private",
         )
         self.db.add(skill)
         self.db.flush()
@@ -273,6 +326,7 @@ class GeneralSkillProposalService:
                 agent_id=instance.agent_id,
                 initiator_user_id=actor.id,
                 operation_id=operation.id,
+                proposal_kind="authored",
                 skill_id=skill.id,
                 revision_id=revision.id,
                 review_artifact_id=artifact.id,
@@ -306,6 +360,86 @@ class GeneralSkillProposalService:
         proposal.row_version += 1
         proposal.updated_at = utc_now()
         self.db.add(proposal)
+
+    def _stage_remote_import(
+        self,
+        *,
+        instance: SopInstance,
+        step: SopNodeExecution,
+        operation: SopOperation,
+        request: GeneralSkillProposalArguments,
+        arguments: dict[str, object],
+        reviewer_user_ids: list[str],
+        actor: User,
+        fetcher: RemoteFetcher,
+    ) -> GeneralSkillProposal:
+        """通过正式 ImportJob 暂存固定 GitHub 来源，审核面只保存脱敏摘要。"""
+
+        assert request.source_url and request.revision and request.source_subpath
+        imports = GeneralSkillImportService(self.db, self.object_store)
+        try:
+            preview = imports.create_job(
+                GeneralSkillImportJobCreate(
+                    tenant_id=instance.tenant_id,
+                    target_agent_id=instance.agent_id,
+                    source_kind="github",
+                    source_url=request.source_url,
+                    revision=request.revision,
+                    source_subpath=request.source_subpath,
+                ),
+                idempotency_key=f"agent-proposal-{operation.id}"[:128],
+                current_user=actor,
+                fetcher=fetcher,
+            )
+        except GeneralSkillImportError as exc:
+            raise GeneralSkillProposalError(exc.error_code, "remote proposal import failed") from exc
+        if preview.status != "awaiting_approval" or not preview.preview_checksum:
+            raise GeneralSkillProposalError(
+                preview.error_code or "GENERAL_SKILL_PROPOSAL_IMPORT_FAILED",
+                "remote proposal preview is unavailable",
+            )
+        candidate_ids = [item.candidate_id for item in preview.candidates]
+        if len(candidate_ids) != 1:
+            self._cancel_remote_job(imports, preview.id, preview.row_version, actor)
+            raise GeneralSkillProposalError(
+                "GENERAL_SKILL_PROPOSAL_IMPORT_CANDIDATE_INVALID",
+                "remote proposal must resolve to one candidate",
+            )
+        summary = self._remote_review_markdown(preview, instance)
+        try:
+            artifact, _ = self.artifact_service.register(
+                instance=instance,
+                source_node=step,
+                artifact_key=f"skill_proposal_{operation.id[-20:]}",
+                filename="remote-skill-import-proposal.md",
+                mime_type="text/markdown",
+                data=summary.encode("utf-8"),
+            )
+            artifact.acl_json = {
+                "user_ids": list(dict.fromkeys([actor.id, *reviewer_user_ids])),
+                "scope": "explicit_users",
+            }
+            self.db.add(artifact)
+            proposal = GeneralSkillProposal(
+                tenant_id=instance.tenant_id,
+                execution_id=instance.id,
+                session_id=instance.session_id,
+                agent_id=instance.agent_id,
+                initiator_user_id=actor.id,
+                operation_id=operation.id,
+                proposal_kind="remote_import",
+                review_artifact_id=artifact.id,
+                import_job_id=preview.id,
+                preview_checksum=preview.preview_checksum,
+                remote_candidate_ids_json=candidate_ids,
+                proposal_checksum=self._proposal_checksum(arguments),
+            )
+            self.db.add(proposal)
+            self.db.flush()
+            return proposal
+        except Exception:
+            self._cancel_remote_job(imports, preview.id, preview.row_version, actor)
+            raise
 
     def publish_approved_operation(
         self,
@@ -345,6 +479,8 @@ class GeneralSkillProposalService:
             raise GeneralSkillProposalError(
                 "GENERAL_SKILL_PROPOSAL_APPROVAL_INVALID", "approval evidence is incomplete"
             )
+        if proposal.proposal_kind == "remote_import":
+            return self._publish_remote_import(proposal, initiator_user_id=initiator_user_id)
         skill = self.db.get(GeneralSkill, proposal.skill_id)
         revision = self.db.get(GeneralSkillRevision, proposal.revision_id)
         if skill is None or revision is None or revision.status != "reviewing":
@@ -432,6 +568,91 @@ class GeneralSkillProposalService:
         self.object_store.release_staging(revision.id)
         return self._publication_result(proposal)
 
+    def _publish_remote_import(
+        self,
+        proposal: GeneralSkillProposal,
+        *,
+        initiator_user_id: str,
+    ) -> dict[str, object]:
+        """批准后仅以提案冻结的 preview checksum 和候选集合确认正式 ImportJob。"""
+
+        actor = self.db.get(User, initiator_user_id)
+        job = self.db.get(GeneralSkillImportJob, proposal.import_job_id or "")
+        if actor is None or job is None or not proposal.preview_checksum:
+            raise GeneralSkillProposalError(
+                "GENERAL_SKILL_PROPOSAL_STATE_CONFLICT", "remote import state is unavailable"
+            )
+        current = import_job_read(job)
+        frozen_candidates = list(proposal.remote_candidate_ids_json or [])
+        current_candidates = [item.candidate_id for item in current.candidates]
+        if (
+            current.status != "awaiting_approval"
+            or current.preview_checksum != proposal.preview_checksum
+            or current_candidates != frozen_candidates
+        ):
+            raise GeneralSkillProposalError(
+                "GENERAL_SKILL_PROPOSAL_PREVIEW_CHANGED", "remote import preview changed"
+            )
+        proposal.status = "publishing"
+        proposal.row_version += 1
+        proposal.updated_at = utc_now()
+        self.db.add(proposal)
+        self.db.commit()
+        try:
+            installed = GeneralSkillImportService(self.db, self.object_store).confirm_job(
+                job.id,
+                GeneralSkillImportConfirm(
+                    preview_checksum=proposal.preview_checksum,
+                    candidate_ids=frozen_candidates,
+                    expected_row_version=current.row_version,
+                ),
+                current_user=actor,
+            )
+        except GeneralSkillImportError as exc:
+            raise GeneralSkillProposalError(exc.error_code, "remote import confirmation failed") from exc
+        if len(installed.installed_revision_ids) != 1:
+            raise GeneralSkillProposalError(
+                "GENERAL_SKILL_PROPOSAL_IMPORT_RESULT_INVALID", "remote import result is ambiguous"
+            )
+        revision = self.db.get(GeneralSkillRevision, installed.installed_revision_ids[0])
+        if revision is None:
+            raise GeneralSkillProposalError(
+                "GENERAL_SKILL_PROPOSAL_IMPORT_RESULT_INVALID", "installed revision is unavailable"
+            )
+        binding = self.db.exec(
+            select(AgentResourceBinding).where(
+                AgentResourceBinding.tenant_id == proposal.tenant_id,
+                AgentResourceBinding.agent_id == proposal.agent_id,
+                AgentResourceBinding.resource_type == "general_skill",
+                AgentResourceBinding.resource_id == revision.skill_id,
+            )
+        ).first()
+        if binding is None:
+            raise GeneralSkillProposalError(
+                "GENERAL_SKILL_PROPOSAL_IMPORT_RESULT_INVALID", "installed binding is unavailable"
+            )
+        self.db.refresh(proposal)
+        proposal.status = "published"
+        proposal.published_binding_id = binding.id
+        proposal.row_version += 1
+        proposal.updated_at = utc_now()
+        proposal.terminal_at = proposal.updated_at
+        self.db.add(proposal)
+        bump_general_skill_authorization_revision(
+            self.db,
+            proposal.tenant_id,
+            event_type="agent_remote_skill_proposal_published",
+            resource_id=binding.id,
+            payload={
+                "proposal_id": proposal.id,
+                "skill_id": revision.skill_id,
+                "revision_id": revision.id,
+                "agent_id": proposal.agent_id,
+            },
+        )
+        self.db.commit()
+        return self._publication_result(proposal)
+
     def terminate(
         self,
         *,
@@ -447,7 +668,7 @@ class GeneralSkillProposalService:
             return None
         if proposal.status in {"published", "rejected", "expired", "failed"}:
             return proposal
-        revision = self.db.get(GeneralSkillRevision, proposal.revision_id)
+        revision = self.db.get(GeneralSkillRevision, proposal.revision_id or "")
         if revision is not None and revision.status in {"draft", "reviewing"}:
             transition_revision(
                 revision,
@@ -461,12 +682,59 @@ class GeneralSkillProposalService:
         proposal.updated_at = utc_now()
         proposal.terminal_at = proposal.updated_at
         self.db.add(proposal)
-        self.object_store.release_staging(proposal.revision_id)
+        if proposal.proposal_kind == "remote_import":
+            actor = self.db.get(User, proposal.initiator_user_id)
+            job = self.db.get(GeneralSkillImportJob, proposal.import_job_id or "")
+            if actor is not None and job is not None:
+                self._cancel_remote_job(
+                    GeneralSkillImportService(self.db, self.object_store),
+                    job.id,
+                    job.row_version,
+                    actor,
+                )
+        elif proposal.revision_id:
+            self.object_store.release_staging(proposal.revision_id)
         return proposal
 
     def review_payload(self, proposal: GeneralSkillProposal) -> dict[str, object]:
         """生成 Attention 可直接展示但不含宿主路径的完整审核摘要。"""
 
+        if proposal.proposal_kind == "remote_import":
+            job = self.db.get(GeneralSkillImportJob, proposal.import_job_id or "")
+            artifact = self.db.get(ExecutionArtifact, proposal.review_artifact_id)
+            if job is None or artifact is None:
+                raise GeneralSkillProposalError(
+                    "GENERAL_SKILL_PROPOSAL_STATE_CONFLICT", "proposal review data is unavailable"
+                )
+            preview = import_job_read(job)
+            return {
+                "proposal_id": proposal.id,
+                "proposal_kind": "remote_import",
+                "review_artifact_id": artifact.id,
+                "import_job_id": job.id,
+                "source_reference_redacted": preview.source_reference_redacted,
+                "preview_checksum": proposal.preview_checksum,
+                "raw_checksum": preview.raw_checksum,
+                "normalized_checksum": preview.normalized_checksum,
+                "candidates": [
+                    {
+                        "candidate_id": item.candidate_id,
+                        "name": item.name,
+                        "description": item.description,
+                        "content_checksum": item.content_checksum,
+                        "manifest_checksum": item.manifest_checksum,
+                        "risk_findings": item.risk_findings,
+                    }
+                    for item in preview.candidates
+                ],
+                "source": {
+                    "kind": "agent_remote_import_proposal",
+                    "execution_id": proposal.execution_id,
+                    "session_id": proposal.session_id,
+                    "agent_id": proposal.agent_id,
+                    "initiator_user_id": proposal.initiator_user_id,
+                },
+            }
         revision = self.db.get(GeneralSkillRevision, proposal.revision_id)
         skill = self.db.get(GeneralSkill, proposal.skill_id)
         artifact = self.db.get(ExecutionArtifact, proposal.review_artifact_id)
@@ -644,13 +912,13 @@ class GeneralSkillProposalService:
         """生成严格 frontmatter；Agent 创建默认 user_only 且工具声明只具收窄语义。"""
 
         metadata = {
-            "name": request.name,
-            "description": request.description,
+            "name": str(request.name),
+            "description": str(request.description),
             "allowed-tools": request.requested_tools,
             "disable-model-invocation": True,
         }
         frontmatter = yaml.safe_dump(metadata, allow_unicode=True, sort_keys=False).strip()
-        return f"---\n{frontmatter}\n---\n\n{request.instructions.strip()}\n"
+        return f"---\n{frontmatter}\n---\n\n{str(request.instructions).strip()}\n"
 
     @staticmethod
     def _staged_manifest_row(candidate: SkillCandidate, resource) -> dict[str, object]:
@@ -699,6 +967,44 @@ class GeneralSkillProposalService:
             f"## 受管来源\n\n{sources}\n\n## 完整 diff\n\n```diff\n{diff}\n```\n"
         )
 
+    @staticmethod
+    def _remote_review_markdown(preview, instance: SopInstance) -> str:
+        """生成远程提案审核摘要；正文留在 ImportJob 暂存对象，不复制到 Attention。"""
+
+        candidates = "\n".join(
+            (
+                f"- `{item.name}` / candidate `{item.candidate_id}` / content "
+                f"`{item.content_checksum}` / manifest `{item.manifest_checksum}` / risks "
+                f"`{', '.join(item.risk_findings) or 'none'}`"
+            )
+            for item in preview.candidates
+        )
+        return (
+            "# Agent 远程 Skill 导入提案\n\n"
+            f"- Execution：`{instance.id}`\n- Session：`{instance.session_id}`\n"
+            f"- Agent：`{instance.agent_id}`\n"
+            f"- 固定来源：`{preview.source_reference_redacted}`\n"
+            f"- Raw checksum：`{preview.raw_checksum}`\n"
+            f"- Normalized checksum：`{preview.normalized_checksum}`\n"
+            f"- Preview checksum：`{preview.preview_checksum}`\n\n"
+            f"## 候选摘要\n\n{candidates}\n\n"
+            "批准前不会创建 Skill、Revision 或绑定；批准只消费以上冻结预览。\n"
+        )
+
+    @staticmethod
+    def _cancel_remote_job(
+        imports: GeneralSkillImportService,
+        job_id: str,
+        row_version: int,
+        actor: User,
+    ) -> None:
+        """尽力取消未确认 ImportJob 并释放配额；终态冲突保持原诊断。"""
+
+        try:
+            imports.cancel_job(job_id, expected_row_version=row_version, current_user=actor)
+        except GeneralSkillImportError:
+            return
+
     def _unique_slug(self, tenant_id: str, name: str) -> str:
         """生成租户内新根唯一 slug；同名提案绝不隐式覆盖。"""
 
@@ -739,14 +1045,22 @@ class GeneralSkillProposalService:
             ).encode("utf-8")
         ).hexdigest()
 
-    @staticmethod
-    def _publication_result(proposal: GeneralSkillProposal) -> dict[str, object]:
+    def _publication_result(self, proposal: GeneralSkillProposal) -> dict[str, object]:
         """返回不含正文、路径和凭据的稳定发布回执。"""
 
+        skill_id = proposal.skill_id
+        revision_id = proposal.revision_id
+        if proposal.proposal_kind == "remote_import":
+            job = self.db.get(GeneralSkillImportJob, proposal.import_job_id or "")
+            installed = list(job.installed_revision_ids_json or []) if job else []
+            if installed:
+                revision = self.db.get(GeneralSkillRevision, installed[0])
+                revision_id = revision.id if revision else installed[0]
+                skill_id = revision.skill_id if revision else None
         return {
             "proposal_id": proposal.id,
-            "skill_id": proposal.skill_id,
-            "revision_id": proposal.revision_id,
+            "skill_id": skill_id,
+            "revision_id": revision_id,
             "binding_id": proposal.published_binding_id,
             "status": proposal.status,
             "agent_id": proposal.agent_id,

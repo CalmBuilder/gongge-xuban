@@ -3,6 +3,9 @@ import { useEffect, useRef, useState } from 'react';
 
 import EmployeeAvatar from '@/components/EmployeeAvatar';
 import ProductIcon from '@/components/ProductIcon';
+import { notify } from '@/components/ui/app-toast';
+import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
+import { Button as UIButton } from '@/components/ui/button';
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -47,6 +50,7 @@ import {
 } from '../chatPageStyles';
 import { attachmentTypeLabel, modelDetailText, modelDisplayName } from '../chatHelpers';
 import type { UseChatSession } from '../useChatSession';
+import type { GeneralSkillInstallIntentRead } from '../chatTypes';
 
 export default function Composer({ chat }: { chat: UseChatSession }) {
   const { t } = useI18n();
@@ -60,9 +64,16 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
     composerIntent,
     setComposerIntent,
     sessionGeneralSkills,
+    generalSkillCatalogLoading,
+    generalSkillCatalogError,
     selectedGeneralSkillId,
     selectSessionGeneralSkill,
-    muteSelectedGeneralSkill,
+    clearSelectedGeneralSkill,
+    generalSkillInstallOpen,
+    setGeneralSkillInstallOpen,
+    generalSkillInstallIntents,
+    createGeneralSkillInstallIntent,
+    resolveGeneralSkillInstallIntent,
     readyComposerAttachments,
     uploadingComposerAttachment,
     currentSessionRunning,
@@ -324,6 +335,10 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
                     <ProductIcon name="clock" size={16} />
                     <span>定时任务</span>
                   </DropdownMenuItem>
+                  <DropdownMenuItem className={CHAT_MENU_ITEM_CLASS} onSelect={() => setGeneralSkillInstallOpen(true)}>
+                    <ProductIcon name="spark" size={16} />
+                    <span>安装 Skill</span>
+                  </DropdownMenuItem>
                 </DropdownMenuContent>
               </DropdownMenu>
               {composerIntent === 'scheduled_task' && (
@@ -358,7 +373,7 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
                   <span>定时任务</span>
                 </button>
               )}
-              {sessionGeneralSkills.length > 0 && (
+              {(
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
                     <button
@@ -367,7 +382,7 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
                       aria-label={t('选择本轮 Skill')}
                     >
                       <ProductIcon name="spark" size={14} />
-                      <span>{selectedGeneralSkill ? selectedGeneralSkill.name : t('使用 Skill')}</span>
+                      <span>{selectedGeneralSkill ? selectedGeneralSkill.name : sessionGeneralSkills.length ? t('使用 Skill') : t('添加 Skill')}</span>
                     </button>
                   </DropdownMenuTrigger>
                   <DropdownMenuContent
@@ -375,6 +390,11 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
                     side="top"
                     className={cn(CHAT_MENU_CONTENT_CLASS, 'max-h-[320px] min-w-[260px] overflow-y-auto')}
                   >
+                    {generalSkillCatalogLoading && <DropdownMenuItem disabled>正在加载 Skill…</DropdownMenuItem>}
+                    {generalSkillCatalogError && <DropdownMenuItem disabled>Skill 加载失败，请刷新重试</DropdownMenuItem>}
+                    {!generalSkillCatalogLoading && !generalSkillCatalogError && !sessionGeneralSkills.length && (
+                      <DropdownMenuItem disabled>当前分身还没有 Skill</DropdownMenuItem>
+                    )}
                     {sessionGeneralSkills.map((item) => (
                       <DropdownMenuItem
                         key={item.skill_id}
@@ -392,6 +412,10 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
                         {selectedGeneralSkillId === item.skill_id && <ProductIcon name="check" size={15} />}
                       </DropdownMenuItem>
                     ))}
+                    <DropdownMenuItem className={CHAT_MENU_ITEM_CLASS} onSelect={() => setGeneralSkillInstallOpen(true)}>
+                      <ProductIcon name="plus" size={15} />
+                      <span>安装 Skill 到当前分身</span>
+                    </DropdownMenuItem>
                   </DropdownMenuContent>
                 </DropdownMenu>
               )}
@@ -399,9 +423,9 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
                 <button
                   type="button"
                   className={CHAT_COMPOSER_INTENT_CHIP_CLASS}
-                  onClick={() => void muteSelectedGeneralSkill()}
-                  aria-label={t('取消并静音 Skill {1}', { 1: selectedGeneralSkill.name })}
-                  title={t('取消本轮选择并在当前会话静音')}
+                  onClick={clearSelectedGeneralSkill}
+                  aria-label={t('取消本轮 Skill {1}', { 1: selectedGeneralSkill.name })}
+                  title={t('只取消本轮选择')}
                 >
                   <ProductIcon name="close" size={10} />
                   <span>{selectedGeneralSkill.name}</span>
@@ -464,7 +488,78 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
             </div>
           </div>
         </form>
+        <GeneralSkillInstallDialog
+          open={generalSkillInstallOpen}
+          sessionId={chat.sessionId || ''}
+          intents={generalSkillInstallIntents}
+          onClose={() => setGeneralSkillInstallOpen(false)}
+          onCreate={createGeneralSkillInstallIntent}
+          onResolve={resolveGeneralSkillInstallIntent}
+        />
       </div>
     </div>
+  );
+}
+
+function GeneralSkillInstallDialog({
+  open,
+  sessionId,
+  intents,
+  onClose,
+  onCreate,
+  onResolve,
+}: {
+  open: boolean;
+  sessionId: string;
+  intents: GeneralSkillInstallIntentRead[];
+  onClose: () => void;
+  onCreate: (source: { source_url: string; revision: string; source_subpath: string }) => Promise<GeneralSkillInstallIntentRead>;
+  onResolve: (intent: GeneralSkillInstallIntentRead, command: 'confirm' | 'cancel') => Promise<void>;
+}) {
+  const [sourceUrl, setSourceUrl] = useState('https://github.com/mattpocock/skills');
+  const [revision, setRevision] = useState('84fdeffd12f2ee307994d1eb6feb48173b6e0502');
+  const [subpath, setSubpath] = useState('skills/engineering/diagnosing-bugs');
+  const [loading, setLoading] = useState(false);
+  const activeIntent = [...intents].reverse().find((item) => item.status === 'awaiting_owner_confirmation') || intents[intents.length - 1];
+
+  async function createIntent() {
+    if (!sessionId) {
+      notify.warning('请先发送一条消息创建正式会话，再安装 Skill');
+      return;
+    }
+    setLoading(true);
+    try {
+      await onCreate({ source_url: sourceUrl.trim(), revision: revision.trim(), source_subpath: subpath.trim() });
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '创建安装预览失败');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={(next) => !next && !loading && onClose()}>
+      <DialogContent aria-describedby={undefined} className="max-h-[88vh] overflow-y-auto sm:max-w-[680px]">
+        <DialogTitle>安装 Skill 到当前分身</DialogTitle>
+        {!activeIntent ? (
+          <div className="grid gap-3">
+            <p className="text-[12px] leading-5 text-[#757f9c]">只接受固定 40 位 commit 和明确目录；系统先生成安全预览，不会直接执行包内脚本。</p>
+            <label className="grid gap-1 text-[12px]">GitHub 仓库地址<input aria-label="安装 Skill GitHub 仓库地址" value={sourceUrl} onChange={(event) => setSourceUrl(event.target.value)} className="h-10 rounded-lg border px-3" /></label>
+            <label className="grid gap-1 text-[12px]">完整 commit SHA<input aria-label="安装 Skill 完整 commit SHA" value={revision} onChange={(event) => setRevision(event.target.value)} className="h-10 rounded-lg border px-3 font-mono" /></label>
+            <label className="grid gap-1 text-[12px]">仓库内 Skill 目录<input aria-label="安装 Skill 仓库目录" value={subpath} onChange={(event) => setSubpath(event.target.value)} className="h-10 rounded-lg border px-3 font-mono" /></label>
+            <div className="flex justify-end gap-2"><UIButton variant="outline" onClick={onClose}>取消</UIButton><UIButton disabled={loading} onClick={() => void createIntent()}>生成安装预览</UIButton></div>
+          </div>
+        ) : (
+          <section aria-label="Skill 安装确认卡" className="grid gap-4 rounded-xl border border-[#cbd8ff] bg-[#f8faff] p-4">
+            <div><strong>{activeIntent.candidates.map((item) => item.name).join('、') || 'Skill 安装'}</strong><p className="mt-1 break-all font-mono text-[11px] text-[#596078]">{activeIntent.source_reference_redacted}</p></div>
+            <dl className="grid grid-cols-2 gap-2 text-[12px]"><div><dt>固定 commit</dt><dd className="font-mono">{activeIntent.source_revision?.slice(0, 12)}…</dd></div><div><dt>包 checksum</dt><dd className="font-mono">{activeIntent.raw_checksum?.slice(0, 12)}…</dd></div></dl>
+            {activeIntent.candidates.map((candidate) => <div key={candidate.candidate_id} className="rounded-lg bg-white p-3"><div>{candidate.description}</div><div className="mt-2 text-[11px] text-[#b45b00]">风险：{candidate.risk_findings.join('、') || '未发现'}</div><div className="mt-1 text-[11px]">文件：{candidate.resources.length} 个</div></div>)}
+            <div role="status">状态：{activeIntent.status}</div>
+            {activeIntent.status === 'awaiting_owner_confirmation' ? <div className="flex justify-end gap-2"><UIButton variant="outline" disabled={loading} onClick={() => void onResolve(activeIntent, 'cancel')}>取消安装</UIButton><UIButton disabled={loading} onClick={() => void onResolve(activeIntent, 'confirm')}>确认安装到当前分身</UIButton></div> : null}
+            {activeIntent.status === 'installed' ? <UIButton onClick={onClose}>安装完成，开始使用</UIButton> : null}
+          </section>
+        )}
+      </DialogContent>
+    </Dialog>
   );
 }

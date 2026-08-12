@@ -1833,7 +1833,7 @@ class GeneralSkillRevision(SQLModel, table=True):
 
 
 class GeneralSkillProposal(SQLModel, table=True):
-    """保存 Agent 提案、审核 Artifact 与发布结果之间的一对一持久关联。"""
+    """保存 authored 或 remote_import 提案、审核证据与安装结果的持久关联。"""
 
     __tablename__ = "general_skill_proposals"
     __table_args__ = (
@@ -1842,11 +1842,7 @@ class GeneralSkillProposal(SQLModel, table=True):
             "operation_id",
             name="uq_general_skill_proposal_operation",
         ),
-        UniqueConstraint(
-            "tenant_id",
-            "revision_id",
-            name="uq_general_skill_proposal_revision",
-        ),
+        UniqueConstraint("tenant_id", "revision_id", name="uq_general_skill_proposal_revision"),
         UniqueConstraint(
             "tenant_id",
             "review_artifact_id",
@@ -1856,6 +1852,17 @@ class GeneralSkillProposal(SQLModel, table=True):
             "status IN ('staged', 'awaiting_approval', 'publishing', 'published', "
             "'rejected', 'expired', 'failed')",
             name="ck_general_skill_proposal_status",
+        ),
+        CheckConstraint(
+            "proposal_kind IN ('authored', 'remote_import')",
+            name="ck_general_skill_proposal_kind",
+        ),
+        CheckConstraint(
+            "(proposal_kind = 'authored' AND skill_id IS NOT NULL AND revision_id IS NOT NULL "
+            "AND import_job_id IS NULL AND preview_checksum IS NULL) OR "
+            "(proposal_kind = 'remote_import' AND skill_id IS NULL AND revision_id IS NULL "
+            "AND import_job_id IS NOT NULL AND preview_checksum IS NOT NULL)",
+            name="ck_general_skill_proposal_payload",
         ),
         CheckConstraint("row_version >= 1", name="ck_general_skill_proposal_row_version"),
         Index(
@@ -1874,9 +1881,13 @@ class GeneralSkillProposal(SQLModel, table=True):
     initiator_user_id: IdentifierString = Field(index=True)
     operation_id: IdentifierString = Field(index=True)
     attention_id: OptionalIdentifierString = Field(default=None, index=True)
-    skill_id: IdentifierString = Field(index=True)
-    revision_id: IdentifierString = Field(index=True)
+    proposal_kind: LabelString = Field(default="authored", index=True)
+    skill_id: OptionalIdentifierString = Field(default=None, index=True)
+    revision_id: OptionalIdentifierString = Field(default=None, index=True)
     review_artifact_id: IdentifierString = Field(index=True)
+    import_job_id: OptionalIdentifierString = Field(default=None, index=True)
+    preview_checksum: OptionalVersionString = Field(default=None, index=True)
+    remote_candidate_ids_json: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     target_skill_id: OptionalIdentifierString = Field(default=None, index=True)
     base_revision_id: OptionalIdentifierString = Field(default=None, index=True)
     base_content_checksum: OptionalVersionString = None
@@ -1888,6 +1899,187 @@ class GeneralSkillProposal(SQLModel, table=True):
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
     terminal_at: datetime | None = None
+
+
+class ResourcePublicationRequest(SQLModel, table=True):
+    """保存 Skill/Agent 共用的申请状态头，冻结内容由类型化快照承载。"""
+
+    __tablename__ = "resource_publication_requests"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "resource_type",
+            "resource_id",
+            "active_slot_key",
+            name="uq_resource_publication_active_slot",
+        ),
+        UniqueConstraint(
+            "tenant_id", "snapshot_kind", "snapshot_id", name="uq_resource_publication_snapshot"
+        ),
+        CheckConstraint(
+            "resource_type IN ('general_skill', 'agent')",
+            name="ck_resource_publication_resource_type",
+        ),
+        CheckConstraint(
+            "snapshot_kind IN ('general_skill', 'agent') AND snapshot_kind = resource_type",
+            name="ck_resource_publication_snapshot_kind",
+        ),
+        CheckConstraint(
+            "status IN ('draft', 'submitted', 'approved', 'rejected', 'expired', "
+            "'withdrawn', 'stale')",
+            name="ck_resource_publication_status",
+        ),
+        CheckConstraint("row_version >= 1", name="ck_resource_publication_row_version"),
+        Index(
+            "ix_resource_publication_owner_status",
+            "tenant_id",
+            "owner_user_id",
+            "status",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("pubreq"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    owner_user_id: IdentifierString = Field(index=True)
+    resource_type: LabelString = Field(index=True)
+    resource_id: IdentifierString = Field(index=True)
+    snapshot_kind: LabelString = Field(index=True)
+    snapshot_id: IdentifierString = Field(index=True)
+    snapshot_checksum: VersionString = Field(index=True)
+    active_slot_key: OptionalLabelString = Field(default="active", index=True)
+    attention_id: OptionalIdentifierString = Field(default=None, index=True)
+    submitted_by_user_id: OptionalIdentifierString = Field(default=None, index=True)
+    reviewed_by_user_id: OptionalIdentifierString = Field(default=None, index=True)
+    status: LabelString = Field(default="draft", index=True)
+    row_version: int = Field(default=1, ge=1)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+    terminal_at: datetime | None = None
+
+
+class GeneralSkillPublicationRevision(SQLModel, table=True):
+    """冻结一次组织审核看到的 Skill revision、来源和安全结论。"""
+
+    __tablename__ = "general_skill_publication_revisions"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "request_id", name="uq_general_skill_publication_request"),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("gspubrev"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    request_id: IdentifierString = Field(index=True)
+    skill_id: IdentifierString = Field(index=True)
+    approved_revision_id: IdentifierString = Field(index=True)
+    content_checksum: VersionString = Field(index=True)
+    manifest_checksum: VersionString = Field(index=True)
+    snapshot_checksum: VersionString = Field(index=True)
+    source_snapshot_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    license_snapshot_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    capability_snapshot_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    risk_snapshot_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class AgentPublicationRevision(SQLModel, table=True):
+    """冻结整 Agent 的 persona 与可传播组件，明确排除私人运行状态。"""
+
+    __tablename__ = "agent_publication_revisions"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "request_id", name="uq_agent_publication_request"),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("agentpubrev"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    request_id: IdentifierString = Field(index=True)
+    agent_id: IdentifierString = Field(index=True)
+    persona_checksum: VersionString = Field(index=True)
+    snapshot_checksum: VersionString = Field(index=True)
+    persona_snapshot_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    component_snapshot_json: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
+    governance_snapshot_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class PublicationRelease(SQLModel, table=True):
+    """保存批准申请产生的可发现发布物，并与不可变批准证据分离。"""
+
+    __tablename__ = "publication_releases"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "approved_request_id", name="uq_publication_release_request"),
+        UniqueConstraint(
+            "tenant_id",
+            "resource_type",
+            "resource_id",
+            "active_slot_key",
+            name="uq_publication_release_active_slot",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "terminal_command_id",
+            name="uq_publication_release_terminal_command",
+        ),
+        CheckConstraint(
+            "resource_type IN ('general_skill', 'agent')",
+            name="ck_publication_release_resource_type",
+        ),
+        CheckConstraint(
+            "snapshot_kind IN ('general_skill', 'agent') AND snapshot_kind = resource_type",
+            name="ck_publication_release_snapshot_kind",
+        ),
+        CheckConstraint(
+            "status IN ('active', 'unpublished', 'security_revoked')",
+            name="ck_publication_release_status",
+        ),
+        CheckConstraint("row_version >= 1", name="ck_publication_release_row_version"),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("pubrel"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    approved_request_id: IdentifierString = Field(index=True)
+    resource_type: LabelString = Field(index=True)
+    resource_id: IdentifierString = Field(index=True)
+    snapshot_kind: LabelString = Field(index=True)
+    snapshot_id: IdentifierString = Field(index=True)
+    snapshot_checksum: VersionString = Field(index=True)
+    active_slot_key: OptionalLabelString = Field(default="active", index=True)
+    status: LabelString = Field(default="active", index=True)
+    row_version: int = Field(default=1, ge=1)
+    terminal_command_id: OptionalIdentifierString = Field(default=None, index=True)
+    terminal_by_user_id: OptionalIdentifierString = Field(default=None, index=True)
+    terminal_reason: OptionalMediumTextString = None
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+    terminal_at: datetime | None = None
+
+
+class PublicationAdoptionCommand(SQLModel, table=True):
+    """保存 Release 主动采用命令，保证重试返回原结果且同键不能改写请求。"""
+
+    __tablename__ = "publication_adoption_commands"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "actor_user_id",
+            "idempotency_key",
+            name="uq_publication_adoption_idempotency",
+        ),
+        CheckConstraint(
+            "resource_type IN ('general_skill', 'agent')",
+            name="ck_publication_adoption_resource_type",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("pubadopt"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    actor_user_id: IdentifierString = Field(index=True)
+    idempotency_key: VersionString = Field(index=True)
+    request_checksum: VersionString = Field(index=True)
+    release_id: IdentifierString = Field(index=True)
+    resource_type: LabelString = Field(index=True)
+    target_agent_id: OptionalIdentifierString = Field(default=None, index=True)
+    binding_id: OptionalIdentifierString = Field(default=None, index=True)
+    adopted_agent_id: OptionalIdentifierString = Field(default=None, index=True)
+    created_at: datetime = Field(default_factory=utc_now)
 
 
 class SessionGeneralSkillOverride(SQLModel, table=True):
@@ -2218,6 +2410,85 @@ class GeneralSkillAuthorizationEvent(SQLModel, table=True):
     event_checksum: VersionString = Field(index=True)
     payload_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     created_at: datetime = Field(default_factory=utc_now)
+
+
+class GeneralSkillBindingBatchCommand(SQLModel, table=True):
+    """保存本人多 Agent 原子装配命令的幂等结果，不承载可变 Skill 正文。"""
+
+    __tablename__ = "general_skill_binding_batch_commands"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "owner_user_id",
+            "idempotency_key",
+            name="uq_general_skill_binding_batch_idempotency",
+        ),
+        CheckConstraint(
+            "status IN ('committed', 'failed')",
+            name="ck_general_skill_binding_batch_status",
+        ),
+        Index(
+            "ix_general_skill_binding_batch_owner_created",
+            "tenant_id",
+            "owner_user_id",
+            "created_at",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("gsbindbatch"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    owner_user_id: IdentifierString = Field(index=True)
+    idempotency_key: VersionString
+    skill_id: IdentifierString = Field(index=True)
+    revision_id: IdentifierString = Field(index=True)
+    preview_checksum: VersionString
+    request_checksum: VersionString
+    status: LabelString = Field(default="committed", index=True)
+    result_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class GeneralSkillInstallIntent(SQLModel, table=True):
+    """保存对话中由用户明确发起的 Skill 安装卡及其唯一导入作业。"""
+
+    __tablename__ = "general_skill_install_intents"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "import_job_id", name="uq_general_skill_install_intent_job"),
+        UniqueConstraint(
+            "tenant_id",
+            "owner_user_id",
+            "idempotency_key",
+            name="uq_general_skill_install_intent_idempotency",
+        ),
+        CheckConstraint(
+            "status IN ('preparing', 'awaiting_owner_confirmation', 'installing', "
+            "'installed', 'failed', 'cancelled', 'expired', 'stale')",
+            name="ck_general_skill_install_intent_status",
+        ),
+        CheckConstraint("row_version >= 1", name="ck_general_skill_install_intent_row_version"),
+        Index(
+            "ix_general_skill_install_intent_session_created",
+            "tenant_id",
+            "session_id",
+            "created_at",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("gsinstall"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    session_id: IdentifierString = Field(index=True)
+    agent_id: IdentifierString = Field(index=True)
+    owner_user_id: IdentifierString = Field(index=True)
+    import_job_id: IdentifierString = Field(index=True)
+    idempotency_key: VersionString
+    source_kind: LabelString = Field(index=True)
+    status: LabelString = Field(default="preparing", index=True)
+    installed_revision_ids_json: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    error_code: OptionalIdentifierString = Field(default=None, index=True)
+    row_version: int = Field(default=1, ge=1)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+    terminal_at: datetime | None = None
 
 
 class KnowledgeBase(SQLModel, table=True):

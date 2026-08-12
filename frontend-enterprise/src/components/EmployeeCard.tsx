@@ -57,6 +57,7 @@ export type EmployeeCardProps = {
   onOpen: () => void;
   onStatus: (status: 'active' | 'archived') => void;
   onGallery: (published: boolean) => void;
+  onPublication?: () => void;
   onDelete: () => void;
   onAvatar: () => void;
   onEdit: () => void;
@@ -83,6 +84,7 @@ export default function EmployeeCard({
   onOpen,
   onStatus,
   onGallery,
+  onPublication,
   onDelete,
   onAvatar,
   onEdit,
@@ -223,6 +225,15 @@ export default function EmployeeCard({
             className="flex w-auto min-w-[128px] flex-col gap-[4px] rounded-[14px] border-0 bg-white p-[4px] shadow-[0px_0px_8px_rgba(0,0,0,0.1)] ring-0 [--accent:#F6F6F6] [--accent-foreground:#18181A]"
             onCloseAutoFocus={(event) => event.preventDefault()}
           >
+            <DropdownMenuItem
+              className={MENU_ITEM_CLASS}
+              disabled={!canManage || busy || !onPublication}
+              onClick={(event) => event.stopPropagation()}
+              onSelect={() => onPublication?.()}
+            >
+              <IconPlatform className="size-[16px]" />
+              提交组织审核
+            </DropdownMenuItem>
             <DropdownMenuItem
               className={MENU_ITEM_CLASS}
               disabled={!online || busy || !canChat}

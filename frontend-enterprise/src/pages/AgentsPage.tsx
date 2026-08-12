@@ -1,7 +1,7 @@
 import { notify } from '@/components/ui/app-toast';
 import { cn } from '@/lib/utils';
 
-import { Clock, Star, UserCheck, Users, UserX } from 'lucide-react';
+import { Bot, Clock, ShieldCheck, Star, UserCheck, Users, UserX } from 'lucide-react';
 
 import IconPlus from '../assets/icons/plus.svg?react';
 import IconSearch from '../assets/icons/search.svg?react';
@@ -23,6 +23,7 @@ import ExpertBulkActionBar from '../components/ExpertBulkActionBar';
 import ExpertClassificationDialog from '../components/ExpertClassificationDialog';
 import ExpertFilterBar from '../components/ExpertFilterBar';
 import SideNavPanel, { type SideNavPanelItem } from '../components/SideNavPanel';
+import { Button, Dialog, DialogContent, DialogTitle } from '@/components/ui';
 import {
   canManageEmployeeAgent,
   canSelectCurrentEmployeeAgent,
@@ -40,6 +41,16 @@ const EMPTY_VIEW_COUNTS: AgentManagementPageRead['view_counts'] = {
   all: 0, online: 0, offline: 0, pending: 0, expert: 0, governance: 0,
 };
 type EmployeeFilter = 'all' | 'online' | 'offline' | 'pending' | 'expert' | 'governance';
+type AgentPublicationRelease = {
+  id: string;
+  resource_type: 'agent';
+  resource_id: string;
+  snapshot_id: string;
+  snapshot_checksum: string;
+  name: string;
+  description: string;
+  components: Array<{ resource_type: string; resource_id: string; metadata?: Record<string, unknown> }>;
+};
 
 const EMPLOYEE_VIEWS: EmployeeFilter[] = [
   'all',
@@ -120,6 +131,9 @@ export default function AgentsPage({
   const [taxonomyUnavailable, setTaxonomyUnavailable] = useState(false);
   const [classificationTargets, setClassificationTargets] = useState<AgentProfileRead[]>([]);
   const [savingClassification, setSavingClassification] = useState(false);
+  const [publicationOpen, setPublicationOpen] = useState(false);
+  const [publicationBusy, setPublicationBusy] = useState(false);
+  const [agentReleases, setAgentReleases] = useState<AgentPublicationRelease[]>([]);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(
     () => window.localStorage.getItem(ENTERPRISE_AGENT_STORAGE_KEY),
   );
@@ -281,6 +295,52 @@ export default function AgentsPage({
       window.dispatchEvent(new Event('gongge-enterprise-agent-scope-refresh'));
     } catch (error) {
       notify.error(error instanceof Error ? error.message : '更新广场状态失败');
+    }
+  }
+
+  async function submitAgentPublication(row: AgentProfileRead) {
+    setPublicationBusy(true);
+    try {
+      await api.post('/api/enterprise/publications', {
+        resource_type: 'agent',
+        resource_id: row.id,
+        expected_resource_revision: row.profile_revision || 1,
+      });
+      notify.success('已提交整 Agent 冻结快照；另一位管理员批准后才会进入组织发布库');
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '提交整 Agent 组织审核失败');
+    } finally {
+      setPublicationBusy(false);
+    }
+  }
+
+  async function openAgentReleases() {
+    setPublicationOpen(true);
+    setPublicationBusy(true);
+    try {
+      setAgentReleases(await api.get<AgentPublicationRelease[]>(
+        '/api/enterprise/publications/releases?resource_type=agent',
+      ));
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '加载组织数字员工发布库失败');
+    } finally {
+      setPublicationBusy(false);
+    }
+  }
+
+  async function adoptAgentRelease(release: AgentPublicationRelease) {
+    setPublicationBusy(true);
+    try {
+      await api.post(`/api/enterprise/publications/releases/${encodeURIComponent(release.id)}/adopt`, {
+        idempotency_key: `agent-adopt-${crypto.randomUUID()}`,
+      });
+      notify.success(`已从冻结发布物创建「${release.name}（采用）」；私人记忆和连接凭据未复制`);
+      setPublicationOpen(false);
+      await load();
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '采用组织数字员工失败');
+    } finally {
+      setPublicationBusy(false);
     }
   }
 
@@ -501,6 +561,7 @@ export default function AgentsPage({
           }}
           onStatus={(status) => void updateStatus(employee, status)}
           onGallery={(published) => void updateGalleryState(employee, published)}
+          onPublication={() => void submitAgentPublication(employee)}
           onDelete={() => setDeleteTarget(employee)}
           onAvatar={() => setAvatarAgent(employee)}
           onEdit={() => setProfileAgent(employee)}
@@ -606,6 +667,10 @@ export default function AgentsPage({
               </h2>
               <p className="mt-[5px] max-w-[680px] text-[12px] leading-[19px] text-[#68718b]">{viewMeta.description}</p>
             </div>
+            <Button variant="outline" onClick={() => void openAgentReleases()}>
+              <Bot className="size-4" />
+              组织数字员工发布库
+            </Button>
           </div>
 
           <div className="border-t border-[#eef1f6] p-[18px]">
@@ -688,6 +753,43 @@ export default function AgentsPage({
         description="删除后该员工的所有配置将一并移除，操作不可撤销。"
         onConfirm={() => void confirmDelete()}
       />
+      <Dialog open={publicationOpen} onOpenChange={(open) => !publicationBusy && setPublicationOpen(open)}>
+        <DialogContent aria-describedby={undefined} className="max-h-[86vh] overflow-y-auto sm:max-w-[720px]">
+          <DialogTitle className="flex items-center gap-2 text-[17px] font-semibold">
+            <ShieldCheck className="size-5 text-[var(--gg-cobalt)]" />
+            组织数字员工发布库
+          </DialogTitle>
+          <p className="text-[12px] leading-5 text-[#68718b]">
+            这里只展示经职责分离审核的冻结快照。采用会创建归你所有的新数字员工，并固定已审 Persona 与组件版本；记忆、会话、连接账号、凭据和定时任务不会传播。
+          </p>
+          {publicationBusy && !agentReleases.length ? <p role="status">正在读取已审发布物…</p> : null}
+          {!publicationBusy && !agentReleases.length ? (
+            <div className="rounded-xl border border-dashed border-[#dfe5f2] px-5 py-10 text-center text-[12px] text-[#7b8498]">
+              当前没有可采用的组织数字员工发布物。
+            </div>
+          ) : null}
+          <div className="grid gap-3">
+            {agentReleases.map((release) => (
+              <article key={release.id} className="rounded-[14px] border border-[#dce5f6] bg-[#fbfcff] p-4">
+                <div className="flex items-start justify-between gap-4">
+                  <div>
+                    <h3 className="text-[14px] font-semibold text-[#202536]">{release.name}</h3>
+                    <p className="mt-1 text-[12px] leading-5 text-[#68718b]">{release.description || '暂无说明'}</p>
+                  </div>
+                  <Button disabled={publicationBusy} onClick={() => void adoptAgentRelease(release)}>
+                    采用为我的员工
+                  </Button>
+                </div>
+                <div className="mt-3 flex flex-wrap gap-2 text-[11px] text-[#53617d]">
+                  <span className="rounded-full bg-white px-2.5 py-1 ring-1 ring-[#dfe6f5]">冻结组件 {release.components.length}</span>
+                  <span className="rounded-full bg-white px-2.5 py-1 font-mono ring-1 ring-[#dfe6f5]">{release.snapshot_checksum.slice(0, 12)}…</span>
+                  <span className="rounded-full bg-[#eef8f2] px-2.5 py-1 text-[#237a48]">已审 Release</span>
+                </div>
+              </article>
+            ))}
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

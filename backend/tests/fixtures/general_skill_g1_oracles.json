@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "github": {
+    "repository": "https://github.com/mattpocock/skills",
+    "revision": "84fdeffd12f2ee307994d1eb6feb48173b6e0502",
+    "archive_sha256": "ebc29488fb0012d3ac07b5b66946d4fb86fb17ccf6c8620c654cff7c075fa5b6",
+    "verified_at": "2026-08-12T10:51:00+08:00"
+  },
+  "skills": {
+    "G1-A": {
+      "source_subpath": "skills/productivity/writing-for-agents",
+      "name": "writing-for-agents",
+      "manifest_path": "skills/productivity/writing-for-agents/SKILL.md",
+      "content_checksum": "e73648b253d7ff9f42c8230a48988ffd4502d5cf146f50b3754430c336b180e9",
+      "manifest_checksum": "a842323e664e5af104eac5c97ad22fda929ebeb62d81c501161ac1f6f482db58",
+      "normalized_checksum": "59ffedaf9eee6e5346c5499ebd905be2ff375a2b71963d2195ed612d9b87ab08",
+      "invocation_policy": "model_allowed",
+      "resource_count": 3,
+      "risk_findings": ["license_not_declared"]
+    },
+    "G1-B": {
+      "source_subpath": "skills/engineering/diagnosing-bugs",
+      "name": "diagnosing-bugs",
+      "manifest_path": "skills/engineering/diagnosing-bugs/SKILL.md",
+      "content_checksum": "44f48fe722169b42cd0a6f7700989749ff25f30e55df93dfd4d58db5ac4db530",
+      "manifest_checksum": "b9339b09ee3980808d8c5a35c7251b891b8b1e0036ec4ca37812b976ebddf6b6",
+      "normalized_checksum": "0cdfbffefb72de4c29c3d308ea37a9347e0e1c2d7b848f1fa1552b5096fc416a",
+      "invocation_policy": "model_allowed",
+      "resource_count": 3,
+      "risk_findings": ["license_not_declared", "contains_executable_content"]
+    },
+    "G1-C1": {
+      "source_subpath": "skills/engineering/tdd",
+      "name": "tdd",
+      "manifest_path": "skills/engineering/tdd/SKILL.md",
+      "content_checksum": "a6ff1b46c6fcd77d824b1d2ea1ce7dcc35fad8296a3cec8bbf97e3e8984e54c6",
+      "manifest_checksum": "5e6b9c16b547113e90afbb946489d1c1384be5c2128f0159bd0bee57251ecf08",
+      "normalized_checksum": "34e920b26d81f29098c273398c1a0469e14c16db27774e3741dfca596c36637d",
+      "invocation_policy": "model_allowed",
+      "resource_count": 4,
+      "risk_findings": ["license_not_declared"]
+    },
+    "G1-D": {
+      "source_subpath": "skills/productivity/to-questionnaire",
+      "name": "to-questionnaire",
+      "manifest_path": "skills/productivity/to-questionnaire/SKILL.md",
+      "content_checksum": "b56ab2e70a29d222eb2e0cf28866f066e1d7ed0cca9d3e72aca9f727bd4ff297",
+      "manifest_checksum": "8e7f9ed8d7b2e66babf1a54aee9b94319bf38c32619cffe78819df6518ead5fc",
+      "normalized_checksum": "00103e878fa0d72475666407f8d5ad01e8f4698a85785dfc674e4d08911d0927",
+      "invocation_policy": "user_only",
+      "resource_count": 2,
+      "risk_findings": ["license_not_declared", "user_only_invocation"]
+    }
+  },
+  "authored_skill": {
+    "requirement_id": "G1-C2",
+    "name": "refund-idempotency-playbook",
+    "source_kind": "agent_proposal",
+    "proposal_kind": "authored",
+    "required_evidence_paths": [
+      "artifacts/refund-replay-red.txt",
+      "artifacts/refund-replay-green.txt",
+      "references/refund/idempotency-contract.md"
+    ],
+    "required_sections": [
+      "受控证据",
+      "幂等键边界",
+      "重复请求复核",
+      "失败补偿",
+      "回归判据"
+    ],
+    "forbidden_provenance": ["github", "skillhub", "https", "upload"],
+    "forbidden_name_aliases": ["tdd", "test-driven-development"]
+  }
+}

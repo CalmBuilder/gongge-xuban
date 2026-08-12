@@ -18,9 +18,12 @@ from sqlmodel import Session, select
 from app.db.models import (
     AgentProfile,
     AgentResourceBinding,
+    AgentPublicationRevision,
     GeneralSkill,
     GeneralSkillAuthorizationState,
+    GeneralSkillPublicationRevision,
     GeneralSkillRevision,
+    PublicationRelease,
     User,
 )
 from app.security.permissions import can_use_agent_in_chat
@@ -45,6 +48,9 @@ class GeneralSkillBindingMetadata(BaseModel):
     invocation_policy: str = Field(pattern=r"^(model_allowed|user_only)$")
     atomic_execution_allowed: bool = False
     created_by_user_id: str
+    publication_release_id: str | None = None
+    publication_snapshot_id: str | None = None
+    published_content_checksum: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,7 +124,7 @@ class EffectiveGeneralSkillResolver:
             skill is None
             or skill.tenant_id != current_user.tenant_id
             or skill.status != "published"
-            or not self._visible_to_user(skill, current_user)
+            or not self._visible_to_user(skill, current_user, binding)
         ):
             return None
         try:
@@ -160,13 +166,51 @@ class EffectiveGeneralSkillResolver:
             revision_policy=metadata.revision_policy,
         )
 
-    @staticmethod
-    def _visible_to_user(skill: GeneralSkill, current_user: User) -> bool:
-        """按稳定所有者与显式可见范围判断，不从名称或来源推断共享。"""
+    def _visible_to_user(
+        self,
+        skill: GeneralSkill,
+        current_user: User,
+        binding: AgentResourceBinding,
+    ) -> bool:
+        """按所有者、显式范围或已审 Agent Release 传播证据判断可见性。"""
 
         if skill.owner_user_id == current_user.id:
             return True
-        return skill.visibility_scope in {"agent_private", "tenant_gallery"}
+        release_id = binding.metadata_json.get("publication_release_id")
+        snapshot_id = binding.metadata_json.get("publication_snapshot_id")
+        if not isinstance(release_id, str) or not isinstance(snapshot_id, str):
+            return skill.visibility_scope in {"agent_private", "tenant_gallery"}
+        release = self.db.get(PublicationRelease, release_id)
+        if (
+            release is None
+            or release.tenant_id != current_user.tenant_id
+            or release.snapshot_id != snapshot_id
+            or release.status == "security_revoked"
+        ):
+            return False
+        if release.resource_type == "general_skill":
+            snapshot = self.db.get(GeneralSkillPublicationRevision, snapshot_id)
+            return bool(
+                snapshot is not None
+                and snapshot.tenant_id == current_user.tenant_id
+                and snapshot.skill_id == skill.id
+                and snapshot.approved_revision_id
+                == binding.metadata_json.get("pinned_revision_id")
+                and snapshot.content_checksum
+                == binding.metadata_json.get("published_content_checksum")
+            )
+        if release.resource_type != "agent":
+            return False
+        snapshot = self.db.get(AgentPublicationRevision, snapshot_id)
+        if snapshot is None or snapshot.tenant_id != current_user.tenant_id:
+            return False
+        return any(
+            component.get("resource_type") == "general_skill"
+            and component.get("resource_id") == skill.id
+            and component.get("metadata", {}).get("pinned_revision_id")
+            == binding.metadata_json.get("pinned_revision_id")
+            for component in snapshot.component_snapshot_json or []
+        )
 
     @staticmethod
     def _revision_checksum_valid(revision: GeneralSkillRevision) -> bool:

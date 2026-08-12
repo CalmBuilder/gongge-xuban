@@ -470,6 +470,102 @@ def test_agent_skill_proposal_preserves_artifact_path_and_content_after_publicat
         db.close()
 
 
+def test_agent_skill_update_proposal_rejects_changed_published_base(tmp_path: Path) -> None:
+    """验证更新提案冻结基线；审核期间当前发布 Revision 变化后不得覆盖新版本。"""
+
+    db, service, owner, _agent, instance, step, operation, arguments = _context(tmp_path)
+    try:
+        first, _ = _approve(db, service, instance, step, operation, arguments)
+        service.publish_approved_operation(
+            tenant_id=instance.tenant_id,
+            execution_id=instance.id,
+            operation_id=operation.id,
+            initiator_user_id=owner.id,
+        )
+        published = db.get(GeneralSkillRevision, first.revision_id)
+        assert published is not None
+
+        update_step = SopNodeExecution(
+            id="node_proposal_update",
+            tenant_id=instance.tenant_id,
+            instance_id=instance.id,
+            node_id="save_skill_update",
+            step_key="save_skill_update",
+            plan_revision_id=instance.current_plan_revision_id,
+            step_kind="tool.write",
+            status="running",
+        )
+        db.add(update_step)
+        db.flush()
+
+        update_operation = SopOperation(
+            id="sopop_proposal_update",
+            tenant_id=instance.tenant_id,
+            instance_id=instance.id,
+            node_execution_id=update_step.id,
+            operation_name=SKILL_PROPOSAL_TOOL_NAME,
+            idempotency_key="proposal-update-idempotency",
+            logical_action_id="proposal-update-action",
+            request_fingerprint=hashlib.sha256(b"proposal-update").hexdigest(),
+            effect_kind="local_write",
+            request_json={},
+            status="prepared",
+        )
+        update_arguments = {
+            **arguments,
+            "instructions": "更新后的退款复盘流程。",
+            "target_skill_id": first.skill_id,
+        }
+        update_operation.request_json = update_arguments
+        db.add(update_operation)
+        db.flush()
+        update = service.stage(
+            instance=instance,
+            step=update_step,
+            operation=update_operation,
+            arguments=update_arguments,
+            reviewer_user_ids=[owner.id],
+        )
+        attention = SopWorkItem(
+            id="attention_proposal_update",
+            tenant_id=instance.tenant_id,
+            instance_id=instance.id,
+            node_execution_id=update_step.id,
+            attention_kind="publication",
+            attention_key="save_skill:update-publication",
+            attention_identity="proposal-update-attention",
+            payload_json={"operation_id": update_operation.id},
+            allowed_commands_json=["allow_once", "deny"],
+            resolution_json={"command": "allow_once", "actor_user_id": owner.id},
+            status="completed",
+            initiator_user_id=owner.id,
+            exclude_initiator=False,
+        )
+        db.add(attention)
+        service.mark_awaiting_approval(update, attention_id=attention.id)
+        update_operation.status = "running"
+        update_operation.approval_work_item_id = attention.id
+        update_operation.approved_by_user_id = owner.id
+        db.add(update_operation)
+        db.commit()
+
+        published.content_checksum = "f" * 64
+        db.add(published)
+        db.commit()
+        with pytest.raises(GeneralSkillProposalError) as changed:
+            service.publish_approved_operation(
+                tenant_id=instance.tenant_id,
+                execution_id=instance.id,
+                operation_id=update_operation.id,
+                initiator_user_id=owner.id,
+            )
+        assert changed.value.code == "GENERAL_SKILL_PROPOSAL_BASE_CHANGED"
+        skill = db.get(GeneralSkill, first.skill_id)
+        assert skill is not None and skill.current_published_revision_id == first.revision_id
+    finally:
+        db.close()
+
+
 def test_expired_publication_terminates_proposal_and_execution(tmp_path: Path) -> None:
     """验证调度器先回收提案暂存对象，再把等待节点和 Execution 收敛为超时终态。"""
 

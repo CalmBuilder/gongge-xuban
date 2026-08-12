@@ -27,6 +27,7 @@ from app.api import (
     feedback,
     expert_taxonomy,
     general_skills,
+    general_skill_library,
     general_skill_governance,
     general_skill_imports,
     general_skill_runtime,
@@ -41,6 +42,7 @@ from app.api import (
     organization_leaders,
     organization_units,
     persona,
+    publications,
     reference_data,
     scheduled_tasks,
     standing_approval_rules,
@@ -134,9 +136,11 @@ app.include_router(agents.scope_router)
 app.include_router(agents.enterprise_router)
 app.include_router(expert_taxonomy.router)
 app.include_router(general_skills.router)
+app.include_router(general_skill_library.router)
 app.include_router(general_skill_governance.router)
 app.include_router(general_skill_imports.router)
 app.include_router(general_skill_runtime.router)
+app.include_router(publications.router)
 app.include_router(knowledge_bases.router)
 app.include_router(knowledge.router)
 app.include_router(management_audit.router)

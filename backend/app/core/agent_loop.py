@@ -7109,7 +7109,7 @@ class AgentLoop:
         user_id: str | None,
         legacy: list[GeneralSkill],
     ) -> list[GeneralSkill]:
-        """开关开启时以 resolver 过滤旧根，并把指导型 Skill 固定到所选 revision。"""
+        """开关开启时以 resolver 作为权威目录，并把指导型 Skill 固定到所选 revision。"""
 
         if not get_settings().general_skill_resolver_v2_enabled or not agent_id or not user_id:
             return legacy
@@ -7117,11 +7117,10 @@ class AgentLoop:
         if user is None or user.tenant_id != tenant_id:
             return []
         catalog = EffectiveGeneralSkillResolver(self.db).resolve(user, agent_id)
-        resolved = {item.skill_id: item for item in catalog.items}
         rows: list[GeneralSkill] = []
-        for root in legacy:
-            item = resolved.get(root.id)
-            if item is None:
+        for item in catalog.items:
+            root = self.db.get(GeneralSkill, item.skill_id)
+            if root is None or root.tenant_id != tenant_id:
                 continue
             if root.usage_mode != "planning_guidance":
                 rows.append(root)

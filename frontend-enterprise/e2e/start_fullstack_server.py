@@ -381,6 +381,16 @@ def seed_e2e_fixtures() -> None:
         )
         db.add(
             User(
+                id="publication_admin_e2e",
+                tenant_id="tenant_demo",
+                username="publication-admin",
+                display_name="E2E Publication Administrator",
+                role="admin",
+                password_hash=legacy_password_hash("publication-admin"),
+            )
+        )
+        db.add(
+            User(
                 id="finance_e2e",
                 tenant_id="tenant_demo",
                 username="finance",
@@ -445,6 +455,19 @@ def seed_e2e_fixtures() -> None:
                 metadata_json={
                     "owner_user_id": "member_e2e",
                     "owner_username": "member",
+                },
+            )
+        )
+        db.add(
+            AgentProfile(
+                id="agent_e2e_member_two",
+                tenant_id="tenant_demo",
+                name="E2E B 问卷采用分身",
+                status="active",
+                owner_user_id="member_two_e2e",
+                metadata_json={
+                    "owner_user_id": "member_two_e2e",
+                    "owner_username": "member-two",
                 },
             )
         )
@@ -2221,6 +2244,42 @@ def install_schedule_llm_override() -> None:
 
                 return [loaded_ref_by_base[name] for name in names]
             goal = str(user_payload.get("goal") or "")
+            if "C1远程导入Skill" in goal:
+                capability_names = {
+                    str(item.get("name") or "")
+                    for item in user_payload.get("capabilities", [])
+                    if isinstance(item, dict)
+                }
+                if "platform.general_skill.propose" not in capability_names:
+                    raise RuntimeError("C1 planner missed governed Skill proposal capability")
+                return {
+                    "goal": goal,
+                    "success_criteria": user_payload.get("success_criteria", []),
+                    "constraints": ["Agent 只建议固定 GitHub commit；本人批准前零安装"],
+                    "assumptions": [],
+                    "steps": [
+                        {
+                            "draft_id": "propose_remote_skill",
+                            "title": "提交 C1 远程 Skill 导入提案",
+                            "kind": "tool.write",
+                            "required": True,
+                            "depends_on": [],
+                            "capability_refs": ["platform.general_skill.propose"],
+                            "guidance_skill_refs": [],
+                            "expected_output_schema": {},
+                        },
+                        {
+                            "draft_id": "answer",
+                            "title": "报告 C1 Skill 安装结果",
+                            "kind": "answer",
+                            "required": True,
+                            "depends_on": ["propose_remote_skill"],
+                            "capability_refs": [],
+                            "guidance_skill_refs": [],
+                            "expected_output_schema": {},
+                        },
+                    ],
+                }
             if "S5创建Skill" in goal:
                 capability_names = {
                     str(item.get("name") or "")
@@ -2869,6 +2928,57 @@ def install_schedule_llm_override() -> None:
             )
             is_s4_diagnosis = "agent_e2e_diagnosis" in str(user_payload)
             is_s4 = "S4-DYNAMIC-FULL-GUIDANCE" in str(user_payload)
+            if step_title == "提交 C1 远程 Skill 导入提案":
+                client._last_completed_response_metadata = {
+                    "response_id": "e2e-c1-remote-proposal-response",
+                    "finish_reason": "stop",
+                    "usage": {"input_tokens": 12, "output_tokens": 10},
+                }
+                return {
+                    "action_kind": "call_tool",
+                    "arguments": {
+                        "proposal_kind": "remote_import",
+                        "source_url": "https://github.com/mattpocock/skills",
+                        "revision": "84fdeffd12f2ee307994d1eb6feb48173b6e0502",
+                        "source_subpath": "skills/engineering/tdd",
+                    },
+                    "capability_ref": "platform.general_skill.propose",
+                    "expected_output_schema": {},
+                    "rationale": "建议安装固定 TDD Skill，等待本人确认冻结预览",
+                }
+            if step_title == "报告 C1 Skill 安装结果":
+                execution_view = user_payload.get("provider_execution_view", {})
+                execution_context = (
+                    execution_view.get("execution_context", {})
+                    if isinstance(execution_view, dict)
+                    else {}
+                )
+                completed = [
+                    str(item.get("step_key") or "")
+                    for item in execution_context.get("completed_steps", [])
+                    if isinstance(item, dict) and item.get("step_key")
+                ]
+                criteria = [
+                    str(item.get("id") or "")
+                    for item in execution_context.get("success_criteria", [])
+                    if isinstance(item, dict) and item.get("id")
+                ]
+                client._last_completed_response_metadata = {
+                    "response_id": "e2e-c1-answer-response",
+                    "finish_reason": "stop",
+                    "usage": {"input_tokens": 8, "output_tokens": 8},
+                }
+                return {
+                    "action_kind": "answer",
+                    "arguments": {
+                        "markdown": "C1-REMOTE-PUBLISHED：固定 TDD Skill 已由本人批准并绑定。",
+                        "criterion_evidence": {criterion: completed for criterion in criteria},
+                        "pending_questions": [],
+                    },
+                    "capability_ref": None,
+                    "expected_output_schema": {},
+                    "rationale": "依据远程导入 Operation 回执报告结果",
+                }
             if step_title == "提交 S5 Skill 提案":
                 client._last_completed_response_metadata = {
                     "response_id": "e2e-s5-proposal-response",
@@ -3327,6 +3437,12 @@ def install_schedule_llm_override() -> None:
                     return "S3-AUTO-GUIDED：模型从有预算目录自动选择并消费了固定修订。"
                 if "S5-PROPOSAL-GUIDANCE" in instructions:
                     return "S5-CONSUMED-SUCCESS：原分身已加载所有者批准的固定 Skill 修订。"
+                if "DIAGNOSING-BUGS-FIXED-COMMIT" in instructions:
+                    return "G1-B-CONSUMED-SUCCESS：已按固定 diagnosing-bugs 修订完成可证伪诊断。"
+                if "# Test-Driven Development" in instructions:
+                    return "G1-C1-CONSUMED-SUCCESS：已按固定 TDD 修订先建立失败测试。"
+                if "TO-QUESTIONNAIRE-FIXED-COMMIT" in instructions:
+                    return "G1-D-CONSUMED-SUCCESS：已按组织批准的固定问卷 Skill 生成问题。"
                 if "只返回 S3-GUIDED-SUCCESS" not in instructions:
                     raise RuntimeError("S3 guidance was not loaded from the fixed revision")
                 return "S3-GUIDED-SUCCESS：已按固定修订的售后核验指南完成本轮处理。"
@@ -3697,6 +3813,16 @@ def install_general_skill_remote_fetcher_override() -> None:
                     "---\n# Test-Driven Development\n",
                 )
                 archive.writestr(
+                    "skills-main/skills/productivity/to-questionnaire/SKILL.md",
+                    "---\n"
+                    "name: to-questionnaire\n"
+                    "description: Convert source documents into a structured questionnaire.\n"
+                    "disable-model-invocation: true\n"
+                    "---\n# To Questionnaire\n"
+                    "TO-QUESTIONNAIRE-FIXED-COMMIT：按主题提取事实、缺口和待确认项，"
+                    "形成带来源的结构化问卷。\n",
+                )
+                archive.writestr(
                     "skills-main/skills/engineering/diagnosing-bugs/SKILL.md",
                     "---\n"
                     "name: diagnosing-bugs\n"
@@ -3707,6 +3833,11 @@ def install_general_skill_remote_fetcher_override() -> None:
                     "DIAGNOSING-BUGS-FIXED-COMMIT：先建立快速、确定、可由 Agent 运行且能命中"
                     "用户原始症状的 red-capable loop；再最小化复现，列出可证伪假设，修复后重跑"
                     "原始复现，并清理所有 [DEBUG-] instrumentation。\n",
+                )
+                archive.writestr(
+                    "skills-main/skills/engineering/diagnosing-bugs/scripts/"
+                    "hitl-loop.template.sh",
+                    "#!/bin/sh\n# E2E risk fixture: imported as read-only content and never executed.\n",
                 )
                 archive.writestr(
                     "skills-main/skills/engineering/codebase-design/SKILL.md",
@@ -3732,6 +3863,9 @@ def install_general_skill_remote_fetcher_override() -> None:
 
     app.dependency_overrides[get_general_skill_remote_fetcher] = BrowserRemoteFetcher
     general_skill_worker.get_remote_fetcher = BrowserRemoteFetcher
+    from app.general_skills import proposals as general_skill_proposals
+
+    general_skill_proposals.get_agent_proposal_remote_fetcher = BrowserRemoteFetcher
 
 
 def seed_pagination_browser_fixtures() -> None:

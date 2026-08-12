@@ -1472,7 +1472,7 @@ class GeneralSkillImportService:
             runtime_config_json={},
             usage_mode="planning_guidance",
             owner_user_id=current_user.id,
-            visibility_scope="agent_private",
+            visibility_scope="user_private",
         )
         self.db.add(skill)
         self.db.flush()

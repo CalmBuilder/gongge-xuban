@@ -259,7 +259,7 @@ def test_confirm_creates_published_revision_and_default_pinned_private_binding(t
     assert skill is not None
     assert skill.current_published_revision_id == revision.id
     assert skill.owner_user_id == owner.id
-    assert skill.visibility_scope == "agent_private"
+    assert skill.visibility_scope == "user_private"
     assert binding.agent_id == "agent_a"
     assert binding.metadata_json == {
         "schema_version": 1,

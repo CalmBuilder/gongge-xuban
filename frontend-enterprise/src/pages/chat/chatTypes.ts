@@ -65,6 +65,32 @@ export type ComposerAttachment = ChatAttachmentRead & {
 };
 
 export type ComposerInteractionMode = 'normal' | 'scheduled_task';
+
+export type GeneralSkillInstallIntentRead = {
+  id: string;
+  session_id: string;
+  agent_id: string;
+  source_kind: string;
+  source_reference_redacted?: string;
+  source_revision?: string;
+  status: 'preparing' | 'awaiting_owner_confirmation' | 'installing' | 'installed' | 'failed' | 'cancelled' | 'expired' | 'stale';
+  import_job_id: string;
+  raw_checksum?: string;
+  normalized_checksum?: string;
+  preview_checksum?: string;
+  candidates: Array<{
+    candidate_id: string;
+    name: string;
+    description: string;
+    risk_findings: string[];
+    resources: Array<Record<string, unknown>>;
+  }>;
+  installed_revision_ids: string[];
+  error_code?: string;
+  row_version: number;
+  created_at: string;
+  updated_at: string;
+};
 export type DraftScheduleType = 'once' | 'daily' | 'weekly' | 'monthly';
 
 export function createEmptySlot(): SessionSlot {

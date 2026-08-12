@@ -79,9 +79,12 @@ import type { BadgeTone } from './scheduled-tasks/shared';
 import type {
   AgentProfileRead,
   GeneralSkillImportJobRead,
+  GeneralSkillBindingBatchPreviewRead,
+  GeneralSkillBindingBatchTarget,
   GeneralSkillSourceCredentialRead,
   GeneralSkillRead,
   GeneralSkillRunResponse,
+  MyGeneralSkillRead,
   ModelConfigRead,
 } from '../types';
 
@@ -324,6 +327,15 @@ type GeneralSkillPageProps = {
   onLogout?: () => void;
 };
 
+type PublicationReleaseRead = {
+  id: string;
+  resource_type: 'general_skill' | 'agent';
+  resource_id: string;
+  name: string;
+  description: string;
+  approved_revision_id?: string;
+};
+
 export function GeneralSkillNewPage(props: GeneralSkillPageProps = {}) {
   return <GeneralSkillEditorPage mode="new" {...props} />;
 }
@@ -377,6 +389,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
   const [secureImportCredentialLoading, setSecureImportCredentialLoading] = useState(false);
   const [secureImportTargetSkillId, setSecureImportTargetSkillId] = useState<string | null>(null);
   const [governanceTarget, setGovernanceTarget] = useState<GeneralSkillRead | null>(null);
+  const [myLibraryOpen, setMyLibraryOpen] = useState(false);
 
   const pageTitle = isOverallAgent ? '技能广场' : '技能';
   const listLabel = isOverallAgent ? '技能广场列表' : '技能列表';
@@ -1125,6 +1138,13 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
           <div className="mt-[20px] mb-[16px] flex items-center justify-end gap-[12px]">
             <UIButton
               variant="outline"
+              onClick={() => setMyLibraryOpen(true)}
+              className="h-[34px] rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[20px] text-[12px] font-normal text-[#464c5e] hover:border-[#cbd3e6] hover:bg-white hover:text-[#18181a]"
+            >
+              我的 Skill 库
+            </UIButton>
+            <UIButton
+              variant="outline"
               onClick={() => void load()}
               disabled={loading}
               className="h-[34px] gap-[4px] rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[20px] text-[12px] font-normal text-[#757f9c] hover:border-[#cbd3e6] hover:bg-white hover:text-[#18181a]"
@@ -1399,7 +1419,262 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
           requestSecurePackageImport(skill.id);
         }}
       />
+      <MyGeneralSkillLibraryDialog
+        open={myLibraryOpen}
+        onClose={() => setMyLibraryOpen(false)}
+        onChanged={load}
+      />
     </div>
+  );
+}
+
+function MyGeneralSkillLibraryDialog({
+  open,
+  onClose,
+  onChanged,
+}: {
+  open: boolean;
+  onClose: () => void;
+  onChanged: () => Promise<unknown>;
+}) {
+  const [skills, setSkills] = useState<MyGeneralSkillRead[]>([]);
+  const [ownedAgents, setOwnedAgents] = useState<AgentProfileRead[]>([]);
+  const [selectedSkillId, setSelectedSkillId] = useState('');
+  const [selectedAgentIds, setSelectedAgentIds] = useState<string[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [preview, setPreview] = useState<GeneralSkillBindingBatchPreviewRead | null>(null);
+  const [releases, setReleases] = useState<PublicationReleaseRead[]>([]);
+  const selectedSkill = skills.find((item) => item.id === selectedSkillId);
+
+  useEffect(() => {
+    if (!open) return;
+    setLoading(true);
+    Promise.all([
+      api.get<MyGeneralSkillRead[]>('/api/enterprise/my-general-skills'),
+      api.get<Array<Pick<AgentProfileRead, 'id' | 'name' | 'status' | 'profile_revision'>>>(
+        '/api/enterprise/my-general-skills/agents',
+      ),
+      api.get<PublicationReleaseRead[]>('/api/enterprise/publications/releases?resource_type=general_skill'),
+    ])
+      .then(([items, agentItems, releaseItems]) => {
+        setSkills(items);
+        setReleases(releaseItems);
+        setOwnedAgents(agentItems.map((agent) => ({
+          ...agent,
+          tenant_id: getRequestTenantId(),
+          is_overall: false,
+          metadata: {},
+          resources: [],
+          created_at: '',
+          updated_at: '',
+        })));
+        setSelectedSkillId((current) => (
+          items.some((item) => item.id === current) ? current : items[0]?.id || ''
+        ));
+      })
+      .catch((error) => notify.error(error instanceof Error ? error.message : '加载我的 Skill 库失败'))
+      .finally(() => setLoading(false));
+  }, [open]);
+
+  useEffect(() => {
+    if (!selectedSkill) {
+      setSelectedAgentIds([]);
+      return;
+    }
+    setSelectedAgentIds(
+      selectedSkill.bindings.filter((binding) => binding.status === 'active').map((binding) => binding.agent_id),
+    );
+    setPreview(null);
+  }, [selectedSkillId, selectedSkill]);
+
+  function targets(): GeneralSkillBindingBatchTarget[] {
+    if (!selectedSkill) return [];
+    return ownedAgents.map((agent) => {
+      const binding = selectedSkill.bindings.find((item) => item.agent_id === agent.id);
+      return {
+        agent_id: agent.id,
+        status: selectedAgentIds.includes(agent.id) ? 'active' : 'inactive',
+        revision_policy: binding?.revision_policy || 'pinned',
+        pinned_revision_id: binding?.revision_policy === 'follow_latest'
+          ? undefined
+          : binding?.pinned_revision_id || selectedSkill.current_revision_id,
+        invocation_policy: binding?.invocation_policy || 'model_allowed',
+        expected_binding_row_version: binding?.row_version,
+      };
+    });
+  }
+
+  async function createPreview() {
+    if (!selectedSkill || !ownedAgents.length) return;
+    setLoading(true);
+    try {
+      const next = await api.post<GeneralSkillBindingBatchPreviewRead>(
+        '/api/enterprise/general-skill-bindings:batch-preview',
+        { skill_id: selectedSkill.id, targets: targets() },
+      );
+      setPreview(next);
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '装配预检失败');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function commit() {
+    if (!selectedSkill || !preview) return;
+    setLoading(true);
+    try {
+      await api.postWithHeaders(
+        '/api/enterprise/general-skill-bindings:batch',
+        { skill_id: selectedSkill.id, targets: targets(), preview_checksum: preview.preview_checksum },
+        { 'Idempotency-Key': `skill-binding-${crypto.randomUUID()}` },
+      );
+      const refreshed = await api.get<MyGeneralSkillRead[]>('/api/enterprise/my-general-skills');
+      setSkills(refreshed);
+      setPreview(null);
+      await onChanged();
+      notify.success('已原子更新所有数字员工的 Skill 装配');
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '装配提交失败，请重新预检');
+      setPreview(null);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function submitPublication() {
+    if (!selectedSkill) return;
+    setLoading(true);
+    try {
+      await api.post('/api/enterprise/publications', {
+        resource_type: 'general_skill',
+        resource_id: selectedSkill.id,
+        expected_resource_revision: selectedSkill.row_version,
+      });
+      notify.success('已提交组织审核；管理员批准后才会出现在组织广场');
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '提交组织审核失败');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function adoptRelease(release: PublicationReleaseRead) {
+    const targetAgentId = ownedAgents[0]?.id;
+    if (!targetAgentId) return;
+    setLoading(true);
+    try {
+      await api.post(`/api/enterprise/publications/releases/${encodeURIComponent(release.id)}/adopt`, {
+        target_agent_id: targetAgentId,
+        idempotency_key: `adopt-${crypto.randomUUID()}`,
+      });
+      await onChanged();
+      notify.success(`已把 ${release.name} 的已审固定版本装配到 ${ownedAgents[0].name}`);
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '采用组织 Skill 失败');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={(next) => !next && !loading && onClose()}>
+      <DialogContent aria-describedby={undefined} className="max-h-[88vh] overflow-y-auto sm:max-w-[760px]">
+        <DialogTitle className="text-[17px] font-semibold">我的 Skill 库</DialogTitle>
+        <p className="text-[12px] leading-5 text-[#757f9c]">
+          每个 Skill 只保存一份不可变修订；勾选要装配的本人数字员工，预检通过后整批生效。
+        </p>
+        {loading && !skills.length ? <p role="status">正在加载 Skill 库…</p> : null}
+        {!loading && !skills.length ? (
+          <div className="rounded-xl border border-dashed border-[#dfe5f2] p-8 text-center text-[#757f9c]">
+            暂无本人私有 Skill，请先在某个数字员工中完成安全导入。
+          </div>
+        ) : null}
+        {skills.length ? (
+          <div className="grid gap-4">
+            <label className="grid gap-2 text-[13px] font-medium">
+              选择 Skill
+              <select
+                aria-label="选择我的 Skill"
+                value={selectedSkillId}
+                disabled={loading}
+                onChange={(event) => setSelectedSkillId(event.target.value)}
+                className="h-10 rounded-[10px] border border-[#dfe5f2] bg-white px-3"
+              >
+                {skills.map((skill) => (
+                  <option key={skill.id} value={skill.id}>{skill.name} · r{skill.current_revision_number}</option>
+                ))}
+              </select>
+            </label>
+            {selectedSkill ? (
+              <div className="rounded-xl bg-[#f7f9ff] p-4 text-[12px] text-[#596078]">
+                <strong className="text-[#252936]">{selectedSkill.name}</strong>
+                <div className="mt-1 font-mono">{selectedSkill.content_checksum.slice(0, 16)}… · {selectedSkill.source_kind || '受管来源'}</div>
+              </div>
+            ) : null}
+            {selectedSkill ? (
+              <section className="rounded-xl border border-[#e3e7f1] p-4" aria-label="Skill 对外发布">
+                <h3 className="font-medium">发布给组织其他用户</h3>
+                <p className="mt-1 text-[12px] leading-5 text-[#757f9c]">这与私有安装不同：提交后由另一位管理员审核冻结 Revision，批准后才生成组织广场 Release。</p>
+                <UIButton className="mt-3" variant="outline" disabled={loading} onClick={() => void submitPublication()}>
+                  提交组织审核
+                </UIButton>
+              </section>
+            ) : null}
+            {releases.length ? (
+              <section className="rounded-xl border border-[#dce5ff] bg-[#fbfcff] p-4" aria-label="组织 Skill 广场">
+                <h3 className="font-medium">组织 Skill 广场</h3>
+                <div className="mt-2 grid gap-2">
+                  {releases.map((release) => (
+                    <div key={release.id} className="flex items-center justify-between gap-3 rounded-lg bg-white px-3 py-2">
+                      <div><strong>{release.name}</strong><div className="text-[11px] text-[#757f9c]">已审 Revision {release.approved_revision_id?.slice(-12)}</div></div>
+                      <UIButton size="sm" disabled={loading || !ownedAgents.length} onClick={() => void adoptRelease(release)}>采用到首个本人分身</UIButton>
+                    </div>
+                  ))}
+                </div>
+              </section>
+            ) : null}
+            <fieldset className="grid gap-2">
+              <legend className="mb-2 text-[13px] font-medium">装配到我的数字员工</legend>
+              {ownedAgents.map((agent) => (
+                <label key={agent.id} className="flex items-center justify-between rounded-xl border border-[#e3e7f1] px-4 py-3">
+                  <span>{agent.name}</span>
+                  <input
+                    type="checkbox"
+                    checked={selectedAgentIds.includes(agent.id)}
+                    disabled={loading}
+                    onChange={(event) => {
+                      setSelectedAgentIds((current) => event.target.checked
+                        ? [...current, agent.id]
+                        : current.filter((id) => id !== agent.id));
+                      setPreview(null);
+                    }}
+                  />
+                </label>
+              ))}
+            </fieldset>
+            {preview ? (
+              <section aria-label="装配预检结果" className="rounded-xl border border-[#cbd8ff] bg-[#f7f9ff] p-4">
+                <h3 className="font-medium">预检通过，尚未写入</h3>
+                <ul className="mt-2 grid gap-1 text-[12px] text-[#596078]">
+                  {preview.targets.map((row) => (
+                    <li key={row.agent_id}>{row.agent_name}：{row.action === 'create' ? '新建绑定' : row.action === 'update' ? '更新绑定' : '保持不变'}</li>
+                  ))}
+                </ul>
+              </section>
+            ) : null}
+            <div className="flex justify-end gap-2">
+              <UIButton variant="outline" disabled={loading} onClick={onClose}>取消</UIButton>
+              {!preview ? (
+                <UIButton disabled={loading || !ownedAgents.length} onClick={() => void createPreview()}>预检装配</UIButton>
+              ) : (
+                <UIButton disabled={loading} onClick={() => void commit()}>确认整批生效</UIButton>
+              )}
+            </div>
+          </div>
+        ) : null}
+      </DialogContent>
+    </Dialog>
   );
 }
 

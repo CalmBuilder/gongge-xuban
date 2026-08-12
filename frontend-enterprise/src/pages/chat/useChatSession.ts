@@ -123,6 +123,7 @@ import {
   createTurnTrace,
   type ComposerAttachment,
   type ComposerInteractionMode,
+  type GeneralSkillInstallIntentRead,
   type SessionSlot,
   type StreamSlot,
   type TraceLine,
@@ -336,6 +337,10 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
   const [composerPlusOpen, setComposerPlusOpen] = useState(false);
   const [composerIntent, setComposerIntent] = useState<Exclude<ComposerInteractionMode, 'normal'> | null>(null);
   const [sessionGeneralSkills, setSessionGeneralSkills] = useState<SessionGeneralSkillCatalogRead['items']>([]);
+  const [generalSkillInstallOpen, setGeneralSkillInstallOpen] = useState(false);
+  const [generalSkillInstallIntents, setGeneralSkillInstallIntents] = useState<GeneralSkillInstallIntentRead[]>([]);
+  const [generalSkillCatalogLoading, setGeneralSkillCatalogLoading] = useState(false);
+  const [generalSkillCatalogError, setGeneralSkillCatalogError] = useState(false);
   const [selectedGeneralSkillId, setSelectedGeneralSkillId] = useState('');
   const [lastTurn, setLastTurn] = useState<ChatTurnResponse | null>(null);
   const [renameSession, setRenameSession] = useState<ChatSession | null>(null);
@@ -531,19 +536,35 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     if (!auth || !sessionId || !displayedAgent?.id || isDraftConversationKey(sessionId)) {
       setSessionGeneralSkills([]);
       setSelectedGeneralSkillId('');
+      setGeneralSkillCatalogLoading(false);
+      setGeneralSkillCatalogError(false);
+      setGeneralSkillInstallIntents([]);
       return;
     }
     let cancelled = false;
-    void api.get<SessionGeneralSkillCatalogRead>(
-      `/api/chat/sessions/${encodeURIComponent(sessionId)}/general-skills?agent_id=${encodeURIComponent(displayedAgent.id)}`,
-    ).then((catalog) => {
+    setGeneralSkillCatalogLoading(true);
+    setGeneralSkillCatalogError(false);
+    void Promise.all([
+      api.get<SessionGeneralSkillCatalogRead>(
+        `/api/chat/sessions/${encodeURIComponent(sessionId)}/general-skills?agent_id=${encodeURIComponent(displayedAgent.id)}`,
+      ),
+      api.get<GeneralSkillInstallIntentRead[]>(
+        `/api/chat/sessions/${encodeURIComponent(sessionId)}/general-skill-install-intents`,
+      ),
+    ]).then(([catalog, intents]) => {
       if (cancelled) return;
       setSessionGeneralSkills(catalog.items);
+      setGeneralSkillInstallIntents(intents);
       setSelectedGeneralSkillId((current) => (
         catalog.items.some((item) => item.skill_id === current && item.enabled) ? current : ''
       ));
     }).catch((error) => {
-      if (!cancelled && !isAuthError(error)) setSessionGeneralSkills([]);
+      if (!cancelled && !isAuthError(error)) {
+        setSessionGeneralSkills([]);
+        setGeneralSkillCatalogError(true);
+      }
+    }).finally(() => {
+      if (!cancelled) setGeneralSkillCatalogLoading(false);
     });
     return () => {
       cancelled = true;
@@ -575,30 +596,55 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     }
   }, [displayedAgent?.id, sessionGeneralSkills, sessionId, t]);
 
-  const muteSelectedGeneralSkill = useCallback(async () => {
-    const item = sessionGeneralSkills.find(
-      (candidate) => candidate.skill_id === selectedGeneralSkillId,
+  const clearSelectedGeneralSkill = useCallback(() => setSelectedGeneralSkillId(''), []);
+
+  const refreshGeneralSkillInstallIntents = useCallback(async () => {
+    if (!sessionId) return;
+    const intents = await api.get<GeneralSkillInstallIntentRead[]>(
+      `/api/chat/sessions/${encodeURIComponent(sessionId)}/general-skill-install-intents`,
     );
-    if (!item || !sessionId || !displayedAgent?.id) return;
-    try {
-      const updated = await api.put<{ enabled: boolean; row_version: number }>(
-        `/api/chat/sessions/${encodeURIComponent(sessionId)}/general-skills/${encodeURIComponent(item.skill_id)}`,
-        {
-          agent_id: displayedAgent.id,
-          enabled: false,
-          expected_row_version: item.override_row_version ?? null,
-        },
-      );
-      setSessionGeneralSkills((current) => current.map((candidate) => (
-        candidate.skill_id === item.skill_id
-          ? { ...candidate, enabled: updated.enabled, override_row_version: updated.row_version }
-          : candidate
-      )));
-      setSelectedGeneralSkillId('');
-    } catch (error) {
-      notify.error(error instanceof Error ? error.message : t('Skill 静音失败'));
+    setGeneralSkillInstallIntents(intents);
+  }, [sessionId]);
+
+  const createGeneralSkillInstallIntent = useCallback(async (source: {
+    source_url: string;
+    revision: string;
+    source_subpath: string;
+  }) => {
+    if (!sessionId || !displayedAgent?.id) {
+      throw new Error('请先进入已创建的会话再安装 Skill');
     }
-  }, [displayedAgent?.id, selectedGeneralSkillId, sessionGeneralSkills, sessionId, t]);
+    const intent = await api.postWithHeaders<GeneralSkillInstallIntentRead>(
+      `/api/chat/sessions/${encodeURIComponent(sessionId)}/general-skill-install-intents`,
+      { agent_id: displayedAgent.id, source_kind: 'github', ...source },
+      { 'Idempotency-Key': `chat-skill-${crypto.randomUUID()}` },
+    );
+    setGeneralSkillInstallIntents((current) => [...current, intent]);
+    return intent;
+  }, [displayedAgent?.id, sessionId]);
+
+  const resolveGeneralSkillInstallIntent = useCallback(async (
+    intent: GeneralSkillInstallIntentRead,
+    command: 'confirm' | 'cancel',
+  ) => {
+    if (!sessionId) return;
+    try {
+      const updated = await api.post<GeneralSkillInstallIntentRead>(
+        `/api/chat/sessions/${encodeURIComponent(sessionId)}/general-skill-install-intents/${encodeURIComponent(intent.id)}/resolve`,
+        { command, expected_row_version: intent.row_version, command_id: crypto.randomUUID() },
+      );
+      setGeneralSkillInstallIntents((current) => current.map((item) => item.id === updated.id ? updated : item));
+      if (command === 'confirm' && displayedAgent?.id) {
+        const catalog = await api.get<SessionGeneralSkillCatalogRead>(
+          `/api/chat/sessions/${encodeURIComponent(sessionId)}/general-skills?agent_id=${encodeURIComponent(displayedAgent.id)}`,
+        );
+        setSessionGeneralSkills(catalog.items);
+      }
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '办理 Skill 安装失败');
+      await refreshGeneralSkillInstallIntents();
+    }
+  }, [displayedAgent?.id, refreshGeneralSkillInstallIntents, sessionId]);
   const emptyProfileTags = displayedProfile?.workStyles.length
     ? displayedProfile.workStyles.slice(0, 3)
     : ['结构化整理', '可追溯', '可追溯'];
@@ -3402,9 +3448,16 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     composerIntent,
     setComposerIntent,
     sessionGeneralSkills,
+    generalSkillCatalogLoading,
+    generalSkillCatalogError,
     selectedGeneralSkillId,
     selectSessionGeneralSkill,
-    muteSelectedGeneralSkill,
+    clearSelectedGeneralSkill,
+    generalSkillInstallOpen,
+    setGeneralSkillInstallOpen,
+    generalSkillInstallIntents,
+    createGeneralSkillInstallIntent,
+    resolveGeneralSkillInstallIntent,
     readyComposerAttachments,
     uploadingComposerAttachment,
     composerActive,

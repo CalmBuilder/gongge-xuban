@@ -155,7 +155,7 @@ export default function AttentionCenter() {
     ? stringPayload(selected, 'provider') || 'slack'
     : null;
 
-  async function resolve(command: 'answer' | 'cancel' | 'allow_once' | 'deny' | 'confirm_applied' | 'confirm_not_applied') {
+  async function resolve(command: 'answer' | 'cancel' | 'allow_once' | 'deny' | 'approve' | 'reject' | 'confirm_applied' | 'confirm_not_applied') {
     if (!selected) return;
     if (command === 'answer' && !answer.trim()) {
       notify.error('请先补充任务所需信息');
@@ -167,6 +167,22 @@ export default function AttentionCenter() {
     }
     setActing(true);
     try {
+      if (stringPayload(selected, 'publication_request_id') && ['approve', 'reject'].includes(command)) {
+        await api.post(
+          `/api/enterprise/publications/${encodeURIComponent(stringPayload(selected, 'publication_request_id'))}/review`,
+          {
+            command_id: crypto.randomUUID(),
+            command,
+            expected_request_row_version: numberPayload(selected, 'request_row_version') || 1,
+            expected_attention_revision: selected.revision,
+            comment: answer.trim() || undefined,
+          },
+        );
+        notify.success(command === 'approve' ? '已批准并生成组织广场 Release' : '已拒绝组织发布申请');
+        setSelected(null);
+        await loadItems(view);
+        return;
+      }
       const payload: Record<string, unknown> = {
         tenant_id: getRequestTenantId(),
         command_id: crypto.randomUUID(),
@@ -180,6 +196,8 @@ export default function AttentionCenter() {
         cancel: '任务取消请求已提交',
         allow_once: '已一次性批准，系统将在派发前重新校验全部授权',
         deny: '已拒绝，冻结操作不会发送',
+        approve: '已批准并生成组织广场 Release',
+        reject: '已拒绝组织发布申请',
         confirm_applied: '已登记外部效果存在，原任务将继续',
         confirm_not_applied: '已登记外部效果未发生，任务将确定失败',
       };
@@ -401,22 +419,38 @@ export default function AttentionCenter() {
                   )}
                 </div>
               ) : null}
-              {selected.kind === 'publication' ? (
+              {selected.kind === 'publication' && stringPayload(selected, 'publication_request_id') ? (
+                <div className="grid gap-[10px] rounded-[12px] border border-[#dce5ff] bg-[#fbfcff] px-[13px] py-[12px]" aria-label="组织发布审核">
+                  <strong>{stringPayload(selected, 'publication_request_kind') === 'agent' ? '整 Agent 发布申请' : 'Skill 发布申请'}</strong>
+                  <span className="text-[12px]">资源：{stringPayload(selected, 'resource_name')}</span>
+                  <span className="break-all text-[12px]">冻结快照：<code>{stringPayload(selected, 'snapshot_checksum')}</code></span>
+                  <p className="text-[11px] leading-[1.6] text-[#6a7388]">提交人与审核人分离；批准生成独立 Release，之后私有修改不会改写该已审快照。</p>
+                </div>
+              ) : selected.kind === 'publication' ? (
                 <div className="grid gap-[10px] rounded-[12px] border border-[#dce5ff] bg-[#fbfcff] px-[13px] py-[12px]" aria-label="待审核 Skill 提案">
-                  <div className="grid gap-[5px] text-[12px] text-[#4f5870] sm:grid-cols-2">
-                    <span>Skill：<strong className="text-[#252b3b]">{stringPayload(selected, 'name')}</strong></span>
-                    <span>调用策略：<code>user_only</code></span>
-                    <span className="sm:col-span-2">说明：{stringPayload(selected, 'description')}</span>
-                    <span className="sm:col-span-2">请求工具：{stringArrayPayload(selected, 'requested_tools').join('、') || '无（不会获得新工具授权）'}</span>
-                  </div>
+                  {stringPayload(selected, 'proposal_kind') === 'remote_import' ? (
+                    <div className="grid gap-[5px] text-[12px] text-[#4f5870]">
+                      <span>类型：<strong className="text-[#252b3b]">固定 GitHub Skill 导入建议</strong></span>
+                      <span className="break-all">来源：<code>{stringPayload(selected, 'source_reference_redacted')}</code></span>
+                      <span>预览校验：<code>{stringPayload(selected, 'preview_checksum').slice(0, 16)}</code></span>
+                      <span>候选内容和风险：见下方冻结审核摘要；批准前不会创建 Skill 或绑定。</span>
+                    </div>
+                  ) : (
+                    <div className="grid gap-[5px] text-[12px] text-[#4f5870] sm:grid-cols-2">
+                      <span>Skill：<strong className="text-[#252b3b]">{stringPayload(selected, 'name')}</strong></span>
+                      <span>调用策略：<code>user_only</code></span>
+                      <span className="sm:col-span-2">说明：{stringPayload(selected, 'description')}</span>
+                      <span className="sm:col-span-2">请求工具：{stringArrayPayload(selected, 'requested_tools').join('、') || '无（不会获得新工具授权）'}</span>
+                    </div>
+                  )}
                   <div className="rounded-[9px] border border-[#e5e9f3] bg-white p-[10px]">
                     <div className="mb-[7px] flex items-center justify-between text-[11px] text-[#70798f]">
-                      <span>完整 diff、权限与 Artifact 来源</span>
-                      <code>{stringPayload(selected, 'content_checksum').slice(0, 12)}</code>
+                      <span>{stringPayload(selected, 'proposal_kind') === 'remote_import' ? '固定来源、checksum、候选与风险摘要' : '完整 diff、权限与 Artifact 来源'}</span>
+                      <code>{(stringPayload(selected, 'preview_checksum') || stringPayload(selected, 'content_checksum')).slice(0, 12)}</code>
                     </div>
                     <pre className="max-h-[360px] overflow-auto whitespace-pre-wrap break-words text-[12px] leading-[1.65] text-[#283044]">{proposalReview?.content || '正在加载审核 Artifact…'}</pre>
                   </div>
-                  <p className="text-[11px] leading-[1.6] text-[#6a7388]">批准后才会发布不可变修订，并以仅用户显式调用的方式绑定当前分身；拒绝、过期或基线变化都不会进入 Skill 目录。</p>
+                  <p className="text-[11px] leading-[1.6] text-[#6a7388]">批准后才会消费冻结预览、发布不可变修订并绑定当前分身；拒绝、过期、来源或校验值变化都不会进入 Skill 目录。</p>
                 </div>
               ) : null}
               {execution?.goal ? (
@@ -476,6 +510,8 @@ export default function AttentionCenter() {
                 {selected.available_commands.includes('answer') ? <Button disabled={acting} onClick={() => void resolve('answer')} className="bg-[#3157e8] text-white hover:bg-[#244bc7]">补充并继续</Button> : null}
                 {selected.available_commands.includes('deny') ? <Button variant="outline" disabled={acting} onClick={() => void resolve('deny')}>{selected.kind === 'publication' ? '拒绝提案' : isWorkspaceApproval(selected) ? '拒绝操作' : '拒绝发送'}</Button> : null}
                 {selected.available_commands.includes('allow_once') ? <Button disabled={acting} onClick={() => void resolve('allow_once')} className="bg-[#3157e8] text-white hover:bg-[#244bc7]">{selected.kind === 'publication' ? '批准并发布' : isWorkspaceApproval(selected) ? '仅批准本次操作' : '仅批准本次发送'}</Button> : null}
+                {selected.available_commands.includes('reject') ? <Button variant="outline" disabled={acting} onClick={() => void resolve('reject')}>拒绝组织发布</Button> : null}
+                {selected.available_commands.includes('approve') ? <Button disabled={acting} onClick={() => void resolve('approve')} className="bg-[#3157e8] text-white hover:bg-[#244bc7]">批准发布到组织广场</Button> : null}
                 {selected.available_commands.includes('confirm_not_applied') ? <Button variant="outline" disabled={acting} onClick={() => void resolve('confirm_not_applied')}>确认未送达</Button> : null}
                 {selected.available_commands.includes('confirm_applied') ? <Button disabled={acting} onClick={() => void resolve('confirm_applied')} className="bg-[#3157e8] text-white hover:bg-[#244bc7]">确认已送达</Button> : null}
                 {selected.available_commands.includes('reauthorize') ? <Button disabled={acting} onClick={() => void completeReauth()} className="bg-[#3157e8] text-white hover:bg-[#244bc7]">验证并恢复任务</Button> : null}

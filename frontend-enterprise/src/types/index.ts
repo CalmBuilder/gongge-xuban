@@ -376,6 +376,46 @@ export type GeneralSkillRead = {
   updated_at: string;
 };
 
+export type MyGeneralSkillRead = {
+  id: string;
+  name: string;
+  slug: string;
+  description?: string;
+  visibility_scope: string;
+  status: string;
+  current_revision_id: string;
+  current_revision_number: number;
+  content_checksum: string;
+  manifest_checksum: string;
+  row_version: number;
+  source_kind?: string;
+  bindings: GeneralSkillBindingRead[];
+};
+
+export type GeneralSkillBindingBatchTarget = {
+  agent_id: string;
+  status: 'active' | 'inactive';
+  revision_policy: 'pinned' | 'follow_latest';
+  pinned_revision_id?: string;
+  invocation_policy: 'model_allowed' | 'user_only';
+  expected_binding_row_version?: number;
+};
+
+export type GeneralSkillBindingBatchPreviewRead = {
+  skill_id: string;
+  revision_id: string;
+  preview_checksum: string;
+  targets: Array<{
+    agent_id: string;
+    agent_name: string;
+    action: 'create' | 'update' | 'unchanged';
+    current_binding_id?: string;
+    current_binding_row_version?: number;
+    eligible: boolean;
+    error_code?: string;
+  }>;
+};
+
 export type GeneralSkillRevisionRead = {
   id: string;
   skill_id: string;

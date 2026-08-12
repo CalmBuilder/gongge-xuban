@@ -921,36 +921,53 @@ class DynamicCapabilityCatalog:
                 "name": SKILL_PROPOSAL_TOOL_NAME,
                 "display_name": "提议把已完成方法保存为当前分身的 Skill",
                 "description": (
-                    "生成待本人审核的 Skill 草稿；批准前不可见，批准后以 user_only 固定修订绑定当前分身。"
+                    "生成待本人审核的自创 Skill 或固定 GitHub Skill 导入提案；批准前不可见，"
+                    "批准后以固定修订绑定当前分身。"
                 ),
                 "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$"},
-                        "description": {"type": "string", "minLength": 1, "maxLength": 500},
-                        "instructions": {"type": "string", "minLength": 1, "maxLength": 48000},
-                        "requested_tools": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "maxItems": 32,
-                        },
-                        "files": {
-                            "type": "array",
-                            "maxItems": 20,
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "artifact_id": {"type": "string"},
-                                    "path": {"type": "string"},
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "properties": {
+                                "proposal_kind": {"const": "authored"},
+                                "name": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$"},
+                                "description": {"type": "string", "minLength": 1, "maxLength": 500},
+                                "instructions": {"type": "string", "minLength": 1, "maxLength": 48000},
+                                "requested_tools": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "maxItems": 32,
                                 },
-                                "required": ["artifact_id", "path"],
-                                "additionalProperties": False,
+                                "files": {
+                                    "type": "array",
+                                    "maxItems": 20,
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "artifact_id": {"type": "string"},
+                                            "path": {"type": "string"},
+                                        },
+                                        "required": ["artifact_id", "path"],
+                                        "additionalProperties": False,
+                                    },
+                                },
+                                "target_skill_id": {"type": ["string", "null"]},
                             },
+                            "required": ["name", "description", "instructions", "requested_tools", "files"],
+                            "additionalProperties": False,
                         },
-                        "target_skill_id": {"type": ["string", "null"]},
-                    },
-                    "required": ["name", "description", "instructions", "requested_tools", "files"],
-                    "additionalProperties": False,
+                        {
+                            "type": "object",
+                            "properties": {
+                                "proposal_kind": {"const": "remote_import"},
+                                "source_url": {"const": "https://github.com/mattpocock/skills"},
+                                "revision": {"type": "string", "pattern": "^[a-fA-F0-9]{40}$"},
+                                "source_subpath": {"type": "string", "minLength": 1, "maxLength": 512},
+                            },
+                            "required": ["proposal_kind", "source_url", "revision", "source_subpath"],
+                            "additionalProperties": False,
+                        },
+                    ],
                 },
                 "output_schema": {
                     "type": "object",

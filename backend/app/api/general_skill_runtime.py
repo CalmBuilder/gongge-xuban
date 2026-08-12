@@ -8,11 +8,24 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from sqlmodel import Session
 
 from app.db import get_session
+from app.config import Settings, get_settings
 from app.db.models import User
+from app.api.general_skill_imports import get_general_skill_remote_fetcher
+from app.general_skills.install_intents import (
+    GeneralSkillInstallIntentError,
+    GeneralSkillInstallIntentService,
+)
+from app.general_skills.install_intent_schema import (
+    GeneralSkillInstallIntentCreate,
+    GeneralSkillInstallIntentRead,
+    GeneralSkillInstallIntentResolve,
+)
+from app.general_skills.object_store import FileSystemSkillObjectStore
+from app.general_skills.remote_source import RemoteFetcher
 from app.general_skills.runtime import GeneralSkillRuntimeError, GeneralSkillRuntimeService
 from app.general_skills.runtime_schema import (
     GeneralSkillLoadRead,
@@ -31,6 +44,98 @@ router = APIRouter(
     tags=["chat:general-skills"],
     dependencies=[Depends(get_current_user)],
 )
+
+
+def _install_service(db: Session, settings: Settings) -> GeneralSkillInstallIntentService:
+    """创建复用正式对象存储的对话安装服务。"""
+
+    if not settings.general_skill_import_v2_enabled:
+        raise HTTPException(status_code=404, detail={"error_code": "FEATURE_NOT_AVAILABLE"})
+    return GeneralSkillInstallIntentService(
+        db,
+        FileSystemSkillObjectStore(settings.general_skill_object_store_path),
+    )
+
+
+@router.get(
+    "/{session_id}/general-skill-install-intents",
+    response_model=list[GeneralSkillInstallIntentRead],
+)
+def list_general_skill_install_intents(
+    session_id: str,
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+    settings: Settings = Depends(get_settings),
+) -> list[GeneralSkillInstallIntentRead]:
+    """恢复当前用户会话中的全部持久安装卡。"""
+
+    try:
+        return _install_service(db, settings).list_session(session_id, current_user=current_user)
+    except GeneralSkillInstallIntentError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"error_code": exc.code, "message": str(exc)},
+        ) from exc
+
+
+@router.post(
+    "/{session_id}/general-skill-install-intents",
+    response_model=GeneralSkillInstallIntentRead,
+    status_code=202,
+)
+def create_general_skill_install_intent(
+    session_id: str,
+    payload: GeneralSkillInstallIntentCreate,
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+    settings: Settings = Depends(get_settings),
+    fetcher: RemoteFetcher = Depends(get_general_skill_remote_fetcher),
+) -> GeneralSkillInstallIntentRead:
+    """由明确 UI 动作创建固定 GitHub 来源的待本人确认卡。"""
+
+    try:
+        return _install_service(db, settings).create(
+            session_id,
+            payload,
+            idempotency_key=idempotency_key,
+            current_user=current_user,
+            fetcher=fetcher,
+        )
+    except GeneralSkillInstallIntentError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"error_code": exc.code, "message": str(exc)},
+        ) from exc
+
+
+@router.post(
+    "/{session_id}/general-skill-install-intents/{intent_id}/resolve",
+    response_model=GeneralSkillInstallIntentRead,
+)
+def resolve_general_skill_install_intent(
+    session_id: str,
+    intent_id: str,
+    payload: GeneralSkillInstallIntentResolve,
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+    settings: Settings = Depends(get_settings),
+) -> GeneralSkillInstallIntentRead:
+    """以本人点击、命令 ID 和乐观锁确认或取消安装卡。"""
+
+    try:
+        return _install_service(db, settings).resolve(
+            session_id,
+            intent_id,
+            command=payload.command,
+            expected_row_version=payload.expected_row_version,
+            current_user=current_user,
+        )
+    except GeneralSkillInstallIntentError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"error_code": exc.code, "message": str(exc)},
+        ) from exc
 
 
 def _http_error(exc: GeneralSkillRuntimeError) -> HTTPException:
