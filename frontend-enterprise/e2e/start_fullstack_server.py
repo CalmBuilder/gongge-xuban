@@ -277,6 +277,7 @@ def configure_environment(database_path: Path) -> None:
             "GENERAL_SKILL_RESOLVER_V2_ENABLED": "true",
             "GENERAL_SKILL_DYNAMIC_GUIDANCE_ENABLED": "true",
             "GENERAL_SKILL_AGENT_PROPOSAL_ENABLED": "true",
+            "DYNAMIC_TASK_SKILL_LOADING_ENABLED": "true",
             "GONGGE_XUBAN_DATA_DIR": str(E2E_RUNTIME_DIR / "user-data"),
         }
     )
@@ -2114,6 +2115,7 @@ def install_schedule_llm_override() -> None:
     from app.llm.stage_protocol import STAGE_PROTOCOL_KEY
 
     original_generate_text = LLMClient.generate_text
+    original_generate_text_stream = LLMClient.generate_text_stream
 
     def deterministic_json(
         client: LLMClient,
@@ -3451,6 +3453,35 @@ def install_schedule_llm_override() -> None:
         return original_generate_text(client, system_prompt, user_payload, response_format)
 
     LLMClient.generate_text = deterministic_text
+
+    def deterministic_text_stream(
+        client: LLMClient,
+        system_prompt: str,
+        user_payload: dict[str, object] | str,
+        *,
+        is_cancelled=None,
+    ):
+        """让隔离 Skill 场景走真实流式/SSE边界，同时禁止占位密钥访问外部供应商。"""
+
+        context = user_payload.get("conversation_context") if isinstance(user_payload, dict) else None
+        loaded = context.get("loaded_general_skills") if isinstance(context, dict) else None
+        if isinstance(loaded, list) and loaded:
+            text = deterministic_text(client, system_prompt, user_payload)
+            for index in range(0, len(text), 8):
+                if is_cancelled and is_cancelled():
+                    from app.llm.client import LLMStreamCancelled
+
+                    raise LLMStreamCancelled("E2E deterministic stream cancelled")
+                yield text[index : index + 8]
+            return
+        yield from original_generate_text_stream(
+            client,
+            system_prompt,
+            user_payload,
+            is_cancelled=is_cancelled,
+        )
+
+    LLMClient.generate_text_stream = deterministic_text_stream
 
 
 def seed_connection_browser_fixtures() -> None:
