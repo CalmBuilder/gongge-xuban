@@ -3,7 +3,7 @@
  * @Author     : zhanglp8181
  * @File       : live_stream_cancel_browser_regression.mjs
  * @CallChain  : Chromium 普通用户 → 聊天 SSE → 停止生成 → 刷新恢复
- * @Description: 验证真实浏览器在首 token 前取消长模型请求，且取消终态刷新后仍一致。
+ * @Description: 正向验证取消终态刷新一致，反向验证普通刷新断连不会被误判为用户取消。
  */
 
 import { chromium } from '../frontend-enterprise/node_modules/playwright/index.mjs';
@@ -64,18 +64,99 @@ try {
   await page.reload();
   await page.waitForLoadState('networkidle');
   const afterRefresh = await page.locator('body').innerText();
-  await page.screenshot({ path: `.dev/${sessionId}-stream-cancel.png`, fullPage: true });
+  await page.screenshot({
+    path: 'docs/manuals/assets/openworker-runtime-enhancements/05-stream-cancel-refresh.png',
+    fullPage: true,
+  });
+
+  // 反向路径：新 Turn 在生成中只刷新页面，不点击停止；断连不应持久化 cancelled 终态。
+  const beforeDisconnectEvents = await page.evaluate(async (targetSessionId) => {
+    const auth = JSON.parse(localStorage.getItem('gongge_auth'));
+    const response = await fetch(`/api/chat/sessions/${targetSessionId}/events?tenant_id=tenant_demo`, {
+      headers: { Authorization: `Bearer ${auth.token}` },
+    });
+    return response.json();
+  }, sessionId);
+  const priorUserTurns = new Set(
+    beforeDisconnectEvents
+      .filter((event) => event.event === 'user_message_received')
+      .map((event) => event.data?.user_message_id),
+  );
+  const priorCancelledTurns = new Set(
+    beforeDisconnectEvents
+      .filter((event) => event.event === 'stream_cancelled')
+      .map((event) => event.data?.user_message_id || event.data?.turn_id),
+  );
+  const composerAfterRefresh = page.getByPlaceholder('输入消息，按 Enter 发送...');
+  await composerAfterRefresh.fill('请用中文列出十条合同归档检查事项，每条一句。');
+  await page.getByRole('button', { name: '发送', exact: true }).last().click();
+  let disconnectTurn = '';
+  for (let attempt = 0; attempt < 120; attempt += 1) {
+    const currentEvents = await page.evaluate(async (targetSessionId) => {
+      const auth = JSON.parse(localStorage.getItem('gongge_auth'));
+      const response = await fetch(`/api/chat/sessions/${targetSessionId}/events?tenant_id=tenant_demo`, {
+        headers: { Authorization: `Bearer ${auth.token}` },
+      });
+      return response.json();
+    }, sessionId);
+    disconnectTurn = [...currentEvents]
+      .reverse()
+      .find(
+        (event) => event.event === 'user_message_received'
+          && !priorUserTurns.has(event.data?.user_message_id),
+      )?.data?.user_message_id || '';
+    if (disconnectTurn) break;
+    await page.waitForTimeout(100);
+  }
+  if (!disconnectTurn) throw new Error('未取得断连反例 Turn 的权威 user_message_id');
+  const stopAfterReloadScenario = page.locator('button[aria-label="停止生成"]');
+  await stopAfterReloadScenario.waitFor({ state: 'visible', timeout: 60_000 });
+  await page.reload();
+  await page.waitForLoadState('networkidle');
+  let afterDisconnectEvents = [];
+  for (let attempt = 0; attempt < 120; attempt += 1) {
+    afterDisconnectEvents = await page.evaluate(async (targetSessionId) => {
+      const auth = JSON.parse(localStorage.getItem('gongge_auth'));
+      const response = await fetch(`/api/chat/sessions/${targetSessionId}/events?tenant_id=tenant_demo`, {
+        headers: { Authorization: `Bearer ${auth.token}` },
+      });
+      if (!response.ok) throw new Error(`${response.status} events`);
+      return response.json();
+    }, sessionId);
+    const terminal = afterDisconnectEvents.some(
+      (event) => ['stream_end', 'stream_cancelled', 'error_occurred'].includes(event.event)
+        && (event.data?.user_message_id || event.data?.turn_id) === disconnectTurn,
+    );
+    if (terminal) break;
+    await page.waitForTimeout(500);
+  }
+  await page.screenshot({
+    path: 'docs/manuals/assets/openworker-runtime-enhancements/06-disconnect-is-not-cancel.png',
+    fullPage: true,
+  });
+  const disconnectWasCancelled = afterDisconnectEvents.some(
+    (event) => event.event === 'stream_cancelled'
+      && (event.data?.user_message_id || event.data?.turn_id) === disconnectTurn
+      && !priorCancelledTurns.has(disconnectTurn),
+  );
+  const disconnectCompleted = afterDisconnectEvents.some(
+    (event) => event.event === 'stream_end'
+      && (event.data?.user_message_id || event.data?.turn_id) === disconnectTurn,
+  );
 
   console.log(JSON.stringify({
     sessionId,
     stoppedBeforeRefresh: beforeRefresh.includes('已停止生成'),
     stoppedAfterRefresh: afterRefresh.includes('已停止生成'),
+    disconnectDidNotAddCancelledTerminal: !disconnectWasCancelled,
+    disconnectTurnCompleted: disconnectCompleted,
     browserErrors,
     failedResponses,
   }, null, 2));
   if (!beforeRefresh.includes('已停止生成')) process.exitCode = 2;
   if (!afterRefresh.includes('已停止生成')) process.exitCode = 3;
-  if (browserErrors.length) process.exitCode = 4;
+  if (disconnectWasCancelled || !disconnectCompleted) process.exitCode = 4;
+  if (browserErrors.length || failedResponses.length) process.exitCode = 5;
 } catch (error) {
   console.error(JSON.stringify({
     url: page.url(),

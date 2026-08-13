@@ -29,9 +29,102 @@ beforeEach(() => {
     kind: 'dynamic_task',
     status: 'running',
     revision: 12,
+    agent_id: 'agent_demo',
+    session_id: 'session_demo',
+    plan_revision_number: 2,
     goal: '生成合同风险简报',
     current_step_key: 'read_contract',
+    parallel_waves: [],
   });
+});
+
+it('从当前会话可用目录给运行中任务增加固定 Skill', async () => {
+  /** 页面只提交服务端 Skill ID；正文、修订和授权均由运行时重新固定与校验。 */
+
+  vi.mocked(api.get).mockImplementation(async (path: string) => {
+    if (path.includes('/general-skills?agent_id=')) {
+      return {
+        session_id: 'session_demo',
+        agent_id: 'agent_demo',
+        items: [
+          {
+            skill_id: 'skill_writing',
+            revision_id: 'revision_writing_3',
+            revision_number: 3,
+            name: 'writing-for-agents',
+            description: '把复杂任务写成可执行规范',
+            invocation_policy: 'model_allowed',
+            revision_policy: 'pinned',
+            enabled: true,
+          },
+          {
+            skill_id: 'skill_muted',
+            revision_id: 'revision_muted',
+            revision_number: 1,
+            name: '已静音 Skill',
+            description: '不应允许追加',
+            invocation_policy: 'user_only',
+            revision_policy: 'pinned',
+            enabled: false,
+          },
+        ],
+      };
+    }
+    return {
+      id: 'execution_1', kind: 'dynamic_task', status: 'running', revision: 12,
+      agent_id: 'agent_demo', session_id: 'session_demo', plan_revision_number: 2,
+      goal: '生成合同风险简报', parallel_waves: [],
+    };
+  });
+  vi.mocked(api.post).mockResolvedValue({
+    command_id: 'add_skill_1', command_type: 'add_skill', status: 'pending',
+  });
+  const user = userEvent.setup();
+  renderControl();
+
+  await user.click(await screen.findByRole('button', { name: '运行中增加 Skill' }));
+  expect(await screen.findByText('writing-for-agents')).toBeInTheDocument();
+  expect(screen.queryByText('已静音 Skill')).not.toBeInTheDocument();
+  await user.click(screen.getByRole('radio', { name: /writing-for-agents/ }));
+  await user.click(screen.getByRole('button', { name: '确认增加 Skill' }));
+
+  await waitFor(() => expect(api.post).toHaveBeenCalledTimes(1));
+  expect(vi.mocked(api.post).mock.calls[0][1]).toMatchObject({
+    tenant_id: 'tenant_demo',
+    command_type: 'add_skill',
+    expected_revision: 12,
+    payload: { skill_id: 'skill_writing', trigger: 'user' },
+  });
+  expect(await screen.findByText('Skill 等待安全边界加载')).toBeInTheDocument();
+});
+
+it('没有可用 Skill 时禁止提交，并展示真实并行波次与计划版本', async () => {
+  /** 空目录不能构造 add_skill 命令；并行提示必须来自持久批次而非前端计时推测。 */
+
+  vi.mocked(api.get).mockImplementation(async (path: string) => {
+    if (path.includes('/general-skills?agent_id=')) {
+      return { session_id: 'session_demo', agent_id: 'agent_demo', items: [] };
+    }
+    return {
+      id: 'execution_1', kind: 'dynamic_task', status: 'running', revision: 18,
+      agent_id: 'agent_demo', session_id: 'session_demo', plan_revision_number: 4,
+      goal: '并行核验合同与供应商',
+      parallel_waves: [{
+        id: 'wave_1', status: 'succeeded', parallelism: 2,
+        ordered_step_keys: ['read_contract', 'read_partner'],
+      }],
+    };
+  });
+  const user = userEvent.setup();
+  renderControl();
+
+  expect(await screen.findByText(/计划 v4/)).toBeInTheDocument();
+  expect(screen.getByText('并行读取 · 2 路 · 已完成')).toBeInTheDocument();
+  expect(screen.getByText('read_contract → read_partner')).toBeInTheDocument();
+  await user.click(screen.getByRole('button', { name: '运行中增加 Skill' }));
+  expect(await screen.findByText('当前会话没有可追加的 Skill')).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: '确认增加 Skill' })).toBeDisabled();
+  expect(api.post).not.toHaveBeenCalled();
 });
 
 it('终态执行展示权威 Artifact 并通过鉴权 API 下载', async () => {

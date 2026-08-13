@@ -3901,12 +3901,8 @@ class DynamicTaskAgent:
 
         if not getattr(get_settings(), "dynamic_task_skill_loading_enabled", False):
             return None
-        planner = self.planner or DynamicTaskPlanner(
-            LLMClient(model_config),
-            explore_enabled=self.explore_enabled,
-        )
-        selector = getattr(planner, "select_guidance_skills", None)
-        if not callable(selector):
+        list_general_skills = getattr(self.catalog, "list_general_skills", None)
+        if not callable(list_general_skills):
             return None
         active_skill_ids = {
             row.skill_id
@@ -3920,7 +3916,7 @@ class DynamicTaskAgent:
         }
         catalog = [
             row
-            for row in self.catalog.list_general_skills(
+            for row in list_general_skills(
                 instance.tenant_id,
                 str(instance.agent_id),
                 actor_user_id=actor_user_id,
@@ -3929,6 +3925,13 @@ class DynamicTaskAgent:
             and row.contract.get("invocation_policy") == "model_allowed"
         ]
         if not catalog:
+            return None
+        planner = self.planner or DynamicTaskPlanner(
+            LLMClient(model_config),
+            explore_enabled=self.explore_enabled,
+        )
+        selector = getattr(planner, "select_guidance_skills", None)
+        if not callable(selector):
             return None
         autonomous_count = len(
             self.db.exec(

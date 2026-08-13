@@ -22,6 +22,7 @@ from app.api.executions import (
     issue_execution_command,
 )
 from app.db.models import (
+    DynamicReadDispatchBatch,
     ExecutionCommand,
     ExecutionPlanRevision,
     GeneralSkillUse,
@@ -195,11 +196,25 @@ def test_execution_card_projects_plan_progress_budget_and_attention(db: Session)
             status="offered",
         )
     )
+    db.add(
+        DynamicReadDispatchBatch(
+            id="readbatch_card",
+            tenant_id="tenant_demo",
+            execution_id=instance.id,
+            plan_revision_id=plan.id,
+            wave_checksum="d" * 64,
+            ordered_step_keys_json=["read_contract", "read_party"],
+            status="succeeded",
+            parallelism=2,
+        )
+    )
     db.commit()
 
     card = get_execution(instance.id, "tenant_demo", owner, db)
 
     assert card.goal == "生成合同风险简报"
+    assert card.agent_id == "agent_demo"
+    assert card.plan_revision_number == 1
     assert card.success_criteria == ["覆盖合同证据"]
     assert card.current_step_key == "clarify_region"
     assert card.steps[0]["status"] == "pending"
@@ -207,6 +222,10 @@ def test_execution_card_projects_plan_progress_budget_and_attention(db: Session)
     assert card.budget == {"max_steps": 4, "max_model_calls": 8}
     assert card.usage == {"model_calls": 3, "tool_calls": 1}
     assert card.pending_attention_count == 1
+    assert len(card.parallel_waves) == 1
+    assert card.parallel_waves[0].parallelism == 2
+    assert card.parallel_waves[0].ordered_step_keys == ["read_contract", "read_party"]
+    assert card.parallel_waves[0].status == "succeeded"
 
 
 def test_execution_card_preserves_completed_step_across_plan_revision(db: Session) -> None:

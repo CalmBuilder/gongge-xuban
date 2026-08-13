@@ -15,8 +15,9 @@ from sqlmodel import Session, select
 from app.config import get_settings
 from app.db import get_session
 from app.db.models import (
-    ExecutionCommand,
+    DynamicReadDispatchBatch,
     ExecutionArtifact,
+    ExecutionCommand,
     ExecutionPlanRevision,
     ExecutionPublication,
     ExecutionResult,
@@ -71,18 +72,29 @@ class ExecutionArtifactSummary(BaseModel):
     source_step_key: str
 
 
+class ParallelReadWaveSummary(BaseModel):
+    """返回执行卡可审计的持久并行读取波次，而非由前端耗时推测并发。"""
+
+    id: str
+    status: str
+    parallelism: int
+    ordered_step_keys: list[str]
+
+
 class ExecutionRead(BaseModel):
     """返回执行卡可直接使用、无需由聊天消息推导的权威状态。"""
 
     id: str
     tenant_id: str
     session_id: str
+    agent_id: str | None
     kind: str
     status: str
     revision: int
     effect_state: str
     cancellation_disposition: str
     current_plan_revision_id: str | None
+    plan_revision_number: int | None
     current_result_id: str | None
     terminal_reason: dict[str, object]
     goal: str | None
@@ -92,6 +104,7 @@ class ExecutionRead(BaseModel):
     budget: dict[str, object]
     usage: dict[str, object]
     pending_attention_count: int
+    parallel_waves: list[ParallelReadWaveSummary]
     artifacts: list[ExecutionArtifactSummary]
 
 
@@ -318,6 +331,23 @@ def _execution_read(db: Session, instance: SopInstance, current_user: User) -> E
             )
         ).all()
     )
+    parallel_waves = [
+        ParallelReadWaveSummary(
+            id=batch.id,
+            status=batch.status,
+            parallelism=batch.parallelism,
+            ordered_step_keys=list(batch.ordered_step_keys_json or []),
+        )
+        for batch in db.exec(
+            select(DynamicReadDispatchBatch)
+            .where(
+                DynamicReadDispatchBatch.tenant_id == instance.tenant_id,
+                DynamicReadDispatchBatch.execution_id == instance.id,
+            )
+            .order_by(DynamicReadDispatchBatch.created_at.desc())
+            .limit(5)
+        ).all()
+    ]
     goal_snapshot = dict(instance.goal_snapshot_json or {})
     criteria = plan.get("success_criteria", goal_snapshot.get("success_criteria", []))
     artifact_service = ArtifactService(db)
@@ -352,12 +382,14 @@ def _execution_read(db: Session, instance: SopInstance, current_user: User) -> E
         id=instance.id,
         tenant_id=instance.tenant_id,
         session_id=instance.session_id,
+        agent_id=instance.agent_id,
         kind=instance.kind,
         status=instance.status,
         revision=instance.revision,
         effect_state=instance.effect_state,
         cancellation_disposition=instance.cancellation_disposition,
         current_plan_revision_id=instance.current_plan_revision_id,
+        plan_revision_number=plan_revision.revision_number if plan_revision is not None else None,
         current_result_id=instance.current_result_id,
         terminal_reason=dict(instance.terminal_reason_json or {}),
         goal=str(plan.get("goal") or goal_snapshot.get("goal") or "").strip() or None,
@@ -369,6 +401,7 @@ def _execution_read(db: Session, instance: SopInstance, current_user: User) -> E
         budget=dict(instance.budget_snapshot_json or plan.get("budget") or {}),
         usage=dict((instance.context_json or {}).get("dynamic_budget_usage") or {}),
         pending_attention_count=pending_attention_count,
+        parallel_waves=parallel_waves,
         artifacts=artifacts,
     )
 
