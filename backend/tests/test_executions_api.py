@@ -23,14 +23,18 @@ from app.api.executions import (
 )
 from app.db.models import (
     DynamicReadDispatchBatch,
+    DynamicReadDispatchItem,
+    DynamicReadDispatchResult,
     ExecutionCommand,
     ExecutionPlanRevision,
     GeneralSkillUse,
     SopInstance,
     SopNodeExecution,
+    SopOperationAttempt,
     SopWorkItem,
     Tenant,
     User,
+    utc_now,
 )
 
 
@@ -208,6 +212,58 @@ def test_execution_card_projects_plan_progress_budget_and_attention(db: Session)
             parallelism=2,
         )
     )
+    db.add(
+        DynamicReadDispatchItem(
+            tenant_id="tenant_demo",
+            batch_id="readbatch_card",
+            execution_id=instance.id,
+            plan_revision_id=plan.id,
+            position=0,
+            step_key="read_contract",
+            node_execution_id="node_read_contract",
+            operation_id="operation_read_contract",
+            operation_revision_at_start=1,
+            dispatch_token="e" * 64,
+            capability_checksum="f" * 64,
+            request_fingerprint="1" * 64,
+            status="settled",
+        )
+    )
+    db.add(
+        DynamicReadDispatchResult(
+            tenant_id="tenant_demo",
+            dispatch_token="e" * 64,
+            status="succeeded",
+            started_at=utc_now(),
+            finished_at=utc_now(),
+        )
+    )
+    db.add(
+        SopOperationAttempt(
+            tenant_id="tenant_demo",
+            instance_id=instance.id,
+            operation_id="operation_read_contract",
+            node_execution_id="node_read_contract",
+            attempt_number=1,
+            status="succeeded",
+        )
+    )
+    db.add(
+        GeneralSkillUse(
+            tenant_id="tenant_demo",
+            session_id=instance.session_id,
+            turn_id="turn_card",
+            execution_id=instance.id,
+            agent_id="agent_demo",
+            user_id=owner.id,
+            skill_id="skill_card",
+            revision_id="revision_card",
+            content_checksum="2" * 64,
+            selection_mode="forced",
+            status="completed",
+            idempotency_key="card-use",
+        )
+    )
     db.commit()
 
     card = get_execution(instance.id, "tenant_demo", owner, db)
@@ -215,6 +271,7 @@ def test_execution_card_projects_plan_progress_budget_and_attention(db: Session)
     assert card.goal == "生成合同风险简报"
     assert card.agent_id == "agent_demo"
     assert card.plan_revision_number == 1
+    assert card.plan_reason == "initial"
     assert card.success_criteria == ["覆盖合同证据"]
     assert card.current_step_key == "clarify_region"
     assert card.steps[0]["status"] == "pending"
@@ -226,6 +283,13 @@ def test_execution_card_projects_plan_progress_budget_and_attention(db: Session)
     assert card.parallel_waves[0].parallelism == 2
     assert card.parallel_waves[0].ordered_step_keys == ["read_contract", "read_party"]
     assert card.parallel_waves[0].status == "succeeded"
+    assert card.parallel_waves[0].item_count == 1
+    assert card.parallel_waves[0].settled_item_count == 1
+    assert card.parallel_waves[0].result_count == 1
+    assert card.parallel_waves[0].attempt_count == 1
+    assert card.skill_uses[0].revision_id == "revision_card"
+    assert card.skill_uses[0].content_checksum == "2" * 64
+    assert card.skill_uses[0].status == "completed"
 
 
 def test_execution_card_preserves_completed_step_across_plan_revision(db: Session) -> None:

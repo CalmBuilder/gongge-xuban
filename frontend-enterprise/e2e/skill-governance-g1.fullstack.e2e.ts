@@ -106,21 +106,43 @@ test('G1-A 正式 GitHub Skill 导入后从我的 Skill 库原子装配多个数
       body: JSON.stringify({
         tenant_id: 'tenant_demo', session_id: session.id,
         agent_id: 'agent_skill_demo_a_docs', client_turn_id: 'turn_g1_a_consume',
-        message: '使用本轮选定的指南编写售后升级处理文档', channel: 'web',
+        message: 'G1-A动态：使用固定 writing-for-agents Skill 编写含输入、步骤、异常和验收标准的售后升级操作规范', channel: 'web',
         forced_general_skill_id: skillId,
       }),
     });
     const body = await response.text();
     const events = await fetch(
       `/api/chat/sessions/${session.id}/events?tenant_id=tenant_demo`, { headers },
-    ).then((eventResponse) => eventResponse.json()) as Array<{ event_type: string }>;
-    return { status: response.status, body, events };
+    ).then((eventResponse) => eventResponse.json()) as Array<{
+      event_type: string; data?: Record<string, unknown>;
+    }>;
+    const executionId = String(
+      events.find((event) => event.event_type === 'dynamic_task_delegated')?.data?.execution_id || '',
+    );
+    const execution = executionId
+      ? await fetch(`/api/executions/${executionId}?tenant_id=tenant_demo`, { headers })
+        .then((eventResponse) => eventResponse.json())
+      : null;
+    return { status: response.status, body, events, executionId, execution };
   }, skill?.id);
   expect(consumed.status).toBe(200);
-  expect(consumed.body).toContain('G1-A-CONSUMED-SUCCESS');
+  expect(consumed.body).toContain('G1-A-DYNAMIC-CONSUMED-SUCCESS');
   expect(consumed.events.map((event) => event.event_type)).toEqual(expect.arrayContaining([
-    'skill_loaded', 'skill_use_completed',
+    'skill_loaded', 'dynamic_task_delegated', 'execution_succeeded', 'skill_use_completed',
   ]));
+  expect(consumed.executionId).not.toBe('');
+  expect(consumed.execution).toMatchObject({ status: 'succeeded' });
+  const executionUses = consumed.execution?.skill_uses as Array<{
+    id: string; skill_id: string; content_checksum: string; status: string;
+  }>;
+  const executionSteps = consumed.execution?.steps as Array<{
+    kind: string; guidance_skill_use_ids: string[];
+  }>;
+  const fixedUse = executionUses.find((use) => use.skill_id === skill?.id);
+  expect(fixedUse).toMatchObject({ status: 'completed' });
+  expect(fixedUse?.content_checksum).toMatch(/^[a-f0-9]{64}$/);
+  expect(executionSteps.find((step) => step.kind === 'answer')?.guidance_skill_use_ids)
+    .toContain(fixedUse?.id);
   expect(browserFailures).toEqual([]);
 });
 
@@ -797,4 +819,49 @@ test('G1.4 整 Agent 变更后旧申请失效，B 从已审冻结快照采用第
   expect(adoptionFacts.tddBody).toContain('G1-C1-CONSUMED-SUCCESS');
   expect(adoptionFacts.authoredStatus).toBe(200);
   expect(adoptionFacts.authoredBody).toContain('S5-CONSUMED-SUCCESS');
+});
+
+test('G1 反向权限：采用者不能查看或把所有者其他私有 Skill 绑定到本人分身', async ({ page }) => {
+  await page.goto('/enterprise/dashboard');
+  const privateSkill = await page.evaluate(async () => {
+    const login = await fetch('/api/auth/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tenant_id: 'tenant_demo', username: 'member', password: 'member' }),
+    });
+    const auth = await login.json() as { token: string };
+    const skills = await fetch('/api/enterprise/my-general-skills', {
+      headers: { Authorization: `Bearer ${auth.token}` },
+    }).then((response) => response.json()) as Array<{
+      id: string; name: string; current_revision_id: string;
+    }>;
+    const target = skills.find((item) => item.name === 'writing-for-agents');
+    if (!target) throw new Error('owner private Skill missing');
+    return target;
+  });
+
+  const denied = await page.evaluate(async (target) => {
+    const login = await fetch('/api/auth/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tenant_id: 'tenant_demo', username: 'member-two', password: 'member-two' }),
+    });
+    const auth = await login.json() as { token: string };
+    localStorage.setItem('gongge_auth', JSON.stringify(auth));
+    const headers = { Authorization: `Bearer ${auth.token}`, 'Content-Type': 'application/json' };
+    const library = await fetch('/api/enterprise/my-general-skills', { headers })
+      .then((response) => response.json()) as Array<{ id: string; name: string }>;
+    const response = await fetch('/api/enterprise/general-skill-governance/bindings', {
+      method: 'POST', headers,
+      body: JSON.stringify({
+        agent_id: 'agent_skill_demo_d_adopter',
+        skill_id: target.id,
+        revision_policy: 'pinned',
+        pinned_revision_id: target.current_revision_id,
+        invocation_policy: 'model_allowed',
+      }),
+    });
+    return { library, status: response.status, body: await response.json() };
+  }, privateSkill);
+  expect(denied.library.map((item) => item.id)).not.toContain(privateSkill.id);
+  expect(denied.status).toBe(403);
+  expect(denied.body.detail.code).toBe('GENERAL_SKILL_FORBIDDEN');
 });

@@ -16,11 +16,15 @@ from app.config import get_settings
 from app.db import get_session
 from app.db.models import (
     DynamicReadDispatchBatch,
+    DynamicReadDispatchItem,
+    DynamicReadDispatchResult,
     ExecutionArtifact,
     ExecutionCommand,
     ExecutionPlanRevision,
     ExecutionPublication,
     ExecutionResult,
+    GeneralSkillUse,
+    SopOperationAttempt,
     SopInstance,
     SopNodeExecution,
     SopWorkItem,
@@ -79,6 +83,21 @@ class ParallelReadWaveSummary(BaseModel):
     status: str
     parallelism: int
     ordered_step_keys: list[str]
+    item_count: int
+    settled_item_count: int
+    result_count: int
+    attempt_count: int
+
+
+class ExecutionSkillUseSummary(BaseModel):
+    """返回当前 Execution 实际消费的固定 Skill 修订事实，不暴露正文。"""
+
+    id: str
+    skill_id: str
+    revision_id: str
+    content_checksum: str
+    selection_mode: str
+    status: str
 
 
 class ExecutionRead(BaseModel):
@@ -95,6 +114,7 @@ class ExecutionRead(BaseModel):
     cancellation_disposition: str
     current_plan_revision_id: str | None
     plan_revision_number: int | None
+    plan_reason: str | None
     current_result_id: str | None
     terminal_reason: dict[str, object]
     goal: str | None
@@ -105,6 +125,7 @@ class ExecutionRead(BaseModel):
     usage: dict[str, object]
     pending_attention_count: int
     parallel_waves: list[ParallelReadWaveSummary]
+    skill_uses: list[ExecutionSkillUseSummary]
     artifacts: list[ExecutionArtifactSummary]
 
 
@@ -312,6 +333,11 @@ def _execution_read(db: Session, instance: SopInstance, current_user: User) -> E
                 ],
                 "status": node.status if node is not None else "pending",
                 "attempt": node.attempt if node is not None else 0,
+                "guidance_skill_use_ids": [
+                    str(value)
+                    for value in raw_step.get("guidance_skill_use_ids", [])
+                    if isinstance(value, str)
+                ],
             }
         )
     current_step = next(
@@ -331,14 +357,8 @@ def _execution_read(db: Session, instance: SopInstance, current_user: User) -> E
             )
         ).all()
     )
-    parallel_waves = [
-        ParallelReadWaveSummary(
-            id=batch.id,
-            status=batch.status,
-            parallelism=batch.parallelism,
-            ordered_step_keys=list(batch.ordered_step_keys_json or []),
-        )
-        for batch in db.exec(
+    parallel_batches = list(
+        db.exec(
             select(DynamicReadDispatchBatch)
             .where(
                 DynamicReadDispatchBatch.tenant_id == instance.tenant_id,
@@ -346,6 +366,72 @@ def _execution_read(db: Session, instance: SopInstance, current_user: User) -> E
             )
             .order_by(DynamicReadDispatchBatch.created_at.desc())
             .limit(5)
+        ).all()
+    )
+    parallel_waves: list[ParallelReadWaveSummary] = []
+    for batch in parallel_batches:
+        items = list(
+            db.exec(
+                select(DynamicReadDispatchItem).where(
+                    DynamicReadDispatchItem.tenant_id == instance.tenant_id,
+                    DynamicReadDispatchItem.batch_id == batch.id,
+                )
+            ).all()
+        )
+        dispatch_tokens = [item.dispatch_token for item in items]
+        operation_ids = [item.operation_id for item in items]
+        results = (
+            list(
+                db.exec(
+                    select(DynamicReadDispatchResult).where(
+                        DynamicReadDispatchResult.tenant_id == instance.tenant_id,
+                        DynamicReadDispatchResult.dispatch_token.in_(dispatch_tokens),
+                    )
+                ).all()
+            )
+            if dispatch_tokens
+            else []
+        )
+        attempts = (
+            list(
+                db.exec(
+                    select(SopOperationAttempt).where(
+                        SopOperationAttempt.tenant_id == instance.tenant_id,
+                        SopOperationAttempt.operation_id.in_(operation_ids),
+                    )
+                ).all()
+            )
+            if operation_ids
+            else []
+        )
+        parallel_waves.append(
+            ParallelReadWaveSummary(
+                id=batch.id,
+                status=batch.status,
+                parallelism=batch.parallelism,
+                ordered_step_keys=list(batch.ordered_step_keys_json or []),
+                item_count=len(items),
+                settled_item_count=sum(item.status == "settled" for item in items),
+                result_count=len(results),
+                attempt_count=len(attempts),
+            )
+        )
+    skill_uses = [
+        ExecutionSkillUseSummary(
+            id=use.id,
+            skill_id=use.skill_id,
+            revision_id=use.revision_id,
+            content_checksum=use.content_checksum,
+            selection_mode=use.selection_mode,
+            status=use.status,
+        )
+        for use in db.exec(
+            select(GeneralSkillUse)
+            .where(
+                GeneralSkillUse.tenant_id == instance.tenant_id,
+                GeneralSkillUse.execution_id == instance.id,
+            )
+            .order_by(GeneralSkillUse.created_at, GeneralSkillUse.id)
         ).all()
     ]
     goal_snapshot = dict(instance.goal_snapshot_json or {})
@@ -390,6 +476,7 @@ def _execution_read(db: Session, instance: SopInstance, current_user: User) -> E
         cancellation_disposition=instance.cancellation_disposition,
         current_plan_revision_id=instance.current_plan_revision_id,
         plan_revision_number=plan_revision.revision_number if plan_revision is not None else None,
+        plan_reason=plan_revision.reason if plan_revision is not None else None,
         current_result_id=instance.current_result_id,
         terminal_reason=dict(instance.terminal_reason_json or {}),
         goal=str(plan.get("goal") or goal_snapshot.get("goal") or "").strip() or None,
@@ -402,6 +489,7 @@ def _execution_read(db: Session, instance: SopInstance, current_user: User) -> E
         usage=dict((instance.context_json or {}).get("dynamic_budget_usage") or {}),
         pending_attention_count=pending_attention_count,
         parallel_waves=parallel_waves,
+        skill_uses=skill_uses,
         artifacts=artifacts,
     )
 

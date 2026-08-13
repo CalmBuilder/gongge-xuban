@@ -2246,6 +2246,36 @@ def install_schedule_llm_override() -> None:
 
                 return [loaded_ref_by_base[name] for name in names]
             goal = str(user_payload.get("goal") or "")
+            if "G1-A动态" in goal:
+                writing_guidance = next(
+                    (
+                        str(item.get("name") or "")
+                        for item in loaded_guidance
+                        if isinstance(item, dict)
+                        and "WRITING-FOR-AGENTS-FIXED-COMMIT" in str(item)
+                    ),
+                    "",
+                )
+                if not writing_guidance:
+                    raise RuntimeError("G1-A dynamic planner missed fixed writing guidance")
+                return {
+                    "goal": goal,
+                    "success_criteria": user_payload.get("success_criteria", []),
+                    "constraints": ["必须按固定 writing-for-agents 修订形成可执行规范"],
+                    "assumptions": [],
+                    "steps": [
+                        {
+                            "draft_id": "answer",
+                            "title": "生成售后升级操作规范",
+                            "kind": "answer",
+                            "required": True,
+                            "depends_on": [],
+                            "capability_refs": [],
+                            "guidance_skill_refs": [writing_guidance],
+                            "expected_output_schema": {},
+                        }
+                    ],
+                }
             if "C1远程导入Skill" in goal:
                 capability_names = {
                     str(item.get("name") or "")
@@ -2928,6 +2958,47 @@ def install_schedule_llm_override() -> None:
                 )
                 or (step_title.startswith("确认 ") and "阶段产物" in step_title)
             )
+            if "G1-A动态" in str(user_payload) and step_kind == "answer":
+                if "WRITING-FOR-AGENTS-FIXED-COMMIT" not in str(user_payload):
+                    raise RuntimeError("G1-A dynamic answer missed fixed writing guidance")
+                execution_view = user_payload.get("provider_execution_view", {})
+                execution_context = (
+                    execution_view.get("execution_context", {})
+                    if isinstance(execution_view, dict)
+                    else {}
+                )
+                criteria = [
+                    str(item.get("id") or "")
+                    for item in execution_context.get("success_criteria", [])
+                    if isinstance(item, dict) and item.get("id")
+                ]
+                completed = [
+                    str(item.get("step_key") or "")
+                    for item in execution_context.get("completed_steps", [])
+                    if isinstance(item, dict) and item.get("step_key")
+                ]
+                client._last_completed_response_metadata = {
+                    "response_id": "e2e-g1-a-dynamic-answer",
+                    "finish_reason": "stop",
+                    "usage": {"input_tokens": 12, "output_tokens": 10},
+                }
+                return {
+                    "action_kind": "answer",
+                    "arguments": {
+                        "markdown": (
+                            "G1-A-DYNAMIC-CONSUMED-SUCCESS：已按固定 writing-for-agents 修订"
+                            "生成包含输入、步骤、异常和验收标准的操作规范。"
+                        ),
+                        "criterion_evidence": {
+                            criterion: [*completed, str(current_step.get("step_key") or "answer")]
+                            for criterion in criteria
+                        },
+                        "pending_questions": [],
+                    },
+                    "capability_ref": None,
+                    "expected_output_schema": {},
+                    "rationale": "按固定 Skill 指令形成可验收动态任务结果",
+                }
             is_s4_diagnosis = "agent_e2e_diagnosis" in str(user_payload)
             is_s4 = "S4-DYNAMIC-FULL-GUIDANCE" in str(user_payload)
             if step_title == "提交 C1 远程 Skill 导入提案":

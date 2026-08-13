@@ -23,10 +23,12 @@ from app.agents.branching import ensure_private_resource_binding  # noqa: E402
 from app.config import get_settings  # noqa: E402
 from app.db import engine  # noqa: E402
 from app.db.models import (  # noqa: E402
+    AgentEvent,
     AgentProfile,
     ChatSession,
     Message,
     ModelConfig,
+    SopInstance,
     Tool,
     User,
     new_id,
@@ -46,6 +48,7 @@ from app.dynamic_tasks.planning import (  # noqa: E402
     SuccessCriterion,
 )
 from app.sop_runtime.execution_store import SopExecutionStore  # noqa: E402
+from app.dynamic_tasks.quotas import DynamicTaskQuotaService  # noqa: E402
 from app.tools.tool_schema import ToolResult  # noqa: E402
 
 
@@ -97,9 +100,10 @@ class DemoParallelExecutor:
 
 
 def main() -> None:
-    """建立三个浏览器会话并输出不含凭据的验收 URL 与 Execution ID。"""
+    """建立四个浏览器会话并输出不含凭据的验收 URL 与 Execution ID。"""
 
     with Session(engine, expire_on_commit=False) as db:
+        _release_stale_runtime_demo_capacity(db)
         user, model = _required_identities(db)
         instant = _create_answer_only_session(
             db,
@@ -116,7 +120,55 @@ def main() -> None:
             label="运行中增加 Skill 空目录反例",
         )
         parallel = _create_parallel_session(db, user=user, model=model)
-        print(json.dumps({"instant_skill": instant, "empty_skill": empty, "parallel": parallel}, ensure_ascii=False, indent=2))
+        dynamic_cancel = _create_answer_only_session(
+            db,
+            user=user,
+            model=model,
+            agent_id=SKILL_AGENT_ID,
+            label="流式停止精确桥接动态任务场景",
+            include_unrelated_turn=True,
+        )
+        print(
+            json.dumps(
+                {
+                    "instant_skill": instant,
+                    "empty_skill": empty,
+                    "parallel": parallel,
+                    "dynamic_cancel": dynamic_cancel,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+
+
+def _release_stale_runtime_demo_capacity(db: Session) -> None:
+    """取消本脚本先前遗留的活动演示 Execution，避免重复验收占满真实用户配额。"""
+
+    instances = db.exec(
+        select(SopInstance).where(
+            SopInstance.tenant_id == TENANT_ID,
+            SopInstance.kind == "dynamic_task",
+            SopInstance.source_kind == "chat",
+            SopInstance.status.in_(("created", "running", "waiting")),
+        )
+    ).all()
+    store = SopExecutionStore(db)
+    quotas = DynamicTaskQuotaService(db)
+    for instance in instances:
+        session = db.get(ChatSession, instance.session_id) if instance.session_id else None
+        if session is None or not str(session.title or "").startswith(
+            ("运行中增加 Skill", "流式停止精确桥接", "低风险并行读取")
+        ):
+            continue
+        with store.owned(instance, worker_id=f"runtime-demo-cleanup-{instance.id[-8:]}"):
+            store.request_cancellation(
+                instance,
+                actor_user_id=USER_ID,
+                reason="runtime_demo_reinitialized",
+            )
+            quotas.release_execution(instance)
+    db.commit()
 
 
 def _required_identities(db: Session) -> tuple[User, ModelConfig]:
@@ -147,6 +199,7 @@ def _create_answer_only_session(
     model: ModelConfig,
     agent_id: str,
     label: str,
+    include_unrelated_turn: bool = False,
 ) -> dict[str, str]:
     """创建停在 answer 安全边界的真实动态 Execution，供页面提交 add_skill 命令。"""
 
@@ -176,9 +229,46 @@ def _create_answer_only_session(
         source_ref=user_message_id,
     )
     db.add(Message(id=user_message_id, tenant_id=TENANT_ID, session_id=session_id, role="user", content=label))
+    db.add(
+        AgentEvent(
+            tenant_id=TENANT_ID,
+            session_id=session_id,
+            event_type="user_message_received",
+            payload_json={"user_message_id": user_message_id, "turn_id": user_message_id},
+        )
+    )
+    unrelated_turn_id = ""
+    if include_unrelated_turn:
+        unrelated_turn_id = new_id("msg")
+        db.add(
+            Message(
+                id=unrelated_turn_id,
+                tenant_id=TENANT_ID,
+                session_id=session_id,
+                role="user",
+                content="与动态任务无关的普通 Turn",
+            )
+        )
+        db.add(
+            AgentEvent(
+                tenant_id=TENANT_ID,
+                session_id=session_id,
+                event_type="user_message_received",
+                payload_json={
+                    "user_message_id": unrelated_turn_id,
+                    "turn_id": unrelated_turn_id,
+                },
+            )
+        )
     db.add(Message(tenant_id=TENANT_ID, session_id=session_id, role="assistant", content="动态任务已建立，请在执行卡中继续验收。", metadata_json={"execution_id": instance.id}))
     db.commit()
-    return {"session_id": session_id, "execution_id": instance.id, "url": f"/workspace/chat/{session_id}"}
+    return {
+        "session_id": session_id,
+        "execution_id": instance.id,
+        "source_turn_id": user_message_id,
+        "unrelated_turn_id": unrelated_turn_id,
+        "url": f"/workspace/chat/{session_id}",
+    }
 
 
 def _create_parallel_session(db: Session, *, user: User, model: ModelConfig) -> dict[str, str]:
