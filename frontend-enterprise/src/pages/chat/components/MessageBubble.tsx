@@ -1,4 +1,5 @@
 import ProductIcon from '@/components/ProductIcon';
+import { notify } from '@/components/ui/app-toast';
 import IconThumbUp from '@/assets/icons/thumb-up.svg?react';
 import IconThumbDown from '@/assets/icons/thumb-down.svg?react';
 import { cn } from '@/lib/utils';
@@ -87,6 +88,17 @@ export default function MessageBubble({ chat, item, render }: MessageBubbleProps
     statusOnly,
   } = render;
   const queuedMessage = item.role === 'user' && item.metadata?.queued === true;
+
+  async function copyVisibleAnswer() {
+    /** 只复制页面实际展示的已完成回答，不复制执行轨迹或隐藏 metadata。 */
+
+    try {
+      await navigator.clipboard.writeText(visibleContent);
+      notify.success('回答已复制');
+    } catch {
+      notify.error('复制失败，请手动选择文本');
+    }
+  }
 
   return (
     <div className={cn(CHAT_MESSAGE_ITEM_CLASS, queuedMessage && CHAT_QUEUED_MESSAGE_ITEM_CLASS)}>
@@ -184,6 +196,14 @@ export default function MessageBubble({ chat, item, render }: MessageBubbleProps
 
           {canRateMessage(item) && (
             <div className={CHAT_FEEDBACK_CLASS}>
+              <button
+                type="button"
+                className={CHAT_FEEDBACK_BTN_CLASS}
+                aria-label="复制回答"
+                onClick={() => void copyVisibleAnswer()}
+              >
+                <ProductIcon name="file" size={15} />
+              </button>
               <button
                 type="button"
                 className={cn(CHAT_FEEDBACK_BTN_CLASS, item.feedback_rating === 'up' && CHAT_FEEDBACK_BTN_ACTIVE_CLASS)}

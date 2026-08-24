@@ -498,6 +498,7 @@ class GeneralSkillRuntimeService:
         agent_id: str,
         turn_id: str,
         skill_ids: Sequence[str],
+        expected_revisions: Sequence[tuple[str, str, str]] = (),
         commit: bool = True,
     ) -> tuple[LoadedGeneralSkill, ...]:
         """合并加载用户显式选择的多个主 Skill，共享依赖只生成一条可审计 Use。"""
@@ -528,6 +529,18 @@ class GeneralSkillRuntimeService:
                     ordered.append(item)
             for child_id, parent_id in bundle_parents.items():
                 parents.setdefault(child_id, parent_id)
+        expected = {row[0]: (row[1], row[2]) for row in expected_revisions}
+        if expected and (
+            set(expected) != {item.skill_id for item in ordered}
+            or any(
+                expected[item.skill_id] != (item.revision_id, item.content_checksum)
+                for item in ordered
+            )
+        ):
+            raise GeneralSkillRuntimeError(
+                "GENERAL_SKILL_REVISION_CONFLICT",
+                "composed skill or required dependency changed after planning preview",
+            )
         settings = get_settings()
         if len(ordered) > settings.general_skill_max_loaded_per_turn:
             raise GeneralSkillRuntimeError(
@@ -1022,6 +1035,7 @@ class GeneralSkillRuntimeService:
             blocks.append(
                 {
                     "path": path,
+                    "media_type": media_type,
                     "content_checksum": checksum,
                     "content": content,
                     "truncated": truncated,

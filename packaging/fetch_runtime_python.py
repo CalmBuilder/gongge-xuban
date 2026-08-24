@@ -24,8 +24,17 @@ ASSETS = {
     ("Windows", "AMD64"): "cpython-3.11.9+20240415-x86_64-pc-windows-msvc-install_only.tar.gz",
 }
 # 预装清单（第一版）：含 Word(python-docx) / Excel(openpyxl) 处理；不预装 pandas/numpy（体积大，用户需要时联网装）
-PRELOAD = ["requests", "httpx", "beautifulsoup4", "lxml", "python-docx",
-           "openpyxl", "python-dateutil"]
+PRELOAD = [
+    "requests",
+    "httpx",
+    "beautifulsoup4",
+    "lxml",
+    "python-docx",
+    "openpyxl",
+    "python-dateutil",
+    "pypdf",
+    "pillow",
+]
 
 # 架构别名归一：Windows 返回 AMD64，mac/linux 返回 x86_64/arm64/aarch64
 ARCH_ALIASES = {
@@ -90,12 +99,16 @@ def main(argv: list[str]) -> int:
     # 验证附带 Python 的 SSL 证书 + 关键包可用（否则技能里 https/word/excel 会失败）
     check = subprocess.run(
         [str(py), "-c",
-         "import ssl, requests, docx, openpyxl; "
+         "import ssl, requests, docx, openpyxl, pypdf, PIL; "
          "print(ssl.get_default_verify_paths().cafile or 'certifi')"],
         capture_output=True, text=True,
     )
     if check.returncode != 0:
-        print(f"附带 Python 自检失败（ssl/requests/docx/openpyxl）：{check.stderr}", file=sys.stderr)
+        print(
+            "附带 Python 自检失败（ssl/requests/docx/openpyxl/pypdf/Pillow）："
+            f"{check.stderr}",
+            file=sys.stderr,
+        )
         return 5
     print(f"runtime ready at {py} (ssl: {check.stdout.strip()})")
     return 0

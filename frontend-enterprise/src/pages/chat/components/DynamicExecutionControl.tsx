@@ -105,8 +105,9 @@ export default function DynamicExecutionControl({ executionId }: { executionId: 
     return () => { active = false; window.clearInterval(timer); };
   }, [command, executionId, loadExecution]);
 
-  if (!execution || execution.kind !== 'dynamic_task') return null;
-  const active = ACTIVE_STATUSES.has(execution.status);
+  if (!execution || !['dynamic_task', 'sop'].includes(execution.kind)) return null;
+  const dynamicExecution = execution.kind === 'dynamic_task';
+  const active = dynamicExecution && ACTIVE_STATUSES.has(execution.status);
 
   async function issue(commandType: 'steer' | 'cancel' | 'add_skill') {
     if (!execution || !active) return;
@@ -193,12 +194,12 @@ export default function DynamicExecutionControl({ executionId }: { executionId: 
   }
 
   return (
-    <div className="mt-[10px] rounded-[12px] border border-[#dfe5f2] bg-[linear-gradient(105deg,#f8faff,#f5fbf8)] px-[12px] py-[10px]" aria-label="动态任务控制">
+    <div className="mt-[10px] rounded-[12px] border border-[#dfe5f2] bg-[linear-gradient(105deg,#f8faff,#f5fbf8)] px-[12px] py-[10px]" aria-label={dynamicExecution ? '动态任务控制' : 'SOP执行结果'}>
       <div className="flex flex-wrap items-center justify-between gap-[8px]">
         <span className="min-w-0">
           <span className="flex items-center gap-[6px] text-[12px] font-semibold text-[#343949]">
             <Route className="size-[13px] text-[#3157e8]" />
-            <span className="truncate">{execution.goal || '动态任务'}</span>
+            <span className="truncate">{execution.goal || (dynamicExecution ? '动态任务' : 'SOP 执行')}</span>
           </span>
           <span className="mt-[2px] block text-[11px] text-[#7b849c]">
             {executionStatusLabel(execution.status)}{execution.current_step_key ? ` · ${execution.current_step_key}` : ''}

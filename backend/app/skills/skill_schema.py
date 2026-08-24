@@ -62,6 +62,7 @@ class SkillCard(BaseModel):
     start_node_id: str
     terminal_node_ids: list[str] = Field(default_factory=list)
     interruption_policy: dict[str, str] = Field(default_factory=dict)
+    expected_artifacts: list[dict[str, Any]] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_graph(self) -> "SkillCard":

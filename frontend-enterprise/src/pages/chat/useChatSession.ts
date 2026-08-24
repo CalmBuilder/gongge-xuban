@@ -149,6 +149,31 @@ const ENTERPRISE_SIDEBAR_STORAGE_KEY = 'gongge_enterprise_sidebar_expanded';
 const MISSING_MODEL_CONFIG_PATTERN = /missing_model_config|missing model config|没有默认模型配置|没有可用模型|模型配置不存在|模型未配置/i;
 const MODEL_CONFIGS_UPDATED_EVENT = 'gongge-enterprise-model-configs-updated';
 
+type AttachmentStatusRead = {
+  ingestion_status: ChatAttachmentRead['ingestion_status'];
+  preview?: string | null;
+  error_code?: string | null;
+};
+
+async function waitForAttachmentReady(
+  tenantId: string,
+  resourceId: string,
+  signal: AbortSignal,
+): Promise<AttachmentStatusRead> {
+  for (let attempt = 0; attempt < 120; attempt += 1) {
+    if (signal.aborted) throw new DOMException('上传已取消', 'AbortError');
+    const status = await api.get<AttachmentStatusRead>(
+      `/api/chat/attachments/${encodeURIComponent(resourceId)}/status?tenant_id=${encodeURIComponent(tenantId)}`,
+    );
+    if (status.ingestion_status === 'ready') return status;
+    if (status.ingestion_status === 'failed' || status.ingestion_status === 'quarantined' || status.ingestion_status === 'revoked') {
+      throw new Error(status.error_code || '文件未通过安全解析');
+    }
+    await new Promise<void>((resolveDelay) => window.setTimeout(resolveDelay, 500));
+  }
+  throw new Error('文件解析超时，请稍后重试');
+}
+
 function isMissingModelConfigurationError(value: unknown): boolean {
   if (value instanceof ApiError) {
     return MISSING_MODEL_CONFIG_PATTERN.test(`${value.message}\n${value.body}`);
@@ -404,6 +429,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
   const autoOpenedSessionIdsRef = useRef(new Set<string>());
   const loadErrorNoticeRef = useRef<Record<string, number>>({});
   const uploadControllersRef = useRef(new Map<string, AbortController>());
+  const cancelledAttachmentUploadsRef = useRef(new Set<string>());
 
   const notifyStore = useCallback(() => setStoreTick((value) => value + 1), []);
   const notifyStream = useCallback(() => setStreamTick((value) => value + 1), []);
@@ -423,6 +449,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
   useEffect(() => () => {
     uploadControllersRef.current.forEach((controller) => controller.abort());
     uploadControllersRef.current.clear();
+    cancelledAttachmentUploadsRef.current.clear();
   }, []);
 
   const updateChatStickiness = useCallback(() => {
@@ -2753,10 +2780,24 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
   ]);
 
   const uploadComposerFiles = useCallback((files: File[]) => {
-    const validFiles = files.filter((file) => file.size > 0);
-    if (!validFiles.length) return;
-    validFiles.forEach((file) => {
+    files.forEach((file) => {
       const uploadKey = `upload_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+      if (file.size === 0) {
+        setComposerAttachments((current) => [
+          ...current,
+          {
+            id: uploadKey,
+            uploadKey,
+            filename: file.name || '空文件',
+            content_type: file.type || 'application/octet-stream',
+            size: 0,
+            kind: file.type.startsWith('image/') ? 'image' : 'binary',
+            uploadStatus: 'error',
+            error: 'ATTACHMENT_EMPTY',
+          },
+        ]);
+        return;
+      }
       const controller = new AbortController();
       uploadControllersRef.current.set(uploadKey, controller);
       setComposerAttachments((current) => [
@@ -2771,12 +2812,59 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
           uploadStatus: 'uploading',
         },
       ]);
-      uploadChatAttachments<ChatAttachmentRead[]>(tenantId, [file], controller.signal)
-        .then((items) => {
+      const targetAgentId = currentSession?.agent_id || activeDraftAgentId || selectedAgentId || displayedAgent?.id || '';
+      const targetSessionId = sessionId || undefined;
+      const targetDraftId = targetSessionId ? undefined : activeConversationId;
+      api.post<{ binding_id: string; nonce: string; expires_at: string }>(
+        '/api/chat/attachments/bindings',
+        {
+          tenant_id: tenantId,
+          agent_id: targetAgentId,
+          session_id: targetSessionId,
+          draft_conversation_id: targetDraftId,
+          idempotency_key: uploadKey,
+        },
+      )
+        .then((binding) => uploadChatAttachments<ChatAttachmentRead[]>(
+          tenantId,
+          [file],
+          binding,
+          controller.signal,
+        ))
+        .then(async (items) => {
           const parsed = items[0];
           if (!parsed) throw new Error('文件解析结果为空');
+          if (parsed.ingestion_status === 'failed' || parsed.ingestion_status === 'quarantined' || parsed.error) {
+            throw new Error(parsed.error || '文件未通过安全解析');
+          }
+          if (cancelledAttachmentUploadsRef.current.has(uploadKey)) {
+            if (parsed.resource_id) {
+              await api.delete(
+                `/api/chat/attachments/${parsed.resource_id}?tenant_id=${encodeURIComponent(tenantId)}`,
+              );
+            }
+            cancelledAttachmentUploadsRef.current.delete(uploadKey);
+            return;
+          }
           setComposerAttachments((current) =>
-            current.map((item) => (item.uploadKey === uploadKey ? { ...parsed, uploadKey, uploadStatus: 'ready' } : item)),
+            current.map((item) => (item.uploadKey === uploadKey ? {
+              ...parsed,
+              uploadKey,
+              uploadStatus: parsed.ingestion_status === 'ready' ? 'ready' : 'uploading',
+            } : item)),
+          );
+          if (parsed.ingestion_status !== 'ready') {
+            if (!parsed.resource_id) throw new Error('文件缺少受管资源身份');
+            const ready = await waitForAttachmentReady(tenantId, parsed.resource_id, controller.signal);
+            parsed.preview = ready.preview || parsed.preview;
+          }
+          setComposerAttachments((current) =>
+            current.map((item) => (item.uploadKey === uploadKey ? {
+              ...parsed,
+              ingestion_status: 'ready',
+              uploadKey,
+              uploadStatus: 'ready',
+            } : item)),
           );
         })
         .catch((error) => {
@@ -2791,15 +2879,25 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
         })
         .finally(() => {
           uploadControllersRef.current.delete(uploadKey);
+          cancelledAttachmentUploadsRef.current.delete(uploadKey);
         });
     });
-  }, [tenantId]);
+  }, [activeConversationId, activeDraftAgentId, currentSession?.agent_id, displayedAgent?.id, selectedAgentId, sessionId, tenantId]);
 
   const removeComposerAttachment = useCallback((uploadKey: string) => {
-    uploadControllersRef.current.get(uploadKey)?.abort();
-    uploadControllersRef.current.delete(uploadKey);
-    setComposerAttachments((current) => current.filter((item) => item.uploadKey !== uploadKey));
-  }, []);
+    cancelledAttachmentUploadsRef.current.add(uploadKey);
+    setComposerAttachments((current) => {
+      const target = current.find((item) => item.uploadKey === uploadKey);
+      if (target?.resource_id) {
+        uploadControllersRef.current.get(uploadKey)?.abort();
+        uploadControllersRef.current.delete(uploadKey);
+        void api.delete(`/api/chat/attachments/${target.resource_id}?tenant_id=${encodeURIComponent(tenantId)}`)
+          .catch((error) => notify.error(error instanceof Error ? error.message : '附件清理失败'))
+          .finally(() => cancelledAttachmentUploadsRef.current.delete(uploadKey));
+      }
+      return current.filter((item) => item.uploadKey !== uploadKey);
+    });
+  }, [tenantId]);
 
   const handleComposerFileChange = useCallback((event: ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(event.target.files || []);
@@ -3080,7 +3178,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
         agent_id: sessionAgentId,
         message: userText,
         client_turn_id: turnId,
-        attachments: outgoingAttachments,
+        attachments: outgoingAttachments.map(toRequestAttachment),
         channel: 'web',
         interaction_mode: resolvedInteractionMode,
         client_timezone: getClientTimeZone(),
@@ -3088,6 +3186,8 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       };
       if (!startedAsDraftConversation) {
         requestBody.session_id = currentConversationId;
+      } else {
+        requestBody.draft_conversation_id = currentConversationId;
       }
       if (prepared.forcedGeneralSkillId) {
         requestBody.forced_general_skill_id = prepared.forcedGeneralSkillId;
@@ -3265,7 +3365,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       agentId: sessionAgentId,
       turnId: `turn_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
       text: input.trim(),
-      attachments: readyComposerAttachments.map(toRequestAttachment),
+      attachments: readyComposerAttachments,
       interactionMode: resolvedInteractionMode,
       modelConfigId: selectedModelConfig?.id,
       forcedGeneralSkillId: selectedGeneralSkillId || undefined,

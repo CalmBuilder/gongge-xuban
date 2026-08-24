@@ -566,6 +566,24 @@ export type ModelConfigRead = {
   updated_at: string;
 };
 
+export type ModelConnectionTestRead = {
+  success: boolean;
+  message: string;
+  output?: string;
+  error_code?: string;
+  http_status?: number;
+  provider_code?: string;
+  request_id?: string;
+  endpoint?: string;
+  model?: string;
+  suggestion?: string;
+  checks: Array<{
+    name: string;
+    status: 'passed' | 'failed' | 'skipped';
+    message: string;
+  }>;
+};
+
 export type PersonaRead = {
   tenant_id: string;
   system_prompt: string;
@@ -841,6 +859,15 @@ export type ChatAttachmentRead = {
   data_url?: string | null;
   python_summary?: string | null;
   error?: string | null;
+  resource_id?: string | null;
+  resource_version?: string | null;
+  content_checksum?: string | null;
+  ingestion_status?: 'uploaded' | 'scanning' | 'extracting' | 'ready' | 'quarantined' | 'failed' | 'revoked' | null;
+};
+
+export type ChatAttachmentRef = {
+  resource_id: string;
+  resource_version: string;
 };
 
 export type KnowledgeCitation = {

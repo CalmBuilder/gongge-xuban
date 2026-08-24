@@ -32,7 +32,7 @@ import IconRefresh from '../assets/icons/refresh.svg?react';
 import IconSearch from '../assets/icons/search.svg?react';
 import { StatusBadge } from './scheduled-tasks/StatusBadge';
 import { useClientPagination } from '../hooks/useClientPagination';
-import type { ModelConfigRead } from '../types';
+import type { ModelConfigRead, ModelConnectionTestRead } from '../types';
 import { PRODUCT_EVENTS } from '@/lib/product-events';
 
 const MODEL_PAGE_SIZE = 8;
@@ -88,6 +88,9 @@ export default function ModelsPage({
   const [selected, setSelected] = useState<ModelConfigRead | null>(null);
   const [editorOpen, setEditorOpen] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [testingId, setTestingId] = useState<string | null>(null);
+  const [connectionResult, setConnectionResult] = useState<ModelConnectionTestRead | null>(null);
+  const [connectionOpen, setConnectionOpen] = useState(false);
   const [form, setForm] = useState<ModelForm>(BLANK_MODEL_FORM);
 
   const updateForm = <K extends keyof ModelForm>(key: K, value: ModelForm[K]) =>
@@ -227,27 +230,43 @@ export default function ModelsPage({
     }
   }
 
-  async function test(row: ModelConfigRead) {
+  async function testConnection(row: ModelConfigRead) {
+    setTestingId(row.id);
     try {
-      const result = await api.post<{ success: boolean; message: string; output?: string }>(
+      const result = await api.post<ModelConnectionTestRead>(
         `/api/enterprise/model-configs/${row.id}/test?tenant_id=${getRequestTenantId()}`,
       );
+      setConnectionResult(result);
+      setConnectionOpen(true);
       if (result.success) {
-        notify.success(result.output || result.message);
+        notify.success('模型连接测试通过');
       } else {
-        notify.error(result.message);
+        notify.error(result.suggestion || result.message);
       }
     } catch (error) {
       notify.error(error instanceof Error ? error.message : '测试失败');
+    } finally {
+      setTestingId(null);
     }
   }
 
   function renderActions(row: ModelConfigRead) {
     return (
-      <DropdownMenu>
+      <div className="ml-auto flex items-center justify-end gap-1">
+        <button
+          type="button"
+          aria-label={`连接测试 ${row.name}`}
+          disabled={testingId === row.id}
+          onClick={() => void testConnection(row)}
+          className="inline-flex h-7 items-center gap-1 rounded-[8px] px-2 text-[11px] font-medium text-[#1a71ff] transition-colors hover:bg-[#edf2ff] disabled:cursor-wait disabled:opacity-60"
+        >
+          <FlaskConical className={cn('size-3.5', testingId === row.id && 'animate-pulse')} />
+          {testingId === row.id ? '测试中' : '连接测试'}
+        </button>
+        <DropdownMenu>
         <DropdownMenuTrigger
           aria-label="模型操作"
-          className="ml-auto grid size-7 place-items-center rounded-[8px] text-[#1a71ff] transition-colors outline-none hover:bg-black/5 hover:text-[#4a8dff] focus-visible:bg-black/5"
+          className="grid size-7 place-items-center rounded-[8px] text-[#1a71ff] transition-colors outline-none hover:bg-black/5 hover:text-[#4a8dff] focus-visible:bg-black/5"
         >
           <IconMore className="size-3.5" />
         </DropdownMenuTrigger>
@@ -260,12 +279,9 @@ export default function ModelsPage({
             <Check />
             {row.is_default ? '已默认' : '设为默认'}
           </DropdownMenuItem>
-          <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => void test(row)}>
-            <FlaskConical />
-            测试
-          </DropdownMenuItem>
         </DropdownMenuContent>
-      </DropdownMenu>
+        </DropdownMenu>
+      </div>
     );
   }
 
@@ -303,7 +319,7 @@ export default function ModelsPage({
     {
       key: 'actions',
       title: '操作',
-      width: 70,
+      width: 150,
       align: 'right',
       render: (row) => renderActions(row),
     },
@@ -518,6 +534,58 @@ export default function ModelsPage({
               保存
             </UIButton>
           </div>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={connectionOpen} onOpenChange={setConnectionOpen}>
+        <DialogContent
+          aria-describedby={undefined}
+          className="max-h-[calc(100dvh-4rem)] w-[calc(100%-2rem)] overflow-y-auto rounded-[14px] px-5 py-4 sm:max-w-[620px]"
+        >
+          <DialogTitle className="text-[15px] font-semibold text-[#18181a]">模型连接诊断</DialogTitle>
+          {connectionResult && (
+            <div className="mt-3 grid gap-3">
+              <div className={cn(
+                'rounded-[10px] border px-3 py-2 text-[12px]',
+                connectionResult.success
+                  ? 'border-[#b7e4c7] bg-[#f2fbf5] text-[#237a42]'
+                  : 'border-[#ffd0d0] bg-[#fff6f6] text-[#b42318]',
+              )}>
+                <p className="font-semibold">{connectionResult.success ? '连接可用' : '连接不可用'}</p>
+                <p className="mt-1 break-words">{connectionResult.message}</p>
+              </div>
+              <dl className="grid grid-cols-[88px_minmax(0,1fr)] gap-x-3 gap-y-1 text-[12px]">
+                <dt className="text-[#858b9c]">Endpoint</dt>
+                <dd className="break-all text-[#303746]">{connectionResult.endpoint || '-'}</dd>
+                <dt className="text-[#858b9c]">Model</dt>
+                <dd className="break-all text-[#303746]">{connectionResult.model || '-'}</dd>
+                <dt className="text-[#858b9c]">错误分类</dt>
+                <dd className="text-[#303746]">{connectionResult.error_code || '-'}</dd>
+                <dt className="text-[#858b9c]">HTTP / Request</dt>
+                <dd className="break-all text-[#303746]">
+                  {connectionResult.http_status || '-'} / {connectionResult.request_id || '-'}
+                </dd>
+              </dl>
+              <div className="grid gap-2">
+                {connectionResult.checks.map((check) => (
+                  <div key={check.name} className="rounded-[10px] border border-[#e8ebf2] px-3 py-2 text-[12px]">
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="font-medium text-[#303746]">{check.name}</span>
+                      <StatusBadge tone={check.status === 'passed' ? 'green' : check.status === 'failed' ? 'red' : 'gray'}>
+                        {check.status === 'passed' ? '通过' : check.status === 'failed' ? '失败' : '跳过'}
+                      </StatusBadge>
+                    </div>
+                    <p className="mt-1 break-words text-[#757f9c]">{check.message}</p>
+                  </div>
+                ))}
+              </div>
+              {connectionResult.suggestion && (
+                <p className="rounded-[10px] bg-[#f6f8fc] px-3 py-2 text-[12px] text-[#464c5e]">
+                  建议：{connectionResult.suggestion}
+                </p>
+              )}
+            </div>
+          )}
         </DialogContent>
       </Dialog>
     </div>

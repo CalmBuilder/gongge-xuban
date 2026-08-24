@@ -29,7 +29,10 @@ from app.db.models import (
     ExecutionSignal,
     GeneralSkillUse,
     InputResourceSnapshot,
+    InputResourceExtraction,
     ManagedInputResource,
+    MessageInputResourceLink,
+    SelectedResourceExtraction,
     Message,
     SopInstance,
     SopNodeExecution,
@@ -234,6 +237,67 @@ class SopExecutionStore:
             expires_at=expires_at,
         )
 
+    @contextmanager
+    def owned_for_cancellation(
+        self,
+        instance: SopInstance,
+        *,
+        worker_id: str,
+        ttl_seconds: int = 30,
+    ) -> Iterator[ExecutionLease]:
+        """让已认证取消命令抢占活动租约，并以新fencing token阻断旧worker迟到写。"""
+
+        if self._lease is not None:
+            raise SopExecutionConflictError("同一 Store 不能嵌套取消抢占租约。")
+        if not worker_id.strip() or ttl_seconds < 1:
+            raise ValueError("取消 worker 和租约 TTL 必须有效。")
+        database_now = self._database_now()
+        expires_at = database_now + timedelta(seconds=ttl_seconds)
+        expected_revision = instance.revision
+        result = self.db.exec(
+            update(SopInstance)
+            .where(
+                SopInstance.id == instance.id,
+                SopInstance.tenant_id == instance.tenant_id,
+                SopInstance.status.in_(ACTIVE_INSTANCE_STATUSES),
+                SopInstance.revision == expected_revision,
+            )
+            .values(
+                lease_owner=worker_id,
+                lease_acquired_at=database_now,
+                lease_heartbeat_at=database_now,
+                lease_expires_at=expires_at,
+                fencing_token=SopInstance.fencing_token + 1,
+                revision=SopInstance.revision + 1,
+                updated_at=database_now,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if result.rowcount != 1:
+            raise SopExecutionConflictError("Execution 已终结或取消抢占发生并发冲突。")
+        self.db.expire(instance)
+        self.db.refresh(instance)
+        lease = ExecutionLease(
+            tenant_id=instance.tenant_id,
+            instance_id=instance.id,
+            worker_id=worker_id,
+            fencing_token=instance.fencing_token,
+            expires_at=expires_at,
+        )
+        self._lease = lease
+        fenced = False
+        try:
+            yield lease
+        except SopExecutionFencedError:
+            fenced = True
+            raise
+        finally:
+            try:
+                if not fenced:
+                    self.release(lease)
+            finally:
+                self._lease = None
+
     def renew(self, lease: ExecutionLease, *, ttl_seconds: int = 30) -> ExecutionLease:
         """仅允许当前未过期 token 续租，并继续使用数据库权威时间。"""
 
@@ -248,7 +312,6 @@ class SopExecutionStore:
                 .values(
                     lease_heartbeat_at=database_now,
                     lease_expires_at=expires_at,
-                    revision=SopInstance.revision + 1,
                     updated_at=database_now,
                 )
                 .execution_options(synchronize_session=False)
@@ -298,6 +361,9 @@ class SopExecutionStore:
         skill_version: str,
         definition_checksum: str,
         start_node_id: str,
+        initiator_user_id: str | None = None,
+        agent_id: str | None = None,
+        source_ref: str | None = None,
         slots: Mapping[str, object] | None = None,
         context: Mapping[str, object] | None = None,
     ) -> tuple[SopInstance, bool]:
@@ -322,8 +388,10 @@ class SopExecutionStore:
             run_number=run_number,
             kind="sop",
             active_slot_key=f"foreground:{session_id}",
+            initiator_user_id=initiator_user_id,
             source_kind="chat",
-            source_ref=session_id,
+            source_ref=source_ref or session_id,
+            agent_id=agent_id,
             current_node_id=start_node_id,
             slots_json=dict(slots or {}),
             context_json=dict(context or {}),
@@ -753,7 +821,9 @@ class SopExecutionStore:
     ) -> tuple[InputResourceSnapshot, bool]:
         """在当前所有权下追加冻结 ready 输入身份；ACL 证据由服务端事实机械生成。"""
 
-        self._assert_dynamic_instance(instance)
+        self._guard_mutation(instance, "input.snapshot")
+        if instance.kind not in {"dynamic_task", "sop"}:
+            raise SopExecutionConflictError("输入资源只能冻结到统一Execution。")
         try:
             assert_input_resource_access(self.db, resource, instance=instance)
         except InputResourceAccessDenied as exc:
@@ -782,7 +852,6 @@ class SopExecutionStore:
         ).first()
         if existing is not None:
             return existing, False
-        self._guard_mutation(instance, "input.snapshot")
         identity_checksum = capability_checksum(
             {
                 "source_type": resource.source_type,
@@ -791,6 +860,20 @@ class SopExecutionStore:
                 "content_checksum": resource.content_checksum,
             }
         )
+        selected = self.db.exec(
+            select(SelectedResourceExtraction).where(
+                SelectedResourceExtraction.tenant_id == instance.tenant_id,
+                SelectedResourceExtraction.resource_id == resource.id,
+                SelectedResourceExtraction.resource_version == resource.version,
+                SelectedResourceExtraction.profile_key == "default",
+            )
+        ).first()
+        extraction = self.db.get(
+            InputResourceExtraction,
+            selected.extraction_id if selected is not None else "",
+        )
+        if extraction is None:
+            raise SopExecutionConflictError("输入资源缺少可复现Extraction。")
         snapshot = InputResourceSnapshot(
             tenant_id=instance.tenant_id,
             execution_id=instance.id,
@@ -803,8 +886,20 @@ class SopExecutionStore:
             size_bytes=resource.size_bytes,
             content_checksum=resource.content_checksum,
             extraction_checksum=resource.extraction_checksum,
+            extraction_id=extraction.id,
+            parser_name=extraction.parser_name,
+            parser_version=extraction.parser_version,
+            parser_config_checksum=extraction.parser_config_checksum,
+            element_manifest_checksum=extraction.element_manifest_checksum,
+            resource_acl_revision_at_snapshot=resource.acl_revision,
             ingestion_status=resource.ingestion_status,
             identity_checksum=identity_checksum,
+            opaque_handle=(
+                "input_handle_"
+                + hashlib.sha256(
+                    f"{instance.id}:{resource.id}:{identity_checksum}".encode()
+                ).hexdigest()
+            ),
             storage_locator_digest=hashlib.sha256(
                 resource.storage_locator.encode("utf-8")
             ).hexdigest(),
@@ -2329,23 +2424,23 @@ class SopExecutionStore:
             ):
                 raise SopExecutionConflictError("计划 Skill Use 与冻结修订快照不一致。")
 
-    @staticmethod
     def _message_references_resource(
+        self,
         message: Message,
         resource: ManagedInputResource,
     ) -> bool:
-        """核对用户消息 metadata 中由上传 API 生成的资源身份、版本和内容摘要。"""
+        """核对规范MessageInputResourceLink，不再信任消息metadata中的客户端字段。"""
 
-        attachments = message.metadata_json.get("attachments")
-        if not isinstance(attachments, list):
-            return False
-        return any(
-            isinstance(item, dict)
-            and item.get("resource_id") == resource.id
-            and item.get("resource_version") == resource.version
-            and item.get("content_checksum") == resource.content_checksum
-            for item in attachments
-        )
+        return self.db.exec(
+            select(MessageInputResourceLink).where(
+                MessageInputResourceLink.tenant_id == message.tenant_id,
+                MessageInputResourceLink.session_id == message.session_id,
+                MessageInputResourceLink.message_id == message.id,
+                MessageInputResourceLink.resource_id == resource.id,
+                MessageInputResourceLink.resource_version == resource.version,
+                MessageInputResourceLink.content_checksum == resource.content_checksum,
+            )
+        ).first() is not None
 
     def _assert_plan_preserves_step_identity(
         self,

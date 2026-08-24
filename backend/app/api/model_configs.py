@@ -8,7 +8,11 @@
 
 from __future__ import annotations
 
+from typing import Any
+from urllib.parse import urlsplit
+
 from fastapi import APIRouter, Depends, HTTPException, Query
+import httpx
 from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
@@ -19,6 +23,7 @@ from app.dynamic_tasks.capability_catalog import capability_checksum
 from app.llm import LLMClient, LLMError
 from app.llm.schemas import (
     ModelCapabilityPreflightResponse,
+    ModelConnectionCheck,
     ModelConfigCreateRequest,
     ModelConfigRead,
     ModelConfigTestResponse,
@@ -169,15 +174,222 @@ def set_default_model_config(
 def test_model_config(
     config_id: str, tenant_id: str = Query(...), db: Session = Depends(get_session)
 ) -> ModelConfigTestResponse:
+    """分阶段验证配置、模型目录、供应商账户状态与最小生成请求。"""
+
     row = _get_model_config(db, tenant_id, config_id)
+    checks = [ModelConnectionCheck(name="配置", status="passed", message="配置与密钥已加载")]
     try:
-        output = LLMClient(row).generate_text(
-            "你是一个连接测试助手。请用一句中文回复连接成功。",
-            {"message": "ping"},
-        )
-        return ModelConfigTestResponse(success=True, message="Model connection succeeded", output=output)
+        client = LLMClient(row)
     except LLMError as exc:
-        return ModelConfigTestResponse(success=False, message=str(exc), output=None)
+        return _connection_failure(row, exc, checks, stage="配置")
+    try:
+        model_ids = client.probe_model_catalog()
+    except LLMError as exc:
+        metadata = _provider_error_metadata(exc)
+        if metadata["http_status"] in {404, 405}:
+            checks.append(
+                ModelConnectionCheck(
+                    name="模型目录",
+                    status="skipped",
+                    message="供应商未实现模型目录接口，继续验证最小生成",
+                )
+            )
+        else:
+            return _connection_failure(row, exc, checks, stage="模型目录")
+    else:
+        if model_ids and row.model not in model_ids:
+            checks.append(
+                ModelConnectionCheck(
+                    name="模型目录",
+                    status="failed",
+                    message=f"端点可访问，但目录中不存在模型 {row.model}",
+                )
+            )
+            return ModelConfigTestResponse(
+                success=False,
+                message="模型名称不在供应商目录中",
+                error_code="MODEL_NOT_AVAILABLE",
+                endpoint=_safe_endpoint(row.base_url),
+                model=row.model,
+                suggestion="请从供应商模型目录复制准确的模型 ID。",
+                checks=checks,
+            )
+        checks.append(
+            ModelConnectionCheck(
+                name="模型目录",
+                status="passed",
+                message=(f"认证成功，已找到模型 {row.model}" if model_ids else "认证成功"),
+            )
+        )
+    balance_failure = _deepseek_balance_failure(row, checks)
+    if balance_failure is not None:
+        return balance_failure
+    try:
+        output = client.probe_text_connection()
+        checks.append(ModelConnectionCheck(name="最小生成", status="passed", message="模型已返回正文"))
+        return ModelConfigTestResponse(
+            success=True,
+            message="模型连接与最小生成均成功",
+            output=output,
+            endpoint=_safe_endpoint(row.base_url),
+            model=row.model,
+            checks=checks,
+        )
+    except LLMError as exc:
+        return _connection_failure(row, exc, checks, stage="最小生成")
+
+
+def _deepseek_balance_failure(
+    row: ModelConfig,
+    checks: list[ModelConnectionCheck],
+) -> ModelConfigTestResponse | None:
+    """对DeepSeek官方端点读取当前API Key账户可用性，其他兼容供应商直接跳过。"""
+
+    endpoint = _safe_endpoint(row.base_url)
+    if urlsplit(endpoint).hostname != "api.deepseek.com":
+        checks.append(
+            ModelConnectionCheck(name="账户状态", status="skipped", message="供应商未提供标准余额接口")
+        )
+        return None
+    secret = decrypt_secret(row.api_key_encrypted)
+    try:
+        response = httpx.get(
+            f"{endpoint.rstrip('/')}/user/balance",
+            headers={"Authorization": f"Bearer {secret}"},
+            timeout=15,
+        )
+        body = response.json() if response.content else {}
+    except (httpx.HTTPError, ValueError):
+        checks.append(
+            ModelConnectionCheck(name="账户状态", status="skipped", message="余额接口不可用，继续验证最小生成")
+        )
+        return None
+    if response.status_code != 200 or not isinstance(body, dict):
+        checks.append(
+            ModelConnectionCheck(name="账户状态", status="skipped", message="余额接口未返回可用状态")
+        )
+        return None
+    if body.get("is_available") is True:
+        checks.append(ModelConnectionCheck(name="账户状态", status="passed", message="API账户可用于生成请求"))
+        return None
+    balance = _deepseek_balance_summary(body)
+    checks.append(
+        ModelConnectionCheck(
+            name="账户状态",
+            status="failed",
+            message=f"该API Key所属账户当前不可用于生成；{balance}",
+        )
+    )
+    checks.append(
+        ModelConnectionCheck(
+            name="最小生成",
+            status="skipped",
+            message="账户不可用，未继续消耗额度",
+        )
+    )
+    return ModelConfigTestResponse(
+        success=False,
+        message="供应商账户不可用于生成请求",
+        error_code="BILLING_UNAVAILABLE",
+        http_status=402,
+        endpoint=endpoint,
+        model=row.model,
+        suggestion="请确认充值的是这把 API Key 所属账户或项目，充值后重新测试。",
+        checks=checks,
+    )
+
+
+def _deepseek_balance_summary(body: dict[str, Any]) -> str:
+    """只投影币种与总余额，不回显任何账户或凭据字段。"""
+
+    values = []
+    for item in body.get("balance_infos") or []:
+        if isinstance(item, dict):
+            values.append(f"{item.get('currency', '')}余额 {item.get('total_balance', '')}")
+    return "、".join(values) or "供应商未返回余额明细"
+
+
+def _connection_failure(
+    row: ModelConfig,
+    exc: LLMError,
+    checks: list[ModelConnectionCheck],
+    *,
+    stage: str,
+) -> ModelConfigTestResponse:
+    """把供应商异常归一为稳定错误码和可操作建议，并移除明文密钥。"""
+
+    metadata = _provider_error_metadata(exc)
+    error_code, suggestion = _connection_error_classification(metadata)
+    message = _sanitize_preflight_error(row, str(exc))
+    checks.append(ModelConnectionCheck(name=stage, status="failed", message=message[:500]))
+    return ModelConfigTestResponse(
+        success=False,
+        message=message,
+        error_code=error_code,
+        http_status=metadata["http_status"],
+        provider_code=metadata["provider_code"],
+        request_id=metadata["request_id"],
+        endpoint=_safe_endpoint(row.base_url),
+        model=row.model,
+        suggestion=suggestion,
+        checks=checks,
+    )
+
+
+def _provider_error_metadata(exc: LLMError) -> dict[str, Any]:
+    """优先读取原始provider异常字段，缺失时从既有稳定诊断文本回退解析。"""
+
+    cause = exc.__cause__
+    status = getattr(cause, "status_code", None)
+    body = getattr(cause, "body", None)
+    provider_code = None
+    if isinstance(body, dict):
+        detail = body.get("error") if isinstance(body.get("error"), dict) else body
+        provider_code = detail.get("code") or detail.get("type")
+    message = str(exc)
+    if status is None:
+        for fragment in message.split(";"):
+            if fragment.strip().startswith("status_code="):
+                try:
+                    status = int(fragment.split("=", 1)[1])
+                except ValueError:
+                    pass
+    return {
+        "http_status": status if isinstance(status, int) else None,
+        "provider_code": str(provider_code)[:64] if provider_code else None,
+        "request_id": str(getattr(cause, "request_id", ""))[:128] or None,
+        "message": message,
+    }
+
+
+def _connection_error_classification(metadata: dict[str, Any]) -> tuple[str, str]:
+    """依据HTTP和provider错误把失败映射为用户可操作的稳定分类。"""
+
+    status = metadata.get("http_status")
+    message = str(metadata.get("message") or "").lower()
+    if status in {401, 403}:
+        return "AUTHENTICATION_FAILED", "请核对 API Key、项目权限和供应商账户。"
+    if status == 402 or "insufficient balance" in message:
+        return "BILLING_UNAVAILABLE", "请确认充值的是该 API Key 所属账户或项目。"
+    if status == 404:
+        return "MODEL_OR_ENDPOINT_NOT_FOUND", "请核对 Base URL 路径和模型 ID。"
+    if status == 429:
+        return "RATE_LIMITED", "供应商正在限流，请稍后重试或检查账户配额。"
+    if status and status >= 500:
+        return "PROVIDER_UNAVAILABLE", "供应商服务异常，请稍后重试。"
+    if "timeout" in message:
+        return "CONNECTION_TIMEOUT", "请检查网络、代理、Base URL 和超时设置。"
+    return "MODEL_CONNECTION_FAILED", "请核对 Base URL、模型名、API Key 和供应商状态。"
+
+
+def _safe_endpoint(value: str | None) -> str:
+    """只返回不含userinfo、query与fragment的模型端点。"""
+
+    parsed = urlsplit(str(value or ""))
+    if not parsed.scheme or not parsed.hostname:
+        return str(value or "")
+    port = f":{parsed.port}" if parsed.port else ""
+    return f"{parsed.scheme}://{parsed.hostname}{port}{parsed.path}".rstrip("/")
 
 
 @router.post(

@@ -105,13 +105,18 @@ export const api = {
 export async function uploadChatAttachments<T>(
   tenantId: string,
   files: File[],
+  binding: { binding_id: string; nonce: string },
   signal?: AbortSignal,
 ): Promise<T> {
   const form = new FormData();
   files.forEach((file) => form.append('files', file));
   const response = await fetch(`${API_BASE}/api/chat/attachments?tenant_id=${encodeURIComponent(tenantId)}`, {
     method: 'POST',
-    headers: { ...authHeader() },
+    headers: {
+      ...authHeader(),
+      'X-Attachment-Binding': binding.binding_id,
+      'X-Attachment-Nonce': binding.nonce,
+    },
     body: form,
     signal,
   });

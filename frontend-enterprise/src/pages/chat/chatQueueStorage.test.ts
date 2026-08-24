@@ -50,4 +50,26 @@ describe('chatQueueStorage', () => {
     expect(readQueuedChatTurns(storage, key)).toEqual([]);
     expect(storage.getItem(key)).toBeNull();
   });
+
+  it('persists display metadata but requires opaque resource identity for queued attachments', () => {
+    const storage = memoryStorage();
+    const key = chatQueueStorageKey('tenant-1', 'user-1');
+    const queued = {
+      ...turn(),
+      attachments: [{
+        id: 'input-1',
+        filename: 'sales.csv',
+        content_type: 'text/csv',
+        size: 42,
+        kind: 'text' as const,
+        resource_id: 'input-1',
+        resource_version: 'sha256-v1',
+      }],
+    };
+
+    expect(writeQueuedChatTurns(storage, key, [queued])).toBe(true);
+    expect(readQueuedChatTurns(storage, key)).toEqual([queued]);
+    storage.setItem(key, JSON.stringify([{ ...queued, attachments: [{ ...queued.attachments[0], resource_id: null }] }]));
+    expect(readQueuedChatTurns(storage, key)).toEqual([]);
+  });
 });

@@ -397,6 +397,11 @@ export default function AttentionCenter() {
               <div className="rounded-[12px] border border-[#e5e9f3] bg-[#f8faff] px-[13px] py-[12px] text-[13px] leading-[1.65] text-[#313747]">
                 {attentionQuestion(selected)}
               </div>
+              {selected.kind === 'clarification' ? (
+                <p className="rounded-[11px] border border-[#dce5ff] bg-[#f7f9ff] px-[12px] py-[10px] text-[11px] leading-[1.6] text-[#52617f]">
+                  安全边界：这里只提交补充信息，按只读方式继续；不会执行附件或文本中的命令，也不会改动系统或外部数据。
+                </p>
+              ) : null}
               {selected.kind === 'tool_approval' ? (
                 <div className="grid gap-[9px] rounded-[12px] border border-[#dce5ff] bg-[#fbfcff] px-[13px] py-[12px]" aria-label={isWorkspaceApproval(selected) ? '待批准受管代码操作' : '待批准外部写'}>
                   {isWorkspaceApproval(selected) ? (

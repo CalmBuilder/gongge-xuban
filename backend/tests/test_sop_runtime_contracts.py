@@ -32,6 +32,121 @@ from app.sop_runtime import (
     transition_operation,
     transition_work_item,
 )
+from app.sop_runtime.definition import (
+    AttachmentInputSlot,
+    CollectInputConfig,
+    ServiceTaskConfig,
+    ServiceTaskKind,
+)
+
+
+def test_collect_input_attachment_slots_are_typed_and_required() -> None:
+    """正式SOP附件槽位必须冻结格式/基数，必填槽位继续沿用required_inputs。"""
+
+    config = CollectInputConfig(
+        required_inputs=("actuals", "targets"),
+        attachment_slots=(
+            AttachmentInputSlot(
+                slot_key="actuals",
+                allowed_formats=("xlsx",),
+                required_columns=("区域", "实际销售额"),
+            ),
+            AttachmentInputSlot(
+                slot_key="targets",
+                allowed_formats=("csv",),
+                required_columns=("区域", "目标销售额"),
+            ),
+        ),
+    )
+    assert config.attachment_slots[0].parser_profile == "default"
+    with pytest.raises(ValidationError, match="required attachment slots"):
+        CollectInputConfig(
+            required_inputs=("actuals",),
+            attachment_slots=(
+                AttachmentInputSlot(slot_key="targets", allowed_formats=("csv",)),
+            ),
+        )
+    with pytest.raises(ValidationError, match="min_count"):
+        AttachmentInputSlot(
+            slot_key="actuals",
+            allowed_formats=("xlsx",),
+            min_count=2,
+            max_count=1,
+        )
+    with pytest.raises(ValidationError, match="required_columns"):
+        AttachmentInputSlot(
+            slot_key="document",
+            allowed_formats=("pdf",),
+            required_columns=("金额",),
+        )
+    with pytest.raises(ValidationError, match="required_columns"):
+        AttachmentInputSlot(
+            slot_key="targets",
+            allowed_formats=("csv",),
+            required_columns=(" Region ", "region"),
+        )
+
+
+def test_builtin_input_service_has_closed_operation_contract() -> None:
+    """正式SOP只能声明平台内建附件操作，不能借节点注入任意执行器。"""
+
+    config = ServiceTaskConfig(
+        kind=ServiceTaskKind.BUILTIN_INPUT,
+        capability="service.builtin_input",
+        result_key="actuals_read",
+        builtin_operation="input.read",
+        input_mapping={"snapshot_handles": "slots.actuals"},
+    )
+    assert config.builtin_operation == "input.read"
+    with pytest.raises(ValidationError):
+        ServiceTaskConfig(
+            kind=ServiceTaskKind.BUILTIN_INPUT,
+            capability="service.builtin_input",
+            result_key="unsafe",
+            builtin_operation="shell.exec",
+        )
+
+
+def test_published_formula_compute_ast_rejects_runtime_ids_missing_cell_and_unknown_ops() -> None:
+    """公式SOP只冻结sheet/cell，运行期ID、缺字段和未知操作必须在发布前失败。"""
+
+    valid = ServiceTaskConfig(
+        kind=ServiceTaskKind.BUILTIN_INPUT,
+        capability="service.builtin_input",
+        result_key="formula_check",
+        builtin_operation="table.compute",
+        input_mapping={"snapshot_handles": "slots.actuals"},
+        compute_ast={"op": "verify_formula", "sheet_name": "Summary", "cell": "D2"},
+    )
+    assert valid.compute_ast["cell"] == "D2"
+    invalid_operations = (
+        {
+            "op": "verify_formula",
+            "element_id": "runtime-id",
+            "cell": "D2",
+            "formula_checksum": "a" * 64,
+        },
+        {"op": "verify_formula", "sheet_name": "Summary"},
+        {"op": "totally_unknown"},
+        {"aggregate": "sum", "column": {"nested": "amount"}},
+        {"aggregate": "count", "column": "silently_ignored"},
+        {
+            "filter": {"op": "eq", "column": ["region"], "value": {"nested": "East"}},
+            "aggregate": "count",
+        },
+        {"op": "verify_formula", "sheet_name": {"nested": "Summary"}, "cell": "D2"},
+        {"op": "verify_formula", "sheet_name": ["Summary"], "cell": "D2"},
+    )
+    for operation in invalid_operations:
+        with pytest.raises(ValidationError):
+            ServiceTaskConfig(
+                kind=ServiceTaskKind.BUILTIN_INPUT,
+                capability="service.builtin_input",
+                result_key="formula_check",
+                builtin_operation="table.compute",
+                input_mapping={"snapshot_handles": "slots.actuals"},
+                compute_ast=operation,
+            )
 
 
 def test_command_and_event_envelopes_are_strict_and_versioned() -> None:

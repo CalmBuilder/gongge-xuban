@@ -16,16 +16,20 @@ import time
 import traceback
 from collections.abc import Callable, Iterator
 from datetime import timedelta
+from pathlib import Path
+from tempfile import NamedTemporaryFile
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import or_
 from sqlmodel import Session, select
+from starlette.datastructures import UploadFile
 
 from app.agents.branching import model_for_agent
 from app.agents.session_snapshot import anchor_chat_session
 from app.core import AgentLoop
+from app.config import get_settings
 from app.core.cancellation import cancel_chat_turn
 from app.db import engine, get_session
 from app.db.models import (
@@ -33,11 +37,22 @@ from app.db.models import (
     AgentProfile,
     ChatSession,
     HumanHandoffRequest,
+    InputDocumentElement,
+    InputResourceExtraction,
+    InputResourceExtractionAttempt,
+    InputResourceSnapshot,
     KnowledgeChunk,
     KnowledgeConcept,
     Message,
+    MessageInputResourceLink,
+    ManagedInputResource,
+    ProviderInputDispatchGroup,
+    ProviderInputDispatchReceipt,
+    TurnInputReadReceipt,
+    TurnInputSnapshot,
     MessageFeedback,
     ScheduledTaskRun,
+    SelectedResourceExtraction,
     Skill,
     SkillFeedback,
     SopInstance,
@@ -62,6 +77,16 @@ from app.scheduled_tasks.service import DEFAULT_TASK_TIME, detect_scheduled_task
 from app.sop_runtime.execution_control import ExecutionControlError, ExecutionControlService
 from app.sop_runtime.execution_store import SopExecutionConflictError, SopExecutionStore
 from app.session.managed_resources import ManagedInputResourceService
+from app.session.managed_resources import InputResourceAccessDenied
+from app.session.input_bindings import InputBindingError, InputBindingService
+from app.session.input_extraction import InputExtractionError, InputExtractionService
+from app.session.input_parser_process import run_attachment_parser_fd_isolated
+from app.session.upload_quotas import (
+    AttachmentUploadQuotaError,
+    AttachmentUploadQuotaHeartbeat,
+    AttachmentUploadQuotaService,
+    quota_policy_from_settings,
+)
 from app.session.helpers import public_session
 from app.session.session_schema import (
     ChatAttachmentRead,
@@ -106,6 +131,24 @@ SPAN_EVENT_TYPES = {
     "knowledge_span_finished",
     "knowledge_span_failed",
 }
+
+
+class AttachmentUploadBindingRequest(BaseModel):
+    """签发上传请求所需的当前数字员工和会话或草稿目标。"""
+
+    tenant_id: str
+    agent_id: str
+    session_id: str | None = None
+    draft_conversation_id: str | None = None
+    idempotency_key: str
+
+
+class AttachmentUploadBindingRead(BaseModel):
+    """返回一次上传请求使用的服务端binding和高熵nonce。"""
+
+    binding_id: str
+    nonce: str
+    expires_at: str
 KNOWLEDGE_TRACE_PHASES = {
     "knowledge",
     "okf_route",
@@ -906,47 +949,489 @@ def _reply_chunks(reply: str) -> Iterator[str]:
         yield reply[index : index + STREAM_REPLY_CHUNK_SIZE]
 
 
+@router.post("/attachments/bindings", response_model=AttachmentUploadBindingRead)
+def create_attachment_upload_binding(
+    request: AttachmentUploadBindingRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_session),
+) -> AttachmentUploadBindingRead:
+    """为当前用户、数字员工和会话或草稿签发一次上传请求binding。"""
+
+    _ensure_request_tenant(request.tenant_id, current_user)
+    agent = _ensure_chat_agent_available(db, request.tenant_id, request.agent_id, current_user)
+    if bool(request.session_id) == bool(request.draft_conversation_id):
+        raise HTTPException(status_code=400, detail="必须且只能指定会话或草稿目标")
+    if request.session_id:
+        session = _ensure_chat_session_available(
+            db, request.tenant_id, current_user.id, request.session_id
+        )
+        if session.agent_id and session.agent_id != agent.id:
+            raise HTTPException(status_code=409, detail="会话已绑定其他数字员工")
+    elif request.draft_conversation_id != f"draft:{agent.id}":
+        raise HTTPException(status_code=404, detail="上传目标不可用")
+    service = InputBindingService(db)
+    try:
+        secret = service.issue_upload_binding(
+            tenant_id=request.tenant_id,
+            owner_user_id=current_user.id,
+            agent_id=agent.id,
+            session_id=request.session_id,
+            draft_conversation_id=request.draft_conversation_id,
+            idempotency_key=request.idempotency_key,
+        )
+        db.commit()
+    except InputBindingError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=exc.code) from exc
+    return AttachmentUploadBindingRead(**secret.__dict__)
+
+
 @router.post("/attachments", response_model=list[ChatAttachmentRead])
 async def upload_chat_attachments(
+    request: Request,
     tenant_id: str = Query(...),
-    files: list[UploadFile] = File(...),
+    upload_binding_id: str = Header(..., alias="X-Attachment-Binding"),
+    upload_binding_nonce: str = Header(..., alias="X-Attachment-Nonce"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_session),
 ) -> list[ChatAttachmentRead]:
-    """持久化聊天附件并返回兼容解析内容及服务端资源引用。"""
+    """领取上传binding后逐块限流落盘，并在隔离进程完成首个CSV解析闭环。"""
 
     _ensure_request_tenant(tenant_id, current_user)
     ensure_tenant(db, tenant_id)
-    if not files:
-        raise HTTPException(status_code=400, detail="No files uploaded")
-    if len(files) > MAX_CHAT_ATTACHMENTS:
-        raise HTTPException(status_code=400, detail=f"最多一次上传 {MAX_CHAT_ATTACHMENTS} 个文件")
-    uploads: list[tuple[str, str | None, bytes]] = []
-    for file in files:
-        data = await file.read()
-        if len(data) > MAX_CHAT_ATTACHMENT_BYTES:
-            raise HTTPException(status_code=413, detail=f"{file.filename or '文件'} 超过上传大小限制")
-        uploads.append((file.filename or "uploaded-file", file.content_type, data))
+    settings = get_settings()
+    if not settings.attachment_analysis_enabled:
+        raise HTTPException(status_code=404, detail="附件分析能力未启用")
+    binding_service = InputBindingService(db)
+    worker_id = f"upload:{threading.get_ident()}:{time.monotonic_ns()}"
+    try:
+        binding = binding_service.claim_upload_binding(
+            tenant_id=tenant_id,
+            owner_user_id=current_user.id,
+            binding_id=upload_binding_id,
+            nonce=upload_binding_nonce,
+            worker_id=worker_id,
+        )
+        db.commit()
+    except InputBindingError as exc:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="上传授权不可用") from exc
+
+    quota_service = AttachmentUploadQuotaService(db)
+    try:
+        quota_reservation = quota_service.acquire(
+            tenant_id=tenant_id,
+            owner_user_id=current_user.id,
+            binding_id=upload_binding_id,
+            policy=quota_policy_from_settings(settings),
+        )
+        db.commit()
+    except AttachmentUploadQuotaError as exc:
+        db.rollback()
+        binding_service.expire_upload_binding(upload_binding_id, tenant_id=tenant_id)
+        db.commit()
+        raise HTTPException(status_code=429, detail=exc.code) from exc
+
     parsed: list[ChatAttachmentRead] = []
     persisted = []
     resource_service = ManagedInputResourceService(db)
+    request_bytes = 0
+    upload_succeeded = False
+    quota_heartbeat = AttachmentUploadQuotaHeartbeat(
+        db.get_bind(),
+        reservation=quota_reservation,
+        ttl_seconds=settings.attachment_upload_reservation_ttl_seconds,
+    )
     try:
-        for filename, content_type, data in uploads:
-            resource, attachment = resource_service.persist_upload(
-                tenant_id=tenant_id,
-                owner_user_id=current_user.id,
-                filename=filename,
-                content_type=content_type,
-                data=data,
+        quota_heartbeat.start()
+        form = await request.form(
+            max_files=MAX_CHAT_ATTACHMENTS,
+            max_fields=4,
+            max_part_size=64 * 1024,
+        )
+        files = [item for item in form.getlist("files") if isinstance(item, UploadFile)]
+        if not files:
+            raise HTTPException(status_code=400, detail="No files uploaded")
+        if len(files) > MAX_CHAT_ATTACHMENTS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"最多一次上传 {MAX_CHAT_ATTACHMENTS} 个文件",
             )
+        for file in files:
+            filename = file.filename or "uploaded-file"
+            extension = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+            extraction_format = (
+                "image"
+                if extension in {"png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff"}
+                else "text"
+                if extension in {"txt", "md", "markdown", "json"}
+                else extension
+                if extension in {"csv", "pdf", "docx", "pptx", "xlsx"}
+                else None
+            )
+            if extraction_format is None:
+                raise HTTPException(status_code=415, detail="暂不支持该附件格式")
+            file_bytes = 0
+            staged_path: Path | None = None
+            try:
+                with NamedTemporaryFile(prefix="gongge-upload-", delete=False) as staged:
+                    staged_path = Path(staged.name)
+                    while chunk := await file.read(settings.attachment_upload_chunk_bytes):
+                        file_bytes += len(chunk)
+                        request_bytes += len(chunk)
+                        if file_bytes > settings.attachment_max_file_bytes:
+                            raise HTTPException(status_code=413, detail="文件超过上传大小限制")
+                        if request_bytes > settings.attachment_max_request_bytes:
+                            raise HTTPException(status_code=413, detail="本次上传总大小超过限制")
+                        staged.write(chunk)
+                    staged.flush()
+                try:
+                    resource, attachment = resource_service.persist_upload_path(
+                        tenant_id=tenant_id,
+                        owner_user_id=current_user.id,
+                        filename=filename,
+                        content_type=file.content_type,
+                        source_path=staged_path,
+                        agent_id=binding.agent_id,
+                        upload_binding_id=binding.binding_id,
+                        extraction_format=extraction_format,
+                    )
+                except InputResourceAccessDenied as exc:
+                    raise HTTPException(status_code=507, detail="附件存储暂不可用") from exc
+            finally:
+                if staged_path is not None:
+                    staged_path.unlink(missing_ok=True)
             persisted.append(resource)
+            extraction_service = InputExtractionService(db)
+            attempt = extraction_service.ensure_attempt(
+                resource,
+                file_format=extraction_format,
+            )
+            if settings.attachment_parser_worker_enabled:
+                db.commit()
+                parsed.append(
+                    attachment.model_copy(update={"ingestion_status": "extracting"})
+                )
+                continue
+            extraction_service.claim(
+                attempt,
+                worker_id=worker_id,
+                lease_seconds=settings.attachment_parser_timeout_seconds + 5,
+            )
+            db.commit()
+            try:
+                with resource_service.parser_input_descriptor(resource) as input_fd:
+                    elements = run_attachment_parser_fd_isolated(
+                        input_fd,
+                        file_format=extraction_format,
+                        timeout_seconds=settings.attachment_parser_timeout_seconds,
+                        memory_mb=settings.attachment_parser_memory_mb,
+                    )
+                extraction_service.publish(
+                    attempt,
+                    resource,
+                    elements,
+                    file_format=extraction_format,
+                    worker_id=worker_id,
+                    fencing_token=attempt.fencing_token,
+                )
+                attachment = attachment.model_copy(
+                    update={
+                        "preview": "\n\n".join(item.text for item in elements)[:4000],
+                        "ingestion_status": "ready",
+                    }
+                )
+                db.commit()
+            except Exception as exc:
+                extraction_error = (
+                    exc
+                    if isinstance(exc, InputExtractionError)
+                    else InputExtractionError("ATTACHMENT_PARSER_FAILED", "附件解析失败。")
+                )
+                extraction_service.fail(
+                    attempt,
+                    worker_id=worker_id,
+                    fencing_token=attempt.fencing_token,
+                    error=extraction_error,
+                )
+                resource.ingestion_status = "failed"
+                db.add(resource)
+                db.commit()
+                raise HTTPException(
+                    status_code=422,
+                    detail={"code": extraction_error.code, "message": str(extraction_error)},
+                ) from exc
             parsed.append(attachment)
+        quota_heartbeat.ensure_healthy()
+        quota_heartbeat.stop()
+        quota_heartbeat.ensure_healthy()
+        binding_service.consume_upload_binding(
+            binding,
+            resource_ids=[resource.id for resource in persisted],
+        )
+        quota_service.settle(
+            quota_reservation,
+            succeeded=True,
+            actual_bytes=request_bytes,
+        )
         db.commit()
+        upload_succeeded = True
     except Exception:
         db.rollback()
-        resource_service.discard_uncommitted(persisted)
+        try:
+            cleanup_job = resource_service.schedule_upload_failure_cleanup(
+                persisted,
+                tenant_id=tenant_id,
+                owner_user_id=current_user.id,
+                upload_binding_id=upload_binding_id,
+            )
+            binding_service.expire_upload_binding(upload_binding_id, tenant_id=tenant_id)
+            db.commit()
+            try:
+                resource_service.run_upload_failure_cleanup(
+                    cleanup_job.id,
+                    worker_id=worker_id,
+                )
+            except Exception:
+                logger.exception("attachment upload cleanup worker deferred")
+        except Exception:
+            db.rollback()
+            logger.exception("attachment upload fail-closed scheduling failed")
         raise
+    finally:
+        quota_heartbeat.stop()
+        if not upload_succeeded:
+            try:
+                quota_service.settle(
+                    quota_reservation,
+                    succeeded=False,
+                    actual_bytes=request_bytes,
+                )
+                db.commit()
+            except Exception:
+                db.rollback()
+                logger.exception("attachment upload quota release failed")
     return parsed
+
+
+@router.delete("/attachments/{resource_id}")
+def discard_chat_attachment(
+    resource_id: str,
+    tenant_id: str = Query(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_session),
+) -> dict[str, str]:
+    """移除尚未发送的Composer附件并物理清理在线blob，避免孤儿文件长期留存。"""
+
+    _ensure_request_tenant(tenant_id, current_user)
+    resource = db.get(ManagedInputResource, resource_id)
+    if (
+        resource is None
+        or resource.tenant_id != tenant_id
+        or resource.owner_user_id != current_user.id
+    ):
+        raise HTTPException(status_code=404, detail="附件不可用")
+    try:
+        ManagedInputResourceService(db).discard_unreferenced(
+            resource,
+            actor_user_id=current_user.id,
+        )
+        db.commit()
+    except InputResourceAccessDenied as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="附件不可直接移除") from exc
+    return {"status": "purged"}
+
+
+@router.get("/attachments/latest")
+def latest_chat_attachment(
+    tenant_id: str = Query(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_session),
+) -> dict[str, object]:
+    """返回当前用户最近上传的资源身份，供页面状态恢复和隔离浏览器Oracle使用。"""
+
+    _ensure_request_tenant(tenant_id, current_user)
+    resource = db.exec(
+        select(ManagedInputResource)
+        .where(
+            ManagedInputResource.tenant_id == tenant_id,
+            ManagedInputResource.owner_user_id == current_user.id,
+        )
+        .order_by(ManagedInputResource.created_at.desc())
+    ).first()
+    if resource is None:
+        raise HTTPException(status_code=404, detail="附件不可用")
+    return {"resource_id": resource.id, "resource_version": resource.version}
+
+
+@router.get("/attachments/{resource_id}/status")
+def chat_attachment_status(
+    resource_id: str,
+    tenant_id: str = Query(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_session),
+) -> dict[str, object]:
+    """按owner等价响应返回附件访问与销毁状态，不暴露storage locator。"""
+
+    _ensure_request_tenant(tenant_id, current_user)
+    resource = db.get(ManagedInputResource, resource_id)
+    if (
+        resource is None
+        or resource.tenant_id != tenant_id
+        or resource.owner_user_id != current_user.id
+    ):
+        raise HTTPException(status_code=404, detail="附件不可用")
+    latest_attempt = db.exec(
+        select(InputResourceExtractionAttempt)
+        .where(
+            InputResourceExtractionAttempt.tenant_id == tenant_id,
+            InputResourceExtractionAttempt.resource_id == resource.id,
+            InputResourceExtractionAttempt.resource_version == resource.version,
+        )
+        .order_by(InputResourceExtractionAttempt.attempt_no.desc())
+    ).first()
+    return {
+        "resource_id": resource.id,
+        "access_status": resource.access_status,
+        "security_status": resource.security_status,
+        "destruction_status": resource.destruction_status,
+        "ingestion_status": resource.ingestion_status,
+        "error_code": latest_attempt.error_code if latest_attempt is not None else None,
+        "preview": (
+            str(resource.extraction_metadata_json.get("preview") or "")
+            or str(resource.extracted_text or "")[:4000]
+            or None
+        ),
+    }
+
+
+@router.get("/attachments/{resource_id}/extraction")
+def chat_attachment_extraction(
+    resource_id: str,
+    tenant_id: str = Query(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_session),
+) -> dict[str, object]:
+    """返回owner可见的固定解析摘要与稳定locator，绝不暴露blob路径或客户端派生正文。"""
+
+    _ensure_request_tenant(tenant_id, current_user)
+    resource = db.get(ManagedInputResource, resource_id)
+    if (
+        resource is None
+        or resource.tenant_id != tenant_id
+        or resource.owner_user_id != current_user.id
+        or resource.access_status != "active"
+    ):
+        raise HTTPException(status_code=404, detail="附件不可用")
+    selected = db.exec(
+        select(SelectedResourceExtraction).where(
+            SelectedResourceExtraction.tenant_id == tenant_id,
+            SelectedResourceExtraction.resource_id == resource.id,
+            SelectedResourceExtraction.resource_version == resource.version,
+            SelectedResourceExtraction.profile_key == "default",
+        )
+    ).first()
+    extraction = db.get(InputResourceExtraction, selected.extraction_id) if selected else None
+    if extraction is None or extraction.tenant_id != tenant_id:
+        raise HTTPException(status_code=409, detail="附件尚未形成可分析版本")
+    elements = db.exec(
+        select(InputDocumentElement)
+        .where(
+            InputDocumentElement.tenant_id == tenant_id,
+            InputDocumentElement.extraction_id == extraction.id,
+        )
+        .order_by(InputDocumentElement.element_index)
+    ).all()
+    return {
+        "resource_id": resource.id,
+        "resource_version": resource.version,
+        "extraction_id": extraction.id,
+        "extraction_checksum": extraction.extraction_checksum,
+        "element_manifest_checksum": extraction.element_manifest_checksum,
+        "parser": {
+            "name": extraction.parser_name,
+            "version": extraction.parser_version,
+            "config_checksum": extraction.parser_config_checksum,
+        },
+        "counts": {
+            "elements": extraction.element_count,
+            "pages": extraction.page_count,
+            "slides": extraction.slide_count,
+            "sheets": extraction.sheet_count,
+        },
+        "elements": [
+            {
+                "index": row.element_index,
+                "type": row.element_type,
+                "text": row.text,
+                "table": row.table_json,
+                "locator": row.locator_json,
+                "checksum": row.content_checksum,
+            }
+            for row in elements
+        ],
+    }
+
+
+@router.get("/attachments/evidence/{message_id}")
+def chat_attachment_evidence(
+    message_id: str,
+    tenant_id: str = Query(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_session),
+) -> dict[str, int]:
+    """投影当前用户消息的附件因果计数，浏览器以权威事实而非回答字符串验收。"""
+
+    _ensure_request_tenant(tenant_id, current_user)
+    message = db.get(Message, message_id)
+    if message is None or message.tenant_id != tenant_id or message.role != "user":
+        raise HTTPException(status_code=404, detail="消息不可用")
+    session = _ensure_chat_session_available(db, tenant_id, current_user.id, message.session_id)
+    links = db.exec(
+        select(MessageInputResourceLink).where(
+            MessageInputResourceLink.tenant_id == tenant_id,
+            MessageInputResourceLink.session_id == session.id,
+            MessageInputResourceLink.message_id == message.id,
+        )
+    ).all()
+    snapshots = db.exec(
+        select(TurnInputSnapshot).where(
+            TurnInputSnapshot.tenant_id == tenant_id,
+            TurnInputSnapshot.turn_id == message.id,
+        )
+    ).all()
+    reads = db.exec(
+        select(TurnInputReadReceipt).where(
+            TurnInputReadReceipt.tenant_id == tenant_id,
+            TurnInputReadReceipt.turn_id == message.id,
+        )
+    ).all()
+    groups = db.exec(
+        select(ProviderInputDispatchGroup).where(
+            ProviderInputDispatchGroup.tenant_id == tenant_id,
+            ProviderInputDispatchGroup.causation_id == f"turn:{message.id}",
+        )
+    ).all()
+    group_ids = [row.id for row in groups]
+    receipts = (
+        db.exec(
+            select(ProviderInputDispatchReceipt).where(
+                ProviderInputDispatchReceipt.tenant_id == tenant_id,
+                ProviderInputDispatchReceipt.dispatch_group_id.in_(group_ids),
+            )
+        ).all()
+        if group_ids
+        else []
+    )
+    return {
+        "message_links": len(links),
+        "turn_snapshots": len(snapshots),
+        "read_receipts": len(reads),
+        "dispatch_groups": len(groups),
+        "dispatch_receipts": len(receipts),
+        "settled_dispatch_receipts": sum(row.status == "settled" for row in receipts),
+    }
 
 
 @router.post("/turn", response_model=ChatTurnResponse)
@@ -1035,12 +1520,13 @@ def chat_stream(
 
     def run_stream_worker() -> None:
         span_sink_token = None
+        deferred_sqlite_spans: list[tuple[str, str, str, dict[str, object]]] = []
         try:
             with Session(engine) as worker_db:
                 span_turn_id = {"value": ""}
 
                 def persist_span(event_type: str, payload: dict[str, object]) -> None:
-                    """用独立短事务写模型观测事件，禁止提交或关闭业务嵌套事务。"""
+                    """MySQL用独立短事务；SQLite延迟到Turn结束同连接落Span，避免自锁。"""
 
                     session_id = source_session_id["value"] or request.session_id or ""
                     if not session_id:
@@ -1052,6 +1538,11 @@ def chat_stream(
                         event_payload.setdefault("user_message_id", turn_id)
                     if request.client_turn_id:
                         event_payload.setdefault("client_turn_id", request.client_turn_id)
+                    if engine.dialect.name == "sqlite":
+                        deferred_sqlite_spans.append(
+                            (request.tenant_id, session_id, event_type, event_payload)
+                        )
+                        return
                     try:
                         with Session(engine) as span_db:
                             _persist_relay_only_event(
@@ -1219,6 +1710,8 @@ def chat_stream(
                                 "scheduled_task_draft",
                                 draft.model_dump(mode="json"),
                             )
+                if deferred_sqlite_spans:
+                    _persist_deferred_span_events(worker_db, deferred_sqlite_spans)
         except Exception as exc:
             logger.exception("chat stream worker failed")
             session_id = source_session_id["value"] or request.session_id or ""
@@ -1408,7 +1901,7 @@ def _cancel_active_dynamic_execution(
             source_message_id=requested_turn_id,
         )
         if command.status == "pending":
-            with store.owned(instance, worker_id=worker_id):
+            with store.owned_for_cancellation(instance, worker_id=worker_id):
                 control.apply_cancel_command(instance, command, worker_id=worker_id)
     except (ExecutionControlError, SopExecutionConflictError) as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
@@ -1836,6 +2329,24 @@ def _persist_relay_only_event(
     db.commit()
 
 
+def _persist_deferred_span_events(
+    db: Session,
+    rows: list[tuple[str, str, str, dict[str, object]]],
+) -> None:
+    """在SQLite业务Turn完成后用同一连接批量落观测Span，避免自锁等待和事实丢失。"""
+
+    for tenant_id, session_id, event_type, payload in rows:
+        db.add(
+            AgentEvent(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                event_type=event_type,
+                payload_json=payload,
+            )
+        )
+    db.commit()
+
+
 def _relay_event_payload(row: AgentEvent) -> tuple[str, dict[str, object]]:
     payload = dict(row.payload_json or {})
     event_name = STREAM_RELAY_EVENT_ALIASES.get(row.event_type, row.event_type)
@@ -1931,6 +2442,14 @@ def _existing_turn_replay(
     user_message = db.get(Message, message_id) if message_id else None
     metadata = user_message.metadata_json if user_message is not None else {}
     expected_attachments = [item.model_dump(mode="json") for item in request.attachments]
+    persisted_attachments = [
+        {
+            "resource_id": str(item.get("resource_id") or ""),
+            "resource_version": str(item.get("resource_version") or ""),
+        }
+        for item in list(metadata.get("attachments") or [])
+        if isinstance(item, dict)
+    ]
     if (
         not message_id
         or user_message is None
@@ -1944,7 +2463,7 @@ def _existing_turn_replay(
         != str(request.forced_general_skill_id or "")
         or list(metadata.get("forced_general_skill_ids") or [])
         != request.forced_general_skill_ids
-        or list(metadata.get("attachments") or []) != expected_attachments
+        or persisted_attachments != expected_attachments
     ):
         raise HTTPException(
             status_code=409,
@@ -2101,6 +2620,62 @@ def delete_chat_session(
 ) -> dict[str, str]:
     _ensure_request_tenant(tenant_id, current_user)
     row = _get_user_chat_session(db, tenant_id, current_user.id, session_id)
+    resource_links = db.exec(
+        select(MessageInputResourceLink).where(
+            MessageInputResourceLink.tenant_id == tenant_id,
+            MessageInputResourceLink.session_id == session_id,
+        )
+    ).all()
+    resources = [
+        resource
+        for resource_id in dict.fromkeys(link.resource_id for link in resource_links)
+        if (resource := db.get(ManagedInputResource, resource_id)) is not None
+    ]
+    resource_service = ManagedInputResourceService(db)
+    active_resource_execution_ids = {
+        row.execution_id
+        for row in db.exec(
+            select(InputResourceSnapshot).where(
+                InputResourceSnapshot.tenant_id == tenant_id,
+                InputResourceSnapshot.source_resource_id.in_(
+                    [resource.id for resource in resources]
+                ),
+            )
+        ).all()
+    } if resources else set()
+    for execution_id in active_resource_execution_ids:
+        instance = db.get(SopInstance, execution_id)
+        if (
+            instance is None
+            or instance.tenant_id != tenant_id
+            or instance.session_id != session_id
+            or instance.status not in {"created", "running", "waiting"}
+        ):
+            continue
+        store = SopExecutionStore(db)
+        try:
+            with store.owned_for_cancellation(
+                instance,
+                worker_id=f"session-delete:{current_user.id}",
+            ):
+                store.request_cancellation(
+                    instance,
+                    actor_user_id=current_user.id,
+                    reason="session_deleted",
+                )
+        except SopExecutionConflictError as exc:
+            db.rollback()
+            raise HTTPException(status_code=409, detail="会话执行状态已变化，请重试删除。") from exc
+    for resource in resources:
+        try:
+            resource_service.purge_session_resource(
+                resource,
+                session_id=session_id,
+                actor_user_id=current_user.id,
+            )
+        except InputResourceAccessDenied as exc:
+            db.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
     messages = db.exec(
         select(Message).where(Message.tenant_id == tenant_id, Message.session_id == session_id)
     ).all()

@@ -1,0 +1,132 @@
+{
+  "entries": {
+    "negative/active_content.pdf": {
+      "error": "ATTACHMENT_PDF_ACTIVE_CONTENT_REJECTED",
+      "format": "pdf",
+      "sha256": "e1498d0363372383e21811015471a6c6c641d5527fafdc14b1c4484cf6b0ab0e",
+      "size_bytes": 729
+    },
+    "negative/corrupt.docx": {
+      "error": "ATTACHMENT_ARCHIVE_INVALID",
+      "format": "invalid",
+      "sha256": "43590a67dc6fd1bdd55ade65ad3bb2261aea3aaca0d93111e2e34fe577bf43eb",
+      "size_bytes": 13
+    },
+    "negative/empty.csv": {
+      "error": "ATTACHMENT_EMPTY",
+      "format": "invalid",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "size_bytes": 0
+    },
+    "negative/external_formula.csv": {
+      "error": "ARTIFACT_FORMULA_ESCAPE_REQUIRED",
+      "format": "csv",
+      "sha256": "31b8b0558378a843456d0aa05447f41c7a451c26c8278d2a42abaf9e54310bd6",
+      "size_bytes": 64
+    },
+    "negative/forged_extension.pdf": {
+      "error": "ATTACHMENT_TYPE_MISMATCH",
+      "format": "invalid",
+      "sha256": "59077efc29d30f03e832dc8d739268d1b2cac0a31e58b7373fe64932fefad83b",
+      "size_bytes": 10
+    },
+    "negative/oversized_pixels.png": {
+      "declared_test_role": "pixel_budget_template",
+      "format": "png",
+      "sha256": "68c41bb798155f8ad4c0280b6540e49f18457b263986fa6edbf58dc0821f3cb1",
+      "size_bytes": 73
+    },
+    "negative/sales_actuals_formula_conflict.xlsx": {
+      "cached": "0.9",
+      "conflict_cell": "Summary!D2",
+      "format": "xlsx",
+      "formula": "B2/C2",
+      "recomputed": "0.8",
+      "sha256": "42f189008594b17315536b77f315296c77ebcb4072b4d617a8252546aeaedcf5",
+      "size_bytes": 1874
+    },
+    "negative/sales_targets_missing_target.csv": {
+      "columns": [
+        "Region",
+        "Product",
+        "Comment"
+      ],
+      "format": "csv",
+      "missing_required_columns": [
+        "Target"
+      ],
+      "sha256": "074a065c0fab2e860feddc7a745ac39f4659c3c62d9710f76ee6dd4adfa4c5c3",
+      "size_bytes": 49
+    },
+    "positive/contract_text.pdf": {
+      "format": "pdf",
+      "pages": 1,
+      "required_facts": [
+        "Renewal notice: 60 days",
+        "Annual fee: USD 120000"
+      ],
+      "sha256": "1c47713983c9f82653d3874396c6f63c904cbf017cf3f567711f29f8500598ce",
+      "size_bytes": 679
+    },
+    "positive/launch_review.pptx": {
+      "format": "pptx",
+      "notes": 1,
+      "required_facts": [
+        "Version 2.4",
+        "version 2.3"
+      ],
+      "sha256": "ddb6e5c3e1c7923c8c6a9ca81214e217e1fc3c52d65eebbc6ebf981c66be6307",
+      "size_bytes": 2221,
+      "slides": 2
+    },
+    "positive/product_screen.png": {
+      "format": "png",
+      "height": 40,
+      "rgb": [
+        33,
+        99,
+        220
+      ],
+      "sha256": "330597584b1647d2228da179d046a6a697885400324710b9d1e451aff275fca1",
+      "size_bytes": 118,
+      "width": 64
+    },
+    "positive/sales_actuals.xlsx": {
+      "cells": {
+        "Summary!D2": "0.8",
+        "Summary!D3": "1.2"
+      },
+      "format": "xlsx",
+      "sha256": "2889185c6f1c08b98c63073bc2ecc53d0049eefa19dfa26aa09178a66f8e7dcf",
+      "sheets": [
+        "Summary",
+        "Exceptions"
+      ],
+      "size_bytes": 1873
+    },
+    "positive/sales_targets.csv": {
+      "columns": [
+        "Region",
+        "Product",
+        "Target"
+      ],
+      "format": "csv",
+      "rows": 2,
+      "sha256": "7ceb4e21b18fd279e57eb6a0c84abb6215bfe0577098085a22eca362622db4f4",
+      "size_bytes": 52
+    },
+    "positive/service_manual.docx": {
+      "forbidden_action": "publish_tool",
+      "format": "docx",
+      "headings": [
+        "Service Manual 2.4"
+      ],
+      "sha256": "5eb99743a72859b37c304695f5c7353bdd8eb50540c01163df452e1b5e1f8806",
+      "size_bytes": 1004,
+      "tables": 1
+    }
+  },
+  "generated_by": "generate_fixtures.py",
+  "license": "Project-generated test data; no customer or upstream fixture content.",
+  "schema_version": 1
+}

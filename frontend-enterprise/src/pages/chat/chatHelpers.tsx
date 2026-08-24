@@ -6,6 +6,7 @@ import type { StreamEvent } from '@/api/client';
 import { formatClientDateTime } from '@/lib/timezone';
 import type {
   ChatAttachmentRead,
+  ChatAttachmentRef,
   ChatMessage,
   ChatSession,
   ChatSessionEventRead,
@@ -1749,9 +1750,16 @@ function imageExtension(contentType: string): string {
 // ---------------------------------------------------------------------------
 // Attachments
 // ---------------------------------------------------------------------------
-export function toRequestAttachment(attachment: ComposerAttachment): ChatAttachmentRead {
-  const { uploadStatus: _uploadStatus, uploadKey: _uploadKey, ...rest } = attachment;
-  return rest;
+export function toRequestAttachment(
+  attachment: Pick<ChatAttachmentRead, 'resource_id' | 'resource_version'>,
+): ChatAttachmentRef {
+  if (!attachment.resource_id || !attachment.resource_version) {
+    throw new Error('附件缺少服务端资源身份，请重新上传');
+  }
+  return {
+    resource_id: attachment.resource_id,
+    resource_version: attachment.resource_version,
+  };
 }
 
 export function messageAttachments(messageItem: ChatMessage): ChatAttachmentRead[] {

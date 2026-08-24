@@ -11,6 +11,7 @@ import { chromium } from '../frontend-enterprise/node_modules/playwright/index.m
 const baseUrl = process.env.BROWSER_TEST_BASE_URL || 'http://127.0.0.1:5137';
 const username = process.env.BROWSER_TEST_USERNAME || 'user_demo';
 const password = process.env.BROWSER_TEST_PASSWORD || 'demo';
+const agentId = (process.env.BROWSER_TEST_AGENT_ID || '').trim();
 const browserErrors = [];
 const failedResponses = [];
 
@@ -37,10 +38,14 @@ async function openDraftChat() {
   await page.getByRole('textbox', { name: '密码', exact: true }).fill(password);
   await page.getByRole('button', { name: '登录', exact: true }).click();
   await page.waitForFunction(() => Boolean(localStorage.getItem('gongge_auth')));
-  await page.goto(`${baseUrl}/workspace/gallery`);
-  await page.getByRole('textbox', { name: '搜索数字员工' }).fill('法务');
-  await page.locator('.gongge-employee-card').filter({ hasText: /^法务/ }).first()
-    .getByRole('button', { name: '发起对话' }).click();
+  if (agentId) {
+    await page.goto(`${baseUrl}/workspace/chat/draft/${agentId}`);
+  } else {
+    await page.goto(`${baseUrl}/workspace/gallery`);
+    await page.getByRole('textbox', { name: '搜索数字员工' }).fill('法务');
+    await page.locator('.gongge-employee-card').filter({ hasText: /^法务/ }).first()
+      .getByRole('button', { name: '发起对话' }).click();
+  }
   await page.waitForURL(/\/workspace\/chat\/draft\//);
   await page.waitForTimeout(2500);
 }
@@ -71,6 +76,20 @@ async function waitForNewTurn(sessionId, knownTurns) {
   throw new Error('未取得新 Turn 的权威 user_message_id');
 }
 
+/** 等待指定 Turn 出现权威事件，确保取消和断连发生在真实回复流而非路由阶段。 */
+async function waitForTurnEvent(sessionId, turnId, eventName, maxAttempts = 240) {
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const events = await fetchEvents(sessionId);
+    const matched = events.some(
+      (event) => event.event === eventName
+        && (event.data?.user_message_id || event.data?.turn_id) === turnId,
+    );
+    if (matched) return;
+    await page.waitForTimeout(500);
+  }
+  throw new Error(`Turn ${turnId} 未在时限内产生 ${eventName}`);
+}
+
 try {
   await openDraftChat();
   const emptySessionMatch = page.url().match(/\/workspace\/chat\/(session_[^/?#]+)/);
@@ -81,7 +100,7 @@ try {
       .map((event) => event.data?.user_message_id),
   );
   const composer = page.getByPlaceholder('输入消息，按 Enter 发送...');
-  await composer.fill('请用中文逐段详细解释企业数字员工的二十个生产级建设要点，每点至少五句话。');
+  await composer.fill('请直接在普通对话中回答，不要创建动态任务或SOP。请用中文逐段详细解释企业数字员工的二十个生产级建设要点，每点至少五句话。');
   const send = page.getByRole('button', { name: '发送' });
   if (await send.isDisabled()) throw new Error('发送按钮不应处于禁用态');
   await send.click();
@@ -92,6 +111,7 @@ try {
 
   const stop = page.locator('button[aria-label="停止生成"]');
   await stop.waitFor({ state: 'visible', timeout: 60_000 });
+  await waitForTurnEvent(sessionId, cancelledTurn, 'stream_delta');
   await stop.click();
   await page.waitForTimeout(1000);
   const beforeRefresh = await page.locator('body').innerText();
@@ -138,15 +158,16 @@ try {
       .map((event) => event.data?.user_message_id || event.data?.turn_id),
   );
   const composerAfterRefresh = page.getByPlaceholder('输入消息，按 Enter 发送...');
-  await composerAfterRefresh.fill('请用中文列出十条合同归档检查事项，每条一句。');
+  await composerAfterRefresh.fill('请直接在普通对话中回答，不要创建动态任务或SOP。请把数字一到十分别写成一行，每行只写一个中文数字。');
   await page.getByRole('button', { name: '发送', exact: true }).last().click();
   const disconnectTurn = await waitForNewTurn(sessionId, priorUserTurns);
   const stopAfterReloadScenario = page.locator('button[aria-label="停止生成"]');
   await stopAfterReloadScenario.waitFor({ state: 'visible', timeout: 60_000 });
+  await waitForTurnEvent(sessionId, disconnectTurn, 'stream_delta');
   await page.reload();
   await page.waitForLoadState('networkidle');
   let afterDisconnectEvents = [];
-  for (let attempt = 0; attempt < 120; attempt += 1) {
+  for (let attempt = 0; attempt < 240; attempt += 1) {
     afterDisconnectEvents = await fetchEvents(sessionId);
     const terminal = afterDisconnectEvents.some(
       (event) => ['stream_end', 'stream_cancelled', 'error_occurred'].includes(event.event)

@@ -108,6 +108,7 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [scheduleIntentHovered, setScheduleIntentHovered] = useState(false);
+  const [previewAttachment, setPreviewAttachment] = useState<UseChatSession['composerAttachments'][number] | null>(null);
 
   useEffect(() => {
     const element = textareaRef.current;
@@ -271,10 +272,19 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
                     <span className={CHAT_COMPOSER_ATTACHMENT_NAME_CLASS}>{attachment.filename}</span>
                     <span className={CHAT_COMPOSER_ATTACHMENT_STATUS_CLASS}>
                       {attachment.uploadStatus === 'uploading' && '解析中'}
-                      {attachment.uploadStatus === 'ready' && attachmentTypeLabel(attachment)}
+                      {attachment.uploadStatus === 'ready' && `${attachmentTypeLabel(attachment)} · 可分析`}
                       {attachment.uploadStatus === 'error' && (attachment.error || '上传失败')}
                     </span>
                   </span>
+                  {attachment.uploadStatus === 'ready' && attachment.preview && (
+                    <button
+                      type="button"
+                      className="shrink-0 rounded-md px-1.5 py-1 text-[11px] font-medium text-[var(--gg-cobalt)] hover:bg-[#edf2ff]"
+                      onClick={() => setPreviewAttachment(attachment)}
+                    >
+                      查看解析内容
+                    </button>
+                  )}
                   <button
                     type="button"
                     className={CHAT_COMPOSER_ATTACHMENT_REMOVE_CLASS}
@@ -287,6 +297,20 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
               ))}
             </div>
           )}
+
+          <Dialog open={Boolean(previewAttachment)} onOpenChange={(open) => !open && setPreviewAttachment(null)}>
+            <DialogContent className="max-w-[720px] rounded-[20px] p-0">
+              <div className="border-b border-[#e8ebf2] px-6 py-5">
+                <DialogTitle className="text-base font-semibold text-[#18181a]">
+                  {previewAttachment?.filename || '附件解析内容'}
+                </DialogTitle>
+                <p className="mt-1 text-xs text-[#757f9c]">内容来自服务端固定解析版本，仅作为不可信数据读取。</p>
+              </div>
+              <pre className="max-h-[60vh] overflow-auto whitespace-pre-wrap break-words px-6 py-5 text-sm leading-6 text-[#303746]" data-i18n-ignore>
+                {previewAttachment?.preview || '暂无可预览内容'}
+              </pre>
+            </DialogContent>
+          </Dialog>
 
           <textarea
             ref={textareaRef}

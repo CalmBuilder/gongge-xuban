@@ -75,6 +75,30 @@ def tool_failure_reply(tool_result: ToolResult) -> str:
 
 
 class ResponseGenerator:
+    def requires_model_call(
+        self,
+        step_result: StepAgentResult,
+        tool_result: ToolResult | None,
+        task_results: list[dict[str, object]] | None = None,
+        *,
+        force_model_call: bool = False,
+        conversation_context: dict[str, object] | None = None,
+    ) -> bool:
+        """在外发附件前机械判断本次回复是否确实会调用模型。"""
+
+        if self._runtime_control_reply(step_result) is not None:
+            return False
+        if not force_model_call and self._can_use_step_reply_directly(
+            step_result, tool_result, task_results
+        ):
+            return False
+        if tool_result and not tool_result.success and not task_results:
+            # 工具失败通常直接返回固定错误，不能把没有发生的模型外呼登记为已授权。
+            # 但本轮若存在已读取的附件切片，固定错误会掩盖用户真正要求回答的附件事实；
+            # 回复阶段必须继续调用模型消费权威切片，失败时由上层把派发组标记为 unknown。
+            return bool(self._authoritative_attachment_evidence(conversation_context))
+        return True
+
     def generate(
         self,
         message: str,
@@ -89,11 +113,14 @@ class ResponseGenerator:
         conversation_context: dict[str, object] | None = None,
         task_results: list[dict[str, object]] | None = None,
         propagate_model_failure: bool = False,
+        force_model_call: bool = False,
     ) -> str:
         runtime_control_reply = self._runtime_control_reply(step_result)
         if runtime_control_reply is not None:
             return runtime_control_reply
-        if self._can_use_step_reply_directly(step_result, tool_result, task_results):
+        if not force_model_call and self._can_use_step_reply_directly(
+            step_result, tool_result, task_results
+        ):
             return step_result.reply.strip()
         raw_payload = self._payload(
             message,
@@ -108,7 +135,12 @@ class ResponseGenerator:
         )
         payload = self._stage_payload(raw_payload, persona_prompt)
         try:
-            if tool_result and not tool_result.success and not task_results:
+            if (
+                tool_result
+                and not tool_result.success
+                and not task_results
+                and not self._authoritative_attachment_evidence(conversation_context)
+            ):
                 return tool_failure_reply(tool_result)
             with llm_operation("response.generate"):
                 text = LLMClient(model_config).generate_text(
@@ -137,6 +169,8 @@ class ResponseGenerator:
         conversation_context: dict[str, object] | None = None,
         task_results: list[dict[str, object]] | None = None,
         is_cancelled: Callable[[], bool] | None = None,
+        force_model_call: bool = False,
+        propagate_model_failure: bool = False,
     ) -> Iterator[str]:
         """流式生成用户回复，并在 provider 首 token 前及每个 chunk 边界响应取消。"""
 
@@ -146,7 +180,9 @@ class ResponseGenerator:
         if runtime_control_reply is not None:
             yield from self._cancelable_chunks(runtime_control_reply, is_cancelled)
             return
-        if self._can_use_step_reply_directly(step_result, tool_result, task_results):
+        if not force_model_call and self._can_use_step_reply_directly(
+            step_result, tool_result, task_results
+        ):
             yield from self._cancelable_chunks(step_result.reply or "", is_cancelled)
             return
         raw_payload = self._payload(
@@ -162,7 +198,12 @@ class ResponseGenerator:
         )
         payload = self._stage_payload(raw_payload, persona_prompt)
         try:
-            if tool_result and not tool_result.success and not task_results:
+            if (
+                tool_result
+                and not tool_result.success
+                and not task_results
+                and not self._authoritative_attachment_evidence(conversation_context)
+            ):
                 yield from self._cancelable_chunks(tool_failure_reply(tool_result), is_cancelled)
                 return
             if router_decision.decision == "clarify" and step_result.reply:
@@ -204,6 +245,8 @@ class ResponseGenerator:
         except LLMStreamCancelled:
             raise
         except Exception as exc:
+            if propagate_model_failure:
+                raise
             yield from self.chunk_text(
                 format_runtime_failure_reply("模型调用失败", exc, "LLM_ERROR", model_failure_suggestion(exc))
             )
@@ -263,18 +306,24 @@ class ResponseGenerator:
         conversation_context: dict[str, object] | None = None,
         task_results: list[dict[str, object]] | None = None,
     ) -> dict[str, object]:
+        authoritative_attachment_evidence = self._authoritative_attachment_evidence(
+            conversation_context
+        )
         projected_task_results = self._project_task_results(task_results)
         if projected_task_results:
-            return {
+            payload: dict[str, object] = {
                 "user_message": message,
                 "conversation_context": (
                     conversation_context if isinstance(conversation_context, dict) else {}
                 ),
                 "task_results": projected_task_results,
             }
+            if authoritative_attachment_evidence:
+                payload["authoritative_attachment_evidence"] = authoritative_attachment_evidence
+            return payload
         knowledge_context = self._current_knowledge_context(message, session, step_result)
         compact_knowledge = compact_knowledge_context(knowledge_context)
-        return {
+        payload = {
             "user_message": message,
             "conversation_context": (
                 conversation_context if isinstance(conversation_context, dict) else {}
@@ -294,6 +343,62 @@ class ResponseGenerator:
             ),
             "response_rules": skill.content_json.get("response_rules", []) if skill else [],
         }
+        if authoritative_attachment_evidence:
+            payload["authoritative_attachment_evidence"] = authoritative_attachment_evidence
+        return payload
+
+    @staticmethod
+    def _authoritative_attachment_evidence(
+        conversation_context: dict[str, object] | None,
+    ) -> list[dict[str, object]]:
+        """把本轮已授权读取的附件切片投影到回复阶段，避免模型只看到历史摘要而漏读附件。"""
+
+        if not isinstance(conversation_context, dict):
+            return []
+        raw_inputs = conversation_context.get("current_turn_inputs")
+        if not isinstance(raw_inputs, list):
+            return []
+        evidence: list[dict[str, object]] = []
+        for raw_input in raw_inputs:
+            if not isinstance(raw_input, dict):
+                continue
+            elements: list[dict[str, object]] = []
+            raw_elements = raw_input.get("elements")
+            if isinstance(raw_elements, list):
+                for raw_element in raw_elements:
+                    if not isinstance(raw_element, dict):
+                        continue
+                    element = {
+                        key: raw_element[key]
+                        for key in (
+                            "element_id",
+                            "type",
+                            "text",
+                            "table",
+                            "locator",
+                            "content_checksum",
+                        )
+                        if key in raw_element
+                    }
+                    if element:
+                        elements.append(element)
+            if not elements:
+                continue
+            evidence.append(
+                {
+                    key: raw_input[key]
+                    for key in (
+                        "filename",
+                        "mime_type",
+                        "instruction_boundary",
+                        "read_receipt_id",
+                        "slice_checksum",
+                    )
+                    if key in raw_input
+                }
+                | {"elements": elements}
+            )
+        return evidence
 
     def _project_task_results(
         self, task_results: list[dict[str, object]] | None

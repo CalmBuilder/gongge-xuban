@@ -279,6 +279,7 @@ def test_user_only_requires_forced_load_and_replay_reuses_one_use() -> None:
     assert first.resources == (
         {
             "path": "references/policy.md",
+            "media_type": "text/markdown",
             "content_checksum": hashlib.sha256(b"refund threshold: 5000").hexdigest(),
             "content": "refund threshold: 5000",
             "truncated": False,

@@ -134,6 +134,12 @@ DEFAULT_CAPABILITY_REGISTRY = CapabilityRegistry(
             description="通过统一知识服务检索业务依据。",
         ),
         CapabilitySpec(
+            name="service.builtin_input",
+            node_types=frozenset({NodeType.SERVICE_TASK}),
+            availability=CapabilityAvailability.EXECUTABLE,
+            description="执行平台受管input.*或table.compute，不进入外部Tool和模型披露边界。",
+        ),
+        CapabilitySpec(
             name="service.response",
             node_types=frozenset({NodeType.SERVICE_TASK}),
             description="生成非终态的结构化用户反馈。",

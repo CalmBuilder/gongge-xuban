@@ -160,6 +160,44 @@ it('终态执行展示权威 Artifact 并通过鉴权 API 下载', async () => {
   vi.unstubAllGlobals();
 });
 
+it('正式SOP复用执行卡展示并下载XLSX且不暴露Dynamic控制', async () => {
+  /** SOP与Dynamic共用Artifact权限边界，但SOP不得出现追加Skill或重规划按钮。 */
+
+  vi.mocked(api.get).mockResolvedValue({
+    id: 'execution_sop_1',
+    kind: 'sop',
+    status: 'succeeded',
+    revision: 8,
+    session_id: 'session_sop',
+    artifacts: [
+      {
+        id: 'artifact_sales',
+        filename: '销售核验报告.xlsx',
+        mime_type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        size_bytes: 4096,
+      },
+    ],
+  });
+  vi.mocked(api.blob).mockResolvedValue(new Blob(['PK'], { type: 'application/octet-stream' }));
+  const createObjectURL = vi.fn(() => 'blob:sop-artifact');
+  const revokeObjectURL = vi.fn();
+  vi.stubGlobal('URL', { ...URL, createObjectURL, revokeObjectURL });
+  const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined);
+  const user = userEvent.setup();
+  renderControl();
+
+  expect(await screen.findByLabelText('SOP执行结果')).toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: '运行中增加 Skill' })).not.toBeInTheDocument();
+  await user.click(screen.getByRole('button', { name: /销售核验报告.xlsx/ }));
+
+  expect(api.blob).toHaveBeenCalledWith(
+    '/api/artifacts/artifact_sales/download?tenant_id=tenant_demo',
+  );
+  expect(click).toHaveBeenCalledTimes(1);
+  click.mockRestore();
+  vi.unstubAllGlobals();
+});
+
 function renderControl() {
   /** 使用真实 i18n 上下文覆盖共享 Textarea 与按钮渲染。 */
 

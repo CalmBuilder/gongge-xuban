@@ -9,9 +9,11 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import sys
 import threading
+from typing import Final
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -49,13 +51,14 @@ from app.dynamic_tasks.planning import (  # noqa: E402
 )
 from app.sop_runtime.execution_store import SopExecutionStore  # noqa: E402
 from app.dynamic_tasks.quotas import DynamicTaskQuotaService  # noqa: E402
+from app.general_skills.eligibility import EffectiveGeneralSkillResolver  # noqa: E402
 from app.tools.tool_schema import ToolResult  # noqa: E402
 
 
 TENANT_ID = "tenant_demo"
-USER_ID = "user_demo"
+USER_ID = os.environ.get("RUNTIME_DEMO_USER_ID", "user_demo").strip() or "user_demo"
 SKILL_AGENT_ID = "agent_skill_demo_a_docs"
-EMPTY_AGENT_ID = "agent_skill_demo_b_diagnosis"
+DEMO_TOOL_MARKER: Final = "openworker_runtime_demo_v1"
 
 
 class DemoParallelProposer:
@@ -105,6 +108,7 @@ def main() -> None:
     with Session(engine, expire_on_commit=False) as db:
         _release_stale_runtime_demo_capacity(db)
         user, model = _required_identities(db)
+        empty_agent_id = _empty_catalog_agent_id(db, user=user)
         instant = _create_answer_only_session(
             db,
             user=user,
@@ -116,7 +120,7 @@ def main() -> None:
             db,
             user=user,
             model=model,
-            agent_id=EMPTY_AGENT_ID,
+            agent_id=empty_agent_id,
             label="运行中增加 Skill 空目录反例",
         )
         parallel = _create_parallel_session(db, user=user, model=model)
@@ -150,6 +154,7 @@ def _release_stale_runtime_demo_capacity(db: Session) -> None:
             SopInstance.tenant_id == TENANT_ID,
             SopInstance.kind == "dynamic_task",
             SopInstance.source_kind == "chat",
+            SopInstance.initiator_user_id == USER_ID,
             SopInstance.status.in_(("created", "running", "waiting")),
         )
     ).all()
@@ -157,9 +162,7 @@ def _release_stale_runtime_demo_capacity(db: Session) -> None:
     quotas = DynamicTaskQuotaService(db)
     for instance in instances:
         session = db.get(ChatSession, instance.session_id) if instance.session_id else None
-        if session is None or not str(session.title or "").startswith(
-            ("运行中增加 Skill", "流式停止精确桥接", "低风险并行读取")
-        ):
+        if not _is_owned_runtime_demo(instance=instance, session=session, user_id=USER_ID):
             continue
         with store.owned(instance, worker_id=f"runtime-demo-cleanup-{instance.id[-8:]}"):
             store.request_cancellation(
@@ -171,25 +174,63 @@ def _release_stale_runtime_demo_capacity(db: Session) -> None:
     db.commit()
 
 
+def _is_owned_runtime_demo(
+    *,
+    instance: SopInstance,
+    session: ChatSession | None,
+    user_id: str,
+) -> bool:
+    """只识别当前用户本人创建、且标题属于本准备器命名空间的演示执行。"""
+
+    return bool(
+        instance.initiator_user_id == user_id
+        and session is not None
+        and session.user_id == user_id
+        and str(session.title or "").startswith(
+            ("运行中增加 Skill", "流式停止精确桥接", "低风险并行读取")
+        )
+    )
+
+
 def _required_identities(db: Session) -> tuple[User, ModelConfig]:
     """解析现有演示用户、三个数字员工和已通过预检的模型，不创建账号或凭据。"""
 
     user = db.get(User, USER_ID)
     if user is None or user.tenant_id != TENANT_ID or user.membership_status != "active":
         raise RuntimeError("活动演示用户 user_demo 不存在")
-    for agent_id in (SKILL_AGENT_ID, EMPTY_AGENT_ID):
+    for agent_id in (SKILL_AGENT_ID,):
         agent = db.get(AgentProfile, agent_id)
         if agent is None or agent.tenant_id != TENANT_ID or agent.owner_user_id != user.id:
             raise RuntimeError(f"请先初始化 Skill 五闭环数字员工：{agent_id}")
     model = db.exec(
         select(ModelConfig).where(
             ModelConfig.tenant_id == TENANT_ID,
+            ModelConfig.enabled == True,  # noqa: E712 - SQLModel布尔表达式。
+            ModelConfig.is_default == True,  # noqa: E712 - 必须与管理端默认选择一致。
             ModelConfig.preflight_status == "ready",
         )
     ).first()
     if model is None:
-        raise RuntimeError("没有已通过预检的演示模型")
+        raise RuntimeError("没有已启用、默认且通过预检的演示模型")
     return user, model
+
+
+def _empty_catalog_agent_id(db: Session, *, user: User) -> str:
+    """从当前用户可用的活动 Agent 中选择实时 Skill 目录为空的反例对象。"""
+
+    resolver = EffectiveGeneralSkillResolver(db)
+    candidates = db.exec(
+        select(AgentProfile).where(
+            AgentProfile.tenant_id == TENANT_ID,
+            AgentProfile.owner_user_id == user.id,
+            AgentProfile.status == "active",
+            AgentProfile.id != SKILL_AGENT_ID,
+        )
+    ).all()
+    for agent in sorted(candidates, key=lambda row: row.id):
+        if not resolver.resolve(user, agent.id).items:
+            return agent.id
+    raise RuntimeError("当前用户没有 Skill 目录为空的活动数字员工")
 
 
 def _create_answer_only_session(
@@ -207,7 +248,10 @@ def _create_answer_only_session(
     user_message_id = new_id("msg")
     db.add(ChatSession(id=session_id, tenant_id=TENANT_ID, user_id=user.id, agent_id=agent_id, title=label))
     plan = NormalizedPlan(
-        goal="把售后升级处理要求整理成含输入、步骤、异常与验收标准的操作规范",
+        goal=(
+            "G1-A动态：把售后升级处理要求整理成含输入、步骤、异常"
+            "与验收标准的操作规范"
+        ),
         success_criteria=(SuccessCriterion(id="complete_spec", type="assertion", spec={"required": True}),),
         steps=(PlanStep(step_key="answer", title="生成完整操作规范", kind="answer"),),
         budget={"max_steps": 4, "max_model_calls": 8, "max_tool_calls": 2},
@@ -278,17 +322,34 @@ def _create_parallel_session(db: Session, *, user: User, model: ModelConfig) -> 
     assert agent is not None
     tool_names = ("demo.runtime.read_contract", "demo.runtime.read_partner")
     for index, name in enumerate(tool_names):
+        expected_tool_id = f"tool_runtime_demo_{index}"
         tool = db.exec(select(Tool).where(Tool.tenant_id == TENANT_ID, Tool.name == name)).first()
         if tool is None:
+            id_collision = db.get(Tool, expected_tool_id)
+            if id_collision is not None:
+                raise RuntimeError(
+                    f"演示工具 ID 已被非目标资源占用，拒绝接管：{expected_tool_id}"
+                )
             tool = Tool(
-                id=f"tool_runtime_demo_{index}",
+                id=expected_tool_id,
                 tenant_id=TENANT_ID,
                 name=name,
                 display_name=f"运行时演示读取 {index + 1}",
                 method="GET",
                 url="https://example.invalid/runtime-demo",
                 output_schema={"type": "object", "properties": {"source": {"type": "string"}, "verified": {"type": "boolean"}}},
+                config_json={
+                    "managed_by": DEMO_TOOL_MARKER,
+                    "owner_user_id": user.id,
+                },
             )
+        else:
+            _assert_demo_tool_owned(tool=tool, expected_tool_id=expected_tool_id, user_id=user.id)
+            tool.config_json = {
+                **dict(tool.config_json or {}),
+                "managed_by": DEMO_TOOL_MARKER,
+                "owner_user_id": user.id,
+            }
         publish_tool_contract(
             tool,
             ToolReliabilityContract(
@@ -355,6 +416,27 @@ def _create_parallel_session(db: Session, *, user: User, model: ModelConfig) -> 
     db.add(Message(tenant_id=TENANT_ID, session_id=session_id, role="assistant", content="两个低风险读取已由统一 Runtime 同波执行；执行卡展示持久批次与稳定顺序。", metadata_json={"execution_id": instance.id}))
     db.commit()
     return {"session_id": session_id, "execution_id": instance.id, "url": f"/workspace/chat/{session_id}"}
+
+
+def _assert_demo_tool_owned(*, tool: Tool, expected_tool_id: str, user_id: str) -> None:
+    """拒绝修改同名业务工具，仅允许本准备器的标记资源或旧版精确演示签名。"""
+
+    config = dict(tool.config_json or {})
+    marker = str(config.get("managed_by") or "")
+    owner_user_id = str(config.get("owner_user_id") or "")
+    legacy_signature = (
+        tool.id == expected_tool_id
+        and tool.method == "GET"
+        and tool.url == "https://example.invalid/runtime-demo"
+        and str(tool.display_name or "").startswith("运行时演示读取 ")
+    )
+    marked_owner = (
+        tool.id == expected_tool_id
+        and marker == DEMO_TOOL_MARKER
+        and owner_user_id == user_id
+    )
+    if not (marked_owner or (not marker and legacy_signature)):
+        raise RuntimeError(f"同名工具不属于当前演示准备器，拒绝覆盖：{tool.name}")
 
 
 if __name__ == "__main__":

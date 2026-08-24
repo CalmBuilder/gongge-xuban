@@ -6,6 +6,7 @@
 @Description: 验证 Runtime 跨轮等待、可靠工具/知识回执、崩溃恢复和确定性终态。
 """
 
+import hashlib
 from datetime import datetime
 
 import pytest
@@ -15,14 +16,27 @@ from sqlmodel import Session, SQLModel, create_engine, select
 from app.core.agent_loop import AgentLoop
 from app.db.demo_sop_versions import _partner_due_diligence_content
 from app.db.models import (
+    AgentProfile,
     AgentEvent,
     ChatSession,
+    ArtifactRendererJob,
+    ExecutionArtifact,
+    InputDocumentElement,
+    InputResourceExtraction,
+    ManagedInputResource,
+    Message,
+    MessageInputBindingLink,
+    MessageInputResourceLink,
+    ProviderInputDispatchReceipt,
+    ResourceSessionBinding,
+    SelectedResourceExtraction,
     Skill,
     SkillVersion,
     SopInstance,
     SopNodeExecution,
     SopOperation,
     Tool,
+    User,
 )
 from app.dynamic_tasks.capability_catalog import ToolReliabilityContract, publish_tool_contract
 from app.knowledge.schema import KnowledgeSearchResponse
@@ -100,6 +114,102 @@ def _content() -> dict[str, object]:
         ],
         "start_node_id": "collect_employee",
         "terminal_node_ids": ["reply_result"],
+    }
+
+
+def _attachment_sop_content() -> dict[str, object]:
+    """构造顺序读取XLSX和CSV、且不调用模型的正式附件SOP。"""
+
+    return {
+        "skill_id": "skill_sales_reconcile",
+        "name": "销售数据核验",
+        "version": "1.0.0",
+        "execution_mode": "deterministic",
+        "condition_schemas": {
+            "slots": {
+                "type": "object",
+                "properties": {
+                    "actuals": {"type": "array", "items": {"type": "string"}},
+                    "targets": {"type": "array", "items": {"type": "string"}},
+                },
+            },
+            "node_output": {
+                "type": "object",
+                "properties": {
+                    "actuals_read": {"type": "object"},
+                    "targets_read": {"type": "object"},
+                },
+            },
+        },
+        "nodes": [
+            {
+                "node_id": "collect_files",
+                "type": "collect_input",
+                "name": "收集销售文件",
+                "expected_user_info": ["actuals", "targets"],
+                "allowed_actions": ["ask_user", "continue_flow"],
+                "metadata": {
+                    "attachment_slots": [
+                        {
+                            "slot_key": "actuals",
+                            "allowed_formats": ["xlsx"],
+                            "min_count": 1,
+                            "max_count": 1,
+                            "required_columns": ["区域", "实际销售额"],
+                        },
+                        {
+                            "slot_key": "targets",
+                            "allowed_formats": ["csv"],
+                            "min_count": 1,
+                            "max_count": 1,
+                            "required_columns": ["区域", "目标销售额"],
+                        },
+                    ]
+                },
+            },
+            {
+                "node_id": "read_actuals",
+                "type": "builtin_input",
+                "name": "读取实际销售",
+                "allowed_actions": ["call_builtin_input:input.read"],
+                "metadata": {
+                    "operation_input": {"snapshot_handles": "slots.actuals"},
+                    "operation_result_key": "actuals_read",
+                },
+            },
+            {
+                "node_id": "read_targets",
+                "type": "builtin_input",
+                "name": "读取销售目标",
+                "allowed_actions": ["call_builtin_input:input.read"],
+                "metadata": {
+                    "operation_input": {"snapshot_handles": "slots.targets"},
+                    "operation_result_key": "targets_read",
+                },
+            },
+            {
+                "node_id": "done",
+                "type": "terminal",
+                "name": "核验完成",
+                "allowed_actions": ["answer_user"],
+            },
+        ],
+        "edges": [
+            {"source_node_id": "collect_files", "next_node_id": "read_actuals"},
+            {"source_node_id": "read_actuals", "next_node_id": "read_targets"},
+            {"source_node_id": "read_targets", "next_node_id": "done"},
+        ],
+        "start_node_id": "collect_files",
+        "terminal_node_ids": ["done"],
+        "expected_artifacts": [
+            {
+                "artifact_key": "sales_reconciliation_xlsx",
+                "filename": "销售核验报告.xlsx",
+                "mime_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "content_source": "result.markdown",
+                "required": True,
+            }
+        ],
     }
 
 
@@ -281,6 +391,159 @@ def _seed(db: Session) -> tuple[Skill, ChatSession]:
     return skill, chat_session
 
 
+def _seed_attachment_sop(db: Session) -> tuple[Skill, ChatSession]:
+    """写入正式附件SOP、同会话权威消息Link及两份不可变Extraction。"""
+
+    content = _attachment_sop_content()
+    definition = compile_legacy_skill_card(content)
+    skill = Skill(
+        tenant_id="tenant_demo",
+        skill_id="skill_sales_reconcile",
+        version="1.0.0",
+        name="销售数据核验",
+        content_json=content,
+        status="published",
+    )
+    version = SkillVersion(
+        id="skillver_sales_reconcile_100",
+        tenant_id="tenant_demo",
+        skill_id=skill.skill_id,
+        version=skill.version,
+        name=skill.name,
+        content_json=content,
+        status="published",
+        compiled_definition_checksum=definition.checksum,
+    )
+    user = User(
+        id="user_attachment_sop",
+        tenant_id="tenant_demo",
+        username="attachment_sop_user",
+        password_hash="test-only",
+    )
+    agent = AgentProfile(
+        id="agent_attachment_sop",
+        tenant_id="tenant_demo",
+        name="附件SOP数字员工",
+        owner_user_id=user.id,
+    )
+    chat_session = ChatSession(
+        id="session_attachment_sop",
+        tenant_id="tenant_demo",
+        user_id=user.id,
+        agent_id=agent.id,
+        active_skill_id=skill.skill_id,
+        active_step_id="collect_files",
+    )
+    message = Message(
+        id="message_attachment_sop",
+        tenant_id="tenant_demo",
+        session_id=chat_session.id,
+        role="user",
+        content="请按已发布SOP核验这两份销售文件。",
+    )
+    db.add_all([skill, version, user, agent, chat_session, message])
+    for ordinal, (resource_id, filename, mime_type, element_text, table_json) in enumerate(
+        (
+            (
+                "input_actuals_xlsx",
+                "销售实际.xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "区域,实际销售额\n华东,120",
+                {"columns": ["区域", "实际销售额"], "rows": [["华东", "120"]]},
+            ),
+            (
+                "input_targets_csv",
+                "销售目标.csv",
+                "text/csv",
+                "区域,目标销售额\n华东,100",
+                {"columns": ["区域", "目标销售额"], "rows": [["华东", "100"]]},
+            ),
+        )
+    ):
+        checksum = f"{ordinal + 1:064d}"
+        extraction_id = f"extract_sales_{ordinal}"
+        resource = ManagedInputResource(
+            id=resource_id,
+            tenant_id="tenant_demo",
+            owner_user_id=user.id,
+            agent_id=agent.id,
+            version=checksum,
+            filename=filename,
+            mime_type=mime_type,
+            size_bytes=len(element_text.encode()),
+            content_checksum=checksum,
+            extraction_checksum=f"extract-checksum-{ordinal}",
+            ingestion_status="ready",
+            security_status="format_verified",
+            storage_locator=f"tenant_demo/{resource_id}/blob",
+        )
+        extraction = InputResourceExtraction(
+            id=extraction_id,
+            tenant_id="tenant_demo",
+            resource_id=resource.id,
+            resource_version=resource.version,
+            content_checksum=checksum,
+            parser_name="builtin-xlsx" if ordinal == 0 else "builtin-csv",
+            parser_version="1.0.0",
+            parser_config_checksum=f"parser-config-{ordinal}",
+            extraction_checksum=f"extract-checksum-{ordinal}",
+            element_manifest_checksum=f"manifest-{ordinal}",
+            published_from_attempt_id=f"attempt-sales-{ordinal}",
+            element_count=1,
+        )
+        binding = ResourceSessionBinding(
+            id=f"binding-sales-{ordinal}",
+            tenant_id="tenant_demo",
+            resource_id=resource.id,
+            resource_version=resource.version,
+            owner_user_id=user.id,
+            session_id=chat_session.id,
+            agent_id=agent.id,
+        )
+        db.add_all(
+            [
+                resource,
+                extraction,
+                SelectedResourceExtraction(
+                    tenant_id="tenant_demo",
+                    resource_id=resource.id,
+                    resource_version=resource.version,
+                    profile_key="default",
+                    extraction_id=extraction.id,
+                ),
+                InputDocumentElement(
+                    id=f"element-sales-{ordinal}",
+                    tenant_id="tenant_demo",
+                    extraction_id=extraction.id,
+                    element_index=0,
+                    element_type="table",
+                    text=element_text,
+                    table_json=table_json,
+                    locator_json={
+                        "kind": "xlsx" if ordinal == 0 else "csv",
+                        "row_start": 1,
+                        "row_end": 2,
+                    },
+                    content_checksum=f"element-checksum-{ordinal}",
+                ),
+                binding,
+                MessageInputResourceLink(
+                    id=f"message-link-sales-{ordinal}",
+                    tenant_id="tenant_demo",
+                    session_id=chat_session.id,
+                    message_id=message.id,
+                    resource_binding_id=binding.id,
+                    resource_id=resource.id,
+                    resource_version=resource.version,
+                    content_checksum=resource.content_checksum,
+                    ordinal=ordinal,
+                ),
+            ]
+        )
+    db.commit()
+    return skill, chat_session
+
+
 def _seed_knowledge(db: Session) -> tuple[Skill, ChatSession]:
     """写入知识服务任务的不可变版本及活动会话。"""
 
@@ -408,6 +671,220 @@ def test_coordinator_closes_wait_tool_and_terminal_across_turns() -> None:
         "succeeded",
     ]
     assert operation_status == "succeeded"
+
+
+def test_formal_sop_reads_typed_attachments_without_provider_dispatch() -> None:
+    """验证正式SOP按发布槽位顺序读取XLSX/CSV并以零ProviderReceipt终结。"""
+
+    with _test_session() as db:
+        skill, chat_session = _seed_attachment_sop(db)
+        coordinator = DeterministicSopCoordinator(db)
+
+        result = coordinator.prepare_step(chat_session, skill, StepAgentResult())
+        db.commit()
+
+        instance = db.exec(select(SopInstance)).one()
+        operations = db.exec(select(SopOperation).order_by(SopOperation.created_at)).all()
+        slot_links = db.exec(
+            select(MessageInputBindingLink).order_by(
+                MessageInputBindingLink.slot_key,
+                MessageInputBindingLink.ordinal,
+            )
+        ).all()
+        provider_receipts = db.exec(select(ProviderInputDispatchReceipt)).all()
+        dynamic_events = db.exec(
+            select(AgentEvent).where(AgentEvent.event_type == "dynamic_task_delegated")
+        ).all()
+        renderer_jobs = db.exec(select(ArtifactRendererJob)).all()
+        artifacts = db.exec(select(ExecutionArtifact)).all()
+
+    assert result.action == "reply"
+    assert result.is_step_completed is True
+    assert instance.kind == "sop"
+    assert instance.status == "succeeded"
+    assert [item.operation_name for item in operations] == ["input.read", "input.read"]
+    assert all(item.status == "succeeded" for item in operations)
+    assert len(slot_links) == 2
+    assert all(item.input_snapshot_id for item in slot_links)
+    assert provider_receipts == []
+    assert dynamic_events == []
+    assert len(renderer_jobs) == 1
+    assert renderer_jobs[0].status == "ready"
+    assert renderer_jobs[0].artifact_id == artifacts[0].id
+    assert artifacts[0].filename == "销售核验报告.xlsx"
+
+
+def test_formal_sop_missing_required_csv_column_waits_without_execution_or_artifact() -> None:
+    """CSV格式正确但缺发布期关键列时必须保持等待，禁止模型补列或委托Dynamic。"""
+
+    with _test_session() as db:
+        skill, chat_session = _seed_attachment_sop(db)
+        target_element = db.get(InputDocumentElement, "element-sales-1")
+        assert target_element is not None
+        target_element.table_json = {
+            "columns": ["区域", "备注"],
+            "rows": [["华东", "缺少目标金额"]],
+        }
+        db.add(target_element)
+        db.commit()
+
+        coordinator = DeterministicSopCoordinator(db)
+        coordinator.prepare_step(chat_session, skill, StepAgentResult())
+        db.commit()
+
+        instance = db.exec(select(SopInstance)).one()
+        bindings = db.exec(
+            select(MessageInputBindingLink).order_by(MessageInputBindingLink.slot_key)
+        ).all()
+        operations = db.exec(select(SopOperation)).all()
+        artifacts = db.exec(select(ExecutionArtifact)).all()
+        dynamic_events = db.exec(
+            select(AgentEvent).where(AgentEvent.event_type == "dynamic_task_delegated")
+        ).all()
+        provider_receipts = db.exec(select(ProviderInputDispatchReceipt)).all()
+
+    assert instance.status == "waiting"
+    assert [binding.slot_key for binding in bindings] == ["actuals"]
+    assert operations == []
+    assert artifacts == []
+    assert dynamic_events == []
+    assert provider_receipts == []
+
+
+def test_formal_sop_table_compute_executes_whitelisted_ast() -> None:
+    """正式SOP的table.compute必须产生真实计算回执，不能退化为普通input.read。"""
+
+    with _test_session() as db:
+        skill, chat_session = _seed_attachment_sop(db)
+        content = dict(skill.content_json)
+        nodes = [dict(node) for node in content["nodes"]]
+        nodes[1] = {
+            **nodes[1],
+            "allowed_actions": ["call_builtin_input:table.compute"],
+            "metadata": {
+                **dict(nodes[1]["metadata"]),
+                "compute_ast": {
+                    "filter": {"op": "eq", "column": "区域", "value": "华东"},
+                    "aggregate": "sum",
+                    "column": "实际销售额",
+                },
+            },
+        }
+        content["nodes"] = nodes
+        compiled = compile_legacy_skill_card(content)
+        skill.content_json = content
+        version = db.exec(
+            select(SkillVersion).where(
+                SkillVersion.tenant_id == skill.tenant_id,
+                SkillVersion.skill_id == skill.skill_id,
+                SkillVersion.version == skill.version,
+            )
+        ).one()
+        version.content_json = content
+        version.compiled_definition_checksum = compiled.checksum
+        db.add(skill)
+        db.add(version)
+        db.commit()
+
+        result = DeterministicSopCoordinator(db).prepare_step(
+            chat_session,
+            skill,
+            StepAgentResult(),
+        )
+        operations = db.exec(select(SopOperation).order_by(SopOperation.created_at)).all()
+
+    assert result.action == "reply"
+    assert operations[0].operation_name == "table.compute"
+    assert operations[0].result_json["items"][0]["result"] == 120.0
+    assert operations[0].result_json["items"][0]["matched_rows"] == 1
+    assert operations[0].result_json["provider_dispatch_receipts"] == 0
+
+
+def test_formal_sop_formula_uses_published_sheet_cell_and_shared_runtime() -> None:
+    """正式SOP按发布期sheet/cell选择唯一公式，并由共享Decimal Runtime给出一致回执。"""
+
+    with _test_session() as db:
+        skill, chat_session = _seed_attachment_sop(db)
+        formula = "B2/C2"
+        formula_checksum = hashlib.sha256(formula.encode()).hexdigest()
+        element = db.get(InputDocumentElement, "element-sales-0")
+        assert element is not None
+        element.table_json = {
+            "sheet_name": "Summary",
+                "columns": ["区域", "实际销售额", "目标销售额", "完成率"],
+            "rows": [["华东", "80", "100", "0.8"]],
+            "cells": [
+                {"cell": "B2", "raw_value": "80", "formula": None},
+                {"cell": "C2", "raw_value": "100", "formula": None},
+                {
+                    "cell": "D2",
+                    "raw_value": "0.8",
+                    "cached_value": "0.8",
+                    "formula": formula,
+                    "formula_checksum": formula_checksum,
+                    "formula_type": "normal",
+                },
+            ],
+            "formulas": [
+                {
+                    "cell": "D2",
+                    "formula": formula,
+                    "formula_checksum": formula_checksum,
+                }
+            ],
+        }
+        db.add(element)
+        content = dict(skill.content_json)
+        nodes = [dict(node) for node in content["nodes"]]
+        nodes[1] = {
+            **nodes[1],
+            "allowed_actions": ["call_builtin_input:table.compute"],
+            "metadata": {
+                **dict(nodes[1]["metadata"]),
+                "compute_ast": {
+                    "op": "verify_formula",
+                    "sheet_name": "Summary",
+                    "cell": "D2",
+                },
+            },
+        }
+        content["nodes"] = nodes
+        compiled = compile_legacy_skill_card(content)
+        skill.content_json = content
+        version = db.exec(
+            select(SkillVersion).where(
+                SkillVersion.tenant_id == skill.tenant_id,
+                SkillVersion.skill_id == skill.skill_id,
+                SkillVersion.version == skill.version,
+            )
+        ).one()
+        version.content_json = content
+        version.compiled_definition_checksum = compiled.checksum
+        db.add(skill)
+        db.add(version)
+        db.commit()
+
+        result = DeterministicSopCoordinator(db).prepare_step(
+            chat_session,
+            skill,
+            StepAgentResult(),
+        )
+        operation = db.exec(
+            select(SopOperation).where(SopOperation.operation_name == "table.compute")
+        ).one()
+        item = operation.result_json["items"][0]
+
+    assert result.action == "reply"
+    assert operation.operation_name == "table.compute"
+    assert item["operation"] == {
+        "op": "verify_formula",
+        "element_id": "element-sales-0",
+        "cell": "D2",
+        "formula_checksum": formula_checksum,
+    }
+    assert item["status"] == "match"
+    assert item["computed_value"] == "0.8"
+    assert operation.result_json["provider_dispatch_receipts"] == 0
 
 
 def test_coordinator_persists_knowledge_receipt_and_routes_without_model_control() -> None:

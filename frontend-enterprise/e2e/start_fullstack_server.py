@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -204,7 +205,11 @@ def build_memory_context(preferences):
     return [item for item in preferences if item.strip()]
 """
 DIAGNOSIS_TEST = """\
+from pathlib import Path
+import sys
 import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.memory_route import build_memory_context
 
@@ -213,6 +218,10 @@ class MemoryContextRegressionTest(unittest.TestCase):
     def test_no_sop_route_retains_agent_preference(self):
         actual = build_memory_context(["称呼用户为张工"])
         self.assertEqual(actual, ["称呼用户为张工"], "remembered preference missing")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
 """
 DIAGNOSIS_CLEAN_CHECK = """\
 from pathlib import Path
@@ -244,52 +253,152 @@ def legacy_password_hash(password: str) -> str:
 
 
 def configure_environment(database_path: Path) -> None:
-    os.environ.update(
-        {
-            "APP_ENV": "test",
-            "APP_HOST": "127.0.0.1",
-            "APP_PORT": str(E2E_PORT),
-            "APP_SECRET": E2E_SECRET,
-            "AUTO_RESTART": "false",
-            "DATABASE_URL": f"sqlite:///{database_path}",
-            "PUBLIC_MOCK_API_KEY": "fullstack-e2e-public-mock-key",
-            "DYNAMIC_TASK_EXECUTION_ENABLED": "true",
-            "DYNAMIC_TASK_TENANT_ALLOWLIST": "*",
-            "DYNAMIC_TASK_AGENT_ALLOWLIST": "*",
-            "DYNAMIC_TASK_ALERT_SIGNAL_BACKLOG_THRESHOLD": "100",
-            "DYNAMIC_TASK_ALERT_DEAD_LETTER_THRESHOLD": "1",
-            "DYNAMIC_TASK_ALERT_UNKNOWN_OPERATION_THRESHOLD": "1",
-            "DYNAMIC_TASK_ALERT_PUBLICATION_BACKLOG_THRESHOLD": "10",
-            "DYNAMIC_TASK_ALERT_WAITING_AGE_SECONDS": "3600",
-            "DYNAMIC_TASK_MAX_ACTIVE_PER_TENANT": "16",
-            "DYNAMIC_TASK_MAX_ACTIVE_PER_AGENT": "8",
-            "DYNAMIC_TASK_MAX_ACTIVE_PER_USER": "4",
-            "DYNAMIC_TASK_MAX_ACTIVE_PER_TOOL": "4",
-            "DYNAMIC_TASK_MANAGED_WORKSPACE_ENABLED": "true",
-            "DYNAMIC_TASK_MANAGED_WORKSPACE_ROOT": str(
-                E2E_RUNTIME_DIR / "managed-workspaces"
-            ),
-            "GENERAL_SKILL_IMPORT_V2_ENABLED": "true",
-            "GENERAL_SKILL_IMPORT_ASYNC_ENABLED": "true",
-            "GENERAL_SKILL_IMPORT_WORKER_POLL_SECONDS": "0.2",
-            "GENERAL_SKILL_IMPORT_WORKER_LEASE_SECONDS": "300",
-            "GENERAL_SKILL_OBJECT_STORE_PATH": str(E2E_RUNTIME_DIR / "general-skill-objects"),
-            "GENERAL_SKILL_RESOLVER_V2_ENABLED": "true",
-            "GENERAL_SKILL_DYNAMIC_GUIDANCE_ENABLED": "true",
-            "GENERAL_SKILL_AGENT_PROPOSAL_ENABLED": "true",
-            "DYNAMIC_TASK_SKILL_LOADING_ENABLED": "true",
-            "GONGGE_XUBAN_DATA_DIR": str(E2E_RUNTIME_DIR / "user-data"),
+    """配置隔离全栈环境；显式测试URL可用于真实 MySQL Chromium 门禁。"""
+
+    database_url = os.environ.get("FULLSTACK_E2E_DATABASE_URL") or f"sqlite:///{database_path}"
+    environment = {
+        "APP_ENV": "test",
+        "APP_HOST": "127.0.0.1",
+        "APP_PORT": str(E2E_PORT),
+        "APP_SECRET": E2E_SECRET,
+        "AUTO_RESTART": "false",
+        "DATABASE_URL": database_url,
+        "PUBLIC_MOCK_API_KEY": "fullstack-e2e-public-mock-key",
+        "DYNAMIC_TASK_EXECUTION_ENABLED": "true",
+        "DYNAMIC_TASK_TENANT_ALLOWLIST": "*",
+        "DYNAMIC_TASK_AGENT_ALLOWLIST": "*",
+        "DYNAMIC_TASK_ALERT_SIGNAL_BACKLOG_THRESHOLD": "100",
+        "DYNAMIC_TASK_ALERT_DEAD_LETTER_THRESHOLD": "1",
+        "DYNAMIC_TASK_ALERT_UNKNOWN_OPERATION_THRESHOLD": "1",
+        "DYNAMIC_TASK_ALERT_PUBLICATION_BACKLOG_THRESHOLD": "10",
+        "DYNAMIC_TASK_ALERT_WAITING_AGE_SECONDS": "3600",
+        "DYNAMIC_TASK_MAX_ACTIVE_PER_TENANT": "16",
+        "DYNAMIC_TASK_MAX_ACTIVE_PER_AGENT": "8",
+        "DYNAMIC_TASK_MAX_ACTIVE_PER_USER": "4",
+        "DYNAMIC_TASK_MAX_ACTIVE_PER_TOOL": "4",
+        "DYNAMIC_TASK_MANAGED_WORKSPACE_ENABLED": "true",
+        "DYNAMIC_TASK_MANAGED_WORKSPACE_ROOT": str(E2E_RUNTIME_DIR / "managed-workspaces"),
+        "GENERAL_SKILL_IMPORT_V2_ENABLED": "true",
+        "GENERAL_SKILL_IMPORT_ASYNC_ENABLED": "true",
+        "GENERAL_SKILL_IMPORT_WORKER_POLL_SECONDS": "0.2",
+        "GENERAL_SKILL_IMPORT_WORKER_LEASE_SECONDS": "300",
+        "GENERAL_SKILL_OBJECT_STORE_PATH": str(E2E_RUNTIME_DIR / "general-skill-objects"),
+        "GENERAL_SKILL_RESOLVER_V2_ENABLED": "true",
+        "GENERAL_SKILL_DYNAMIC_GUIDANCE_ENABLED": "true",
+        "GENERAL_SKILL_AGENT_PROPOSAL_ENABLED": "true",
+        "DYNAMIC_TASK_SKILL_LOADING_ENABLED": "true",
+        "ATTACHMENT_ANALYSIS_ENABLED": "true",
+        "ATTACHMENT_PARSER_WORKER_ENABLED": "true",
+        "GONGGE_XUBAN_DATA_DIR": str(E2E_RUNTIME_DIR / "user-data"),
+    }
+    if live_attachment_e2e_enabled():
+        live_values = {
+            "DEMO_MODEL_API_KEY": os.environ.get("LIVE_ATTACHMENT_MODEL_API_KEY", "").strip(),
+            "DEMO_MODEL_BASE_URL": os.environ.get(
+                "LIVE_ATTACHMENT_MODEL_BASE_URL", ""
+            ).strip(),
+            "DEMO_MODEL_NAME": os.environ.get("LIVE_ATTACHMENT_MODEL_NAME", "").strip(),
+            "LIVE_ATTACHMENT_MODEL_TEMPERATURE": os.environ.get(
+                "LIVE_ATTACHMENT_MODEL_TEMPERATURE", ""
+            ).strip(),
+            "LIVE_ATTACHMENT_MODEL_MAX_OUTPUT_TOKENS": os.environ.get(
+                "LIVE_ATTACHMENT_MODEL_MAX_OUTPUT_TOKENS", ""
+            ).strip(),
+            "LIVE_ATTACHMENT_MODEL_EXTRA_BODY_JSON": os.environ.get(
+                "LIVE_ATTACHMENT_MODEL_EXTRA_BODY_JSON", "{}"
+            ).strip(),
         }
-    )
+        missing = [name for name, value in live_values.items() if not value]
+        if missing:
+            raise RuntimeError(
+                "LIVE_ATTACHMENT_E2E requires explicit isolated model settings: "
+                + ", ".join(missing)
+            )
+        environment.update(live_values)
+    os.environ.update(environment)
     os.chdir(BACKEND_DIR)
     sys.path.insert(0, str(BACKEND_DIR))
+
+
+def live_attachment_e2e_enabled() -> bool:
+    """判断本次全栈进程是否进入禁止模型替身的附件真实认证模式。"""
+
+    return os.environ.get("LIVE_ATTACHMENT_E2E") == "1"
+
+
+def assert_live_attachment_model_configured() -> None:
+    """校验隔离LIVE模型配置，禁止从持久`.env`旧seed密钥静默回退。"""
+
+    from app.config import get_settings
+
+    settings = get_settings()
+    if settings.public_mock_llm_enabled:
+        raise RuntimeError("LIVE_ATTACHMENT_E2E forbids PUBLIC_MOCK_LLM_ENABLED")
+    if not settings.demo_model_api_key.strip():
+        raise RuntimeError("LIVE_ATTACHMENT_E2E requires an explicit isolated model API key")
+    if not settings.demo_model_base_url.strip() or not settings.demo_model_name.strip():
+        raise RuntimeError("LIVE_ATTACHMENT_E2E requires model base URL and model name")
+
+
+def certify_live_dynamic_model() -> None:
+    """以真实provider探针冻结临时库Dynamic能力，禁止手工伪造ready快照。"""
+
+    from sqlmodel import Session, select
+
+    from app.db import engine
+    from app.db.models import ModelConfig, utc_now
+    from app.dynamic_tasks.capability_catalog import capability_checksum
+    from app.llm import LLMClient
+
+    with Session(engine) as db:
+        model = db.exec(
+            select(ModelConfig).where(
+                ModelConfig.tenant_id == "tenant_demo",
+                ModelConfig.enabled == True,  # noqa: E712
+                ModelConfig.is_default == True,  # noqa: E712
+            )
+        ).first()
+        if model is None:
+            raise RuntimeError("LIVE_ATTACHMENT_E2E default model was not seeded")
+        try:
+            extra_body = json.loads(
+                os.environ.get("LIVE_ATTACHMENT_MODEL_EXTRA_BODY_JSON", "{}") or "{}"
+            )
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("LIVE attachment model extra_body is invalid JSON") from exc
+        if not isinstance(extra_body, dict):
+            raise RuntimeError("LIVE attachment model extra_body must be an object")
+        try:
+            temperature = float(os.environ["LIVE_ATTACHMENT_MODEL_TEMPERATURE"])
+            max_output_tokens = int(os.environ["LIVE_ATTACHMENT_MODEL_MAX_OUTPUT_TOKENS"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("LIVE attachment model generation settings are invalid") from exc
+        if not math.isfinite(temperature) or temperature < 0 or temperature > 2:
+            raise RuntimeError("LIVE attachment model temperature is outside 0..2")
+        if max_output_tokens < 1 or max_output_tokens > 131_072:
+            raise RuntimeError("LIVE attachment model max_output_tokens is invalid")
+        model.extra_body_json = extra_body
+        model.temperature = temperature
+        model.max_output_tokens = max_output_tokens
+        capabilities = LLMClient(model).preflight_dynamic_capabilities()
+        model.capability_snapshot_json = capabilities
+        model.name = os.environ.get("LIVE_ATTACHMENT_MODEL_DISPLAY_NAME", model.name).strip()
+        model.capability_checksum = capability_checksum(capabilities)
+        model.preflight_status = "ready"
+        model.preflight_error = None
+        model.capability_verified_at = utc_now()
+        db.add(model)
+        db.commit()
 
 
 def seed_e2e_fixtures() -> None:
     """初始化 E2E 租户、双账号、数字员工、知识建议和可认领流程任务。"""
     from sqlmodel import Session, select
 
-    from app.agents.branching import ensure_agent_private_knowledge_branch
+    from app.agents.branching import (
+        ensure_agent_private_knowledge_branch,
+        ensure_private_resource_binding,
+    )
     from app.db import engine, init_db
     from app.db.models import (
         AgentProfile,
@@ -349,6 +458,112 @@ def seed_e2e_fixtures() -> None:
         )
         db.commit()
         seed_demo_data(db)
+
+        sales_sop_content = {
+            "skill_id": "attachment_sales_reconcile_sop",
+            "name": "附件销售数据核验SOP",
+            "version": "1.0.0",
+            "execution_mode": "deterministic",
+            "condition_schemas": {
+                "slots": {
+                    "type": "object",
+                    "properties": {
+                        "actuals": {"type": "array", "items": {"type": "string"}},
+                        "targets": {"type": "array", "items": {"type": "string"}},
+                    },
+                },
+                "node_output": {
+                    "type": "object",
+                    "properties": {
+                        "actuals_read": {"type": "object"},
+                        "targets_read": {"type": "object"},
+                    },
+                },
+            },
+            "nodes": [
+                {
+                    "node_id": "collect_files",
+                    "type": "collect_input",
+                    "name": "收集销售文件",
+                    "expected_user_info": ["actuals", "targets"],
+                    "allowed_actions": ["ask_user", "continue_flow"],
+                    "metadata": {
+                        "attachment_slots": [
+                            {
+                                "slot_key": "actuals",
+                                "allowed_formats": ["xlsx"],
+                                "required_columns": ["Region", "Actual", "Target"],
+                            },
+                            {
+                                "slot_key": "targets",
+                                "allowed_formats": ["csv"],
+                                "required_columns": ["Region", "Product", "Target"],
+                            },
+                        ]
+                    },
+                },
+                {
+                    "node_id": "read_actuals",
+                    "type": "builtin_input",
+                    "name": "读取实际销售",
+                    "allowed_actions": ["call_builtin_input:input.read"],
+                    "metadata": {
+                        "operation_input": {"snapshot_handles": "slots.actuals"},
+                        "operation_result_key": "actuals_read",
+                    },
+                },
+                {
+                    "node_id": "read_targets",
+                    "type": "builtin_input",
+                    "name": "读取销售目标",
+                    "allowed_actions": ["call_builtin_input:input.read"],
+                    "metadata": {
+                        "operation_input": {"snapshot_handles": "slots.targets"},
+                        "operation_result_key": "targets_read",
+                    },
+                },
+                {"node_id": "done", "type": "terminal", "name": "核验完成"},
+            ],
+            "edges": [
+                {"source_node_id": "collect_files", "next_node_id": "read_actuals"},
+                {"source_node_id": "read_actuals", "next_node_id": "read_targets"},
+                {"source_node_id": "read_targets", "next_node_id": "done"},
+            ],
+            "start_node_id": "collect_files",
+            "terminal_node_ids": ["done"],
+            "expected_artifacts": [
+                {
+                    "artifact_key": "sales_reconciliation_xlsx",
+                    "filename": "销售核验报告.xlsx",
+                    "mime_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    "content_source": "result.markdown",
+                    "required": True,
+                }
+            ],
+        }
+        sales_sop_definition = compile_legacy_skill_card(sales_sop_content)
+        db.add(
+            Skill(
+                tenant_id="tenant_demo",
+                skill_id="attachment_sales_reconcile_sop",
+                version="1.0.0",
+                name="附件销售数据核验SOP",
+                content_json=sales_sop_content,
+                status="published",
+            )
+        )
+        db.add(
+            SkillVersion(
+                id="skillver_attachment_sales_reconcile_100",
+                tenant_id="tenant_demo",
+                skill_id="attachment_sales_reconcile_sop",
+                version="1.0.0",
+                name="附件销售数据核验SOP",
+                content_json=sales_sop_content,
+                status="published",
+                compiled_definition_checksum=sales_sop_definition.checksum,
+            )
+        )
 
         db.add(
             User(
@@ -435,6 +650,19 @@ def seed_e2e_fixtures() -> None:
         )
         db.add(
             AgentProfile(
+                id="agent_q1_diagnosis_positive",
+                tenant_id="tenant_demo",
+                name="Q1 隔离诊断正向分身",
+                status="active",
+                owner_user_id="member_e2e",
+                metadata_json={
+                    "owner_user_id": "member_e2e",
+                    "owner_username": "member",
+                },
+            )
+        )
+        db.add(
+            AgentProfile(
                 id="agent_e2e_delivery",
                 tenant_id="tenant_demo",
                 name="E2E 研发交付数字员工",
@@ -457,6 +685,127 @@ def seed_e2e_fixtures() -> None:
                     "owner_user_id": "member_e2e",
                     "owner_username": "member",
                 },
+            )
+        )
+        db.add(
+            AgentProfile(
+                id="agent_q1_plain",
+                tenant_id="tenant_demo",
+                name="Q1 纯对话基线分身",
+                status="active",
+                owner_user_id="member_e2e",
+                metadata_json={
+                    "owner_user_id": "member_e2e",
+                    "owner_username": "member",
+                    "q1_resource_policy": "no_skill_no_attachment_no_tool_no_knowledge",
+                },
+            )
+        )
+        db.add(
+            AgentProfile(
+                id="agent_q1_cross_turn",
+                tenant_id="tenant_demo",
+                name="Q1 跨轮附件隔离分身",
+                status="active",
+                owner_user_id="member_e2e",
+                metadata_json={
+                    "owner_user_id": "member_e2e",
+                    "owner_username": "member",
+                    "q1_resource_policy": "cross_turn_no_skill_no_knowledge",
+                },
+            )
+        )
+        db.add(
+            AgentProfile(
+                id="agent_q1_diagnosis_control",
+                tenant_id="tenant_demo",
+                name="Q1 诊断无 Skill 对照分身",
+                status="active",
+                owner_user_id="member_e2e",
+                metadata_json={
+                    "owner_user_id": "member_e2e",
+                    "owner_username": "member",
+                    "q1_resource_policy": "diagnosing_control_no_skill",
+                },
+            )
+        )
+        db.add(
+            AgentProfile(
+                id="agent_q1_writing_control",
+                tenant_id="tenant_demo",
+                name="Q1 writing-for-agents 无 Skill 对照分身",
+                status="active",
+                owner_user_id="member_e2e",
+                metadata_json={
+                    "owner_user_id": "member_e2e",
+                    "owner_username": "member",
+                    "q1_resource_policy": "writing_control_no_skill",
+                },
+            )
+        )
+        db.add(
+            AgentProfile(
+                id="agent_q1_codebase_control",
+                tenant_id="tenant_demo",
+                name="Q1 codebase-design 无 Skill 对照分身",
+                status="active",
+                owner_user_id="member_e2e",
+                metadata_json={
+                    "owner_user_id": "member_e2e",
+                    "owner_username": "member",
+                    "q1_resource_policy": "codebase_control_no_skill",
+                },
+            )
+        )
+        db.flush()
+        sales_skill = db.exec(
+            select(Skill).where(
+                Skill.tenant_id == "tenant_demo",
+                Skill.skill_id == "attachment_sales_reconcile_sop",
+            )
+        ).one()
+        ensure_private_resource_binding(
+            db,
+            "tenant_demo",
+            "agent_e2e_member_employee",
+            "skill",
+            sales_skill.id,
+            "active",
+        )
+        db.add(
+            ChatSession(
+                id="session_attachment_sales_sop",
+                tenant_id="tenant_demo",
+                user_id="member_e2e",
+                agent_id="agent_e2e_member_employee",
+                title="附件销售数据核验SOP",
+                active_skill_id="attachment_sales_reconcile_sop",
+                active_step_id="collect_files",
+                status="active",
+            )
+        )
+        db.add(
+            ChatSession(
+                id="session_attachment_sales_sop_missing_slot",
+                tenant_id="tenant_demo",
+                user_id="member_e2e",
+                agent_id="agent_e2e_member_employee",
+                title="附件销售数据核验SOP缺槽反例",
+                active_skill_id="attachment_sales_reconcile_sop",
+                active_step_id="collect_files",
+                status="active",
+            )
+        )
+        db.add(
+            ChatSession(
+                id="session_attachment_sales_sop_missing_column",
+                tenant_id="tenant_demo",
+                user_id="member_e2e",
+                agent_id="agent_e2e_member_employee",
+                title="附件销售数据核验SOP缺列反例",
+                active_skill_id="attachment_sales_reconcile_sop",
+                active_step_id="collect_files",
+                status="active",
             )
         )
         db.add(
@@ -1393,6 +1742,7 @@ def seed_dynamic_task_browser_fixtures() -> None:
         SopWorkItemCandidate,
         utc_now,
     )
+    from app.dynamic_tasks.artifact_renderer import ArtifactRendererService
     from app.dynamic_tasks.artifacts import ArtifactService
     from app.dynamic_tasks.capability_catalog import capability_checksum
     from app.dynamic_tasks.planning import canonical_checksum
@@ -1548,6 +1898,185 @@ def seed_dynamic_task_browser_fixtures() -> None:
             required=True,
             status="settled",
             receipt_json={"message_id": message.id},
+            settled_at=now,
+        ))
+
+        delivery_content = (
+            "# Artifact 安全交付矩阵\n\n"
+            "<script>window.__artifactContentXss = true</script>\n"
+            "[危险链接](javascript:window.__artifactLinkXss=true)\n"
+            "=2+2\n"
+            "+cmd|' /C calc'!A0\n"
+            "-1+1\n"
+            "@SUM(A1:A2)\n"
+            "\t=HYPERLINK(\"javascript:alert(1)\")\n"
+        )
+        delivery_artifacts = (
+            (
+                "delivery_markdown",
+                "<img src=x onerror=window.__artifactFilenameXss=true>.md",
+                "text/markdown",
+            ),
+            ("delivery_text", "安全交付矩阵.txt", "text/plain"),
+            ("delivery_csv", "安全交付矩阵.csv", "text/csv"),
+        )
+        delivery_plan = {
+            "goal": "验证文本与CSV交付安全",
+            "success_criteria": ["三种文本交付物可下载且内容完整"],
+            "steps": [{
+                "step_key": "answer",
+                "title": "生成安全交付矩阵",
+                "kind": "answer",
+                "required": True,
+                "depends_on": [],
+            }],
+            "expected_artifacts": [
+                {
+                    "artifact_key": artifact_key,
+                    "filename": filename,
+                    "mime_type": mime_type,
+                    "content_source": "result.markdown",
+                    "required": True,
+                }
+                for artifact_key, filename, mime_type in delivery_artifacts
+            ],
+            "budget": {"max_model_calls": 1, "max_steps": 1},
+        }
+        delivery_checksum = canonical_checksum(delivery_plan)
+        delivery_session = ChatSession(
+            id="session_e2e_artifact_delivery_matrix",
+            tenant_id=tenant_id,
+            user_id="member_e2e",
+            agent_id="agent_e2e_member_employee",
+            agent_profile_revision=1,
+            title="Artifact 安全交付矩阵",
+            summary="三种文本交付物已生成",
+            status="active",
+        )
+        delivery_instance = SopInstance(
+            id="execution_e2e_artifact_delivery_matrix",
+            tenant_id=tenant_id,
+            session_id=delivery_session.id,
+            kind="dynamic_task",
+            initiator_user_id="member_e2e",
+            agent_id="agent_e2e_member_employee",
+            goal_snapshot_json={"goal": delivery_plan["goal"]},
+            current_plan_revision_id="plan_e2e_artifact_delivery_matrix",
+            current_plan_checksum=delivery_checksum,
+            capability_snapshot_json=capability,
+            capability_checksum=capability_digest,
+            budget_snapshot_json=dict(delivery_plan["budget"]),
+            current_result_id="result_e2e_artifact_delivery_matrix",
+            status="succeeded",
+            revision=4,
+            started_at=now,
+            completed_at=now,
+        )
+        delivery_node = SopNodeExecution(
+            id="node_e2e_artifact_delivery_matrix",
+            tenant_id=tenant_id,
+            instance_id=delivery_instance.id,
+            node_id="answer",
+            step_key="answer",
+            plan_revision_id=delivery_instance.current_plan_revision_id,
+            step_kind="answer",
+            title="生成安全交付矩阵",
+            status="succeeded",
+            started_at=now,
+            completed_at=now,
+        )
+        delivery_result_payload = {
+            "markdown": delivery_content,
+            "criterion_evidence": {"criterion_01": ["answer"]},
+            "pending_questions": [],
+        }
+        delivery_result = ExecutionResult(
+            id=delivery_instance.current_result_id,
+            tenant_id=tenant_id,
+            execution_id=delivery_instance.id,
+            status="verified",
+            result_json=delivery_result_payload,
+            verification_json={"passed": True},
+            checksum=canonical_checksum(delivery_result_payload),
+            created_by_step_key="answer",
+        )
+        delivery_message = Message(
+            id="message_e2e_artifact_delivery_matrix",
+            tenant_id=tenant_id,
+            session_id=delivery_session.id,
+            role="assistant",
+            content=delivery_content,
+            metadata_json={
+                "execution_id": delivery_instance.id,
+                "result_id": delivery_result.id,
+            },
+        )
+        db.add(delivery_session)
+        db.add(delivery_instance)
+        db.add(ExecutionPlanRevision(
+            id=delivery_instance.current_plan_revision_id,
+            tenant_id=tenant_id,
+            execution_id=delivery_instance.id,
+            revision_number=1,
+            reason="initial",
+            status="active",
+            plan_json=delivery_plan,
+            checksum=delivery_checksum,
+            capability_snapshot_json=capability,
+            capability_checksum=capability_digest,
+            activated_at=now,
+        ))
+        db.add(delivery_node)
+        db.add(delivery_result)
+        db.add(delivery_message)
+        db.flush()
+        renderer = ArtifactRendererService(db)
+        delivery_artifact_ids: list[str] = []
+        for artifact_key, filename, mime_type in delivery_artifacts:
+            job, _ = renderer.ensure_job(
+                instance=delivery_instance,
+                result_id=delivery_result.id,
+                result_checksum=delivery_result.checksum,
+                source_node=delivery_node,
+                artifact_key=artifact_key,
+                filename=filename,
+                mime_type=mime_type,
+                required=True,
+            )
+            claimed = renderer.claim(job, worker_id="e2e-delivery-renderer")
+            rendered = renderer.render_and_publish(
+                claimed,
+                markdown=delivery_content,
+                worker_id="e2e-delivery-renderer",
+                fencing_token=claimed.fencing_token,
+                input_snapshot_ids=(),
+            )
+            delivery_artifact_ids.append(rendered.id)
+        delivery_result.verification_json = {
+            "passed": True,
+            "artifact_ids": delivery_artifact_ids,
+        }
+        delivery_message.metadata_json = {
+            "execution_id": delivery_instance.id,
+            "result_id": delivery_result.id,
+            "artifact_ids": delivery_artifact_ids,
+        }
+        db.add(delivery_result)
+        db.add(delivery_message)
+        db.add(ExecutionPublication(
+            id="publication_e2e_artifact_delivery_matrix",
+            tenant_id=tenant_id,
+            execution_id=delivery_instance.id,
+            result_id=delivery_result.id,
+            publication_key=canonical_checksum({
+                "execution_id": delivery_instance.id,
+                "target_type": "application",
+            }),
+            target_type="application",
+            target_ref=delivery_session.id,
+            required=True,
+            status="settled",
+            receipt_json={"message_id": delivery_message.id},
             settled_at=now,
         ))
 
@@ -1760,6 +2289,10 @@ def seed_managed_workspace_browser_fixture() -> None:
         DIAGNOSIS_CLEAN_CHECK,
         encoding="utf-8",
     )
+    (diagnosis_repo / "checks" / "diagnosis_red.py").write_text(
+        DIAGNOSIS_TEST,
+        encoding="utf-8",
+    )
     subprocess.run(["git", "-C", str(diagnosis_repo), "add", "."], check=True)
     subprocess.run(
         ["git", "-C", str(diagnosis_repo), "commit", "-m", "baseline"],
@@ -1883,6 +2416,12 @@ def seed_managed_workspace_browser_fixture() -> None:
                         ],
                     },
                 }
+                input_properties = {
+                    "profile": {
+                        "type": "string",
+                        "enum": sorted(config["check_profiles"]),
+                    }
+                }
             tool = Tool(
                 tenant_id="tenant_demo",
                 name=name,
@@ -1917,6 +2456,11 @@ def seed_managed_workspace_browser_fixture() -> None:
                         },
                         "timeout_policy": "failed",
                         "dynamic_task_enabled": True,
+                        "applicability": {
+                            "mode": "goal_scoped",
+                            "domains": ["refund"],
+                            "aliases": ["退款"],
+                        },
                     }
                 ),
             )
@@ -1966,10 +2510,31 @@ def seed_managed_workspace_browser_fixture() -> None:
                 {"profile": {"type": "string"}},
                 {
                     "profile": {"type": "string"},
-                    "passed": {"type": "boolean"},
+                    "passed": {
+                        "type": "boolean",
+                        "description": (
+                            "true表示退出码属于expected_exit_codes且必需输出已命中；"
+                            "对diagnosis-red，exit_code=1是预期捕获bug，不是执行故障"
+                        ),
+                    },
                     "exit_code": {"type": "integer"},
+                    "expected_exit_codes": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                    },
+                    "required_output_substrings": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
                 },
-                ["input.profile", "output.profile", "output.passed", "output.exit_code"],
+                [
+                    "input.profile",
+                    "output.profile",
+                    "output.passed",
+                    "output.exit_code",
+                    "output.expected_exit_codes",
+                    "output.required_output_substrings",
+                ],
             ),
             (
                 "workspace.memory.commit",
@@ -1997,12 +2562,7 @@ def seed_managed_workspace_browser_fixture() -> None:
                         "image": image,
                         "argv": [
                             "python",
-                            "-m",
-                            "unittest",
-                            "discover",
-                            "-s",
-                            "tests",
-                            "-v",
+                            "checks/diagnosis_red.py",
                         ],
                         "timeout_seconds": 60,
                         "expected_exit_codes": [1],
@@ -2014,6 +2574,12 @@ def seed_managed_workspace_browser_fixture() -> None:
                         "timeout_seconds": 60,
                         "required_output_substrings": ["GREEN_AND_CLEAN"],
                     },
+                }
+                input_properties = {
+                    "profile": {
+                        "type": "string",
+                        "enum": sorted(config["check_profiles"]),
+                    }
                 }
             tool = Tool(
                 tenant_id="tenant_demo",
@@ -2062,6 +2628,15 @@ def seed_managed_workspace_browser_fixture() -> None:
                 tool.id,
                 "active",
             )
+            if name in {"workspace.memory.read", "workspace.memory.check"}:
+                ensure_private_resource_binding(
+                    db,
+                    "tenant_demo",
+                    "agent_q1_diagnosis_positive",
+                    "tool",
+                    tool.id,
+                    "active",
+                )
         db.commit()
 
 
@@ -2081,6 +2656,8 @@ def seed_schedule_dynamic_model() -> None:
         "credentials_verified": True,
         "structured_output": True,
         "tool_calling": True,
+        "vision": True,
+        "pdf_input": True,
     }
     with Session(engine) as db:
         model = db.exec(
@@ -2111,11 +2688,40 @@ def seed_schedule_dynamic_model() -> None:
 def install_schedule_llm_override() -> None:
     """仅替换隔离 provider 响应，保留 Router、AgentLoop、Planner、Signal 和 Runtime 真链路。"""
 
+    from app.api import model_configs as model_config_api
     from app.llm.client import LLMClient
+    from app.llm.schemas import ModelConnectionCheck
     from app.llm.stage_protocol import STAGE_PROTOCOL_KEY
 
     original_generate_text = LLMClient.generate_text
     original_generate_text_stream = LLMClient.generate_text_stream
+
+    def deterministic_model_catalog(client: LLMClient) -> list[str]:
+        """为隔离浏览器测试返回配置自身的目录项，不绕过模型配置 API。"""
+
+        return [client.model]
+
+    def deterministic_connection_probe(client: LLMClient) -> str:
+        """只替换外部最小生成响应，保留连接诊断的正式分阶段流程。"""
+
+        return "E2E-CONNECTION-OK"
+
+    LLMClient.probe_model_catalog = deterministic_model_catalog
+    LLMClient.probe_text_connection = deterministic_connection_probe
+
+    def deterministic_account_probe(row, checks):  # noqa: ANN001, ANN202
+        """隔离浏览器不访问真实余额接口，但仍保留账户阶段的正式响应结构。"""
+
+        checks.append(
+            ModelConnectionCheck(
+                name="账户状态",
+                status="skipped",
+                message="确定性浏览器环境不访问供应商余额接口",
+            )
+        )
+        return None
+
+    model_config_api._deepseek_balance_failure = deterministic_account_probe
 
     def deterministic_json(
         client: LLMClient,
@@ -2124,9 +2730,70 @@ def install_schedule_llm_override() -> None:
     ) -> dict[str, object]:
         """按正式阶段协议返回可预测结构，禁止测试直接调用内部 Agent。"""
 
+        if "附件视觉证据复核器" in system_prompt:
+            resources = user_payload.get("reviewed_structural_evidence")
+            parts = user_payload.get("_provider_content_parts")
+            if not isinstance(resources, list) or not resources or not isinstance(parts, list):
+                raise RuntimeError("attachment visual review missed frozen evidence or native parts")
+            client._last_completed_response_metadata = {
+                "response_id": "e2e-attachment-visual-review",
+                "finish_reason": "stop",
+                "usage": {"input_tokens": 20, "output_tokens": 20},
+            }
+            if "ATTACHMENT-VISUAL-CANCEL-DYNAMIC" in str(user_payload):
+                time.sleep(8)
+            if "ATTACHMENT-VISUAL-CONFLICT-DYNAMIC" in str(user_payload):
+                first = next((item for item in resources if isinstance(item, dict)), {})
+                return {
+                    "observations": [
+                        {
+                            "snapshot_id": str(first.get("snapshot_id") or ""),
+                            "fact_key": "contract.renewal_notice_days",
+                            "normalized_value": "90",
+                            "locator": {"page": 1, "kind": "visual"},
+                            "confidence": 0.99,
+                        }
+                    ],
+                    "conflicts": [
+                        {
+                            "snapshot_id": str(first.get("snapshot_id") or ""),
+                            "fact_key": "contract.renewal_notice_days",
+                            "structural_value": "60",
+                            "visual_value": "90",
+                            "locator": {"page": 1, "kind": "visual"},
+                        }
+                    ],
+                    "gaps": [],
+                }
+            return {
+                "observations": [
+                    {
+                        "snapshot_id": str(item.get("snapshot_id") or ""),
+                        "fact_key": f"visual.snapshot_{index}",
+                        "normalized_value": "视觉复核已完成",
+                        "locator": {"kind": "native", "ordinal": index},
+                        "confidence": 0.99,
+                    }
+                    for index, item in enumerate(resources)
+                    if isinstance(item, dict)
+                ],
+                "conflicts": [],
+                "gaps": [],
+            }
+
         stage = user_payload.get(STAGE_PROTOCOL_KEY, {})
         phase = str(stage.get("phase") or "") if isinstance(stage, dict) else ""
         if phase == "Router":
+            user_message = str(user_payload.get("user_message") or "")
+            if "ATTACHMENT-SOP-SALES" in user_message:
+                return {
+                    "decision": "start_new_task",
+                    "target_skill_id": "attachment_sales_reconcile_sop",
+                    "target_step_id": "collect_files",
+                    "confidence": 0.99,
+                    "general_intent": None,
+                    "reason": "用户明确启动已发布附件销售核验SOP",
+                }
             return {
                 "decision": "answer_only",
                 "confidence": 0.99,
@@ -2155,7 +2822,12 @@ def install_schedule_llm_override() -> None:
             }
         if phase == "Router / Dynamic Task Shadow":
             goal = str(user_payload.get("user_message") or "生成合同巡检结果")
-            if "S3" in goal or "本轮选定的指南" in goal:
+            if (
+                "S3" in goal
+                or "本轮选定的指南" in goal
+                or "请读取本轮CSV" in goal
+                or "只核对两份材料中的当前版本号" in goal
+            ):
                 return {
                     "mode": "answer",
                     "goal": None,
@@ -2166,7 +2838,7 @@ def install_schedule_llm_override() -> None:
                     "clarification": None,
                     "execution_intent": "none",
                     "confidence": 0.99,
-                    "reason": "S3 验证是单轮或跨轮对话 Skill，不需要持久动态执行",
+                    "reason": "该验证是有界单轮读取，不需要持久动态执行",
                 }
             return {
                 "mode": "dynamic_task",
@@ -2179,6 +2851,28 @@ def install_schedule_llm_override() -> None:
                 "execution_intent": "new_task",
                 "confidence": 0.99,
                 "reason": "任务需要跨轮等待用户确认",
+            }
+        if phase == "Step Agent":
+            is_attachment_sop = "ATTACHMENT-SOP-SALES" in str(user_payload)
+            return {
+                "action": "advance" if is_attachment_sop else "reply",
+                "reply": None,
+                "slot_updates": {},
+                "tool_call": None,
+                "knowledge_query": None,
+                "knowledge_results": [],
+                "next_step_id": None,
+                "is_step_completed": is_attachment_sop,
+                "handoff": False,
+            }
+        if phase == "Reflection":
+            return {
+                "action": "pass",
+                "needs_retry": False,
+                "reason": "确定性SOP输出已由Runtime和回执验证。",
+                "target_skill_id": None,
+                "target_step_id": None,
+                "target_tool_name": None,
             }
         if "动态任务指导选择器" in system_prompt:
             names = {
@@ -2246,35 +2940,153 @@ def install_schedule_llm_override() -> None:
 
                 return [loaded_ref_by_base[name] for name in names]
             goal = str(user_payload.get("goal") or "")
-            if "G1-A动态" in goal:
+            if (
+                "ATTACHMENT-FORMULA-MATCH-DYNAMIC" in goal
+                or "ATTACHMENT-FORMULA-CONFLICT-DYNAMIC" in goal
+            ):
+                return {
+                    "goal": goal,
+                    "success_criteria": user_payload.get("success_criteria", []),
+                    "constraints": [
+                        "公式结论只能引用平台table.compute回执；缓存与重算冲突时必须并列披露"
+                    ],
+                    "assumptions": [],
+                    "steps": [
+                        {
+                            "draft_id": "answer",
+                            "title": "核验XLSX公式缓存与平台重算证据",
+                            "kind": "answer",
+                            "required": True,
+                            "depends_on": [],
+                            "capability_refs": [],
+                            "guidance_skill_refs": [],
+                            "expected_output_schema": {"formula_evidence_required": True},
+                        }
+                    ],
+                    "expected_artifacts": [],
+                }
+            if (
+                "ATTACHMENT-VISUAL-CONFLICT-DYNAMIC" in goal
+                or "ATTACHMENT-VISUAL-CANCEL-DYNAMIC" in goal
+            ):
+                return {
+                    "goal": goal,
+                    "success_criteria": user_payload.get("success_criteria", []),
+                    "constraints": ["结构与视觉证据不一致时必须在最终答案并列披露"],
+                    "assumptions": [],
+                    "steps": [
+                        {
+                            "draft_id": "answer",
+                            "title": "合并附件双证据并展示冲突",
+                            "kind": "answer",
+                            "required": True,
+                            "depends_on": [],
+                            "capability_refs": [],
+                            "guidance_skill_refs": [],
+                            "expected_output_schema": {"dual_evidence_required": True},
+                        }
+                    ],
+                    "expected_artifacts": [],
+                }
+            if (
+                "G1-A动态" in goal
+                or "ATTACHMENT-SKILL-DYNAMIC" in goal
+                or "ATTACHMENT-SKILL-MULTI-DYNAMIC" in goal
+            ):
+                is_attachment_skill = (
+                    "ATTACHMENT-SKILL-DYNAMIC" in goal
+                    or "ATTACHMENT-SKILL-MULTI-DYNAMIC" in goal
+                )
+                is_multi_attachment = "ATTACHMENT-SKILL-MULTI-DYNAMIC" in goal
                 writing_guidance = next(
                     (
                         str(item.get("name") or "")
                         for item in loaded_guidance
                         if isinstance(item, dict)
-                        and "WRITING-FOR-AGENTS-FIXED-COMMIT" in str(item)
+                        and str(item.get("name") or "").startswith("writing-for-agents")
+                        and any(
+                            isinstance(source, dict)
+                            and str(source.get("source_ref") or "") == "instructions"
+                            and str(source.get("source_checksum") or "")
+                            for source in item.get("sources", [])
+                        )
                     ),
                     "",
                 )
                 if not writing_guidance:
                     raise RuntimeError("G1-A dynamic planner missed fixed writing guidance")
+                if is_attachment_skill:
+                    if not user_payload.get("input_resources"):
+                        raise RuntimeError("attachment Skill planner missed frozen input catalog")
+                steps = [
+                    {
+                        "draft_id": "answer",
+                        "title": (
+                            (
+                                "核对多格式发布材料并生成一致性操作规范"
+                                if is_multi_attachment
+                                else "读取合同证据并生成售后升级操作规范"
+                            )
+                            if is_attachment_skill
+                            else "生成售后升级操作规范"
+                        ),
+                        "kind": "answer",
+                        "required": True,
+                        "depends_on": [],
+                        "capability_refs": [],
+                        "guidance_skill_refs": [writing_guidance],
+                        "expected_output_schema": (
+                            {"attachment_claims_required": True}
+                            if is_attachment_skill
+                            and not is_multi_attachment
+                            else {}
+                        ),
+                    }
+                ]
                 return {
                     "goal": goal,
                     "success_criteria": user_payload.get("success_criteria", []),
                     "constraints": ["必须按固定 writing-for-agents 修订形成可执行规范"],
                     "assumptions": [],
-                    "steps": [
+                    "guidance_requirements": [
                         {
-                            "draft_id": "answer",
-                            "title": "生成售后升级操作规范",
-                            "kind": "answer",
-                            "required": True,
-                            "depends_on": [],
-                            "capability_refs": [],
-                            "guidance_skill_refs": [writing_guidance],
-                            "expected_output_schema": {},
+                            "skill_ref": writing_guidance,
+                            "source_kind": "instructions",
+                            "source_ref": "instructions",
+                            "principle": (
+                                "WRITING-FOR-AGENTS-FIXED-COMMIT：使用稳定术语、显式输入输出、"
+                                "可验证步骤和异常边界编写 Agent 可消费文档。"
+                            ),
+                            "task_mapping": "把合同事实转成可执行的操作规范",
+                            "observable_acceptance": "最终正文包含输入、步骤、异常和验收标准",
+                            "disposition": "apply",
                         }
                     ],
+                    "steps": steps,
+                    "expected_artifacts": (
+                        [
+                            {
+                                "artifact_key": (
+                                    "multi_attachment_skill_report_docx"
+                                    if is_multi_attachment
+                                    else "contract_skill_report_docx"
+                                ),
+                                "filename": (
+                                    "多格式材料一致性操作规范.docx"
+                                    if is_multi_attachment
+                                    else "合同续约操作规范.docx"
+                                ),
+                                "mime_type": (
+                                    "application/vnd.openxmlformats-officedocument."
+                                    "wordprocessingml.document"
+                                ),
+                                "content_source": "result.markdown",
+                                "required": True,
+                            }
+                        ]
+                        if is_attachment_skill
+                        else []
+                    ),
                 }
             if "C1远程导入Skill" in goal:
                 capability_names = {
@@ -2958,9 +3770,189 @@ def install_schedule_llm_override() -> None:
                 )
                 or (step_title.startswith("确认 ") and "阶段产物" in step_title)
             )
-            if "G1-A动态" in str(user_payload) and step_kind == "answer":
-                if "WRITING-FOR-AGENTS-FIXED-COMMIT" not in str(user_payload):
+            if (
+                (
+                    "ATTACHMENT-FORMULA-MATCH-DYNAMIC" in str(user_payload)
+                    or "ATTACHMENT-FORMULA-CONFLICT-DYNAMIC" in str(user_payload)
+                )
+                and step_kind == "answer"
+            ):
+                provider_view = user_payload.get("provider_execution_view", {})
+                messages = (
+                    provider_view.get("messages", [])
+                    if isinstance(provider_view, dict)
+                    else []
+                )
+                resource_message = next(
+                    (
+                        item.get("content", {})
+                        for item in messages
+                        if isinstance(item, dict)
+                        and isinstance(item.get("content"), dict)
+                        and item["content"].get("input_resources")
+                    ),
+                    {},
+                )
+                resources = resource_message.get("input_resources", [])
+                resource = resources[0] if isinstance(resources, list) and resources else {}
+                elements = resource.get("elements", []) if isinstance(resource, dict) else []
+                element = elements[0] if isinstance(elements, list) and elements else {}
+                checks = resource.get("formula_checks", []) if isinstance(resource, dict) else []
+                if not isinstance(checks, list) or not checks:
+                    raise RuntimeError("formula answer missed persisted table.compute checks")
+                claims = [
+                    {
+                        "claim_id": check.get("fact_key"),
+                        "text": (
+                            f"公式{check.get('cell')}平台重算值为{check.get('computed_value')}"
+                        ),
+                        "claim_type": "computed",
+                        "normalized_value": check.get("computed_value"),
+                        "unit": None,
+                        "evidence_refs": [
+                            {
+                                "snapshot_id": resource.get("snapshot_id"),
+                                "extraction_id": resource.get("extraction_id"),
+                                "read_operation_id": resource.get("read_operation_id"),
+                                "slice_checksum": resource.get("slice_checksum"),
+                                "element_id": element.get("element_id"),
+                                "element_checksum": element.get("content_checksum"),
+                                "locator": element.get("locator"),
+                            }
+                        ],
+                        "computation_receipt_id": check.get("computation_receipt_id"),
+                        "semantic_review_status": "verified",
+                    }
+                    for check in checks
+                    if isinstance(check, dict) and check.get("status") == "match"
+                ]
+                conflict = next(
+                    (
+                        check
+                        for check in checks
+                        if isinstance(check, dict) and check.get("status") == "conflict"
+                    ),
+                    None,
+                )
+                markdown = (
+                    "ATTACHMENT-FORMULA-CONFLICT-SUCCESS：D2公式存在冲突，"
+                    f"缓存值{conflict.get('cached_value')}，平台重算值"
+                    f"{conflict.get('computed_value')}；D3缓存值1.2与平台重算值1.2一致。"
+                    if isinstance(conflict, dict)
+                    else "ATTACHMENT-FORMULA-MATCH-SUCCESS：D2缓存值0.8与平台重算值0.8一致；"
+                    "D3缓存值1.2与平台重算值1.2一致。"
+                )
+                execution_context = (
+                    provider_view.get("execution_context", {})
+                    if isinstance(provider_view, dict)
+                    else {}
+                )
+                criteria = [
+                    str(item.get("id") or "")
+                    for item in execution_context.get("success_criteria", [])
+                    if isinstance(item, dict) and item.get("id")
+                ]
+                client._last_completed_response_metadata = {
+                    "response_id": "e2e-attachment-formula-answer",
+                    "finish_reason": "stop",
+                    "usage": {"input_tokens": 20, "output_tokens": 20},
+                }
+                return {
+                    "action_kind": "answer",
+                    "arguments": {
+                        "markdown": markdown,
+                        "criterion_evidence": {
+                            criterion: [str(current_step.get("step_key") or "answer")]
+                            for criterion in criteria
+                        },
+                        "pending_questions": [],
+                        "claims": claims,
+                    },
+                    "capability_ref": None,
+                    "expected_output_schema": {},
+                    "rationale": "只引用平台公式重算回执并显式披露缓存冲突",
+                }
+            if "ATTACHMENT-VISUAL-CANCEL-DYNAMIC" in str(user_payload):
+                client._last_completed_response_metadata = {
+                    "response_id": "e2e-attachment-visual-cancel-late-answer",
+                    "finish_reason": "stop",
+                    "usage": {"input_tokens": 16, "output_tokens": 8},
+                }
+                return {
+                    "action_kind": "answer",
+                    "arguments": {
+                        "markdown": "ATTACHMENT-VISUAL-CANCEL-SHOULD-NOT-PUBLISH",
+                        "criterion_evidence": {},
+                        "pending_questions": [],
+                        "claims": [],
+                    },
+                    "capability_ref": None,
+                    "expected_output_schema": {},
+                    "rationale": "用于验证取消后的迟到结果不会发布",
+                }
+            if "ATTACHMENT-VISUAL-CONFLICT-DYNAMIC" in str(user_payload):
+                if step_kind != "answer" or "visual_review" not in str(user_payload):
+                    raise RuntimeError("visual conflict answer missed persisted review evidence")
+                execution_view = user_payload.get("provider_execution_view", {})
+                execution_context = (
+                    execution_view.get("execution_context", {})
+                    if isinstance(execution_view, dict)
+                    else {}
+                )
+                criteria = [
+                    str(item.get("id") or "")
+                    for item in execution_context.get("success_criteria", [])
+                    if isinstance(item, dict) and item.get("id")
+                ]
+                client._last_completed_response_metadata = {
+                    "response_id": "e2e-attachment-visual-conflict-answer",
+                    "finish_reason": "stop",
+                    "usage": {"input_tokens": 16, "output_tokens": 12},
+                }
+                return {
+                    "action_kind": "answer",
+                    "arguments": {
+                        "markdown": (
+                            "ATTACHMENT-VISUAL-CONFLICT-SUCCESS：证据存在冲突，"
+                            "结构提取为60天，视觉复核为90天；需人工复核，未静默选择任一值。"
+                        ),
+                        "criterion_evidence": {
+                            criterion: [str(current_step.get("step_key") or "answer")]
+                            for criterion in criteria
+                        },
+                        "pending_questions": [],
+                        "claims": [],
+                    },
+                    "capability_ref": None,
+                    "expected_output_schema": {},
+                    "rationale": "明确展示结构与视觉证据冲突",
+                }
+            if (
+                (
+                    "G1-A动态" in str(user_payload)
+                    or "ATTACHMENT-SKILL-DYNAMIC" in str(user_payload)
+                    or "ATTACHMENT-SKILL-MULTI-DYNAMIC" in str(user_payload)
+                )
+                and step_kind == "answer"
+            ):
+                payload_text = str(user_payload)
+                is_multi_attachment_skill = "ATTACHMENT-SKILL-MULTI-DYNAMIC" in payload_text
+                is_single_attachment_skill = (
+                    "ATTACHMENT-SKILL-DYNAMIC" in payload_text
+                    and not is_multi_attachment_skill
+                )
+                if "WRITING-FOR-AGENTS-FIXED-COMMIT" not in payload_text:
                     raise RuntimeError("G1-A dynamic answer missed fixed writing guidance")
+                if (
+                    is_single_attachment_skill
+                    and "Renewal notice: 60 days" not in payload_text
+                ):
+                    raise RuntimeError("attachment Skill answer missed reviewed PDF element")
+                if (
+                    is_multi_attachment_skill
+                    and "Version 2.4" not in payload_text
+                ):
+                    raise RuntimeError("multi attachment Skill answer missed reviewed Office elements")
                 execution_view = user_payload.get("provider_execution_view", {})
                 execution_context = (
                     execution_view.get("execution_context", {})
@@ -2977,6 +3969,83 @@ def install_schedule_llm_override() -> None:
                     for item in execution_context.get("completed_steps", [])
                     if isinstance(item, dict) and item.get("step_key")
                 ]
+                guidance_requirements = []
+                for message in (
+                    execution_view.get("messages", [])
+                    if isinstance(execution_view, dict)
+                    else []
+                ):
+                    content = message.get("content") if isinstance(message, dict) else None
+                    requirements = (
+                        content.get("guidance_requirements")
+                        if isinstance(content, dict)
+                        else None
+                    )
+                    if isinstance(requirements, list):
+                        guidance_requirements.extend(
+                            item for item in requirements if isinstance(item, dict)
+                        )
+                claims = []
+                if (
+                    is_single_attachment_skill
+                    or is_multi_attachment_skill
+                ):
+                    provider_view = user_payload.get("provider_execution_view", {})
+                    messages = (
+                        provider_view.get("messages", [])
+                        if isinstance(provider_view, dict)
+                        else []
+                    )
+                    resource_message = next(
+                        (
+                            item.get("content", {})
+                            for item in messages
+                            if isinstance(item, dict)
+                            and isinstance(item.get("content"), dict)
+                            and item["content"].get("input_resources")
+                        ),
+                        {},
+                    )
+                    resources = resource_message.get("input_resources", [])
+                    claims = []
+                    for index, resource in enumerate(resources if isinstance(resources, list) else []):
+                        if not isinstance(resource, dict):
+                            continue
+                        elements = resource.get("elements", [])
+                        element = elements[0] if isinstance(elements, list) and elements else {}
+                        claims.append(
+                            {
+                                "claim_id": f"attachment_fact_{index + 1}",
+                                "text": (
+                                    "合同要求提前60天通知"
+                                    if is_single_attachment_skill
+                                    else f"已核验附件 {index + 1} 的结构事实"
+                                ),
+                                "claim_type": "fact",
+                                "normalized_value": (
+                                    60
+                                    if is_single_attachment_skill
+                                    else None
+                                ),
+                                "unit": (
+                                    "days"
+                                    if is_single_attachment_skill
+                                    else "document"
+                                ),
+                                "semantic_review_status": "verified",
+                                "evidence_refs": [
+                                    {
+                                        "snapshot_id": resource.get("snapshot_id"),
+                                        "extraction_id": resource.get("extraction_id"),
+                                        "read_operation_id": resource.get("read_operation_id"),
+                                        "slice_checksum": resource.get("slice_checksum"),
+                                        "element_id": element.get("element_id"),
+                                        "element_checksum": element.get("content_checksum"),
+                                        "locator": element.get("locator"),
+                                    }
+                                ],
+                            }
+                        )
                 client._last_completed_response_metadata = {
                     "response_id": "e2e-g1-a-dynamic-answer",
                     "finish_reason": "stop",
@@ -2986,7 +4055,19 @@ def install_schedule_llm_override() -> None:
                     "action_kind": "answer",
                     "arguments": {
                         "markdown": (
-                            "G1-A-DYNAMIC-CONSUMED-SUCCESS：已按固定 writing-for-agents 修订"
+                            (
+                                "ATTACHMENT-SKILL-MULTI-DYNAMIC-SUCCESS：DOCX与PPTX版本均为2.4，"
+                                "图片已作为受管视觉附件纳入证据；已按固定Skill生成包含输入、步骤、"
+                                "异常和验收标准的一致性操作规范。"
+                                if is_multi_attachment_skill
+                                else "ATTACHMENT-SKILL-DYNAMIC-SUCCESS：合同要求提前60天通知；"
+                                "已按固定 writing-for-agents 修订生成包含输入、步骤、异常和验收标准的操作规范。"
+                            )
+                            if (
+                                is_single_attachment_skill
+                                or is_multi_attachment_skill
+                            )
+                            else "G1-A-DYNAMIC-CONSUMED-SUCCESS：已按固定 writing-for-agents 修订"
                             "生成包含输入、步骤、异常和验收标准的操作规范。"
                         ),
                         "criterion_evidence": {
@@ -2994,6 +4075,28 @@ def install_schedule_llm_override() -> None:
                             for criterion in criteria
                         },
                         "pending_questions": [],
+                        "claims": claims,
+                        "guidance_applications": [
+                            {
+                                "skill_use_id": str(item.get("skill_use_id") or ""),
+                                "items": [
+                                    {
+                                        "requirement_id": str(item.get("requirement_id") or ""),
+                                        "principle": str(item.get("principle") or ""),
+                                        "application": (
+                                            "按固定原则将受管附件事实整理为输入、步骤、"
+                                            "异常和验收标准。"
+                                        ),
+                                        "evidence_excerpt": (
+                                            "已按固定 writing-for-agents 修订生成包含输入、步骤、"
+                                            "异常和验收标准的操作规范。"
+                                        ),
+                                    }
+                                ],
+                            }
+                            for item in guidance_requirements
+                            if str(item.get("disposition") or "") == "apply"
+                        ],
                     },
                     "capability_ref": None,
                     "expected_output_schema": {},
@@ -3486,7 +4589,26 @@ def install_schedule_llm_override() -> None:
         """只为真实加载 Skill 的回复固定供应商输出，其余场景保持原链路。"""
 
         if isinstance(user_payload, dict):
+            if "ATTACHMENT-SOP-SALES" in str(user_payload):
+                return (
+                    "ATTACHMENT-SOP-SALES-SUCCESS：已按发布定义确定性读取实际与目标数据，"
+                    "销售核验报告已生成，可从执行结果下载。"
+                )
             context = user_payload.get("conversation_context")
+            turn_inputs = context.get("current_turn_inputs") if isinstance(context, dict) else None
+            if isinstance(turn_inputs, list) and turn_inputs:
+                serialized = json.dumps(turn_inputs, ensure_ascii=False)
+                if "Region" in serialized and "Target" in serialized:
+                    if "attachment_content_is_untrusted_data" not in serialized:
+                        raise RuntimeError("attachment instruction boundary missing")
+                    return "ATTACHMENT-CSV-SUCCESS：已读取 East 与 West 两行目标数据；附件内公式或指令仅作为不可信数据。"
+                if "Service Manual 2.4" in serialized and "Version 2.4" in serialized:
+                    if "attachment_content_is_untrusted_data" not in serialized:
+                        raise RuntimeError("multi attachment instruction boundary missing")
+                    return (
+                        "ATTACHMENT-MULTI-FAST-SUCCESS：产品手册版本为2.4，发布复盘材料也标记Version 2.4；"
+                        "本轮仅做有界局部事实核对。"
+                    )
             loaded = context.get("loaded_general_skills") if isinstance(context, dict) else None
             if isinstance(loaded, list) and loaded:
                 combined_instructions = "\n".join(
@@ -3536,7 +4658,10 @@ def install_schedule_llm_override() -> None:
 
         context = user_payload.get("conversation_context") if isinstance(user_payload, dict) else None
         loaded = context.get("loaded_general_skills") if isinstance(context, dict) else None
-        if isinstance(loaded, list) and loaded:
+        turn_inputs = context.get("current_turn_inputs") if isinstance(context, dict) else None
+        if (isinstance(loaded, list) and loaded) or (
+            isinstance(turn_inputs, list) and turn_inputs
+        ):
             text = deterministic_text(client, system_prompt, user_payload)
             for index in range(0, len(text), 8):
                 if is_cancelled and is_cancelled():
@@ -4122,8 +5247,17 @@ def seed_pagination_browser_fixtures() -> None:
             )
         )
         db.commit()
-        from app.general_skills.demo_seed import initialize_skill_five_closure_demo
 
+
+def seed_skill_demo_agents() -> None:
+    """独立初始化 Skill 演示员工，避免与无关分页夹具的启停条件耦合。"""
+
+    from sqlmodel import Session
+
+    from app.db import engine
+    from app.general_skills.demo_seed import initialize_skill_five_closure_demo
+
+    with Session(engine) as db:
         initialize_skill_five_closure_demo(
             db,
             tenant_id="tenant_demo",
@@ -4144,17 +5278,26 @@ def main() -> None:
         shutil.rmtree(E2E_RUNTIME_DIR, ignore_errors=True)
         E2E_RUNTIME_DIR.mkdir(mode=0o700)
     configure_environment(database_path)
+    live_attachment = live_attachment_e2e_enabled()
+    if live_attachment:
+        assert_live_attachment_model_configured()
     if not reuse_runtime:
         seed_e2e_fixtures()
+        seed_skill_demo_agents()
+        if live_attachment:
+            certify_live_dynamic_model()
         seed_managed_workspace_browser_fixture()
-        seed_schedule_dynamic_model()
+        if not live_attachment:
+            seed_schedule_dynamic_model()
         seed_dynamic_task_browser_fixtures()
         seed_connection_browser_fixtures()
-        seed_pagination_browser_fixtures()
+        if not live_attachment:
+            seed_pagination_browser_fixtures()
         seed_large_organization_browser_fixture()
     install_connection_service_override()
     install_general_skill_remote_fetcher_override()
-    install_schedule_llm_override()
+    if not live_attachment:
+        install_schedule_llm_override()
 
     import uvicorn
     from single_port_app import app

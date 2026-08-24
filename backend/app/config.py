@@ -73,6 +73,35 @@ class Settings(BaseSettings):
     dynamic_task_max_active_per_agent: int = Field(default=0, ge=0, le=1024)
     dynamic_task_max_active_per_user: int = Field(default=0, ge=0, le=256)
     dynamic_task_max_active_per_tool: int = Field(default=0, ge=0, le=1024)
+    attachment_analysis_enabled: bool = False
+    attachment_parser_worker_enabled: bool = False
+    attachment_upload_chunk_bytes: int = Field(default=256 * 1024, ge=64 * 1024, le=1024 * 1024)
+    attachment_max_file_bytes: int = Field(default=12 * 1024 * 1024, ge=1024, le=64 * 1024 * 1024)
+    attachment_max_request_bytes: int = Field(default=48 * 1024 * 1024, ge=1024, le=128 * 1024 * 1024)
+    attachment_multipart_overhead_bytes: int = Field(
+        default=1024 * 1024,
+        ge=64 * 1024,
+        le=8 * 1024 * 1024,
+    )
+    attachment_upload_user_concurrency: int = Field(default=2, ge=1, le=32)
+    attachment_upload_tenant_concurrency: int = Field(default=20, ge=1, le=512)
+    attachment_upload_reservation_ttl_seconds: int = Field(default=180, ge=30, le=3600)
+    attachment_upload_user_daily_bytes: int = Field(
+        default=1024 * 1024 * 1024,
+        ge=1024,
+        le=1024 * 1024 * 1024 * 1024,
+    )
+    attachment_upload_tenant_daily_bytes: int = Field(
+        default=20 * 1024 * 1024 * 1024,
+        ge=1024,
+        le=10 * 1024 * 1024 * 1024 * 1024,
+    )
+    attachment_parser_timeout_seconds: int = Field(default=60, ge=5, le=600)
+    attachment_parser_memory_mb: int = Field(default=512, ge=128, le=4096)
+    attachment_scan_assurance: str = Field(
+        default="format_verified",
+        pattern="^(format_verified|malware_scanned)$",
+    )
     slack_oauth_client_id: str = ""
     slack_oauth_client_secret: str = ""
     slack_oauth_redirect_uri: str = ""

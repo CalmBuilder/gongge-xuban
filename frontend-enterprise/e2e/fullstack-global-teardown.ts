@@ -4,7 +4,9 @@ import { join } from 'node:path';
 
 export default async function fullstackGlobalTeardown() {
   if (process.env.PRESERVE_FULLSTACK_E2E === '1') return;
-  const runtimePath = join(tmpdir(), 'gongge-fullstack-e2e-current');
+  const runtimePath = process.env.FULLSTACK_E2E_RUNTIME_DIR
+    ? process.env.FULLSTACK_E2E_RUNTIME_DIR
+    : join(tmpdir(), 'gongge-fullstack-e2e-current');
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
       await rm(runtimePath, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });

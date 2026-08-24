@@ -93,14 +93,14 @@ async function openSession(sessionId) {
   /** 打开已由正式 Runtime 建立的聊天会话并等待执行卡加载。 */
 
   await page.goto(`${baseUrl}/workspace/chat/${sessionId}`);
-  await page.getByLabel('动态任务控制').waitFor({ state: 'visible', timeout: 30_000 });
+  await page.getByLabel('动态任务控制').first().waitFor({ state: 'visible', timeout: 30_000 });
 }
 
 try {
   await login();
 
   await openSession(instantSessionId);
-  const initialCard = await page.getByLabel('动态任务控制').innerText();
+  const initialCard = await page.getByLabel('动态任务控制').first().innerText();
   await page.getByRole('button', { name: '运行中增加 Skill', exact: true }).click();
   await page.getByText('writing-for-agents', { exact: true }).waitFor();
   await page.screenshot({ path: `${evidenceDir}/01-runtime-skill-catalog.png`, fullPage: true });
@@ -110,15 +110,22 @@ try {
 
   let instantExecution;
   let instantCommand;
-  for (let attempt = 0; attempt < 120; attempt += 1) {
+  for (let attempt = 0; attempt < 360; attempt += 1) {
     instantExecution = await api(`/api/executions/${instantExecutionId}?tenant_id=tenant_demo`);
     if (submittedCommandId) instantCommand = await api(`/api/executions/${instantExecutionId}/commands/${submittedCommandId}?tenant_id=tenant_demo`);
-    if (instantExecution.plan_revision_number >= 2 && instantCommand?.status === 'applied') break;
+    if (
+      instantExecution.plan_revision_number >= 2
+      && instantCommand?.status === 'applied'
+      && instantExecution.status === 'succeeded'
+    ) break;
     await page.waitForTimeout(500);
   }
+  const instantResult = await api(
+    `/api/executions/${instantExecutionId}/result?tenant_id=tenant_demo`,
+  );
   await page.reload();
-  await page.getByText(/计划 v2/).waitFor({ timeout: 30_000 });
-  const appliedCard = await page.getByLabel('动态任务控制').innerText();
+  await page.getByText(/计划 v2/).first().waitFor({ timeout: 30_000 });
+  const appliedCard = await page.getByLabel('动态任务控制').first().innerText();
   await page.screenshot({ path: `${evidenceDir}/02-runtime-skill-applied.png`, fullPage: true });
 
   await openSession(emptySessionId);
@@ -129,7 +136,7 @@ try {
   await page.screenshot({ path: `${evidenceDir}/03-runtime-skill-empty-negative.png`, fullPage: true });
 
   await openSession(parallelSessionId);
-  const parallelCard = await page.getByLabel('动态任务控制').innerText();
+  const parallelCard = await page.getByLabel('动态任务控制').first().innerText();
   const parallelExecution = await api(`/api/executions/${parallelExecutionId}?tenant_id=tenant_demo`);
   await page.screenshot({ path: `${evidenceDir}/04-parallel-read-wave.png`, fullPage: true });
 
@@ -142,7 +149,7 @@ try {
   });
   const afterExact = await api(`/api/executions/${cancelExecutionId}?tenant_id=tenant_demo`);
   await page.goto(`${baseUrl}/workspace/chat/${cancelSessionId}`);
-  await page.getByLabel('动态任务控制').waitFor({ state: 'visible', timeout: 30_000 });
+  await page.getByLabel('动态任务控制').first().waitFor({ state: 'visible', timeout: 30_000 });
   await page.screenshot({ path: `${evidenceDir}/07-dynamic-cancel-source-bridge.png`, fullPage: true });
   const dynamicCancel = {
     unrelatedStatus: unrelatedResponse.status,
@@ -161,6 +168,8 @@ try {
       initialPlanVisible: initialCard.includes('计划 v1'),
       appliedPlanVisible: appliedCard.includes('计划 v2'),
       commandStatus: instantCommand?.status,
+      executionStatus: instantExecution?.status,
+      resultStatus: instantResult?.status,
       planRevisionNumber: instantExecution?.plan_revision_number,
       planReason: instantExecution?.plan_reason,
       fixedUse: appliedUse && {
@@ -194,6 +203,7 @@ try {
   console.log(JSON.stringify(result, null, 2));
   if (!result.instantSkill.initialPlanVisible || !result.instantSkill.appliedPlanVisible) process.exitCode = 2;
   if (result.instantSkill.commandStatus !== 'applied') process.exitCode = 3;
+  if (result.instantSkill.executionStatus !== 'succeeded' || result.instantSkill.resultStatus !== 'verified') process.exitCode = 3;
   if (result.instantSkill.planReason !== 'skill_added') process.exitCode = 3;
   if (result.instantSkill.fixedUse?.checksumLength !== 64 || !result.instantSkill.answerReferencesUse) process.exitCode = 3;
   if (!result.emptySkillNegative.submitDisabled || result.emptySkillNegative.commandPosts !== 0) process.exitCode = 4;

@@ -160,18 +160,19 @@ export const CHAT_FEEDBACK_BTN_DISLIKE_ACTIVE_CLASS = 'bg-[#fce7e7] text-[#d20b0
 // Empty state (Hello {name})
 // ---------------------------------------------------------------------------
 export const CHAT_EMPTY_CLASS =
-  'mx-auto flex w-full max-w-[640px] flex-col gap-[16px] pt-[8vh]';
+  'mx-auto flex min-h-full w-full max-w-[820px] flex-col justify-center gap-[14px] py-[40px]';
 export const CHAT_EMPTY_GREETING_CARD_CLASS =
-  'flex w-full items-end justify-between rounded-[20px] bg-[#f6f6f6] pl-[8px] pr-[16px]';
-export const CHAT_EMPTY_TITLE_CLASS = 'text-[36px] font-semibold leading-none text-[#18181a]';
-export const CHAT_EMPTY_SUBTITLE_CLASS = 'text-[18px] font-medium text-[#464c5e]';
+  'grid min-h-[132px] w-full grid-cols-[132px_minmax(0,1fr)] items-end gap-[22px] rounded-[20px] border border-white/80 bg-white/72 px-[20px] shadow-[0_14px_40px_rgba(24,33,61,0.06)] max-[560px]:grid-cols-[88px_minmax(0,1fr)] max-[560px]:gap-[14px] max-[560px]:px-[14px]';
+export const CHAT_EMPTY_TITLE_CLASS =
+  'wrap-anywhere text-[clamp(24px,3.2vw,36px)] font-semibold leading-[1.12] tracking-[-0.025em] text-[var(--gg-ink)]';
+export const CHAT_EMPTY_SUBTITLE_CLASS = 'text-[16px] font-medium text-[var(--gg-slate)]';
 export const CHAT_EMPTY_CARD_CLASS =
-  'flex w-full items-stretch gap-[8px] rounded-[20px] bg-[#f6f6f6] p-[16px]';
-export const CHAT_EMPTY_ROLE_CLASS = 'line-clamp-2 text-[12px] capitalize leading-[1.5] text-[#757f9c]';
+  'grid w-full grid-cols-[minmax(0,1.2fr)_minmax(300px,0.8fr)] items-stretch gap-[18px] rounded-[20px] border border-white/80 bg-white/58 p-[16px] shadow-[0_10px_30px_rgba(24,33,61,0.04)] max-[700px]:grid-cols-1';
+export const CHAT_EMPTY_ROLE_CLASS = 'line-clamp-2 text-[12px] leading-[1.6] text-[var(--gg-slate)]';
 export const CHAT_EMPTY_TAGS_CLASS =
-  'flex flex-wrap items-center gap-[10px] [&>span]:rounded-[10px] [&>span]:border-[0.5px] [&>span]:border-[#e3e7f1] [&>span]:px-[10px] [&>span]:py-[4px] [&>span]:text-[10px] [&>span]:capitalize [&>span]:text-[#757f9c]';
+  'flex flex-wrap items-center gap-[8px] [&>span]:rounded-full [&>span]:border [&>span]:border-[var(--gg-border)] [&>span]:bg-white/70 [&>span]:px-[10px] [&>span]:py-[4px] [&>span]:text-[10px] [&>span]:text-[var(--gg-slate)]';
 export const CHAT_EMPTY_STAT_CELL_CLASS =
-  'flex flex-1 flex-col justify-center gap-[4px] border-[0.5px] border-[#e3e7f1] px-[20px] py-[8px] capitalize text-[#464c5e] first:rounded-l-[14px] last:rounded-r-[14px] [&:not(:first-child)]:ml-[-0.5px]';
+  'flex min-h-[72px] flex-1 flex-col justify-center gap-[6px] border border-[var(--gg-border)] bg-white/65 px-[18px] py-[10px] text-[var(--gg-slate)] first:rounded-l-[14px] last:rounded-r-[14px] [&:not(:first-child)]:ml-[-1px]';
 
 // ---------------------------------------------------------------------------
 // Composer
@@ -179,7 +180,7 @@ export const CHAT_EMPTY_STAT_CELL_CLASS =
 export const CHAT_INPUT_SHELL_CLASS = 'shrink-0 px-[24px] pb-[20px] pt-[6px]';
 export const CHAT_COMPOSER_STAGE_CLASS = 'relative mx-auto w-full max-w-[820px]';
 export const CHAT_COMPOSER_AVATAR_CLASS =
-  'absolute bottom-full left-[16px] z-10 mb-[2px] size-[44px] shrink-0 overflow-hidden';
+  'absolute left-[16px] top-0 z-10 size-[44px] -translate-y-[calc(100%-8px)] shrink-0 overflow-hidden rounded-[10px] border-[3px] border-[var(--gg-cloud)] bg-[var(--gg-cloud)] shadow-[0_8px_18px_rgba(24,33,61,0.14)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--gg-cobalt)] focus-visible:ring-offset-2';
 export const CHAT_COMPOSER_FORM_CLASS =
   'relative flex min-w-0 flex-1 flex-col gap-[10px] rounded-[14px] border border-[var(--gg-cobalt)] bg-white p-[12px] shadow-[0_10px_32px_rgba(49,87,232,0.10)] transition-colors';
 export const CHAT_COMPOSER_FORM_DRAG_CLASS = 'border-dashed border-[#0b6cf5] bg-[#f5f9ff]';

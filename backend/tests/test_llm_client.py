@@ -6,6 +6,7 @@
 @Description: 验证模型请求协议、输出配额、重试诊断、上下文投影和结构化响应。
 """
 
+import copy
 from threading import Event, Thread
 from time import monotonic
 
@@ -16,10 +17,11 @@ from app.llm.client import (
     LLMClient,
     LLMError,
     LLMStreamCancelled,
+    _json_repair_output_token_budget,
     _prepare_user_input,
     _thinking_mode_for_model,
 )
-from app.llm.output_policy import operation_output_tokens
+from app.llm.output_policy import operation_output_tokens, operation_thinking_mode
 from app.llm.stage_protocol import TURN_STAGE_MESSAGES_KEY, stage_payload
 from app.llm.schemas import ModelConfigCreateRequest
 from app.observability.spans import bind_span_sink, llm_operation
@@ -202,6 +204,8 @@ def test_dynamic_preflight_requires_native_structured_output_and_tool_call() -> 
     assert result["vision"] is False
     assert result["pdf_input"] is False
     assert calls[0]["response_format"] == {"type": "json_object"}
+    assert calls[0]["max_tokens"] == 512
+    assert calls[1]["max_tokens"] == 512
     assert calls[1]["tool_choice"] == {
         "type": "function",
         "function": {"name": "dynamic_capability_probe"},
@@ -286,7 +290,7 @@ def test_dynamic_preflight_freezes_successful_optional_image_and_pdf_probes() ->
                 return type("Completion", (), {"choices": [choice]})()
             content = kwargs["messages"][0]["content"]
             if any(part.get("type") == "image_url" for part in content):
-                return _completion_with_content("red")
+                return _completion_with_content("red left, blue right")
             return _completion_with_content("PDFCAP7")
 
     client.client = type(
@@ -358,6 +362,36 @@ def test_generate_text_uses_chat_completions_only():
         {"role": "user", "content": '{"hello": "world"}'},
     ]
     assert call["max_tokens"] == 256
+
+
+def test_connection_probe_reserves_reasoning_budget_before_expect_text() -> None:
+    """验证连接探针给推理模型留出足够配额，避免16 token导致空正文假阴性。"""
+
+    client = object.__new__(LLMClient)
+    client.client = _FakeOpenAIClient()
+    client.model = "reasoning-model"
+
+    assert client.probe_text_connection() == "ok"
+    call = client.client.chat.completions.calls[0]
+    assert call["temperature"] == 0
+    assert call["max_tokens"] == 256
+
+
+def test_connection_and_optional_input_probes_keep_provider_extra_body() -> None:
+    """验证连接、图片与PDF探针沿用管理端参数，避免思考模型产生空正文假失败。"""
+
+    client = object.__new__(LLMClient)
+    client.client = _FakeOpenAIClient()
+    client.model = "thinking-vision-model"
+    client.thinking_mode = ""
+    client.extra_body = {"enable_thinking": False}
+
+    assert client.probe_text_connection() == "ok"
+    client._probe_optional_dynamic_inputs()
+
+    calls = client.client.chat.completions.calls
+    assert len(calls) == 3
+    assert all(call["extra_body"] == {"enable_thinking": False} for call in calls)
 
 
 def test_generate_text_can_disable_provider_thinking():
@@ -1296,6 +1330,37 @@ def test_internal_output_budget_never_increases_smaller_model_config():
     assert operation_output_tokens("router.scene", 256) == 256
 
 
+def test_dynamic_plan_disables_thinking_without_changing_answer_profile() -> None:
+    """结构化Planner关闭推理耗散，最终答案仍尊重管理端模型配置。"""
+
+    assert operation_thinking_mode("dynamic_task.plan", "enabled") == "disabled"
+    assert operation_thinking_mode("dynamic_task.answer", "enabled") == "enabled"
+
+
+def test_dynamic_plan_request_overrides_configured_thinking_to_disabled() -> None:
+    """真实请求参数必须把Planner阶段投影为disabled，而非只修改telemetry标签。"""
+
+    client = object.__new__(LLMClient)
+    client.client = _FakeOpenAIClient()
+    client.model = "demo-model"
+    client.temperature = 0.2
+    client.max_output_tokens = 8192
+    client.thinking_mode = "enabled"
+    client.extra_body = {"thinking": {"type": "enabled", "budget_tokens": 1024}}
+    client.client.chat.completions.create = lambda **kwargs: (  # noqa: E731
+        client.client.chat.completions.calls.append(kwargs)
+        or _completion_with_content('{"goal":"ok"}')
+    )
+
+    with llm_operation("dynamic_task.plan"):
+        assert client.generate_json("planner", {}) == {"goal": "ok"}
+
+    assert client.client.chat.completions.calls[0]["extra_body"]["thinking"] == {
+        "type": "disabled",
+        "budget_tokens": 1024,
+    }
+
+
 def test_user_visible_response_caps_output_budget_at_4096():
     client = object.__new__(LLMClient)
     client.client = _FakeOpenAIClient()
@@ -1319,6 +1384,11 @@ def test_user_visible_response_caps_output_budget_at_4096():
         ("response.generate_stream", 4096),
         ("reflection.review", 2048),
         ("general_skill.select", 2048),
+        ("dynamic_task.route_shadow", 2048),
+        ("dynamic_task.plan", 8192),
+        ("dynamic_task.action", 2048),
+        ("dynamic_task.action.write", 8192),
+        ("dynamic_task.answer", 8192),
         ("general_skill.review", 2048),
         ("general_skill.reply", 2048),
         ("knowledge.document_route", 2048),
@@ -1334,6 +1404,14 @@ def test_control_plane_operation_output_budgets(operation, expected):  # noqa: A
 def test_step_agent_caps_output_budget_at_4096() -> None:
     assert operation_output_tokens("step_agent.run", 8192) == 4096
     assert operation_output_tokens("step_agent.repair", 8192) == 4096
+
+
+def test_dynamic_answer_reserves_one_complete_long_form_response() -> None:
+    """Dynamic最终交付预留16K，普通动作2K，写入动作保留8K。"""
+
+    assert operation_output_tokens("dynamic_task.answer", 32_768) == 16_384
+    assert operation_output_tokens("dynamic_task.action", 32_768) == 2_048
+    assert operation_output_tokens("dynamic_task.action.write", 32_768) == 8_192
 
 
 def test_generate_json_falls_back_when_json_object_mode_is_unsupported():
@@ -1400,6 +1478,29 @@ def test_generate_json_retries_invalid_json(monkeypatch):
     assert client.generate_json("prompt", {}) == {"ok": True}
 
 
+def test_generate_json_retries_share_one_deadline(monkeypatch) -> None:
+    """JSON语法修复重试必须共享总deadline，不能每轮重新获得完整模型超时。"""
+
+    client = object.__new__(LLMClient)
+    client.timeout_seconds = 1.0
+    calls = iter(["not json", "still not json"])
+    observed_calls: list[str] = []
+    moments = iter([0.0, 0.5, 0.6, 2.0])
+
+    def fake_generate_text(_system_prompt, _payload):
+        """返回两次坏JSON，第三次调用前由总deadline拒绝继续外呼。"""
+
+        observed_calls.append("called")
+        return next(calls)
+
+    monkeypatch.setattr(client, "generate_text", fake_generate_text)
+    monkeypatch.setattr("app.llm.client.time.monotonic", lambda: next(moments))
+
+    with pytest.raises(LLMError, match="MODEL_CALL_DEADLINE_EXCEEDED"):
+        client.generate_json("prompt", {})
+    assert observed_calls == ["called", "called"]
+
+
 def test_generate_json_retry_keeps_original_payload(monkeypatch):
     client = object.__new__(LLMClient)
     payloads = []
@@ -1415,6 +1516,74 @@ def test_generate_json_retry_keeps_original_payload(monkeypatch):
     assert payloads[1]["query"] == "廊坊天气"
     assert payloads[1]["skill"]["slug"] == "weather-zh"
     assert payloads[1]["_json_repair"]["previous_output"] == "not json"
+
+
+def test_generate_json_truncation_repair_requires_compact_complete_object(monkeypatch):
+    """长JSON在尾部截断时，修复轮必须压缩正文而不是重复生成同一份半包。"""
+
+    client = object.__new__(LLMClient)
+    payloads: list[dict[str, object]] = []
+    outputs = iter(['{"markdown":"' + ("x" * 5_000), '{"ok":true}'])
+
+    def fake_generate_text(system_prompt, user_payload, response_format=None):
+        """记录每轮修复载荷并返回先截断、后合法的确定性响应。"""
+
+        payloads.append(copy.deepcopy(user_payload))
+        return next(outputs)
+
+    monkeypatch.setattr(client, "generate_text", fake_generate_text)
+
+    assert client.generate_json("prompt", {"query": "生成结构化报告"}) == {"ok": True}
+    instruction = str(payloads[1]["_json_repair"]["instruction"])
+    assert "疑似因输出过长而被截断" in instruction
+    assert "显著压缩" in instruction
+    assert "完整闭合" in instruction
+
+
+def test_json_truncation_repair_escalates_budget_but_syntax_repair_does_not() -> None:
+    """截断修复逐轮扩到上限，普通JSON语法错误不得无条件增加模型成本。"""
+
+    truncated = "上一轮 JSON 疑似因输出过长而被截断。请显著压缩。"
+    assert _json_repair_output_token_budget(
+        {"_json_repair": {"attempt": 1, "instruction": truncated}},
+        8_192,
+    ) == 16_384
+    assert _json_repair_output_token_budget(
+        {"_json_repair": {"attempt": 2, "instruction": truncated}},
+        8_192,
+    ) == 32_768
+    assert _json_repair_output_token_budget(
+        {"_json_repair": {"attempt": 3, "instruction": truncated}},
+        8_192,
+    ) == 32_768
+    assert _json_repair_output_token_budget(
+        {"_json_repair": {"attempt": 1, "instruction": "修复逗号和引号。"}},
+        8_192,
+    ) == 8_192
+
+
+def test_generate_text_applies_truncation_repair_budget_to_provider_request() -> None:
+    """确认截断预算真正进入 provider 请求，而非只停留在独立辅助函数。"""
+
+    client = object.__new__(LLMClient)
+    client.client = _FakeOpenAIClient()
+    client.model = "demo-model"
+    client.temperature = 0.2
+    client.max_output_tokens = 8_192
+
+    result = client.generate_text(
+        "system",
+        {
+            "_json_repair": {
+                "attempt": 1,
+                "instruction": "上一轮 JSON 疑似因输出过长而被截断。请显著压缩。",
+            }
+        },
+        response_format={"type": "json_object"},
+    )
+
+    assert result == "ok"
+    assert client.client.chat.completions.calls[0]["max_tokens"] == 16_384
 
 
 def test_generate_json_repairs_unescaped_string_quotes_without_retry(monkeypatch):
@@ -1531,8 +1700,8 @@ def test_generate_text_escalates_from_operation_budget_after_reasoning_length(
     ] == expected_tokens
 
 
-def test_generate_text_does_not_escalate_reasoning_without_length_finish():
-    """只有明确的 length 截断才扩容，普通推理空响应沿用原配额。"""
+def test_generate_text_escalates_reasoning_only_empty_stop_response():
+    """推理非空但stop无正文时也扩容，避免复杂任务重复撞上同一空响应。"""
     client = object.__new__(LLMClient)
     client.client = _FakeOpenAIClient()
     client.model = "demo-model"
@@ -1567,7 +1736,32 @@ def test_generate_text_does_not_escalate_reasoning_without_length_finish():
 
     assert [
         call["max_tokens"] for call in client.client.chat.completions.calls
-    ] == [2048, 2048]
+    ] == [2048, 4096]
+
+
+def test_generate_text_deadline_covers_all_empty_response_retries(monkeypatch) -> None:
+    """单次模型阶段总deadline覆盖空响应重试，不能为每轮重置完整超时。"""
+
+    client = object.__new__(LLMClient)
+    client.client = _FakeOpenAIClient()
+    client.model = "demo-model"
+    client.temperature = 0.2
+    client.max_output_tokens = 8192
+    client.timeout_seconds = 1.0
+
+    def fake_create(**kwargs):  # noqa: ANN003
+        """记录首轮空响应，后续应在再次请求前被总deadline阻断。"""
+
+        client.client.chat.completions.calls.append(kwargs)
+        return _reasoning_length_completion()
+
+    client.client.chat.completions.create = fake_create
+    moments = iter([0.0, 0.0, 2.0])
+    monkeypatch.setattr("app.llm.client.time.monotonic", lambda: next(moments))
+
+    with pytest.raises(LLMError, match="MODEL_CALL_DEADLINE_EXCEEDED"):
+        client.generate_text("system prompt", {"hello": "world"})
+    assert len(client.client.chat.completions.calls) == 1
 
 
 def test_generate_text_preserves_configured_budget_above_escalation_ceiling():

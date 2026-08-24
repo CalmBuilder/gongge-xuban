@@ -34,6 +34,7 @@ from app.db.models import (
 )
 from app.observability.event_log import EventLog
 from app.session.session_schema import ChatTurnRequest
+from app.sop_runtime.execution_store import SopExecutionFencedError, SopExecutionStore
 
 
 def test_completed_client_turn_replays_persisted_stream_without_new_execution() -> None:
@@ -1245,6 +1246,55 @@ def test_chat_cancel_bridges_to_active_dynamic_execution() -> None:
     assert command.command_type == "cancel"
     assert command.status == "applied"
     assert command.source_type == "chat"
+
+
+def test_chat_cancel_preempts_model_worker_lease_and_fences_late_write() -> None:
+    """用户停止必须抢占长模型租约，旧worker续租或落结果时只能得到fenced。"""
+
+    db = _test_db()
+    session_row = ChatSession(
+        id="session_dynamic_cancel_preempt",
+        tenant_id="tenant_demo",
+        user_id="user_demo",
+        agent_id="agent_demo",
+    )
+    instance = SopInstance(
+        id="execution_dynamic_cancel_preempt",
+        tenant_id="tenant_demo",
+        session_id=session_row.id,
+        kind="dynamic_task",
+        active_slot_key="dynamic:session_dynamic_cancel_preempt",
+        initiator_user_id="user_demo",
+        agent_id="agent_demo",
+        goal_snapshot_json={"goal": "阻塞中的视觉复核"},
+        current_plan_revision_id="plan_dynamic_cancel_preempt",
+        current_plan_checksum="a" * 64,
+        capability_snapshot_json={"capabilities": []},
+        status="running",
+        source_ref="msg_dynamic_preempt",
+    )
+    db.add(session_row)
+    db.add(instance)
+    db.commit()
+    old_lease = SopExecutionStore(db).claim(
+        instance,
+        worker_id="model-worker",
+        ttl_seconds=300,
+    )
+    db.commit()
+
+    assert _cancel_active_dynamic_execution(
+        db,
+        session_row,
+        "msg_dynamic_preempt",
+        "user_demo",
+    )
+    db.commit()
+    db.refresh(instance)
+
+    assert instance.status == "cancelled"
+    with pytest.raises(SopExecutionFencedError):
+        SopExecutionStore(db).renew(old_lease, ttl_seconds=300)
 
 
 def test_chat_cancel_does_not_stop_an_unrelated_dynamic_execution() -> None:

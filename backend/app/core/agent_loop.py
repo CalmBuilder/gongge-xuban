@@ -60,12 +60,17 @@ from app.db.models import (
     GeneralSkillRevision,
     GeneralSkillUse,
     HumanHandoffRequest,
+    InputDocumentElement,
+    InputResourceExtraction,
     KnowledgeBaseVersion,
     Message,
+    ManagedInputResource,
     ModelConfig,
     PersonaConfig,
     Skill,
+    SopInstance,
     ScheduledTaskRun,
+    SelectedResourceExtraction,
     Tool,
     UIConfig,
     User,
@@ -74,6 +79,7 @@ from app.db.models import (
 )
 from app.db.database import engine
 from app.dynamic_tasks.agent import DynamicRunOutcome, DynamicTaskAgent, DynamicTaskAgentError
+from app.dynamic_tasks.planner_service import DynamicTaskPlannerError
 from app.dynamic_tasks.quotas import (
     DynamicTaskQuotaError,
     DynamicTaskQuotaService,
@@ -1880,6 +1886,7 @@ class AgentLoop:
         finalized_turn_reply: str | None = None
         user_message_id: str | None = None
         cancellation_token: TurnCancellationToken | None = None
+        stable_session_id = str(request.session_id or "").strip()
 
         def record_current_turn_cancelled(client_turn_id: str | None = None) -> bool:
             nonlocal turn_finalized
@@ -1984,14 +1991,16 @@ class AgentLoop:
             finalized_turn_reply = finalized_reply
             return finalized_reply
 
-        def recover_chat_session_after_exception() -> ChatSession:
+        def recover_chat_session_after_exception() -> ChatSession | None:
+            """回滚后重载会话；并发删除时不复活会话或写入迟到失败消息。"""
+
             nonlocal chat_session
-            session_id = str(
-                (chat_session.id if chat_session else request.session_id) or ""
-            ).strip()
             self.db.rollback()
-            recovered = self.db.get(ChatSession, session_id) if session_id else None
+            recovered = self.db.get(ChatSession, stable_session_id) if stable_session_id else None
             if recovered is None:
+                if stable_session_id:
+                    chat_session = None
+                    return None
                 recovered = self._get_or_create_session(request)
             chat_session = recovered
             return recovered
@@ -2014,6 +2023,8 @@ class AgentLoop:
         ) -> Iterator[dict[str, object]]:
             nonlocal reply
             target_session = recover_chat_session_after_exception()
+            if target_session is None:
+                return
             if mark_current_turn_cancelled():
                 return
             error_message = message if message is not None else str(error)
@@ -2054,6 +2065,7 @@ class AgentLoop:
 
         try:
             chat_session = self._get_or_create_session(request)
+            stable_session_id = chat_session.id
             self._mark_session_running(chat_session)
             yield self._stream_event(
                 "session_created",
@@ -2067,6 +2079,7 @@ class AgentLoop:
                 request.message,
                 metadata=self._user_message_metadata(request),
             )
+            self._bind_user_message_inputs(request, chat_session, user_message)
             user_message_id = user_message.id
             cancel_probe_state: dict[str, float | bool] = {
                 "checked_at": 0.0,
@@ -2175,6 +2188,9 @@ class AgentLoop:
                 no_skill_context = self._conversation_context(
                     chat_session, model_config=model_config
                 )
+                # 权威附件 Snapshot/ReadReceipt 可能在上下文构建时落库；任何 Router/Selector
+                # 远程调用前先提交，禁止把 SQLite 写锁带入不可控模型延迟。
+                self.db.commit()
                 if self._context_compacted_now(no_skill_context):
                     yield self._stream_status(
                         chat_session,
@@ -2349,6 +2365,7 @@ class AgentLoop:
                 return
             self._finish_stale_completed_skill(request.tenant_id, chat_session, skills)
             conversation_context = self._conversation_context(chat_session, model_config=model_config)
+            self.db.commit()
             if self._context_compacted_now(conversation_context):
                 yield self._stream_status(
                     chat_session,
@@ -3098,6 +3115,7 @@ class AgentLoop:
             request.message,
             metadata=self._user_message_metadata(request),
         )
+        self._bind_user_message_inputs(request, chat_session, user_message)
         bind_event_turn = getattr(self.events, "bind_turn", None)
         if callable(bind_event_turn):
             bind_event_turn(user_message.id, request.client_turn_id)
@@ -3145,6 +3163,7 @@ class AgentLoop:
             no_skill_context = self._conversation_context(
                 chat_session, model_config=model_config
             )
+            self.db.commit()
             if self._context_compacted_now(no_skill_context):
                 status("preparing", {"compacted_now": True})
             capability_route = self._decide_non_sop_capability(
@@ -3233,6 +3252,7 @@ class AgentLoop:
             )
         self._finish_stale_completed_skill(request.tenant_id, chat_session, skills)
         conversation_context = self._conversation_context(chat_session, model_config=model_config)
+        self.db.commit()
         if self._context_compacted_now(conversation_context):
             status("preparing", {"compacted_now": True})
 
@@ -3666,20 +3686,59 @@ class AgentLoop:
         task_results: list[dict[str, object]] | None = None,
         propagate_model_failure: bool = False,
     ) -> str:
-        return self.response_generator.generate(
-            message,
-            chat_session,
-            active_skill,
-            router_decision,
+        conversation_context = self._refresh_response_input_context(
+            chat_session, conversation_context
+        )
+        gateway = None
+        group = None
+        read_receipt_ids = list(
+            conversation_context.get("current_turn_input_read_receipt_ids") or []
+        )
+        if read_receipt_ids and self.response_generator.requires_model_call(
             step_result,
             tool_result,
-            model_config,
-            persona_prompt,
-            memory_context,
-            conversation_context,
             task_results,
-            propagate_model_failure,
-        )
+            force_model_call=True,
+            conversation_context=conversation_context,
+        ):
+            from app.session.provider_input_dispatch import ProviderInputDispatchGateway
+
+            gateway = ProviderInputDispatchGateway(self.db)
+            group = gateway.prepare_turn_group(
+                tenant_id=chat_session.tenant_id,
+                turn_id=str(conversation_context.get("current_turn_input_turn_id") or ""),
+                read_receipt_ids=[str(item) for item in read_receipt_ids],
+                egress_policy_checksum="inline-model-default-v1",
+            )
+            if group is None:
+                raise ValueError("ATTACHMENT_DISPATCH_INVALID")
+            gateway.authorize(group, worker_id=f"turn:{chat_session.id}")
+            self.db.commit()
+        try:
+            reply = self.response_generator.generate(
+                message,
+                chat_session,
+                active_skill,
+                router_decision,
+                step_result,
+                tool_result,
+                model_config,
+                persona_prompt,
+                memory_context,
+                conversation_context,
+                task_results,
+                propagate_model_failure or bool(group),
+                bool(read_receipt_ids),
+            )
+        except Exception:
+            if gateway is not None and group is not None:
+                gateway.mark_unknown(group)
+                self.db.commit()
+            raise
+        if gateway is not None and group is not None:
+            gateway.settle_delivered(group)
+            self.db.commit()
+        return reply
 
     def _generate_reply_stream_segment(
         self,
@@ -3696,20 +3755,107 @@ class AgentLoop:
         task_results: list[dict[str, object]] | None = None,
         is_cancelled: Callable[[], bool] | None = None,
     ) -> Iterator[str]:
-        yield from self.response_generator.generate_stream(
-            message,
-            chat_session,
-            active_skill,
-            router_decision,
+        conversation_context = self._refresh_response_input_context(
+            chat_session, conversation_context
+        )
+        gateway = None
+        group = None
+        read_receipt_ids = list(
+            conversation_context.get("current_turn_input_read_receipt_ids") or []
+        )
+        if read_receipt_ids and self.response_generator.requires_model_call(
             step_result,
             tool_result,
-            model_config,
-            persona_prompt,
-            memory_context,
-            conversation_context,
             task_results,
-            is_cancelled,
+            force_model_call=True,
+            conversation_context=conversation_context,
+        ):
+            from app.session.provider_input_dispatch import ProviderInputDispatchGateway
+
+            gateway = ProviderInputDispatchGateway(self.db)
+            group = gateway.prepare_turn_group(
+                tenant_id=chat_session.tenant_id,
+                turn_id=str(conversation_context.get("current_turn_input_turn_id") or ""),
+                read_receipt_ids=[str(item) for item in read_receipt_ids],
+                egress_policy_checksum="inline-model-default-v1",
+            )
+            if group is None:
+                raise ValueError("ATTACHMENT_DISPATCH_INVALID")
+            gateway.authorize(group, worker_id=f"turn:{chat_session.id}")
+            self.db.commit()
+        try:
+            stream = self.response_generator.generate_stream(
+                message,
+                chat_session,
+                active_skill,
+                router_decision,
+                step_result,
+                tool_result,
+                model_config,
+                persona_prompt,
+                memory_context,
+                conversation_context,
+                task_results,
+                is_cancelled,
+                bool(read_receipt_ids),
+                bool(group),
+            )
+            if group is None:
+                yield from stream
+                return
+            # 附件正文已经越过provider边界时，先缓冲并完成外发审计，再向浏览器公开回答；
+            # 撤权或provider异常因此不会留下“页面已显示但Receipt仍未结算”的假终态。
+            buffered_chunks = list(stream)
+        except Exception:
+            if gateway is not None and group is not None:
+                gateway.mark_unknown(group)
+                self.db.commit()
+            raise
+        if gateway is not None and group is not None:
+            gateway.settle_delivered(group)
+            self.db.commit()
+            yield from buffered_chunks
+
+    def _refresh_response_input_context(
+        self,
+        chat_session: ChatSession,
+        conversation_context: dict[str, object],
+    ) -> dict[str, object]:
+        """在真正回复外呼前按最新用户消息重建权威附件切片与Receipt身份。"""
+
+        refreshed = dict(conversation_context)
+        for key in (
+            "current_turn_inputs",
+            "current_turn_input_read_receipt_ids",
+            "current_turn_input_turn_id",
+        ):
+            refreshed.pop(key, None)
+        latest_user = self.db.exec(
+            select(Message)
+            .where(
+                Message.tenant_id == chat_session.tenant_id,
+                Message.session_id == chat_session.id,
+                Message.role == "user",
+            )
+            .order_by(Message.created_at.desc(), Message.id.desc())
+        ).first()
+        if latest_user is None:
+            return refreshed
+        from app.session.input_runtime import TurnInputRuntimeService
+
+        current_turn_inputs = TurnInputRuntimeService(self.db).read_turn_inputs(
+            tenant_id=chat_session.tenant_id,
+            session_id=chat_session.id,
+            turn_id=latest_user.id,
         )
+        if not current_turn_inputs:
+            return refreshed
+        refreshed["current_turn_inputs"] = current_turn_inputs
+        refreshed["current_turn_input_read_receipt_ids"] = [
+            str(item["read_receipt_id"]) for item in current_turn_inputs
+        ]
+        refreshed["current_turn_input_turn_id"] = latest_user.id
+        return refreshed
 
     def _task_response_context(
         self,
@@ -7468,6 +7614,12 @@ class AgentLoop:
                 shadow_attempted=False,
                 shadow_duration_ms=0.0,
             )
+        # projected catalog 与知识范围查询会重新打开只读事务。SQLite 回滚日志模式下，
+        # 该读事务也会阻塞独立 span/worker 的提交，因此在首个选择模型外呼前再次结束。
+        db = getattr(self, "db", None)
+        commit = getattr(db, "commit", None)
+        if callable(commit):
+            commit()
         route = self.non_sop_capability_router.decide(
             message=message,
             general_skills=general_skills,
@@ -7487,6 +7639,24 @@ class AgentLoop:
             )
         return route
 
+    @staticmethod
+    def _explicit_dynamic_task_requested(message: str) -> bool:
+        """识别用户明确的持久动态执行请求，避免被一次性 Skill 回复降级。"""
+
+        text = " ".join(str(message or "").split())
+        named_request = re.search(
+            r"(?:请|使用|通过|交给|启动|创建|让)[^\n]{0,48}"
+            r"dynamictaskagent[^\n]{0,32}(?:完成|执行|处理|分析|诊断|生成)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        durable_request = (
+            "动态任务" in text
+            and any(marker in text for marker in ("持久", "可恢复"))
+            and any(marker in text for marker in ("请", "启动", "创建", "执行", "完成"))
+        )
+        return named_request is not None or durable_request
+
     def _try_handle_dynamic_task(
         self,
         request: ChatTurnRequest,
@@ -7499,6 +7669,24 @@ class AgentLoop:
         """只在独立 kill switch 生效且路由通过时委托 DynamicTaskAgent 完整执行。"""
 
         decision = route.effective_decision
+        if self._explicit_dynamic_task_requested(request.message):
+            decision = NonSopCapabilityDecision(
+                mode="dynamic_task",
+                goal=request.message.strip(),
+                success_criteria=["按用户明确要求在持久执行中形成可校验结果"],
+                requires_durable_execution=True,
+                confidence=1.0,
+                reason="用户明确指定 DynamicTaskAgent/持久动态任务执行。",
+            )
+        if request.attachments and self._attachments_require_dynamic(request):
+            decision = NonSopCapabilityDecision(
+                mode="dynamic_task",
+                goal=request.message.strip(),
+                success_criteria=["完整读取本轮附件并形成可追责的分析结论"],
+                requires_durable_execution=True,
+                confidence=1.0,
+                reason="图片或超出普通问答有界切片的附件必须进入持久分析运行时。",
+            )
         if len(tuple(dict.fromkeys(request.forced_general_skill_ids))) > 1:
             decision = NonSopCapabilityDecision(
                 mode="dynamic_task",
@@ -7521,6 +7709,9 @@ class AgentLoop:
             return None
         if not chat_session.agent_id or not request.user_id:
             return None
+        stable_session_id = chat_session.id
+        stable_agent_id = chat_session.agent_id
+
         if request.forced_general_skill_id:
             forced_skill, _selection = self._forced_general_skill_capability(
                 request,
@@ -7577,41 +7768,46 @@ class AgentLoop:
             if not bool(knowledge_capability.get("available")):
                 raise DynamicTaskAgentError("DYNAMIC_KNOWLEDGE_REQUIRED_UNAVAILABLE")
             knowledge_capability = {**knowledge_capability, "required": True}
+        # Router/Step/Skill 选择已经产生本轮审计事实。DynamicTaskAgent 随后可能执行真实
+        # selector/planner 外呼；先提交这些事实，禁止请求级 Session 把 SQLite 写锁带入
+        # 长模型等待。Execution/Plan/Use 仍由 start_task 在规划返回后以短事务创建。
+        self.db.commit()
         try:
-            with self.db.begin_nested():
-                instance, created = dynamic_agent.start_task(
-                    tenant_id=request.tenant_id,
-                    session_id=chat_session.id,
-                    agent_id=chat_session.agent_id,
-                    initiator_user_id=request.user_id,
-                    goal=str(decision.goal or ""),
-                    success_criteria=tuple(decision.success_criteria),
-                    model_config=model_config,
-                    source_ref=source_ref,
-                    source_kind=source_kind,
-                    input_resource_ids=tuple(
-                        item.resource_id
-                        for item in request.attachments
-                        if item.resource_id is not None
-                    ),
-                    knowledge_capability=knowledge_capability,
-                    forced_general_skill_id=(
-                        request.forced_general_skill_id if request.channel == "web" else None
-                    ),
-                    forced_general_skill_ids=(
-                        tuple(request.forced_general_skill_ids)
-                        if request.channel == "web"
-                        else ()
-                    ),
-                    memory_context=memory_context,
+            instance, created = dynamic_agent.start_task(
+                tenant_id=request.tenant_id,
+                session_id=stable_session_id,
+                agent_id=stable_agent_id,
+                initiator_user_id=request.user_id,
+                # 路由模型只决定是否委托及成功标准，不能改写或遗漏用户原始任务事实。
+                goal=request.message.strip(),
+                success_criteria=tuple(decision.success_criteria),
+                model_config=model_config,
+                source_ref=source_ref,
+                source_kind=source_kind,
+                input_resource_ids=tuple(
+                    item.resource_id
+                    for item in request.attachments
+                    if item.resource_id is not None
+                ),
+                knowledge_capability=knowledge_capability,
+                forced_general_skill_id=(
+                    request.forced_general_skill_id if request.channel == "web" else None
+                ),
+                forced_general_skill_ids=(
+                    tuple(request.forced_general_skill_ids)
+                    if request.channel == "web"
+                    else ()
+                ),
+                memory_context=memory_context,
+            )
+            if created and quota_limits is not None:
+                DynamicTaskQuotaService(self.db).acquire_execution(
+                    instance,
+                    limits=quota_limits,
                 )
-                if created and quota_limits is not None:
-                    DynamicTaskQuotaService(self.db).acquire_execution(
-                        instance,
-                        limits=quota_limits,
-                    )
         except Exception as exc:
             failure_code = str(getattr(exc, "code", "") or type(exc).__name__)
+            diagnostic = str(exc)[:500] if isinstance(exc, DynamicTaskPlannerError) else ""
             self._fail_unbound_dynamic_skill_uses(
                 request=request,
                 chat_session=chat_session,
@@ -7622,8 +7818,12 @@ class AgentLoop:
                 request.tenant_id,
                 chat_session.id,
                 "dynamic_task_delegation_failed",
-                self._turn_payload({"code": failure_code[:128]}, user_message_id),
+                self._turn_payload(
+                    {"code": failure_code[:128], "diagnostic": diagnostic},
+                    user_message_id,
+                ),
             )
+            self.db.commit()
             raise DynamicTaskAgentError(failure_code[:128]) from exc
         if source_kind == "schedule":
             control = ExecutionControlService(self.db, dynamic_agent.store)
@@ -7678,6 +7878,21 @@ class AgentLoop:
                 ),
                 session_state=public_session(chat_session),
             )
+        self.events.record(
+            request.tenant_id,
+            chat_session.id,
+            "dynamic_task_delegated",
+            self._turn_payload(
+                {
+                    "execution_id": instance.id,
+                    "execution_created": created,
+                    "execution_status": str(getattr(instance, "status", "created")),
+                },
+                user_message_id,
+            ),
+        )
+        # 在任何长模型外呼前公开权威Execution身份，使另一请求可以精确取消当前Turn。
+        self.db.commit()
         try:
             outcome = dynamic_agent.run_until_blocked_or_complete(
                 execution_id=instance.id,
@@ -7720,16 +7935,18 @@ class AgentLoop:
                 execution_id=instance.id,
                 worker_id=f"chat-failure:{user_message_id}",
                 error_code=failure_code,
+                diagnostics=getattr(exc, "details", None),
             )
-            self.events.record(
-                request.tenant_id,
-                chat_session.id,
-                "dynamic_task_execution_failed",
-                self._turn_payload(
-                    {"execution_id": instance.id, "code": failure_code},
-                    user_message_id,
-                ),
-            )
+            if self.db.get(ChatSession, stable_session_id) is not None:
+                self.events.record(
+                    request.tenant_id,
+                    stable_session_id,
+                    "dynamic_task_execution_failed",
+                    self._turn_payload(
+                        {"execution_id": instance.id, "code": failure_code},
+                        user_message_id,
+                    ),
+                )
             self.db.commit()
             raise
         if outcome.status == "waiting" and outcome.blocking_step_key:
@@ -7738,20 +7955,6 @@ class AgentLoop:
                 execution_id=instance.id,
                 blocking_step_key=outcome.blocking_step_key,
                 user_message_id=user_message_id,
-            )
-            self.events.record(
-                request.tenant_id,
-                chat_session.id,
-                "dynamic_task_delegated",
-                self._turn_payload(
-                    {
-                        "execution_id": instance.id,
-                        "execution_created": created,
-                        "execution_status": "waiting",
-                        "blocking_step_key": outcome.blocking_step_key,
-                    },
-                    user_message_id,
-                ),
             )
             self.db.commit()
             self.db.refresh(chat_session)
@@ -7770,15 +7973,6 @@ class AgentLoop:
             )
         if outcome.status != "succeeded" or outcome.message is None:
             raise DynamicTaskAgentError("DYNAMIC_TASK_DID_NOT_CLOSE")
-        self.events.record(
-            request.tenant_id,
-            chat_session.id,
-            "dynamic_task_delegated",
-            self._turn_payload(
-                {"execution_id": instance.id, "execution_created": created},
-                user_message_id,
-            ),
-        )
         self.db.commit()
         self.db.refresh(chat_session)
         return ChatTurnResponse(
@@ -7794,6 +7988,63 @@ class AgentLoop:
             ),
             session_state=public_session(chat_session),
         )
+
+    def _attachments_require_dynamic(self, request: ChatTurnRequest) -> bool:
+        """依据权威资源与已发布Extraction判断附件是否超出普通问答安全快路径。"""
+
+        total_elements = 0
+        total_chars = 0
+        from app.session.input_runtime import formula_analysis_intent
+        for ref in request.attachments:
+            resource = self.db.exec(
+                select(ManagedInputResource).where(
+                    ManagedInputResource.tenant_id == request.tenant_id,
+                    ManagedInputResource.id == ref.resource_id,
+                    ManagedInputResource.version == ref.resource_version,
+                )
+            ).first()
+            if resource is None or resource.mime_type.startswith("image/"):
+                return True
+            selected = self.db.exec(
+                select(SelectedResourceExtraction).where(
+                    SelectedResourceExtraction.tenant_id == request.tenant_id,
+                    SelectedResourceExtraction.resource_id == resource.id,
+                    SelectedResourceExtraction.resource_version == resource.version,
+                    SelectedResourceExtraction.profile_key == "default",
+                )
+            ).first()
+            extraction = self.db.get(
+                InputResourceExtraction,
+                selected.extraction_id if selected is not None else "",
+            )
+            if extraction is None:
+                return True
+            elements = self.db.exec(
+                select(InputDocumentElement).where(
+                    InputDocumentElement.tenant_id == request.tenant_id,
+                    InputDocumentElement.extraction_id == extraction.id,
+                )
+            ).all()
+            formula_cells = {
+                (
+                    str(item.table_json.get("sheet_name") or ""),
+                    str(formula.get("cell") or "").upper(),
+                )
+                for item in elements
+                if isinstance(item.table_json, dict)
+                for formula in item.table_json.get("formulas", [])
+                if isinstance(formula, dict) and formula.get("cell")
+            }
+            if formula_cells and formula_analysis_intent(
+                request.message,
+                formula_cells=formula_cells,
+            ):
+                return True
+            total_elements += len(elements)
+            total_chars += sum(item.char_count for item in elements)
+            if total_elements > 64 or total_chars > 32_000:
+                return True
+        return False
 
     def _fail_unbound_dynamic_skill_uses(
         self,
@@ -8270,6 +8521,28 @@ class AgentLoop:
             if model_config
             else None,
         )
+        latest_user = next((row for row in reversed(rows) if row.role == "user"), None)
+        if latest_user is not None and hasattr(self.db, "get") and hasattr(self.db, "add"):
+            from app.session.input_bindings import InputBindingError
+            from app.session.input_runtime import TurnInputRuntimeService
+            try:
+                current_turn_inputs = TurnInputRuntimeService(self.db).read_turn_inputs(
+                    tenant_id=chat_session.tenant_id,
+                    session_id=chat_session.id,
+                    turn_id=latest_user.id,
+                )
+            except InputBindingError as exc:
+                if exc.code != "ATTACHMENT_FAST_PATH_BUDGET_EXCEEDED":
+                    raise
+                # 超出快路径预算是Dynamic路由事实，不是附件失权；控制阶段不得提前失败。
+                current_turn_inputs = []
+                context["current_turn_input_requires_dynamic"] = True
+            if current_turn_inputs:
+                context["current_turn_inputs"] = current_turn_inputs
+                context["current_turn_input_read_receipt_ids"] = [
+                    str(item["read_receipt_id"]) for item in current_turn_inputs
+                ]
+                context["current_turn_input_turn_id"] = latest_user.id
         next_state = context.get("context_state")
         if isinstance(next_state, dict) and next_state != (chat_session.context_state_json or {}):
             chat_session.context_state_json = next_state
@@ -8326,8 +8599,25 @@ class AgentLoop:
         step_result: StepAgentResult | None,
         chat_session: ChatSession,
         source_message: str | None = None,
+        user_message_id: str | None = None,
     ) -> dict[str, Any]:
+        """汇总回复控制、知识引用及当前用户消息精确关联的SOP Execution身份。"""
+
         metadata = step_result.runtime_reply_metadata() if step_result else {}
+        if user_message_id:
+            sop_instance = self.db.exec(
+                select(SopInstance)
+                .where(
+                    SopInstance.tenant_id == chat_session.tenant_id,
+                    SopInstance.session_id == chat_session.id,
+                    SopInstance.kind == "sop",
+                    SopInstance.source_kind == "chat",
+                    SopInstance.source_ref == user_message_id,
+                )
+                .order_by(SopInstance.created_at.desc(), SopInstance.id.desc())
+            ).first()
+            if sop_instance is not None:
+                metadata = {**metadata, "execution_id": sop_instance.id}
         knowledge_results = list(step_result.knowledge_results or []) if step_result else []
         citations = self._dedupe_knowledge_citations(
             knowledge_citations_from_results(knowledge_results)
@@ -8528,6 +8818,38 @@ class AgentLoop:
         if request.attachments:
             metadata["attachments"] = [item.model_dump(mode="json") for item in request.attachments]
         return metadata
+
+    def _bind_user_message_inputs(
+        self,
+        request: ChatTurnRequest,
+        chat_session: ChatSession,
+        user_message: Message,
+    ) -> None:
+        """回查最小附件ref并原子建立会话、消息Link，客户端正文永不进入消息。"""
+
+        if not request.attachments:
+            return
+        from app.session.input_bindings import InputBindingService
+
+        service = InputBindingService(self.db)
+        resolved = service.resolve_turn_refs(
+            request.attachments,
+            tenant_id=request.tenant_id,
+            owner_user_id=request.user_id or chat_session.user_id,
+            session_id=chat_session.id,
+            agent_id=request.agent_id or chat_session.agent_id or "",
+            draft_conversation_id=request.draft_conversation_id,
+        )
+        service.link_message(
+            tenant_id=request.tenant_id,
+            session_id=chat_session.id,
+            message_id=user_message.id,
+            resolved=resolved,
+        )
+        metadata = dict(user_message.metadata_json or {})
+        metadata["attachments"] = [projection.model_dump(mode="json") for *_, projection in resolved]
+        user_message.metadata_json = metadata
+        self.db.add(user_message)
 
     def _record_runtime_event(
         self,
@@ -8770,7 +9092,12 @@ class AgentLoop:
         chat_session.updated_at = utc_now()
         if chat_session.status != "handoff":
             chat_session.status = "active"
-        metadata = self._assistant_message_metadata(step_result, chat_session, source_message)
+        metadata = self._assistant_message_metadata(
+            step_result,
+            chat_session,
+            source_message,
+            user_message_id,
+        )
         reply = restore_truncated_atomic_references(
             reply,
             metadata.get("knowledge_citations"),

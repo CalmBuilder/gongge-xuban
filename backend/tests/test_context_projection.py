@@ -132,6 +132,32 @@ def test_compact_conversation_context_keeps_recent_history_within_control_budget
     assert compacted["metadata"]["compacted"] is True
 
 
+def test_control_context_never_discloses_managed_attachment_payload() -> None:
+    """Router/Step/Reflection不得在Provider账本外收到附件正文、图片或Receipt身份。"""
+
+    context = {
+        "messages": [
+            {
+                "role": "user",
+                "content": "请分析文件\n\n上传附件上下文：\n可读取正文：\nTOP-SECRET",
+                "images": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}],
+            }
+        ],
+        "current_turn_inputs": [{"elements": [{"text": "TOP-SECRET"}]}],
+        "current_turn_input_read_receipt_ids": ["receipt-secret"],
+        "current_turn_input_turn_id": "turn-secret",
+        "metadata": {"estimated_tokens": 20},
+    }
+
+    compacted = compact_conversation_context(context)
+
+    assert compacted["messages"] == [{"role": "user", "content": "请分析文件"}]
+    assert "current_turn_inputs" not in compacted
+    assert "current_turn_input_read_receipt_ids" not in compacted
+    assert "current_turn_input_turn_id" not in compacted
+    assert context["current_turn_inputs"][0]["elements"][0]["text"] == "TOP-SECRET"
+
+
 def test_step_skill_context_keeps_only_local_graph_and_complete_instructions() -> None:
     """验证步骤模型只接收局部图和完整节点说明。"""
 

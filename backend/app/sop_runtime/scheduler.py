@@ -38,6 +38,7 @@ class RuntimeAction(StrEnum):
     ADVANCE = "advance"
     CALL_TOOL = "call_tool"
     QUERY_KNOWLEDGE = "query_knowledge"
+    CALL_BUILTIN_INPUT = "call_builtin_input"
     COMPLETE = "complete"
     FAIL = "fail"
 
@@ -100,6 +101,8 @@ def plan_next_action(
     if isinstance(node, DecisionNode):
         return _route(definition, node.node_id, runtime_data)
     if isinstance(node, ServiceTaskNode):
+        if node.config.kind is ServiceTaskKind.BUILTIN_INPUT:
+            return _plan_builtin_input(definition, node, runtime_data)
         if node.config.kind is ServiceTaskKind.TOOL:
             return _plan_tool(definition, node, runtime_data)
         if node.config.kind is ServiceTaskKind.KNOWLEDGE:
@@ -205,6 +208,40 @@ def _plan_knowledge(
             "max_chunks": knowledge_config.max_chunks,
             "max_depth": knowledge_config.max_depth,
         },
+        result_key=config.result_key,
+    )
+
+
+def _plan_builtin_input(
+    definition: CompiledSopDefinition,
+    node: ServiceTaskNode,
+    runtime_data: Mapping[str, object],
+) -> RuntimePlan:
+    """为平台内建附件能力生成确定性调用，不伪装成外部Tool或模型外发。"""
+
+    config = node.config
+    if not config.builtin_operation or not config.result_key:
+        return _failure(node.node_id, "RUNTIME_BUILTIN_INPUT_DEFINITION_INVALID")
+    node_outputs = runtime_data["node_output"]
+    receipt = (
+        node_outputs.get(config.result_key)
+        if isinstance(node_outputs, Mapping)
+        else None
+    )
+    if isinstance(receipt, Mapping):
+        return _route(definition, node.node_id, runtime_data)
+    arguments: dict[str, object] = {}
+    for argument_name, path in config.input_mapping.items():
+        value, found = _resolve_path(runtime_data, path)
+        if found and value is not None:
+            arguments[argument_name] = value
+    if config.compute_ast:
+        arguments["operation"] = dict(config.compute_ast)
+    return RuntimePlan(
+        action=RuntimeAction.CALL_BUILTIN_INPUT,
+        node_id=node.node_id,
+        operation_name=config.builtin_operation,
+        operation_arguments=arguments,
         result_key=config.result_key,
     )
 

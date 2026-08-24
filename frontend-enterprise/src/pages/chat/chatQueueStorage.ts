@@ -33,6 +33,8 @@ function isQueuedAttachment(value: unknown): value is ChatAttachmentRead {
     && typeof value.content_type === 'string'
     && typeof value.size === 'number'
     && ['text', 'pdf', 'image', 'binary'].includes(String(value.kind || ''))
+    && typeof value.resource_id === 'string'
+    && typeof value.resource_version === 'string'
   );
 }
 

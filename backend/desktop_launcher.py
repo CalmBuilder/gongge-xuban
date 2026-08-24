@@ -583,6 +583,16 @@ def _run_windows_taskbar_app(cfg: dict, url: str) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """按CLI模式运行受限parser或启动桌面单端口服务。"""
+
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments and arguments[0] == "--input-parser":
+        os.environ.setdefault("APP_ENV", "attachment-parser")
+        os.environ.setdefault("PUBLIC_MOCK_API_KEY", "attachment-parser-disabled")
+        os.environ.setdefault("PUBLIC_MOCK_LLM_ENABLED", "false")
+        from app.session.input_parser_cli import main as parser_main
+
+        return parser_main(arguments[1:])
     _redirect_logs_when_frozen()
 
     host = desktop_env_value("HOST", "127.0.0.1")

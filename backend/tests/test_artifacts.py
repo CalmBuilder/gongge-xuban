@@ -17,7 +17,10 @@ from sqlmodel import Session, SQLModel, create_engine, select
 from app.api.artifacts import download_artifact, get_artifact, list_artifacts, preview_artifact
 from app.db.models import (
     ArtifactInputLink,
+    ExecutionArtifact,
     InputResourceSnapshot,
+    ManagedInputResource,
+    ResourceSessionBinding,
     SopInstance,
     SopNodeExecution,
     User,
@@ -27,6 +30,7 @@ from app.dynamic_tasks.artifacts import (
     ArtifactContractError,
     ArtifactService,
 )
+from app.session.managed_resources import ManagedInputResourceService
 
 
 @pytest.fixture
@@ -95,11 +99,26 @@ def _facts(db: Session):
         storage_locator_digest="d" * 64,
         captured_acl_json={"owner": owner.id},
     )
+    resource = ManagedInputResource(
+        id=snapshot.source_resource_id,
+        tenant_id=instance.tenant_id,
+        owner_user_id=owner.id,
+        agent_id=instance.agent_id,
+        version=snapshot.source_version,
+        filename=snapshot.filename,
+        mime_type=snapshot.mime_type,
+        size_bytes=snapshot.size_bytes,
+        content_checksum=snapshot.content_checksum,
+        extraction_checksum=snapshot.extraction_checksum,
+        ingestion_status="ready",
+        storage_locator="managed/input",
+    )
     db.add(owner)
     db.add(outsider)
     db.add(instance)
     db.add(node)
     db.add(snapshot)
+    db.add(resource)
     db.commit()
     return owner, outsider, instance, node, snapshot
 
@@ -149,6 +168,7 @@ def test_register_preview_download_and_exact_input_lineage(
     assert preview.truncated is False
     assert download.body == "# 风险简报\n\n证据已核验。".encode()
     assert download.headers["content-disposition"].startswith("attachment; filename*=UTF-8''")
+    assert download.headers["x-content-type-options"] == "nosniff"
     assert len(visible) == 1
     assert [(item.artifact_id, item.input_snapshot_id) for item in links] == [
         (artifact.id, snapshot.id)
@@ -246,6 +266,34 @@ def test_artifact_rejects_cross_execution_lineage_and_client_paths(
             data=b"brief",
             input_snapshot_ids=(snapshot.id,),
         )
+
+
+def test_artifact_download_fails_closed_after_input_is_revoked(
+    db: Session,
+    tmp_path: Path,
+) -> None:
+    """输入撤权后关联Artifact即使blob仍在也不得继续下载。"""
+
+    owner, _, instance, node, snapshot = _facts(db)
+    service = ArtifactService(db, storage_root=tmp_path)
+    artifact, _ = service.register(
+        instance=instance,
+        source_node=node,
+        artifact_key="revoked-input-report",
+        filename="report.md",
+        mime_type="text/markdown",
+        data=b"# derived content",
+        input_snapshot_ids=(snapshot.id,),
+    )
+    resource = db.get(ManagedInputResource, snapshot.source_resource_id)
+    resource.access_status = "revoked"
+    resource.revoked_at = snapshot.created_at
+    resource.acl_revision += 1
+    db.add(resource)
+    db.commit()
+
+    with pytest.raises(ArtifactAccessDenied, match="ARTIFACT_NOT_FOUND"):
+        service.resolve(artifact.id, tenant_id=instance.tenant_id, actor_user_id=owner.id)
     with pytest.raises(ArtifactContractError, match="ARTIFACT_FILENAME_INVALID"):
         service.register(
             instance=instance,
@@ -254,6 +302,60 @@ def test_artifact_rejects_cross_execution_lineage_and_client_paths(
             filename="../brief.md",
             mime_type="text/markdown",
             data=b"brief",
+        )
+
+
+def test_session_purge_revokes_linked_artifact_before_source_tombstone(
+    db: Session,
+    tmp_path: Path,
+) -> None:
+    """会话输入销毁必须级联撤销派生Artifact，残留blob也不能再预览或下载。"""
+
+    owner, _, instance, node, snapshot = _facts(db)
+    artifact_service = ArtifactService(db, storage_root=tmp_path / "artifacts")
+    artifact, _ = artifact_service.register(
+        instance=instance,
+        source_node=node,
+        artifact_key="purged-source-report",
+        filename="report.md",
+        mime_type="text/markdown",
+        data=b"# derived sensitive content",
+        input_snapshot_ids=(snapshot.id,),
+    )
+    resource = db.get(ManagedInputResource, snapshot.source_resource_id)
+    assert resource is not None
+    db.add(
+        ResourceSessionBinding(
+            tenant_id=instance.tenant_id,
+            resource_id=resource.id,
+            resource_version=resource.version,
+            owner_user_id=owner.id,
+            session_id=instance.session_id,
+            agent_id=instance.agent_id,
+        )
+    )
+    instance.status = "succeeded"
+    instance.active_slot_key = None
+    db.add(instance)
+    db.commit()
+    input_root = tmp_path / "inputs"
+    (input_root / "managed").mkdir(parents=True)
+    (input_root / resource.storage_locator).write_bytes(b"source")
+
+    ManagedInputResourceService(db, storage_root=input_root).purge_session_resource(
+        resource,
+        session_id=instance.session_id,
+        actor_user_id=owner.id,
+    )
+    persisted_artifact = db.get(ExecutionArtifact, artifact.id)
+
+    assert resource.destruction_status == "purged"
+    assert persisted_artifact is not None and persisted_artifact.status == "revoked"
+    with pytest.raises(ArtifactAccessDenied, match="ARTIFACT_NOT_FOUND"):
+        artifact_service.resolve(
+            artifact.id,
+            tenant_id=instance.tenant_id,
+            actor_user_id=owner.id,
         )
 
 
@@ -297,3 +399,32 @@ def test_artifact_write_rejects_symlink_escape(
         )
 
     assert list(outside.iterdir()) == []
+
+
+def test_artifact_read_rejects_blob_with_external_hardlink(
+    db: Session,
+    tmp_path: Path,
+) -> None:
+    """Artifact blob出现第二目录项时下载必须fail closed，不能把外部hardlink当受管副本。"""
+
+    owner, _, instance, node, _ = _facts(db)
+    service = ArtifactService(db, storage_root=tmp_path / "artifacts")
+    artifact, _ = service.register(
+        instance=instance,
+        source_node=node,
+        artifact_key="hardlink-report",
+        filename="hardlink-report.md",
+        mime_type="text/markdown",
+        data=b"sensitive artifact",
+    )
+    outside_link = tmp_path / "outside-artifact-link"
+    outside_link.hardlink_to((tmp_path / "artifacts") / artifact.storage_locator)
+
+    with pytest.raises(ArtifactAccessDenied, match="ARTIFACT_NOT_FOUND"):
+        service.resolve(
+            artifact.id,
+            tenant_id=instance.tenant_id,
+            actor_user_id=owner.id,
+        )
+
+    assert outside_link.read_bytes() == b"sensitive artifact"

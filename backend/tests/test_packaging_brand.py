@@ -65,6 +65,7 @@ def test_macos_build_aligns_dependencies_and_smoke_tests_signed_app() -> None:
     pyproject = (ROOT / "backend/pyproject.toml").read_text(encoding="utf-8")
 
     assert '"cryptography>=42.0.0,<49.0.0"' in pyproject
+    assert '"pillow>=10.4.0,<13.0.0"' in pyproject
     assert 'pip install $DEPS "pyinstaller>=6.6.0"' in build_script
     assert 'bash packaging/smoke_macos_app.sh "$APP"' in build_script
     assert "GONGGE_XUBAN_HEADLESS=1" in smoke_script
@@ -78,3 +79,16 @@ def test_macos_build_aligns_dependencies_and_smoke_tests_signed_app() -> None:
         ["bash", "-n", str(PACKAGING / "smoke_macos_app.sh")],
         check=True,
     )
+
+
+def test_bundled_runtime_preloads_attachment_parser_dependencies() -> None:
+    """随包Python必须包含PDF、Office与图片parser依赖，禁止开发态通过而安装包失效。"""
+
+    fetch_script = (PACKAGING / "fetch_runtime_python.py").read_text(encoding="utf-8")
+    linux_script = (PACKAGING / "build_linux.sh").read_text(encoding="utf-8")
+
+    for package in ("python-docx", "openpyxl", "pypdf", "pillow"):
+        assert f'"{package}"' in fetch_script
+    assert "import ssl, requests, docx, openpyxl, pypdf, PIL" in fetch_script
+    assert 'import requests, docx, openpyxl, pypdf, PIL' in linux_script
+    assert "libsframe1" in linux_script

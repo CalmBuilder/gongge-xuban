@@ -21,7 +21,16 @@ BACKEND_DIR = ROOT_DIR / "backend"
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from app.config import Settings
+
+def _load_settings_class():
+    """在补入 backend 模块路径后加载统一配置类，保持脚本直接启动兼容性。"""
+
+    from app.config import Settings
+
+    return Settings
+
+
+Settings = _load_settings_class()
 
 
 RUN_DIR = ROOT_DIR / ".dev"

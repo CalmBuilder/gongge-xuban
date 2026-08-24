@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Callable
+from pathlib import Path
 
 import pytest
-from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from app.config import get_settings
@@ -44,10 +45,11 @@ from app.sop_runtime.execution_store import (
 class _TwoPhasePlanningClient:
     """先从无正文目录选择 Skill，再要求全文实际进入计划模型。"""
 
-    def __init__(self) -> None:
+    def __init__(self, *, on_plan: Callable[[], None] | None = None) -> None:
         """初始化两阶段 payload 记录。"""
 
         self.calls: list[dict[str, object]] = []
+        self.on_plan = on_plan
 
     def generate_json(self, system_prompt: str, user_payload: dict) -> dict:
         """按 payload 阶段返回选择或引用固定指导的收敛计划。"""
@@ -59,15 +61,54 @@ class _TwoPhasePlanningClient:
                 "selected_skill_names": ["diagnosing-bugs"],
                 "reason": "任务需要先复现再提出可证伪假设",
             }
-        assert "S4-DIAGNOSE-FULL-INSTRUCTIONS" in str(user_payload["loaded_guidance"])
+        if "candidate_options" in user_payload:
+            candidates = user_payload["candidate_options"]
+            requirements = user_payload.get("requirements", [])
+            identities = []
+            if isinstance(candidates, list) and isinstance(requirements, list):
+                for requirement in requirements:
+                    if not isinstance(requirement, dict):
+                        continue
+                    principle = str(requirement.get("principle") or "").strip()
+                    candidate_index = next(
+                        (
+                            index for index, candidate in enumerate(candidates)
+                            if isinstance(candidate, dict)
+                            and str(candidate.get("principle") or "").strip() == principle
+                        ),
+                        None,
+                    )
+                    if candidate_index is not None:
+                        identities.append({
+                            "index": requirement.get("index"),
+                            "candidate_index": candidate_index,
+                        })
+            return {"identities": identities}
+        assert "S4-DIAGNOSE-FULL-INSTRUCTIONS" not in str(user_payload["loaded_guidance"])
+        assert "S4-DIAGNOSE-FULL-INSTRUCTIONS" in str(
+            user_payload["guidance_principle_candidates"]
+        )
         assert "先称呼我为张工" in str(user_payload["memory_context"])
         assert "memory-secret-must-not-leak" not in str(user_payload)
+        if self.on_plan is not None:
+            self.on_plan()
         return {
             "goal": "模型不得改写目标",
             "success_criteria": [
                 {"id": "model_placeholder", "type": "assertion", "spec": {}}
             ],
             "constraints": ["先复现再修复"],
+            "guidance_requirements": [
+                {
+                    "skill_ref": "diagnosing-bugs",
+                    "source_kind": "instructions",
+                    "source_ref": "instructions",
+                    "principle": "先复现再形成假设",
+                    "task_mapping": "先复现记忆缺失，再形成可证伪假设",
+                    "observable_acceptance": "诊断计划同时列出复现步骤和假设验证",
+                    "disposition": "apply",
+                }
+            ],
             "steps": [
                 {
                     "draft_id": "answer",
@@ -125,13 +166,13 @@ def _checksum(value: object) -> str:
 
 def test_dynamic_task_selects_loads_and_freezes_guidance_use(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    """动态计划只在选择后看全文，并把固定 Use/修订链接到 Execution 与 PlanRevision。"""
+    """规划期间允许独立写库，模型返回后再固定 Skill Use 与 PlanRevision。"""
 
     engine = create_engine(
-        "sqlite://",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
+        f"sqlite:///{tmp_path / 'dynamic-skill-planning.db'}",
+        connect_args={"check_same_thread": False, "timeout": 1},
     )
     SQLModel.metadata.create_all(engine)
     with Session(engine, expire_on_commit=False) as db:
@@ -237,63 +278,85 @@ def test_dynamic_task_selects_loads_and_freezes_guidance_use(
         db.commit()
         settings = get_settings()
         monkeypatch.setattr(settings, "general_skill_resolver_v2_enabled", True)
-        client = _TwoPhasePlanningClient()
+        def write_during_plan() -> None:
+            """从独立会话提交事件，证明真实规划等待期间不存在 SQLite 写锁。"""
+
+            with Session(engine) as contender:
+                contender.add(
+                    AgentEvent(
+                        tenant_id=tenant.id,
+                        session_id=chat.id,
+                        event_type="planning_concurrent_write_probe",
+                        payload_json={},
+                    )
+                )
+                contender.commit()
+
+        client = _TwoPhasePlanningClient(on_plan=write_during_plan)
 
         dynamic = DynamicTaskAgent(db, planner=DynamicTaskPlanner(client))
-        with db.begin_nested():
-            instance, created = dynamic.start_task(
-                tenant_id=tenant.id,
-                session_id=chat.id,
-                agent_id=agent.id,
-                initiator_user_id=user.id,
-                goal="诊断并修复记忆缺失问题",
-                success_criteria=("形成可验证诊断计划",),
-                model_config=model,
-                source_ref="msg_s4_dynamic",
-                memory_context=(
-                    {
-                        "kind": "profile",
-                        "content": "先称呼我为张工",
-                        "metadata": {
-                            "preference": "formal",
-                            "secret": "memory-secret-must-not-leak",
-                        },
+        instance, created = dynamic.start_task(
+            tenant_id=tenant.id,
+            session_id=chat.id,
+            agent_id=agent.id,
+            initiator_user_id=user.id,
+            goal="诊断并修复记忆缺失问题",
+            success_criteria=("形成可验证诊断计划",),
+            model_config=model,
+            source_ref="msg_s4_dynamic",
+            memory_context=(
+                {
+                    "kind": "profile",
+                    "content": "先称呼我为张工",
+                    "metadata": {
+                        "preference": "formal",
+                        "secret": "memory-secret-must-not-leak",
                     },
-                ),
-            )
+                },
+            ),
+        )
         assert created is True
-        assert len(client.calls) == 2
+        # 选择目录、生成计划后，宿主还会为缺少稳定 candidate ID 的旧式 mock
+        # 发起一次有界 identity repair；这仍然属于同一 PlanRevision，不是第二套 Runtime。
+        assert len(client.calls) == 3
+        assert "candidate_options" in client.calls[2]
         use = db.exec(select(GeneralSkillUse)).one()
         assert use.revision_id == revision.id
         assert use.execution_id == instance.id
         plan_revision = db.exec(select(ExecutionPlanRevision)).one()
         assert plan_revision.plan_json["steps"][0]["guidance_skill_use_ids"] == [use.id]
+        assert plan_revision.plan_json["guidance_requirements"][0]["skill_use_id"] == use.id
         assert "skill_markdown" not in str(instance.capability_snapshot_json["general_skills"])
         loaded_event = db.exec(
             select(AgentEvent).where(AgentEvent.event_type == "skill_loaded")
         ).one()
         assert loaded_event.payload_json["consumer"] == "dynamic_task"
-        with db.begin_nested():
-            replayed, replay_created = dynamic.start_task(
-                tenant_id=tenant.id,
-                session_id=chat.id,
-                agent_id=agent.id,
-                initiator_user_id=user.id,
-                goal="诊断并修复记忆缺失问题",
-                success_criteria=("形成可验证诊断计划",),
-                model_config=model,
-                source_ref="msg_s4_dynamic",
-                memory_context=(
-                    {
-                        "kind": "profile",
-                        "content": "先称呼我为张工",
-                        "metadata": {"preference": "formal"},
-                    },
-                ),
+        assert db.exec(
+            select(AgentEvent).where(
+                AgentEvent.session_id == chat.id,
+                AgentEvent.event_type == "planning_concurrent_write_probe",
             )
+        ).one()
+        replayed, replay_created = dynamic.start_task(
+            tenant_id=tenant.id,
+            session_id=chat.id,
+            agent_id=agent.id,
+            initiator_user_id=user.id,
+            goal="诊断并修复记忆缺失问题",
+            success_criteria=("形成可验证诊断计划",),
+            model_config=model,
+            source_ref="msg_s4_dynamic",
+            memory_context=(
+                {
+                    "kind": "profile",
+                    "content": "先称呼我为张工",
+                    "metadata": {"preference": "formal"},
+                },
+            ),
+        )
         assert replayed.id == instance.id
         assert replay_created is False
-        assert len(client.calls) == 2
+        assert len(client.calls) == 3
         assert len(db.exec(select(GeneralSkillUse)).all()) == 1
         assert len(
             db.exec(select(AgentEvent).where(AgentEvent.event_type == "skill_loaded")).all()

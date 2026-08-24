@@ -5,7 +5,11 @@ from fastapi import HTTPException
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from app.agents.branching import ensure_open_gallery_binding, ensure_private_resource_binding
+from app.agents.branching import (
+    ensure_open_gallery_binding,
+    ensure_private_resource_binding,
+    model_for_agent,
+)
 from app.agents.schema import (
     AgentGalleryPublicationRequest,
     AgentModelBindingInput,
@@ -41,6 +45,7 @@ from app.db.models import (
     GeneralSkill,
     ManagementAuditLog,
     Message,
+    ModelConfig,
     OrganizationUnit,
     Tenant,
     Tool,
@@ -54,6 +59,31 @@ from app.security.permissions import (
 )
 from app.organization.reference_data import ensure_agent_category_catalog
 from app.tools.tool_schema import ToolCreateRequest, ToolUpdateRequest
+
+
+def test_database_default_model_is_authoritative_over_demo_seed_environment(monkeypatch) -> None:
+    """验证正常运行时以管理端数据库默认模型为准，不回退到`.env`初始密钥。"""
+
+    monkeypatch.setenv("DEMO_MODEL_API_KEY", "stale-seed-key-must-not-win")
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_model_priority", name="模型优先级租户"))
+        configured = ModelConfig(
+            id="model_database_authoritative",
+            tenant_id="tenant_model_priority",
+            name="管理端默认模型",
+            api_key_encrypted="database-managed-ciphertext",
+            model="database-model",
+            is_default=True,
+            enabled=True,
+        )
+        db.add(configured)
+        db.commit()
+
+        resolved = model_for_agent(db, "tenant_model_priority", None)
+
+        assert resolved is not None
+        assert resolved.id == configured.id
+        assert resolved.model == "database-model"
 
 
 def test_only_owner_can_update_and_delete_agent_while_admin_is_governance_only() -> None:

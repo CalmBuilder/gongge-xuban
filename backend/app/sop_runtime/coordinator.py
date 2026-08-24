@@ -19,7 +19,14 @@ from app.config import get_settings
 from app.db.models import (
     AgentEvent,
     ChatSession,
+    ExecutionArtifact,
+    InputDocumentElement,
+    InputResourceSnapshot,
     Message,
+    ManagedInputResource,
+    MessageInputBindingLink,
+    MessageInputResourceLink,
+    SelectedResourceExtraction,
     Skill,
     SkillVersion,
     SopInstance,
@@ -29,11 +36,14 @@ from app.db.models import (
     SopWorkItem,
     Tool,
 )
+from app.dynamic_tasks.artifact_renderer import ArtifactRenderError, ArtifactRendererService
 from app.dynamic_tasks.capability_catalog import (
     ToolReliabilityContract,
     published_tool_snapshot,
 )
 from app.session.session_schema import KnowledgeQuery, StepAgentResult
+from app.session.input_bindings import InputBindingError
+from app.session.input_runtime import TurnInputRuntimeService
 from app.sop_runtime.capabilities import DEFAULT_CAPABILITY_REGISTRY
 from app.sop_runtime.definition import CollectInputNode, HumanTaskNode
 from app.sop_runtime.execution_store import (
@@ -363,7 +373,7 @@ class DeterministicSopCoordinator:
                 }
             }
         )
-        instance, _ = self.store.start_instance(
+        instance, instance_created = self.store.start_instance(
             tenant_id=chat_session.tenant_id,
             session_id=chat_session.id,
             skill_id=skill.skill_id,
@@ -371,13 +381,39 @@ class DeterministicSopCoordinator:
             skill_version=version.version,
             definition_checksum=definition.checksum,
             start_node_id=definition.start_node_id,
+            initiator_user_id=chat_session.user_id,
+            agent_id=chat_session.agent_id,
             slots=identity_resolution.slots,
             context={"identity": identity_resolution.audit_context}
             if identity_resolution.audit_context
             else None,
         )
+        source_message_id = self._latest_user_message_id(chat_session)
         with self._owned(instance):
+            if instance_created:
+                instance.source_kind = "chat"
+                instance.source_ref = source_message_id
+                self.db.add(instance)
+                self.db.add(
+                    AgentEvent(
+                        tenant_id=instance.tenant_id,
+                        session_id=instance.session_id,
+                        event_type="sop_execution_started",
+                        payload_json={
+                            "execution_id": instance.id,
+                            "skill_id": instance.skill_id,
+                            "skill_version_id": instance.skill_version_id,
+                            "definition_checksum": instance.definition_checksum,
+                            "source_message_id": source_message_id,
+                        },
+                    )
+                )
             instance.slots_json = dict(identity_resolution.slots)
+            self._bind_attachment_slots(
+                instance,
+                definition,
+                source_message_id=source_message_id,
+            )
             if identity_resolution.audit_context:
                 instance.context_json = {
                     **(instance.context_json or {}),
@@ -1076,6 +1112,14 @@ class DeterministicSopCoordinator:
                         }
                     )
                 return plan
+            if plan.action is RuntimeAction.CALL_BUILTIN_INPUT and plan.operation_name:
+                return self._execute_builtin_input(
+                    chat_session,
+                    instance,
+                    current_execution,
+                    definition,
+                    plan,
+                )
             if plan.action is RuntimeAction.CALL_TOOL and plan.operation_name:
                 capability_snapshot, capability_snapshot_checksum, idempotency_policy = (
                     self._operation_capability_contract(
@@ -1151,6 +1195,7 @@ class DeterministicSopCoordinator:
                     error_code="RUNTIME_OPERATION_CANCELLED",
                 )
             if plan.action is RuntimeAction.COMPLETE:
+                self._render_declared_artifacts(instance, current_execution)
                 if not already_completed and current_execution.status == "running":
                     self.store.complete_node(
                         instance,
@@ -1161,6 +1206,91 @@ class DeterministicSopCoordinator:
                     self.store.complete_instance(instance, slots=instance.slots_json)
                 return plan
             return plan
+
+    def _render_declared_artifacts(
+        self,
+        instance: SopInstance,
+        source_node: SopNodeExecution,
+    ) -> list[ExecutionArtifact]:
+        """为正式SOP声明的交付物冻结结果并生成可恢复Artifact，重放保持幂等。"""
+
+        version = self.db.get(SkillVersion, instance.skill_version_id)
+        declarations = (
+            (version.content_json or {}).get("expected_artifacts")
+            if version is not None and version.tenant_id == instance.tenant_id
+            else None
+        )
+        if not isinstance(declarations, list) or not declarations:
+            return []
+        from app.sop_runtime.execution_control import ExecutionControlService
+
+        markdown = self._formal_sop_report_markdown(instance)
+        result_body = {
+            "status": "succeeded",
+            "slots": dict(instance.slots_json or {}),
+            "node_outputs": self._node_outputs(instance),
+            "markdown": markdown,
+        }
+        result_row, _ = ExecutionControlService(self.db, self.store).ensure_terminal_result(
+            instance,
+            target_status="succeeded",
+            result=result_body,
+            verification={"passed": True, "source": "formal_sop_runtime"},
+        )
+        input_snapshot_ids = tuple(
+            row.id
+            for row in self.db.exec(
+                select(InputResourceSnapshot).where(
+                    InputResourceSnapshot.tenant_id == instance.tenant_id,
+                    InputResourceSnapshot.execution_id == instance.id,
+                )
+            ).all()
+        )
+        renderer = ArtifactRendererService(self.db)
+        worker_id = f"sop-renderer:{instance.id}"
+        artifacts: list[ExecutionArtifact] = []
+        for raw in declarations:
+            if not isinstance(raw, Mapping):
+                continue
+            if str(raw.get("content_source") or "result.markdown") != "result.markdown":
+                if raw.get("required", True) is True:
+                    raise ArtifactRenderError("ARTIFACT_RENDER_SOURCE_UNSUPPORTED")
+                continue
+            job, _ = renderer.ensure_job(
+                instance=instance,
+                result_id=result_row.id,
+                result_checksum=result_row.checksum,
+                source_node=source_node,
+                artifact_key=str(raw.get("artifact_key") or "").strip(),
+                filename=str(raw.get("filename") or "").strip(),
+                mime_type=str(raw.get("mime_type") or "").strip(),
+                required=raw.get("required", True) is True,
+            )
+            if job.status != "ready":
+                renderer.claim(job, worker_id=worker_id)
+                artifact = renderer.render_and_publish(
+                    job,
+                    markdown=markdown,
+                    worker_id=worker_id,
+                    fencing_token=job.fencing_token,
+                    input_snapshot_ids=input_snapshot_ids,
+                )
+            elif job.artifact_id:
+                artifact = self.db.get(ExecutionArtifact, job.artifact_id)
+                if artifact is None:
+                    raise ArtifactRenderError("ARTIFACT_RENDER_ARTIFACT_MISSING")
+            else:
+                raise ArtifactRenderError("ARTIFACT_RENDER_JOB_INVALID")
+            artifacts.append(artifact)
+        return artifacts
+
+    def _formal_sop_report_markdown(self, instance: SopInstance) -> str:
+        """把确定性节点回执投影为不含公式和外链的稳定报告正文。"""
+
+        lines = ["# 附件分析报告", "", f"执行编号：{instance.id}"]
+        for result_key, raw in sorted(self._node_outputs(instance).items()):
+            lines.extend(("", f"## {result_key}", str(raw)))
+        return "\n".join(lines)
 
     @staticmethod
     def merge_plan(model_result: StepAgentResult, plan: RuntimePlan) -> StepAgentResult:
@@ -1213,6 +1343,16 @@ class DeterministicSopCoordinator:
                 if plan.control_reply
                 else result
             )
+        if plan.action is RuntimeAction.CALL_BUILTIN_INPUT:
+            return model_result.model_copy(
+                update={
+                    "action": "reply",
+                    "reply": "正在按已发布SOP读取并核验附件。",
+                    "tool_call": None,
+                    "next_step_id": None,
+                    "is_step_completed": False,
+                }
+            ).mark_runtime_control_reply("BUILTIN_INPUT_RUNNING")
         if plan.action is RuntimeAction.WAIT_WORK_ITEM:
             result = model_result.model_copy(
                 update={
@@ -1257,6 +1397,234 @@ class DeterministicSopCoordinator:
             )
         return model_result
 
+    def _latest_user_message_id(self, chat_session: ChatSession) -> str | None:
+        """返回当前会话最新权威用户消息，SOP附件只能从其MessageLink绑定。"""
+
+        message = self.db.exec(
+            select(Message)
+            .where(
+                Message.tenant_id == chat_session.tenant_id,
+                Message.session_id == chat_session.id,
+                Message.role == "user",
+            )
+            .order_by(Message.created_at.desc(), Message.id.desc())
+        ).first()
+        return message.id if message is not None else None
+
+    def _bind_attachment_slots(self, instance: SopInstance, definition, *, source_message_id: str | None) -> None:
+        """按发布槽位格式和顺序冻结消息附件，缺失槽位保持现有WAIT_INPUT语义。"""
+
+        slots = [
+            slot
+            for node in definition.nodes
+            if isinstance(node, CollectInputNode)
+            for slot in node.config.attachment_slots
+        ]
+        if not slots or source_message_id is None:
+            return
+        links = list(
+            self.db.exec(
+                select(MessageInputResourceLink)
+                .where(
+                    MessageInputResourceLink.tenant_id == instance.tenant_id,
+                    MessageInputResourceLink.session_id == instance.session_id,
+                    MessageInputResourceLink.message_id == source_message_id,
+                )
+                .order_by(MessageInputResourceLink.ordinal)
+            ).all()
+        )
+        available = list(links)
+        resolved_slots = dict(instance.slots_json or {})
+        for slot in slots:
+            existing = self.db.exec(
+                select(MessageInputBindingLink)
+                .where(
+                    MessageInputBindingLink.tenant_id == instance.tenant_id,
+                    MessageInputBindingLink.execution_id == instance.id,
+                    MessageInputBindingLink.slot_key == slot.slot_key,
+                )
+                .order_by(MessageInputBindingLink.ordinal)
+            ).all()
+            if existing:
+                resolved_slots[slot.slot_key] = [item.input_snapshot_id for item in existing]
+                continue
+            matching = []
+            for link in list(available):
+                resource = self.db.get(ManagedInputResource, link.resource_id)
+                file_format = _attachment_format(resource.filename if resource else "")
+                if (
+                    resource is not None
+                    and file_format in slot.allowed_formats
+                    and self._resource_matches_required_columns(resource, slot.required_columns)
+                ):
+                    matching.append((link, resource))
+                    available.remove(link)
+                    if len(matching) >= slot.max_count:
+                        break
+            if len(matching) < slot.min_count:
+                continue
+            snapshot_ids: list[str] = []
+            snapshot_handles: list[str] = []
+            for ordinal, (link, resource) in enumerate(matching):
+                snapshot, _ = self.store.snapshot_input_resource(
+                    instance,
+                    resource,
+                    source_message_id=source_message_id,
+                )
+                self.db.add(
+                    MessageInputBindingLink(
+                        tenant_id=instance.tenant_id,
+                        execution_id=instance.id,
+                        definition_checksum=instance.definition_checksum or "",
+                        slot_key=slot.slot_key,
+                        ordinal=ordinal,
+                        message_resource_link_id=link.id,
+                        input_snapshot_id=snapshot.id,
+                    )
+                )
+                snapshot_ids.append(snapshot.id)
+                if snapshot.opaque_handle:
+                    snapshot_handles.append(snapshot.opaque_handle)
+            resolved_slots[slot.slot_key] = snapshot_handles
+        instance.slots_json = resolved_slots
+        self.db.add(instance)
+        self.db.flush()
+
+    def _resource_matches_required_columns(
+        self,
+        resource: ManagedInputResource,
+        required_columns: tuple[str, ...],
+    ) -> bool:
+        """按当前发布Extraction表头验证typed slot关键列，缺失时保持WAIT_INPUT。"""
+
+        if not required_columns:
+            return True
+        selected = self.db.exec(
+            select(SelectedResourceExtraction).where(
+                SelectedResourceExtraction.tenant_id == resource.tenant_id,
+                SelectedResourceExtraction.resource_id == resource.id,
+                SelectedResourceExtraction.resource_version == resource.version,
+                SelectedResourceExtraction.profile_key == "default",
+            )
+        ).first()
+        if selected is None:
+            return False
+        required = {column.strip().casefold() for column in required_columns}
+        elements = self.db.exec(
+            select(InputDocumentElement).where(
+                InputDocumentElement.tenant_id == resource.tenant_id,
+                InputDocumentElement.extraction_id == selected.extraction_id,
+                InputDocumentElement.element_type == "table",
+            )
+        ).all()
+        return any(
+            required
+            <= {
+                str(column).strip().casefold()
+                for column in (element.table_json or {}).get("columns", [])
+            }
+            for element in elements
+        )
+
+    def _execute_builtin_input(
+        self,
+        chat_session: ChatSession,
+        instance: SopInstance,
+        execution: SopNodeExecution,
+        definition,
+        plan: RuntimePlan,
+    ) -> RuntimePlan:
+        """在同一Execution内执行本地input能力并持久化Operation/Attempt，零模型外发。"""
+
+        operation, _ = self.store.prepare_operation(
+            instance,
+            execution,
+            operation_name=plan.operation_name or "input.read",
+            request=plan.operation_arguments,
+            effect_kind="read",
+            idempotency_policy=IdempotencyPolicy(),
+            capability_snapshot={"type": "builtin_input", "name": plan.operation_name},
+            capability_snapshot_checksum=None,
+        )
+        if operation.status == "prepared":
+            self.store.start_operation(operation)
+        try:
+            result = self._invoke_builtin_input(instance, plan)
+        except InputBindingError as exc:
+            self.store.finish_operation(operation, succeeded=False, error={"code": exc.code})
+            self.store.fail_node(instance, execution, error={"code": exc.code})
+            self.store.fail_instance(instance, context_patch={"input_error": exc.code})
+            return RuntimePlan(action=RuntimeAction.FAIL, node_id=execution.node_id, error_code=exc.code)
+        self.store.finish_operation(operation, succeeded=True, result=result)
+        outputs = self._node_outputs(instance)
+        outputs[str(plan.result_key)] = {
+            "status": "succeeded",
+            "data": result,
+            "operation_id": operation.id,
+        }
+        instance.context_json = {**(instance.context_json or {}), "node_outputs": outputs}
+        self.store.complete_node(instance, execution, output={"node_output": outputs[str(plan.result_key)]})
+        return self._advance_until_external_action(
+            chat_session,
+            instance,
+            execution,
+            definition,
+            current_already_completed=True,
+        )
+
+    def _invoke_builtin_input(self, instance: SopInstance, plan: RuntimePlan) -> dict[str, object]:
+        """把已冻结SOP snapshot映射为不透明handle并调用共享Runtime。"""
+
+        handles = plan.operation_arguments.get("snapshot_handles")
+        if isinstance(handles, str):
+            handles = [handles]
+        if not isinstance(handles, list) or not handles:
+            raise InputBindingError("ATTACHMENT_HANDLE_REQUIRED")
+        runtime = TurnInputRuntimeService(self.db)
+        payloads = []
+        for handle in handles:
+            operation_name = plan.operation_name or "input.read"
+            if operation_name == "input.read":
+                payload = runtime.read_execution(
+                    str(handle),
+                    tenant_id=instance.tenant_id,
+                    execution_id=instance.id,
+                )
+            elif operation_name == "input.search":
+                payload = runtime.search_execution(
+                    str(handle),
+                    tenant_id=instance.tenant_id,
+                    execution_id=instance.id,
+                    query=str(plan.operation_arguments.get("query") or ""),
+                )
+            elif operation_name == "input.table_profile":
+                payload = runtime.table_profile_execution(
+                    str(handle),
+                    tenant_id=instance.tenant_id,
+                    execution_id=instance.id,
+                )
+            elif operation_name == "table.compute":
+                compute_ast = plan.operation_arguments.get("operation")
+                if not isinstance(compute_ast, dict):
+                    raise InputBindingError("ATTACHMENT_COMPUTE_AST_INVALID")
+                if compute_ast.get("op") == "verify_formula" and "element_id" not in compute_ast:
+                    payload = runtime.table_compute_published_sop(
+                        str(handle),
+                        tenant_id=instance.tenant_id,
+                        execution_id=instance.id,
+                        operation=compute_ast,
+                    )
+                else:
+                    payload = runtime.table_compute_execution(
+                        str(handle),
+                        tenant_id=instance.tenant_id,
+                        execution_id=instance.id,
+                        operation=compute_ast,
+                    )
+            else:
+                raise InputBindingError("ATTACHMENT_BUILTIN_OPERATION_INVALID")
+            payloads.append(payload)
+        return {"items": payloads, "provider_dispatch_receipts": 0}
     def remote_idempotency_key_for(
         self,
         chat_session: ChatSession,
@@ -1583,3 +1951,10 @@ class DeterministicSopCoordinator:
         if isinstance(identity, Mapping) and identity:
             snapshot["identity"] = dict(identity)
         return snapshot
+
+
+def _attachment_format(filename: str) -> str:
+    """把受管文件扩展名映射为发布期附件格式枚举。"""
+
+    suffix = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    return "image" if suffix in {"png", "jpg", "jpeg", "webp", "gif"} else suffix

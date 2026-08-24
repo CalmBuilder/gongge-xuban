@@ -9,6 +9,8 @@
 from __future__ import annotations
 
 from enum import StrEnum
+import math
+import re
 from typing import Annotated, Literal, TypeAlias
 
 from pydantic import Field, model_validator
@@ -38,6 +40,7 @@ class ServiceTaskKind(StrEnum):
     TOOL = "tool"
     KNOWLEDGE = "knowledge"
     RESPONSE = "response"
+    BUILTIN_INPUT = "builtin_input"
 
 
 class HumanTaskKind(StrEnum):
@@ -151,6 +154,37 @@ class ExplicitConfirmationPolicy(RuntimeContract):
         return self
 
 
+class AttachmentInputSlot(RuntimeContract):
+    """发布期冻结正式 SOP 一个附件槽位的格式、基数和解析策略。"""
+
+    slot_key: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
+    allowed_formats: tuple[
+        Literal["pdf", "docx", "pptx", "xlsx", "csv", "image"], ...
+    ] = Field(min_length=1)
+    min_count: int = Field(default=1, ge=0, le=8)
+    max_count: int = Field(default=1, ge=1, le=8)
+    parser_profile: str = Field(default="default", pattern=r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
+    source_link_policy: Literal["same_turn", "same_session_explicit"] = "same_turn"
+    required_columns: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_attachment_count(self) -> "AttachmentInputSlot":
+        """拒绝倒置基数及重复格式，避免运行时猜测文件分配。"""
+
+        if self.min_count > self.max_count:
+            raise ValueError("attachment slot min_count must not exceed max_count")
+        if len(set(self.allowed_formats)) != len(self.allowed_formats):
+            raise ValueError("attachment slot allowed_formats must be unique")
+        normalized_columns = tuple(column.strip().casefold() for column in self.required_columns)
+        if any(not column or len(column) > 128 for column in normalized_columns):
+            raise ValueError("attachment slot required_columns must be non-empty and bounded")
+        if len(set(normalized_columns)) != len(normalized_columns):
+            raise ValueError("attachment slot required_columns must be unique")
+        if self.required_columns and not set(self.allowed_formats).intersection({"csv", "xlsx"}):
+            raise ValueError("attachment slot required_columns require csv or xlsx format")
+        return self
+
+
 class CollectInputConfig(RuntimeContract):
     """收集用户输入节点的规范配置。"""
 
@@ -159,6 +193,23 @@ class CollectInputConfig(RuntimeContract):
     input_bindings: dict[str, AuthenticatedInputBinding] = Field(default_factory=dict)
     value_aliases: dict[str, dict[str, str]] = Field(default_factory=dict)
     confirmation_policy: ExplicitConfirmationPolicy | None = None
+    attachment_slots: tuple[AttachmentInputSlot, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_attachment_slots(self) -> "CollectInputConfig":
+        """要求附件槽位身份唯一并纳入required_inputs，保持既有等待输入语义。"""
+
+        keys = [item.slot_key for item in self.attachment_slots]
+        if len(keys) != len(set(keys)):
+            raise ValueError("attachment slot keys must be unique")
+        missing = {
+            item.slot_key
+            for item in self.attachment_slots
+            if item.min_count > 0 and item.slot_key not in self.required_inputs
+        }
+        if missing:
+            raise ValueError("required attachment slots must be declared in required_inputs")
+        return self
 
 
 class DecisionConfig(RuntimeContract):
@@ -185,6 +236,13 @@ class ServiceTaskConfig(RuntimeContract):
     input_mapping: dict[str, str] = Field(default_factory=dict)
     result_key: str | None = Field(default=None, pattern=r"^[A-Za-z][A-Za-z0-9_]*$")
     knowledge_query: KnowledgeTaskConfig | None = None
+    builtin_operation: Literal[
+        "input.read",
+        "input.search",
+        "input.table_profile",
+        "table.compute",
+    ] | None = None
+    compute_ast: dict[str, object] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_kind_specific_config(self) -> "ServiceTaskConfig":
@@ -192,7 +250,60 @@ class ServiceTaskConfig(RuntimeContract):
 
         if self.kind is not ServiceTaskKind.KNOWLEDGE and self.knowledge_query is not None:
             raise ValueError("knowledge_query config is only valid for knowledge service tasks")
+        if self.kind is ServiceTaskKind.BUILTIN_INPUT:
+            if self.builtin_operation is None or not self.result_key:
+                raise ValueError("builtin input service requires operation and result_key")
+            if self.builtin_operation == "table.compute":
+                _validate_published_compute_ast(self.compute_ast)
+            elif self.compute_ast:
+                raise ValueError("compute_ast is only valid for table.compute")
+        elif self.builtin_operation is not None or self.compute_ast:
+            raise ValueError("builtin input config is only valid for builtin input tasks")
         return self
+
+
+def _validate_published_compute_ast(operation: dict[str, object]) -> None:
+    """在SOP发布期冻结table.compute白名单，拒绝运行期ID和未知计算语义。"""
+
+    op = operation.get("op")
+    if op == "verify_formula":
+        if set(operation) != {"op", "sheet_name", "cell"}:
+            raise ValueError("verify_formula requires exact sheet_name and cell")
+        sheet_name = operation.get("sheet_name")
+        cell = operation.get("cell")
+        if type(sheet_name) is not str or not sheet_name.strip() or len(sheet_name) > 128:
+            raise ValueError("verify_formula sheet_name is required")
+        if type(cell) is not str or re.fullmatch(r"[A-Za-z]{1,3}[1-9]\d*", cell) is None:
+            raise ValueError("verify_formula cell must be an A1 reference")
+        return
+    aggregate = operation.get("aggregate")
+    if aggregate not in {"count", "sum", "avg"}:
+        raise ValueError("table.compute aggregate is unsupported")
+    allowed = {"aggregate", "filter"} if aggregate == "count" else {
+        "aggregate",
+        "column",
+        "filter",
+    }
+    if set(operation) - allowed:
+        raise ValueError("table.compute contains unsupported fields")
+    column = operation.get("column")
+    if aggregate in {"sum", "avg"} and (type(column) is not str or not column.strip()):
+        raise ValueError("table.compute numeric aggregate requires column")
+    filter_spec = operation.get("filter")
+    if filter_spec is not None:
+        if (
+            not isinstance(filter_spec, dict)
+            or set(filter_spec) != {"op", "column", "value"}
+            or filter_spec.get("op") != "eq"
+            or type(filter_spec.get("column")) is not str
+            or not filter_spec["column"].strip()
+            or type(filter_spec.get("value")) not in {type(None), str, bool, int, float}
+            or (
+                type(filter_spec.get("value")) is float
+                and not math.isfinite(filter_spec["value"])
+            )
+        ):
+            raise ValueError("table.compute filter must be an exact eq predicate")
 
 
 class WorkItemOutcomeOption(RuntimeContract):

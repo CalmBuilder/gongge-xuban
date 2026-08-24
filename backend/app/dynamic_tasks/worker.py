@@ -495,6 +495,12 @@ def _is_terminal_signal_error(code: str) -> bool:
     return code in {
         "GENERAL_SKILL_COUNTERMANDED",
         "DYNAMIC_RESULT_REPAIR_EXHAUSTED",
+        # 最终 answer 的 schema/verification 在同一执行内只允许一次有界 repair；
+        # repair 仍失败时必须像预算错误一样终结 signal，不能把模型自相矛盾
+        # 的结果当作瞬时网络故障无限退避，导致 Execution 长时间停留 running。
+        "DYNAMIC_RESULT_SCHEMA_INVALID",
+        "DYNAMIC_RESULT_VERIFICATION_FAILED",
+        "DYNAMIC_ACTION_PROPOSAL_INVALID",
         "DYNAMIC_STEP_BUDGET_EXHAUSTED",
         "DYNAMIC_RUNTIME_BUDGET_EXCEEDED",
         "DYNAMIC_INPUT_BUDGET_EXCEEDED",

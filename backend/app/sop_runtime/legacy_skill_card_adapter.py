@@ -28,6 +28,7 @@ from app.sop_runtime.condition_dsl import (
 )
 from app.sop_runtime.definition import (
     AuthenticatedInputBinding,
+    AttachmentInputSlot,
     CanonicalEdge,
     CanonicalNode,
     CompilationDiagnostic,
@@ -76,6 +77,7 @@ KNOWN_LEGACY_NODE_TYPES = frozenset(
         "knowledge_query",
         "tool_call",
         "service_task",
+        "builtin_input",
         "handoff",
         "human_task",
         "response",
@@ -356,6 +358,11 @@ def _compile_node(
                     diagnostics,
                     node_id=node.node_id,
                 ),
+                attachment_slots=_attachment_slots(
+                    node.metadata,
+                    diagnostics,
+                    node_id=node.node_id,
+                ),
             ),
         )
     if inferred_type is NodeType.DECISION:
@@ -411,6 +418,18 @@ def _compile_node(
         diagnostics,
         node_id=node.node_id,
     )
+    builtin_operation = None
+    compute_ast: dict[str, object] = {}
+    if service_kind is ServiceTaskKind.BUILTIN_INPUT:
+        declared = [
+            action.split(":", 1)[1]
+            for action in node.allowed_actions
+            if action.startswith("call_builtin_input:") and ":" in action
+        ]
+        builtin_operation = declared[0] if len(declared) == 1 else None
+        raw_compute = node.metadata.get("compute_ast")
+        if isinstance(raw_compute, Mapping):
+            compute_ast = dict(raw_compute)
     if service_kind is ServiceTaskKind.KNOWLEDGE and knowledge_query is not None and not result_key:
         diagnostics.append(
             _error(
@@ -433,6 +452,8 @@ def _compile_node(
             ),
             result_key=result_key,
             knowledge_query=knowledge_query if service_kind is ServiceTaskKind.KNOWLEDGE else None,
+            builtin_operation=builtin_operation,
+            compute_ast=compute_ast,
         ),
     )
 
@@ -452,9 +473,11 @@ def _canonical_node_type(
         return NodeType.TERMINAL
     if legacy_type == "decision":
         return NodeType.DECISION
-    if legacy_type in {"knowledge_query", "tool_call", "service_task"}:
+    if legacy_type in {"knowledge_query", "tool_call", "service_task", "builtin_input"}:
         return NodeType.SERVICE_TASK
-    if any(action.startswith("call_tool:") for action in actions) and not expected_inputs:
+    if any(
+        action.startswith(("call_tool:", "call_builtin_input:")) for action in actions
+    ) and not expected_inputs:
         return NodeType.SERVICE_TASK
     if legacy_type == "response" and not expected_inputs:
         return NodeType.SERVICE_TASK
@@ -468,6 +491,10 @@ def _service_capability(legacy_type: str, actions: tuple[str, ...]) -> tuple[Ser
 
     if legacy_type == "knowledge_query" or "knowledge_query" in actions:
         return ServiceTaskKind.KNOWLEDGE, "service.knowledge"
+    if legacy_type == "builtin_input" or any(
+        action.startswith("call_builtin_input:") for action in actions
+    ):
+        return ServiceTaskKind.BUILTIN_INPUT, "service.builtin_input"
     if legacy_type == "tool_call" or any(action.startswith("call_tool:") for action in actions):
         return ServiceTaskKind.TOOL, "service.tool"
     return ServiceTaskKind.RESPONSE, "service.response"
@@ -837,6 +864,31 @@ def _confirmation_policy(
             )
         )
         return None
+
+
+def _attachment_slots(
+    metadata: Mapping[str, Any],
+    diagnostics: list[CompilationDiagnostic],
+    *,
+    node_id: str,
+) -> tuple[AttachmentInputSlot, ...]:
+    """把旧图metadata中的结构化附件槽位编译到发布定义，拒绝自由文本猜测。"""
+
+    raw = metadata.get("attachment_slots")
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        diagnostics.append(_error("INVALID_ATTACHMENT_SLOTS", "附件槽位必须是数组。", node_id=node_id))
+        return ()
+    slots: list[AttachmentInputSlot] = []
+    for item in raw:
+        try:
+            slots.append(AttachmentInputSlot.model_validate(item))
+        except (ValidationError, ValueError, TypeError) as exc:
+            diagnostics.append(
+                _error("INVALID_ATTACHMENT_SLOT", f"附件槽位无效：{exc}", node_id=node_id)
+            )
+    return tuple(slots)
 
 
 def _operation_input_mapping(

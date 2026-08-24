@@ -22,6 +22,12 @@ KNOWLEDGE_RELATED_CONTENT_LIMIT = 4_800
 KNOWLEDGE_CONCEPT_LIMIT = 8
 KNOWLEDGE_DOCUMENT_LIMIT = 5
 RETRIEVED_KNOWLEDGE_LIMIT = 4
+ATTACHMENT_CONTEXT_MARKER = "\n\n上传附件上下文："
+CONTROL_ONLY_ATTACHMENT_KEYS = {
+    "current_turn_inputs",
+    "current_turn_input_read_receipt_ids",
+    "current_turn_input_turn_id",
+}
 
 
 def compact_knowledge_context(
@@ -49,24 +55,48 @@ def compact_conversation_context(
     *,
     token_budget: int = CONTROL_CONTEXT_TOKEN_BUDGET,
 ) -> dict[str, object]:
+    """投影控制阶段上下文，并阻止附件正文绕过Provider外发账本。"""
+
     if not isinstance(context, dict):
         return build_conversation_context([], token_budget)
-    turn_messages = context.setdefault(TURN_STAGE_MESSAGES_KEY, [])
-    messages = context.get("messages")
+    projected_context = {
+        key: value for key, value in context.items() if key not in CONTROL_ONLY_ATTACHMENT_KEYS
+    }
+    turn_messages = projected_context.setdefault(TURN_STAGE_MESSAGES_KEY, [])
+    messages = projected_context.get("messages")
     if not isinstance(messages, list):
-        context["messages"] = []
-        return context
-    metadata = context.get("metadata")
+        projected_context["messages"] = []
+        return projected_context
+    projected_context["messages"] = [_control_message(item) for item in messages]
+    metadata = projected_context.get("metadata")
     if (
         isinstance(metadata, dict)
         and int(metadata.get("estimated_tokens") or 0) <= token_budget
     ):
-        return context
+        return projected_context
     compacted = build_conversation_context(
-        [message for message in messages if isinstance(message, dict)], token_budget
+        [
+            message
+            for message in projected_context["messages"]
+            if isinstance(message, dict)
+        ],
+        token_budget,
     )
     compacted[TURN_STAGE_MESSAGES_KEY] = turn_messages
     return compacted
+
+
+def _control_message(value: object) -> object:
+    """从Router/Step/Reflection消息中剥离附件派生正文与原生图片。"""
+
+    if not isinstance(value, dict):
+        return value
+    projected = dict(value)
+    content = str(projected.get("content") or "")
+    if ATTACHMENT_CONTEXT_MARKER in content:
+        projected["content"] = content.split(ATTACHMENT_CONTEXT_MARKER, 1)[0]
+    projected.pop("images", None)
+    return projected
 
 
 def compact_current_step(

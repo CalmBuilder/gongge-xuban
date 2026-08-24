@@ -62,6 +62,10 @@ from app.connectors.worker import (
     start_connector_background_worker,
     stop_connector_background_worker,
 )
+from app.dynamic_tasks.artifact_renderer_worker import (
+    start_background_worker as start_artifact_renderer_worker,
+    stop_background_worker as stop_artifact_renderer_worker,
+)
 from app.db import engine, init_db
 from app.db.seed import seed_demo_data
 from app.general_skills.worker import (
@@ -69,7 +73,16 @@ from app.general_skills.worker import (
     stop_background_worker as stop_general_skill_import_worker,
 )
 from app.public_mock import router as public_mock_router
+from app.security.bounded_request_body import BoundedAttachmentBodyMiddleware
 from app.scheduled_tasks.worker import start_background_worker, stop_background_worker
+from app.session.input_extraction_worker import (
+    start_background_worker as start_input_extraction_worker,
+    stop_background_worker as stop_input_extraction_worker,
+)
+from app.session.input_purge_worker import (
+    start_background_worker as start_input_purge_worker,
+    stop_background_worker as stop_input_purge_worker,
+)
 
 settings = get_settings()
 
@@ -81,6 +94,9 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         seed_demo_data(db)
     start_background_worker()
     start_general_skill_import_worker()
+    start_input_extraction_worker()
+    start_input_purge_worker()
+    start_artifact_renderer_worker()
     if settings.app_env != "test":
         start_connector_background_worker()
     try:
@@ -88,6 +104,9 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     finally:
         stop_background_worker()
         stop_general_skill_import_worker()
+        stop_input_extraction_worker()
+        stop_input_purge_worker()
+        stop_artifact_renderer_worker()
         stop_connector_background_worker()
         shutdown_async_jobs()
 
@@ -107,6 +126,12 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+)
+app.add_middleware(
+    BoundedAttachmentBodyMiddleware,
+    max_body_bytes=(
+        settings.attachment_max_request_bytes + settings.attachment_multipart_overhead_bytes
+    ),
 )
 
 @app.get("/api/health", tags=["health"])

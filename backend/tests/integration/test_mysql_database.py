@@ -22,6 +22,8 @@ from sqlmodel import Session, create_engine, select
 from app.api.model_configs import set_default_model_config
 from app.db.models import (
     ActionProposalRecord,
+    AttachmentUploadDailyUsage,
+    AttachmentUploadQuotaLease,
     AgentEvent,
     AgentProfile,
     ArtifactInputLink,
@@ -36,6 +38,7 @@ from app.db.models import (
     ExecutionPlanRevision,
     ExecutionMutationRejection,
     Message,
+    ManagedInputResource,
     ModelConfig,
     InputResourceSnapshot,
     PermissionDefinition,
@@ -51,6 +54,11 @@ from app.db.models import (
     User,
 )
 from app.dynamic_tasks.artifacts import ArtifactService
+from app.session.upload_quotas import (
+    AttachmentUploadQuotaError,
+    AttachmentUploadQuotaPolicy,
+    AttachmentUploadQuotaService,
+)
 from app.organization.governance import (
     BUILTIN_GOVERNANCE_ROLES,
     ensure_builtin_governance_catalog,
@@ -223,6 +231,16 @@ def test_alembic_upgrades_empty_mysql_database(mysql_database_url: str) -> None:
     assert "execution_plan_revisions" in tables
     assert "action_proposal_records" in tables
     assert "managed_input_resources" in tables
+    assert "input_resource_extractions" in tables
+    assert "input_resource_extraction_attempts" in tables
+    assert "turn_input_snapshots" in tables
+    assert "provider_input_dispatch_receipts" in tables
+    assert "message_input_binding_links" in tables
+    assert "artifact_renderer_jobs" in tables
+    assert "attachment_upload_quota_reservations" in tables
+    assert "attachment_upload_quota_leases" in tables
+    assert "attachment_upload_daily_usage" in tables
+    assert "attachment_upload_cleanup_jobs" in tables
     assert "input_resource_snapshots" in tables
     assert {
         "execution_commands",
@@ -237,6 +255,8 @@ def test_alembic_upgrades_empty_mysql_database(mysql_database_url: str) -> None:
     assert "ix_member_org_tenant_org_current" in {
         item["name"] for item in inspector.get_indexes("member_org_assignments")
     }
+
+
     assert "ix_org_leader_tenant_org_current" in {
         item["name"] for item in inspector.get_indexes("organization_leader_assignments")
     }
@@ -412,6 +432,60 @@ def test_alembic_upgrades_empty_mysql_database(mysql_database_url: str) -> None:
             connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
             == current_head_revision()
         )
+
+
+def test_mysql_attachment_upload_quota_is_cross_session_atomic(
+    mysql_database_url: str,
+) -> None:
+    """MySQL跨Session只允许一个用户slot，且字节列可容纳默认20GiB租户额度。"""
+
+    upgrade(mysql_database_url)
+    engine = create_engine(mysql_database_url, pool_pre_ping=True)
+    policy = AttachmentUploadQuotaPolicy(
+        user_concurrency=1,
+        tenant_concurrency=2,
+        user_daily_bytes=4 * 1024**3,
+        tenant_daily_bytes=20 * 1024**3,
+        reservation_ttl_seconds=60,
+        reservation_bytes=100,
+    )
+    try:
+        quota_columns = {
+            item["name"]: item["type"]
+            for item in inspect(engine).get_columns("attachment_upload_daily_usage")
+        }
+        assert quota_columns["reserved_bytes"].__class__.__name__ == "BIGINT"
+        assert quota_columns["consumed_bytes"].__class__.__name__ == "BIGINT"
+        with Session(engine) as first_db:
+            held = AttachmentUploadQuotaService(first_db).acquire(
+                tenant_id="tenant-upload-quota",
+                owner_user_id="user-upload-quota",
+                binding_id="binding-mysql-1",
+                policy=policy,
+            )
+            first_db.commit()
+            with Session(engine) as second_db:
+                with pytest.raises(AttachmentUploadQuotaError) as exc_info:
+                    AttachmentUploadQuotaService(second_db).acquire(
+                        tenant_id="tenant-upload-quota",
+                        owner_user_id="user-upload-quota",
+                        binding_id="binding-mysql-2",
+                        policy=policy,
+                    )
+                second_db.rollback()
+            assert exc_info.value.code == "ATTACHMENT_UPLOAD_USER_CONCURRENCY_EXCEEDED"
+            AttachmentUploadQuotaService(first_db).settle(
+                held,
+                succeeded=False,
+                actual_bytes=0,
+            )
+            first_db.commit()
+        with Session(engine) as verify_db:
+            assert verify_db.exec(select(AttachmentUploadQuotaLease)).all() == []
+            usage = verify_db.exec(select(AttachmentUploadDailyUsage)).all()
+            assert all(item.reserved_bytes == 0 for item in usage)
+    finally:
+        engine.dispose()
 
 
 def test_mysql_capability_catalog_backfills_legacy_tools_and_guards_downgrade(
@@ -1059,6 +1133,63 @@ def test_mysql_execution_active_slot_and_fencing_are_cross_worker_safe(
     assert operation is not None and operation.status == "prepared"
     assert rejection.action == "operation.start"
     assert rejection.rejected_fencing_token < rejection.current_fencing_token
+
+
+def test_mysql_authenticated_cancellation_preempts_model_worker_lease(
+    mysql_database_url: str,
+) -> None:
+    """验证 MySQL 中聊天取消可抢占长模型租约，且旧worker不能续租或迟到写。"""
+
+    upgrade(mysql_database_url)
+    engine = create_engine(mysql_database_url, pool_pre_ping=True)
+    with Session(engine) as setup_session:
+        instance, _ = SopExecutionStore(setup_session).start_instance(
+            tenant_id="tenant_cancel_preempt",
+            session_id="session_cancel_preempt",
+            skill_id="skill_cancel_preempt",
+            skill_version_id="version_cancel_preempt",
+            skill_version="1.0.0",
+            definition_checksum="c" * 64,
+            start_node_id="answer",
+            initiator_user_id="user_cancel_preempt",
+            source_ref="turn_cancel_preempt",
+        )
+        instance_id = instance.id
+        setup_session.commit()
+
+    with Session(engine) as model_session:
+        model_instance = model_session.get(SopInstance, instance_id)
+        assert model_instance is not None
+        model_store = SopExecutionStore(model_session)
+        with model_store.owned(model_instance, worker_id="mysql-model-worker") as model_lease:
+            model_session.commit()
+
+            with Session(engine) as cancel_session:
+                cancel_instance = cancel_session.get(SopInstance, instance_id)
+                assert cancel_instance is not None
+                cancel_store = SopExecutionStore(cancel_session)
+                with cancel_store.owned_for_cancellation(
+                    cancel_instance,
+                    worker_id="mysql-chat-cancel",
+                ):
+                    cancelled = cancel_store.request_cancellation(
+                        cancel_instance,
+                        actor_user_id="user_cancel_preempt",
+                        reason="chat_turn_cancelled",
+                    )
+                    assert cancelled is True
+                cancel_session.commit()
+
+            with pytest.raises(SopExecutionFencedError):
+                model_store.renew(model_lease)
+            model_session.commit()
+
+    with Session(engine) as verify_session:
+        final = verify_session.get(SopInstance, instance_id)
+        assert final is not None
+        assert final.status == "cancelled"
+        assert final.cancellation_requested_by == "user_cancel_preempt"
+        assert final.lease_owner is None
 
 
 def test_mysql_effective_interval_precision_migration_is_reversible(
@@ -2217,9 +2348,28 @@ def test_mysql_execution_artifact_and_exact_lineage_round_trip(
             storage_locator_digest="f" * 64,
             captured_acl_json={"owner": owner.id},
         )
+        resource = ManagedInputResource(
+            id="mysql_resource_artifact",
+            tenant_id=owner.tenant_id,
+            owner_user_id=owner.id,
+            agent_id=instance.agent_id,
+            version="v1",
+            filename="合同.pdf",
+            mime_type="application/pdf",
+            size_bytes=128,
+            content_checksum="c" * 64,
+            extraction_checksum="d" * 64,
+            ingestion_status="ready",
+            storage_locator="mysql-resource-artifact",
+            access_status="active",
+            security_status="accepted",
+            destruction_status="retained",
+            acl_revision=0,
+        )
         db.add(owner)
         db.add(instance)
         db.add(node)
+        db.add(resource)
         db.add(snapshot)
         db.commit()
 

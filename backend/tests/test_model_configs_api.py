@@ -17,6 +17,7 @@ from sqlmodel import Session, SQLModel, create_engine, select
 from app.api.model_configs import (
     preflight_dynamic_model_config,
     set_default_model_config,
+    test_model_config as run_model_config_test,
     update_model_config,
 )
 from app.db.models import ModelConfig, Tenant
@@ -180,6 +181,82 @@ def test_dynamic_preflight_persists_capabilities_and_config_change_invalidates(
         assert persisted.preflight_status == "unverified"
         assert persisted.capability_snapshot_json == {}
         assert persisted.capability_checksum is None
+
+
+def test_connection_test_reports_auth_catalog_and_generation_success(
+    tmp_path, monkeypatch
+) -> None:
+    """普通兼容端点应展示模型目录与最小生成两个独立成功阶段。"""
+
+    engine = _engine(tmp_path)
+    _seed_models(engine)
+    monkeypatch.setattr(
+        "app.api.model_configs.LLMClient.probe_model_catalog",
+        lambda self: ["model-next"],
+    )
+    monkeypatch.setattr(
+        "app.api.model_configs.LLMClient.probe_text_connection",
+        lambda self: "连接成功",
+    )
+    with Session(engine) as db:
+        response = run_model_config_test("a_next", tenant_id="tenant_a", db=db)
+
+    assert response.success is True
+    assert response.output == "连接成功"
+    assert [(item.name, item.status) for item in response.checks] == [
+        ("配置", "passed"),
+        ("模型目录", "passed"),
+        ("账户状态", "skipped"),
+        ("最小生成", "passed"),
+    ]
+
+
+def test_connection_test_explains_deepseek_key_account_balance(
+    tmp_path, monkeypatch
+) -> None:
+    """DeepSeek目录认证成功但Key账户不可用时必须明确归类计费而非误报网络故障。"""
+
+    engine = _engine(tmp_path)
+    _seed_models(engine)
+    with Session(engine) as db:
+        row = db.get(ModelConfig, "a_next")
+        assert row is not None
+        row.base_url = "https://api.deepseek.com"
+        db.add(row)
+        db.commit()
+    monkeypatch.setattr(
+        "app.api.model_configs.LLMClient.probe_model_catalog",
+        lambda self: ["model-next"],
+    )
+
+    class BalanceResponse:
+        """模拟DeepSeek对当前API Key返回不可用余额。"""
+
+        status_code = 200
+        content = b"{}"
+
+        @staticmethod
+        def json() -> dict[str, object]:
+            """返回不包含账户身份的余额事实。"""
+
+            return {
+                "is_available": False,
+                "balance_infos": [{"currency": "CNY", "total_balance": "-0.13"}],
+            }
+
+    monkeypatch.setattr("app.api.model_configs.httpx.get", lambda *args, **kwargs: BalanceResponse())
+    with Session(engine) as db:
+        response = run_model_config_test("a_next", tenant_id="tenant_a", db=db)
+
+    assert response.success is False
+    assert response.error_code == "BILLING_UNAVAILABLE"
+    assert response.http_status == 402
+    assert response.suggestion == "请确认充值的是这把 API Key 所属账户或项目，充值后重新测试。"
+    assert response.checks[-2].name == "账户状态"
+    assert response.checks[-2].status == "failed"
+    assert "CNY余额 -0.13" in response.checks[-2].message
+    assert response.checks[-1].name == "最小生成"
+    assert response.checks[-1].status == "skipped"
 
 
 def _admin_user_for_model_test():  # noqa: ANN201

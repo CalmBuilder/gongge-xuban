@@ -187,7 +187,8 @@ class ChatTurnRequest(BaseModel):
     client_turn_id: Optional[str] = None
     user_id: Optional[str] = None
     message: str
-    attachments: list["ChatAttachmentRead"] = Field(default_factory=list)
+    attachments: list["ChatAttachmentRef"] = Field(default_factory=list)
+    draft_conversation_id: Optional[str] = None
     channel: str = "web"
     interaction_mode: Literal["normal", "scheduled_task"] = "normal"
     client_timezone: Optional[str] = None
@@ -213,6 +214,15 @@ class ChatAttachmentRead(BaseModel):
     ingestion_status: Optional[
         Literal["uploaded", "scanning", "extracting", "ready", "quarantined", "failed", "revoked"]
     ] = None
+
+
+class ChatAttachmentRef(BaseModel):
+    """表示客户端提交给Turn的最小不透明引用，所有展示及内容字段由服务端回查。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    resource_id: str
+    resource_version: str
 
 
 class ChatTurnResponse(BaseModel):

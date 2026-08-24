@@ -139,7 +139,10 @@ def download_artifact(
     return Response(
         content=data,
         media_type=artifact.mime_type,
-        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"},
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{filename}",
+            "X-Content-Type-Options": "nosniff",
+        },
     )
 
 

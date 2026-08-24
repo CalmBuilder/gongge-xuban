@@ -887,6 +887,10 @@ class ManagedInputResource(SQLModel, table=True):
         default=None,
         sa_column=Column(String(512), nullable=True, index=True),
     )
+    upload_binding_id: str | None = Field(
+        default=None,
+        sa_column=Column(String(128), nullable=True, index=True),
+    )
     source_type: LabelString = Field(default="chat_upload")
     source_message_id: str | None = Field(
         default=None,
@@ -902,10 +906,123 @@ class ManagedInputResource(SQLModel, table=True):
     storage_locator: str = Field(sa_column=Column(String(1000), nullable=False))
     extracted_text: OptionalLongTextString = None
     extraction_metadata_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    access_status: LabelString = Field(default="active", index=True)
+    security_status: LabelString = Field(default="pending_scan", index=True)
+    destruction_status: LabelString = Field(default="retained", index=True)
     acl_revision: int = Field(default=0, ge=0)
     revoked_at: datetime | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
+
+
+class InputResourcePurgeJob(SQLModel, table=True):
+    """持久记录输入资源在线副本销毁的租约、fencing 与可恢复终态。"""
+
+    __tablename__ = "input_resource_purge_jobs"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "resource_id",
+            "resource_version",
+            name="uq_input_resource_purge_job_resource",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'claimed', 'purging', 'succeeded', 'failed', "
+            "'dead_letter')",
+            name="ck_input_resource_purge_job_status",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("purgejob"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    resource_id: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    resource_version: VersionString
+    session_id: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    requested_by_user_id: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    status: LabelString = Field(default="pending", index=True)
+    attempt_no: int = Field(default=0, ge=0)
+    lease_owner: OptionalIdentifierString = Field(default=None, index=True)
+    fencing_token: int = Field(default=0, ge=0)
+    lease_expires_at: datetime | None = Field(default=None, index=True, sa_type=PRECISE_DATETIME)
+    error_code: OptionalLabelString = None
+    error_detail_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+
+
+class InputResourcePurgeTombstone(SQLModel, table=True):
+    """记录已完成输入销毁的最小审计身份，禁止保存原文件定位和正文摘要。"""
+
+    __tablename__ = "input_resource_purge_tombstones"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "resource_id",
+            "resource_version",
+            name="uq_input_resource_purge_tombstone_resource",
+        ),
+        CheckConstraint(
+            "event_kind IN ('session_purge', 'upload_cleanup', 'composer_discard', 'replay')",
+            name="ck_input_resource_purge_tombstone_event",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("purgetomb"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    resource_id: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    resource_version: VersionString
+    purge_job_id: str | None = Field(
+        default=None,
+        sa_column=Column(String(512), nullable=True, index=True),
+    )
+    session_id: str | None = Field(
+        default=None,
+        sa_column=Column(String(128), nullable=True, index=True),
+    )
+    requested_by_user_id: str | None = Field(
+        default=None,
+        sa_column=Column(String(128), nullable=True, index=True),
+    )
+    event_kind: LabelString = Field(default="session_purge", index=True)
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class AttachmentUploadCleanupJob(SQLModel, table=True):
+    """持久记录失败上传中未绑定资源和blob的幂等清理租约。"""
+
+    __tablename__ = "attachment_upload_cleanup_jobs"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "upload_binding_id",
+            name="uq_attachment_upload_cleanup_binding",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'claimed', 'purging', 'succeeded', 'failed')",
+            name="ck_attachment_upload_cleanup_status",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("uploadcleanup"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    owner_user_id: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    upload_binding_id: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    resource_manifest_json: list[dict[str, Any]] = Field(
+        default_factory=list,
+        sa_column=Column(JSON, nullable=False),
+    )
+    status: LabelString = Field(default="pending", index=True)
+    attempt_no: int = Field(default=0, ge=0)
+    fencing_token: int = Field(default=0, ge=0)
+    lease_owner: str | None = Field(default=None, sa_column=Column(String(128), nullable=True))
+    lease_expires_at: datetime | None = Field(default=None, sa_type=PRECISE_DATETIME)
+    error_code: str | None = Field(default=None, sa_column=Column(String(128), nullable=True))
+    error_detail_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+    finished_at: datetime | None = None
 
 
 class InputResourceSnapshot(SQLModel, table=True):
@@ -940,10 +1057,594 @@ class InputResourceSnapshot(SQLModel, table=True):
     size_bytes: int = Field(ge=0)
     content_checksum: VersionString = Field(index=True)
     extraction_checksum: OptionalVersionString = Field(default=None, index=True)
+    extraction_id: str | None = Field(
+        default=None,
+        sa_column=Column(String(512), nullable=True, index=True),
+    )
+    parser_name: OptionalLabelString = None
+    parser_version: OptionalVersionString = None
+    parser_config_checksum: OptionalVersionString = None
+    element_manifest_checksum: OptionalVersionString = None
+    resource_acl_revision_at_snapshot: int = Field(default=0, ge=0)
     ingestion_status: LabelString = Field(index=True)
     identity_checksum: VersionString = Field(index=True)
+    opaque_handle: str | None = Field(
+        default=None,
+        sa_column=Column(String(96), nullable=True, index=True),
+    )
     storage_locator_digest: VersionString
     captured_acl_json: dict[str, Any] = Field(sa_column=Column(JSON, nullable=False))
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class DraftUploadBinding(SQLModel, table=True):
+    """在读取 multipart 正文前冻结一次上传请求的用户、Agent 与会话/草稿边界。"""
+
+    __tablename__ = "draft_upload_bindings"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "binding_id", name="uq_draft_upload_binding_identity"),
+        UniqueConstraint("tenant_id", "idempotency_key", name="uq_draft_upload_idempotency"),
+        CheckConstraint(
+            "status IN ('active', 'claimed', 'consumed', 'expired')",
+            name="ck_draft_upload_binding_status",
+        ),
+        CheckConstraint(
+            "NOT (session_id IS NULL AND draft_conversation_id IS NULL)",
+            name="ck_draft_upload_binding_target",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("uploadbind"), primary_key=True)
+    binding_id: IdentifierString = Field(index=True)
+    tenant_id: IdentifierString = Field(index=True)
+    owner_user_id: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    agent_id: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    session_id: str | None = Field(default=None, sa_column=Column(String(128), index=True))
+    draft_conversation_id: str | None = Field(
+        default=None,
+        sa_column=Column(String(128), index=True),
+    )
+    nonce_checksum: VersionString
+    idempotency_key: VersionString
+    resource_set_checksum: OptionalVersionString = None
+    status: LabelString = Field(default="active", index=True)
+    revision: int = Field(default=0, ge=0)
+    lease_owner: OptionalIdentifierString = None
+    expires_at: datetime = Field(index=True, sa_type=PRECISE_DATETIME)
+    claimed_at: datetime | None = None
+    consumed_at: datetime | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class AttachmentUploadQuotaReservation(SQLModel, table=True):
+    """持久化一次上传在读取multipart正文前取得的并发槽和日额度预留。"""
+
+    __tablename__ = "attachment_upload_quota_reservations"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "binding_id", name="uq_attachment_upload_reservation_binding"),
+        CheckConstraint(
+            "status IN ('active', 'completed', 'released', 'expired')",
+            name="ck_attachment_upload_reservation_status",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("uploadquota"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    owner_user_id: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    binding_id: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    fencing_token: str = Field(
+        default_factory=lambda: new_id("uploadfence"),
+        sa_column=Column(String(128), nullable=False),
+    )
+    reserved_bytes: int = Field(sa_column=Column(BigInteger, nullable=False))
+    actual_bytes: int = Field(default=0, sa_column=Column(BigInteger, nullable=False))
+    status: LabelString = Field(default="active", index=True)
+    expires_at: datetime = Field(index=True, sa_type=PRECISE_DATETIME)
+    created_at: datetime = Field(default_factory=utc_now)
+    settled_at: datetime | None = None
+
+
+class AttachmentUploadQuotaLease(SQLModel, table=True):
+    """通过唯一slot提供SQLite/MySQL一致的tenant和user跨进程上传并发限制。"""
+
+    __tablename__ = "attachment_upload_quota_leases"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "scope_type",
+            "scope_ref",
+            "slot_number",
+            name="uq_attachment_upload_quota_scope_slot",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "reservation_id",
+            "scope_type",
+            name="uq_attachment_upload_quota_reservation_scope",
+        ),
+        CheckConstraint(
+            "scope_type IN ('tenant', 'user')",
+            name="ck_attachment_upload_quota_scope_type",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("uploadslot"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    reservation_id: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    scope_type: LabelString = Field(index=True)
+    scope_ref: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    slot_number: int = Field(ge=0)
+    expires_at: datetime = Field(index=True, sa_type=PRECISE_DATETIME)
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class AttachmentUploadDailyUsage(SQLModel, table=True):
+    """按UTC自然日原子累计tenant/user成功上传字节并保存活动预留字节。"""
+
+    __tablename__ = "attachment_upload_daily_usage"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "scope_type",
+            "scope_ref",
+            "day_key",
+            name="uq_attachment_upload_daily_scope",
+        ),
+        CheckConstraint(
+            "scope_type IN ('tenant', 'user')",
+            name="ck_attachment_upload_daily_scope_type",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("uploaddaily"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    scope_type: LabelString = Field(index=True)
+    scope_ref: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    day_key: str = Field(sa_column=Column(String(10), nullable=False, index=True))
+    reserved_bytes: int = Field(default=0, sa_column=Column(BigInteger, nullable=False))
+    consumed_bytes: int = Field(default=0, sa_column=Column(BigInteger, nullable=False))
+    revision: int = Field(default=0, sa_column=Column(BigInteger, nullable=False))
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class ResourceSessionBinding(SQLModel, table=True):
+    """以全局唯一资源版本 CAS 绑定一个会话和数字员工，禁止跨会话复用上传。"""
+
+    __tablename__ = "resource_session_bindings"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "resource_id",
+            "resource_version",
+            name="uq_resource_session_binding_resource",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("resbind"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    resource_id: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    resource_version: VersionString
+    owner_user_id: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    session_id: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    agent_id: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    upload_binding_id: str | None = Field(
+        default=None,
+        sa_column=Column(String(128), nullable=True, index=True),
+    )
+    revision: int = Field(default=0, ge=0)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class MessageInputResourceLink(SQLModel, table=True):
+    """把权威用户消息绑定到资源版本，消息元数据不再保存可消费正文。"""
+
+    __tablename__ = "message_input_resource_links"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "message_id",
+            "resource_id",
+            "resource_version",
+            name="uq_message_input_resource_link",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("msginput"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    session_id: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    message_id: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    resource_binding_id: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    resource_id: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    resource_version: VersionString
+    content_checksum: VersionString
+    ordinal: int = Field(default=0, ge=0)
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class MessageInputBindingLink(SQLModel, table=True):
+    """把正式SOP附件槽位冻结到同会话权威消息资源Link，禁止模型猜测映射。"""
+
+    __tablename__ = "message_input_binding_links"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "execution_id",
+            "slot_key",
+            "ordinal",
+            name="uq_message_input_binding_slot_ordinal",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "execution_id",
+            "message_resource_link_id",
+            name="uq_message_input_binding_resource",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("slotinput"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    execution_id: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    definition_checksum: VersionString = Field(index=True)
+    slot_key: IdentifierString = Field(index=True)
+    ordinal: int = Field(default=0, ge=0)
+    message_resource_link_id: str = Field(
+        sa_column=Column(String(128), nullable=False, index=True)
+    )
+    input_snapshot_id: str | None = Field(
+        default=None,
+        sa_column=Column(String(128), nullable=True, index=True),
+    )
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class InputResourceExtractionAttempt(SQLModel, table=True):
+    """追加记录每次隔离解析物理尝试、租约和失败，不覆盖既有作业事实。"""
+
+    __tablename__ = "input_resource_extraction_attempts"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "resource_id",
+            "resource_version",
+            "parser_config_checksum",
+            "attempt_no",
+            name="uq_input_extraction_attempt",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'claimed', 'running', 'succeeded', 'failed', "
+            "'cancelled', 'dead_letter')",
+            name="ck_input_extraction_attempt_status",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("extracttry"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    resource_id: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    resource_version: VersionString
+    parser_name: LabelString
+    parser_version: VersionString
+    parser_config_checksum: VersionString
+    attempt_no: int = Field(default=1, ge=1)
+    status: LabelString = Field(default="pending", index=True)
+    lease_owner: OptionalIdentifierString = Field(default=None, index=True)
+    fencing_token: int = Field(default=0, ge=0)
+    lease_expires_at: datetime | None = Field(default=None, index=True, sa_type=PRECISE_DATETIME)
+    retry_at: datetime | None = Field(default=None, index=True, sa_type=PRECISE_DATETIME)
+    temporary_manifest_checksum: OptionalVersionString = None
+    error_code: OptionalLabelString = None
+    error_detail_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    created_at: datetime = Field(default_factory=utc_now)
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+
+
+class InputResourceExtraction(SQLModel, table=True):
+    """保存一次原子发布、发布后永久不可变的文档结构提取身份。"""
+
+    __tablename__ = "input_resource_extractions"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "resource_id",
+            "resource_version",
+            "parser_config_checksum",
+            "extraction_checksum",
+            name="uq_input_resource_extraction_content",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "published_from_attempt_id",
+            name="uq_input_resource_extraction_attempt",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("extract"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    resource_id: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    resource_version: VersionString
+    content_checksum: VersionString
+    parser_name: LabelString
+    parser_version: VersionString
+    parser_config_checksum: VersionString
+    extraction_checksum: VersionString = Field(index=True)
+    element_manifest_checksum: VersionString = Field(index=True)
+    published_from_attempt_id: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    element_count: int = Field(default=0, ge=0)
+    page_count: int = Field(default=0, ge=0)
+    sheet_count: int = Field(default=0, ge=0)
+    slide_count: int = Field(default=0, ge=0)
+    metadata_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    published_at: datetime = Field(default_factory=utc_now)
+
+
+class SelectedResourceExtraction(SQLModel, table=True):
+    """以 revision CAS 选择资源在指定分析 profile 下的新建 Turn 默认提取版本。"""
+
+    __tablename__ = "selected_resource_extractions"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "resource_id",
+            "resource_version",
+            "profile_key",
+            name="uq_selected_resource_extraction_profile",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("extractsel"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    resource_id: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    resource_version: VersionString
+    profile_key: IdentifierString = Field(index=True)
+    extraction_id: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    revision: int = Field(default=0, ge=0)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class InputDocumentElement(SQLModel, table=True):
+    """保存不可变 Extraction 中可分页读取且带稳定 locator 的结构元素。"""
+
+    __tablename__ = "input_document_elements"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "extraction_id",
+            "element_index",
+            name="uq_input_document_element_index",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("element"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    extraction_id: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    element_index: int = Field(ge=0)
+    element_type: LabelString = Field(index=True)
+    text: OptionalLongTextString = None
+    table_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    locator_json: dict[str, Any] = Field(sa_column=Column(JSON, nullable=False))
+    content_checksum: VersionString = Field(index=True)
+    char_count: int = Field(default=0, ge=0)
+    row_count: int = Field(default=0, ge=0)
+    column_count: int = Field(default=0, ge=0)
+    truncated: bool = Field(default=False)
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class TurnInputSnapshot(SQLModel, table=True):
+    """在普通 AgentLoop 的一个 server turn 内冻结唯一资源与提取版本句柄。"""
+
+    __tablename__ = "turn_input_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "turn_id",
+            "message_resource_link_id",
+            name="uq_turn_input_snapshot_link",
+        ),
+        UniqueConstraint("tenant_id", "opaque_handle", name="uq_turn_input_snapshot_handle"),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("turnsnap"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    turn_id: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    session_id: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    message_resource_link_id: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    resource_id: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    resource_version: VersionString
+    extraction_id: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    extraction_checksum: VersionString
+    element_manifest_checksum: VersionString
+    resource_acl_revision_at_snapshot: int = Field(default=0, ge=0)
+    opaque_handle: VersionString = Field(index=True)
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class TurnInputReadReceipt(SQLModel, table=True):
+    """追加记录普通问答实际读取的快照切片和 locator，不复制附件正文。"""
+
+    __tablename__ = "turn_input_read_receipts"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "turn_id", "receipt_checksum", name="uq_turn_read_receipt"),
+        CheckConstraint(
+            "status IN ('prepared', 'succeeded', 'failed', 'countermanded')",
+            name="ck_turn_input_read_receipt_status",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("turnread"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    turn_id: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    snapshot_id: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    element_ids_json: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    slice_checksum: VersionString
+    locator_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    budget_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    receipt_checksum: VersionString = Field(index=True)
+    provider_dispatch_group_id: str | None = Field(
+        default=None,
+        sa_column=Column(String(128), nullable=True, index=True),
+    )
+    status: LabelString = Field(default="prepared", index=True)
+    created_at: datetime = Field(default_factory=utc_now)
+    settled_at: datetime | None = None
+
+
+class ProviderInputDispatchGroup(SQLModel, table=True):
+    """聚合一次模型动作中有序的多资源外发，并按最保守子状态收敛。"""
+
+    __tablename__ = "provider_input_dispatch_groups"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "causation_id", "attempt_no", name="uq_provider_dispatch_group"),
+        CheckConstraint(
+            "status IN ('prepared', 'dispatching', 'delivered', 'failed_pre_send', "
+            "'unknown', 'settled', 'discarded')",
+            name="ck_provider_dispatch_group_status",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("dispatchgrp"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    consumer_kind: LabelString = Field(index=True)
+    causation_id: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    attempt_no: int = Field(default=1, ge=1)
+    ordered_receipt_ids_json: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    status: LabelString = Field(default="prepared", index=True)
+    created_at: datetime = Field(default_factory=utc_now)
+    settled_at: datetime | None = None
+
+
+class ProviderInputDispatchReceipt(SQLModel, table=True):
+    """记录模型外发授权线性化点和无法由数据库证明的网络 unknown 边界。"""
+
+    __tablename__ = "provider_input_dispatch_receipts"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "dispatch_token", name="uq_provider_dispatch_token"),
+        UniqueConstraint(
+            "tenant_id",
+            "dispatch_group_id",
+            "resource_id",
+            "attempt_no",
+            name="uq_provider_dispatch_resource_attempt",
+        ),
+        CheckConstraint(
+            "status IN ('prepared', 'dispatching', 'delivered', 'failed_pre_send', "
+            "'unknown', 'settled', 'discarded')",
+            name="ck_provider_dispatch_receipt_status",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("dispatch"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    dispatch_group_id: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    attempt_no: int = Field(default=1, ge=1)
+    consumer_kind: LabelString = Field(index=True)
+    turn_id: str | None = Field(default=None, sa_column=Column(String(128), index=True))
+    execution_id: str | None = Field(default=None, sa_column=Column(String(128), index=True))
+    operation_id: str | None = Field(default=None, sa_column=Column(String(128), index=True))
+    resource_id: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    extraction_id: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    slice_checksum: VersionString
+    expected_acl_revision: int = Field(default=0, ge=0)
+    egress_policy_checksum: VersionString
+    dispatch_token: VersionString = Field(index=True)
+    lease_owner: OptionalIdentifierString = Field(default=None, index=True)
+    fencing_token: int = Field(default=0, ge=0)
+    deadline_at: datetime = Field(index=True, sa_type=PRECISE_DATETIME)
+    provider_request_id: str | None = Field(default=None, sa_column=Column(String(128)))
+    status: LabelString = Field(default="prepared", index=True)
+    causation_id: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    prepared_at: datetime = Field(default_factory=utc_now)
+    dispatch_started_at: datetime | None = None
+    settled_at: datetime | None = None
+
+
+class ProviderInputExposureReconciliationJob(SQLModel, table=True):
+    """记录第三方输入文件暴露对账和删除作业，隔离unknown与本地purge终态。"""
+
+    __tablename__ = "provider_input_exposure_reconciliation_jobs"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "dispatch_receipt_id",
+            "job_kind",
+            name="uq_provider_exposure_receipt_kind",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "provider_file_id",
+            "job_kind",
+            name="uq_provider_exposure_file_kind",
+        ),
+        CheckConstraint(
+            "job_kind IN ('reconcile_exposure', 'delete_file')",
+            name="ck_provider_exposure_job_kind",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'dispatching', 'reconciled', 'deleted', 'not_found', "
+            "'unknown', 'retry_wait', 'dead_letter', 'attention')",
+            name="ck_provider_exposure_job_status",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("providerexposure"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    dispatch_group_id: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    dispatch_receipt_id: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    job_kind: LabelString = Field(index=True)
+    provider_file_id: str | None = Field(
+        default=None,
+        sa_column=Column(String(256), nullable=True, index=True),
+    )
+    provider_request_id: str | None = Field(
+        default=None,
+        sa_column=Column(String(128), nullable=True, index=True),
+    )
+    dispatch_token: VersionString = Field(index=True)
+    status: LabelString = Field(default="pending", index=True)
+    attempt_no: int = Field(default=0, ge=0)
+    fencing_token: int = Field(default=0, ge=0)
+    lease_owner: OptionalIdentifierString = Field(default=None, index=True)
+    lease_expires_at: datetime | None = Field(default=None, index=True, sa_type=PRECISE_DATETIME)
+    error_code: OptionalLabelString = None
+    result_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+    finished_at: datetime | None = None
+
+
+class ScannerEvidence(SQLModel, table=True):
+    """持久化可重算 freshness 的格式验真或恶意软件扫描保证等级。"""
+
+    __tablename__ = "scanner_evidence"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "resource_id",
+            "resource_version",
+            "engine",
+            "definition_version",
+            name="uq_scanner_evidence_definition",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("scan"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    resource_id: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    resource_version: VersionString
+    assurance_level: LabelString = Field(index=True)
+    engine: LabelString
+    engine_version: VersionString
+    definition_version: VersionString
+    definition_published_at: datetime = Field(sa_type=PRECISE_DATETIME)
+    scanned_at: datetime = Field(sa_type=PRECISE_DATETIME)
+    freshness_policy_checksum: VersionString
+    max_age_at_scan_seconds: int = Field(ge=0)
+    verdict: LabelString = Field(index=True)
+    evidence_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     created_at: datetime = Field(default_factory=utc_now)
 
 
@@ -1003,6 +1704,50 @@ class ArtifactInputLink(SQLModel, table=True):
     artifact_id: IdentifierString = Field(index=True)
     input_snapshot_id: IdentifierString = Field(index=True)
     created_at: datetime = Field(default_factory=utc_now)
+
+
+class ArtifactRendererJob(SQLModel, table=True):
+    """以租约和fencing持久化确定性Artifact渲染，避免请求内崩溃留下假成功。"""
+
+    __tablename__ = "artifact_renderer_jobs"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "execution_id",
+            "result_checksum",
+            "artifact_key",
+            "renderer_version",
+            name="uq_artifact_renderer_job_identity",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'claimed', 'rendering', 'staged', 'ready', "
+            "'retry_wait', 'failed', 'dead_letter', 'cancelled')",
+            name="ck_artifact_renderer_job_status",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("renderjob"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    execution_id: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    result_id: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    result_checksum: VersionString = Field(index=True)
+    source_node_execution_id: IdentifierString = Field(index=True)
+    artifact_key: IdentifierString = Field(index=True)
+    filename: NameString
+    mime_type: NameString
+    renderer_version: VersionString
+    required: bool = Field(default=True, index=True)
+    status: LabelString = Field(default="pending", index=True)
+    attempt_no: int = Field(default=0, ge=0)
+    lease_owner: OptionalIdentifierString = Field(default=None, index=True)
+    lease_expires_at: datetime | None = Field(default=None, index=True, sa_type=PRECISE_DATETIME)
+    fencing_token: int = Field(default=0, ge=0)
+    staged_checksum: OptionalVersionString = None
+    artifact_id: str | None = Field(default=None, sa_column=Column(String(512), index=True))
+    error_code: OptionalLabelString = None
+    retry_at: datetime | None = Field(default=None, index=True, sa_type=PRECISE_DATETIME)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
 
 
 class SopOperation(SQLModel, table=True):

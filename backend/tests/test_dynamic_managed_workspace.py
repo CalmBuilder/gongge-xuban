@@ -10,8 +10,11 @@ from __future__ import annotations
 
 import hashlib
 import subprocess
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 
+import pytest
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
@@ -172,8 +175,31 @@ class _WorkspaceProposer:
 
 def test_dynamic_workspace_write_waits_for_approval_and_resumes_once(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """验证确认前文件不变，独立管理员批准后写入并可按同一 signal 重放。"""
+    """验证确认前零副作用，批准后的长续跑受 signal 心跳保护且可安全重放。"""
+
+    heartbeat_signal_ids: list[str] = []
+    original_heartbeat = DynamicTaskAgent._signal_lease_heartbeat
+
+    @contextmanager
+    def record_signal_heartbeat(
+        self: DynamicTaskAgent,
+        signal_id: str,
+        *,
+        worker_id: str,
+    ) -> Iterator[None]:
+        """记录每次本地工具成功后的继续执行是否处于同一 signal 续租作用域。"""
+
+        heartbeat_signal_ids.append(signal_id)
+        with original_heartbeat(self, signal_id, worker_id=worker_id):
+            yield
+
+    monkeypatch.setattr(
+        DynamicTaskAgent,
+        "_signal_lease_heartbeat",
+        record_signal_heartbeat,
+    )
 
     root = tmp_path / "managed"
     repo = root / "tenant_workspace" / "refund-demo"
@@ -551,6 +577,14 @@ def test_dynamic_workspace_write_waits_for_approval_and_resumes_once(
                 actor_user_id=approver.id,
             )
             assert completed.status == replay.status == "succeeded"
+            assert sorted(heartbeat_signal_ids) == sorted(
+                signal.id
+                for signal in db.exec(
+                    select(ExecutionSignal).where(
+                        ExecutionSignal.causation_type == "attention_resolution"
+                    )
+                ).all()
+            )
             assert (repo / "refund.py").read_text(encoding="utf-8") == (
                 "STATUS = 'approval_required'\n"
             )

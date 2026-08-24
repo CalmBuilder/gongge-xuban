@@ -63,6 +63,38 @@ class _ShadowSelector:
         return self.decision
 
 
+def test_empty_skill_and_knowledge_catalog_skips_remote_selector() -> None:
+    """无 Skill 且无知识候选时直接进入 shadow，避免空目录浪费长模型阶段预算。"""
+
+    general_selector = _GeneralSelector(GeneralSkillSelection())
+    router = NonSopCapabilityRouter(
+        shadow_enabled=True,
+        execution_enabled=True,
+        shadow_selector=_ShadowSelector(
+            NonSopCapabilityDecision(
+                mode="dynamic_task",
+                goal="分析隔离工作区中的故障",
+                success_criteria=["形成可校验诊断"],
+                confidence=0.95,
+            )
+        ),
+    )
+
+    result = router.decide(
+        message="分析隔离工作区中的故障",
+        general_skills=[],
+        model_config=SimpleNamespace(),
+        general_skill_selector=general_selector,
+        conversation_context=None,
+        memory_context=None,
+        knowledge_capability={"available": False, "accessible_count": 0},
+    )
+
+    assert general_selector.calls == 0
+    assert result.shadow_attempted is True
+    assert result.effective_decision.mode == "dynamic_task"
+
+
 def test_shadow_selector_receives_skill_tool_requirements(monkeypatch) -> None:
     """执行模式路由必须看到服务端审定工具声明，但不得把声明误解为本轮必调用。"""
 
@@ -412,6 +444,7 @@ def test_agent_loop_delegates_effective_dynamic_route_without_copying_loop(monke
         refresh=lambda _row: None,
         commit=lambda: None,
         begin_nested=lambda: nullcontext(),
+        get=lambda _model, _identity: session,
     )
     loop.events = SimpleNamespace(record=lambda *_args, **_kwargs: None)
     loop._knowledge_capability_payload = lambda *_args: {"available": False}
@@ -439,8 +472,10 @@ def test_agent_loop_delegates_effective_dynamic_route_without_copying_loop(monke
     assert calls == ["init", "start", "run"]
 
 
-def test_dynamic_delegation_preserves_forced_general_skill_selection(monkeypatch) -> None:
-    """复杂任务进入 DynamicTaskAgent 时必须携带用户显式选择的固定 Skill。"""
+def test_explicit_dynamic_request_cannot_be_downgraded_by_forced_general_skill(
+    monkeypatch,
+) -> None:
+    """用户明确要求持久 DynamicTaskAgent 时，Skill 只能作为指导而不能降级路由。"""
 
     skill = _skill()
     route = NonSopCapabilityRouteResult(
@@ -451,11 +486,9 @@ def test_dynamic_delegation_preserves_forced_general_skill_selection(monkeypatch
             confidence=1.0,
         ),
         effective_decision=NonSopCapabilityDecision(
-            mode="dynamic_task",
-            goal="生成受控操作规范",
-            success_criteria=["包含输入、步骤、异常和验收标准"],
-            requires_artifact=True,
-            confidence=0.95,
+            mode="general_skill",
+            selected_general_skill_slug=skill.slug,
+            confidence=1.0,
         ),
         shadow_decision=None,
         shadow_attempted=True,
@@ -490,6 +523,7 @@ def test_dynamic_delegation_preserves_forced_general_skill_selection(monkeypatch
         refresh=lambda _row: None,
         commit=lambda: None,
         begin_nested=lambda: nullcontext(),
+        get=lambda _model, _identity: session,
     )
     loop.events = SimpleNamespace(record=lambda *_args, **_kwargs: None)
     loop._knowledge_capability_payload = lambda *_args: {"available": False}
@@ -508,7 +542,10 @@ def test_dynamic_delegation_preserves_forced_general_skill_selection(monkeypatch
             tenant_id="tenant_demo",
             user_id="user_demo",
             agent_id="agent_demo",
-            message="生成受控操作规范",
+            message=(
+                "请通过持久、可恢复、可校验的 DynamicTaskAgent "
+                "完成受控操作规范"
+            ),
             forced_general_skill_id=skill.id,
         ),
         session,
@@ -520,6 +557,17 @@ def test_dynamic_delegation_preserves_forced_general_skill_selection(monkeypatch
     assert response is not None
     assert captured["forced_general_skill_id"] == skill.id
     assert captured["forced_general_skill_ids"] == ()
+
+
+def test_explicit_dynamic_request_detection_does_not_capture_explanatory_chat() -> None:
+    """服务端只接管明确执行请求，不把概念解释误路由为动态任务。"""
+
+    assert AgentLoop._explicit_dynamic_task_requested(
+        "请通过持久、可恢复的 DynamicTaskAgent 完成 INC-742 诊断"
+    )
+    assert AgentLoop._explicit_dynamic_task_requested("请创建可恢复的动态任务完成评审")
+    assert not AgentLoop._explicit_dynamic_task_requested("请解释 DynamicTaskAgent 是什么")
+    assert not AgentLoop._explicit_dynamic_task_requested("普通对话为什么不需要持久动态任务？")
 
 
 def test_multiple_forced_general_skills_always_enter_composed_dynamic_runtime(monkeypatch) -> None:
@@ -935,7 +983,7 @@ def test_dynamic_task_clarification_returns_durable_waiting_projection(monkeypat
             shadow_selector=_ShadowSelector(
                 NonSopCapabilityDecision(
                     mode="dynamic_task",
-                    goal="生成风险简报",
+                    goal="模型改写后的风险简报",
                     success_criteria=["明确报告区域"],
                     confidence=0.95,
                 )
@@ -944,6 +992,7 @@ def test_dynamic_task_clarification_returns_durable_waiting_projection(monkeypat
         _GeneralSelector(GeneralSkillSelection()),
     )
     calls: list[str] = []
+    observed_start: dict[str, object] = {}
 
     class _DynamicAgent:
         """模拟创建成功后进入受控澄清等待的独立动态 Agent。"""
@@ -957,6 +1006,7 @@ def test_dynamic_task_clarification_returns_durable_waiting_projection(monkeypat
             """返回已经创建的权威 Execution。"""
 
             calls.append("start")
+            observed_start.update(kwargs)
             return SimpleNamespace(id="execution_waiting"), True
 
         def run_until_blocked_or_complete(self, **kwargs):
@@ -1006,6 +1056,7 @@ def test_dynamic_task_clarification_returns_durable_waiting_projection(monkeypat
     assert response.step_result is not None
     assert response.step_result.is_step_completed is False
     assert calls == ["init", "start", "run"]
+    assert observed_start["goal"] == "生成风险简报"
     assert any(args[2] == "dynamic_task_delegated" for args in recorded_events)
 
 
@@ -1062,6 +1113,7 @@ def test_dynamic_execution_error_is_failed_before_error_propagates(monkeypatch) 
         refresh=lambda _row: None,
         commit=lambda: None,
         begin_nested=lambda: nullcontext(),
+        get=lambda _model, _identity: session,
     )
     recorded_events: list[tuple] = []
     loop.events = SimpleNamespace(record=lambda *args, **_kwargs: recorded_events.append(args))

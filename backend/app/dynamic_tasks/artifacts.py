@@ -9,9 +9,7 @@
 from __future__ import annotations
 
 import hashlib
-import os
 from pathlib import Path
-from tempfile import NamedTemporaryFile
 
 from sqlmodel import Session, select
 
@@ -20,9 +18,17 @@ from app.db.models import (
     ArtifactInputLink,
     ExecutionArtifact,
     InputResourceSnapshot,
+    ManagedInputResource,
     SopInstance,
     SopNodeExecution,
     User,
+    new_id,
+)
+from app.security.managed_storage import (
+    ManagedStorageError,
+    managed_read_bytes,
+    managed_validate_path,
+    managed_write_bytes,
 )
 
 
@@ -32,6 +38,11 @@ PREVIEWABLE_MIME_TYPES = {
     "text/plain",
     "text/csv",
     "application/json",
+}
+BINARY_ARTIFACT_MIME_TYPES = {
+    "application/pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 }
 
 
@@ -62,10 +73,11 @@ class ArtifactService:
         mime_type: str,
         data: bytes,
         input_snapshot_ids: tuple[str, ...] = (),
+        artifact_id: str | None = None,
     ) -> tuple[ExecutionArtifact, bool]:
         """校验来源、内容和输入快照后幂等登记 Artifact 与有方向 lineage。"""
 
-        if instance.kind != "dynamic_task" or source_node.instance_id != instance.id:
+        if instance.kind not in {"dynamic_task", "sop"} or source_node.instance_id != instance.id:
             raise ArtifactContractError("ARTIFACT_SOURCE_INVALID")
         if source_node.status not in {"running", "succeeded"}:
             raise ArtifactContractError("ARTIFACT_SOURCE_NOT_ACTIVE")
@@ -73,7 +85,7 @@ class ArtifactService:
             raise ArtifactContractError("ARTIFACT_KEY_INVALID")
         if not filename.strip() or len(filename) > 191 or "/" in filename or "\\" in filename:
             raise ArtifactContractError("ARTIFACT_FILENAME_INVALID")
-        if mime_type not in PREVIEWABLE_MIME_TYPES and mime_type != "application/pdf":
+        if mime_type not in PREVIEWABLE_MIME_TYPES and mime_type not in BINARY_ARTIFACT_MIME_TYPES:
             raise ArtifactContractError("ARTIFACT_MIME_UNSUPPORTED")
         if not data or len(data) > MAX_ARTIFACT_BYTES:
             raise ArtifactContractError("ARTIFACT_SIZE_INVALID")
@@ -93,12 +105,14 @@ class ArtifactService:
                 or existing.filename != filename
                 or existing.mime_type != mime_type
                 or existing.source_node_execution_id != source_node.id
+                or (artifact_id is not None and existing.id != artifact_id)
                 or sorted(item.input_snapshot_id for item in self.lineage(existing))
                 != sorted(requested_snapshot_ids)
             ):
                 raise ArtifactContractError("ARTIFACT_IDENTITY_CONFLICT")
             return existing, False
         artifact = ExecutionArtifact(
+            id=artifact_id or new_id("artifact"),
             tenant_id=instance.tenant_id,
             execution_id=instance.id,
             source_node_execution_id=source_node.id,
@@ -109,15 +123,29 @@ class ArtifactService:
             size_bytes=len(data),
             content_checksum=checksum,
             storage_locator="pending",
-            acl_json={"user_ids": [instance.initiator_user_id], "scope": "explicit_users"},
+            acl_json={
+                "user_ids": [instance.initiator_user_id] if instance.initiator_user_id else [],
+                "scope": "explicit_users",
+            },
             lineage_json={
                 "source_step_key": source_node.step_key,
                 "input_snapshot_ids": [item.id for item in snapshots],
             },
         )
         locator = self._locator(instance.tenant_id, artifact.id, checksum)
-        self._write_blob(locator, data)
-        artifact.storage_locator = locator.relative_to(self.storage_root).as_posix()
+        relative_locator = locator.relative_to(self.storage_root).as_posix()
+        try:
+            managed_write_bytes(self.storage_root, relative_locator, data)
+        except ManagedStorageError as exc:
+            if str(exc) != "MANAGED_STORAGE_ALREADY_EXISTS":
+                raise ArtifactContractError("ARTIFACT_STORAGE_ESCAPE") from exc
+            try:
+                staged = managed_read_bytes(self.storage_root, relative_locator)
+            except ManagedStorageError as read_exc:
+                raise ArtifactContractError("ARTIFACT_STORAGE_ESCAPE") from read_exc
+            if hashlib.sha256(staged).hexdigest() != checksum or len(staged) != len(data):
+                raise ArtifactContractError("ARTIFACT_STAGING_IDENTITY_CONFLICT") from exc
+        artifact.storage_locator = relative_locator
         self.db.add(artifact)
         self.db.flush()
         for snapshot in snapshots:
@@ -146,10 +174,9 @@ class ArtifactService:
             tenant_id=tenant_id,
             actor_user_id=actor_user_id,
         )
-        locator = self._safe_locator(artifact.storage_locator)
         try:
-            data = locator.read_bytes()
-        except OSError as exc:
+            data = managed_read_bytes(self.storage_root, artifact.storage_locator)
+        except ManagedStorageError as exc:
             raise ArtifactAccessDenied("ARTIFACT_NOT_FOUND") from exc
         if len(data) != artifact.size_bytes or hashlib.sha256(data).hexdigest() != artifact.content_checksum:
             raise ArtifactAccessDenied("ARTIFACT_INTEGRITY_FAILED")
@@ -177,7 +204,27 @@ class ArtifactService:
         allowed = artifact.acl_json.get("user_ids") if isinstance(artifact.acl_json, dict) else []
         if actor is None or not isinstance(allowed, list) or actor.id not in allowed:
             raise ArtifactAccessDenied("ARTIFACT_NOT_FOUND")
-        self._safe_locator(artifact.storage_locator)
+        for lineage in self.lineage(artifact):
+            snapshot = self.db.get(InputResourceSnapshot, lineage.input_snapshot_id)
+            resource = self.db.get(
+                ManagedInputResource,
+                snapshot.source_resource_id if snapshot is not None else "",
+            )
+            if (
+                snapshot is None
+                or snapshot.tenant_id != tenant_id
+                or resource is None
+                or resource.tenant_id != tenant_id
+                or resource.access_status != "active"
+                or resource.revoked_at is not None
+                or resource.destruction_status not in {"retained", "held"}
+                or resource.acl_revision != snapshot.resource_acl_revision_at_snapshot
+            ):
+                raise ArtifactAccessDenied("ARTIFACT_NOT_FOUND")
+        try:
+            managed_validate_path(self.storage_root, artifact.storage_locator)
+        except ManagedStorageError as exc:
+            raise ArtifactAccessDenied("ARTIFACT_NOT_FOUND") from exc
         return artifact
 
     def lineage(self, artifact: ExecutionArtifact) -> list[ArtifactInputLink]:
@@ -198,7 +245,7 @@ class ArtifactService:
         instance: SopInstance,
         snapshot_ids: tuple[str, ...],
     ) -> list[InputResourceSnapshot]:
-        """解析去重后的精确输入快照，并拒绝跨 Execution/tenant 伪造 lineage。"""
+        """解析精确输入快照，并在发布前实时复核来源资源仍可用于派生产物。"""
 
         snapshots: list[InputResourceSnapshot] = []
         for snapshot_id in dict.fromkeys(snapshot_ids):
@@ -209,6 +256,16 @@ class ArtifactService:
                 or snapshot.execution_id != instance.id
             ):
                 raise ArtifactContractError("ARTIFACT_INPUT_SNAPSHOT_INVALID")
+            resource = self.db.get(ManagedInputResource, snapshot.source_resource_id)
+            if (
+                resource is None
+                or resource.tenant_id != instance.tenant_id
+                or resource.access_status != "active"
+                or resource.revoked_at is not None
+                or resource.destruction_status not in {"retained", "held"}
+                or resource.acl_revision != snapshot.resource_acl_revision_at_snapshot
+            ):
+                raise ArtifactContractError("ARTIFACT_INPUT_COUNTERMANDED")
             snapshots.append(snapshot)
         return snapshots
 
@@ -217,40 +274,3 @@ class ArtifactService:
 
         tenant_digest = hashlib.sha256(tenant_id.encode("utf-8")).hexdigest()[:24]
         return self.storage_root / tenant_digest / artifact_id / checksum
-
-    def _safe_locator(self, relative_locator: str) -> Path:
-        """解析受管 locator 并拒绝数据库记录逃离 Artifact 根目录。"""
-
-        root = self.storage_root.resolve()
-        candidate = (root / relative_locator).resolve()
-        if candidate == root or root not in candidate.parents:
-            raise ArtifactAccessDenied("ARTIFACT_NOT_FOUND")
-        return candidate
-
-    def _write_blob(self, locator: Path, data: bytes) -> None:
-        """拒绝受管根目录内 symlink，并以 0700/0600 权限原子写入内容。"""
-
-        self.storage_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        root = self.storage_root.resolve()
-        os.chmod(root, 0o700)
-        relative = locator.relative_to(self.storage_root)
-        parent = root
-        for component in relative.parts[:-1]:
-            parent = parent / component
-            parent.mkdir(exist_ok=True, mode=0o700)
-            if parent.is_symlink():
-                raise ArtifactContractError("ARTIFACT_STORAGE_ESCAPE")
-            os.chmod(parent, 0o700)
-        target = parent / relative.name
-        if target.is_symlink():
-            raise ArtifactContractError("ARTIFACT_STORAGE_ESCAPE")
-        with NamedTemporaryFile(dir=parent, prefix=".artifact-", delete=False) as handle:
-            temporary = Path(handle.name)
-            try:
-                handle.write(data)
-                handle.flush()
-                os.fsync(handle.fileno())
-                os.chmod(temporary, 0o600)
-                os.replace(temporary, target)
-            finally:
-                temporary.unlink(missing_ok=True)

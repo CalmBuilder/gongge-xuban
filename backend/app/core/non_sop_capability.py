@@ -16,6 +16,7 @@ from typing import Literal, Protocol
 from pydantic import BaseModel, Field
 
 from app import paths
+from app.core.context_projection import compact_conversation_context
 from app.db.models import GeneralSkill, ModelConfig
 from app.general_skills.schema import GeneralSkillSelection
 from app.llm import LLMClient, LLMError
@@ -216,14 +217,24 @@ class NonSopCapabilityRouter:
     ) -> NonSopCapabilityRouteResult:
         """分别决定 Skill 与执行模式；结构化强制 Skill 不再短路动态任务判断。"""
 
-        selector_context = dict(conversation_context or {})
+        selector_context = compact_conversation_context(conversation_context)
         selector_context["knowledge_capability"] = knowledge_capability
+        # 没有任何已发布通用 Skill 且成员/Agent 知识交集为空时，选择器没有可消费
+        # 的候选，也没有需要判断的知识；跳过一次完整远程调用，避免在 Dynamic
+        # shadow/规划前白白消耗 600 秒模型阶段预算。只要存在 Skill 或知识，仍走
+        # 原选择器以保持知识自动/必需语义不变。
         if forced_general_skill is not None:
             selection = GeneralSkillSelection(
                 use_general_skill=True,
                 selected_slug=forced_general_skill.slug,
                 confidence=1.0,
                 reason="用户通过结构化会话入口显式选择 Skill。",
+            )
+        elif not general_skills and not bool(knowledge_capability.get("available")):
+            selection = GeneralSkillSelection(
+                use_general_skill=False,
+                knowledge_mode="auto",
+                reason="当前没有可用通用 Skill 或企业知识，直接进入普通/动态能力判断。",
             )
         else:
             try:
@@ -241,7 +252,6 @@ class NonSopCapabilityRouter:
                     degraded=True,
                     failure_code="capability_selection_failed",
                 )
-
         selected_skill = forced_general_skill or self._resolve_selected_general_skill(
             selection, general_skills
         )
@@ -292,7 +302,7 @@ class NonSopCapabilityRouter:
                 message,
                 general_skills,
                 model_config,
-                conversation_context,
+                selector_context,
                 memory_context,
                 knowledge_capability,
             )

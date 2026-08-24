@@ -18,6 +18,7 @@ import math
 from queue import Empty, Full, Queue
 import re
 from threading import Event, Thread
+import time
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -25,7 +26,7 @@ from openai import OpenAI
 
 from app.config import get_settings
 from app.db.models import ModelConfig
-from app.llm.output_policy import operation_output_tokens
+from app.llm.output_policy import operation_output_tokens, operation_thinking_mode
 from app.llm.stage_protocol import (
     STAGE_PROTOCOL_KEY,
     TURN_STAGE_MESSAGES_KEY,
@@ -140,6 +141,30 @@ def _escalate_reasoning_token_budget(current_max_tokens: int) -> int:
     return min(current_max_tokens * 2, REASONING_TOKEN_ESCALATION_CEILING)
 
 
+def _json_repair_output_token_budget(
+    user_payload: dict[str, Any] | str,
+    base_max_tokens: int,
+) -> int:
+    """仅对已确认的长JSON截断修复轮有界扩容，普通语法修复保持原预算。"""
+
+    if not isinstance(user_payload, dict):
+        return base_max_tokens
+    repair = user_payload.get("_json_repair")
+    if not isinstance(repair, dict):
+        return base_max_tokens
+    instruction = str(repair.get("instruction") or "")
+    if "疑似因输出过长而被截断" not in instruction:
+        return base_max_tokens
+    try:
+        repair_attempt = max(1, min(int(repair.get("attempt") or 1), 2))
+    except (TypeError, ValueError):
+        repair_attempt = 1
+    budget = base_max_tokens
+    for _ in range(repair_attempt):
+        budget = _escalate_reasoning_token_budget(budget)
+    return budget
+
+
 class _CurrentStageText(str):
     pass
 
@@ -180,6 +205,46 @@ class LLMClient:
             )
         )
 
+    def probe_model_catalog(self) -> list[str]:
+        """读取兼容端点模型目录，用于区分认证成功与模型名称配置错误。"""
+
+        try:
+            page = self.client.models.list()
+        except Exception as exc:
+            raise LLMError(_provider_failure_detail(self, exc)) from exc
+        return [
+            str(getattr(item, "id", "")).strip()
+            for item in getattr(page, "data", []) or []
+            if str(getattr(item, "id", "")).strip()
+        ]
+
+    def probe_text_connection(self) -> str:
+        """执行一次低token最小生成，验证模型调用而不触发普通回答的多轮重试。"""
+
+        try:
+            thinking_kwargs = _thinking_request_kwargs(
+                getattr(self, "thinking_mode", ""),
+                getattr(self, "extra_body", {}),
+            )
+            completion = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "你是连接测试助手。"},
+                    {"role": "user", "content": "只回复：连接成功"},
+                ],
+                temperature=0,
+                # 推理模型会先消耗 reasoning tokens；16 token 可能 HTTP 成功却
+                # 没有正文，造成“账户可用但连接失败”的假阴性。
+                max_tokens=256,
+                **thinking_kwargs,
+            )
+        except Exception as exc:
+            raise LLMError(_provider_failure_detail(self, exc)) from exc
+        content = _completion_message_content(completion).strip()
+        if not content:
+            raise LLMError("MODEL_CONNECTION_EMPTY_RESPONSE")
+        return content
+
     def generate_text(
         self,
         system_prompt: str,
@@ -187,8 +252,11 @@ class LLMClient:
         response_format: dict[str, str] | None = None,
     ) -> str:
         """生成非流式文本，并对只产生推理且长度截断的空正文扩大配额重试。"""
-        max_output_tokens = operation_output_tokens(
-            current_llm_operation(), self.max_output_tokens
+        operation = current_llm_operation()
+        max_output_tokens = operation_output_tokens(operation, self.max_output_tokens)
+        max_output_tokens = _json_repair_output_token_budget(
+            user_payload,
+            max_output_tokens,
         )
         context_messages, serialized = _prepare_user_input(user_payload)
         request_messages = _request_messages(system_prompt, context_messages, serialized)
@@ -202,6 +270,18 @@ class LLMClient:
         request_shape = _request_shape_metrics(
             system_prompt, context_messages, serialized, request_messages
         )
+        timeout_seconds = float(
+            getattr(self, "timeout_seconds", DEFAULT_MODEL_API_TIMEOUT_SECONDS)
+            or DEFAULT_MODEL_API_TIMEOUT_SECONDS
+        )
+        now = time.monotonic()
+        json_deadline = getattr(self, "_json_deadline", None)
+        if isinstance(json_deadline, (int, float)):
+            remaining_json_budget = float(json_deadline) - now
+            if remaining_json_budget <= 0:
+                raise LLMError("MODEL_CALL_DEADLINE_EXCEEDED")
+            timeout_seconds = min(timeout_seconds, remaining_json_budget)
+        deadline = now + max(0.1, timeout_seconds)
         try:
             request: dict[str, Any] = {
                 "model": self.model,
@@ -211,11 +291,12 @@ class LLMClient:
             }
             if response_format:
                 request["response_format"] = response_format
+            thinking_mode = operation_thinking_mode(
+                operation,
+                getattr(self, "thinking_mode", ""),
+            )
             request.update(
-                _thinking_request_kwargs(
-                    getattr(self, "thinking_mode", ""),
-                    getattr(self, "extra_body", {}),
-                )
+                _thinking_request_kwargs(thinking_mode, getattr(self, "extra_body", {}))
             )
             empty_diagnostics: list[str] = []
             current_max_tokens = max_output_tokens
@@ -230,11 +311,18 @@ class LLMClient:
                     retry_count=attempt,
                     max_attempts=EMPTY_RESPONSE_RETRIES + 1,
                     max_output_tokens=current_max_tokens,
-                    thinking_mode=getattr(self, "thinking_mode", "") or "provider_default",
+                    thinking_mode=thinking_mode or "provider_default",
                     **request_shape,
                 )
                 try:
-                    completion = self.client.chat.completions.create(
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise LLMError("MODEL_CALL_DEADLINE_EXCEEDED")
+                    request_client = self.client
+                    with_options = getattr(self.client, "with_options", None)
+                    if callable(with_options):
+                        request_client = with_options(timeout=max(0.1, remaining))
+                    completion = request_client.chat.completions.create(
                         **request,
                     )
                 except BaseException as exc:
@@ -269,9 +357,12 @@ class LLMClient:
                 )
                 empty_diagnostics.append(_completion_empty_diagnostic(completion, attempt + 1))
                 if (
-                    metrics.get("finish_reason") == "length"
+                    metrics.get("finish_reason") in {"length", "stop"}
                     and metrics.get("reasoning_chars", 0) > 0
                 ):
+                    # 部分推理模型会在推理完成后以 stop 结束，却没有写入
+                    # message.content；这和 length 截断一样需要扩大正文预算，
+                    # 否则每次重试都复用同一过小配额并把复杂任务误报为 provider 失败。
                     current_max_tokens = _escalate_reasoning_token_budget(
                         current_max_tokens
                     )
@@ -458,61 +549,75 @@ class LLMClient:
         next_payload = user_payload
         last_error: json.JSONDecodeError | None = None
         json_mode_supported = True
-        for attempt in range(JSON_REPAIR_ATTEMPTS + 1):
-            with llm_span_attributes(
-                response_mode="json",
-                json_attempt=attempt + 1,
-                json_retry_count=attempt,
-                json_max_attempts=JSON_REPAIR_ATTEMPTS + 1,
-            ):
-                previous_defer = getattr(self, "_defer_stage_recording", False)
-                self._defer_stage_recording = True
+        configured_timeout = float(
+            getattr(self, "timeout_seconds", DEFAULT_MODEL_API_TIMEOUT_SECONDS)
+            or DEFAULT_MODEL_API_TIMEOUT_SECONDS
+        )
+        json_deadline = time.monotonic() + max(0.1, configured_timeout)
+        previous_json_deadline = getattr(self, "_json_deadline", None)
+        self._json_deadline = json_deadline
+        try:
+            for attempt in range(JSON_REPAIR_ATTEMPTS + 1):
+                if json_deadline - time.monotonic() <= 0:
+                    raise LLMError("MODEL_CALL_DEADLINE_EXCEEDED")
+                with llm_span_attributes(
+                    response_mode="json",
+                    json_attempt=attempt + 1,
+                    json_retry_count=attempt,
+                    json_max_attempts=JSON_REPAIR_ATTEMPTS + 1,
+                ):
+                    previous_defer = getattr(self, "_defer_stage_recording", False)
+                    self._defer_stage_recording = True
+                    try:
+                        text = self._generate_json_candidate(
+                            system_prompt, next_payload, json_mode_supported
+                        )
+                        if json_mode_supported and _response_format_unsupported(text):
+                            json_mode_supported = False
+                            if json_deadline - time.monotonic() <= 0:
+                                raise LLMError("MODEL_CALL_DEADLINE_EXCEEDED")
+                            text = self.generate_text(system_prompt, next_payload)
+                    finally:
+                        self._defer_stage_recording = previous_defer
+                outputs.append(text)
                 try:
-                    text = self._generate_json_candidate(
-                        system_prompt, next_payload, json_mode_supported
+                    parsed = _loads_llm_json(text)
+                    _record_stage_exchange(
+                        next_payload,
+                        text,
+                        request_user_content=getattr(
+                            self, "_last_stage_request_user_content", None
+                        ),
                     )
-                    if json_mode_supported and _response_format_unsupported(text):
-                        json_mode_supported = False
-                        text = self.generate_text(system_prompt, next_payload)
-                finally:
-                    self._defer_stage_recording = previous_defer
-            outputs.append(text)
-            try:
-                parsed = _loads_llm_json(text)
-                _record_stage_exchange(
-                    next_payload,
-                    text,
-                    request_user_content=getattr(
-                        self, "_last_stage_request_user_content", None
-                    ),
-                )
-                return parsed
-            except json.JSONDecodeError as exc:
-                last_error = exc
-                _record_stage_exchange(
-                    next_payload,
-                    text,
-                    request_user_content=getattr(
-                        self, "_last_stage_request_user_content", None
-                    ),
-                )
-                if attempt >= JSON_REPAIR_ATTEMPTS:
-                    break
-                next_payload = copy.deepcopy(user_payload)
-                if isinstance(user_payload.get(STAGE_PROTOCOL_KEY), dict):
-                    next_payload["conversation_context"] = user_payload.get(
-                        "conversation_context"
+                    return parsed
+                except json.JSONDecodeError as exc:
+                    last_error = exc
+                    _record_stage_exchange(
+                        next_payload,
+                        text,
+                        request_user_content=getattr(
+                            self, "_last_stage_request_user_content", None
+                        ),
                     )
-                next_payload["_json_repair"] = {
-                    "attempt": attempt + 1,
-                    "max_attempts": JSON_REPAIR_ATTEMPTS,
-                    "previous_output": _preview(text),
-                    "parser_error": str(exc),
-                    "instruction": (
-                        "上一轮输出不是合法 JSON。请基于原始任务上下文重新输出完整、可解析的 JSON object。"
-                        "字符串内部的双引号必须转义；不要输出 Markdown、解释、代码块或额外文本。"
-                    ),
-                }
+                    if attempt >= JSON_REPAIR_ATTEMPTS:
+                        break
+                    next_payload = copy.deepcopy(user_payload)
+                    if isinstance(user_payload.get(STAGE_PROTOCOL_KEY), dict):
+                        next_payload["conversation_context"] = user_payload.get(
+                            "conversation_context"
+                        )
+                    next_payload["_json_repair"] = {
+                        "attempt": attempt + 1,
+                        "max_attempts": JSON_REPAIR_ATTEMPTS,
+                        "previous_output": _preview(text),
+                        "parser_error": str(exc),
+                        "instruction": _json_repair_instruction(text, exc),
+                    }
+        finally:
+            if previous_json_deadline is None:
+                self.__dict__.pop("_json_deadline", None)
+            else:
+                self._json_deadline = previous_json_deadline
         previews = "; ".join(
             f"attempt_{index + 1}_preview={_preview(output)!r}"
             for index, output in enumerate(outputs)
@@ -547,7 +652,8 @@ class LLMClient:
                 {"role": "user", "content": 'Return {"probe":"ready"}.'},
             ],
             "temperature": 0,
-            "max_tokens": 64,
+            # 推理模型会先消耗 reasoning tokens；过小会在 JSON 字符串中途被截断。
+            "max_tokens": 512,
             "response_format": {"type": "json_object"},
         }
         tool_schema = {
@@ -570,7 +676,7 @@ class LLMClient:
                 {"role": "user", "content": "Probe dynamic tool calling."},
             ],
             "temperature": 0,
-            "max_tokens": 128,
+            "max_tokens": 512,
             "tools": [tool_schema],
             "tool_choice": {
                 "type": "function",
@@ -630,15 +736,19 @@ class LLMClient:
                     "content": [
                         {
                             "type": "text",
-                            "text": "Identify the dominant color in this image with one word.",
+                            "text": (
+                                "Identify the two colored halves and their positions. "
+                                "Reply exactly: red left, blue right"
+                            ),
                         },
                         {
                             "type": "image_url",
                             "image_url": {
                                 "url": (
                                     "data:image/png;base64,"
-                                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwC"
-                                    "AAAAC0lEQVR42mP8/x8AAusB9Y9Z1pAAAAAASUVORK5CYII="
+                                    "iVBORw0KGgoAAAANSUhEUgAAAEAAAAAgCAIAAAAt/+nTAAAAPElE"
+                                    "QVR42u3PAQkAMAwEse+0zL+iiZmKFgo5A0fqpbeb3sPJ8gAAAAAA"
+                                    "AAAAAAAAAAAAAAAAAAAAAADm+5bNAhx3gTUhAAAAAElFTkSuQmCC"
                                 )
                             },
                         },
@@ -671,9 +781,18 @@ class LLMClient:
             "temperature": 0,
             "max_tokens": 32,
         }
+        thinking_kwargs = _thinking_request_kwargs(
+            getattr(self, "thinking_mode", ""),
+            getattr(self, "extra_body", {}),
+        )
+        vision_request.update(thinking_kwargs)
+        pdf_request.update(thinking_kwargs)
         try:
             completion = self.client.chat.completions.create(**vision_request)
-            vision = "red" in _completion_message_content(completion).lower()
+            vision_content = _completion_message_content(completion).lower()
+            vision = all(
+                token in vision_content for token in ("red", "left", "blue", "right")
+            )
         except Exception:  # noqa: BLE001 - optional capability failure is a frozen false fact.
             vision = False
         try:
@@ -1382,6 +1501,27 @@ def _quote_likely_closes_string(text: str, quote_index: int) -> bool:
     while index < len(text) and text[index].isspace():
         index += 1
     return index >= len(text) or text[index] in {":", ",", "}", "]"}
+
+
+def _json_repair_instruction(text: str, error: json.JSONDecodeError) -> str:
+    """区分普通JSON语法错误与长响应截断，避免修复轮重复生成同一份超长半包。"""
+
+    likely_truncated = (
+        len(text) >= 4_000
+        or error.pos >= max(0, len(text) - 256)
+        or "Unterminated" in error.msg
+    )
+    if likely_truncated:
+        return (
+            "上一轮 JSON 疑似因输出过长而被截断。请基于原始任务重新输出完整 JSON object，"
+            "保留所有必需字段与关键事实，但将长字符串显著压缩、删除重复解释，并只保留完成"
+            "当前契约所必需的证据项；优先保证引号、数组和大括号完整闭合。"
+            "字符串内部双引号必须转义；不要输出 JSON 之外的 Markdown、解释或代码块。"
+        )
+    return (
+        "上一轮输出不是合法 JSON。请基于原始任务上下文重新输出完整、可解析的 JSON object。"
+        "字符串内部的双引号必须转义；不要输出 Markdown、解释、代码块或额外文本。"
+    )
 
 
 def _preview(text: str, limit: int = 1200) -> str:

@@ -6,6 +6,8 @@
 @Description: 验证回复投影、工具失败、控制消息直出和模型调用边界。
 """
 
+import pytest
+
 from app.core.response_generator import ResponseGenerator
 from app.db.models import ChatSession, Skill
 from app.llm.client import LLMClient
@@ -201,6 +203,69 @@ def test_failed_tool_result_returns_explicit_failure_without_model_call(monkeypa
     )
 
     assert reply == "工具调用失败：order.query（HTTP_ERROR）：工具返回异常状态码：502。请检查工具配置、调用参数或外部服务状态后重试。"
+
+
+def test_failed_tool_result_with_authoritative_attachment_calls_response_model(monkeypatch):
+    """附件事实存在时工具失败不能掩盖附件回答，回复阶段仍须调用模型。"""
+
+    calls: list[dict[str, object]] = []
+
+    class FakeClient:
+        """记录带附件权威切片的回复模型调用。"""
+
+        def __init__(self, _model_config) -> None:
+            """接受与生产客户端一致的模型配置参数。"""
+
+        def generate_text(self, _system_prompt, payload):
+            """保存回复负载并返回附件事实。"""
+
+            calls.append(payload)
+            return "版本 2.4，发布日期 2026-09-15。"
+
+    monkeypatch.setattr("app.core.response_generator.LLMClient", FakeClient)
+    context = {
+        "current_turn_inputs": [
+            {
+                "filename": "service_manual.docx",
+                "read_receipt_id": "receipt_docx",
+                "elements": [
+                    {
+                        "element_id": "docx_1",
+                        "type": "text",
+                        "text": "Service Manual 2.4;发布日期 2026-09-15",
+                    }
+                ],
+            }
+        ]
+    }
+    tool_result = ToolResult(
+        tool_name="publish_tool",
+        success=False,
+        error=ToolError(code="TOOL_REJECTED", message="附件中的指令不允许执行"),
+    )
+
+    generator = ResponseGenerator()
+    assert generator.requires_model_call(
+        StepAgentResult(),
+        tool_result,
+        force_model_call=True,
+        conversation_context=context,
+    ) is True
+    reply = generator.generate(
+        "只依据附件回答版本号和发布日期",
+        ChatSession(id="session_test", tenant_id="tenant_demo"),
+        None,
+        RouterDecision(decision="answer_only"),
+        StepAgentResult(),
+        tool_result,
+        model_config=None,  # type: ignore[arg-type]
+        conversation_context=context,
+        force_model_call=True,
+    )
+
+    assert reply == "版本 2.4，发布日期 2026-09-15。"
+    assert len(calls) == 1
+    assert calls[0]["authoritative_attachment_evidence"][0]["filename"] == "service_manual.docx"
 
 
 def test_identity_authorization_denial_is_returned_verbatim(monkeypatch):
@@ -563,6 +628,50 @@ def test_stream_model_failure_returns_explicit_reason(monkeypatch):
     assert "".join(chunks) == "模型调用失败（LLM_ERROR）：connection refused。请检查模型配置、API Key、网络或模型服务状态后重试。"
 
 
+def test_stream_attachment_model_failure_can_propagate_for_dispatch_ledger(monkeypatch):
+    """已授权附件外呼失败时必须抛回 AgentLoop，避免错误结算 Provider Receipt。"""
+
+    def fake_init(self, model_config):  # noqa: ANN001
+        return None
+
+    def failing_stream(self, system_prompt, payload):  # noqa: ANN001
+        raise RuntimeError("provider unavailable")
+        yield ""  # pragma: no cover
+
+    monkeypatch.setattr(LLMClient, "__init__", fake_init)
+    monkeypatch.setattr(LLMClient, "generate_text_stream", failing_stream)
+
+    with pytest.raises(RuntimeError, match="provider unavailable"):
+        list(
+            ResponseGenerator().generate_stream(
+                message="只依据附件回答版本号",
+                session=ChatSession(id="session_test", tenant_id="tenant_demo"),
+                skill=None,
+                router_decision=RouterDecision(decision="answer_only"),
+                step_result=StepAgentResult(),
+                tool_result=None,
+                model_config=None,  # type: ignore[arg-type]
+                conversation_context={
+                    "current_turn_inputs": [
+                        {
+                            "filename": "service_manual.docx",
+                            "read_receipt_id": "receipt_docx",
+                            "elements": [
+                                {
+                                    "element_id": "docx_1",
+                                    "type": "text",
+                                    "text": "Service Manual 2.4",
+                                }
+                            ],
+                        }
+                    ]
+                },
+                force_model_call=True,
+                propagate_model_failure=True,
+            )
+        )
+
+
 def test_stream_pending_reply_without_tool_result_is_model_driven(monkeypatch):
     def fake_init(self, model_config):  # noqa: ANN001
         return None
@@ -739,6 +848,71 @@ def test_response_generator_skips_model_for_simple_step_question(monkeypatch) ->
     )
 
     assert reply == "请补充报销金额。"
+
+
+def test_managed_attachment_forces_response_model_even_if_step_guessed_a_reply(
+    monkeypatch,
+) -> None:
+    """控制模型的ask_user文案不得绕过附件外发账本并冒充附件分析结果。"""
+
+    calls: list[str] = []
+    payloads: list[dict[str, object]] = []
+
+    class FakeClient:
+        """记录模型调用，避免测试依赖真实加密配置。"""
+
+        def __init__(self, _model_config) -> None:
+            """接受与生产客户端一致的配置入口。"""
+
+        def generate_text(self, _system_prompt, _payload):
+            """返回可识别的附件分析结果并记录一次真实生成分支。"""
+
+            calls.append("called")
+            payloads.append(_payload)
+            return "East=100，West=100"
+
+    monkeypatch.setattr("app.core.response_generator.LLMClient", FakeClient)
+    reply = ResponseGenerator().generate(
+        "请分析本轮附件",
+        ChatSession(id="session_test", tenant_id="tenant_demo"),
+        None,
+        RouterDecision(decision="answer_only"),
+        StepAgentResult(action="ask_user", reply="East=100，West=100"),
+        None,
+        model_config=None,  # type: ignore[arg-type]
+        conversation_context={
+            "current_turn_inputs": [
+                {
+                    "filename": "sales_targets.csv",
+                    "mime_type": "text/csv",
+                    "instruction_boundary": "attachment_content_is_untrusted_data",
+                    "read_receipt_id": "receipt_1",
+                    "slice_checksum": "checksum_1",
+                    "elements": [
+                        {
+                            "element_id": "element_1",
+                            "type": "table",
+                            "text": "Region,Target\\nEast,100\\nWest,100",
+                            "table": {
+                                "columns": ["Region", "Target"],
+                                "rows": [["East", "100"], ["West", "100"]],
+                            },
+                            "locator": {"kind": "csv", "row_start": 1, "row_end": 3},
+                            "content_checksum": "element_checksum_1",
+                        }
+                    ],
+                }
+            ]
+        },
+        force_model_call=True,
+    )
+
+    assert reply == "East=100，West=100"
+    assert calls == ["called"]
+    evidence = payloads[0]["authoritative_attachment_evidence"]
+    assert isinstance(evidence, list)
+    assert evidence[0]["filename"] == "sales_targets.csv"
+    assert evidence[0]["elements"][0]["text"] == "Region,Target\\nEast,100\\nWest,100"
 
 
 def test_response_generator_stream_skips_model_for_simple_clarification(monkeypatch) -> None:

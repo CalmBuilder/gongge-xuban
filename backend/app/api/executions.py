@@ -19,12 +19,18 @@ from app.db.models import (
     DynamicReadDispatchItem,
     DynamicReadDispatchResult,
     ExecutionArtifact,
+    ArtifactRendererJob,
     ExecutionCommand,
     ExecutionPlanRevision,
     ExecutionPublication,
     ExecutionResult,
     GeneralSkillUse,
+    InputResourceSnapshot,
+    MessageInputBindingLink,
+    ProviderInputDispatchGroup,
+    ProviderInputDispatchReceipt,
     SopOperationAttempt,
+    SopOperation,
     SopInstance,
     SopNodeExecution,
     SopWorkItem,
@@ -100,6 +106,51 @@ class ExecutionSkillUseSummary(BaseModel):
     status: str
 
 
+class ExecutionInputResourceSummary(BaseModel):
+    """返回 Execution 冻结的附件版本与提取清单校验事实，不返回文件正文。"""
+
+    id: str
+    source_resource_id: str
+    source_version: str
+    filename: str
+    mime_type: str
+    content_checksum: str
+    extraction_id: str | None
+    extraction_checksum: str
+    element_manifest_checksum: str | None
+
+
+class ExecutionInputDispatchSummary(BaseModel):
+    """返回附件外发Group及逐资源Receipt终态计数，不暴露正文或凭据。"""
+
+    group_id: str
+    status: str
+    receipt_count: int
+    settled_count: int
+    unknown_count: int
+
+
+class ExecutionRendererJobSummary(BaseModel):
+    """返回确定性产物任务状态和固定renderer版本，供浏览器机械验收。"""
+
+    id: str
+    artifact_key: str
+    filename: str
+    status: str
+    required: bool
+    renderer_version: str
+    artifact_id: str | None
+
+
+class ExecutionOperationSummary(BaseModel):
+    """返回正式SOP与动态任务实际执行的Operation终态，不暴露输入正文。"""
+
+    id: str
+    operation_name: str
+    effect_kind: str
+    status: str
+
+
 class ExecutionRead(BaseModel):
     """返回执行卡可直接使用、无需由聊天消息推导的权威状态。"""
 
@@ -115,6 +166,7 @@ class ExecutionRead(BaseModel):
     current_plan_revision_id: str | None
     plan_revision_number: int | None
     plan_reason: str | None
+    guidance_requirements: list[dict[str, object]]
     current_result_id: str | None
     terminal_reason: dict[str, object]
     goal: str | None
@@ -125,8 +177,13 @@ class ExecutionRead(BaseModel):
     usage: dict[str, object]
     pending_attention_count: int
     parallel_waves: list[ParallelReadWaveSummary]
+    input_resources: list[ExecutionInputResourceSummary]
+    input_dispatches: list[ExecutionInputDispatchSummary]
     skill_uses: list[ExecutionSkillUseSummary]
     artifacts: list[ExecutionArtifactSummary]
+    renderer_jobs: list[ExecutionRendererJobSummary]
+    operations: list[ExecutionOperationSummary]
+    input_binding_count: int
 
 
 class ExecutionResultRead(BaseModel):
@@ -434,6 +491,55 @@ def _execution_read(db: Session, instance: SopInstance, current_user: User) -> E
             .order_by(GeneralSkillUse.created_at, GeneralSkillUse.id)
         ).all()
     ]
+    input_resources = [
+        ExecutionInputResourceSummary(
+            id=snapshot.id,
+            source_resource_id=snapshot.source_resource_id,
+            source_version=snapshot.source_version,
+            filename=snapshot.filename,
+            mime_type=snapshot.mime_type,
+            content_checksum=snapshot.content_checksum,
+            extraction_id=snapshot.extraction_id,
+            extraction_checksum=snapshot.extraction_checksum,
+            element_manifest_checksum=snapshot.element_manifest_checksum,
+        )
+        for snapshot in db.exec(
+            select(InputResourceSnapshot)
+            .where(
+                InputResourceSnapshot.tenant_id == instance.tenant_id,
+                InputResourceSnapshot.execution_id == instance.id,
+            )
+            .order_by(InputResourceSnapshot.created_at, InputResourceSnapshot.id)
+        ).all()
+    ]
+    input_dispatches: list[ExecutionInputDispatchSummary] = []
+    for group in db.exec(
+        select(ProviderInputDispatchGroup)
+        .where(
+            ProviderInputDispatchGroup.tenant_id == instance.tenant_id,
+            ProviderInputDispatchGroup.consumer_kind == "dynamic_task",
+            ProviderInputDispatchGroup.causation_id.startswith(
+                f"execution:{instance.id}:"
+            ),
+        )
+        .order_by(ProviderInputDispatchGroup.created_at, ProviderInputDispatchGroup.id)
+    ).all():
+        receipts = db.exec(
+            select(ProviderInputDispatchReceipt).where(
+                ProviderInputDispatchReceipt.tenant_id == instance.tenant_id,
+                ProviderInputDispatchReceipt.dispatch_group_id == group.id,
+                ProviderInputDispatchReceipt.execution_id == instance.id,
+            )
+        ).all()
+        input_dispatches.append(
+            ExecutionInputDispatchSummary(
+                group_id=group.id,
+                status=group.status,
+                receipt_count=len(receipts),
+                settled_count=sum(item.status == "settled" for item in receipts),
+                unknown_count=sum(item.status == "unknown" for item in receipts),
+            )
+        )
     goal_snapshot = dict(instance.goal_snapshot_json or {})
     criteria = plan.get("success_criteria", goal_snapshot.get("success_criteria", []))
     artifact_service = ArtifactService(db)
@@ -463,6 +569,49 @@ def _execution_read(db: Session, instance: SopInstance, current_user: User) -> E
                 source_step_key=artifact.source_step_key,
             )
         )
+    renderer_jobs = [
+        ExecutionRendererJobSummary(
+            id=job.id,
+            artifact_key=job.artifact_key,
+            filename=job.filename,
+            status=job.status,
+            required=job.required,
+            renderer_version=job.renderer_version,
+            artifact_id=job.artifact_id,
+        )
+        for job in db.exec(
+            select(ArtifactRendererJob)
+            .where(
+                ArtifactRendererJob.tenant_id == instance.tenant_id,
+                ArtifactRendererJob.execution_id == instance.id,
+            )
+            .order_by(ArtifactRendererJob.created_at, ArtifactRendererJob.id)
+        ).all()
+    ]
+    operations = [
+        ExecutionOperationSummary(
+            id=operation.id,
+            operation_name=operation.operation_name,
+            effect_kind=operation.effect_kind,
+            status=operation.status,
+        )
+        for operation in db.exec(
+            select(SopOperation)
+            .where(
+                SopOperation.tenant_id == instance.tenant_id,
+                SopOperation.instance_id == instance.id,
+            )
+            .order_by(SopOperation.created_at, SopOperation.id)
+        ).all()
+    ]
+    input_binding_count = len(
+        db.exec(
+            select(MessageInputBindingLink.id).where(
+                MessageInputBindingLink.tenant_id == instance.tenant_id,
+                MessageInputBindingLink.execution_id == instance.id,
+            )
+        ).all()
+    )
 
     return ExecutionRead(
         id=instance.id,
@@ -477,6 +626,11 @@ def _execution_read(db: Session, instance: SopInstance, current_user: User) -> E
         current_plan_revision_id=instance.current_plan_revision_id,
         plan_revision_number=plan_revision.revision_number if plan_revision is not None else None,
         plan_reason=plan_revision.reason if plan_revision is not None else None,
+        guidance_requirements=[
+            dict(value)
+            for value in plan.get("guidance_requirements", [])
+            if isinstance(value, dict)
+        ],
         current_result_id=instance.current_result_id,
         terminal_reason=dict(instance.terminal_reason_json or {}),
         goal=str(plan.get("goal") or goal_snapshot.get("goal") or "").strip() or None,
@@ -489,8 +643,13 @@ def _execution_read(db: Session, instance: SopInstance, current_user: User) -> E
         usage=dict((instance.context_json or {}).get("dynamic_budget_usage") or {}),
         pending_attention_count=pending_attention_count,
         parallel_waves=parallel_waves,
+        input_resources=input_resources,
+        input_dispatches=input_dispatches,
         skill_uses=skill_uses,
         artifacts=artifacts,
+        renderer_jobs=renderer_jobs,
+        operations=operations,
+        input_binding_count=input_binding_count,
     )
 
 

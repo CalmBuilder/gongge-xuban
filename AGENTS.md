@@ -58,7 +58,7 @@ npm ci
 ./app.sh stop
 ```
 
-统一应用和 Swagger 默认位于 `http://localhost:5137` 与 `/docs`。直接运行 `npm run dev` 的 5173 端口只用于前后端拆分调试；此时要核对 `VITE_API_BASE_URL`/Vite proxy，不能假定它与统一启动链路相同。
+统一应用和 Swagger 默认位于 `http://localhost:5137` 与 `/docs`。直接运行 `npm run dev` 时也使用 5137，但它只用于前后端拆分调试；此时要核对 `VITE_API_BASE_URL`/Vite proxy，不能与统一启动链路同时占用该端口。
 
 ## 验证命令
 

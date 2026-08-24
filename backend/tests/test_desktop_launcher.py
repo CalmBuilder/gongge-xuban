@@ -88,6 +88,21 @@ def test_desktop_identity_uses_new_brand() -> None:
     assert desktop_launcher.APP_ID == "cn.gongge.xuban.desktop"
 
 
+def test_parser_cli_short_circuits_desktop_server(monkeypatch) -> None:
+    """打包进程收到parser参数时只运行解析入口，不初始化端口、窗口或Web服务。"""
+
+    monkeypatch.setattr("app.session.input_parser_cli.main", lambda argv: 17)
+    monkeypatch.delenv("PUBLIC_MOCK_API_KEY", raising=False)
+    monkeypatch.setattr(
+        desktop_launcher,
+        "build_server_config",
+        lambda: (_ for _ in ()).throw(AssertionError("desktop server must not start")),
+    )
+
+    assert desktop_launcher.main(["--input-parser", "--format", "csv"]) == 17
+    assert desktop_launcher.os.environ["PUBLIC_MOCK_API_KEY"] == "attachment-parser-disabled"
+
+
 def test_health_accepts_new_product_marker(monkeypatch) -> None:
     """健康检查应接受 5137 端口返回的当前产品标识。"""
     class FakeResponse:

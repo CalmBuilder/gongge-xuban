@@ -486,8 +486,8 @@ def test_0055_backfills_legacy_revision_and_authorization_state_reentrantly(tmp_
                 )
             },
         )
-    command.upgrade(config, "head")
-    command.upgrade(config, "head")
+    command.upgrade(config, "20260815_0066")
+    command.upgrade(config, "20260815_0066")
 
     assert "general_skill_authorization_states" in inspect(engine).get_table_names()
     assert "general_skill_authorization_events" in inspect(engine).get_table_names()

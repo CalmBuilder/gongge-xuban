@@ -160,6 +160,34 @@ class ModelVisibilityContract(BaseModel):
         return self
 
 
+class CapabilityApplicabilityContract(BaseModel):
+    """声明领域能力或通用 Agent 工作区能力可进入规划器的目标范围。"""
+
+    mode: Literal["goal_scoped", "agent_workspace"]
+    domains: tuple[str, ...] = ()
+    aliases: tuple[str, ...] = ()
+    intents: tuple[Literal["code_inspect", "code_change", "code_execute"], ...] = ()
+    model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="after")
+    def validate_scope(self) -> "CapabilityApplicabilityContract":
+        """拒绝空领域范围、重复匹配词和没有代码意图的工作区声明。"""
+
+        terms = [*self.domains, *self.aliases]
+        if any(not item.strip() or len(item) > 64 for item in terms):
+            raise ValueError("能力适用范围词必须为1至64个非空字符")
+        if len({item.casefold() for item in terms}) != len(terms):
+            raise ValueError("能力适用范围词不得重复")
+        if len(set(self.intents)) != len(self.intents):
+            raise ValueError("Agent工作区意图不得重复")
+        if self.mode == "goal_scoped":
+            if not terms or self.intents:
+                raise ValueError("goal_scoped必须声明domain/alias且不得声明工作区意图")
+        elif self.domains or self.aliases or not self.intents:
+            raise ValueError("agent_workspace必须且只能声明至少一个代码意图")
+        return self
+
+
 class ToolReliabilityContract(BaseModel):
     """动态任务工具的服务端可靠性发布契约。"""
 
@@ -169,6 +197,7 @@ class ToolReliabilityContract(BaseModel):
     idempotency: IdempotencyContract = Field(default_factory=IdempotencyContract)
     reconcile: ReconcileContract = Field(default_factory=ReconcileContract)
     model_visibility: ModelVisibilityContract = Field(default_factory=ModelVisibilityContract)
+    applicability: CapabilityApplicabilityContract | None = None
     timeout_policy: Literal["failed", "unknown"]
     dynamic_task_enabled: bool = False
     explore_safe: bool = False
@@ -270,6 +299,8 @@ def _tool_contract_payload(contract: ToolReliabilityContract) -> dict[str, Any]:
     """序列化发布契约，并在默认关闭时保持既有 checksum 向后兼容。"""
 
     payload = contract.model_dump(mode="json")
+    if payload.get("applicability") is None:
+        payload.pop("applicability", None)
     if payload.get("explore_safe") is False:
         payload.pop("explore_safe", None)
     if payload.get("parallel_safe") is False:

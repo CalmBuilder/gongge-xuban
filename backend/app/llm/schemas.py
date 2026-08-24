@@ -71,12 +71,28 @@ class ModelConfigRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class ModelConnectionCheck(BaseModel):
+    """描述连接测试的单个机械阶段，便于页面区分认证、模型与计费故障。"""
+
+    name: str
+    status: Literal["passed", "failed", "skipped"]
+    message: str
+
+
 class ModelConfigTestResponse(BaseModel):
-    """表达普通连接测试结果，不等价于动态能力预检。"""
+    """表达分阶段连接测试结果，不等价于动态能力预检。"""
 
     success: bool
     message: str
     output: Optional[str] = None
+    error_code: Optional[str] = None
+    http_status: Optional[int] = None
+    provider_code: Optional[str] = None
+    request_id: Optional[str] = None
+    endpoint: Optional[str] = None
+    model: Optional[str] = None
+    suggestion: Optional[str] = None
+    checks: list[ModelConnectionCheck] = Field(default_factory=list)
 
 
 class ModelCapabilityPreflightResponse(BaseModel):
