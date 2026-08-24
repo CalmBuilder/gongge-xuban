@@ -8462,13 +8462,24 @@ def _ensure_diagnostic_guidance_scaffold(
         return completed
     if completed.proposal.action_kind not in {ActionKind.ANSWER, ActionKind.COMPLETE}:
         return completed
-    feedback_text = json.dumps(repair_feedback, ensure_ascii=False)
     diagnostic_errors = (
         "guidance_hypotheses_required",
         "guidance_probe_required",
         "guidance_exit_criteria_required",
     )
-    if not any(error in feedback_text for error in diagnostic_errors):
+    # 只根据验证器实际返回的 guidance_application_errors 决定是否补骨架。
+    # repair_feedback 的 instruction 会列出所有可能的错误码，不能把其中的
+    # 示例文字当成当前结果的失败事实，否则普通写作/附件任务会被误加诊断段落。
+    verification = repair_feedback.get("verification")
+    verification_errors = (
+        verification.get("guidance_application_errors")
+        if isinstance(verification, Mapping)
+        else None
+    )
+    if not isinstance(verification_errors, Sequence) or not any(
+        any(error_code in str(error) for error_code in diagnostic_errors)
+        for error in verification_errors
+    ):
         return completed
     arguments = completed.proposal.arguments
     markdown = str(arguments.get("markdown") or "")

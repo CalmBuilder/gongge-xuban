@@ -636,6 +636,42 @@ def test_diagnostic_guidance_scaffold_repairs_short_provider_answer_without_fact
     assert proposal.proposal.arguments["markdown"] == "已读取源码并运行 diagnosis-red check，结果见上文。"
 
 
+def test_diagnostic_guidance_scaffold_ignores_error_codes_only_listed_in_repair_instruction() -> None:
+    """修复说明中的候选错误码不能被误当成当前验证失败。"""
+
+    proposal = CompletedProviderProposal(
+        response_id="provider_coverage_repair",
+        finish_reason="stop",
+        proposal=RuntimeActionProposal(
+            action_kind=ActionKind.ANSWER,
+            arguments={
+                "markdown": "已补充改动行为与测试覆盖清单。",
+                "criterion_evidence": {},
+                "pending_questions": [],
+            },
+            rationale="形成最终结果",
+        ),
+    )
+
+    repaired = _ensure_diagnostic_guidance_scaffold(
+        proposal,
+        repair_feedback={
+            "verification": {
+                "guidance_application_errors": [
+                    "guidreq_demo:guidance_changed_behavior_test_coverage_required",
+                ]
+            },
+            # 真实修复提示会枚举其它可能的错误码；这些文字不是验证结果。
+            "instruction": (
+                "若 guidance_application_errors 含 guidance_hypotheses_required、"
+                "guidance_probe_required 或 guidance_exit_criteria_required，则补充诊断骨架。"
+            ),
+        },
+    )
+
+    assert repaired.proposal.arguments["markdown"] == "已补充改动行为与测试覆盖清单。"
+
+
 def test_authoritative_claim_disclosure_repair_only_appends_supported_atom() -> None:
     """仅补入元素正文支持的最小事实，不把模型摘要或伪造Claim写进答案。"""
 
