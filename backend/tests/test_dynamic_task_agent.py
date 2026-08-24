@@ -78,6 +78,7 @@ from app.dynamic_tasks.agent import (
     _append_authoritative_claim_disclosures,
     _append_frozen_guidance_disclosures,
     _ensure_diagnostic_guidance_scaffold,
+    _repair_feedback_has_guidance_error,
     _normalize_dynamic_result_arguments,
     _redact_untrusted_instruction_echoes,
     _untrusted_instruction_echo_errors,
@@ -670,6 +671,31 @@ def test_diagnostic_guidance_scaffold_ignores_error_codes_only_listed_in_repair_
     )
 
     assert repaired.proposal.arguments["markdown"] == "已补充改动行为与测试覆盖清单。"
+
+
+def test_repair_feedback_error_lookup_reads_only_verifier_error_list() -> None:
+    """修复动作门禁只接受验证器错误列表中的代码。"""
+
+    feedback = {
+        "verification": {
+            "guidance_application_errors": [
+                "guidreq_demo:guidance_completion_criteria_required",
+            ]
+        },
+        "instruction": (
+            "若 guidance_application_errors 含 guidance_changed_behavior_test_coverage_required，"
+            "才补充改动行为测试覆盖。"
+        ),
+    }
+
+    assert _repair_feedback_has_guidance_error(
+        feedback,
+        "guidance_completion_criteria_required",
+    )
+    assert not _repair_feedback_has_guidance_error(
+        feedback,
+        "guidance_changed_behavior_test_coverage_required",
+    )
 
 
 def test_authoritative_claim_disclosure_repair_only_appends_supported_atom() -> None:

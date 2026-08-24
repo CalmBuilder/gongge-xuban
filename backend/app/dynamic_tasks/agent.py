@@ -6818,9 +6818,9 @@ class DynamicTaskAgent:
                 if repair_feedback is None
                 else "请依据 result_repair_feedback 修复同一最终动作。"
             )
-            if repair_feedback is not None and "guidance_changed_behavior_test_coverage_required" in json.dumps(
+            if _repair_feedback_has_guidance_error(
                 repair_feedback,
-                ensure_ascii=False,
+                "guidance_changed_behavior_test_coverage_required",
             ):
                 action_instruction += (
                     " 这是硬性结果门禁：最终 markdown 必须逐项列出改动行为对应的测试/检查，"
@@ -8445,6 +8445,25 @@ def _append_frozen_guidance_disclosures(
     return result.model_copy(update={"markdown": f"{markdown}{suffix}"})
 
 
+def _repair_feedback_has_guidance_error(
+    repair_feedback: Mapping[str, object] | None,
+    error_code: str,
+) -> bool:
+    """只在验证器错误列表中查找指定错误，忽略修复提示中的候选错误码。"""
+
+    if repair_feedback is None:
+        return False
+    verification = repair_feedback.get("verification")
+    errors = (
+        verification.get("guidance_application_errors")
+        if isinstance(verification, Mapping)
+        else None
+    )
+    if not isinstance(errors, Sequence) or isinstance(errors, (str, bytes)):
+        return False
+    return any(error_code in str(error) for error in errors)
+
+
 def _ensure_diagnostic_guidance_scaffold(
     completed: CompletedProviderProposal,
     *,
@@ -8462,23 +8481,16 @@ def _ensure_diagnostic_guidance_scaffold(
         return completed
     if completed.proposal.action_kind not in {ActionKind.ANSWER, ActionKind.COMPLETE}:
         return completed
-    diagnostic_errors = (
-        "guidance_hypotheses_required",
-        "guidance_probe_required",
-        "guidance_exit_criteria_required",
-    )
     # 只根据验证器实际返回的 guidance_application_errors 决定是否补骨架。
     # repair_feedback 的 instruction 会列出所有可能的错误码，不能把其中的
     # 示例文字当成当前结果的失败事实，否则普通写作/附件任务会被误加诊断段落。
-    verification = repair_feedback.get("verification")
-    verification_errors = (
-        verification.get("guidance_application_errors")
-        if isinstance(verification, Mapping)
-        else None
-    )
-    if not isinstance(verification_errors, Sequence) or not any(
-        any(error_code in str(error) for error_code in diagnostic_errors)
-        for error in verification_errors
+    if not any(
+        _repair_feedback_has_guidance_error(repair_feedback, error_code)
+        for error_code in (
+            "guidance_hypotheses_required",
+            "guidance_probe_required",
+            "guidance_exit_criteria_required",
+        )
     ):
         return completed
     arguments = completed.proposal.arguments
