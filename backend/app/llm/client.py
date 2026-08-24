@@ -1514,8 +1514,10 @@ def _json_repair_instruction(text: str, error: json.JSONDecodeError) -> str:
     if likely_truncated:
         return (
             "上一轮 JSON 疑似因输出过长而被截断。请基于原始任务重新输出完整 JSON object，"
-            "保留所有必需字段与关键事实，但将长字符串显著压缩、删除重复解释，并只保留完成"
-            "当前契约所必需的证据项；优先保证引号、数组和大括号完整闭合。"
+            "保留所有必需字段与关键事实，但将长字符串显著压缩、删除重复解释；这是控制面草案，"
+            "默认 constraints、assumptions、expected_artifacts 为空，不要复制附件或最终文档正文，"
+            "无能力/无 Skill 的任务只保留一个 answer 步骤，并只保留完成当前契约所必需的证据项；"
+            "优先保证引号、数组和大括号完整闭合。"
             "字符串内部双引号必须转义；不要输出 JSON 之外的 Markdown、解释或代码块。"
         )
     return (

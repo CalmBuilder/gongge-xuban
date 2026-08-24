@@ -29,6 +29,7 @@ ROLE_PATHS = {
     "attachment_evidence_and_safety": EVIDENCE_DIR / "q1-current-source-blind-role-attachment.json",
 }
 OUTPUT_PATH = EVIDENCE_DIR / "q1-current-source-blind-review-report.json"
+Q1_RELEASE_POLICY = "quality_first"
 BATCH_PATHS = {
     "current-source": {
         "package": PACKAGE_PATH,
@@ -308,9 +309,20 @@ def _build_report(
         },
         "release_gate": {
             "status": "not_passed",
+            "policy": Q1_RELEASE_POLICY,
+            "blocking_gaps": [
+                "supplementary_blind_scores_are_not_hidden_100_point_certification",
+                "q1_preregistered_quality_and_fact_safety_noninferiority_not_closed",
+                "historical_same_task_deployment_comparison_not_reproducible",
+                "real_deployment_and_native_external_gates_not_closed",
+            ],
+            "deferred_observations": [
+                "cost_and_latency_budget_attribution_is_deferred_by_quality_first_policy",
+            ],
             "reason": (
                 "独立角色覆盖已完成，但盲评分值是0..10的补充观察，不等同隐藏100分量表；"
-                "Q1预注册总分/方法分阈值、事实安全历史非劣、成本预算和历史同题部署仍未闭合。"
+                "Q1预注册总分/方法分阈值、事实安全非劣、历史同题部署和真实部署外部门仍未闭合。"
+                "成本/延迟按quality_first策略延后，不作为当前质量验收阻断项。"
             ),
             "q1_claim_allowed": False,
         },

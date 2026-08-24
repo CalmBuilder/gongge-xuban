@@ -78,7 +78,10 @@ from app.dynamic_tasks.agent import (
     _append_authoritative_claim_disclosures,
     _append_frozen_guidance_disclosures,
     _ensure_diagnostic_guidance_scaffold,
+    _ensure_guidance_coverage_scaffold,
+    _guidance_repair_hints,
     _repair_feedback_has_guidance_error,
+    _restore_guidance_repair_hints,
     _normalize_dynamic_result_arguments,
     _redact_untrusted_instruction_echoes,
     _untrusted_instruction_echo_errors,
@@ -696,6 +699,161 @@ def test_repair_feedback_error_lookup_reads_only_verifier_error_list() -> None:
         feedback,
         "guidance_changed_behavior_test_coverage_required",
     )
+
+
+def test_guidance_coverage_scaffold_only_adds_pending_boundary() -> None:
+    """覆盖门禁失败时只补冻结映射的待执行清单，不捏造命令或成功回执。"""
+
+    proposal = CompletedProviderProposal(
+        response_id="provider_coverage_empty_repair",
+        finish_reason="stop",
+        proposal=RuntimeActionProposal(
+            action_kind=ActionKind.ANSWER,
+            arguments={
+                "markdown": "已整理文档，但模型修复轮未返回覆盖清单。",
+                "criterion_evidence": {},
+                "pending_questions": [],
+            },
+            rationale="形成最终结果",
+        ),
+    )
+    repaired = _ensure_guidance_coverage_scaffold(
+        proposal,
+        repair_feedback={
+            "verification": {
+                "guidance_application_errors": [
+                    "guidreq_demo:guidance_changed_behavior_test_coverage_required",
+                ]
+            }
+        },
+        guidance_requirements=[
+            {
+                "requirement_id": "guidreq_demo",
+                "task_mapping": "将完成标准映射到当前文档改动",
+                "observable_acceptance": "逐项列出对应检查",
+            }
+        ],
+    )
+    markdown = repaired.proposal.arguments["markdown"]
+    assert "改动行为测试/检查清单（待执行，不代表已通过）" in markdown
+    assert "所有改动行为均有测试覆盖" in markdown
+    assert "材料未提供真实执行回执" in markdown
+    assert "exit_code=0" not in markdown
+    assert proposal.proposal.arguments["markdown"] == (
+        "已整理文档，但模型修复轮未返回覆盖清单。"
+    )
+
+
+def test_guidance_coverage_scaffold_ignores_instruction_examples() -> None:
+    """修复说明中列出的候选错误码不能触发覆盖清单宿主兜底。"""
+
+    proposal = CompletedProviderProposal(
+        response_id="provider_coverage_instruction_only",
+        finish_reason="stop",
+        proposal=RuntimeActionProposal(
+            action_kind=ActionKind.ANSWER,
+            arguments={
+                "markdown": "已完成交付。",
+                "criterion_evidence": {},
+                "pending_questions": [],
+            },
+            rationale="形成最终结果",
+        ),
+    )
+    repaired = _ensure_guidance_coverage_scaffold(
+        proposal,
+        repair_feedback={
+            "verification": {"guidance_application_errors": []},
+            "instruction": "若含 guidance_changed_behavior_test_coverage_required，则补充清单",
+        },
+    )
+    assert repaired.proposal.arguments["markdown"] == "已完成交付。"
+
+
+def test_guidance_repair_hints_preserve_previous_application_and_excerpt() -> None:
+    """同一动作的覆盖修复不能丢掉上一轮已经提交的 Skill 回证。"""
+
+    arguments = {
+        "markdown": "已整理文档。",
+        "guidance_applications": [
+            {
+                "skill_use_id": "gsuse_demo",
+                "items": [
+                    {
+                        "requirement_id": "guidreq_0123456789abcdef01234567",
+                        "principle": "保留单一事实来源。",
+                        "application": "将冲突处理规则集中到一个章节。",
+                        "evidence_excerpt": "冲突规则集中到一个章节。",
+                    }
+                ],
+            }
+        ],
+    }
+    hints = _guidance_repair_hints(arguments)
+    assert hints[0]["skill_use_id"] == "gsuse_demo"
+    assert hints[0]["items"][0]["evidence_excerpt"] == "冲突规则集中到一个章节。"
+
+    proposal = CompletedProviderProposal(
+        response_id="provider_guidance_repair",
+        finish_reason="stop",
+        proposal=RuntimeActionProposal(
+            action_kind=ActionKind.ANSWER,
+            arguments={
+                "markdown": "修复轮已重写正文。",
+                "criterion_evidence": {},
+                "pending_questions": [],
+                "guidance_applications": [],
+            },
+            rationale="形成最终结果",
+        ),
+    )
+    repaired = _restore_guidance_repair_hints(
+        proposal,
+        repair_feedback={
+            "verification": {
+                "guidance_application_errors": [
+                    "guidreq_0123456789abcdef01234567:guidance_requirement_required",
+                ]
+            },
+            "guidance_repair_hints": hints,
+        },
+    )
+    repaired_arguments = repaired.proposal.arguments
+    assert repaired_arguments["guidance_applications"][0]["skill_use_id"] == "gsuse_demo"
+    assert "冲突规则集中到一个章节。" in repaired_arguments["markdown"]
+
+
+def test_guidance_repair_hints_do_not_restore_without_required_error() -> None:
+    """无 Requirement 缺失错误时不把旧回证注入新结果。"""
+
+    proposal = CompletedProviderProposal(
+        response_id="provider_guidance_no_restore",
+        finish_reason="stop",
+        proposal=RuntimeActionProposal(
+            action_kind=ActionKind.ANSWER,
+            arguments={
+                "markdown": "已完成。",
+                "criterion_evidence": {},
+                "pending_questions": [],
+                "guidance_applications": [],
+            },
+            rationale="形成最终结果",
+        ),
+    )
+    repaired = _restore_guidance_repair_hints(
+        proposal,
+        repair_feedback={
+            "verification": {
+                "guidance_application_errors": [
+                    "guidreq_demo:guidance_changed_behavior_test_coverage_required",
+                ]
+            },
+            "guidance_repair_hints": [
+                {"skill_use_id": "gsuse_demo", "items": []},
+            ],
+        },
+    )
+    assert repaired.proposal.arguments["guidance_applications"] == []
 
 
 def test_authoritative_claim_disclosure_repair_only_appends_supported_atom() -> None:

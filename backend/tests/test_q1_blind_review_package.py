@@ -81,3 +81,11 @@ def test_current_final_batch_points_to_latest_three_profile_reports() -> None:
     assert aggregator.BATCH_PATHS["current-final"]["package"].name == (
         "q1-current-final-blind-review-package.json"
     )
+
+
+def test_q1_release_policy_defers_cost_without_relaxing_quality_gate() -> None:
+    """quality_first 只移除成本阻断口径，不能把未闭合质量门改成通过。"""
+
+    aggregator = _load_aggregator()
+
+    assert aggregator.Q1_RELEASE_POLICY == "quality_first"

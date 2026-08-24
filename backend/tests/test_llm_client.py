@@ -1401,6 +1401,13 @@ def test_control_plane_operation_output_budgets(operation, expected):  # noqa: A
     assert operation_output_tokens(operation, 8192) == expected
 
 
+def test_dynamic_plan_can_use_configured_long_form_budget_without_inflating_short_models() -> None:
+    """复杂计划可使用管理端16K上限，但小模型配置仍不会被宿主放大。"""
+
+    assert operation_output_tokens("dynamic_task.plan", 16_384) == 16_384
+    assert operation_output_tokens("dynamic_task.plan", 8_192) == 8_192
+
+
 def test_step_agent_caps_output_budget_at_4096() -> None:
     assert operation_output_tokens("step_agent.run", 8192) == 4096
     assert operation_output_tokens("step_agent.repair", 8192) == 4096

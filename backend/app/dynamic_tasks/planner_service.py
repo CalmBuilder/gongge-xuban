@@ -509,7 +509,12 @@ loaded_guidance 非空时，每个已加载 Skill 必须在 guidance_requirement
 具体决策或验收问题；若候选不足以覆盖某个工作面，不得自行补写原则，应诚实保留未覆盖项。
 当用户不授权执行前置操作时，应选择前置门禁并说明所需证据/授权，而不是跳到后续结论。
 只有 forced Skill 确实不适用时，才能为该 Skill 返回唯一
-not_applicable 声明；每个 auto Skill 都必须至少有一条 apply。"""
+not_applicable 声明；每个 auto Skill 都必须至少有一条 apply。
+计划是控制面契约，不是最终回答正文：默认 constraints、assumptions 和
+expected_artifacts 都返回空数组，只有输入明确要求且确实必要时才填写；不要从材料、附件或
+常见工程经验臆造假设、文件或交付物。无能力、无附件、无 loaded_guidance 的普通分析/写作任务
+必须只返回一个 answer 步骤。每个 title 保持简短，steps 尽量少于 4 个，禁止复制附件全文或
+在计划中展开最终文档内容；优先输出短而完整、可校验的结构，避免因冗长控制面响应被截断。"""
 
 _GUIDANCE_IDENTITY_REPAIR_SYSTEM_PROMPT = """你是共格·序伴的 Guidance 身份修复器。只输出一个 JSON object。
 输入包含模型刚刚生成、但缺少 principle_candidate_id 的 GuidanceRequirement，以及服务端投影的

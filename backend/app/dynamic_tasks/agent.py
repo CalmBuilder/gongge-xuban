@@ -1065,6 +1065,9 @@ class DynamicTaskAgent:
                                 completed.proposal.arguments,
                                 exc.details,
                             ),
+                            "guidance_repair_hints": _guidance_repair_hints(
+                                completed.proposal.arguments,
+                            ),
                             "instruction": (
                                 "只修复最终结果 JSON；逐项满足成功标准，证据引用只能使用"
                                 " output_contract 明列的 step_key，并把所需真实回执值写入正文。"
@@ -6827,6 +6830,15 @@ class DynamicTaskAgent:
                     "并逐字包含‘所有改动行为均有测试覆盖’或等价句；不得只把这句话放在"
                     " guidance_applications 或内部说明中。"
                 )
+            if _repair_feedback_has_guidance_error(
+                repair_feedback,
+                "guidance_requirement_required",
+            ):
+                action_instruction += (
+                    " 如果 result_repair_feedback.guidance_repair_hints 非空，必须保留其中"
+                    "上一轮已经提交的 guidance_applications/items；除非验证器明确指出该项身份、"
+                    "来源或证据无效，不得在修复同一动作时删除它们。"
+                )
             view = build_provider_execution_view(
                 execution_context=projection.model_dump(mode="json"),
                 canonical_messages=[
@@ -6883,6 +6895,15 @@ class DynamicTaskAgent:
             # 假设。这里仅补入不声称已验证事实的最小方法骨架；根因、回执和
             # 命令仍必须来自模型正文/已完成步骤，不能由 Runtime 代写。
             completed = _ensure_diagnostic_guidance_scaffold(
+                completed,
+                repair_feedback=repair_feedback,
+            )
+            completed = _ensure_guidance_coverage_scaffold(
+                completed,
+                repair_feedback=repair_feedback,
+                guidance_requirements=guidance_requirements,
+            )
+            completed = _restore_guidance_repair_hints(
                 completed,
                 repair_feedback=repair_feedback,
             )
@@ -7949,6 +7970,55 @@ def _result_claim_repair_hints(
     return hints
 
 
+def _guidance_repair_hints(arguments: Mapping[str, object]) -> list[dict[str, object]]:
+    """保存上一轮模型已提交的 Guidance 回证，供同一动作的受限修复轮回放。"""
+
+    raw_applications = arguments.get("guidance_applications")
+    if not isinstance(raw_applications, (list, tuple)):
+        return []
+    hints: list[dict[str, object]] = []
+    for raw_application in raw_applications:
+        if not isinstance(raw_application, Mapping):
+            continue
+        skill_use_id = str(raw_application.get("skill_use_id") or "").strip()
+        raw_items = raw_application.get("items")
+        if not skill_use_id or not isinstance(raw_items, (list, tuple)):
+            continue
+        items: list[dict[str, str]] = []
+        for raw_item in raw_items:
+            if not isinstance(raw_item, Mapping):
+                continue
+            requirement_id = str(raw_item.get("requirement_id") or "").strip()
+            principle = str(raw_item.get("principle") or "").strip()
+            application = str(raw_item.get("application") or "").strip()
+            evidence_excerpt = str(raw_item.get("evidence_excerpt") or "").strip()
+            if (
+                not requirement_id
+                or not principle
+                or not application
+                or not evidence_excerpt
+                or len(principle) > 240
+                or len(application) > 800
+                or len(evidence_excerpt) > 500
+            ):
+                continue
+            items.append(
+                {
+                    "requirement_id": requirement_id,
+                    "principle": principle,
+                    "application": application,
+                    "evidence_excerpt": evidence_excerpt,
+                }
+            )
+            if len(items) >= 8:
+                break
+        if items:
+            hints.append({"skill_use_id": skill_use_id, "items": items})
+        if len(hints) >= 3:
+            break
+    return hints
+
+
 def _append_authoritative_claim_disclosures(
     result: DynamicTaskResult,
     *,
@@ -8537,6 +8607,167 @@ def _ensure_diagnostic_guidance_scaffold(
     suffix = "\n\n诊断门禁补充（待验证）：\n" + "\n".join(f"- {item}" for item in additions)
     normalized_arguments = dict(arguments)
     normalized_arguments["markdown"] = f"{markdown}{suffix}"
+    normalized_proposal = completed.proposal.model_copy(update={"arguments": normalized_arguments})
+    return completed.model_copy(update={"proposal": normalized_proposal})
+
+
+def _ensure_guidance_coverage_scaffold(
+    completed: CompletedProviderProposal,
+    *,
+    repair_feedback: Mapping[str, object] | None,
+    guidance_requirements: Sequence[Mapping[str, object]] = (),
+) -> CompletedProviderProposal:
+    """在验证器明确要求测试覆盖时补入待执行边界，不伪造测试回执。
+
+    Provider 修复轮可能连续返回空正文或忘记覆盖清单。宿主只能投影冻结
+    Requirement 的任务映射/验收条件，并明确标记为待执行；真实命令、退出码和
+    成功回执仍必须来自模型正文或已完成 Operation，不能由 Runtime 代写。
+    """
+
+    if not _repair_feedback_has_guidance_error(
+        repair_feedback,
+        "guidance_changed_behavior_test_coverage_required",
+    ):
+        return completed
+    if completed.proposal.action_kind not in {ActionKind.ANSWER, ActionKind.COMPLETE}:
+        return completed
+    arguments = completed.proposal.arguments
+    markdown = str(arguments.get("markdown") or "")
+    if not markdown.strip():
+        return completed
+    body = markdown.split("\nSkill应用记录", 1)[0]
+    if re.search(
+        r"(?:所有|每个)[^\n]{0,40}(?:(?:改动|变更|修改)[^\n]{0,60}行为|行为[^\n]{0,40}(?:改动|变更|修改))[^\n]{0,80}测试|"
+        r"every (?:changed|modified) behavior[^\n]{0,100}(?:test|coverage)",
+        body,
+        re.IGNORECASE,
+    ):
+        return completed
+    requirement_ids = {
+        str(error).split(":", 1)[0]
+        for error in (
+            (repair_feedback or {}).get("verification", {}).get(
+                "guidance_application_errors", []
+            )
+            if isinstance((repair_feedback or {}).get("verification"), Mapping)
+            else []
+        )
+        if "guidance_changed_behavior_test_coverage_required" in str(error)
+    }
+    checklist: list[str] = []
+    for requirement in guidance_requirements:
+        requirement_id = str(requirement.get("requirement_id") or "")
+        if requirement_ids and requirement_id not in requirement_ids:
+            continue
+        mapping = " ".join(str(requirement.get("task_mapping") or "").split())[:280]
+        acceptance = " ".join(
+            str(requirement.get("observable_acceptance") or "").split()
+        )[:280]
+        detail = mapping or acceptance or "按当前任务逐项核对变更行为"
+        if acceptance and acceptance != mapping:
+            detail = f"{detail}；验收：{acceptance}"
+        checklist.append(f"- {detail}（待执行；材料未提供真实测试回执）")
+    if not checklist:
+        checklist.append("- 按当前任务逐项核对每个改动行为及对应测试/检查（待执行；材料未提供真实测试回执）")
+    suffix = (
+        "\n\n改动行为测试/检查清单（待执行，不代表已通过）：\n"
+        + "\n".join(checklist)
+        + "\n验收边界：所有改动行为均有测试覆盖；当前材料未提供真实执行回执，不能宣称已通过。"
+    )
+    normalized_arguments = dict(arguments)
+    normalized_arguments["markdown"] = f"{markdown}{suffix}"
+    normalized_proposal = completed.proposal.model_copy(update={"arguments": normalized_arguments})
+    return completed.model_copy(update={"proposal": normalized_proposal})
+
+
+def _restore_guidance_repair_hints(
+    completed: CompletedProviderProposal,
+    *,
+    repair_feedback: Mapping[str, object] | None,
+) -> CompletedProviderProposal:
+    """只在缺失 Requirement 回证时回放上一轮已提交的 Guidance application。"""
+
+    if not _repair_feedback_has_guidance_error(
+        repair_feedback,
+        "guidance_requirement_required",
+    ):
+        return completed
+    hints = (repair_feedback or {}).get("guidance_repair_hints", [])
+    if not isinstance(hints, (list, tuple)) or not hints:
+        return completed
+    arguments = completed.proposal.arguments
+    raw_applications = arguments.get("guidance_applications")
+    applications = [
+        dict(item)
+        for item in raw_applications
+        if isinstance(item, Mapping)
+    ] if isinstance(raw_applications, (list, tuple)) else []
+    by_skill_use = {
+        str(item.get("skill_use_id") or ""): item
+        for item in applications
+        if str(item.get("skill_use_id") or "").strip()
+    }
+    additions: list[str] = []
+    normalized_markdown = " ".join(str(arguments.get("markdown") or "").casefold().split())
+    changed = False
+    for hint in hints:
+        if not isinstance(hint, Mapping):
+            continue
+        skill_use_id = str(hint.get("skill_use_id") or "").strip()
+        raw_items = hint.get("items")
+        if not skill_use_id or not isinstance(raw_items, (list, tuple)):
+            continue
+        target = by_skill_use.get(skill_use_id)
+        if target is None:
+            target = {"skill_use_id": skill_use_id, "items": []}
+            applications.append(target)
+            by_skill_use[skill_use_id] = target
+            changed = True
+        existing_items = [
+            dict(item)
+            for item in target.get("items", [])
+            if isinstance(item, Mapping)
+        ]
+        existing_ids = {
+            str(item.get("requirement_id") or "")
+            for item in existing_items
+        }
+        for item in raw_items:
+            if not isinstance(item, Mapping):
+                continue
+            requirement_id = str(item.get("requirement_id") or "").strip()
+            if not requirement_id or requirement_id in existing_ids:
+                continue
+            evidence_excerpt = str(item.get("evidence_excerpt") or "").strip()
+            if not evidence_excerpt or len(evidence_excerpt) > 500:
+                continue
+            existing_items.append(
+                {
+                    "requirement_id": requirement_id,
+                    "principle": str(item.get("principle") or "").strip(),
+                    "application": str(item.get("application") or "").strip(),
+                    "evidence_excerpt": evidence_excerpt,
+                }
+            )
+            existing_ids.add(requirement_id)
+            normalized_excerpt = " ".join(evidence_excerpt.casefold().split())
+            if normalized_excerpt not in normalized_markdown:
+                additions.append(evidence_excerpt)
+                normalized_markdown = f"{normalized_markdown} {normalized_excerpt}"
+            changed = True
+            if len(existing_items) >= 8:
+                break
+        target["items"] = existing_items[:8]
+    if not changed:
+        return completed
+    normalized_arguments = dict(arguments)
+    normalized_arguments["guidance_applications"] = applications[:3]
+    if additions:
+        markdown = str(normalized_arguments.get("markdown") or "")
+        normalized_arguments["markdown"] = (
+            f"{markdown}\n\nSkill回证修复（沿用上一轮已提交证据）：\n"
+            + "\n".join(f"- {item}" for item in additions[:8])
+        )
     normalized_proposal = completed.proposal.model_copy(update={"arguments": normalized_arguments})
     return completed.model_copy(update={"proposal": normalized_proposal})
 
