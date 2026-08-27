@@ -259,6 +259,47 @@ def test_connection_test_explains_deepseek_key_account_balance(
     assert response.checks[-1].status == "skipped"
 
 
+def test_dynamic_preflight_accepts_supported_provider_aliases(tmp_path, monkeypatch) -> None:
+    """Ark、DeepSeek、SiliconFlow 均沿用统一 Chat 协议，不应再被旧 provider 门禁拒绝。"""
+
+    engine = _engine(tmp_path)
+    _seed_models(engine)
+    monkeypatch.setattr(
+        "app.api.model_configs.LLMClient.preflight_dynamic_capabilities",
+        lambda self: {
+            "protocol_version": "dynamic-v1",
+            "sdk_available": True,
+            "credentials_verified": True,
+            "structured_output": True,
+            "tool_calling": True,
+        },
+    )
+    provider_urls = {
+        "a_next": ("ark", "https://ark.cn-beijing.volces.com/api/plan/v3"),
+        "b_next": ("deepseek", "https://api.deepseek.com"),
+        "z_previous": ("siliconflow", "https://api.siliconflow.cn/v1"),
+    }
+    with Session(engine) as db:
+        for config_id, (provider, base_url) in provider_urls.items():
+            row = db.get(ModelConfig, config_id)
+            assert row is not None
+            row.provider = provider
+            row.base_url = base_url
+            db.add(row)
+            db.commit()
+            result = preflight_dynamic_model_config(config_id, tenant_id="tenant_a", db=db)
+            assert result.success is True
+            assert result.capabilities["provider"] == provider
+            provider_file_api = result.capabilities["provider_file_api"]
+            assert isinstance(provider_file_api, dict)
+            assert provider_file_api["chat_supported"] is True
+            assert provider_file_api["canonical_provider"] == {
+                "ark": "ark",
+                "deepseek": "deepseek",
+                "siliconflow": "siliconflow",
+            }[provider]
+
+
 def _admin_user_for_model_test():  # noqa: ANN201
     """构造模型配置更新的租户管理员身份。"""
 

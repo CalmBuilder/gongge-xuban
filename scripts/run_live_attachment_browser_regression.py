@@ -291,6 +291,8 @@ def _certification_fingerprints() -> dict[str, str]:
         "backend/app/dynamic_tasks/action_proposer.py",
         "backend/app/dynamic_tasks/attachment_evidence.py",
         "backend/app/dynamic_tasks/result_verifier.py",
+        "backend/app/llm/client.py",
+        "backend/app/session/provider_file_adapters.py",
         "backend/app/session/managed_resources.py",
         "backend/app/session/provider_input_dispatch.py",
         "backend/app/session/input_extraction.py",

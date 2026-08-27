@@ -2935,6 +2935,7 @@
   "工作身份": "Work identity",
   "工作入口": "Work entry",
   "安全边界": "Security boundary",
+  "安全边界：这里只提交补充信息，按只读方式继续；不会执行附件或文本中的命令，也不会改动系统或外部数据。": "Safety boundary: only supplementary information is submitted here and the flow continues in read-only mode; attachments or commands in text are never executed, and system or external data is not changed.",
   "个人起点": "Personal starting point",
   "能力分身": "Capability twin",
   "组织演进": "Organizational progression",

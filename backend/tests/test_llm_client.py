@@ -13,6 +13,7 @@ from time import monotonic
 import pytest
 
 from app.llm.client import (
+    OPTIONAL_INPUT_PROBE_MAX_TOKENS,
     PROVIDER_CONTENT_PARTS_KEY,
     LLMClient,
     LLMError,
@@ -154,6 +155,30 @@ def test_llm_client_allows_scoped_timeout_override(monkeypatch):
     assert client.timeout_seconds == 120
     assert captured["timeout"] == 120
     assert captured["max_retries"] == 0
+
+
+def test_llm_client_clamps_ark_output_budget_to_provider_limit(monkeypatch):
+    """验证 Ark 管理端高容量配置不会把超出供应商上限的 max_tokens 发给 provider。"""
+
+    model_config = type(
+        "ModelConfig",
+        (),
+        {
+            "api_key_encrypted": "encrypted",
+            "base_url": "https://ark.cn-beijing.volces.com/api/plan/v3",
+            "model": "kimi-k3",
+            "temperature": 0.2,
+            "max_output_tokens": 819_200,
+            "extra_body_json": {},
+        },
+    )()
+    monkeypatch.setattr("app.llm.client.decrypt_secret", lambda value: "api-key")
+    monkeypatch.setattr("app.llm.client.OpenAI", lambda **kwargs: _FakeOpenAIClient())
+
+    client = LLMClient(model_config)
+
+    assert client.configured_max_output_tokens == 819_200
+    assert client.max_output_tokens == 131_072
 
 
 def test_model_config_create_defaults_to_8192_output_tokens():
@@ -487,6 +512,8 @@ def test_connection_and_optional_input_probes_keep_provider_extra_body() -> None
     calls = client.client.chat.completions.calls
     assert len(calls) == 3
     assert all(call["extra_body"] == {"enable_thinking": False} for call in calls)
+    assert calls[1]["max_tokens"] == OPTIONAL_INPUT_PROBE_MAX_TOKENS
+    assert calls[2]["max_tokens"] == OPTIONAL_INPUT_PROBE_MAX_TOKENS
 
 
 def test_generate_text_can_disable_provider_thinking():

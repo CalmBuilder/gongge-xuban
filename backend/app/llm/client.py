@@ -133,6 +133,7 @@ DEFAULT_MODEL_API_TIMEOUT_SECONDS = 600.0
 DEFAULT_INPUT_TOKEN_BUDGET = 32_000
 TURN_STAGE_MESSAGE_MARKER = "_agent_turn_message"
 REASONING_TOKEN_ESCALATION_CEILING = 32_768
+OPTIONAL_INPUT_PROBE_MAX_TOKENS = 256
 PROVIDER_CONTENT_PARTS_KEY = "_provider_content_parts"
 
 
@@ -141,6 +142,20 @@ def _escalate_reasoning_token_budget(current_max_tokens: int) -> int:
     if current_max_tokens >= REASONING_TOKEN_ESCALATION_CEILING:
         return current_max_tokens
     return min(current_max_tokens * 2, REASONING_TOKEN_ESCALATION_CEILING)
+
+
+def _provider_max_output_tokens(base_url: str | None, model: str | None) -> int | None:
+    """返回已知供应商硬上限，避免管理端高容量配置生成 provider 400。"""
+
+    del model  # Ark 当前公开兼容端点对该类模型统一执行 131072 上限。
+    try:
+        parsed = urlsplit(str(base_url or ""))
+    except ValueError:
+        return None
+    host = (parsed.hostname or "").lower()
+    if host in {"ark.cn-beijing.volces.com", "ark.ap-southeast.bytepluses.com"}:
+        return 131_072
+    return None
 
 
 def _json_repair_output_token_budget(
@@ -214,7 +229,12 @@ class LLMClient:
         )
         self.model = model_config.model
         self.temperature = model_config.temperature
-        self.max_output_tokens = model_config.max_output_tokens
+        self.configured_max_output_tokens = max(1, int(model_config.max_output_tokens or 1))
+        provider_limit = _provider_max_output_tokens(self.base_url, self.model)
+        self.max_output_tokens = min(
+            self.configured_max_output_tokens,
+            provider_limit if provider_limit is not None else self.configured_max_output_tokens,
+        )
         self.extra_body = _normalize_extra_body(
             getattr(model_config, "extra_body_json", {})
         )
@@ -822,7 +842,9 @@ class LLMClient:
                 }
             ],
             "temperature": 0,
-            "max_tokens": 32,
+            # 思考模型会先消耗 reasoning tokens；32 token 会在正文前结束，
+            # 将真实支持视觉的模型误判为 vision=false。
+            "max_tokens": OPTIONAL_INPUT_PROBE_MAX_TOKENS,
         }
         pdf_request = {
             "model": self.model,
@@ -845,7 +867,9 @@ class LLMClient:
                 }
             ],
             "temperature": 0,
-            "max_tokens": 32,
+            # PDF 探针与图片探针保持相同预算，避免 provider 仅因推理配额不足
+            # 进入可选能力的 fail-closed 分支。
+            "max_tokens": OPTIONAL_INPUT_PROBE_MAX_TOKENS,
         }
         thinking_kwargs = _thinking_request_kwargs(
             getattr(self, "thinking_mode", ""),
@@ -1758,13 +1782,17 @@ def _prepare_user_input(
 
 
 def _valid_provider_native_part(value: object) -> bool:
-    """只允许有界 data URL 图片或 PDF 进入原生 provider part，拒绝远程 URL 与任意块。"""
+    """只允许有界内联数据或受控 provider file-id 进入原生 part，拒绝任意远程 URL。"""
 
     if not isinstance(value, dict):
         return False
     if value.get("type") == "image_url" and set(value) == {"type", "image_url"}:
         image = value.get("image_url")
-        if not isinstance(image, dict) or set(image) != {"url"}:
+        if not isinstance(image, dict):
+            return False
+        if set(image) == {"file_id"}:
+            return _valid_provider_file_id(image.get("file_id"), prefixes=("file-",))
+        if set(image) != {"url"}:
             return False
         url = image.get("url")
         prefixes = (
@@ -1775,6 +1803,19 @@ def _valid_provider_native_part(value: object) -> bool:
             "data:image/bmp;base64,",
         )
         return isinstance(url, str) and url.startswith(prefixes) and len(url) <= 12_000_000
+    if value.get("type") == "video_url" and set(value) == {"type", "video_url"}:
+        video = value.get("video_url")
+        return (
+            isinstance(video, dict)
+            and set(video) == {"file_id"}
+            and _valid_provider_file_id(video.get("file_id"), prefixes=("file-",))
+        )
+    if value.get("type") == "file" and set(value) == {"type", "file_id"}:
+        return _valid_provider_file_id(value.get("file_id"), prefixes=("file-api-", "file-"))
+    if value.get("type") == "file" and set(value) == {"type", "file"}:
+        file_part = value.get("file")
+        if isinstance(file_part, dict) and set(file_part) == {"file_id"}:
+            return _valid_provider_file_id(file_part.get("file_id"), prefixes=("file-",))
     if value.get("type") == "file" and set(value) == {"type", "file"}:
         file_part = value.get("file")
         if not isinstance(file_part, dict) or set(file_part) != {"filename", "file_data"}:
@@ -1791,6 +1832,14 @@ def _valid_provider_native_part(value: object) -> bool:
             and len(data) <= 15_000_000
         )
     return False
+
+
+def _valid_provider_file_id(value: object, *, prefixes: tuple[str, ...]) -> bool:
+    """校验由已配置 provider 返回的 file-id，阻断路径、查询串和过长身份。"""
+
+    if not isinstance(value, str) or not value.startswith(prefixes) or len(value) > 256:
+        return False
+    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}", value))
 
 
 def _prepare_stage_user_input(

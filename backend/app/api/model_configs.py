@@ -33,6 +33,11 @@ from app.security.auth import get_current_user, require_current_tenant
 from app.security.encryption import decrypt_secret, encrypt_secret, mask_secret
 from app.security.permissions import ensure_tenant_admin, require_tenant_admin
 from app.security.tenant import ensure_tenant
+from app.session.provider_file_adapters import (
+    is_supported_chat_provider,
+    profile_for_model_config,
+    provider_file_profile_payload,
+)
 
 router = APIRouter(
     prefix="/api/enterprise/model-configs",
@@ -405,20 +410,22 @@ def preflight_dynamic_model_config(
     """验证原生 structured-output/tool-call 协议并持久化可审计能力快照。"""
 
     row = _get_model_config(db, tenant_id, config_id)
-    if row.provider != "openai_compatible":
+    if not is_supported_chat_provider(row.provider, row.base_url):
         return _record_preflight_failure(
             db,
             row,
             "UNSUPPORTED_PROVIDER_SDK",
         )
     try:
+        file_profile = profile_for_model_config(row)
         capabilities = LLMClient(row).preflight_dynamic_capabilities()
-    except LLMError as exc:
+    except (LLMError, ValueError) as exc:
         return _record_preflight_failure(db, row, _sanitize_preflight_error(row, str(exc)))
     snapshot = {
         **capabilities,
         "provider": row.provider,
         "model": row.model,
+        "provider_file_api": provider_file_profile_payload(file_profile),
     }
     row.capability_snapshot_json = snapshot
     row.capability_checksum = capability_checksum(snapshot)

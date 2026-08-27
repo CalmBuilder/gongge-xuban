@@ -14,10 +14,22 @@ from typing import Any
 from sqlmodel import Session
 
 from app.db import engine
+from app.db.models import ModelConfig
+from app.session.provider_file_adapters import (
+    ProviderFileApiAdapter,
+    ProviderFileProfile,
+    provider_file_profile_payload,
+)
 from app.session.provider_input_reconciliation import (
     ProviderExposureAdapter,
     ProviderInputReconciliationService,
 )
+
+
+def build_provider_exposure_adapter(model_config: ModelConfig) -> ProviderFileApiAdapter:
+    """从租户模型配置构造真实 Files 适配器，保持 worker 的显式注入边界。"""
+
+    return ProviderFileApiAdapter(model_config)
 
 
 def run_reconciliation_once(
@@ -54,7 +66,11 @@ def run_worker(
 def adapter_health_payload(adapter: ProviderExposureAdapter) -> dict[str, Any]:
     """返回不包含凭据的适配器能力标记，供维护面显示是否可自动对账。"""
 
-    return {
+    payload: dict[str, Any] = {
         "provider_exposure_reconciliation": "configured",
         "adapter_type": type(adapter).__name__,
     }
+    profile = getattr(adapter, "profile", None)
+    if isinstance(profile, ProviderFileProfile):
+        payload["provider_file_api"] = provider_file_profile_payload(profile)
+    return payload
