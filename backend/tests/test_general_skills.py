@@ -1986,6 +1986,7 @@ def test_general_skill_runner_repairs_failed_code(monkeypatch) -> None:
         if "通用技能结果回复器" in prompt_text:
             calls.append("reply")
             assert payload["structured_result"]["success"] is True
+            assert payload["skill"]["markdown"] == WEATHER_SKILL_MD
             return {"reply": "北京今天晴。"}
         raise AssertionError("unexpected prompt")
 
@@ -2021,6 +2022,65 @@ def test_general_skill_runner_repairs_failed_code(monkeypatch) -> None:
     assert calls == ["runner", "repair", "reply"]
     assert any(item["phase"] == "reflection_retrying" for item in response.execution_trace)
     assert any(item["phase"] == "stdout_chunk" and "first_fail" in item["text"] for item in events)
+
+
+def test_general_skill_runner_reviews_writing_skill_reply(monkeypatch) -> None:
+    """正文声明写作纪律时，最终回复必须经过一次独立的有界复核。"""
+
+    calls: list[str] = []
+
+    def fake_init(self, model_config):  # noqa: ANN001
+        return None
+
+    def fake_generate_json(self, system_prompt, payload):  # noqa: ANN001
+        prompt_text = _system_and_stage_instructions(system_prompt, payload)
+        if "通用技能执行器" in prompt_text:
+            calls.append("runner")
+            return {
+                "code": (
+                    "import json\n"
+                    "print(json.dumps({'success': True, 'draft': 'ok'}, ensure_ascii=False))\n"
+                ),
+                "rationale": "生成可供复核的草稿结果。",
+            }
+        if "通用技能结果回复器" in prompt_text:
+            if "第二次有界复核" in prompt_text:
+                calls.append("reply_review")
+                assert payload["draft_reply"] == "初稿"
+                assert "completion criteria" in payload["skill"]["markdown"].casefold()
+                return {"reply": "复核后的回复"}
+            calls.append("reply")
+            return {"reply": "初稿"}
+        raise AssertionError("unexpected prompt")
+
+    monkeypatch.setattr(LLMClient, "__init__", fake_init)
+    monkeypatch.setattr(LLMClient, "generate_json", fake_generate_json)
+
+    skill = GeneralSkill(
+        tenant_id="tenant_demo",
+        slug="writing-discipline",
+        name="写作纪律",
+        description="要求信息层级和完成标准",
+        skill_markdown="# Context pointers\nInformation hierarchy\nCompletion criteria\n",
+        status="published",
+    )
+    model_config = ModelConfig(
+        tenant_id="tenant_demo",
+        name="Fake model",
+        api_key_encrypted=encrypt_secret("test-key"),
+        model="fake",
+        is_default=True,
+        enabled=True,
+    )
+
+    events: list[dict] = []
+    response = GeneralSkillRunner().run(
+        skill, "整理说明", model_config, max_attempts=1, event_sink=events.append
+    )
+
+    assert calls == ["runner", "reply", "reply_review"]
+    assert not [item for item in events if item.get("phase") == "reply_review_failed"]
+    assert response.reply == "复核后的回复"
 
 
 def test_general_skill_runner_materializes_folder_package(monkeypatch) -> None:

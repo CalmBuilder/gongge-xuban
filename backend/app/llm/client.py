@@ -126,6 +126,8 @@ def _interruptible_provider_stream(
 
 JSON_REPAIR_ATTEMPTS = 3
 EMPTY_RESPONSE_RETRIES = 2
+PROVIDER_TRANSIENT_RETRIES = 2
+PROVIDER_RETRY_BASE_SECONDS = 1.0
 EMPTY_RESPONSE_MESSAGE = "Model returned an empty response"
 DEFAULT_MODEL_API_TIMEOUT_SECONDS = 600.0
 DEFAULT_INPUT_TOKEN_BUDGET = 32_000
@@ -163,6 +165,27 @@ def _json_repair_output_token_budget(
     for _ in range(repair_attempt):
         budget = _escalate_reasoning_token_budget(budget)
     return budget
+
+
+def _length_retry_payload(
+    user_payload: dict[str, Any],
+    *,
+    attempt: int,
+) -> dict[str, Any]:
+    """为可解析但以 ``length`` 结束的 JSON 生成有界扩容提示，不猜测业务字段。"""
+
+    retry_payload = copy.deepcopy(user_payload)
+    retry_payload["_json_repair"] = {
+        "attempt": max(1, min(attempt, 2)),
+        "max_attempts": 2,
+        "previous_output": "JSON 可解析，但 provider 以 finish_reason=length 结束。",
+        "parser_error": "provider_finish_reason=length",
+        "instruction": (
+            "疑似因输出过长而被截断；请在更高输出配额下重新返回一个完整、最小的 JSON 对象，"
+            "不要复制最终答案或添加契约外字段。"
+        ),
+    }
+    return retry_payload
 
 
 class _CurrentStageText(str):
@@ -327,6 +350,9 @@ class LLMClient:
                     )
                 except BaseException as exc:
                     span.fail(exc, **_completion_span_metrics(None))
+                    if _is_retryable_provider_error(exc) and attempt < PROVIDER_TRANSIENT_RETRIES:
+                        _wait_before_provider_retry(attempt)
+                        continue
                     raise
                 content = _completion_message_content(completion)
                 metrics = _completion_span_metrics(completion)
@@ -486,6 +512,13 @@ class LLMClient:
                         reasoning_chars=reasoning_chars,
                         **stream_usage_metrics,
                     )
+                    if (
+                        not emitted_text
+                        and _is_retryable_provider_error(exc)
+                        and attempt < PROVIDER_TRANSIENT_RETRIES
+                    ):
+                        _wait_before_provider_retry(attempt)
+                        continue
                     raise
                 if emitted_text:
                     span.finish(
@@ -631,16 +664,27 @@ class LLMClient:
         system_prompt: str,
         user_payload: dict[str, Any],
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        """返回完整 JSON 及其真实 provider response 身份，供动作提案持久化防重。"""
+        """返回完整 JSON 及其真实 provider response 身份，供动作提案持久化防重。
+
+        provider 偶尔会在 JSON 表面已经可解析时仍以 ``length`` 结束，通常是推理
+        token 用尽而非正文契约完成。该响应不能直接进入 ActionProposal；按有界
+        重试原则提高输出配额并重新请求，最终仍不是 ``stop/tool_calls`` 就 fail closed。
+        """
 
         self._last_completed_response_metadata = None
-        payload = self.generate_json(system_prompt, user_payload)
-        metadata = getattr(self, "_last_completed_response_metadata", None)
-        if not isinstance(metadata, dict) or not metadata.get("response_id"):
-            raise LLMError("Provider completed JSON response is missing a stable response id")
-        if metadata.get("finish_reason") not in {"stop", "tool_calls"}:
-            raise LLMError("Provider completed JSON response has an unsupported finish reason")
-        return payload, dict(metadata)
+        retry_payload = user_payload
+        for retry_index in range(3):
+            payload = self.generate_json(system_prompt, retry_payload)
+            metadata = getattr(self, "_last_completed_response_metadata", None)
+            if not isinstance(metadata, dict) or not metadata.get("response_id"):
+                raise LLMError("Provider completed JSON response is missing a stable response id")
+            finish_reason = metadata.get("finish_reason")
+            if finish_reason in {"stop", "tool_calls"}:
+                return payload, dict(metadata)
+            if finish_reason != "length" or retry_index >= 2:
+                raise LLMError("Provider completed JSON response has an unsupported finish reason")
+            retry_payload = _length_retry_payload(user_payload, attempt=retry_index + 1)
+        raise LLMError("Provider completed JSON response did not settle")
 
     def preflight_dynamic_capabilities(self) -> dict[str, bool | str]:
         """使用原生 JSON mode 与真实 tool call 探针验证动态计划必需协议。"""
@@ -696,16 +740,38 @@ class LLMClient:
             if parsed != {"probe": "ready"}:
                 raise LLMError("Structured-output capability probe returned an invalid payload")
             try:
-                tool_completion = self.client.chat.completions.create(**tool_request)
+                tool_probe_request = tool_request
+                used_compatible_tool_request = False
+                tool_completion = self.client.chat.completions.create(**tool_probe_request)
             except Exception as exc:
                 if not _tool_choice_unsupported(exc):
                     raise
-                compatible_tool_request = dict(tool_request)
-                compatible_tool_request.pop("tool_choice", None)
-                tool_completion = self.client.chat.completions.create(
-                    **compatible_tool_request
-                )
+                tool_probe_request = dict(tool_request)
+                tool_probe_request.pop("tool_choice", None)
+                used_compatible_tool_request = True
+                tool_completion = self.client.chat.completions.create(**tool_probe_request)
             tool_calls = _completion_tool_calls(tool_completion)
+            if used_compatible_tool_request and not any(
+                call["name"] == "dynamic_capability_probe" for call in tool_calls
+            ):
+                # 兼容 provider 在温度为 0 时偶发只返回普通文本的情况。重试仍使用
+                # 同一真实工具契约，次数有界；不把文本回复推断成 tool calling 能力。
+                retry_request = dict(tool_probe_request)
+                retry_request["messages"] = [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Emit exactly one dynamic_capability_probe tool call. "
+                            "Do not answer with text."
+                        ),
+                    },
+                    {"role": "user", "content": "Probe dynamic tool calling now."},
+                ]
+                for _ in range(2):
+                    tool_completion = self.client.chat.completions.create(**retry_request)
+                    tool_calls = _completion_tool_calls(tool_completion)
+                    if any(call["name"] == "dynamic_capability_probe" for call in tool_calls):
+                        break
             if not any(call["name"] == "dynamic_capability_probe" for call in tool_calls):
                 raise LLMError("Tool-calling capability probe returned no required tool call")
         except Exception as exc:
@@ -1298,6 +1364,36 @@ def _empty_response_detail(client: Any, diagnostics: list[str]) -> str:
     )
 
 
+def _is_retryable_provider_error(exc: BaseException) -> bool:
+    """识别可短暂恢复的 provider 拒绝，避免把过载误报成永久模型故障。"""
+
+    status_code = getattr(exc, "status_code", None)
+    if status_code in {408, 409, 425, 429} or (
+        isinstance(status_code, int) and 500 <= status_code <= 599
+    ):
+        return True
+    body = getattr(exc, "body", None)
+    provider_code = getattr(exc, "code", None)
+    if isinstance(body, dict):
+        error_body = body.get("error")
+        if isinstance(error_body, dict):
+            provider_code = error_body.get("code") or error_body.get("type") or provider_code
+    normalized = str(provider_code or "").replace("_", "").replace("-", "").lower()
+    return normalized in {
+        "serveroverloaded",
+        "temporarilyunavailable",
+        "serviceunavailable",
+        "ratelimitexceeded",
+    }
+
+
+def _wait_before_provider_retry(attempt: int) -> None:
+    """以有界指数退避等待下一次 provider 请求，避免并发过载时立即风暴重试。"""
+
+    delay = min(PROVIDER_RETRY_BASE_SECONDS * (2**max(0, attempt)), 4.0)
+    time.sleep(delay)
+
+
 def _provider_failure_detail(client: Any, exc: Exception) -> str:
     model = _safe_fragment(getattr(client, "model", None), 80) or "unknown"
     endpoint = _endpoint_label(getattr(client, "base_url", None))
@@ -1549,7 +1645,7 @@ def _response_format_unsupported(message: str) -> bool:
 
 
 def _tool_choice_unsupported(exc: Exception) -> bool:
-    """只对明确拒绝 tool_choice 的协议错误启用无强制参数的真实工具探针。"""
+    """兼容明确拒绝强制选择的 provider，并保持工具调用结果为最终能力证据。"""
 
     status_code = getattr(exc, "status_code", None)
     if status_code not in {400, 422}:
@@ -1559,7 +1655,7 @@ def _tool_choice_unsupported(exc: Exception) -> bool:
     if isinstance(body, dict):
         fragments.append(json.dumps(body, ensure_ascii=False, default=str))
     lowered = " ".join(fragments).lower()
-    return "tool_choice" in lowered and any(
+    message_indicates_unsupported = "tool_choice" in lowered and any(
         phrase in lowered
         for phrase in (
             "does not support",
@@ -1570,6 +1666,19 @@ def _tool_choice_unsupported(exc: Exception) -> bool:
             "invalid parameter",
         )
     )
+    if message_indicates_unsupported:
+        return True
+    # 部分 OpenAI-compatible provider（例如 Ark kimi-k3）只返回
+    # error.code=InvalidParameter，不回显被拒绝的字段名。这里仅针对
+    # 当前 tool_choice 请求的 400/422 异常降级；后续仍必须拿到真实
+    # dynamic_capability_probe tool call，否则预检继续 fail closed。
+    provider_code = getattr(exc, "code", None)
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        error_body = body.get("error")
+        if isinstance(error_body, dict):
+            provider_code = error_body.get("code") or provider_code
+    return str(provider_code or "").replace("_", "").lower() == "invalidparameter"
 
 
 def _empty_response(message: str) -> bool:

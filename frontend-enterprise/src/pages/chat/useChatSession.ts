@@ -2314,33 +2314,15 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       return;
     }
     if (item.event === 'stream_end') {
-      finishTrace(traceTurnId);
       if (!shouldTouchStream) {
-        syncTurnUntilAssistant(eventSessionId, traceTurnId);
         notifyTrace();
         return;
       }
-      const hadStreamContent = Boolean(normalizeMessageText(eventStream.accumulated));
-      finalizeStreaming(eventSessionId);
-      if (!hadStreamContent && !hasAssistantMessageForTurn(getSlot(eventSessionId), traceTurnId)) {
-        upsertTraceStatusPlaceholder(getSlot(eventSessionId), eventSessionId, traceTurnId);
-        notifyStore();
-      }
-      eventStream.loading = false;
-      eventStream.phase = '';
-      eventStream.abortController = null;
-      eventStream.relayRecoveryStartedAt = null;
-      eventStream.relayRecoveryTurnId = null;
-      setRunningTurn((current) => (
-        current?.sessionId === eventSessionId && current.turnId === traceTurnId ? null : current
-      ));
+      // The server emits `complete` after this transport boundary.  Flush
+      // pending deltas for a responsive UI, but keep the stream slot and
+      // recovery watchdog alive until a business terminal is observed.
+      flushStreaming(eventSessionId);
       notifyStream();
-      loadSessions();
-      window.setTimeout(() => {
-        loadMessages(eventSessionId);
-        loadTraces(eventSessionId);
-        syncTurnUntilAssistant(eventSessionId, traceTurnId);
-      }, 250);
       return;
     }
     if (item.event === 'stream_cancelled') {
@@ -2482,6 +2464,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     applySessionTitleSummary,
     clearStreamSlot,
     finalizeStreaming,
+    flushStreaming,
     finishTrace,
     getSlot,
     getStreamSlot,
@@ -2510,7 +2493,6 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
   const isTerminalEvent = useCallback((event: ChatSessionEventRead) => (
     event.event === 'complete'
     || event.event === 'done'
-    || event.event === 'stream_end'
     || event.event === 'stream_cancelled'
     || event.event === 'stream_interrupted'
     || event.event === 'error_occurred'
@@ -3235,8 +3217,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
           return;
         }
         if (
-          item.event === 'stream_end'
-          || item.event === 'stream_cancelled'
+          item.event === 'stream_cancelled'
           || item.event === 'stream_interrupted'
           || item.event === 'error_occurred'
         ) {

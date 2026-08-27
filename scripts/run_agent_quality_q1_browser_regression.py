@@ -50,6 +50,14 @@ Q1_PROFILES = {
         "skill_dir": None,
         "e2e_file": "e2e/agent-quality-q1-plain-simple.live.fullstack.e2e.ts",
     },
+    "ordinary": {
+        "skill_dir": WRITING_SKILL_DIR,
+        "e2e_file": "e2e/agent-quality-q1-ordinary.live.fullstack.e2e.ts",
+    },
+    "event-window": {
+        "skill_dir": None,
+        "e2e_file": "e2e/agent-quality-event-window.live.fullstack.e2e.ts",
+    },
     "cross-turn": {
         "skill_dir": None,
         "e2e_file": "e2e/agent-quality-q1-cross-turn.live.fullstack.e2e.ts",
@@ -205,6 +213,13 @@ def _selected_profile() -> tuple[str, dict[str, object]]:
         if not configured:
             raise RuntimeError("skill-sample必须显式提供Q1_SAMPLE_SKILL_DIR")
         profile = {**profile, "skill_dir": Path(configured).expanduser().resolve()}
+    elif (
+        profile_name == "ordinary"
+        and os.environ.get("Q1_ORDINARY_BENCHMARK", "").strip() == "codebase"
+    ):
+        # ordinary E2E 与 dynamic codebase 使用同一受审 Skill，但仍保持
+        # ordinary 路由层；目录选择必须和浏览器侧 benchmark 分支同步。
+        profile = {**profile, "skill_dir": CODEBASE_SKILL_DIR}
     return profile_name, profile
 
 
@@ -272,6 +287,12 @@ def _q1_browser_environment(
             "Q1_SOURCE_MODEL_CONFIG_ID": model_id,
             "Q1_PROVIDER_ENDPOINT": public_endpoint,
             "Q1_MODEL_NAME": model_name,
+            "Q1_MODEL_TEMPERATURE": str(
+                server_environment.get("LIVE_ATTACHMENT_MODEL_TEMPERATURE", "")
+            ),
+            "Q1_MODEL_MAX_OUTPUT_TOKENS": str(
+                server_environment.get("LIVE_ATTACHMENT_MODEL_MAX_OUTPUT_TOKENS", "")
+            ),
             "Q1_MODEL_CAPABILITY_CHECKSUM": capability_checksum,
             "FULLSTACK_E2E_REUSE_EXISTING_SERVER": "1",
             "PRESERVE_FULLSTACK_E2E": "1",
@@ -287,8 +308,17 @@ def _q1_browser_environment(
             "diagnosing": "Q1_DIAGNOSING_SKILL_DIR",
             "diagnosing-positive": "Q1_DIAGNOSING_SKILL_DIR",
             "unrelated": "Q1_WRITING_SKILL_DIR",
+            "ordinary": "Q1_WRITING_SKILL_DIR",
             "skill-sample": "Q1_WRITING_SKILL_DIR",
         }.get(profile_name)
+        if (
+            profile_name == "ordinary"
+            and server_environment.get("Q1_ORDINARY_BENCHMARK", "").strip() == "codebase"
+        ):
+            # ordinary E2E 会依据 benchmark 选择 Skill；不能把 codebase 目录
+            # 塞进 writing 变量，否则浏览器白名单会丢失真正的输入来源，
+            # 使正式批次只能依赖测试进程的旁路补丁才能启动。
+            skill_directory_key = "Q1_CODEBASE_SKILL_DIR"
         if skill_directory_key is None:
             raise RuntimeError(f"Skill Q1 profile未配置安全目录变量: {profile_name}")
         browser_environment.update(
@@ -303,6 +333,8 @@ def _q1_browser_environment(
             }
         )
     for name in (
+        "EVENT_WINDOW_E2E",
+        "EVENT_WINDOW_EVIDENCE_FILE",
         "Q1_ONLY_SCENARIO",
         "Q1_ORDER_SEED",
         "Q1_CERTIFICATION_RUN_ID",
@@ -315,6 +347,7 @@ def _q1_browser_environment(
         "Q1_DIAGNOSING_EVIDENCE_FILE",
         "Q1_DIAGNOSING_POSITIVE_EVIDENCE_FILE",
         "Q1_WRITING_BENCHMARK",
+        "Q1_ORDINARY_BENCHMARK",
         "Q1_SAMPLE_SKILL_NAME",
         "Q1_SAMPLE_TASK_FAMILY",
     ):
@@ -358,6 +391,7 @@ def _certification_fingerprints(*, profile_name: str = "writing") -> dict[str, s
         "backend/app/core/context_projection.py",
         "backend/app/core/non_sop_capability.py",
         "backend/app/core/response_generator.py",
+        "backend/app/api/chat.py",
         "backend/app/dynamic_tasks/action_proposer.py",
         "backend/app/dynamic_tasks/agent.py",
         "backend/app/dynamic_tasks/budget_policy.py",
@@ -370,6 +404,8 @@ def _certification_fingerprints(*, profile_name: str = "writing") -> dict[str, s
         "backend/app/llm/prompts/response_generator_prompt.md",
         "backend/app/session/input_runtime.py",
         "backend/app/sop_runtime/execution_store.py",
+        "frontend-enterprise/src/pages/chat/chatHelpers.tsx",
+        "frontend-enterprise/src/pages/chat/useChatSession.ts",
         f"frontend-enterprise/{profile['e2e_file']}",
         "frontend-enterprise/e2e/start_fullstack_server.py",
         "scripts/run_agent_quality_q1_browser_regression.py",

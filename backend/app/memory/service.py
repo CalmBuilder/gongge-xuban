@@ -85,6 +85,11 @@ class MemoryService:
             normalize=False,
             agent_id=agent_id,
         )
+        existing_memory_text = _memories_for_model(existing_rows)
+        # 读取记忆后即将进入不可控时长的外部模型调用；先结束只读事务，
+        # 避免 SQLite 的共享读锁在推理期间阻塞前台流式事件写入。Memory
+        # 任务使用独立 Session，后续 upsert 会在模型返回后重新建立事务。
+        self.db.rollback()
         with llm_operation("memory.capture", existing_count=len(existing_rows)):
             raw_delta = LLMClient(model_config).generate_json(
                 PROMPT_PATH.read_text(encoding="utf-8"),
@@ -92,7 +97,7 @@ class MemoryService:
                     "conversation_context": {
                         "messages": conversation_messages
                     },
-                    "existing_memories": _memories_for_model(existing_rows),
+                    "existing_memories": existing_memory_text,
                     "step_result": compact_step_result(step_result.model_dump(mode="json")),
                     "tool_result": tool_result.model_dump(mode="json") if tool_result else None,
                 },

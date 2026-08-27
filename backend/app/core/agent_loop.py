@@ -7641,7 +7641,12 @@ class AgentLoop:
 
     @staticmethod
     def _explicit_dynamic_task_requested(message: str) -> bool:
-        """识别用户明确的持久动态执行请求，避免被一次性 Skill 回复降级。"""
+        """识别用户明确的持久动态执行请求，避免被一次性 Skill 回复降级。
+
+        不能要求用户必须说出 ``DynamicTaskAgent`` 这个实现名；“持久、可恢复”
+        加上明确的分析/交付动作已经是同一执行契约。仍要求动作与请求语义同时
+        出现，避免把概念解释或普通闲聊升级成持久 Execution。
+        """
 
         text = " ".join(str(message or "").split())
         named_request = re.search(
@@ -7650,12 +7655,28 @@ class AgentLoop:
             text,
             flags=re.IGNORECASE,
         )
-        durable_request = (
+        explicit_dynamic_name = (
             "动态任务" in text
             and any(marker in text for marker in ("持久", "可恢复"))
             and any(marker in text for marker in ("请", "启动", "创建", "执行", "完成"))
         )
+        durable_request = explicit_dynamic_name or (
+            all(marker in text for marker in ("持久", "可恢复"))
+            and any(marker in text for marker in ("分析", "诊断", "整理", "生成", "处理", "交付", "校验"))
+            and any(marker in text for marker in ("请", "启动", "创建", "执行", "完成", "通过"))
+        )
         return named_request is not None or durable_request
+
+    @staticmethod
+    def _explicit_answer_only_requested(message: str) -> bool:
+        """识别用户明确要求单轮直接交付且禁止计划/工具任务的普通问答契约。"""
+
+        text = " ".join(str(message or "").split())
+        direct_delivery = bool(re.search(r"直接(?:在回复中)?交付|直接回复", text))
+        no_durable_plan = bool(
+            re.search(r"不(?:要|得)?创建(?:计划|文件|工具任务)|不创建(?:计划|文件|工具任务)", text)
+        )
+        return direct_delivery and no_durable_plan
 
     def _try_handle_dynamic_task(
         self,
@@ -7677,6 +7698,14 @@ class AgentLoop:
                 requires_durable_execution=True,
                 confidence=1.0,
                 reason="用户明确指定 DynamicTaskAgent/持久动态任务执行。",
+            )
+        elif self._explicit_answer_only_requested(request.message):
+            # 模型 shadow 只能提出建议；用户明确要求单轮直接交付时，禁止
+            # shadow 把普通问答升级为持久执行，避免普通路径的闭环契约漂移。
+            decision = NonSopCapabilityDecision(
+                mode="answer",
+                confidence=1.0,
+                reason="用户明确要求直接交付且禁止创建计划、文件或工具任务。",
             )
         if request.attachments and self._attachments_require_dynamic(request):
             decision = NonSopCapabilityDecision(

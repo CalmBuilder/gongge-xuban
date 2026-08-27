@@ -136,6 +136,8 @@ test.afterAll(async () => {
     source_model_config_id: process.env.Q1_SOURCE_MODEL_CONFIG_ID || '',
     provider_endpoint: process.env.Q1_PROVIDER_ENDPOINT || '',
     model: process.env.Q1_MODEL_NAME || '',
+    temperature: Number(process.env.Q1_MODEL_TEMPERATURE || '0'),
+    max_output_tokens: Number(process.env.Q1_MODEL_MAX_OUTPUT_TOKENS || '0'),
     capability_checksum: process.env.Q1_MODEL_CAPABILITY_CHECKSUM || '',
     certification_fingerprints: parseRecord(
       process.env.Q1_CERTIFICATION_FINGERPRINT_JSON, 'Q1_CERTIFICATION_FINGERPRINT_JSON',
@@ -526,16 +528,25 @@ async function runScenario(page: Page, testInfo: TestInfo, variant: Variant, inp
   await expect.poll(async () => {
     const observed = await readFacts(page, sessionId);
     const status = String((observed.execution as { status?: string } | null)?.status || '');
-    if (/^(succeeded|failed|cancelled|waiting)$/.test(status)) {
+    // 失败事件已经是当前 session 的持久终态时立即返回；不要因 Execution API
+    // 投影短暂延迟而继续消耗完整复杂题预算。
+    if (observed.events.some((event) =>
+      event.event_type === 'dynamic_task_execution_failed'
+      || event.event_type === 'dynamic_task_delegation_failed')) {
+      initialStatus = 'execution:failed';
+    } else if (/^(succeeded|failed|cancelled|waiting)$/.test(status)) {
       initialStatus = `execution:${status}`;
     } else if (/Agent Loop 出错|AGENT_LOOP_ERROR/.test(observed.answer)) {
       initialStatus = 'answer:error';
+    } else if (!observed.executionId && observed.answer.trim()) {
+      // 最终回答已落库却没有 Dynamic delegation，不能继续消耗长任务等待预算。
+      initialStatus = 'answer:without_execution';
     } else {
       initialStatus = '';
     }
     return initialStatus;
   }, { timeout: Q1_EXECUTION_WAIT_TIMEOUT_MS, intervals: [2_000, 5_000, 10_000] })
-    .toMatch(/^(?:execution:(?:succeeded|failed|cancelled|waiting)|answer:error)$/);
+    .toMatch(/^(?:execution:(?:succeeded|failed|cancelled|waiting)|answer:(?:error|without_execution))$/);
   let clarificationResolved = false;
   if (initialStatus === 'execution:waiting') {
     const waitingFacts = await readFacts(page, sessionId);

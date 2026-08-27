@@ -56,6 +56,8 @@ from app.db.models import (
     Message,
     MessageInputResourceLink,
     ModelConfig,
+    ProviderInputDispatchGroup,
+    ProviderInputDispatchReceipt,
     ResourceSessionBinding,
     SopInstance,
     SopOperation,
@@ -79,7 +81,10 @@ from app.dynamic_tasks.agent import (
     _append_frozen_guidance_disclosures,
     _ensure_diagnostic_guidance_scaffold,
     _ensure_guidance_coverage_scaffold,
+    _ensure_guidance_evidence_disclosures,
+    _ensure_claim_repair_hint_disclosures,
     _guidance_repair_hints,
+    _prune_guidance_duplicate_commands,
     _repair_feedback_has_guidance_error,
     _restore_guidance_repair_hints,
     _normalize_dynamic_result_arguments,
@@ -100,7 +105,11 @@ from app.dynamic_tasks.capability_catalog import (
     publish_tool_contract,
 )
 from app.dynamic_tasks.execution_context import build_execution_context_projection
-from app.dynamic_tasks.result_verifier import DynamicTaskResult
+from app.dynamic_tasks.result_verifier import (
+    DynamicTaskResult,
+    GuidanceApplication,
+    GuidanceApplicationItem,
+)
 from app.dynamic_tasks.worker import (
     _is_terminal_signal_error,
     due_dynamic_task_signals,
@@ -856,6 +865,146 @@ def test_guidance_repair_hints_do_not_restore_without_required_error() -> None:
     assert repaired.proposal.arguments["guidance_applications"] == []
 
 
+def test_guidance_repair_hints_restore_when_evidence_is_missing_from_markdown() -> None:
+    """正文遗漏已提交 evidence_excerpt 时按真实错误码回放同一条回证。"""
+
+    proposal = CompletedProviderProposal(
+        response_id="provider_guidance_evidence_restore",
+        finish_reason="stop",
+        proposal=RuntimeActionProposal(
+            action_kind=ActionKind.ANSWER,
+            arguments={
+                "markdown": "已整理文档，但修复轮遗漏了 Skill 回证。",
+                "criterion_evidence": {},
+                "pending_questions": [],
+                "guidance_applications": [],
+            },
+            rationale="形成最终结果",
+        ),
+    )
+    repaired = _restore_guidance_repair_hints(
+        proposal,
+        repair_feedback={
+            "verification": {
+                "guidance_application_errors": [
+                    "guidreq_demo:guidance_evidence_not_in_markdown",
+                ]
+            },
+            "guidance_repair_hints": [
+                {
+                    "skill_use_id": "gsuse_demo",
+                    "items": [
+                        {
+                            "requirement_id": "guidreq_demo",
+                            "principle": "保持单一事实来源。",
+                            "application": "将规则集中到一个章节。",
+                            "evidence_excerpt": "规则集中到一个章节。",
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+
+    arguments = repaired.proposal.arguments
+    assert arguments["guidance_applications"][0]["items"][0]["evidence_excerpt"] == (
+        "规则集中到一个章节。"
+    )
+    assert "规则集中到一个章节。" in arguments["markdown"]
+
+
+def test_guidance_evidence_disclosure_reuses_current_proposal_excerpt() -> None:
+    """正文证据缺失时只回写当前 proposal 已提交的原文摘录。"""
+
+    proposal = CompletedProviderProposal(
+        response_id="provider_guidance_evidence_disclosure",
+        finish_reason="stop",
+        proposal=RuntimeActionProposal(
+            action_kind=ActionKind.ANSWER,
+            arguments={
+                "markdown": "已整理文档。",
+                "criterion_evidence": {},
+                "pending_questions": [],
+                "guidance_applications": [
+                    {
+                        "skill_use_id": "gsuse_demo",
+                        "items": [
+                            {
+                                "requirement_id": "guidreq_demo",
+                                "principle": "保持单一事实来源。",
+                                "application": "集中规则定义。",
+                                "evidence_excerpt": "规则集中到一个章节。",
+                            }
+                        ],
+                    }
+                ],
+            },
+            rationale="形成最终结果",
+        ),
+    )
+    repaired = _ensure_guidance_evidence_disclosures(
+        proposal,
+        repair_feedback={
+            "verification": {
+                "guidance_application_errors": [
+                    "guidreq_demo:guidance_evidence_not_in_markdown",
+                ]
+            }
+        },
+    )
+
+    assert "规则集中到一个章节。" in repaired.proposal.arguments["markdown"]
+    assert "已整理文档。" in repaired.proposal.arguments["markdown"]
+
+
+def test_claim_repair_hint_disclosure_reuses_exact_previous_claim_text() -> None:
+    """附件Claim仅缺正文回证时，修复轮应回放上一轮的逐字Claim文本。"""
+
+    proposal = CompletedProviderProposal(
+        response_id="provider_claim_disclosure_repair",
+        finish_reason="stop",
+        proposal=RuntimeActionProposal(
+            action_kind=ActionKind.ANSWER,
+            arguments={
+                "markdown": "已整理交付文档；完成标准见正文。",
+                "criterion_evidence": {},
+                "pending_questions": [],
+                "claims": [
+                    {
+                        "claim_id": "interp_completion_criterion_assumption",
+                        "text": "假设：两条校验命令均以退出码 0 完成。",
+                        "claim_type": "interpretation",
+                        "normalized_value": None,
+                        "evidence_refs": [],
+                        "semantic_review_status": "review",
+                    }
+                ],
+            },
+            rationale="保留同一结果动作",
+        ),
+    )
+    repaired = _ensure_claim_repair_hint_disclosures(
+        proposal,
+        repair_feedback={
+            "verification": {
+                "attachment_evidence_errors": [
+                    "interp_completion_criterion_assumption:not_disclosed_in_markdown",
+                ]
+            },
+            "claim_repair_hints": [
+                {
+                    "claim_id": "interp_completion_criterion_assumption",
+                    "exact_text_to_copy_into_markdown": "假设：两条校验命令均以退出码 0 完成。",
+                }
+            ],
+        },
+    )
+
+    assert "假设：两条校验命令均以退出码 0 完成。" in repaired.proposal.arguments[
+        "markdown"
+    ]
+
+
 def test_authoritative_claim_disclosure_repair_only_appends_supported_atom() -> None:
     """仅补入元素正文支持的最小事实，不把模型摘要或伪造Claim写进答案。"""
 
@@ -1211,6 +1360,62 @@ def test_dynamic_result_arguments_strip_redundant_guidance_plan_metadata() -> No
     assert "unexpected" not in item
 
 
+def test_dynamic_result_arguments_strip_same_parent_skill_use_from_guidance_item() -> None:
+    """Guidance 子项重复父级 SkillUse 时收敛为单一身份来源。"""
+
+    normalized = _normalize_dynamic_result_arguments(
+        {
+            "markdown": "正文",
+            "criterion_evidence": {},
+            "guidance_applications": [
+                {
+                    "skill_use_id": "skill_use_demo",
+                    "items": [
+                        {
+                            "requirement_id": "guidreq_" + "b" * 24,
+                            "skill_use_id": "skill_use_demo",
+                            "principle": "单一事实来源",
+                            "application": "正文引用一个来源",
+                            "evidence_excerpt": "正文",
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+    assert "skill_use_id" not in normalized["guidance_applications"][0]["items"][0]
+
+
+def test_dynamic_result_arguments_preserve_mismatched_nested_skill_use_for_fail_closed() -> None:
+    """Guidance 子项伪造不同 SkillUse 时不能被宿主静默改写。"""
+
+    normalized = _normalize_dynamic_result_arguments(
+        {
+            "markdown": "正文",
+            "criterion_evidence": {},
+            "guidance_applications": [
+                {
+                    "skill_use_id": "skill_use_demo",
+                    "items": [
+                        {
+                            "requirement_id": "guidreq_" + "c" * 24,
+                            "skill_use_id": "skill_use_other",
+                            "principle": "单一事实来源",
+                            "application": "正文引用一个来源",
+                            "evidence_excerpt": "正文",
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+    assert normalized["guidance_applications"][0]["items"][0]["skill_use_id"] == (
+        "skill_use_other"
+    )
+
+
 def test_dynamic_result_arguments_bound_guidance_evidence_excerpt() -> None:
     """过长回显片段截为正文前缀，仍交给结果验证器检查是否真实出现。"""
 
@@ -1268,6 +1473,116 @@ def test_frozen_not_applicable_guidance_is_disclosed_in_result_body() -> None:
 
     assert "[不适用]" in disclosed.markdown
     assert "Skill grill-me 的冻结原则" in disclosed.markdown
+
+
+def test_prune_guidance_duplicate_commands_keeps_first_command_and_completion_semantics() -> None:
+    """Pruning Skill 明确生效时只折叠重复命令，不删除退出码或审计尾注。"""
+
+    result = DynamicTaskResult(
+        markdown=(
+            "- 运行：`uv run pytest backend/payments/tests -q`\n"
+            "- 检查：`uv run ruff check backend/payments`\n"
+            "\n## 验收\n"
+            "以上 `uv run pytest backend/payments/tests -q` 与 "
+            "`uv run ruff check backend/payments` 均以退出码 0 完成。"
+            "\n\nSkill应用记录：\n- 已回证"
+        ),
+        criterion_evidence={},
+    )
+
+    pruned, changed = _prune_guidance_duplicate_commands(
+        result,
+        guidance_source_catalog={"use_demo": "## Pruning\nKeep each meaning in a single source of truth."},
+    )
+
+    assert changed is True
+    assert pruned.markdown.count("uv run pytest backend/payments/tests -q") == 1
+    assert pruned.markdown.count("uv run ruff check backend/payments") == 1
+    assert "退出码 0" in pruned.markdown
+    assert "Skill应用记录" in pruned.markdown
+    assert "上述 pytest 命令" in pruned.markdown
+
+
+def test_prune_guidance_duplicate_commands_is_not_applied_without_pruning_source() -> None:
+    """普通指导或无 Skill 结果保持原文，避免宿主引入第二套输出语义。"""
+
+    result = DynamicTaskResult(
+        markdown="uv run pytest backend/payments/tests -q\nuv run pytest backend/payments/tests -q",
+        criterion_evidence={},
+    )
+
+    unchanged, changed = _prune_guidance_duplicate_commands(
+        result,
+        guidance_source_catalog={"use_demo": "## Context pointers\nRead the referenced docs."},
+    )
+
+    assert changed is False
+    assert unchanged.markdown == result.markdown
+
+
+def test_prune_guidance_duplicate_commands_handles_trigger_principle_and_audit_tail() -> None:
+    """明确声明单触发原则时，回证尾注的重复命令也折叠但仍保留审计标记。"""
+
+    result = DynamicTaskResult(
+        markdown=(
+            "- 运行：`uv run pytest backend/payments/tests -q`\n"
+            "- 检查：`uv run ruff check backend/payments`\n"
+            "\nSkill应用记录：\n"
+            "- 完成标准：`uv run pytest backend/payments/tests -q` 返回退出码 0，"
+            "`uv run ruff check backend/payments` 返回退出码 0。"
+        ),
+        criterion_evidence={},
+    )
+
+    pruned, changed = _prune_guidance_duplicate_commands(
+        result,
+        guidance_source_catalog={
+            "use_demo": "**One trigger per branch.** Collapse synonyms into one branch."
+        },
+    )
+
+    assert changed is True
+    assert pruned.markdown.count("uv run pytest backend/payments/tests -q") == 1
+    assert pruned.markdown.count("uv run ruff check backend/payments") == 1
+    assert "上述 pytest 命令" in pruned.markdown
+    assert "上述 ruff 命令" in pruned.markdown
+    assert "Skill应用记录" in pruned.markdown
+
+
+def test_prune_guidance_duplicate_commands_preserves_evidence_excerpt_verbatim() -> None:
+    """命令去重不得改写绑定 Requirement 的 evidence_excerpt 原文。"""
+
+    evidence_excerpt = "uv run pytest backend/payments/tests -q 在本文只出现一次"
+    result = DynamicTaskResult(
+        markdown=(
+            "- 验证命令：`uv run pytest backend/payments/tests -q`\n"
+            "- 再次核对：`uv run pytest backend/payments/tests -q`\n"
+            f"\nSkill应用记录：\n- {evidence_excerpt}。"
+        ),
+        criterion_evidence={},
+        guidance_applications=(
+            GuidanceApplication(
+                skill_use_id="use_demo",
+                items=(
+                    GuidanceApplicationItem(
+                        requirement_id="guidreq_0123456789abcdef01234567",
+                        principle="Keep each meaning in a single source of truth.",
+                        application="将重复命令合并到单一来源。",
+                        evidence_excerpt=evidence_excerpt,
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    pruned, changed = _prune_guidance_duplicate_commands(
+        result,
+        guidance_source_catalog={"use_demo": "## Pruning\nKeep each meaning in a single source of truth."},
+    )
+
+    assert changed is True
+    assert evidence_excerpt in pruned.markdown
+    assert "上述 pytest 命令" in pruned.markdown
 
 
 class _InputRunProposer(_RunProposer):
@@ -3223,12 +3538,44 @@ def test_run_loop_repairs_invalid_result_once_and_settles_skill_use() -> None:
         assert use.result_summary_json["message_id"] == outcome.message.id
 
 
-def test_run_loop_repairs_invalid_answer_shape_before_result_verification() -> None:
-    """answer提案形状非法时只重试一次并以稳定终态完成，不泄漏Pydantic异常。"""
+def test_run_loop_repairs_invalid_answer_shape_before_result_verification(tmp_path: Path) -> None:
+    """answer提案形状非法时只重试一次、结算附件派发并以稳定终态完成。"""
 
     engine = create_engine("sqlite://", poolclass=StaticPool)
     SQLModel.metadata.create_all(engine)
     with Session(engine, expire_on_commit=False) as db:
+        user = User(
+            id="user_answer_shape_repair",
+            tenant_id="tenant_demo",
+            username="answer-shape-repair",
+            password_hash="x",
+        )
+        profile = AgentProfile(
+            id="agent_demo",
+            tenant_id="tenant_demo",
+            name="动态模型测试员工",
+            owner_user_id=user.id,
+        )
+        db.add(user)
+        db.add(profile)
+        resource_service = ManagedInputResourceService(db, storage_root=tmp_path)
+        resource, _attachment = resource_service.persist_upload(
+            tenant_id="tenant_demo",
+            owner_user_id=user.id,
+            agent_id=profile.id,
+            filename="contract.txt",
+            content_type="text/plain",
+            data="合同正文：续约日期 2026-12-31".encode(),
+        )
+        message = Message(
+            id="message_answer_shape_repair",
+            tenant_id="tenant_demo",
+            session_id="session_answer_shape_repair",
+            role="user",
+            content="根据附件生成简报",
+            metadata_json={},
+        )
+        db.add(message)
         capabilities = _model_capabilities()
         model = ModelConfig(
             id="model_answer_shape_repair",
@@ -3242,6 +3589,12 @@ def test_run_loop_repairs_invalid_answer_shape_before_result_verification() -> N
         )
         db.add(model)
         db.flush()
+        _publish_test_input(
+            db,
+            resource=resource,
+            message=message,
+            text="合同正文：续约日期 2026-12-31",
+        )
         proposer = _ShapeRepairRunProposer()
         agent = DynamicTaskAgent(
             db,
@@ -3249,28 +3602,39 @@ def test_run_loop_repairs_invalid_answer_shape_before_result_verification() -> N
             tool_executor=_Executor(),
             planner=_Planner(),
             action_proposer=proposer,
+            resource_service=resource_service,
         )
         instance, _ = agent.start_task(
             tenant_id="tenant_demo",
             session_id="session_answer_shape_repair",
-            agent_id="agent_demo",
-            initiator_user_id="user_demo",
+            agent_id=profile.id,
+            initiator_user_id=user.id,
             goal="生成续约风险简报",
             success_criteria=("覆盖合同证据",),
             model_config=model,
+            source_ref=message.id,
+            input_resource_ids=(resource.id,),
         )
 
         outcome = agent.run_until_blocked_or_complete(
             execution_id=instance.id,
             model_config=model,
             worker_id="worker_answer_shape_repair",
-            actor_user_id="user_demo",
+            actor_user_id=user.id,
         )
 
         assert outcome.status == "succeeded"
         assert outcome.message is not None
         assert proposer.invalid_answer_calls == 1
         assert proposer.repair_feedback_seen is True
+        groups = db.exec(
+            select(ProviderInputDispatchGroup).where(
+                ProviderInputDispatchGroup.tenant_id == "tenant_demo",
+            )
+        ).all()
+        receipts = db.exec(select(ProviderInputDispatchReceipt)).all()
+        assert groups and all(group.status == "settled" for group in groups)
+        assert receipts and all(receipt.status == "settled" for receipt in receipts)
 
 
 def test_fail_execution_settles_active_skill_use_with_stable_reason() -> None:

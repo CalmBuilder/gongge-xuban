@@ -148,6 +148,16 @@ def test_attachment_launcher_runtime_cleanup_fails_closed_when_directory_remains
                 module._remove_runtime_dir(runtime_dir)
 
 
+def test_fullstack_live_model_preserves_high_management_output_capacity() -> None:
+    """真实回归应接受管理端高容量模型配置，阶段预算另行负责消费约束。"""
+
+    module = _load_script("frontend-enterprise/e2e/start_fullstack_server.py")
+
+    assert module._validate_live_model_max_output_tokens(819_200) == 819_200
+    with pytest.raises(RuntimeError, match="max_output_tokens"):
+        module._validate_live_model_max_output_tokens(module.LIVE_MODEL_MAX_OUTPUT_TOKENS + 1)
+
+
 def _load_script(relative_path: str) -> ModuleType:
     """按文件路径加载无包脚本，避免执行其 main 入口。"""
 

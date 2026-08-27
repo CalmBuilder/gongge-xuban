@@ -263,6 +263,101 @@ def test_dynamic_preflight_retries_without_tool_choice_when_protocol_rejects_it(
     assert calls[2]["tools"] == calls[1]["tools"]
 
 
+def test_dynamic_preflight_retries_for_provider_invalid_parameter_without_field_echo() -> None:
+    """兼容 provider 仅返回 InvalidParameter、未回显 tool_choice 字段的协议错误。"""
+
+    client = object.__new__(LLMClient)
+    client.model = "ark-kimi-k3"
+    calls: list[dict[str, object]] = []
+
+    class InvalidParameterError(Exception):
+        """模拟 Ark 对强制 tool_choice 返回无字段名的错误体。"""
+
+        status_code = 400
+        body = {"error": {"code": "InvalidParameter", "message": "A parameter is not valid"}}
+
+    class Completions:
+        """强制选择失败后，允许提示驱动的真实工具调用。"""
+
+        def create(self, **kwargs):  # noqa: ANN003, ANN201
+            """记录探针请求并返回结构化/工具结果。"""
+
+            calls.append(kwargs)
+            if "response_format" in kwargs:
+                return _completion_with_content('{"probe":"ready"}')
+            if "tool_choice" in kwargs:
+                raise InvalidParameterError("invalid parameter")
+            function = type(
+                "Function", (), {"name": "dynamic_capability_probe", "arguments": "{}"}
+            )()
+            tool_call = type("ToolCall", (), {"function": function})()
+            message = type("Message", (), {"content": None, "tool_calls": [tool_call]})()
+            choice = type("Choice", (), {"message": message})()
+            return type("Completion", (), {"choices": [choice]})()
+
+    client.client = type(
+        "Client",
+        (),
+        {"chat": type("Chat", (), {"completions": Completions()})()},
+    )()
+
+    result = client.preflight_dynamic_capabilities()
+
+    assert result["tool_calling"] is True
+    assert "tool_choice" in calls[1]
+    assert "tool_choice" not in calls[2]
+
+
+def test_dynamic_preflight_retries_compatible_tool_probe_after_text_only_response() -> None:
+    """provider偶发返回普通文本时，预检有界重试但不把文本当作工具能力。"""
+
+    client = object.__new__(LLMClient)
+    client.model = "ark-kimi-k3"
+    calls: list[dict[str, object]] = []
+    fallback_attempts = 0
+
+    class InvalidParameterError(Exception):
+        """模拟强制 tool_choice 被 provider 拒绝。"""
+
+        status_code = 400
+        body = {"error": {"code": "InvalidParameter"}}
+
+    class Completions:
+        """记录降级探针，并在最后一次返回真实 tool call。"""
+
+        def create(self, **kwargs):  # noqa: ANN003, ANN201
+            """按探针阶段返回结构化、协议错误、文本和工具响应。"""
+
+            nonlocal fallback_attempts
+            calls.append(kwargs)
+            if "response_format" in kwargs:
+                return _completion_with_content('{"probe":"ready"}')
+            if "tool_choice" in kwargs:
+                raise InvalidParameterError("invalid parameter")
+            fallback_attempts += 1
+            if fallback_attempts < 3:
+                return _completion_with_content("not a tool call")
+            function = type(
+                "Function", (), {"name": "dynamic_capability_probe", "arguments": "{}"}
+            )()
+            tool_call = type("ToolCall", (), {"function": function})()
+            message = type("Message", (), {"content": None, "tool_calls": [tool_call]})()
+            choice = type("Choice", (), {"message": message})()
+            return type("Completion", (), {"choices": [choice]})()
+
+    client.client = type(
+        "Client",
+        (),
+        {"chat": type("Chat", (), {"completions": Completions()})()},
+    )()
+
+    result = client.preflight_dynamic_capabilities()
+
+    assert result["tool_calling"] is True
+    assert len(calls) == 7
+    assert calls[3]["messages"][0]["content"].startswith("Emit exactly one")
+
+
 def test_dynamic_preflight_freezes_successful_optional_image_and_pdf_probes() -> None:
     """验证原生图片/PDF 能力来自真实内容探针结果，而不是按模型名称猜测。"""
 
@@ -542,6 +637,37 @@ def test_generate_text_retries_empty_response():
 
     assert client.generate_text("system prompt", {"hello": "world"}) == "ok"
     assert len(client.client.chat.completions.calls) == 3
+
+
+def test_generate_text_retries_transient_provider_overload(monkeypatch: pytest.MonkeyPatch) -> None:
+    """provider 临时过载时只做有界退避重试，恢复后返回正文而不改写业务输入。"""
+
+    client = object.__new__(LLMClient)
+    client.client = _FakeOpenAIClient()
+    client.model = "demo-model"
+    client.temperature = 0.2
+    client.max_output_tokens = 256
+    calls = 0
+
+    class ServerOverloaded(Exception):
+        """模拟 OpenAI-compatible provider 的 429 过载错误。"""
+
+        status_code = 429
+        body = {"error": {"code": "ServerOverloaded"}}
+
+    def fake_create(**kwargs):  # noqa: ANN003
+        nonlocal calls
+        calls += 1
+        client.client.chat.completions.calls.append(kwargs)
+        if calls < 3:
+            raise ServerOverloaded("temporarily overloaded")
+        return _completion_with_content("ok")
+
+    monkeypatch.setattr("app.llm.client._wait_before_provider_retry", lambda _attempt: None)
+    client.client.chat.completions.create = fake_create
+
+    assert client.generate_text("system prompt", {"hello": "world"}) == "ok"
+    assert calls == 3
 
 
 def test_generate_text_records_each_empty_response_retry():
@@ -1307,6 +1433,39 @@ def test_generate_json_with_metadata_preserves_provider_action_identity():
     }
 
 
+def test_generate_json_with_metadata_retries_parseable_length_response():
+    """JSON虽可解析但以length结束时提高配额重试，不能把半完成动作持久化。"""
+
+    client = object.__new__(LLMClient)
+    client.client = _FakeOpenAIClient()
+    client.model = "demo-model"
+    client.temperature = 0.2
+    client.max_output_tokens = 256
+    first = _completion_with_content('{"ok": true}')
+    first.id = "response-provider-length"
+    first.choices[0].finish_reason = "length"
+    second = _completion_with_content('{"ok": true}')
+    second.id = "response-provider-stop"
+    second.choices[0].finish_reason = "stop"
+    responses = iter([first, second])
+
+    def fake_create(**kwargs):  # noqa: ANN003
+        """记录截断恢复使用的有界输出预算。"""
+
+        client.client.chat.completions.calls.append(kwargs)
+        return next(responses)
+
+    client.client.chat.completions.create = fake_create
+
+    payload, metadata = client.generate_json_with_metadata("prompt", {})
+
+    assert payload == {"ok": True}
+    assert metadata["response_id"] == "response-provider-stop"
+    assert metadata["finish_reason"] == "stop"
+    assert [call["max_tokens"] for call in client.client.chat.completions.calls] == [256, 512]
+    assert "finish_reason=length" in client.client.chat.completions.calls[1]["messages"][-1]["content"]
+
+
 def test_internal_json_operation_caps_output_without_mutating_system_prompt():
     client = object.__new__(LLMClient)
     client.client = _FakeOpenAIClient()
@@ -1404,7 +1563,7 @@ def test_control_plane_operation_output_budgets(operation, expected):  # noqa: A
 def test_dynamic_plan_can_use_configured_long_form_budget_without_inflating_short_models() -> None:
     """复杂计划可使用管理端16K上限，但小模型配置仍不会被宿主放大。"""
 
-    assert operation_output_tokens("dynamic_task.plan", 16_384) == 16_384
+    assert operation_output_tokens("dynamic_task.plan", 16_384) == 8_192
     assert operation_output_tokens("dynamic_task.plan", 8_192) == 8_192
 
 

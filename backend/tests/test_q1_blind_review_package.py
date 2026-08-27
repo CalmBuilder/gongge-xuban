@@ -83,6 +83,42 @@ def test_current_final_batch_points_to_latest_three_profile_reports() -> None:
     )
 
 
+def test_bf34_current_batch_isolated_from_historical_blind_packages() -> None:
+    """bf34 当前指纹批次必须读取三组新报告并使用独立盲评文件。"""
+
+    builder = _load_builder()
+    aggregator = _load_aggregator()
+    current = builder.REPORT_GLOBS_BY_BATCH["bf34-current"]
+
+    assert "bf34-r3" in current["writing-fair"]
+    assert "bf34-r1" in current["codebase-design"]
+    assert "bf34-r1" in current["diagnosing-positive"]
+    assert builder.OUTPUT_STEMS["bf34-current"] == "q1-bf34-current-blind-review"
+    assert aggregator.BATCH_PATHS["bf34-current"]["package"].name == (
+        "q1-bf34-current-blind-review-package.json"
+    )
+    assert aggregator.BATCH_PATHS["bf34-current"]["package"] != (
+        aggregator.BATCH_PATHS["current-final"]["package"]
+    )
+
+
+def test_final_ark_batch_binds_current_four_layer_reports() -> None:
+    """当前 Ark 四层批次必须使用独立盲评文件，且包含普通 codebase 五轮证据。"""
+
+    builder = _load_builder()
+    aggregator = _load_aggregator()
+    current = builder.REPORT_GLOBS_BY_BATCH["final-ark-20260827"]
+
+    assert "postmysql-8k" in current["writing-fair"]
+    assert "formal-ark-20260826-final" in current["codebase-design"]
+    assert "formal-ark-20260826-final-v2" in current["diagnosing-positive"]
+    assert "20260827-r2" in current["ordinary-codebase"]
+    assert builder.OUTPUT_STEMS["final-ark-20260827"] == "q1-final-ark-20260827-blind-review"
+    assert aggregator.BATCH_PATHS["final-ark-20260827"]["package"].name == (
+        "q1-final-ark-20260827-blind-review-package.json"
+    )
+
+
 def test_q1_release_policy_defers_cost_without_relaxing_quality_gate() -> None:
     """quality_first 只移除成本阻断口径，不能把未闭合质量门改成通过。"""
 

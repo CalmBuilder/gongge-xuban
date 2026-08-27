@@ -110,6 +110,8 @@ test.afterAll(async () => {
     source_model_config_id: process.env.Q1_SOURCE_MODEL_CONFIG_ID || '',
     provider_endpoint: process.env.Q1_PROVIDER_ENDPOINT || '',
     model: process.env.Q1_MODEL_NAME || '',
+    temperature: Number(process.env.Q1_MODEL_TEMPERATURE || '0'),
+    max_output_tokens: Number(process.env.Q1_MODEL_MAX_OUTPUT_TOKENS || '0'),
     capability_checksum: process.env.Q1_MODEL_CAPABILITY_CHECKSUM || '',
     certification_fingerprints: parseRecord(
       process.env.Q1_CERTIFICATION_FINGERPRINT_JSON, 'Q1_CERTIFICATION_FINGERPRINT_JSON',
@@ -343,7 +345,7 @@ function evaluateScenario(base: Omit<Scenario,
     red_receipt_before_answer: executeStepIndex >= 0 && answerStepIndex > executeStepIndex,
     // 同一诊断可由模型写成“根因已定位”“诊断结论”或“原因在于”；只要有明确
     // 的因果/定位表述即可，不能把标题措辞差异误判为业务失败。
-    basic_diagnosis_delivered: /(?:证据指向|原因(?:是|为|在于|指向)|原因分析|(?:已)?定位到|诊断(?:结论|报告|结果)|导致|根因)/.test(
+    basic_diagnosis_delivered: /(?:证据指向|原因(?:是|为|在(?:于)?|指向)|原因分析|(?:已)?定位到|诊断(?:结论|报告|结果)|导致|根因)/.test(
       base.raw_answer,
     )
       && /build_memory_context/.test(base.raw_answer)
@@ -458,6 +460,8 @@ async function runScenario(page: Page, variant: Variant, skill: SkillIdentity | 
       return `failed:${JSON.stringify(delegationFailure.data || {})}`;
     }
     if (/Agent Loop 出错（/.test(facts.answer)) return `failed:${facts.answer}`;
+    // 正向 published-check 也必须先有持久 Dynamic；普通最终回答不能进入审批流。
+    if (!facts.executionId && facts.answer.trim()) return 'failed:answer_without_execution';
     return String((facts.execution as { status?: string } | null)?.status || '');
   }, { timeout: Q1_EXECUTION_WAIT_TIMEOUT_MS, intervals: [2_000, 5_000, 10_000] }).toMatch(/^(waiting|failed:)/);
   const waitingFacts = await readFacts(page, sessionId);

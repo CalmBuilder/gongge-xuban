@@ -489,13 +489,20 @@ async function runScenario(page: Page, testInfo: TestInfo, variant: Variant, inp
   await expect.poll(async () => {
     const observed = await readFacts(page, sessionId);
     const status = String((observed.execution as { status?: string } | null)?.status || '');
+    // Execution API 短暂不可读时仍以当前 session 的持久失败事件收口，避免把已落库的
+    // provider/runtime 失败误等成无界长任务；后续 hard gate 会保留该失败证据。
+    if (observed.events.some((event) =>
+      event.event_type === 'dynamic_task_execution_failed'
+      || event.event_type === 'dynamic_task_delegation_failed')) return 'execution:failed';
     // waiting 是持久化的受控澄清终态；本题输入完整时应计为失败，但必须先由当前
     // session 的 Execution API 保存原始证据，不能读取上一轮页面残留文案。
     if (/^(succeeded|failed|cancelled|waiting)$/.test(status)) return `execution:${status}`;
     if (/Agent Loop 出错|AGENT_LOOP_ERROR/.test(observed.answer)) return 'answer:error';
+    // 已有最终回答但无 Dynamic delegation 时立即记录硬门失败，避免空等长预算。
+    if (!observed.executionId && observed.answer.trim()) return 'answer:without_execution';
     return '';
   }, { timeout: Q1_EXECUTION_WAIT_TIMEOUT_MS, intervals: [2_000, 5_000, 10_000] })
-    .toMatch(/^(?:execution:(?:succeeded|failed|cancelled|waiting)|answer:error)$/);
+    .toMatch(/^(?:execution:(?:succeeded|failed|cancelled|waiting)|answer:(?:error|without_execution))$/);
   const facts = await readFacts(page, sessionId);
   const uses = (facts.execution as { skill_uses?: Array<Record<string, unknown>> } | null)
     ?.skill_uses || [];

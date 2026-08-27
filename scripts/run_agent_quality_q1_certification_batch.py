@@ -17,6 +17,7 @@ from pathlib import Path
 import re
 import subprocess
 import signal
+from statistics import mean
 from typing import Any
 
 
@@ -78,6 +79,7 @@ def main() -> int:
                 "evidence_file": str(report_path.relative_to(ROOT)),
                 "exit_code": completed_code,
                 "test_status": report.get("test_status", "missing"),
+                "source_fingerprint_digest": _source_fingerprint_digest(report),
                 "scenarios": _scenario_summary(report),
             }
         )
@@ -87,6 +89,7 @@ def main() -> int:
     aggregate = {
         "suite": "Q1 certification batch",
         "profile": args.profile,
+        "routing_layer": "ordinary" if args.profile == "ordinary" else "dynamic",
         "started_at": started_at,
         "completed_at": datetime.now(UTC).isoformat(),
         "runs_requested": args.runs,
@@ -97,13 +100,37 @@ def main() -> int:
         "quality_gain_threshold_enforced": False,
         "runs": rows,
     }
+    passed = len(rows) == args.runs and all(
+        row["exit_code"] == 0
+        and row["test_status"] == "passed"
+        and bool(row["scenarios"])
+        and not any(item.get("hard_gate_failures") for item in row["scenarios"])
+        for row in rows
+    )
+    source_digests = sorted(
+        {
+            str(row["source_fingerprint_digest"])
+            for row in rows
+            if str(row["source_fingerprint_digest"])
+        }
+    )
+    source_homogeneous = len(rows) == args.runs and len(source_digests) == 1
+    aggregate["source_homogeneity"] = {
+        "status": "passed" if source_homogeneous else "not_passed",
+        "digest_count": len(source_digests),
+        "digests": source_digests,
+        "interpretation": (
+            "所有轮次使用相同源码/模型/Skill来源指纹"
+            if source_homogeneous
+            else "轮次缺少统一源码/模型/Skill来源指纹，不能合并成认证批"
+        ),
+    }
+    aggregate["quality_summary"] = _quality_summary(rows)
+    aggregate["passed"] = bool(passed and source_homogeneous)
     aggregate_path = _aggregate_report_path(profile=args.profile, batch_slug=batch_slug)
     aggregate_path.write_text(json.dumps(aggregate, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    passed = len(rows) == args.runs and all(
-        row["exit_code"] == 0 and row["test_status"] == "passed" for row in rows
-    )
-    print(f"[Q1] aggregate={aggregate_path} passed={passed}", flush=True)
-    return 0 if passed else 1
+    print(f"[Q1] aggregate={aggregate_path} passed={aggregate['passed']}", flush=True)
+    return 0 if aggregate["passed"] else 1
 
 
 def _parse_args() -> argparse.Namespace:
@@ -115,7 +142,7 @@ def _parse_args() -> argparse.Namespace:
         default="diagnosing",
         choices=(
             "diagnosing", "diagnosing-positive", "writing", "writing-fair", "codebase",
-            "plain", "plain-simple", "cross-turn", "unrelated",
+            "plain", "plain-simple", "ordinary", "cross-turn", "unrelated",
         ),
     )
     parser.add_argument("--runs", type=int, default=5)
@@ -212,6 +239,87 @@ def _scenario_summary(report: dict[str, Any]) -> list[dict[str, Any]]:
             }
         )
     return summary
+
+
+def _source_fingerprint_digest(report: dict[str, Any]) -> str:
+    """对不含密钥的源码、模型和 Skill 来源指纹做稳定摘要，防止混批。"""
+
+    fields = (
+        "certification_fingerprints",
+        "source_model_config_id",
+        "provider_endpoint",
+        "model",
+        "temperature",
+        "max_output_tokens",
+        "capability_checksum",
+        "upstream_skills_revision",
+        "upstream_skill_source_checksums",
+    )
+    payload = {field: report.get(field) for field in fields}
+    if not isinstance(payload["certification_fingerprints"], dict):
+        return ""
+    return sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _quality_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """汇总本批四象限分数、硬门和成对方向，只作当前源码观察。"""
+
+    by_scenario: dict[str, list[float]] = {}
+    hard_failures: dict[str, int] = {}
+    pair_deltas: list[dict[str, Any]] = []
+    for row in rows:
+        per_run: dict[str, dict[str, Any]] = {}
+        for item in row.get("scenarios", []):
+            if not isinstance(item, dict):
+                continue
+            scenario = str(item.get("scenario") or "")
+            score = item.get("score")
+            if scenario and isinstance(score, (int, float)) and not isinstance(score, bool):
+                by_scenario.setdefault(scenario, []).append(float(score))
+            if scenario and item.get("hard_gate_failures"):
+                hard_failures[scenario] = hard_failures.get(scenario, 0) + 1
+            if scenario:
+                per_run[scenario] = item
+        prefixes = {name.rsplit("-", 1)[0] for name in per_run if "-" in name}
+        if "control" in per_run and "treatment" in per_run:
+            prefixes.add("")
+        for prefix in sorted(prefixes):
+            control_name = f"{prefix}-control" if prefix else "control"
+            treatment_name = f"{prefix}-treatment" if prefix else "treatment"
+            control = per_run.get(control_name)
+            treatment = per_run.get(treatment_name)
+            if (
+                isinstance(control, dict)
+                and isinstance(treatment, dict)
+                and isinstance(control.get("score"), (int, float))
+                and isinstance(treatment.get("score"), (int, float))
+            ):
+                delta = float(treatment["score"]) - float(control["score"])
+                pair_deltas.append(
+                    {
+                        "run_id": row.get("run_id"),
+                        "input_mode": prefix or "published-check",
+                        "control": control["score"],
+                        "treatment": treatment["score"],
+                        "delta": round(delta, 3),
+                        "treatment_non_decrease": delta >= 0,
+                    }
+                )
+    return {
+        "by_scenario": {
+            scenario: {
+                "count": len(values),
+                "mean": round(mean(values), 3),
+                "hard_gate_failure_count": hard_failures.get(scenario, 0),
+            }
+            for scenario, values in sorted(by_scenario.items())
+        },
+        "pair_count": len(pair_deltas),
+        "pair_deltas": pair_deltas,
+        "treatment_non_decrease_count": sum(
+            bool(item["treatment_non_decrease"]) for item in pair_deltas
+        ),
+    }
 
 
 if __name__ == "__main__":

@@ -103,18 +103,21 @@ def run_memory_capture_job(payload: dict[str, Any]) -> None:
             db.commit()
             return
 
-        def persist_span(event_type: str, event_payload: dict[str, Any]) -> None:
+        deferred_spans: list[tuple[str, dict[str, Any]]] = []
+
+        def defer_span(event_type: str, event_payload: dict[str, Any]) -> None:
+            """只在模型外呼期间收集观测，避免后台任务持有 SQLite 写锁。"""
+
             traced_payload = dict(event_payload)
             if turn_id:
                 traced_payload.setdefault("turn_id", turn_id)
                 traced_payload.setdefault("user_message_id", turn_id)
             if request.client_turn_id:
                 traced_payload.setdefault("client_turn_id", request.client_turn_id)
-            events.record(request.tenant_id, session_id, event_type, traced_payload)
-            db.commit()
+            deferred_spans.append((event_type, traced_payload))
 
         try:
-            with bind_span_sink(persist_span):
+            with bind_span_sink(defer_span):
                 rows = MemoryService(db).capture_turn(
                     request,
                     chat_session,
@@ -133,6 +136,8 @@ def run_memory_capture_job(payload: dict[str, Any]) -> None:
             db.commit()
             return
 
+        for event_type, event_payload in deferred_spans:
+            events.record(request.tenant_id, session_id, event_type, event_payload)
         saved = [memory_read(row) for row in rows]
         if saved:
             events.record(

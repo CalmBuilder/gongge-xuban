@@ -450,6 +450,11 @@ function scoreQuality(answer: string, result: Record<string, unknown> | null) {
   })();
   const bothCommandsExitZero = /(?:都|两者|两个|both|each)[^\n。.!！]{0,100}(?:退出码|exit)[^\n0-9]{0,24}0\b/i
     .test(completionWindow);
+  // 文档型答案常先给出“全部检查通过（退出码为 0）”的总验收，再在下方列出
+  // 两条命令；局部窗口会把这两个事实错误地分开。命令本身仍由
+  // paths_and_commands 单独校验，这里只修复完成语义的距离误判。
+  const completionSummary = /(?:全部|两条|两个|上述|both|each)[^\n。.!！]{0,120}(?:通过|成功|完成)[^\n。.!！]{0,120}(?:退出码|exit)[^\n0-9]{0,24}0\b/i
+    .test(text);
   // Skill 应用记录是审计元数据，不属于交付文档正文；质量项不能因审计摘录重复命令而误判剪枝。
   const answerBody = answer.split(/\nSkill应用记录(?:（[^\n]*）)?:/u, 1)[0];
   const pathsAndCommands = {
@@ -475,7 +480,8 @@ function scoreQuality(answer: string, result: Record<string, unknown> | null) {
       /pytest[\s\S]{0,240}(?:退出码|exit)[\s\S]{0,60}0/i.test(text)
       && /ruff[\s\S]{0,240}(?:退出码|exit)[\s\S]{0,60}0/i.test(text)
     ) || /both commands[\s\S]{0,120}exit[\s\S]{0,30}0/i.test(text)
-      || bothCommandsExitZero,
+      || bothCommandsExitZero
+      || completionSummary,
     every_changed_behavior_tested: /每个[^\n]{0,40}(?:(?:改动|变更|修改)[^\n]{0,60}行为|行为[^\n]{0,40}(?:改动|变更|修改))[^\n]{0,60}测试|所有[^\n]{0,40}改动行为[^\n]{0,60}测试|every (?:changed|modified) behavior[^\n]{0,100}test coverage|every behavior (?:you )?(?:change|changed)[^\n]{0,80}(?:test[^\n]{0,40}cover|covered by[^\n]{0,40}test)/i
       .test(text),
   };
@@ -933,15 +939,22 @@ async function runScenario(
   await expect.poll(async () => {
     const facts = await readScenario(page, sessionId);
     const status = String((facts.execution as { status?: string } | null)?.status || '');
+    // 失败事件由当前 session 账本确认后即可结束本格；后续 hard gate 会保留失败原因。
+    if (facts.events.some((event) =>
+      event.event_type === 'dynamic_task_execution_failed'
+      || event.event_type === 'dynamic_task_delegation_failed')) return 'execution:failed';
     // waiting 是受控澄清的持久终态：本题输入已完整时它应计为失败，但必须
     // 先由当前 session 的 Execution API 落出证据，不能读取上一轮页面残留文案。
     if (/^(succeeded|failed|cancelled|waiting)$/.test(status)) return `execution:${status}`;
     if (/Agent Loop 出错|AGENT_LOOP_ERROR/.test(facts.rawAnswer)) return 'answer:error';
+    // Dynamic 认证题若已有最终回答却没有 delegation，立即记录硬门失败，不能
+    // 把 1920 秒复杂预算变成无界等待。
+    if (!facts.executionId && facts.rawAnswer.trim()) return 'answer:without_execution';
     return '';
   }, {
     timeout: Q1_EXECUTION_WAIT_TIMEOUT_MS,
     intervals: [2_000, 5_000, 10_000],
-  }).toMatch(/^(?:execution:(?:succeeded|failed|cancelled|waiting)|answer:error)$/);
+  }).toMatch(/^(?:execution:(?:succeeded|failed|cancelled|waiting)|answer:(?:error|without_execution))$/);
   let facts = await readScenario(page, sessionId);
   if (Q1_PROFILE === 'skill-sample'
     && String((facts.execution as { status?: string } | null)?.status || '') === 'waiting') {

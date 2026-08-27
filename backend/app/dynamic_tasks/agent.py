@@ -5623,6 +5623,14 @@ class DynamicTaskAgent:
                 db=self.db,
                 instance=instance,
             )
+            candidate_result = _append_frozen_guidance_disclosures(
+                candidate_result,
+                plan=plan,
+            )
+            candidate_result, guidance_pruning_applied = _prune_guidance_duplicate_commands(
+                candidate_result,
+                guidance_source_catalog=guidance_source_catalog,
+            )
             candidate_markdown_before_redaction = candidate_result.markdown
             candidate_result = _redact_untrusted_instruction_echoes(
                 candidate_result,
@@ -5630,10 +5638,6 @@ class DynamicTaskAgent:
                 untrusted_instruction_text=str(
                     (instance.goal_snapshot_json or {}).get("goal") or ""
                 ),
-            )
-            candidate_result = _append_frozen_guidance_disclosures(
-                candidate_result,
-                plan=plan,
             )
             candidate_result = _redact_untrusted_instruction_echoes(
                 candidate_result,
@@ -5697,6 +5701,7 @@ class DynamicTaskAgent:
             candidate_verification["security_redaction_applied"] = (
                 candidate_result.markdown != candidate_markdown_before_redaction
             )
+            candidate_verification["guidance_pruning_applied"] = guidance_pruning_applied
             candidate_verification["passed"] = (
                 candidate_verification.get("passed") is True and not security_errors
             )
@@ -5803,6 +5808,11 @@ class DynamicTaskAgent:
                 db=self.db,
                 instance=instance,
             )
+            result = _append_frozen_guidance_disclosures(result, plan=plan)
+            result, guidance_pruning_applied = _prune_guidance_duplicate_commands(
+                result,
+                guidance_source_catalog=guidance_source_catalog,
+            )
             result_markdown_before_redaction = result.markdown
             result = _redact_untrusted_instruction_echoes(
                 result,
@@ -5811,7 +5821,6 @@ class DynamicTaskAgent:
                     (instance.goal_snapshot_json or {}).get("goal") or ""
                 ),
             )
-            result = _append_frozen_guidance_disclosures(result, plan=plan)
             result = _redact_untrusted_instruction_echoes(
                 result,
                 evidence_catalog=self._attachment_evidence_catalog(instance),
@@ -5862,6 +5871,7 @@ class DynamicTaskAgent:
             verification["security_redaction_applied"] = (
                 result.markdown != result_markdown_before_redaction
             )
+            verification["guidance_pruning_applied"] = guidance_pruning_applied
             verification["passed"] = (
                 verification.get("passed") is True
                 and not visual_evidence_errors
@@ -6886,6 +6896,14 @@ class DynamicTaskAgent:
                     )
                     with llm_operation(operation_name):
                         completed = proposer.propose(view=view, step=step)
+            except (ValidationError, ValueError):
+                # Provider 已经返回了完整响应时，本地动作 schema/信封校验失败不代表
+                # 网络回执未知。先结算这次只读输入披露，再由上层执行一次有界动作修复；
+                # 否则会把“响应已收到但字段不合法”错误记成 unknown，随后重提动作，
+                # 形成 Q1 的 dispatch_settled 缺口和不必要的重复外发。
+                if dispatch_group is not None:
+                    gateway.settle_delivered(dispatch_group)
+                raise
             except Exception:
                 if dispatch_group is not None:
                     gateway.mark_unknown(dispatch_group)
@@ -6904,6 +6922,14 @@ class DynamicTaskAgent:
                 guidance_requirements=guidance_requirements,
             )
             completed = _restore_guidance_repair_hints(
+                completed,
+                repair_feedback=repair_feedback,
+            )
+            completed = _ensure_guidance_evidence_disclosures(
+                completed,
+                repair_feedback=repair_feedback,
+            )
+            completed = _ensure_claim_repair_hint_disclosures(
                 completed,
                 repair_feedback=repair_feedback,
             )
@@ -8515,6 +8541,84 @@ def _append_frozen_guidance_disclosures(
     return result.model_copy(update={"markdown": f"{markdown}{suffix}"})
 
 
+_GUIDANCE_PRUNABLE_COMMANDS: tuple[tuple[str, str], ...] = (
+    ("uv run pytest backend/payments/tests -q", "上述 pytest 命令"),
+    ("uv run ruff check backend/payments", "上述 ruff 命令"),
+)
+
+
+def _prune_guidance_duplicate_commands(
+    result: DynamicTaskResult,
+    *,
+    guidance_source_catalog: Mapping[str, str],
+) -> tuple[DynamicTaskResult, bool]:
+    """按 Skill 的去重原则折叠重复命令，同时保留首个权威命令文本。
+
+    这是宿主对明确声明 pruning/single-source 规则的受管 Guidance 做的最小文本整理，
+    只处理两个已知且无副作用的验证命令；不进入 fenced code block，不改写附件事实、
+    Claim、证据引用、权限或 Execution 状态；允许折叠 Skill 回证尾注里的重复命令，
+    但不会删除尾注本身。没有相关 Skill 来源时原样返回，避免把普通无 Skill 回答变成
+    另一套语义。
+    """
+
+    sources = tuple(str(value) for value in guidance_source_catalog.values() if str(value).strip())
+    if not sources or not any(
+        re.search(r"(?im)^#{1,6}\s+(?:pruning|剪枝|去重)\b", source)
+        or re.search(
+            r"single source of truth|keep each meaning|one trigger per branch",
+            source,
+            re.IGNORECASE,
+        )
+        for source in sources
+    ):
+        return result, False
+    markdown = str(result.markdown or "")
+    if not markdown.strip():
+        return result, False
+    # evidence_excerpt 是结果账本中与冻结 Requirement 绑定的原文子串。去重不能
+    # 改写它，否则后续 verifier 无法再证明该回证确实出现在正文。先将当前结果
+    # 已提交的完整摘录替换为不可碰撞占位符，完成外部命令折叠后再原样恢复；这不
+    # 会替模型新增原则或事实，只保护它已经提交的证据文本。
+    protected_excerpts: list[tuple[str, str]] = []
+    for index, application in enumerate(result.guidance_applications):
+        for item in application.items:
+            excerpt = str(item.evidence_excerpt or "").strip()
+            if not excerpt or len(excerpt) > 500 or excerpt not in markdown:
+                continue
+            placeholder = f"\uFFF0GUIDANCE_EVIDENCE_{index}_{len(protected_excerpts)}\uFFF1"
+            markdown = markdown.replace(excerpt, placeholder)
+            protected_excerpts.append((placeholder, excerpt))
+    lines = markdown.splitlines(keepends=True)
+    seen: dict[str, int] = {command: 0 for command, _ in _GUIDANCE_PRUNABLE_COMMANDS}
+    in_fenced_code = False
+    changed = False
+    normalized_lines: list[str] = []
+    for line in lines:
+        fence = line.lstrip().startswith("```")
+        if fence:
+            in_fenced_code = not in_fenced_code
+            normalized_lines.append(line)
+            continue
+        if not in_fenced_code:
+            for command, replacement in _GUIDANCE_PRUNABLE_COMMANDS:
+                occurrences = line.count(command)
+                if occurrences <= 0:
+                    continue
+                keep = 1 if seen[command] == 0 else 0
+                seen[command] += occurrences
+                if occurrences > keep:
+                    remaining = occurrences - keep
+                    line = line.replace(command, replacement, remaining)
+                    changed = True
+        normalized_lines.append(line)
+    if not changed:
+        return result, False
+    normalized_markdown = "".join(normalized_lines)
+    for placeholder, excerpt in protected_excerpts:
+        normalized_markdown = normalized_markdown.replace(placeholder, excerpt)
+    return result.model_copy(update={"markdown": normalized_markdown}), True
+
+
 def _repair_feedback_has_guidance_error(
     repair_feedback: Mapping[str, object] | None,
     error_code: str,
@@ -8685,11 +8789,14 @@ def _restore_guidance_repair_hints(
     *,
     repair_feedback: Mapping[str, object] | None,
 ) -> CompletedProviderProposal:
-    """只在缺失 Requirement 回证时回放上一轮已提交的 Guidance application。"""
+    """在Requirement缺失或正文遗漏回证时回放上一轮已提交的Guidance application。"""
 
-    if not _repair_feedback_has_guidance_error(
-        repair_feedback,
-        "guidance_requirement_required",
+    if not any(
+        _repair_feedback_has_guidance_error(repair_feedback, error_code)
+        for error_code in (
+            "guidance_requirement_required",
+            "guidance_evidence_not_in_markdown",
+        )
     ):
         return completed
     hints = (repair_feedback or {}).get("guidance_repair_hints", [])
@@ -8772,6 +8879,135 @@ def _restore_guidance_repair_hints(
     return completed.model_copy(update={"proposal": normalized_proposal})
 
 
+def _ensure_guidance_evidence_disclosures(
+    completed: CompletedProviderProposal,
+    *,
+    repair_feedback: Mapping[str, object] | None,
+) -> CompletedProviderProposal:
+    """在验证器报告正文遗漏时原样披露当前 proposal 已提交的 Guidance 回证。"""
+
+    if not _repair_feedback_has_guidance_error(
+        repair_feedback,
+        "guidance_evidence_not_in_markdown",
+    ):
+        return completed
+    arguments = completed.proposal.arguments
+    raw_applications = arguments.get("guidance_applications")
+    if not isinstance(raw_applications, (list, tuple)):
+        return completed
+    errored_ids = {
+        str(error).split(":", 1)[0]
+        for error in (
+            (repair_feedback or {}).get("verification", {}).get(
+                "guidance_application_errors", []
+            )
+            if isinstance((repair_feedback or {}).get("verification"), Mapping)
+            else []
+        )
+        if "guidance_evidence_not_in_markdown" in str(error)
+    }
+    if not errored_ids:
+        return completed
+    markdown = str(arguments.get("markdown") or "")
+    normalized_markdown = " ".join(markdown.casefold().split())
+    additions: list[str] = []
+    for application in raw_applications:
+        if not isinstance(application, Mapping):
+            continue
+        for item in application.get("items", []):
+            if not isinstance(item, Mapping):
+                continue
+            requirement_id = str(item.get("requirement_id") or "").strip()
+            evidence_excerpt = str(item.get("evidence_excerpt") or "").strip()
+            if (
+                requirement_id not in errored_ids
+                or not evidence_excerpt
+                or len(evidence_excerpt) > 500
+            ):
+                continue
+            normalized_excerpt = " ".join(evidence_excerpt.casefold().split())
+            if normalized_excerpt in normalized_markdown:
+                continue
+            additions.append(evidence_excerpt)
+            normalized_markdown = f"{normalized_markdown} {normalized_excerpt}"
+    if not additions:
+        return completed
+    normalized_arguments = dict(arguments)
+    normalized_arguments["markdown"] = (
+        f"{markdown}\n\nSkill回证正文披露（沿用当前 proposal 原文）：\n"
+        + "\n".join(f"- {item}" for item in additions[:8])
+    )
+    normalized_proposal = completed.proposal.model_copy(update={"arguments": normalized_arguments})
+    return completed.model_copy(update={"proposal": normalized_proposal})
+
+
+def _ensure_claim_repair_hint_disclosures(
+    completed: CompletedProviderProposal,
+    *,
+    repair_feedback: Mapping[str, object] | None,
+) -> CompletedProviderProposal:
+    """在附件Claim修复轮原样回放上一轮已提交且待披露的短Claim正文。
+
+    ``result_verifier`` 已确认 Claim 的证据血缘后，可能只报告
+    ``not_disclosed_in_markdown``；模型修复轮若再次用“上述命令”等概括替代原文，
+    会在有限修复耗尽后留下不可交付结果。这里仅使用上一轮 arguments 中保存的
+    ``exact_text_to_copy_into_markdown``，不创建 Claim、不改变引用或语义状态，随后
+    仍由统一脱敏和结果验证重新检查。
+    """
+
+    if repair_feedback is None:
+        return completed
+    verification = repair_feedback.get("verification")
+    errors = (
+        verification.get("attachment_evidence_errors")
+        if isinstance(verification, Mapping)
+        else None
+    )
+    if not isinstance(errors, Sequence) or isinstance(errors, (str, bytes)):
+        return completed
+    errored_ids = {
+        str(error).split(":", 1)[0]
+        for error in errors
+        if str(error).endswith(":not_disclosed_in_markdown")
+    }
+    if not errored_ids:
+        return completed
+    raw_hints = repair_feedback.get("claim_repair_hints")
+    if not isinstance(raw_hints, Sequence) or isinstance(raw_hints, (str, bytes)):
+        return completed
+    arguments = completed.proposal.arguments
+    markdown = str(arguments.get("markdown") or "")
+    normalized_markdown = " ".join(markdown.casefold().split())
+    additions: list[str] = []
+    for raw_hint in raw_hints:
+        if not isinstance(raw_hint, Mapping):
+            continue
+        claim_id = str(raw_hint.get("claim_id") or "").strip()
+        exact_text = str(raw_hint.get("exact_text_to_copy_into_markdown") or "").strip()
+        if (
+            claim_id not in errored_ids
+            or not exact_text
+            or len(exact_text) > 500
+        ):
+            continue
+        normalized_text = " ".join(exact_text.casefold().split())
+        if normalized_text in normalized_markdown:
+            continue
+        additions.append(exact_text)
+        normalized_markdown = f"{normalized_markdown} {normalized_text}"
+        if len(additions) >= 8:
+            break
+    if not additions:
+        return completed
+    normalized_arguments = dict(arguments)
+    normalized_arguments["markdown"] = (
+        f"{markdown}\n\n附件 Claim 回证（沿用上一轮已提交原文）：\n"
+        + "\n".join(f"- {item}" for item in additions)
+    )
+    normalized_proposal = completed.proposal.model_copy(update={"arguments": normalized_arguments})
+    return completed.model_copy(update={"proposal": normalized_proposal})
+
+
 def _normalize_dynamic_result_arguments(arguments: Mapping[str, object]) -> dict[str, object]:
     """归一模型常见的结果外形，剥离不具权威性的重复指导元数据。"""
 
@@ -8817,12 +9053,23 @@ def _normalize_dynamic_result_arguments(arguments: Mapping[str, object]) -> dict
             if isinstance(raw_items, Mapping):
                 raw_items = [raw_items]
             if isinstance(raw_items, list):
+                parent_skill_use_id = str(application.get("skill_use_id") or "").strip()
                 canonical_items: list[object] = []
                 for raw_item in raw_items:
                     if not isinstance(raw_item, Mapping):
                         canonical_items.append(raw_item)
                         continue
                     item = dict(raw_item)
+                    # provider 偶尔会把父级 skill_use_id 冗余复制到每个 item。父级
+                    # 是唯一权威身份；只有两者完全相同才剥离该重复字段，异值继续
+                    # 保留并由 GuidanceApplication 的 extra=forbid fail closed。
+                    nested_skill_use_id = str(item.get("skill_use_id") or "").strip()
+                    if (
+                        parent_skill_use_id
+                        and nested_skill_use_id
+                        and nested_skill_use_id == parent_skill_use_id
+                    ):
+                        item.pop("skill_use_id", None)
                     # 这些字段属于冻结 PlanRevision 的输入元数据；结果契约只需
                     # 回证 requirement_id/principle/application/evidence_excerpt。
                     # 仅剥离这两个已知重复字段，未知字段仍由 extra=forbid 拒绝。

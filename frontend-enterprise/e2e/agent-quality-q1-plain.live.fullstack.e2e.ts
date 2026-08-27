@@ -129,6 +129,8 @@ test.afterAll(async () => {
     source_model_config_id: process.env.Q1_SOURCE_MODEL_CONFIG_ID || '',
     provider_endpoint: process.env.Q1_PROVIDER_ENDPOINT || '',
     model: process.env.Q1_MODEL_NAME || '',
+    temperature: Number(process.env.Q1_MODEL_TEMPERATURE || '0'),
+    max_output_tokens: Number(process.env.Q1_MODEL_MAX_OUTPUT_TOKENS || '0'),
     capability_checksum: process.env.Q1_MODEL_CAPABILITY_CHECKSUM || '',
     certification_fingerprints: fingerprints,
     ...report,
@@ -344,11 +346,18 @@ async function runScenario(page: Page, definition: ScenarioDefinition): Promise<
   await expect.poll(async () => {
     const observed = await readFacts(page, sessionId);
     const status = String((observed.execution as { status?: string } | null)?.status || '');
+    // 以当前 session 的持久失败事件作为终态兜底，避免 Execution API 短暂不可读时
+    // 把已经落账的 provider/runtime 失败误等成无界复杂题。
+    if (observed.events.some((event) =>
+      event.event_type === 'dynamic_task_execution_failed'
+      || event.event_type === 'dynamic_task_delegation_failed')) return 'execution:failed';
     if (/^(succeeded|failed|cancelled|waiting)$/.test(status)) return `execution:${status}`;
     if (/Agent Loop 出错|AGENT_LOOP_ERROR/.test(observed.answer)) return 'answer:error';
+    // 纯对话复杂题若已经返回最终答案但没有 Execution，立即结束为硬门失败。
+    if (!observed.executionId && observed.answer.trim()) return 'answer:without_execution';
     return '';
   }, { timeout: Q1_EXECUTION_WAIT_TIMEOUT_MS, intervals: [2_000, 5_000, 10_000] })
-    .toMatch(/^(?:execution:(?:succeeded|failed|cancelled|waiting)|answer:error)$/);
+    .toMatch(/^(?:execution:(?:succeeded|failed|cancelled|waiting)|answer:(?:error|without_execution))$/);
   const facts = await readFacts(page, sessionId);
   const execution = facts.execution as {
     kind?: string; status?: string; skill_uses?: Array<Record<string, unknown>>;

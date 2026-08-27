@@ -59,6 +59,28 @@ BATCH_PATHS = {
         },
         "output": EVIDENCE_DIR / "q1-current-final-blind-review-report.json",
     },
+    "bf34-current": {
+        "package": EVIDENCE_DIR / "q1-bf34-current-blind-review-package.json",
+        "key": EVIDENCE_DIR / "q1-bf34-current-blind-review-key.json",
+        "roles": {
+            "product_value": EVIDENCE_DIR / "q1-bf34-current-blind-role-product.json",
+            "runtime_contract": EVIDENCE_DIR / "q1-bf34-current-blind-role-runtime.json",
+            "skill_method_and_prompt": EVIDENCE_DIR / "q1-bf34-current-blind-role-skill.json",
+            "attachment_evidence_and_safety": EVIDENCE_DIR / "q1-bf34-current-blind-role-attachment.json",
+        },
+        "output": EVIDENCE_DIR / "q1-bf34-current-blind-review-report.json",
+    },
+    "final-ark-20260827": {
+        "package": EVIDENCE_DIR / "q1-final-ark-20260827-blind-review-package.json",
+        "key": EVIDENCE_DIR / "q1-final-ark-20260827-blind-review-key.json",
+        "roles": {
+            "product_value": EVIDENCE_DIR / "q1-final-ark-20260827-blind-role-product.json",
+            "runtime_contract": EVIDENCE_DIR / "q1-final-ark-20260827-blind-role-runtime.json",
+            "skill_method_and_prompt": EVIDENCE_DIR / "q1-final-ark-20260827-blind-role-skill.json",
+            "attachment_evidence_and_safety": EVIDENCE_DIR / "q1-final-ark-20260827-blind-role-attachment.json",
+        },
+        "output": EVIDENCE_DIR / "q1-final-ark-20260827-blind-review-report.json",
+    },
 }
 
 

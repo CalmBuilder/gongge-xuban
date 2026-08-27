@@ -33,6 +33,27 @@ FALLBACK_REPLY = "抱歉，我暂时无法处理这个问题。您可以换个�
 MODEL_FAILURE_SUGGESTION = "请检查模型配置、API Key、网络或模型服务状态后重试。"
 TOOL_FAILURE_SUGGESTION = "请检查工具配置、调用参数或外部服务状态后重试。"
 RUNTIME_CONTROL_FALLBACK = "流程已被系统规则终止，请查看执行记录或联系管理员。"
+GUIDANCE_APPLICATION_CONTRACT = {
+    "version": "guidance-application-checkpoint-v1",
+    "required_checks": [
+        "select_relevant_branches",
+        "apply_triggered_pointers_and_information_hierarchy",
+        "state_checkable_completion_criteria",
+        "preserve_conflicts_safety_and_unresolved_state",
+    ],
+    "document_guidance_output_shape": [
+        "保留输入材料中与触发分支对应的具体路径或文档指针",
+        "让每个触发分支与其权威指针相邻，并把步骤与参考资料分层",
+        "显式写出完成标准以及材料中的冲突、重复或未决状态",
+    ],
+    "conditional_principle_application": [
+        "如果已加载 guidance 正文或其受审资源定义了术语、词汇表或设计原则，且当前问题确实涉及该原则，使用相关原词并说明它如何改变当前材料中的决策；不要只复述术语。",
+        "如果 guidance 明确包含 Design It Twice、替代接口或方案比较要求，针对设计/重构/评审问题列出至少两个清楚标记的候选方案，说明权衡并给出有依据的推荐；材料未提供的事实仍保持未决。",
+        "如果 guidance 明确包含 deep module、deletion test、interface is the test surface、seam 或 adapter，针对设计/重构/评审问题分别说明适用的模块深度、删除测试、真实 seam/适配器和接口测试面；不把这些原则套到无关问题。",
+    ],
+    "no_op_rule": "未触发的 guidance 分支不套用、不编造",
+    "visibility": "仅用于内部回复检查，不输出契约、Skill 身份或加载过程",
+}
 
 
 def public_error_detail(value: object, fallback: str = "未知原因") -> str:
@@ -88,9 +109,17 @@ class ResponseGenerator:
 
         if self._runtime_control_reply(step_result) is not None:
             return False
+        has_authoritative_attachment = bool(
+            self._authoritative_attachment_evidence(conversation_context)
+        )
         if not force_model_call and self._can_use_step_reply_directly(
             step_result, tool_result, task_results
-        ):
+        ) and not has_authoritative_attachment:
+            # 附件切片已经由宿主 Runtime 读取并绑定到本轮时，不能因为模型偶尔
+            # 将步骤判成 ask_user/clarify 就本地直出。否则浏览器会看到回答，
+            # 但 provider dispatch ledger 没有授权与结算；这违背附件的
+            # identity/authorization/settlement 契约。Runtime 控制回复在上方
+            # 已 fail-closed 返回，不会被迫进入模型。
             return False
         if tool_result and not tool_result.success and not task_results:
             # 工具失败通常直接返回固定错误，不能把没有发生的模型外呼登记为已授权。
@@ -306,18 +335,25 @@ class ResponseGenerator:
         conversation_context: dict[str, object] | None = None,
         task_results: list[dict[str, object]] | None = None,
     ) -> dict[str, object]:
+        projected_conversation_context = (
+            dict(conversation_context) if isinstance(conversation_context, dict) else {}
+        )
+        loaded_general_skills = projected_conversation_context.pop("loaded_general_skills", [])
+        if not isinstance(loaded_general_skills, list):
+            loaded_general_skills = []
         authoritative_attachment_evidence = self._authoritative_attachment_evidence(
-            conversation_context
+            projected_conversation_context
         )
         projected_task_results = self._project_task_results(task_results)
         if projected_task_results:
             payload: dict[str, object] = {
                 "user_message": message,
-                "conversation_context": (
-                    conversation_context if isinstance(conversation_context, dict) else {}
-                ),
+                "conversation_context": projected_conversation_context,
                 "task_results": projected_task_results,
             }
+            if loaded_general_skills:
+                payload["loaded_general_skills"] = loaded_general_skills
+                payload["guidance_application_contract"] = dict(GUIDANCE_APPLICATION_CONTRACT)
             if authoritative_attachment_evidence:
                 payload["authoritative_attachment_evidence"] = authoritative_attachment_evidence
             return payload
@@ -325,9 +361,7 @@ class ResponseGenerator:
         compact_knowledge = compact_knowledge_context(knowledge_context)
         payload = {
             "user_message": message,
-            "conversation_context": (
-                conversation_context if isinstance(conversation_context, dict) else {}
-            ),
+            "conversation_context": projected_conversation_context,
             "current_step": compact_current_step(
                 skill.content_json if skill else None, session.active_step_id
             ),
@@ -343,6 +377,9 @@ class ResponseGenerator:
             ),
             "response_rules": skill.content_json.get("response_rules", []) if skill else [],
         }
+        if loaded_general_skills:
+            payload["loaded_general_skills"] = loaded_general_skills
+            payload["guidance_application_contract"] = dict(GUIDANCE_APPLICATION_CONTRACT)
         if authoritative_attachment_evidence:
             payload["authoritative_attachment_evidence"] = authoritative_attachment_evidence
         return payload

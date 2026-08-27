@@ -38,11 +38,24 @@ REPORT_GLOBS_BY_BATCH = {
         "codebase-design": "agent-quality-q1-codebase-q1-codebase-current-final-r31-0[1-5].json",
         "diagnosing-positive": "agent-quality-q1-diagnosing-positive-q1-diagnosing-positive-current-final-r32-0[1-5].json",
     },
+    "bf34-current": {
+        "writing-fair": "agent-quality-q1-writing-fair-q1-writing-fair-bf34-r3-0[1-5].json",
+        "codebase-design": "agent-quality-q1-codebase-q1-codebase-bf34-r1-0[1-5].json",
+        "diagnosing-positive": "agent-quality-q1-diagnosing-positive-q1-diagnosing-positive-bf34-r1-0[1-5].json",
+    },
+    "final-ark-20260827": {
+        "writing-fair": "agent-quality-q1-writing-fair-q1-writing-fair-formal-ark-20260826-postmysql-8k-0[1-5].json",
+        "codebase-design": "agent-quality-q1-codebase-q1-codebase-formal-ark-20260826-final-0[1-5].json",
+        "diagnosing-positive": "agent-quality-q1-diagnosing-positive-q1-diagnosing-positive-formal-ark-20260826-final-v2-0[1-5].json",
+        "ordinary-codebase": "agent-quality-q1-ordinary-q1-ordinary-codebase-current-ark-20260827-r2-0[1-5].json",
+    },
 }
 OUTPUT_STEMS = {
     "current-source": "q1-current-source-blind-review",
     "release-candidate": "q1-release-candidate-blind-review",
     "current-final": "q1-current-final-blind-review",
+    "bf34-current": "q1-bf34-current-blind-review",
+    "final-ark-20260827": "q1-final-ark-20260827-blind-review",
 }
 
 

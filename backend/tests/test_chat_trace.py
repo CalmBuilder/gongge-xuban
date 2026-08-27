@@ -1,9 +1,19 @@
+"""
+@Time       : 2026/08/27
+@Author     : zhanglp8181
+@File       : test_chat_trace.py
+@CallChain  : pytest → chat event projection/API → SQLite test ledger
+@Description: 验证会话事件窗口的恢复锚点、边界、终态和租户隔离契约。
+"""
+
 from datetime import datetime, timedelta
 from threading import Thread
 from time import sleep
 
 import pytest
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
+from fastapi.routing import APIRoute
+from fastapi.testclient import TestClient
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
@@ -14,14 +24,23 @@ from app.api.chat import (
     _existing_turn_replay,
     _format_scheduled_task_schedule,
     _message_turn_ids_from_events,
+    _normalized_session_event_payload,
     _persist_chat_turn_cancelled,
     _persist_chat_turn_interrupted,
     _relay_event_payload,
+    _session_event_history_rows,
     _stream_existing_turn,
+    _turn_has_terminal_event,
+    SESSION_EVENT_HISTORY_LIMIT,
+    SESSION_EVENT_HISTORY_MAX_LIMIT,
+    SESSION_EVENT_LATEST_TURN_MAX,
+    SESSION_EVENT_TERMINAL_MAX,
+    list_chat_session_events,
     list_chat_session_spans,
     message_read,
 )
 from app.api import chat as chat_api
+from app.db import get_session
 from app.db.models import (
     AgentEvent,
     ChatSession,
@@ -33,6 +52,7 @@ from app.db.models import (
     User,
 )
 from app.observability.event_log import EventLog
+from app.security.auth import get_current_user
 from app.session.session_schema import ChatTurnRequest
 from app.sop_runtime.execution_store import SopExecutionFencedError, SopExecutionStore
 
@@ -219,6 +239,90 @@ def test_running_client_turn_reattaches_until_original_worker_persists_terminal(
 
     assert "原 worker 完成" in stream
     assert "event: complete" in stream
+
+
+def test_stream_end_only_replay_stays_open_until_business_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """重放只收到stream_end时不能宣称成功，并在短空闲窗口后安全结束。"""
+
+    db = _test_db()
+    session_row = ChatSession(
+        id="session_stream_end_replay",
+        tenant_id="tenant_demo",
+        user_id="user_stream_end_replay",
+        agent_id="agent_demo",
+    )
+    user_message = Message(
+        id="msg_stream_end_replay",
+        tenant_id="tenant_demo",
+        session_id=session_row.id,
+        role="user",
+        content="只收到流结束",
+        metadata_json={"client_turn_id": "client_stream_end_replay"},
+    )
+    db.add_all(
+        [
+            session_row,
+            user_message,
+            User(
+                id="user_stream_end_replay",
+                tenant_id="tenant_demo",
+                username="stream-end-replay",
+                password_hash="x",
+            ),
+            AgentEvent(
+                id="evt_stream_end_replay_received",
+                tenant_id="tenant_demo",
+                session_id=session_row.id,
+                event_type="user_message_received",
+                payload_json={
+                    "message_id": user_message.id,
+                    "turn_id": user_message.id,
+                    "client_turn_id": "client_stream_end_replay",
+                    "channel": "web",
+                },
+            ),
+            AgentEvent(
+                id="evt_stream_end_replay_end",
+                tenant_id="tenant_demo",
+                session_id=session_row.id,
+                event_type="stream_end",
+                payload_json={
+                    "turn_id": user_message.id,
+                    "client_turn_id": "client_stream_end_replay",
+                },
+            ),
+        ]
+    )
+    db.commit()
+    monkeypatch.setattr(chat_api, "STREAM_RELAY_POLL_SECONDS", 0.001)
+    monkeypatch.setattr(chat_api, "STREAM_RELAY_IDLE_TIMEOUT_SECONDS", 0.01)
+    request = ChatTurnRequest(
+        tenant_id="tenant_demo",
+        session_id=session_row.id,
+        agent_id="agent_demo",
+        user_id="user_stream_end_replay",
+        message=user_message.content,
+        client_turn_id="client_stream_end_replay",
+    )
+
+    replay = _existing_turn_replay(db, request)
+    assert replay is not None
+    message_id, rows, cursor, terminal = replay
+    assert message_id == user_message.id
+    assert terminal is False
+    stream = "".join(
+        _stream_existing_turn(
+            request,
+            message_id=message_id,
+            initial_rows=rows,
+            initial_cursor=cursor,
+            terminal=terminal,
+        )
+    )
+    assert "event: stream_end" in stream
+    assert "event: complete" not in stream
 
 
 def test_event_log_binds_all_execution_events_to_current_turn() -> None:
@@ -1499,6 +1603,277 @@ def test_relay_event_payload_maps_persisted_router_and_status_events() -> None:
     assert router_payload["decision"] == "answer_only"
 
 
+def test_event_projection_keeps_persisted_envelope_authoritative() -> None:
+    """事件业务payload不能伪造事件身份、类型或创建时间，避免破坏恢复排序。"""
+
+    row = AgentEvent(
+        id="evt_authoritative",
+        tenant_id="tenant_demo",
+        session_id="session_authoritative",
+        event_type="stream_end",
+        payload_json={
+            "id": "spoofed-id",
+            "event": "complete",
+            "type": "complete",
+            "event_type": "complete",
+            "created_at": "2099-01-01T00:00:00",
+            "content": "正文",
+        },
+        created_at=datetime(2026, 7, 4, 9, 9, 0),
+    )
+
+    projected = _normalized_session_event_payload(row)
+    event_name, relay_payload = _relay_event_payload(row)
+
+    assert projected["id"] == row.id
+    assert projected["event"] == "stream_end"
+    assert projected["type"] == "stream_end"
+    assert projected["event_type"] == "stream_end"
+    assert projected["created_at"] == row.created_at.isoformat()
+    assert event_name == "stream_end"
+    assert relay_payload["kind"] == "stream_end"
+    assert relay_payload["sessionId"] == row.session_id
+    assert relay_payload["timestamp"] == row.created_at.isoformat()
+
+
+def test_session_event_window_preserves_latest_turn_after_old_history() -> None:
+    """历史事件达到窗口上限时，最新运行Turn仍完整可见而不只返回旧前缀。"""
+
+    db = _test_db()
+    tenant = Tenant(id="tenant_latest", name="Latest")
+    user = User(id="user_latest", tenant_id=tenant.id, username="latest", password_hash="x")
+    session_row = ChatSession(
+        id="session_latest_turn",
+        tenant_id=tenant.id,
+        user_id=user.id,
+        agent_id="agent_demo",
+    )
+    db.add_all([tenant, user, session_row])
+    started_at = datetime(2026, 8, 27, 12, 0, 0)
+    for index in range(100):
+        db.add(
+            AgentEvent(
+                id=f"evt_old_{index:03d}",
+                tenant_id=tenant.id,
+                session_id=session_row.id,
+                event_type="stream_delta",
+                payload_json={"turn_id": "old_turn", "content": "o"},
+                created_at=started_at + timedelta(microseconds=index),
+            )
+    )
+    latest_started_at = started_at + timedelta(seconds=1)
+    db.add(
+        AgentEvent(
+            id="evt_000_same_timestamp",
+            tenant_id=tenant.id,
+            session_id=session_row.id,
+            event_type="stream_delta",
+            payload_json={"turn_id": "old_turn", "content": "old"},
+            created_at=latest_started_at,
+        )
+    )
+    db.add(
+        AgentEvent(
+            id="evt_latest_received",
+            tenant_id=tenant.id,
+            session_id=session_row.id,
+            event_type="user_message_received",
+            payload_json={"message_id": "latest_turn", "turn_id": "latest_turn"},
+            created_at=latest_started_at,
+        )
+    )
+    for index in range(120):
+        db.add(
+            AgentEvent(
+                id=f"evt_latest_{index:03d}",
+                tenant_id=tenant.id,
+                session_id=session_row.id,
+                event_type="stream_delta",
+                payload_json={"turn_id": "latest_turn", "content": "n"},
+                created_at=latest_started_at + timedelta(microseconds=index + 1),
+            )
+        )
+    db.commit()
+
+    rows = _session_event_history_rows(db, tenant.id, session_row.id, limit=100)
+
+    assert len(rows) == 221
+    assert rows[0].id == "evt_old_000"
+    assert rows[-1].id == "evt_latest_119"
+    assert sum(row.event_type == "stream_delta" for row in rows if row.id.startswith("evt_latest_")) == 120
+
+
+def test_session_event_window_filters_late_other_turn_and_bounds_latest_extension() -> None:
+    """最新Turn按身份筛选且最多保留5000条扩展，避免并发迟到事件或超长响应失控。"""
+
+    assert SESSION_EVENT_LATEST_TURN_MAX == 5000
+    db = _test_db()
+    tenant = Tenant(id="tenant_latest_bound", name="Latest bound")
+    user = User(
+        id="user_latest_bound",
+        tenant_id=tenant.id,
+        username="latest-bound",
+        password_hash="x",
+    )
+    session_row = ChatSession(
+        id="session_latest_bound",
+        tenant_id=tenant.id,
+        user_id=user.id,
+        agent_id="agent_demo",
+    )
+    db.add_all([tenant, user, session_row])
+    started_at = datetime(2026, 8, 27, 12, 0, 0)
+    for index in range(100):
+        db.add(
+            AgentEvent(
+                id=f"evt_bound_old_{index:03d}",
+                tenant_id=tenant.id,
+                session_id=session_row.id,
+                event_type="stream_delta",
+                payload_json={"turn_id": "old_turn", "content": "o"},
+                created_at=started_at + timedelta(microseconds=index),
+            )
+        )
+    latest_started_at = started_at + timedelta(seconds=1)
+    db.add(
+        AgentEvent(
+            id="evt_bound_user",
+            tenant_id=tenant.id,
+            session_id=session_row.id,
+            event_type="user_message_received",
+            payload_json={"message_id": "bound_turn", "turn_id": "bound_turn"},
+            created_at=latest_started_at,
+        )
+    )
+    for index in range(5105):
+        db.add(
+            AgentEvent(
+                id=f"evt_bound_latest_{index:04d}",
+                tenant_id=tenant.id,
+                session_id=session_row.id,
+                event_type="stream_delta",
+                payload_json={"turn_id": "bound_turn", "content": "n"},
+                created_at=latest_started_at + timedelta(microseconds=index + 1),
+            )
+        )
+    db.add(
+        AgentEvent(
+            id="evt_bound_late_other",
+            tenant_id=tenant.id,
+            session_id=session_row.id,
+            event_type="stream_delta",
+            payload_json={"turn_id": "old_turn", "content": "late"},
+            created_at=latest_started_at + timedelta(seconds=1),
+        )
+    )
+    db.add(
+        AgentEvent(
+            id="evt_bound_complete",
+            tenant_id=tenant.id,
+            session_id=session_row.id,
+            event_type="complete",
+            payload_json={"turn_id": "bound_turn", "reply": "完成"},
+            created_at=latest_started_at + timedelta(seconds=2),
+        )
+    )
+    db.commit()
+
+    rows = _session_event_history_rows(db, tenant.id, session_row.id, limit=100)
+    latest_rows = [
+        row
+        for row in rows
+        if row.id == "evt_bound_user" or row.id.startswith("evt_bound_latest_")
+    ]
+
+    # complete 占用一个最新 Turn 扩展槽位，终态本身仍由 terminal anchor 保留。
+    assert len(latest_rows) == SESSION_EVENT_LATEST_TURN_MAX - 1
+    assert latest_rows[0].id == "evt_bound_user"
+    assert rows[-1].id == "evt_bound_complete"
+    assert "evt_bound_late_other" not in {row.id for row in rows}
+    assert all(
+        (row.payload_json or {}).get("turn_id") != "old_turn"
+        for row in rows
+        if row.created_at >= latest_started_at
+    )
+
+
+def test_stream_end_is_not_success_terminal_for_interruption_guard() -> None:
+    """仅有stream_end而没有complete时仍允许写入中断终态，避免假装成功。"""
+
+    db = _test_db()
+    tenant = Tenant(id="tenant_stream_end", name="Stream end")
+    user = User(id="user_stream_end", tenant_id=tenant.id, username="stream-end", password_hash="x")
+    session_row = ChatSession(
+        id="session_stream_end",
+        tenant_id=tenant.id,
+        user_id=user.id,
+        agent_id="agent_demo",
+    )
+    db.add_all([tenant, user, session_row])
+    db.add(
+        AgentEvent(
+            tenant_id=tenant.id,
+            session_id=session_row.id,
+            event_type="stream_end",
+            payload_json={"turn_id": "turn_stream_end"},
+        )
+    )
+    db.commit()
+
+    assert not _turn_has_terminal_event(db, tenant.id, session_row.id, "turn_stream_end")
+
+
+def test_session_event_window_preserves_tenant_and_session_boundaries() -> None:
+    """事件窗口查询拒绝跨租户或非会话所有者读取，避免补回逻辑扩大可见范围。"""
+
+    db = _test_db()
+    tenant_a = Tenant(id="tenant_events_a", name="Events A")
+    tenant_b = Tenant(id="tenant_events_b", name="Events B")
+    user_a = User(id="user_events_a", tenant_id=tenant_a.id, username="events-a", password_hash="x")
+    user_b = User(id="user_events_b", tenant_id=tenant_b.id, username="events-b", password_hash="x")
+    session_row = ChatSession(
+        id="session_events_a",
+        tenant_id=tenant_a.id,
+        user_id=user_a.id,
+        agent_id="agent_demo",
+    )
+    db.add_all(
+        [
+            tenant_a,
+            tenant_b,
+            user_a,
+            user_b,
+            session_row,
+            AgentEvent(
+                id="evt_events_a",
+                tenant_id=tenant_a.id,
+                session_id=session_row.id,
+                event_type="complete",
+                payload_json={"turn_id": "turn_a", "reply": "仅租户A可见"},
+            ),
+        ]
+    )
+    db.commit()
+
+    with pytest.raises(HTTPException) as tenant_error:
+        list_chat_session_events(
+            session_row.id,
+            tenant_id=tenant_b.id,
+            current_user=user_b,
+            db=db,
+        )
+    assert tenant_error.value.status_code == 404
+
+    with pytest.raises(HTTPException) as user_error:
+        list_chat_session_events(
+            session_row.id,
+            tenant_id=tenant_a.id,
+            current_user=user_b,
+            db=db,
+        )
+    assert user_error.value.status_code == 403
+
+
 def test_turn_trace_without_terminal_event_stays_open_for_refresh_recovery() -> None:
     started_at = datetime(2026, 7, 4, 9, 6, 0)
     messages = [
@@ -2153,6 +2528,161 @@ def test_message_read_uses_metadata_turn_id_when_event_mapping_is_missing() -> N
     )
 
     assert message_read(row).turn_id == "msg_user"
+
+
+def test_session_event_window_keeps_terminal_event_after_long_stream() -> None:
+    """长流超过历史窗口时仍返回 complete，避免刷新端把已完成 Turn 判成运行中。"""
+
+    assert SESSION_EVENT_HISTORY_LIMIT == 1024
+    assert SESSION_EVENT_HISTORY_MAX_LIMIT == 5000
+    db = _test_db()
+    tenant = Tenant(id="tenant_demo", name="Demo")
+    user = User(id="user_demo", tenant_id=tenant.id, username="demo", password_hash="x")
+    session_row = ChatSession(
+        id="session_long_stream",
+        tenant_id=tenant.id,
+        user_id=user.id,
+        agent_id="agent_demo",
+    )
+    db.add_all([tenant, user, session_row])
+    started_at = datetime(2026, 8, 27, 12, 0, 0)
+    for index in range(1024):
+        db.add(
+            AgentEvent(
+                id=f"evt_long_{index:03d}",
+                tenant_id=tenant.id,
+                session_id=session_row.id,
+                event_type="stream_delta",
+                payload_json={"turn_id": "msg_long", "content": "x"},
+                created_at=started_at + timedelta(microseconds=index),
+            )
+        )
+    db.add(
+        AgentEvent(
+            id="evt_long_complete",
+            tenant_id=tenant.id,
+            session_id=session_row.id,
+            event_type="complete",
+            payload_json={"turn_id": "msg_long", "reply": "完成"},
+            created_at=started_at + timedelta(microseconds=1025),
+        )
+    )
+    db.commit()
+
+    rows = _session_event_history_rows(db, tenant.id, session_row.id, limit=500)
+    assert len(rows) == 501
+    assert rows[-1].event_type == "complete"
+    default_rows = _session_event_history_rows(db, tenant.id, session_row.id)
+    assert len(default_rows) == 1025
+    assert default_rows[-1].event_type == "complete"
+    projected = list_chat_session_events(
+        session_row.id,
+        tenant_id=tenant.id,
+        current_user=user,
+        db=db,
+        limit=500,
+    )
+    assert projected[-1]["event_type"] == "complete"
+
+
+def test_session_event_window_bounds_terminal_anchor_query() -> None:
+    """终态锚点补回在 SQL 查询层最多读取1024条，避免历史终态无限膨胀。"""
+
+    assert SESSION_EVENT_TERMINAL_MAX == 1024
+    db = _test_db()
+    tenant = Tenant(id="tenant_terminal_bound", name="Terminal bound")
+    user = User(
+        id="user_terminal_bound",
+        tenant_id=tenant.id,
+        username="terminal-bound",
+        password_hash="x",
+    )
+    session_row = ChatSession(
+        id="session_terminal_bound",
+        tenant_id=tenant.id,
+        user_id=user.id,
+        agent_id="agent_demo",
+    )
+    db.add_all([tenant, user, session_row])
+    started_at = datetime(2026, 8, 27, 12, 0, 0)
+    for index in range(1024):
+        db.add(
+            AgentEvent(
+                id=f"evt_terminal_history_{index:04d}",
+                tenant_id=tenant.id,
+                session_id=session_row.id,
+                event_type="stream_delta",
+                payload_json={"turn_id": "old_turn", "content": "history"},
+                created_at=started_at + timedelta(microseconds=index),
+            )
+        )
+    terminal_started_at = started_at + timedelta(seconds=1)
+    for index in range(1100):
+        db.add(
+            AgentEvent(
+                id=f"evt_terminal_{index:04d}",
+                tenant_id=tenant.id,
+                session_id=session_row.id,
+                event_type="complete",
+                payload_json={"turn_id": f"turn_{index:04d}"},
+                created_at=terminal_started_at + timedelta(microseconds=index),
+            )
+        )
+    db.commit()
+
+    rows = _session_event_history_rows(db, tenant.id, session_row.id)
+
+    terminal_rows = [row for row in rows if row.event_type == "complete"]
+    assert len(terminal_rows) == SESSION_EVENT_TERMINAL_MAX
+    assert terminal_rows[0].id == "evt_terminal_0076"
+    assert terminal_rows[-1].id == "evt_terminal_1099"
+
+
+def test_session_event_route_rejects_limit_above_public_bound() -> None:
+    """HTTP 事件窗口只接受不超过5000的请求，避免客户端绕过资源契约。"""
+
+    db = _test_db()
+    tenant = Tenant(id="tenant_route_bound", name="Route bound")
+    user = User(
+        id="user_route_bound",
+        tenant_id=tenant.id,
+        username="route-bound",
+        password_hash="x",
+    )
+    session_row = ChatSession(
+        id="session_route_bound",
+        tenant_id=tenant.id,
+        user_id=user.id,
+        agent_id="agent_demo",
+    )
+    db.add_all([tenant, user, session_row])
+    db.commit()
+
+    def override_session() -> Session:
+        """为路由测试注入隔离的 SQLite 会话。"""
+
+        return db
+
+    app = FastAPI()
+    app.include_router(chat_api.router)
+    app.dependency_overrides[get_session] = override_session
+    app.dependency_overrides[get_current_user] = lambda: user
+    try:
+        response = TestClient(app).get(
+            f"/api/chat/sessions/{session_row.id}/events",
+            params={"tenant_id": tenant.id, "limit": SESSION_EVENT_HISTORY_MAX_LIMIT + 1},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 422
+    route = next(
+        item
+        for item in chat_api.router.routes
+        if isinstance(item, APIRoute) and item.path == "/api/chat/sessions/{session_id}/events"
+    )
+    limit_parameter = next(item for item in route.dependant.query_params if item.name == "limit")
+    assert any(getattr(metadata, "le", None) == SESSION_EVENT_HISTORY_MAX_LIMIT for metadata in limit_parameter.field_info.metadata)
 
 
 def _test_db() -> Session:

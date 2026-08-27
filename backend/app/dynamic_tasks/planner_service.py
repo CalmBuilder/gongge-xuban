@@ -363,6 +363,28 @@ class DynamicTaskPlanner:
                 # 最后一轮 repair 仍可能把报告章节拆成多个 answer。这个形状错误不应
                 # 让真实附件任务随机失败；只合并终态，不放宽能力、依赖或 Skill 来源校验。
                 raw = _repair_terminal_answer_steps(raw)
+            if (
+                attempt >= 1
+                and guidance_use_ids_by_name
+                and not _repair_covers_loaded_skills(
+                    raw.get("guidance_requirements"),
+                    loaded_skill_contract,
+                )
+            ):
+                # Guidance 连续性/终态收敛属于计划后处理，可能在前面的兜底之后再次
+                # 返回一个没有 requirements 的草案。这里必须在 normalize 前再做一次
+                # 宿主侧闭合：仅从同一冻结候选目录为每个已加载 Skill 绑定一条
+                # source-backed apply，不改写步骤、能力、权限或预算；没有候选时仍
+                # 交给 normalize_plan_draft fail-closed。这保持了 OpenWorker 的宿主
+                # 权威输入边界、Hermes 的不可满足契约拒绝和 Prime 的固定计划回放语义。
+                fallback = _deterministic_guidance_requirement_fallback(
+                    loaded_skill_contract,
+                    _guidance_candidate_options(payload["guidance_principle_candidates"]),
+                    goal=goal,
+                )
+                if fallback is not None:
+                    raw = dict(raw)
+                    raw["guidance_requirements"] = fallback
             try:
                 draft = DynamicPlanDraft.model_validate(raw).model_copy(
                     update={
@@ -670,22 +692,45 @@ def _repair_covers_loaded_skills(
     requirements: object,
     loaded_skill_contract: list[dict[str, object]],
 ) -> bool:
-    """确认受限修复至少为每个已加载 Skill 返回1至3条要求，避免空修复误放行。"""
+    """确认修复结果满足每个 Skill 的适用性基数，避免非法 not_applicable 误放行。"""
 
     if not isinstance(requirements, list):
         return False
-    loaded_names = {
-        str(item.get("skill_ref") or "")
+    contracts = {
+        str(item.get("skill_ref") or "").strip(): item
         for item in loaded_skill_contract
         if str(item.get("skill_ref") or "").strip()
     }
-    counts: dict[str, int] = {}
+    if len(contracts) != len(loaded_skill_contract):
+        return False
+    grouped: dict[str, list[dict[str, object]]] = {name: [] for name in contracts}
     for item in requirements:
         if not isinstance(item, dict):
             return False
-        skill_ref = str(item.get("skill_ref") or "")
-        counts[skill_ref] = counts.get(skill_ref, 0) + 1
-    return set(counts) == loaded_names and all(1 <= count <= 3 for count in counts.values())
+        skill_ref = str(item.get("skill_ref") or "").strip()
+        if skill_ref not in grouped:
+            return False
+        disposition = str(item.get("disposition") or "apply").strip()
+        if disposition not in {"apply", "not_applicable"}:
+            return False
+        grouped[skill_ref].append(item)
+    for skill_ref, items in grouped.items():
+        if not 1 <= len(items) <= 3:
+            return False
+        not_applicable_count = sum(
+            str(item.get("disposition") or "apply").strip() == "not_applicable"
+            for item in items
+        )
+        if not_applicable_count:
+            # 只有 forced Skill 才能用唯一 not_applicable 解释不适用；它不能
+            # 与 apply 混用，否则 normalize_plan_draft 会在更晚阶段拒绝整份计划。
+            if (
+                str(contracts[skill_ref].get("selection_mode") or "forced").strip() != "forced"
+                or len(items) != 1
+                or not_applicable_count != 1
+            ):
+                return False
+    return True
 
 
 def _deterministic_guidance_requirement_fallback(

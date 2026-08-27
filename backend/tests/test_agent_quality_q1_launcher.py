@@ -81,7 +81,10 @@ def test_q1_skill_source_and_certification_fingerprints_are_current() -> None:
         "otherpro/skills/skills/productivity/writing-for-agents/agents/openai.yaml",
     }
     assert all(len(checksum) == 64 for checksum in skill_checksums.values())
+    assert "backend/app/api/chat.py" in fingerprints
     assert "backend/app/dynamic_tasks/action_proposer.py" in fingerprints
+    assert "frontend-enterprise/src/pages/chat/chatHelpers.tsx" in fingerprints
+    assert "frontend-enterprise/src/pages/chat/useChatSession.ts" in fingerprints
     assert "frontend-enterprise/e2e/agent-quality-q1.live.fullstack.e2e.ts" in fingerprints
     assert "scripts/run_agent_quality_q1_browser_regression.py" in fingerprints
     assert all(len(checksum) == 64 for checksum in fingerprints.values())
@@ -120,6 +123,37 @@ def test_q1_codebase_profile_freezes_only_reviewed_skill_files(
     }
     assert environment["Q1_CODEBASE_SKILL_DIR"] == str(skill_dir)
     assert "Q1_WRITING_SKILL_DIR" not in environment
+
+
+def test_q1_ordinary_codebase_benchmark_forwards_codebase_skill_directory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ordinary codebase benchmark必须把实际Skill目录投影到对应白名单变量。"""
+
+    module = _load_launcher()
+    monkeypatch.setenv("Q1_PROFILE", "ordinary")
+    monkeypatch.setenv("Q1_ORDINARY_BENCHMARK", "codebase")
+    profile_name, profile = module._selected_profile()
+    skill_dir = Path(module.CODEBASE_SKILL_DIR)
+    environment = module._q1_browser_environment(
+        {
+            "PATH": "/usr/bin",
+            "Q1_ORDINARY_BENCHMARK": "codebase",
+        },
+        fingerprints=module._certification_fingerprints(profile_name=profile_name),
+        model_id="model-id",
+        model_name="model-name",
+        capability_checksum="capability-checksum",
+        public_endpoint="https://example.invalid/v1",
+        profile_name=profile_name,
+        skill_dir=skill_dir,
+    )
+
+    assert profile["e2e_file"] == "e2e/agent-quality-q1-ordinary.live.fullstack.e2e.ts"
+    assert Path(profile["skill_dir"]) == skill_dir
+    assert environment["Q1_CODEBASE_SKILL_DIR"] == str(skill_dir)
+    assert "Q1_WRITING_SKILL_DIR" not in environment
+    assert environment["Q1_ORDINARY_BENCHMARK"] == "codebase"
 
 
 def test_q1_writing_fair_profile_selects_fair_benchmark_and_forwards_selector(
@@ -189,6 +223,40 @@ def test_q1_plain_profile_has_no_skill_source_dependency(
     assert "Q1_CODEBASE_SKILL_DIR" not in environment
     assert "Q1_SKILLS_REVISION" not in environment
     assert "Q1_SKILL_SOURCE_CHECKSUM_JSON" not in environment
+
+
+def test_event_window_profile_projects_real_probe_flags_without_skill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """长流窗口探针必须选择专属E2E，并只投影运行开关和无密钥证据路径。"""
+
+    module = _load_launcher()
+    monkeypatch.setenv("Q1_PROFILE", "event-window")
+
+    profile_name, profile = module._selected_profile()
+    environment = module._q1_browser_environment(
+        {
+            "PATH": "/usr/bin",
+            "LIVE_ATTACHMENT_E2E": "1",
+            "EVENT_WINDOW_E2E": "1",
+            "EVENT_WINDOW_EVIDENCE_FILE": "event-window-r15.json",
+        },
+        fingerprints={"frontend-enterprise/e2e/event-window.ts": "a" * 64},
+        model_id="model-id",
+        model_name="model-name",
+        capability_checksum="capability-checksum",
+        public_endpoint="https://example.invalid/v1",
+        profile_name=profile_name,
+        skill_dir=None,
+    )
+
+    assert profile_name == "event-window"
+    assert profile["skill_dir"] is None
+    assert profile["e2e_file"] == "e2e/agent-quality-event-window.live.fullstack.e2e.ts"
+    assert environment["EVENT_WINDOW_E2E"] == "1"
+    assert environment["EVENT_WINDOW_EVIDENCE_FILE"] == "event-window-r15.json"
+    assert "Q1_WRITING_SKILL_DIR" not in environment
+    assert "Q1_CODEBASE_SKILL_DIR" not in environment
 
 
 def test_q1_unrelated_profile_projects_reviewed_skill_without_changing_agent_scope(

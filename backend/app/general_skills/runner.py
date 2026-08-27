@@ -707,12 +707,19 @@ class GeneralSkillRunner:
         conversation_context: dict[str, object] | None = None,
         memory_context: list[dict[str, object]] | None = None,
     ) -> str:
+        """基于已执行结果生成最终回复，并对声明写作纪律的 Skill 做一次有界复核。"""
+
         _emit(trace, {"phase": "replying", "message": "正在根据运行结果生成回复"}, event_sink)
         stage_data = {
             "skill": {
                 "slug": skill.slug,
                 "name": skill.name,
                 "description": skill.description,
+                # 最终回复阶段也必须看到同一份冻结 Skill 正文。此前这里只投影
+                # description，导致 runner 虽然加载了 Skill，reply 模型却无法按
+                # Context pointers、信息层级和 completion criteria 收敛最终文本。
+                # 正文作为受控参考传入，不授予执行脚本或扩大能力边界。
+                "markdown": _truncate(skill.skill_markdown, 12000),
             },
             "execution_trace": trace,
             "stdout": stdout,
@@ -740,6 +747,65 @@ class GeneralSkillRunner:
             raise LLMError(f"General skill reply returned invalid JSON schema: {exc}") from exc
         if not reply:
             raise LLMError("General skill reply is empty")
+        if _skill_requests_reply_review(skill.skill_markdown):
+            _emit(
+                trace,
+                {
+                    "phase": "reply_reviewing",
+                    "message": "已生成草稿，正在按固定 Skill 做最终复核",
+                },
+                event_sink,
+            )
+            review_stage_data = {
+                **stage_data,
+                "draft_reply": reply,
+                "review_contract": (
+                    "只返回修订后的最终回复；保留用户材料的事实与未决状态，"
+                    "补齐适用的触发条件、信息层级和完成标准，删除重复或未裁决的旧规则，"
+                    "最终交付中同一事实只保留一次；如需说明已去重，用一句简短说明即可。"
+                    "不得执行命令、扩大权限或输出复核过程。"
+                ),
+            }
+            review_instructions = (
+                REPLY_PROMPT.read_text(encoding="utf-8")
+                + "\n\n这是最终回复的第二次有界复核。draft_reply 是待修订草稿；请重新对照"
+                " skill.markdown 和 review_contract，必要时修订，最后仍只输出 {\"reply\":\"...\"}。"
+            )
+            try:
+                with llm_operation("general_skill.reply", attempt=2):
+                    reviewed_raw = LLMClient(model_config).generate_json(
+                        unified_system_prompt(),
+                        stage_payload(
+                            phase="Response Generator / General Skill Reply Review",
+                            user_message=query,
+                            conversation_context=conversation_context,
+                            memory_context=memory_context,
+                            instructions=review_instructions,
+                            stage_data=review_stage_data,
+                            output_contract=GENERAL_SKILL_REPLY_OUTPUT,
+                        ),
+                    )
+                reviewed_reply = GeneralSkillReply.model_validate(reviewed_raw).reply.strip()
+                if reviewed_reply:
+                    reply = reviewed_reply
+                    _emit(
+                        trace,
+                        {
+                            "phase": "reply_reviewed",
+                            "message": "已按固定 Skill 完成最终回复复核",
+                        },
+                        event_sink,
+                    )
+            except Exception as exc:  # 复核失败保留已生成的可见回复，不重跑技能代码。
+                _emit(
+                    trace,
+                    {
+                        "phase": "reply_review_failed",
+                        "message": "最终 Skill 复核失败，保留首次回复",
+                        "error": str(exc),
+                    },
+                    event_sink,
+                )
         _emit(trace, {"phase": "reply_created", "message": "已生成最终回复"}, event_sink)
         return reply
 
@@ -840,6 +906,19 @@ def _plan_runtime(plan: GeneralSkillExecutionPlan) -> str:
 
 def _runtime_label(runtime: str) -> str:
     return "Bash" if runtime == "bash" else "Python"
+
+
+def _skill_requests_reply_review(markdown: str) -> bool:
+    """仅为正文明确包含写作纪律的 Skill 启用一次最终回复复核。"""
+
+    normalized = " ".join(str(markdown or "").casefold().split())
+    markers = (
+        "context pointers",
+        "information hierarchy",
+        "completion criteria",
+        "progressive disclosure",
+    )
+    return sum(marker in normalized for marker in markers) >= 2
 
 
 def _skill_files(skill: GeneralSkill) -> list[dict[str, Any]]:

@@ -206,6 +206,8 @@ test('同会话附件首轮后下一轮纯对话不继承附件与Skill执行', 
     source_model_config_id: process.env.Q1_SOURCE_MODEL_CONFIG_ID || null,
     provider_endpoint: process.env.Q1_PROVIDER_ENDPOINT || null,
     model: process.env.Q1_MODEL_NAME || null,
+    temperature: Number(process.env.Q1_MODEL_TEMPERATURE || '0'),
+    max_output_tokens: Number(process.env.Q1_MODEL_MAX_OUTPUT_TOKENS || '0'),
     profile: process.env.Q1_PROFILE || null,
     session_id: sessionId,
     prompt_sha256: [

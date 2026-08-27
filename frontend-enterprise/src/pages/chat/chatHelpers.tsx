@@ -45,7 +45,11 @@ export const CHAT_STREAM_IDLE_TIMEOUT_MS = 600 * 1000;
 export const CHAT_STREAM_IDLE_CHECK_INTERVAL_MS = 5 * 1000;
 export const CHAT_STREAM_HEARTBEAT_GRACE_MS = 20 * 1000;
 export const CHAT_TRACE_RECOVERY_WINDOW_MS = 10 * 60 * 1000;
-export const STREAM_TERMINAL_EVENTS = new Set(['complete', 'done', 'stream_end', 'stream_cancelled', 'stream_interrupted', 'error', 'error_occurred']);
+// `stream_end` only marks the transport boundary.  The persisted turn is
+// closed by `complete` (or an explicit cancellation/error/interruption), so a
+// reconnect after a boundary without a business terminal must remain eligible
+// for event-log recovery.
+export const STREAM_TERMINAL_EVENTS = new Set(['complete', 'done', 'stream_cancelled', 'stream_interrupted', 'error', 'error_occurred']);
 export const HIDDEN_GENERAL_SKILL_TRACE_PHASES = new Set(['replying']);
 const DRAFT_SCHEDULE_TYPES = new Set<DraftScheduleType>(['once', 'daily', 'weekly', 'monthly']);
 const DRAFT_SCHEDULE_TYPE_LABELS: Record<DraftScheduleType, string> = {

@@ -11,6 +11,7 @@ from __future__ import annotations
 import re
 
 import pytest
+import app.dynamic_tasks.planner_service as planner_service
 
 from app.dynamic_tasks.capability_catalog import CapabilitySnapshot, capability_checksum
 from app.dynamic_tasks.planner_service import (
@@ -18,6 +19,7 @@ from app.dynamic_tasks.planner_service import (
     DynamicTaskPlannerError,
     _force_guidance_phase_gate,
     _planner_guidance_candidate_catalog,
+    _repair_covers_loaded_skills,
     _repair_guidance_phase_continuity,
     _repair_terminal_answer_steps,
     _repair_guidance_identity_fields,
@@ -2396,6 +2398,26 @@ def test_guidance_not_applicable_is_unique_and_forced_only() -> None:
     assert forced.guidance_requirements[0].disposition == "not_applicable"
 
 
+def test_guidance_repair_does_not_accept_mixed_not_applicable_and_apply() -> None:
+    """Guidance 修复不能把同一 Skill 的不适用和适用要求混在一起提前放行。"""
+
+    contract = [{"skill_ref": "diagnosing-bugs", "selection_mode": "forced"}]
+    mixed = [
+        {"skill_ref": "diagnosing-bugs", "disposition": "not_applicable"},
+        {"skill_ref": "diagnosing-bugs", "disposition": "apply"},
+    ]
+
+    assert not _repair_covers_loaded_skills(mixed, contract)
+    assert _repair_covers_loaded_skills(
+        [{"skill_ref": "diagnosing-bugs", "disposition": "not_applicable"}],
+        contract,
+    )
+    assert not _repair_covers_loaded_skills(
+        [{"skill_ref": "diagnosing-bugs", "disposition": "not_applicable"}],
+        [{"skill_ref": "diagnosing-bugs", "selection_mode": "auto"}],
+    )
+
+
 def test_each_auto_guidance_must_have_an_applicable_requirement() -> None:
     """多个自动 Skill 中任一个声明不适用都应拒绝，避免保留无效 Use。"""
 
@@ -2713,6 +2735,44 @@ def test_planner_uses_authoritative_guidance_fallback_after_two_empty_repairs() 
 
     assert client.calls == 4
     assert client.requirement_repairs == 2
+    assert plan.guidance_requirements[0].principle == "Use a checkable acceptance criterion."
+
+
+def test_planner_restores_guidance_after_phase_repair_postprocessing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """阶段连续性后处理丢失要求时，normalize 前仍按权威候选恢复契约。"""
+
+    loaded = (
+        {
+            "name": "codebase-design",
+            "skill_use_ids": ["gsuse_design"],
+            "selection_mode": "forced",
+            "skills": [
+                {
+                    "instructions": "Use a checkable acceptance criterion.",
+                    "reviewed_resources": [],
+                }
+            ],
+        },
+    )
+    criterion = SuccessCriterion(id="done", type="assertion", spec={"required": True})
+
+    def drop_requirements(raw: dict, *, candidate_catalog: object) -> dict:
+        """模拟阶段收敛器意外丢弃字段，验证末次宿主兜底仍生效。"""
+
+        repaired = dict(raw)
+        repaired["guidance_requirements"] = []
+        return repaired
+
+    monkeypatch.setattr(planner_service, "_repair_guidance_phase_continuity", drop_requirements)
+    plan = DynamicTaskPlanner(_MissingGuidanceRequirementRepairClient()).create_plan(
+        goal="评审架构边界",
+        success_criteria=(criterion,),
+        capabilities=(),
+        loaded_guidance=loaded,
+    )
+
     assert plan.guidance_requirements[0].principle == "Use a checkable acceptance criterion."
 
 

@@ -25,6 +25,10 @@ FRONTEND_DIR = Path(__file__).resolve().parents[1]
 BACKEND_DIR = FRONTEND_DIR.parent / "backend"
 E2E_PORT = int(os.environ.get("FULLSTACK_E2E_PORT", "5148"))
 E2E_SECRET = "fullstack-e2e-isolated-secret-at-least-32-bytes"
+# 管理端模型容量与单个 Dynamic/回答阶段预算是两层契约。真实回归必须接受
+# 管理端配置的高容量模型，但运行阶段仍由 backend/app/llm/output_policy.py
+# 和 DynamicBudgetProfile 限制实际请求，避免把模型容量直接变成无限消费。
+LIVE_MODEL_MAX_OUTPUT_TOKENS = 1_048_576
 E2E_RUNTIME_DIR = Path(
     os.environ.get(
         "FULLSTACK_E2E_RUNTIME_DIR",
@@ -375,8 +379,7 @@ def certify_live_dynamic_model() -> None:
             raise RuntimeError("LIVE attachment model generation settings are invalid") from exc
         if not math.isfinite(temperature) or temperature < 0 or temperature > 2:
             raise RuntimeError("LIVE attachment model temperature is outside 0..2")
-        if max_output_tokens < 1 or max_output_tokens > 131_072:
-            raise RuntimeError("LIVE attachment model max_output_tokens is invalid")
+        _validate_live_model_max_output_tokens(max_output_tokens)
         model.extra_body_json = extra_body
         model.temperature = temperature
         model.max_output_tokens = max_output_tokens
@@ -389,6 +392,14 @@ def certify_live_dynamic_model() -> None:
         model.capability_verified_at = utc_now()
         db.add(model)
         db.commit()
+
+
+def _validate_live_model_max_output_tokens(value: int) -> int:
+    """校验真实回归的模型容量上限，并保留管理端高容量配置不被静默改写。"""
+
+    if value < 1 or value > LIVE_MODEL_MAX_OUTPUT_TOKENS:
+        raise RuntimeError("LIVE attachment model max_output_tokens is invalid")
+    return value
 
 
 def seed_e2e_fixtures() -> None:

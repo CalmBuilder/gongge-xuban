@@ -25,10 +25,10 @@ OPERATION_MAX_OUTPUT_TOKENS: dict[str, int] = {
     "general_skill.repair": 8192,
     "general_skill.review": 2048,
     "general_skill.reply": 2048,
-    # 规划是控制面，但复杂附件/长题的结构化草案也可能超过 8K；预算仍受
-    # 管理端 ModelConfig 上限约束，避免把短模型配置静默放大。JSON 修复轮
-    # 还会在确认截断后有界扩容，确保长题不会因控制面硬截断直接变成 LLMError。
-    "dynamic_task.plan": 16_384,
+    # 规划是控制面，先用 8K 的保守首轮预算降低 Ark 等 provider 对长上下文
+    # 请求的排队/过载概率；若真实响应被确认因长度截断，LLMClient 的 JSON
+    # 修复契约会有界扩容到 16K/32K，复杂任务不会因固定小预算被静默截断。
+    "dynamic_task.plan": 8_192,
     "dynamic_task.action": 2048,
     "dynamic_task.action.write": 8192,
     "dynamic_task.answer": 16384,

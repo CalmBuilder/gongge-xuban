@@ -123,6 +123,23 @@ STREAM_RELAY_TERMINAL_EVENTS = {
     "stream_cancelled",
     "stream_interrupted",
 }
+SESSION_EVENT_HISTORY_LIMIT = 1024
+SESSION_EVENT_HISTORY_MAX_LIMIT = 5000
+# 最新运行 Turn 和历史终态是窗口外的恢复锚点，也必须各自有界；否则把 limit
+# 提高为 5000 仍可能因单个超长 Turn 或异常终态堆积返回无上限正文。
+SESSION_EVENT_LATEST_TURN_MAX = 5000
+SESSION_EVENT_TERMINAL_MAX = 1024
+# 长回复会产生数百到数千个 stream_delta；即使历史窗口截断，也必须把本轮
+# 的结构性终态保留给刷新/恢复端，否则客户端只能看到“消息已存在”而无法判断
+# Turn 是否已经闭合。
+SESSION_EVENT_TERMINAL_TYPES = {
+    "complete",
+    "stream_end",
+    "assistant_message_created",
+    "error_occurred",
+    "stream_cancelled",
+    "stream_interrupted",
+}
 SPAN_EVENT_TYPES = {
     "llm_call_started",
     "llm_call_finished",
@@ -557,22 +574,118 @@ def _fallback_session_title(messages: list[Message]) -> str:
 
 def _normalized_session_event_payload(row: AgentEvent) -> dict[str, object]:
     payload = dict(row.payload_json or {})
-    event_name = str(payload.get("event") or payload.get("type") or row.event_type)
+    # AgentEvent.event_type/id/created_at 是宿主账本信封；payload 只能提供业务数据，
+    # 不能伪造事件种类、排序键或事件身份后影响恢复端状态机。
+    event_name = row.event_type
     data = payload.get("data")
     if not isinstance(data, dict):
         data = {key: value for key, value in payload.items() if key not in EVENT_PAYLOAD_META_KEYS}
     normalized: dict[str, object] = {
         **payload,
-        "id": str(payload.get("id") or row.id),
+        "id": str(row.id),
         "event": event_name,
-        "type": str(payload.get("type") or event_name),
-        "event_type": str(payload.get("event_type") or event_name),
-        "created_at": str(payload.get("created_at") or row.created_at.isoformat()),
+        "type": event_name,
+        "event_type": event_name,
+        "created_at": row.created_at.isoformat(),
         "data": data,
     }
     if "run_id" not in normalized and data.get("run_id"):
         normalized["run_id"] = str(data.get("run_id"))
     return normalized
+
+
+def _session_event_history_rows(
+    db: Session,
+    tenant_id: str,
+    session_id: str,
+    limit: int = SESSION_EVENT_HISTORY_LIMIT,
+) -> list[AgentEvent]:
+    """返回有界事件窗口，并补齐窗口外每个终态事件，保证刷新可判定 Turn 已闭合。"""
+
+    rows = db.exec(
+        select(AgentEvent)
+        .where(
+            AgentEvent.tenant_id == tenant_id,
+            AgentEvent.session_id == session_id,
+        )
+        .order_by(AgentEvent.created_at, AgentEvent.id)
+        .limit(limit)
+    ).all()
+    if len(rows) < limit:
+        return rows
+
+    row_by_id = {row.id: row for row in rows}
+    # 会话历史按时间从头截断时，当前最新 Turn 可能完全落在窗口外。把最新
+    # user_message_received 之后的事件作为一个恢复组保留，确保运行中刷新能够
+    # 看到该 Turn 的完整增量；旧历史仍受 limit 约束。
+    latest_user = db.exec(
+        select(AgentEvent)
+        .where(
+            AgentEvent.tenant_id == tenant_id,
+            AgentEvent.session_id == session_id,
+            AgentEvent.event_type == "user_message_received",
+        )
+        .order_by(AgentEvent.created_at.desc(), AgentEvent.id.desc())
+        .limit(1)
+    ).first()
+    if latest_user is not None:
+        latest_user_payload = latest_user.payload_json or {}
+        latest_turn_ids = {
+            str(latest_user_payload.get(key) or "").strip()
+            for key in ("turn_id", "user_message_id", "message_id", "client_turn_id")
+            if str(latest_user_payload.get(key) or "").strip()
+        }
+        # 只把明确携带本轮身份的事件交给恢复投影，并在 SQL 层先取有界的最新
+        # 尾部；不能先 .all() 再由 Python 截断，否则超长 Turn 仍会把整个会话
+        # 扫入进程内存。事件信封没有统一的 turn_id 列，因此沿用运行时写入的
+        # 四种兼容身份键；没有身份的迟到事件宁可不归入本轮，也不跨 Turn 猜测。
+        latest_turn_identity_match = or_(
+            *(
+                AgentEvent.payload_json[key].as_string().in_(latest_turn_ids)
+                for key in ("turn_id", "user_message_id", "message_id", "client_turn_id")
+            )
+        )
+        latest_turn_candidates = db.exec(
+            select(AgentEvent)
+            .where(
+                AgentEvent.tenant_id == tenant_id,
+                AgentEvent.session_id == session_id,
+                or_(
+                    AgentEvent.created_at > latest_user.created_at,
+                    (AgentEvent.created_at == latest_user.created_at)
+                    & (AgentEvent.id >= latest_user.id),
+                ),
+                latest_turn_identity_match,
+            )
+            .order_by(AgentEvent.created_at.desc(), AgentEvent.id.desc())
+            .limit(SESSION_EVENT_LATEST_TURN_MAX)
+        ).all()
+        latest_turn_candidates.reverse()
+        latest_turn_rows = [
+            row
+            for row in latest_turn_candidates
+            if row.id == latest_user.id or bool(latest_turn_ids & _event_turn_ids(row))
+        ]
+        if latest_user.id not in {row.id for row in latest_turn_rows}:
+            latest_turn_rows.insert(0, latest_user)
+        if len(latest_turn_rows) > SESSION_EVENT_LATEST_TURN_MAX:
+            # 永远保留 user 锚点，再保留本轮最新尾部；完成/错误等终态随后还会
+            # 由 terminal_rows 单独补回。这样单个超长 Turn 不会把 HTTP 响应撑爆。
+            latest_turn_tail = [row for row in latest_turn_rows if row.id != latest_user.id]
+            latest_turn_rows = [latest_user] + latest_turn_tail[-(SESSION_EVENT_LATEST_TURN_MAX - 1):]
+        row_by_id.update({row.id: row for row in latest_turn_rows})
+    terminal_rows = db.exec(
+        select(AgentEvent)
+        .where(
+            AgentEvent.tenant_id == tenant_id,
+            AgentEvent.session_id == session_id,
+            AgentEvent.event_type.in_(SESSION_EVENT_TERMINAL_TYPES),  # type: ignore[attr-defined]
+        )
+        .order_by(AgentEvent.created_at.desc(), AgentEvent.id.desc())
+        .limit(SESSION_EVENT_TERMINAL_MAX)
+    ).all()
+    row_by_id.update({row.id: row for row in terminal_rows})
+    return sorted(row_by_id.values(), key=lambda row: (row.created_at, row.id))
 
 
 def _resume_human_handoff_async(handoff_id: str) -> None:
@@ -1521,6 +1634,7 @@ def chat_stream(
     def run_stream_worker() -> None:
         span_sink_token = None
         deferred_sqlite_spans: list[tuple[str, str, str, dict[str, object]]] = []
+        title_summary_request: tuple[str, str, str, str | None] | None = None
         try:
             with Session(engine) as worker_db:
                 span_turn_id = {"value": ""}
@@ -1665,16 +1779,13 @@ def chat_stream(
                             or data.get("message_id")
                             or ""
                         )
-                        _schedule_session_title_summary(
-                            request.tenant_id,
-                            request.user_id,
-                            event_source_session_id,
-                            request.agent_id,
-                        )
+                        # 标题摘要属于本轮完成后的旁路工作；不要在首个事件后启动
+                        # 另一个 SQLite 写入者，否则它的模型观测/标题提交会与流式
+                        # delta 提交竞争写锁。完成事件分支会在主 Turn 落盘后调度。
                         continue
                     if item["event"] == "complete":
                         event_source_session_id = str(item["data"].get("sessionId") or request.session_id or "")
-                        _schedule_session_title_summary(
+                        title_summary_request = (
                             request.tenant_id,
                             request.user_id,
                             event_source_session_id,
@@ -1712,6 +1823,11 @@ def chat_stream(
                             )
                 if deferred_sqlite_spans:
                     _persist_deferred_span_events(worker_db, deferred_sqlite_spans)
+            # 等主 Turn 的业务事件和 SQLite 观测批量提交、worker session 关闭后，
+            # 再启动标题摘要旁路任务；它可能发起模型调用并写标题/Span，不能与
+            # 当前流的提交窗口重叠。
+            if title_summary_request:
+                _schedule_session_title_summary(*title_summary_request)
         except Exception as exc:
             logger.exception("chat stream worker failed")
             session_id = source_session_id["value"] or request.session_id or ""
@@ -2351,11 +2467,11 @@ def _relay_event_payload(row: AgentEvent) -> tuple[str, dict[str, object]]:
     payload = dict(row.payload_json or {})
     event_name = STREAM_RELAY_EVENT_ALIASES.get(row.event_type, row.event_type)
     data: dict[str, object] = {
+        **payload,
         "kind": event_name,
         "sessionId": row.session_id,
         "timestamp": row.created_at.isoformat(),
         "provider": "skill",
-        **payload,
     }
     return event_name, data
 
@@ -2734,20 +2850,15 @@ def list_chat_messages(
 def list_chat_session_events(
     session_id: str,
     tenant_id: str = Query(...),
+    limit: int = Query(SESSION_EVENT_HISTORY_LIMIT, ge=1, le=SESSION_EVENT_HISTORY_MAX_LIMIT),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_session),
 ) -> list[dict]:
+    """读取会话事件窗口，并保留窗口外的消息/流终态供恢复协议判定。"""
+
     _ensure_request_tenant(tenant_id, current_user)
     _get_readable_chat_session(db, tenant_id, current_user, session_id)
-    rows = db.exec(
-        select(AgentEvent)
-        .where(
-            AgentEvent.tenant_id == tenant_id,
-            AgentEvent.session_id == session_id,
-        )
-        .order_by(AgentEvent.created_at)
-        .limit(500)
-    ).all()
+    rows = _session_event_history_rows(db, tenant_id, session_id, limit)
     return [_normalized_session_event_payload(row) for row in rows]
 
 

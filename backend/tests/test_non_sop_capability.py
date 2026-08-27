@@ -565,9 +565,69 @@ def test_explicit_dynamic_request_detection_does_not_capture_explanatory_chat() 
     assert AgentLoop._explicit_dynamic_task_requested(
         "请通过持久、可恢复的 DynamicTaskAgent 完成 INC-742 诊断"
     )
+    assert AgentLoop._explicit_dynamic_task_requested(
+        "请通过持久、可恢复的分析任务完成仓库协作说明整理"
+    )
     assert AgentLoop._explicit_dynamic_task_requested("请创建可恢复的动态任务完成评审")
     assert not AgentLoop._explicit_dynamic_task_requested("请解释 DynamicTaskAgent 是什么")
     assert not AgentLoop._explicit_dynamic_task_requested("普通对话为什么不需要持久动态任务？")
+
+
+def test_explicit_answer_only_request_blocks_shadow_dynamic_upgrade() -> None:
+    """用户要求直接交付且禁止计划/工具任务时，shadow不得升级持久执行。"""
+
+    assert AgentLoop._explicit_answer_only_requested(
+        "请直接在回复中交付，不创建计划、文件或工具任务。"
+    )
+    assert AgentLoop._explicit_answer_only_requested(
+        "直接回复这份材料的整理结果，不要创建计划。"
+    )
+    assert not AgentLoop._explicit_answer_only_requested("请创建计划后生成风险简报。")
+    assert not AgentLoop._explicit_answer_only_requested("请直接解释 DynamicTaskAgent 是什么。")
+
+
+def test_explicit_answer_only_request_does_not_delegate_dynamic_task(monkeypatch) -> None:
+    """即使 shadow 返回 dynamic_task，普通单轮契约也不得创建 Execution。"""
+
+    monkeypatch.setattr(
+        "app.core.agent_loop.DynamicTaskAgent",
+        lambda _db: pytest.fail("direct-delivery request must not initialize DynamicTaskAgent"),
+    )
+    loop = object.__new__(AgentLoop)
+    loop.db = SimpleNamespace()
+    loop.events = SimpleNamespace(record=lambda *_args, **_kwargs: None)
+    route = NonSopCapabilityRouteResult(
+        selected_general_skill=None,
+        general_selection=GeneralSkillSelection(),
+        effective_decision=NonSopCapabilityDecision(
+            mode="dynamic_task",
+            goal="整理材料",
+            success_criteria=["形成说明"],
+            confidence=0.99,
+        ),
+        shadow_decision=None,
+        shadow_attempted=True,
+        shadow_duration_ms=1.0,
+    )
+
+    response = loop._try_handle_dynamic_task(
+        ChatTurnRequest(
+            tenant_id="tenant_demo",
+            user_id="user_demo",
+            agent_id="agent_demo",
+            message="请直接在回复中交付，不创建计划、文件或工具任务。",
+        ),
+        ChatSession(
+            id="session_answer_only",
+            tenant_id="tenant_demo",
+            agent_id="agent_demo",
+        ),
+        SimpleNamespace(id="model_1"),
+        route,
+        "message_answer_only",
+    )
+
+    assert response is None
 
 
 def test_multiple_forced_general_skills_always_enter_composed_dynamic_runtime(monkeypatch) -> None:

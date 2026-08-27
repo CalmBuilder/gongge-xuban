@@ -81,6 +81,41 @@ def test_memory_capture_uses_model_updates_and_deduplicates_profile_name(monkeyp
     assert "recent_messages" not in captured_payload
 
 
+def test_memory_capture_releases_read_transaction_before_model_call(monkeypatch) -> None:
+    """模型外呼前结束记忆查询事务，避免 SQLite 长推理阻塞前台事件写入。"""
+
+    observed_transaction_state: list[bool] = []
+
+    def fake_init(self, model_config):  # noqa: ANN001
+        return None
+
+    def fake_generate_json(self, system_prompt, payload):  # noqa: ANN001
+        del system_prompt, payload
+        observed_transaction_state.append(self._test_session.in_transaction())
+        return {"memories": [], "updated_summary": ""}
+
+    monkeypatch.setattr(LLMClient, "__init__", fake_init)
+
+    with _test_session() as db:
+        original_generate_json = fake_generate_json
+
+        def bound_generate_json(client, system_prompt, payload):  # noqa: ANN001
+            client._test_session = db
+            return original_generate_json(client, system_prompt, payload)
+
+        monkeypatch.setattr(LLMClient, "generate_json", bound_generate_json)
+        MemoryService(db).capture_turn(
+            ChatTurnRequest(tenant_id="tenant_demo", user_id="user_demo", message="你好"),
+            ChatSession(id="session_test", tenant_id="tenant_demo", user_id="user_demo"),
+            StepAgentResult(),
+            None,
+            ModelConfig(tenant_id="tenant_demo", name="demo", api_key_encrypted="", model="demo"),
+            [{"role": "user", "content": "你好"}],
+        )
+
+    assert observed_transaction_state == [False]
+
+
 def test_memory_capture_ignores_summary_updates(monkeypatch) -> None:
     def fake_init(self, model_config):  # noqa: ANN001
         return None

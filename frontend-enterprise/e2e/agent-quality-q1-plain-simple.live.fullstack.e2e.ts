@@ -116,6 +116,8 @@ test('Q1 plain simple真实短对话不误进入Dynamic或Skill', async ({ page 
     source_model_config_id: process.env.Q1_SOURCE_MODEL_CONFIG_ID || null,
     provider_endpoint: process.env.Q1_PROVIDER_ENDPOINT || null,
     model: process.env.Q1_MODEL_NAME || null,
+    temperature: Number(process.env.Q1_MODEL_TEMPERATURE || '0'),
+    max_output_tokens: Number(process.env.Q1_MODEL_MAX_OUTPUT_TOKENS || '0'),
     capability_checksum: process.env.Q1_MODEL_CAPABILITY_CHECKSUM || null,
     profile: process.env.Q1_PROFILE || null,
     session_id: sessionId,
