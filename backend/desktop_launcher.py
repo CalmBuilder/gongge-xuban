@@ -189,8 +189,11 @@ def _health_ok(url: str) -> bool:
         return False
 
 
-def _find_existing_app_url(host: str) -> str | None:
-    for port in _port_candidates():
+def _find_existing_app_url(host: str, ports: list[int] | None = None) -> str | None:
+    """在指定端口集合中查找健康的本产品服务，省略集合时扫描完整回退范围。"""
+
+    candidate_ports = ports if ports is not None else _port_candidates()
+    for port in candidate_ports:
         if not port_in_use(host, port):
             continue
         url = f"http://{host}:{port}"
@@ -763,7 +766,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if _use_windows_taskbar_app():
         _log_startup_phase("instance_lock_acquired", startup_started_at)
-    existing_url = _find_existing_app_url(host)
+    # Windows 冻结版已有命名互斥锁，正常首启只需确认首选端口；只有首选端口
+    # 被占用时才进入完整回退范围，避免每次启动无意义地探测 5137–5199。
+    existing_ports = _port_candidates()[:1] if _use_windows_taskbar_app() else None
+    existing_url = _find_existing_app_url(host, existing_ports)
     if existing_url:
         print(f"{APP_NAME} 已在运行：{existing_url}/chat/")
         if _use_windows_taskbar_app():

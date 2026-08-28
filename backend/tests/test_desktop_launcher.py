@@ -161,6 +161,21 @@ def test_health_rejects_other_local_service(monkeypatch) -> None:
     assert desktop_launcher._health_ok("http://127.0.0.1:5175") is False
 
 
+def test_existing_app_lookup_accepts_a_bounded_port_set(monkeypatch) -> None:
+    """Windows 首选端口快速路径只检查调用方明确给出的端口，不扫描整个范围。"""
+
+    checked = []
+    monkeypatch.setattr(
+        desktop_launcher,
+        "port_in_use",
+        lambda _host, port: checked.append(port) or True,
+    )
+    monkeypatch.setattr(desktop_launcher, "_health_ok", lambda _url: False)
+
+    assert desktop_launcher._find_existing_app_url("127.0.0.1", [5137]) is None
+    assert checked == [5137]
+
+
 def test_windows_second_launch_reuses_primary_instance(monkeypatch) -> None:
     """Windows 冻结版第二次启动应置前已有浏览器，而不是再创建标签页或服务。"""
 

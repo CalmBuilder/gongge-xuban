@@ -65,6 +65,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
 冻结版通过命名互斥锁先完成单实例裁决，启动中的首实例尚未健康时，后续启动会等待并
 复用它。
 
+安装器启用 `CloseApplications=yes`，更新安装时只请求关闭占用共格·序伴安装文件的
+应用；不会按端口号强杀未知进程。
+
 ## 当前 Linux 主机的边界
 
 当前项目工作主机为 Linux，且没有 Windows 内核、Wine、Inno Setup 或 Windows SDK。
