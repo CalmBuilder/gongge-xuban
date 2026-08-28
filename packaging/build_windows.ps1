@@ -76,15 +76,13 @@ function Get-PythonCommand {
 $PY = Get-PythonCommand
 Write-Host "Using Python: $($PY.Command) $($PY.PrefixArgs -join ' ')"
 
-Write-Host "==> [1/6] Build frontend"
-if (-not (Test-Path frontend-enterprise\node_modules)) {
-  npm ci --prefix frontend-enterprise --no-audit --no-fund
-  Assert-NativeCommandSucceeded "npm ci"
-}
+Write-Host "==> [1/7] Build frontend"
+npm ci --prefix frontend-enterprise --no-audit --no-fund
+Assert-NativeCommandSucceeded "npm ci"
 npm --prefix frontend-enterprise run build
 Assert-NativeCommandSucceeded "Frontend build"
 
-Write-Host "==> [2/6] Create backend venv and install packaging dependencies"
+Write-Host "==> [2/7] Create backend venv and install packaging dependencies"
 & $PY.Command @($PY.PrefixArgs) -m venv backend\.venv
 Assert-NativeCommandSucceeded "Backend virtual environment creation"
 backend\.venv\Scripts\python -m pip install -U pip
@@ -100,7 +98,7 @@ Assert-NativeCommandSucceeded "Backend dependency installation"
 backend\.venv\Scripts\python -m pip install "pyinstaller>=6.6.0" "certifi>=2024.2.2"
 Assert-NativeCommandSucceeded "Packaging dependency installation"
 
-Write-Host "==> [3/6] Build PyInstaller application"
+Write-Host "==> [3/7] Build PyInstaller application"
 Push-Location backend
 .\.venv\Scripts\pyinstaller ..\packaging\gongge-xuban.spec --noconfirm --distpath ..\packaging\out --workpath ..\packaging\build
 Assert-NativeCommandSucceeded "PyInstaller build"
@@ -118,13 +116,13 @@ if ($signingConfigured) {
   Write-Warning "Code signing is not configured; Windows artifacts will be UNSIGNED."
 }
 
-Write-Host "==> [4/6] Bundle the Python skill runtime"
+Write-Host "==> [4/7] Bundle the Python skill runtime"
 backend\.venv\Scripts\python packaging\fetch_runtime_python.py packaging\runtime_dl --expect-arch x86_64
 Assert-NativeCommandSucceeded "Python skill runtime download"
 if (Test-Path packaging\out\gongge-xuban\runtime) { Remove-Item -Recurse -Force packaging\out\gongge-xuban\runtime }
 Copy-Item -Recurse -Force packaging\runtime_dl\python packaging\out\gongge-xuban\runtime
 
-Write-Host "==> [5/6] Build the Inno Setup installer"
+Write-Host "==> [5/7] Build the Inno Setup installer"
 $isccCandidates = @(
   $env:ISCC,
   "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
