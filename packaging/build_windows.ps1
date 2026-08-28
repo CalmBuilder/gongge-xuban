@@ -95,6 +95,19 @@ function Assert-PeX64 {
   }
 }
 
+function Test-NonRuntimeExecutableTemplate {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Path
+  )
+
+  $normalized = $Path.Replace("/", "\")
+  return (
+    $normalized -match '\\Lib\\site-packages\\pip\\_vendor\\distlib\\[tw](?:32|64)(?:-arm)?\.exe$' -or
+    $normalized -match '\\Lib\\site-packages\\setuptools\\(?:cli|gui)(?:-(?:32|64|arm64))?\.exe$'
+  )
+}
+
 function Assert-BundlePeX64 {
   param(
     [Parameter(Mandatory = $true)]
@@ -107,10 +120,21 @@ function Assert-BundlePeX64 {
   if ($files.Count -eq 0) {
     throw "PE architecture check found no Windows binary payloads under $Root."
   }
+  $verifiedCount = 0
+  $templateCount = 0
   foreach ($file in $files) {
+    if ($file.Extension -eq ".exe" -and (Test-NonRuntimeExecutableTemplate $file.FullName)) {
+      $templateCount += 1
+      Write-Host "PE architecture check skipped known launcher template: $($file.FullName)"
+      continue
+    }
     Assert-PeX64 $file.FullName
+    $verifiedCount += 1
   }
-  Write-Host "PE x64 payloads verified: $($files.Count) file(s)"
+  if ($verifiedCount -eq 0) {
+    throw "PE architecture check found no executable payloads to verify under $Root."
+  }
+  Write-Host "PE x64 payloads verified: $verifiedCount file(s); launcher templates skipped: $templateCount"
 }
 
 function Stop-ExistingProductProcesses {

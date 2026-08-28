@@ -74,6 +74,7 @@ def test_windows_build_has_native_installation_smoke_gate() -> None:
         "Assert-PythonX64",
         "Assert-PeX64",
         "Assert-BundlePeX64",
+        "Test-NonRuntimeExecutableTemplate",
         "PROCESSOR_ARCHITECTURE",
         "--clean",
         "Stop-ExistingProductProcesses",

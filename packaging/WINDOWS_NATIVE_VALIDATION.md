@@ -33,7 +33,9 @@ PyInstaller 的 `--clean` 生成并校验 PE machine=`0x8664` 的 x64 可执行�
 
 - Inno Setup 安装器可静默安装，且安装目录含 `gongge-xuban.exe`；
 - 安装包内置 `runtime\python.exe` 能导入 PDF、Office、图片解析依赖；
-- 安装包内置的 exe、dll、pyd、node payload 均通过 PE x64（AMD64）架构检查；
+- 安装包内置的实际 exe、dll、pyd、node payload 均通过 PE x64（AMD64）架构检查；
+  pip/distlib 与 setuptools 中仅用于生成入口脚本的多架构模板会明确记录为跳过，不能
+  把这些模板误判成应用运行时；
 - 冻结版进程以 headless 模式启动，在固定 loopback 端口返回
   `status=ok`、`product_id=gongge-xuban`；
 - `/chat/` 前端路由返回 HTTP 200，并创建产品运行日志；
