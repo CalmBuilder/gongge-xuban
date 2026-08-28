@@ -161,6 +161,24 @@ def test_health_rejects_other_local_service(monkeypatch) -> None:
     assert desktop_launcher._health_ok("http://127.0.0.1:5175") is False
 
 
+def test_windows_second_launch_reuses_primary_instance(monkeypatch) -> None:
+    """Windows 冻结版第二次启动应等待首实例并复用其浏览器地址，而不是启动第二个服务。"""
+
+    opened = []
+    monkeypatch.setattr(desktop_launcher, "_use_windows_taskbar_app", lambda: True)
+    monkeypatch.setattr(desktop_launcher, "_acquire_windows_instance_mutex", lambda: False)
+    monkeypatch.setattr(
+        desktop_launcher,
+        "_wait_for_existing_app_url",
+        lambda _host: "http://127.0.0.1:5137",
+    )
+    monkeypatch.setattr(desktop_launcher, "_open_browser", opened.append)
+    monkeypatch.setattr(desktop_launcher, "_redirect_logs_when_frozen", lambda: None)
+
+    assert desktop_launcher.main([]) == 0
+    assert opened == ["http://127.0.0.1:5137/chat/"]
+
+
 def test_frozen_launcher_generates_ephemeral_mock_key_without_dotenv(monkeypatch, tmp_path) -> None:
     """无用户配置文件的冻结桌面包应生成进程级 mock key 后再加载 Settings。"""
 

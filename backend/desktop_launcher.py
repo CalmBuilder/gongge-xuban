@@ -30,6 +30,7 @@ DEFAULT_PORT_RANGE_START = 5137
 DEFAULT_PORT_RANGE_END = 5199
 _MACOS_DELEGATE_REF = None
 _MACOS_INSTANCE_LOCK_HANDLE = None
+_WINDOWS_INSTANCE_MUTEX_HANDLE = None
 PRODUCT_ICON_PNG = ("packaging", "assets", "gongge-xuban.png")
 
 
@@ -203,6 +204,34 @@ def _acquire_macos_instance_lock() -> bool:
     lock_file.truncate()
     lock_file.flush()
     _MACOS_INSTANCE_LOCK_HANDLE = lock_file
+    return True
+
+
+def _acquire_windows_instance_mutex() -> bool:
+    """以 Windows 命名互斥锁保证同一用户会话只运行一个桌面服务实例。"""
+
+    if not _use_windows_taskbar_app():
+        return True
+
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    mutex_name = f"Local\\{APP_ID}.instance"
+    handle = kernel32.CreateMutexW(None, True, mutex_name)
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+        kernel32.CloseHandle(handle)
+        return False
+
+    global _WINDOWS_INSTANCE_MUTEX_HANDLE
+    _WINDOWS_INSTANCE_MUTEX_HANDLE = handle
     return True
 
 
@@ -611,6 +640,15 @@ def main(argv: list[str] | None = None) -> int:
     _redirect_logs_when_frozen()
 
     host = desktop_env_value("HOST", "127.0.0.1")
+    if _use_windows_taskbar_app() and not _acquire_windows_instance_mutex():
+        existing_url = _wait_for_existing_app_url(host)
+        if existing_url:
+            print(f"{APP_NAME} 正在运行：{existing_url}")
+            _open_browser(existing_url + "/chat/")
+        else:
+            print(f"{APP_NAME} 已有实例正在启动，当前实例退出。")
+        return 0
+
     existing_url = _find_existing_app_url(host)
     if existing_url:
         print(f"{APP_NAME} 已在运行：{existing_url}/chat/")
