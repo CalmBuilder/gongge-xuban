@@ -28,6 +28,7 @@ APP_ID = DESKTOP_APP_ID
 APP_VERSION = "0.1.0"
 DEFAULT_PORT_RANGE_START = 5137
 DEFAULT_PORT_RANGE_END = 5199
+LOOPBACK_PORT_PROBE_TIMEOUT_SECONDS = 0.2
 BROWSER_PAGE_TITLE = f"{APP_NAME}｜企业数字员工平台"
 _MACOS_DELEGATE_REF = None
 _MACOS_INSTANCE_LOCK_HANDLE = None
@@ -44,6 +45,19 @@ def build_server_config() -> dict:
         "host": host,
         "port": find_available_port(host),
     }
+
+
+def _log_startup_phase(phase: str, started_at: float, **fields: object) -> None:
+    """记录桌面启动阶段耗时，便于区分导入、数据库和端口等待。"""
+
+    details = " ".join(f"{key}={value}" for key, value in fields.items())
+    suffix = f" {details}" if details else ""
+    logging.getLogger("gongge_xuban.runtime").info(
+        "Desktop startup phase=%s elapsed_ms=%.0f%s",
+        phase,
+        (time.perf_counter() - started_at) * 1000,
+        suffix,
+    )
 
 
 def _redirect_logs_when_frozen() -> None:
@@ -91,8 +105,10 @@ def _ensure_frozen_public_mock_api_key() -> None:
 
 
 def port_in_use(host: str, port: int) -> bool:
+    """以短超时探测 loopback 端口，避免启动时被防火墙拖住整段端口范围。"""
+
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.settimeout(0.5)
+        sock.settimeout(LOOPBACK_PORT_PROBE_TIMEOUT_SECONDS)
         return sock.connect_ex((host, port)) == 0
 
 
@@ -121,10 +137,17 @@ def _port_candidates() -> list[int]:
 
 
 def find_available_port(host: str) -> int:
-    for port in _port_candidates():
+    candidates = _port_candidates()
+    for index, port in enumerate(candidates):
         if not port_in_use(host, port):
+            if index:
+                logging.getLogger("gongge_xuban.runtime").info(
+                    "Preferred desktop port is occupied; selected fallback port=%s preferred=%s",
+                    port,
+                    candidates[0],
+                )
             return port
-    first, last = _port_candidates()[0], _port_candidates()[-1]
+    first, last = candidates[0], candidates[-1]
     raise RuntimeError(f"{APP_NAME} 可用端口耗尽：{first}-{last} 都已被占用")
 
 
@@ -723,10 +746,13 @@ def main(argv: list[str] | None = None) -> int:
         from app.session.input_parser_cli import main as parser_main
 
         return parser_main(arguments[1:])
+    startup_started_at = time.perf_counter()
     _redirect_logs_when_frozen()
+    _log_startup_phase("logging_ready", startup_started_at)
 
     host = desktop_env_value("HOST", "127.0.0.1")
     if _use_windows_taskbar_app() and not _acquire_windows_instance_mutex():
+        _log_startup_phase("existing_instance_detected", startup_started_at)
         existing_url = _wait_for_existing_app_url(host)
         if existing_url:
             print(f"{APP_NAME} 正在运行：{existing_url}")
@@ -735,6 +761,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{APP_NAME} 已有实例正在启动，当前实例退出。")
         return 0
 
+    if _use_windows_taskbar_app():
+        _log_startup_phase("instance_lock_acquired", startup_started_at)
     existing_url = _find_existing_app_url(host)
     if existing_url:
         print(f"{APP_NAME} 已在运行：{existing_url}/chat/")
@@ -755,9 +783,11 @@ def main(argv: list[str] | None = None) -> int:
 
     # 时序：先选定端口并设 env，再 import uvicorn / 触发 app.* import。
     cfg = build_server_config()
+    _log_startup_phase("port_selected", startup_started_at, host=cfg["host"], port=cfg["port"])
     apply_runtime_env(cfg)
     url = f"http://{cfg['host']}:{cfg['port']}"
     preload_server_app(cfg)
+    _log_startup_phase("app_preloaded", startup_started_at)
 
     if _use_macos_dock_app():
         return _run_macos_dock_app(cfg, url)

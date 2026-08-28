@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+import logging
+import time
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -85,13 +87,25 @@ from app.session.input_purge_worker import (
 )
 
 settings = get_settings()
+LOGGER = logging.getLogger("gongge_xuban.runtime")
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """完成数据库就绪、演示数据同步和后台 worker 启动后再对外提供服务。"""
+
+    started_at = time.perf_counter()
     init_db()
+    LOGGER.info(
+        "Application startup phase=database_initialized elapsed_ms=%.0f",
+        (time.perf_counter() - started_at) * 1000,
+    )
     with Session(engine) as db:
         seed_demo_data(db)
+    LOGGER.info(
+        "Application startup phase=demo_data_seeded elapsed_ms=%.0f",
+        (time.perf_counter() - started_at) * 1000,
+    )
     start_background_worker()
     start_general_skill_import_worker()
     start_input_extraction_worker()
@@ -99,6 +113,10 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     start_artifact_renderer_worker()
     if settings.app_env != "test":
         start_connector_background_worker()
+    LOGGER.info(
+        "Application startup phase=workers_started elapsed_ms=%.0f",
+        (time.perf_counter() - started_at) * 1000,
+    )
     try:
         yield
     finally:

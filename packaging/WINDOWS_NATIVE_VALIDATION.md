@@ -42,6 +42,13 @@ PyInstaller 的 `--clean` 生成并校验 PE machine=`0x8664` 的 x64 可执行�
 - 停止进程后卸载器能删除应用可执行文件；
 - 全部检查通过才输出 `WINDOWS_NATIVE_SMOKE_PASS`。
 
+桌面启动默认优先使用 `127.0.0.1:5137`；如果该端口已被其他进程占用，会按
+`GONGGE_XUBAN_PORT_RANGE_START` 到 `GONGGE_XUBAN_PORT_RANGE_END`（默认 5137–5199）
+选择下一个可用端口，例如 5138。这不是随机改端口，也不会覆盖占用 5137 的进程。
+冻结版日志会记录 `port_selected`、`app_preloaded`、数据库初始化和演示数据同步的耗时，
+日志位置为 `%APPDATA%\Gongge-Xuban\logs\gongge-xuban.log`，可据此区分端口探测、Python
+导入和数据库阶段的启动延迟。
+
 也可以对已有安装器单独运行：
 
 ```powershell
