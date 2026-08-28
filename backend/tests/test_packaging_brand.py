@@ -70,6 +70,18 @@ def test_windows_build_has_native_installation_smoke_gate() -> None:
     assert "npm ci --prefix frontend-enterprise --no-audit --no-fund" in build_script
     assert "if (-not (Test-Path frontend-enterprise\\node_modules))" not in build_script
     for marker in (
+        "Assert-WindowsX64Host",
+        "Assert-PythonX64",
+        "Assert-PeX64",
+        "Assert-BundlePeX64",
+        "PROCESSOR_ARCHITECTURE",
+        "--clean",
+        "Stop-ExistingProductProcesses",
+        "Clear-ApplicationBuildOutput",
+        "0x8664",
+    ):
+        assert marker in build_script
+    for marker in (
         "Invoke-Installer",
         "Invoke-Uninstaller",
         "runtime\\python.exe",

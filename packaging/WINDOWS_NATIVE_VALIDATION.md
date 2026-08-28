@@ -20,7 +20,9 @@ $env:VERSION = "0.1.0"
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File packaging\build_windows.ps1
 ```
 
-构建脚本会按 `backend/pyproject.toml` 安装依赖，生成
+构建脚本会先校验宿主机和 Python 均为 x64，并在 PyInstaller 前停止同名的旧版
+`gongge-xuban` 进程、清理旧的产品输出目录；随后按 `backend/pyproject.toml` 安装依赖，使用
+PyInstaller 的 `--clean` 生成并校验 PE machine=`0x8664` 的 x64 可执行文件，最后生成
 `packaging\out\Gongge-Xuban-windows-x64-setup.exe`，并自动调用
 `packaging\smoke_windows.ps1`。未配置证书时只允许本地 unsigned 验证，脚本会明确
 打印 `UNSIGNED`；公开发布必须配置 Authenticode 证书并通过签名校验。
@@ -31,6 +33,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File packaging\build_windows.
 
 - Inno Setup 安装器可静默安装，且安装目录含 `gongge-xuban.exe`；
 - 安装包内置 `runtime\python.exe` 能导入 PDF、Office、图片解析依赖；
+- 安装包内置的 exe、dll、pyd、node payload 均通过 PE x64（AMD64）架构检查；
 - 冻结版进程以 headless 模式启动，在固定 loopback 端口返回
   `status=ok`、`product_id=gongge-xuban`；
 - `/chat/` 前端路由返回 HTTP 200，并创建产品运行日志；

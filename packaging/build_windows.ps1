@@ -22,6 +22,122 @@ function Assert-NativeCommandSucceeded {
   }
 }
 
+function Assert-WindowsX64Host {
+  # 只允许原生 Windows x64；WSL、Wine、32 位 Windows 和 ARM64 均不生成本包。
+  if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
+    throw "Windows native build is required; this script is running on a non-Windows host."
+  }
+  if (-not [Environment]::Is64BitOperatingSystem) {
+    throw "Windows x64 is required; a 32-bit operating system is not supported."
+  }
+
+  $nativeArchitecture = $env:PROCESSOR_ARCHITEW6432
+  if ([string]::IsNullOrWhiteSpace($nativeArchitecture)) {
+    $nativeArchitecture = $env:PROCESSOR_ARCHITECTURE
+  }
+  if ([string]::IsNullOrWhiteSpace($nativeArchitecture)) {
+    throw "Windows native architecture could not be determined."
+  }
+  $nativeArchitecture = $nativeArchitecture.Trim().ToUpperInvariant()
+  if ($nativeArchitecture -notin @("AMD64", "X86_64")) {
+    throw "Windows x64 is required; detected native architecture: $nativeArchitecture"
+  }
+  Write-Host "Windows native architecture: $nativeArchitecture"
+}
+
+function Assert-PythonX64 {
+  param(
+    [Parameter(Mandatory = $true)]
+    [pscustomobject]$Python
+  )
+
+  & $Python.Command @($Python.PrefixArgs) -c `
+    "import platform, struct; machine = platform.machine().lower(); assert struct.calcsize('P') == 8 and machine in ('amd64', 'x86_64'), f'expected x64 Python, got {machine}'; print(f'Python x64: {machine}')"
+  Assert-NativeCommandSucceeded "Python x64 architecture check"
+}
+
+function Assert-PeX64 {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Path
+  )
+
+  $resolved = (Resolve-Path -LiteralPath $Path).Path
+  $stream = $null
+  $reader = $null
+  try {
+    $stream = [System.IO.File]::OpenRead($resolved)
+    $reader = [System.IO.BinaryReader]::new($stream)
+    if ($reader.ReadUInt16() -ne 0x5A4D) {
+      throw "PE architecture check failed: $resolved is not a Windows executable."
+    }
+    $stream.Seek(0x3C, [System.IO.SeekOrigin]::Begin) | Out-Null
+    $peOffset = $reader.ReadInt32()
+    if ($peOffset -lt 0 -or $peOffset -gt ($stream.Length - 6)) {
+      throw "PE architecture check failed: invalid PE header offset in $resolved."
+    }
+    $stream.Seek($peOffset, [System.IO.SeekOrigin]::Begin) | Out-Null
+    if ($reader.ReadUInt32() -ne 0x00004550) {
+      throw "PE architecture check failed: $resolved has no PE signature."
+    }
+    $machine = $reader.ReadUInt16()
+    if ($machine -ne 0x8664) {
+      throw "PE architecture check failed: $resolved machine is 0x$('{0:X4}' -f $machine), expected AMD64 (0x8664)."
+    }
+    Write-Host "PE x64 verified: $resolved"
+  }
+  finally {
+    if ($null -ne $reader) {
+      $reader.Dispose()
+    } elseif ($null -ne $stream) {
+      $stream.Dispose()
+    }
+  }
+}
+
+function Assert-BundlePeX64 {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Root
+  )
+
+  $signableExtensions = @(".exe", ".dll", ".pyd", ".node")
+  $files = @(Get-ChildItem -LiteralPath $Root -Recurse -File |
+    Where-Object { $signableExtensions -contains $_.Extension.ToLowerInvariant() })
+  if ($files.Count -eq 0) {
+    throw "PE architecture check found no Windows binary payloads under $Root."
+  }
+  foreach ($file in $files) {
+    Assert-PeX64 $file.FullName
+  }
+  Write-Host "PE x64 payloads verified: $($files.Count) file(s)"
+}
+
+function Stop-ExistingProductProcesses {
+  $running = @(Get-Process -Name "gongge-xuban" -ErrorAction SilentlyContinue)
+  if ($running.Count -eq 0) {
+    return
+  }
+
+  $processIds = @($running | Select-Object -ExpandProperty Id)
+  Write-Host "==> stopping $($running.Count) running gongge-xuban process(es) holding the build output"
+  $running | Stop-Process -Force
+  Start-Sleep -Seconds 1
+  foreach ($processId in $processIds) {
+    if (Get-Process -Id $processId -ErrorAction SilentlyContinue) {
+      throw "Could not stop gongge-xuban process $processId; the build output may be locked."
+    }
+  }
+}
+
+function Clear-ApplicationBuildOutput {
+  $applicationOutput = Join-Path $Repo "packaging\out\gongge-xuban"
+  if (Test-Path -LiteralPath $applicationOutput) {
+    Write-Host "==> removing stale application output $applicationOutput"
+    Remove-Item -LiteralPath $applicationOutput -Recurse -Force
+  }
+}
+
 function ConvertTo-WindowsVersionInfoVersion {
   param(
     [Parameter(Mandatory = $true)]
@@ -45,6 +161,7 @@ function ConvertTo-WindowsVersionInfoVersion {
   return ($parts[0..3] -join ".")
 }
 
+$null = Assert-WindowsX64Host
 $env:WINDOWS_VERSION_INFO_VERSION = ConvertTo-WindowsVersionInfoVersion $env:VERSION
 Write-Host "Windows VersionInfoVersion: $env:WINDOWS_VERSION_INFO_VERSION"
 
@@ -75,6 +192,7 @@ function Get-PythonCommand {
 
 $PY = Get-PythonCommand
 Write-Host "Using Python: $($PY.Command) $($PY.PrefixArgs -join ' ')"
+Assert-PythonX64 $PY
 
 Write-Host "==> [1/7] Build frontend"
 npm ci --prefix frontend-enterprise --no-audit --no-fund
@@ -99,10 +217,13 @@ backend\.venv\Scripts\python -m pip install "pyinstaller>=6.6.0" "certifi>=2024.
 Assert-NativeCommandSucceeded "Packaging dependency installation"
 
 Write-Host "==> [3/7] Build PyInstaller application"
+Stop-ExistingProductProcesses
+Clear-ApplicationBuildOutput
 Push-Location backend
-.\.venv\Scripts\pyinstaller ..\packaging\gongge-xuban.spec --noconfirm --distpath ..\packaging\out --workpath ..\packaging\build
+.\.venv\Scripts\pyinstaller ..\packaging\gongge-xuban.spec --noconfirm --clean --distpath ..\packaging\out --workpath ..\packaging\build
 Assert-NativeCommandSucceeded "PyInstaller build"
 Pop-Location
+Assert-PeX64 "packaging\out\gongge-xuban\gongge-xuban.exe"
 
 $signingConfigured = Test-SigningConfigured
 if ($signingConfigured) {
@@ -121,6 +242,7 @@ backend\.venv\Scripts\python packaging\fetch_runtime_python.py packaging\runtime
 Assert-NativeCommandSucceeded "Python skill runtime download"
 if (Test-Path packaging\out\gongge-xuban\runtime) { Remove-Item -Recurse -Force packaging\out\gongge-xuban\runtime }
 Copy-Item -Recurse -Force packaging\runtime_dl\python packaging\out\gongge-xuban\runtime
+Assert-BundlePeX64 "packaging\out\gongge-xuban"
 
 Write-Host "==> [5/7] Build the Inno Setup installer"
 $isccCandidates = @(
