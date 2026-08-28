@@ -1,5 +1,5 @@
 """
-@Time       : 2026/07/27 13:45
+@Time       : 2026/08/28 13:20
 @Author     : zhanglp8181
 @File       : client.py
 @CallChain  : Agent/知识/技能阶段 → LLMClient → OpenAI 兼容 Chat Completions
@@ -24,6 +24,7 @@ from urllib.parse import urlsplit
 
 from openai import OpenAI
 
+from app.cancellation import raise_if_cancelled, run_cancellable
 from app.config import get_settings
 from app.db.models import ModelConfig
 from app.llm.output_policy import operation_output_tokens, operation_thinking_mode
@@ -595,9 +596,16 @@ class LLMClient:
                 raise
             raise LLMError(_provider_failure_detail(self, exc)) from exc
 
-    def generate_json(self, system_prompt: str, user_payload: dict[str, Any]) -> dict[str, Any]:
+    def generate_json(
+        self,
+        system_prompt: str,
+        user_payload: dict[str, Any],
+        *,
+        is_cancelled: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
         """生成 JSON object，并在输出不合法时通过有界修复重试校正。"""
 
+        raise_if_cancelled(is_cancelled)
         outputs: list[str] = []
         next_payload = user_payload
         last_error: json.JSONDecodeError | None = None
@@ -611,6 +619,7 @@ class LLMClient:
         self._json_deadline = json_deadline
         try:
             for attempt in range(JSON_REPAIR_ATTEMPTS + 1):
+                raise_if_cancelled(is_cancelled)
                 if json_deadline - time.monotonic() <= 0:
                     raise LLMError("MODEL_CALL_DEADLINE_EXCEEDED")
                 with llm_span_attributes(
@@ -622,17 +631,30 @@ class LLMClient:
                     previous_defer = getattr(self, "_defer_stage_recording", False)
                     self._defer_stage_recording = True
                     try:
+                        candidate_kwargs = (
+                            {"is_cancelled": is_cancelled}
+                            if is_cancelled is not None
+                            else {}
+                        )
                         text = self._generate_json_candidate(
-                            system_prompt, next_payload, json_mode_supported
+                            system_prompt,
+                            next_payload,
+                            json_mode_supported,
+                            **candidate_kwargs,
                         )
                         if json_mode_supported and _response_format_unsupported(text):
                             json_mode_supported = False
                             if json_deadline - time.monotonic() <= 0:
                                 raise LLMError("MODEL_CALL_DEADLINE_EXCEEDED")
-                            text = self.generate_text(system_prompt, next_payload)
+                            text = self._generate_json_text(
+                                system_prompt,
+                                next_payload,
+                                is_cancelled=is_cancelled,
+                            )
                     finally:
                         self._defer_stage_recording = previous_defer
                 outputs.append(text)
+                raise_if_cancelled(is_cancelled)
                 try:
                     parsed = _loads_llm_json(text)
                     _record_stage_exchange(
@@ -683,6 +705,8 @@ class LLMClient:
         self,
         system_prompt: str,
         user_payload: dict[str, Any],
+        *,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """返回完整 JSON 及其真实 provider response 身份，供动作提案持久化防重。
 
@@ -694,7 +718,15 @@ class LLMClient:
         self._last_completed_response_metadata = None
         retry_payload = user_payload
         for retry_index in range(3):
-            payload = self.generate_json(system_prompt, retry_payload)
+            raise_if_cancelled(is_cancelled)
+            generate_kwargs = (
+                {"is_cancelled": is_cancelled} if is_cancelled is not None else {}
+            )
+            payload = self.generate_json(
+                system_prompt,
+                retry_payload,
+                **generate_kwargs,
+            )
             metadata = getattr(self, "_last_completed_response_metadata", None)
             if not isinstance(metadata, dict) or not metadata.get("response_id"):
                 raise LLMError("Provider completed JSON response is missing a stable response id")
@@ -897,24 +929,62 @@ class LLMClient:
         system_prompt: str,
         user_payload: dict[str, Any],
         json_mode_supported: bool,
+        *,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> str:
         if not json_mode_supported:
-            return self.generate_text(system_prompt, user_payload)
+            return self._generate_json_text(
+                system_prompt,
+                user_payload,
+                is_cancelled=is_cancelled,
+            )
         try:
-            return self.generate_text(
+            return self._generate_json_text(
                 system_prompt,
                 user_payload,
                 response_format={"type": "json_object"},
+                is_cancelled=is_cancelled,
             )
         except TypeError:
-            return self.generate_text(system_prompt, user_payload)
+            return self._generate_json_text(
+                system_prompt,
+                user_payload,
+                is_cancelled=is_cancelled,
+            )
         except LLMError as exc:
             message = str(exc)
             if _response_format_unsupported(message):
                 return message
             if _empty_response(message):
-                return self.generate_text(system_prompt, user_payload)
+                return self._generate_json_text(
+                    system_prompt,
+                    user_payload,
+                    is_cancelled=is_cancelled,
+                )
             raise
+
+    def _generate_json_text(
+        self,
+        system_prompt: str,
+        user_payload: dict[str, Any],
+        *,
+        response_format: dict[str, str] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
+    ) -> str:
+        """执行 JSON 阶段文本请求，并在取消时关闭 provider 客户端连接。"""
+
+        def operation() -> str:
+            """调用现有非流式文本接口，兼容旧的测试替身签名。"""
+
+            if response_format is not None:
+                return self.generate_text(system_prompt, user_payload, response_format)
+            return self.generate_text(system_prompt, user_payload)
+
+        return run_cancellable(
+            operation,
+            is_cancelled,
+            on_cancel=lambda: _best_effort_close_stream(self.client),
+        )
 
 
 def _completion_message_content(completion: Any) -> str:

@@ -1,5 +1,5 @@
 """
-@Time       : 2026/07/29 16:20
+@Time       : 2026/08/28 13:20
 @Author     : zhanglp8181
 @File       : runner.py
 @CallChain  : AgentLoop → GeneralSkillSelector/GeneralSkillRunner → LLMClient/受限运行环境
@@ -13,17 +13,20 @@ import json
 import os
 import queue
 import selectors
+import signal
 import subprocess
 import sys
 import threading
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from pathlib import Path
 from tempfile import mkdtemp
 from types import SimpleNamespace
 from typing import Any
 
 from app import paths
+from app.cancellation import TurnCancellationRequested, raise_if_cancelled
 from app.db.models import GeneralSkill, ModelConfig
 from app.general_skills.schema import (
     GeneralSkillExecutionPlan,
@@ -86,9 +89,11 @@ class GeneralSkillSelector:
         model_config: ModelConfig,
         conversation_context: dict[str, object] | None = None,
         memory_context: list[dict[str, object]] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> GeneralSkillSelection:
         """基于稳定历史和服务端能力事实选择通用技能与知识，不继承同轮 Router 输出。"""
 
+        raise_if_cancelled(is_cancelled)
         selector_context = copy.deepcopy(
             conversation_context if isinstance(conversation_context, dict) else {}
         )
@@ -124,8 +129,11 @@ class GeneralSkillSelector:
             output_contract=GENERAL_SKILL_SELECTION_OUTPUT,
         )
         with llm_operation("general_skill.select"):
+            generate_kwargs = (
+                {"is_cancelled": is_cancelled} if is_cancelled is not None else {}
+            )
             raw = LLMClient(model_config).generate_json(
-                unified_system_prompt(), payload
+                unified_system_prompt(), payload, **generate_kwargs
             )
         decision = GeneralSkillSelection.model_validate(raw)
         if decision.use_knowledge:
@@ -162,11 +170,20 @@ class GeneralSkillRunner:
         event_sink: TraceSink | None = None,
         conversation_context: dict[str, object] | None = None,
         memory_context: list[dict[str, object]] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> GeneralSkillRunResponse:
+        """规划、执行、复核并回复通用技能；取消时立即终止后续重试和回复阶段。"""
+
+        raise_if_cancelled(is_cancelled)
         trace: list[dict[str, Any]] = []
         max_attempts = max(1, min(max_attempts, GENERAL_SKILL_MAX_ATTEMPTS))
         _emit(trace, {"phase": "skill_loaded", "message": f"已加载通用技能 {skill.name}", "slug": skill.slug}, event_sink)
         try:
+            planning_args = (
+                (is_cancelled,)
+                if is_cancelled is not None
+                else ()
+            )
             plan, planning_attempts = self._generate_plan_with_reflection(
                 skill,
                 query,
@@ -176,6 +193,7 @@ class GeneralSkillRunner:
                 max_attempts,
                 conversation_context,
                 memory_context,
+                *planning_args,
             )
         except LLMError as exc:
             _emit(trace, {"phase": "plan_failed", "message": "模型生成 runner 失败", "error": str(exc)}, event_sink)
@@ -194,11 +212,13 @@ class GeneralSkillRunner:
         stderr = ""
         structured_result: dict[str, Any] = {}
         for attempt in range(1, max_attempts + 1):
+            raise_if_cancelled(is_cancelled)
             _emit(
                 trace,
                 {"phase": "attempt_started", "message": f"开始第 {attempt} 次运行", "attempt": attempt},
                 event_sink,
             )
+            execute_args = (is_cancelled,) if is_cancelled is not None else ()
             stdout, stderr, structured_result = self._execute_plan(
                 skill,
                 query,
@@ -207,8 +227,10 @@ class GeneralSkillRunner:
                 trace,
                 event_sink,
                 attempt,
+                *execute_args,
             )
             _normalize_failure_diagnostics(structured_result)
+            review_args = (is_cancelled,) if is_cancelled is not None else ()
             review = self._review_execution_result(
                 skill,
                 query,
@@ -222,6 +244,7 @@ class GeneralSkillRunner:
                 attempt,
                 conversation_context,
                 memory_context,
+                *review_args,
             )
             attempts.append(
                 {
@@ -279,6 +302,7 @@ class GeneralSkillRunner:
                 event_sink,
             )
             try:
+                repair_args = (is_cancelled,) if is_cancelled is not None else ()
                 plan = self._repair_plan(
                     skill,
                     query,
@@ -289,6 +313,7 @@ class GeneralSkillRunner:
                     attempt + 1,
                     conversation_context,
                     memory_context,
+                    *repair_args,
                 )
             except LLMError as exc:
                 _emit(
@@ -299,6 +324,7 @@ class GeneralSkillRunner:
                 break
 
         try:
+            reply_args = (is_cancelled,) if is_cancelled is not None else ()
             reply = self._generate_reply(
                 skill,
                 query,
@@ -310,6 +336,7 @@ class GeneralSkillRunner:
                 event_sink,
                 conversation_context,
                 memory_context,
+                *reply_args,
             )
         except LLMError as exc:
             _emit(trace, {"phase": "reply_failed", "message": "模型生成最终回复失败", "error": str(exc)}, event_sink)
@@ -333,7 +360,11 @@ class GeneralSkillRunner:
         event_sink: TraceSink | None = None,
         conversation_context: dict[str, object] | None = None,
         memory_context: list[dict[str, object]] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> GeneralSkillExecutionPlan:
+        """调用规划模型生成合法 runtime 与代码，并支持在模型响应期间取消。"""
+
+        raise_if_cancelled(is_cancelled)
         _emit(trace, {"phase": "planning", "message": "正在根据 SKILL.md 生成 runner"}, event_sink)
         stage_data = {
             "skill": {
@@ -366,9 +397,13 @@ class GeneralSkillRunner:
             output_contract=GENERAL_SKILL_PLAN_OUTPUT,
         )
         with llm_operation("general_skill.plan"):
+            generate_kwargs = (
+                {"is_cancelled": is_cancelled} if is_cancelled is not None else {}
+            )
             raw = LLMClient(_with_min_tokens(model_config, GENERAL_SKILL_MAX_TOKENS)).generate_json(
                 unified_system_prompt(),
                 payload,
+                **generate_kwargs,
             )
         plan = GeneralSkillExecutionPlan.model_validate(raw)
         plan.runtime = _plan_runtime(plan)
@@ -399,10 +434,12 @@ class GeneralSkillRunner:
         max_attempts: int,
         conversation_context: dict[str, object] | None,
         memory_context: list[dict[str, object]] | None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> tuple[GeneralSkillExecutionPlan, list[dict[str, Any]]]:
         planning_failures: list[dict[str, Any]] = []
         last_error: LLMError | None = None
         for plan_attempt in range(1, max_attempts + 1):
+            raise_if_cancelled(is_cancelled)
             try:
                 if plan_attempt == 1:
                     return (
@@ -414,6 +451,7 @@ class GeneralSkillRunner:
                             event_sink,
                             conversation_context,
                             memory_context,
+                            is_cancelled,
                         ),
                         planning_failures,
                     )
@@ -428,6 +466,7 @@ class GeneralSkillRunner:
                         plan_attempt,
                         conversation_context,
                         memory_context,
+                        is_cancelled,
                     ),
                     planning_failures,
                 )
@@ -489,7 +528,11 @@ class GeneralSkillRunner:
         next_attempt: int,
         conversation_context: dict[str, object] | None = None,
         memory_context: list[dict[str, object]] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> GeneralSkillExecutionPlan:
+        """根据前次失败诊断生成下一版 runner 代码，并支持取消传播。"""
+
+        raise_if_cancelled(is_cancelled)
         _emit(
             trace,
             {"phase": "repair_planning", "message": f"正在生成第 {next_attempt} 次运行代码", "attempt": next_attempt},
@@ -527,9 +570,13 @@ class GeneralSkillRunner:
             output_contract=GENERAL_SKILL_PLAN_OUTPUT,
         )
         with llm_operation("general_skill.repair", attempt=next_attempt):
+            generate_kwargs = (
+                {"is_cancelled": is_cancelled} if is_cancelled is not None else {}
+            )
             raw = LLMClient(_with_min_tokens(model_config, GENERAL_SKILL_MAX_TOKENS)).generate_json(
                 unified_system_prompt(),
                 payload,
+                **generate_kwargs,
             )
         plan = GeneralSkillExecutionPlan.model_validate(raw)
         plan.runtime = _plan_runtime(plan)
@@ -560,7 +607,11 @@ class GeneralSkillRunner:
         trace: list[dict[str, Any]],
         event_sink: TraceSink | None = None,
         attempt: int = 1,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> tuple[str, str, dict[str, Any]]:
+        """在独立进程组中执行 runner，并在取消或超时时收敛整个进程树。"""
+
+        raise_if_cancelled(is_cancelled)
         run_dir = Path(mkdtemp(prefix="gongge_xuban_general_skill_"))
         skill_dir = run_dir / "skill"
         _materialize_skill_package(skill, skill_dir)
@@ -640,16 +691,24 @@ class GeneralSkillRunner:
             cwd=cwd,
             env=env,
             text=False,
+            **_process_group_kwargs(),
         )
+        setattr(process, "_gongge_process_group", True)
         if process.stdin:
             process.stdin.write(json.dumps(stdin_payload, ensure_ascii=False).encode("utf-8"))
             process.stdin.close()
 
         try:
-            stdout, stderr, timed_out = _stream_process_output(process, trace, event_sink, attempt)
+            stdout, stderr, timed_out = _stream_process_output(
+                process,
+                trace,
+                event_sink,
+                attempt,
+                is_cancelled=is_cancelled,
+            )
         finally:
             if process.poll() is None:
-                process.kill()
+                _terminate_runner_process(process, force=True)
                 process.wait()
 
         if timed_out:
@@ -706,9 +765,11 @@ class GeneralSkillRunner:
         event_sink: TraceSink | None = None,
         conversation_context: dict[str, object] | None = None,
         memory_context: list[dict[str, object]] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> str:
         """基于已执行结果生成最终回复，并对声明写作纪律的 Skill 做一次有界复核。"""
 
+        raise_if_cancelled(is_cancelled)
         _emit(trace, {"phase": "replying", "message": "正在根据运行结果生成回复"}, event_sink)
         stage_data = {
             "skill": {
@@ -737,8 +798,11 @@ class GeneralSkillRunner:
         )
         try:
             with llm_operation("general_skill.reply"):
+                generate_kwargs = (
+                    {"is_cancelled": is_cancelled} if is_cancelled is not None else {}
+                )
                 raw = LLMClient(model_config).generate_json(
-                    unified_system_prompt(), payload
+                    unified_system_prompt(), payload, **generate_kwargs
                 )
             reply = GeneralSkillReply.model_validate(raw).reply.strip()
         except LLMError:
@@ -772,7 +836,11 @@ class GeneralSkillRunner:
                 " skill.markdown 和 review_contract，必要时修订，最后仍只输出 {\"reply\":\"...\"}。"
             )
             try:
+                raise_if_cancelled(is_cancelled)
                 with llm_operation("general_skill.reply", attempt=2):
+                    generate_kwargs = (
+                        {"is_cancelled": is_cancelled} if is_cancelled is not None else {}
+                    )
                     reviewed_raw = LLMClient(model_config).generate_json(
                         unified_system_prompt(),
                         stage_payload(
@@ -784,6 +852,7 @@ class GeneralSkillRunner:
                             stage_data=review_stage_data,
                             output_contract=GENERAL_SKILL_REPLY_OUTPUT,
                         ),
+                        **generate_kwargs,
                     )
                 reviewed_reply = GeneralSkillReply.model_validate(reviewed_raw).reply.strip()
                 if reviewed_reply:
@@ -796,6 +865,8 @@ class GeneralSkillRunner:
                         },
                         event_sink,
                     )
+            except TurnCancellationRequested:
+                raise
             except Exception as exc:  # 复核失败保留已生成的可见回复，不重跑技能代码。
                 _emit(
                     trace,
@@ -823,7 +894,11 @@ class GeneralSkillRunner:
         attempt: int,
         conversation_context: dict[str, object] | None = None,
         memory_context: list[dict[str, object]] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
+        """调用结果复核模型，并在取消时跳过失败降级和自动修复。"""
+
+        raise_if_cancelled(is_cancelled)
         _emit(
             trace,
             {
@@ -863,10 +938,15 @@ class GeneralSkillRunner:
         )
         try:
             with llm_operation("general_skill.review", attempt=attempt):
+                generate_kwargs = (
+                    {"is_cancelled": is_cancelled} if is_cancelled is not None else {}
+                )
                 raw = LLMClient(model_config).generate_json(
-                    unified_system_prompt(), payload
+                    unified_system_prompt(), payload, **generate_kwargs
                 )
             review = GeneralSkillExecutionReview.model_validate(raw).model_dump(mode="json")
+        except TurnCancellationRequested:
+            raise
         except Exception as exc:
             fallback_needs_retry = _execution_needs_retry(stdout, stderr, structured_result)
             review = {
@@ -1005,6 +1085,7 @@ def _stream_process_output_selectors(
     trace: list[dict[str, Any]],
     event_sink: TraceSink | None,
     attempt: int,
+    is_cancelled: Callable[[], bool] | None = None,
 ) -> tuple[str, str, bool]:
     selector = selectors.DefaultSelector()
     stdout_parts: list[str] = []
@@ -1022,9 +1103,12 @@ def _stream_process_output_selectors(
     timed_out = False
     try:
         while selector.get_map():
+            if is_cancelled is not None and is_cancelled():
+                _terminate_runner_process(process, force=False)
+                raise TurnCancellationRequested("通用技能 runner 已取消。")
             if time.monotonic() > deadline:
                 timed_out = True
-                process.kill()
+                _terminate_runner_process(process, force=True)
                 break
             events = selector.select(timeout=0.1)
             if not events and process.poll() is not None:
@@ -1064,13 +1148,21 @@ def _use_thread_reader() -> bool:
     return sys.platform == "win32"
 
 
-def _stream_process_output(process, trace, event_sink, attempt):
+def _stream_process_output(process, trace, event_sink, attempt, is_cancelled=None):
+    """按平台选择非阻塞输出读取器，并把 Turn 取消传入读取循环。"""
+
     if _use_thread_reader():
-        return _stream_process_output_threaded(process, trace, event_sink, attempt)
-    return _stream_process_output_selectors(process, trace, event_sink, attempt)
+        return _stream_process_output_threaded(
+            process, trace, event_sink, attempt, is_cancelled=is_cancelled
+        )
+    return _stream_process_output_selectors(
+        process, trace, event_sink, attempt, is_cancelled=is_cancelled
+    )
 
 
-def _stream_process_output_threaded(process, trace, event_sink, attempt):
+def _stream_process_output_threaded(process, trace, event_sink, attempt, is_cancelled=None):
+    """在线程读取器实现中轮询取消，并终止 runner 的整个进程树。"""
+
     q: "queue.Queue[tuple[str, bytes]]" = queue.Queue()
     stdout_parts: list[str] = []
     stderr_parts: list[str] = []
@@ -1096,9 +1188,12 @@ def _stream_process_output_threaded(process, trace, event_sink, attempt):
     timed_out = False
     eof_count = 0
     while eof_count < open_streams:
+        if is_cancelled is not None and is_cancelled():
+            _terminate_runner_process(process, force=False)
+            raise TurnCancellationRequested("通用技能 runner 已取消。")
         if time.monotonic() > deadline:
             timed_out = True
-            process.kill()
+            _terminate_runner_process(process, force=True)
             break
         try:
             name, chunk = q.get(timeout=0.1)
@@ -1119,6 +1214,39 @@ def _stream_process_output_threaded(process, trace, event_sink, attempt):
     for t in threads:
         t.join(timeout=1.0)
     return "".join(stdout_parts), "".join(stderr_parts), timed_out
+
+
+def _process_group_kwargs() -> dict[str, int | bool]:
+    """为通用 Skill runner 创建独立进程组，避免取消只终止父解释器。"""
+
+    if os.name == "nt":
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
+
+
+def _terminate_runner_process(process: subprocess.Popen, *, force: bool) -> None:
+    """终止 runner 进程树；未由本模块创建的测试进程只终止自身。"""
+
+    if process.poll() is not None:
+        return
+    if not getattr(process, "_gongge_process_group", False):
+        process.kill() if force else process.terminate()
+        return
+    try:
+        if os.name == "nt":
+            if force:
+                subprocess.run(
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    check=False,
+                    capture_output=True,
+                )
+            else:
+                process.send_signal(signal.CTRL_BREAK_EVENT)
+            return
+        os.killpg(os.getpgid(process.pid), signal.SIGKILL if force else signal.SIGTERM)
+    except (AttributeError, OSError, ProcessLookupError):
+        with suppress(Exception):
+            process.kill() if force else process.terminate()
 
 
 def _bash_supported() -> bool:

@@ -1,5 +1,5 @@
 """
-@Time       : 2026/08/12
+@Time       : 2026/08/28 13:20
 @Author     : zhanglp8181
 @File       : start_fullstack_server.py
 @CallChain  : Playwright fullstack 配置 → 临时 SQLite → FastAPI 单端口应用
@@ -268,7 +268,9 @@ def configure_environment(database_path: Path) -> None:
         "AUTO_RESTART": "false",
         "DATABASE_URL": database_url,
         "PUBLIC_MOCK_API_KEY": "fullstack-e2e-public-mock-key",
-        "DYNAMIC_TASK_EXECUTION_ENABLED": "true",
+        "DYNAMIC_TASK_EXECUTION_ENABLED": (
+            "false" if os.environ.get("SKILL_AB_E2E") == "1" else "true"
+        ),
         "DYNAMIC_TASK_TENANT_ALLOWLIST": "*",
         "DYNAMIC_TASK_AGENT_ALLOWLIST": "*",
         "DYNAMIC_TASK_ALERT_SIGNAL_BACKLOG_THRESHOLD": "100",
@@ -2738,8 +2740,14 @@ def install_schedule_llm_override() -> None:
         client: LLMClient,
         system_prompt: str,
         user_payload: dict[str, object],
+        *,
+        is_cancelled=None,
     ) -> dict[str, object]:
         """按正式阶段协议返回可预测结构，禁止测试直接调用内部 Agent。"""
+
+        from app.cancellation import raise_if_cancelled
+
+        raise_if_cancelled(is_cancelled)
 
         if "附件视觉证据复核器" in system_prompt:
             resources = user_payload.get("reviewed_structural_evidence")
@@ -2752,7 +2760,9 @@ def install_schedule_llm_override() -> None:
                 "usage": {"input_tokens": 20, "output_tokens": 20},
             }
             if "ATTACHMENT-VISUAL-CANCEL-DYNAMIC" in str(user_payload):
-                time.sleep(8)
+                for _ in range(80):
+                    time.sleep(0.1)
+                    raise_if_cancelled(is_cancelled)
             if "ATTACHMENT-VISUAL-CONFLICT-DYNAMIC" in str(user_payload):
                 first = next((item for item in resources if isinstance(item, dict)), {})
                 return {
@@ -4597,9 +4607,11 @@ def install_schedule_llm_override() -> None:
         user_payload: dict[str, object] | str,
         response_format: dict[str, str] | None = None,
     ) -> str:
-        """只为真实加载 Skill 的回复固定供应商输出，其余场景保持原链路。"""
+        """只在 Skill A/B 隔离回归中固定四象限供应商输出，其余场景保持原链路。"""
 
         if isinstance(user_payload, dict):
+            if os.environ.get("SKILL_AB_E2E") == "1":
+                return skill_ab_response(user_payload)
             if "ATTACHMENT-SOP-SALES" in str(user_payload):
                 return (
                     "ATTACHMENT-SOP-SALES-SUCCESS：已按发布定义确定性读取实际与目标数据，"
@@ -4656,6 +4668,59 @@ def install_schedule_llm_override() -> None:
                 return "S3-GUIDED-SUCCESS：已按固定修订的售后核验指南完成本轮处理。"
         return original_generate_text(client, system_prompt, user_payload, response_format)
 
+    def skill_ab_response(user_payload: dict[str, object]) -> str:
+        """为 Skill 能力增益对照返回固定答案，并验证附件只来自本轮权威输入。"""
+
+        context = user_payload.get("conversation_context")
+        context_dict = context if isinstance(context, dict) else {}
+        raw_inputs = context_dict.get("current_turn_inputs")
+        attachment_text = json.dumps(raw_inputs, ensure_ascii=False)
+        has_attachment = isinstance(raw_inputs, list) and bool(raw_inputs)
+        if has_attachment and "SKILL-AB-ATTACHMENT-FACT" not in attachment_text:
+            raise RuntimeError("Skill A/B response did not receive the uploaded attachment")
+        raw_loaded = user_payload.get("loaded_general_skills")
+        if not isinstance(raw_loaded, list):
+            raw_loaded = context_dict.get("loaded_general_skills")
+        loaded = [item for item in raw_loaded or [] if isinstance(item, dict)]
+        instructions = "\n".join(str(item.get("instructions") or "") for item in loaded)
+        name = str(loaded[0].get("name") or "") if loaded else ""
+        evidence = "已读取本轮真实附件中的 SKILL-AB-ATTACHMENT-FACT。" if has_attachment else "已核对内联事实。"
+        baseline = (
+            "SKILL-AB-BASELINE：\n"
+            "事实：CASE-AB-REFUND-001 涉及高额退款审批；租户隔离和幂等键是既有约束。\n"
+            "风险：当前方案可能绕过审批或让重复请求产生重复退款。\n"
+            "下一步：先确认状态转换、幂等边界和回滚条件，再补充可复现验证。\n"
+            "验收：高额请求进入待审批，重复请求只产生一个结果，失败路径可回滚。\n"
+            f"{evidence}"
+        )
+        if not loaded:
+            return baseline
+        if name == "code-review" or "Standards" in instructions and "Spec" in instructions:
+            return (
+                "SKILL-AB-TREATMENT code-review：\n"
+                f"{baseline}\n"
+                "Standards 轴：检查事务边界、租户隔离、幂等键和错误处理；按严重级别列出证据缺口。\n"
+                "Spec 轴：逐条对照需求、兼容 SQLite/MySQL、回滚和测试覆盖，未证实项保持待验证。\n"
+                "交付增益：把事实、风险、证据缺口和验收条件分开，形成可复核审查结论。"
+            )
+        if name == "implement" or "Implement the work" in instructions:
+            return (
+                "SKILL-AB-TREATMENT implement：\n"
+                f"{baseline}\n"
+                "实施步骤：先固定规格和状态模型，再用 /tdd 建立失败测试，完成最小实现，最后用 /code-review 复核。\n"
+                "依赖与回滚：先确认迁移、旧状态兼容和幂等键契约；任一步骤失败都保留可回滚边界。\n"
+                "完成标准：每个变更行为都有测试，SQLite/MySQL 均通过，且审批与重复请求证据可追溯。"
+            )
+        if name == "diagnosing-bugs" or "feedback loop" in instructions:
+            return (
+                "SKILL-AB-TREATMENT diagnosing-bugs：\n"
+                f"{baseline}\n"
+                "反馈回路：先构造能命中 CASE-AB-REFUND-001 的最小复现，再一次只改变一个变量。\n"
+                "假设：H1 是审批状态丢失，H2 是幂等键未持久化，H3 是失败补偿重复执行；每个假设都要有判别探针。\n"
+                "停止条件：修复后原始复现变绿，保留失败/成功回执，并清理临时 instrumentation。"
+            )
+        return f"SKILL-AB-TREATMENT {name}：\n{baseline}\n已按已加载 Skill 的相关原则补充结构化验收。"
+
     LLMClient.generate_text = deterministic_text
 
     def deterministic_text_stream(
@@ -4668,12 +4733,23 @@ def install_schedule_llm_override() -> None:
         """让隔离 Skill 场景走真实流式/SSE边界，同时禁止占位密钥访问外部供应商。"""
 
         context = user_payload.get("conversation_context") if isinstance(user_payload, dict) else None
-        loaded = context.get("loaded_general_skills") if isinstance(context, dict) else None
+        loaded = user_payload.get("loaded_general_skills") if isinstance(user_payload, dict) else None
+        if not isinstance(loaded, list):
+            loaded = context.get("loaded_general_skills") if isinstance(context, dict) else None
         turn_inputs = context.get("current_turn_inputs") if isinstance(context, dict) else None
-        if (isinstance(loaded, list) and loaded) or (
+        if os.environ.get("SKILL_AB_E2E") == "1" or (isinstance(loaded, list) and loaded) or (
             isinstance(turn_inputs, list) and turn_inputs
         ):
-            text = deterministic_text(client, system_prompt, user_payload)
+            deterministic_payload = user_payload
+            if isinstance(user_payload, dict) and isinstance(loaded, list) and loaded:
+                deterministic_payload = {
+                    **user_payload,
+                    "conversation_context": {
+                        **(context if isinstance(context, dict) else {}),
+                        "loaded_general_skills": loaded,
+                    },
+                }
+            text = deterministic_text(client, system_prompt, deterministic_payload)
             for index in range(0, len(text), 8):
                 if is_cancelled and is_cancelled():
                     from app.llm.client import LLMStreamCancelled

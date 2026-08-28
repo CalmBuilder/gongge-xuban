@@ -9,11 +9,13 @@
 from __future__ import annotations
 
 from datetime import timedelta
+import socket
 
 import httpx
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
+import app.security.outbound as outbound
 from app.agents.branching import ensure_private_resource_binding
 from app.db.models import (
     AgentProfile,
@@ -113,6 +115,13 @@ def test_tool_executor_persists_successful_authorization_snapshot(monkeypatch) -
             )
 
     monkeypatch.setattr(httpx, "Client", FakeClient)
+    monkeypatch.setattr(
+        outbound.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+        ],
+    )
     with _test_session() as db:
         context = _seed_authorization_context(db, assignment_mode="execute")
         tool = Tool(

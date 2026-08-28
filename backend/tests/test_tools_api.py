@@ -1,3 +1,11 @@
+"""
+@Time       : 2026/08/28 13:20
+@Author     : zhanglp8181
+@File       : test_tools_api.py
+@CallChain  : pytest → Tools API → 临时 HTTP/MCP 探测与租户/角色边界
+@Description: 验证工具管理、临时探测安全策略和持久化工具权限契约。
+"""
+
 import subprocess
 import sys
 from pathlib import Path
@@ -19,6 +27,7 @@ from app.api.tools import (
     tool_read,
 )
 from app.config import get_settings
+import app.security.outbound as outbound
 from app.db.models import AgentProfile, AgentResourceBinding, Tenant, Tool, User
 from app.tools.tool_schema import ToolCreateRequest, ToolProbeRequest
 
@@ -41,6 +50,24 @@ def _member_user() -> User:
 
 def probe_tool(request: ToolProbeRequest, db: Session):  # noqa: ANN201
     return _probe_tool(request, db, _member_user())
+
+
+def admin_probe_tool(request: ToolProbeRequest, db: Session):  # noqa: ANN201
+    """以管理员身份调用需要外部出网或 stdio 权限的临时探测入口。"""
+
+    return _probe_tool(request, db, _admin_user())
+
+
+def _fake_public_dns(monkeypatch: pytest.MonkeyPatch) -> None:
+    """让 HTTPX 假客户端测试使用稳定公网地址，避免沙箱 DNS 映射干扰策略断言。"""
+
+    monkeypatch.setattr(
+        outbound.socket,
+        "getaddrinfo",
+        lambda host, port, **kwargs: [
+            (outbound.socket.AF_INET, outbound.socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))
+        ],
+    )
 
 
 def test_managed_workspace_tool_requires_admin_and_valid_local_contract(
@@ -554,7 +581,7 @@ def test_probe_tool_success_infers_output_schema(monkeypatch: pytest.MonkeyPatch
         def __exit__(self, *args):
             return None
 
-        def request(self, method, url, headers=None, json=None, params=None):
+        def request(self, method, url, headers=None, json=None, params=None, **kwargs):
             assert method == "POST"
             assert url == (
                 f"{get_settings().normalized_tool_base_url}"
@@ -615,9 +642,85 @@ def test_probe_mcp_tool_success_infers_output_schema() -> None:
         assert result.inferred_output_schema["properties"]["total"]["type"] == "integer"
 
 
+def test_probe_external_http_is_denied_for_member() -> None:
+    """普通成员不能借临时探测入口访问任意外部 HTTP 地址。"""
+
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.commit()
+
+        with pytest.raises(HTTPException) as denied:
+            probe_tool(
+                ToolProbeRequest(
+                    tenant_id="tenant_demo",
+                    name="external.member_probe",
+                    method="GET",
+                    url="https://example.test/health",
+                ),
+                db,
+            )
+
+    assert denied.value.status_code == 403
+
+
+def test_probe_rejects_secret_references_before_network_call() -> None:
+    """临时探测不得把服务端 secret 引用展开后发送给用户指定目标。"""
+
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.commit()
+
+        with pytest.raises(HTTPException) as denied:
+            admin_probe_tool(
+                ToolProbeRequest(
+                    tenant_id="tenant_demo",
+                    name="external.secret_probe",
+                    method="POST",
+                    url="https://example.test/health",
+                    headers={"Authorization": "Bearer ${secret.EXTERNAL_API_KEY}"},
+                ),
+                db,
+            )
+
+    assert denied.value.status_code == 400
+
+
+def test_probe_rejects_private_http_target_before_client_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """管理员临时探测也不能直接连接 loopback 或云元数据等私网地址。"""
+
+    class MustNotRequestClient:
+        def __init__(self, *args, **kwargs):
+            """若构造客户端即说明目标校验顺序发生回退。"""
+
+            raise AssertionError("私网目标应在创建 HTTP 客户端前被阻断")
+
+    monkeypatch.setattr(httpx, "Client", MustNotRequestClient)
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.commit()
+
+        result = admin_probe_tool(
+            ToolProbeRequest(
+                tenant_id="tenant_demo",
+                name="internal.blocked_probe",
+                method="GET",
+                url="http://127.0.0.1:8080/health",
+            ),
+            db,
+        )
+
+    assert result.success is False
+    assert result.status_code == 400
+    assert result.error is not None
+    assert result.error.code == "OUTBOUND_TARGET_BLOCKED"
+
+
 def test_probe_get_tool_preserves_query_string_when_arguments_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _fake_public_dns(monkeypatch)
     requested: dict[str, object] = {}
 
     class FakeClient:
@@ -630,7 +733,7 @@ def test_probe_get_tool_preserves_query_string_when_arguments_empty(
         def __exit__(self, *args):
             return None
 
-        def request(self, method, url, headers=None, json=None, params=None):
+        def request(self, method, url, headers=None, json=None, params=None, **kwargs):
             requested.update({"method": method, "url": url, "params": params})
             return httpx.Response(200, json={"current": {"temperature_2m": 27.4}})
 
@@ -639,7 +742,7 @@ def test_probe_get_tool_preserves_query_string_when_arguments_empty(
         db.add(Tenant(id="tenant_demo", name="Demo"))
         db.commit()
 
-        result = probe_tool(
+        result = admin_probe_tool(
             ToolProbeRequest(
                 tenant_id="tenant_demo",
                 name="weather.forecast",
@@ -654,19 +757,18 @@ def test_probe_get_tool_preserves_query_string_when_arguments_empty(
         )
 
     assert result.success is True
-    assert requested == {
-        "method": "GET",
-        "url": (
-            "https://api.open-meteo.com/v1/forecast"
-            "?latitude=39.90&longitude=116.40&current=temperature_2m"
-        ),
-        "params": None,
-    }
+    assert requested["method"] == "GET"
+    assert requested["url"] == (
+        "https://93.184.216.34/v1/forecast"
+        "?latitude=39.90&longitude=116.40&current=temperature_2m"
+    )
+    assert requested["params"] is None
 
 
 def test_probe_get_tool_sends_sample_arguments_as_query_params(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _fake_public_dns(monkeypatch)
     requested: dict[str, object] = {}
 
     class FakeClient:
@@ -679,7 +781,7 @@ def test_probe_get_tool_sends_sample_arguments_as_query_params(
         def __exit__(self, *args):
             return None
 
-        def request(self, method, url, headers=None, json=None, params=None):
+        def request(self, method, url, headers=None, json=None, params=None, **kwargs):
             requested.update({"method": method, "url": url, "params": params, "json": json})
             return httpx.Response(200, json={"timezone": "Asia/Shanghai"})
 
@@ -688,7 +790,7 @@ def test_probe_get_tool_sends_sample_arguments_as_query_params(
         db.add(Tenant(id="tenant_demo", name="Demo"))
         db.commit()
 
-        result = probe_tool(
+        result = admin_probe_tool(
             ToolProbeRequest(
                 tenant_id="tenant_demo",
                 name="weather.forecast",
@@ -706,18 +808,16 @@ def test_probe_get_tool_sends_sample_arguments_as_query_params(
         )
 
     assert result.success is True
-    assert requested == {
-        "method": "GET",
-        "url": "https://api.open-meteo.com/v1/forecast",
-        "params": {
-            "latitude": "39.90",
-            "longitude": "116.40",
-            "current": "temperature_2m,wind_speed_10m",
-            "daily": "weather_code,temperature_2m_max,temperature_2m_min",
-            "timezone": "Asia/Shanghai",
-        },
-        "json": None,
+    assert requested["method"] == "GET"
+    assert requested["url"] == "https://93.184.216.34/v1/forecast"
+    assert requested["params"] == {
+        "latitude": "39.90",
+        "longitude": "116.40",
+        "current": "temperature_2m,wind_speed_10m",
+        "daily": "weather_code,temperature_2m_max,temperature_2m_min",
+        "timezone": "Asia/Shanghai",
     }
+    assert requested["json"] is None
 
 
 def test_probe_mcp_tool_error_is_stable() -> None:
@@ -725,7 +825,7 @@ def test_probe_mcp_tool_error_is_stable() -> None:
         db.add(Tenant(id="tenant_demo", name="Demo"))
         db.commit()
 
-        result = probe_tool(
+        result = admin_probe_tool(
             ToolProbeRequest(
                 tenant_id="tenant_demo",
                 name="mcp.bad",
@@ -749,7 +849,7 @@ def test_probe_stdio_mcp_tool_success_infers_output_schema() -> None:
         db.add(Tenant(id="tenant_demo", name="Demo"))
         db.commit()
 
-        result = probe_tool(
+        result = admin_probe_tool(
             ToolProbeRequest(
                 tenant_id="tenant_demo",
                 name="mcp.real_product_lookup",
@@ -786,6 +886,7 @@ def test_probe_tool_relative_url_uses_configured_tool_base(monkeypatch: pytest.M
 
 
 def test_probe_tool_http_error_returns_stable_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    _fake_public_dns(monkeypatch)
     class FakeClient:
         def __init__(self, *args, **kwargs):
             pass
@@ -804,7 +905,7 @@ def test_probe_tool_http_error_returns_stable_error(monkeypatch: pytest.MonkeyPa
         db.add(Tenant(id="tenant_demo", name="Demo"))
         db.commit()
 
-        result = probe_tool(
+        result = admin_probe_tool(
             ToolProbeRequest(
                 tenant_id="tenant_demo",
                 name="missing.tool",

@@ -1,5 +1,5 @@
 """
-@Time       : 2026/07/18 09:22
+@Time       : 2026/08/28 13:20
 @Author     : zhanglp8181
 @File       : config.py
 @CallChain  : Environment/.env → Settings/get_settings → app/main/db/api
@@ -109,6 +109,7 @@ class Settings(BaseSettings):
     dynamic_task_router_shadow_min_confidence: float = Field(default=0.7, ge=0.0, le=1.0)
     tool_timeout_seconds: float = 8.0
     tool_base_url: str = "http://localhost:5137"
+    tool_outbound_allowed_hosts: str = ""
     public_mock_api_key: str
     public_mock_llm_enabled: bool = False
     cors_origins: str = "http://localhost:5137,http://127.0.0.1:5137"

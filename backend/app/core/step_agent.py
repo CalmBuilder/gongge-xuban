@@ -1,6 +1,17 @@
+"""
+@Time       : 2026/08/28 11:30
+@Author     : zhanglp8181
+@File       : step_agent.py
+@CallChain  : AgentLoop → StepAgent → LLMClient → StepAgentResult
+@Description: 根据当前 SOP、上下文、知识和工具目录生成受约束的下一步动作。
+"""
+
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from app import paths
+from app.cancellation import TurnCancellationRequested, raise_if_cancelled
 from app.core.context_projection import (
     compact_awaiting_input,
     compact_conversation_context,
@@ -63,7 +74,11 @@ class StepAgent:
         memory_context: list[dict[str, object]] | None = None,
         conversation_context: dict[str, object] | None = None,
         current_knowledge: list[dict[str, object]] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> StepAgentResult:
+        """生成下一步结构化动作，并在模型调用前后阻止已取消 Turn 继续推进。"""
+
+        raise_if_cancelled(is_cancelled)
         compact_knowledge = compact_knowledge_context(current_knowledge)
         compact_repair = _compact_repair_context(repair_context)
         active_skill = (
@@ -116,13 +131,19 @@ class StepAgent:
             operation = "step_agent.repair" if repair_context else "step_agent.run"
             repair_reason = str((repair_context or {}).get("reason") or "") or None
             with llm_operation(operation, repair_reason=repair_reason):
-                raw = LLMClient(model_config).generate_json(
-                    unified_system_prompt(), payload
+                generate_kwargs = (
+                    {"is_cancelled": is_cancelled} if is_cancelled is not None else {}
                 )
+                raw = LLMClient(model_config).generate_json(
+                    unified_system_prompt(), payload, **generate_kwargs
+                )
+            raise_if_cancelled(is_cancelled)
             result = StepAgentResult.model_validate(raw)
             if not result.action:
                 result.action = _infer_action(result, router_decision)
             return result
+        except TurnCancellationRequested:
+            raise
         except Exception as exc:
             if isinstance(exc, LLMError):
                 raise

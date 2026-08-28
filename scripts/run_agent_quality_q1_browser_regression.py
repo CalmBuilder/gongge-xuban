@@ -26,9 +26,10 @@ SKILLS_ROOT = UPSTREAM_SKILLS / "skills"
 WRITING_SKILL_DIR = UPSTREAM_SKILLS / "skills" / "productivity" / "writing-for-agents"
 CODEBASE_SKILL_DIR = UPSTREAM_SKILLS / "skills" / "engineering" / "codebase-design"
 DIAGNOSING_SKILL_DIR = UPSTREAM_SKILLS / "skills" / "engineering" / "diagnosing-bugs"
-# PlanRevision Q1-WRITING-20260821-02：上游仅发生 prose punctuation/grammar
-# 变化；候选、权限、资源清单和许可证已重新审查并由报告固定。
-EXPECTED_SKILLS_REVISION = "0ab1b63a410a03d3627979a109c8695de27af954"
+# PlanRevision Q1-WRITING-20260828-03：上游新增 implement-spec 与 retro 两个
+# in-progress Skill，并调整 in-progress 说明；已重新核对候选、权限、资源清单和许可证。
+# 本项目只消费已审核的 engineering/productivity/misc 候选，不把 in-progress 内容纳入执行。
+EXPECTED_SKILLS_REVISION = "6654f6b60cd9d5be8b54c6fafe44346dabeb3b76"
 Q1_PROFILES = {
     "writing": {
         "skill_dir": WRITING_SKILL_DIR,

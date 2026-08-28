@@ -1,13 +1,23 @@
+"""
+@Time       : 2026/08/28 14:10
+@Author     : zhanglp8181
+@File       : test_tool_executor.py
+@CallChain  : pytest → ToolExecutor → HTTP/MCP 工具执行与出网策略
+@Description: 验证工具执行的授权、幂等键、取消和持久化 HTTP 目标安全边界。
+"""
+
 import sys
 from pathlib import Path
 
 import httpx
+import pytest
 
 from app.agents.branching import ensure_private_resource_binding
 from app.tools.tool_executor import ToolExecutor
 from app.tools.tool_schema import ToolCall
 from app.tools.managed_workspace import ManagedCodeWorkspaceService
 from app.db.models import AgentProfile, MCPServer, Tenant, Tool
+import app.security.outbound as outbound
 from app.security.internal_service import INTERNAL_SERVICE_HEADER, internal_service_token
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
@@ -349,6 +359,7 @@ def test_execute_stdio_mcp_tool_error_is_stable() -> None:
 
 
 def test_execute_get_tool_preserves_query_string_when_arguments_empty(monkeypatch) -> None:
+    _fake_public_dns(monkeypatch)
     requested: dict[str, object] = {}
 
     class FakeClient:
@@ -361,7 +372,7 @@ def test_execute_get_tool_preserves_query_string_when_arguments_empty(monkeypatc
         def __exit__(self, *args):
             return None
 
-        def request(self, method, url, headers=None, json=None, params=None):
+        def request(self, method, url, headers=None, json=None, params=None, **kwargs):
             requested.update({"method": method, "url": url, "params": params})
             return httpx.Response(
                 200,
@@ -397,7 +408,7 @@ def test_execute_get_tool_preserves_query_string_when_arguments_empty(monkeypatc
     assert requested == {
         "method": "GET",
         "url": (
-            "https://api.open-meteo.com/v1/forecast"
+            "https://93.184.216.34/v1/forecast"
             "?latitude=39.90&longitude=116.40&current=temperature_2m"
         ),
         "params": None,
@@ -407,6 +418,7 @@ def test_execute_get_tool_preserves_query_string_when_arguments_empty(monkeypatc
 def test_execute_http_write_sends_authoritative_remote_idempotency_header(monkeypatch) -> None:
     """验证远端幂等键只进入 HTTP 写请求头，并覆盖工具配置中的同名大小写变体。"""
 
+    _fake_public_dns(monkeypatch)
     requested: dict[str, object] = {}
 
     class FakeClient:
@@ -423,7 +435,7 @@ def test_execute_http_write_sends_authoritative_remote_idempotency_header(monkey
 
             return None
 
-        def request(self, method, url, headers=None, json=None, params=None):
+        def request(self, method, url, headers=None, json=None, params=None, **kwargs):
             """记录最终请求头并返回成功响应。"""
 
             requested.update({"method": method, "headers": dict(headers or {}), "json": json})
@@ -454,8 +466,77 @@ def test_execute_http_write_sends_authoritative_remote_idempotency_header(monkey
         )
 
     assert result.success is True
-    assert requested["headers"] == {"Idempotency-Key": "runtime-command-key"}
+    assert requested["headers"] == {
+        "Idempotency-Key": "runtime-command-key",
+        "Host": "example.test",
+    }
     assert requested["json"] == {"amount": 100}
+
+
+def test_execute_http_tool_rejects_private_target_before_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """持久化 HTTP 工具也必须在连接前阻断未批准的私网目标。"""
+
+    class MustNotRequestClient:
+        def __init__(self, *args, **kwargs):
+            """允许构造客户端，但任何真实请求都应在目标策略前被阻断。"""
+
+        def __enter__(self):
+            """返回测试客户端。"""
+
+            return self
+
+        def __exit__(self, *args):
+            """结束测试上下文。"""
+
+            return None
+
+        def request(self, *args, **kwargs):
+            """若进入请求方法则说明 SSRF 防护顺序失效。"""
+
+            raise AssertionError("私网持久化工具不应发起 HTTP 请求")
+
+    monkeypatch.setattr(httpx, "Client", MustNotRequestClient)
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.add(
+            Tool(
+                tenant_id="tenant_demo",
+                name="internal.lookup",
+                method="POST",
+                url="http://127.0.0.1:8080/metadata",
+                enabled=True,
+            )
+        )
+        db.commit()
+
+        result = ToolExecutor(db).execute(
+            tenant_id="tenant_demo",
+            tool_call=ToolCall(name="internal.lookup", arguments={}),
+        )
+
+    assert result.success is False
+    assert result.error is not None
+    assert result.error.code == "OUTBOUND_TARGET_BLOCKED"
+
+
+def _fake_public_dns(monkeypatch: pytest.MonkeyPatch) -> None:
+    """为持久化 HTTP 工具测试固定公网解析结果，避免依赖环境 DNS。"""
+
+    monkeypatch.setattr(
+        outbound.socket,
+        "getaddrinfo",
+        lambda host, port, **kwargs: [
+            (
+                outbound.socket.AF_INET,
+                outbound.socket.SOCK_STREAM,
+                6,
+                "",
+                ("93.184.216.34", port),
+            )
+        ],
+    )
 
 
 def _mock_mcp_server_path() -> Path:

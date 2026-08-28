@@ -1,3 +1,11 @@
+"""
+@Time       : 2026/08/28 13:20
+@Author     : zhanglp8181
+@File       : test_mcp_servers_api.py
+@CallChain  : pytest → MCP Server API → builtin/stdio 发现、同步与工具执行
+@Description: 验证 MCP 连接权限、发现同步幂等及导入工具的租户范围。
+"""
+
 import sys
 from pathlib import Path
 
@@ -68,7 +76,7 @@ def test_discover_stdio_mcp_server_lists_tools() -> None:
                 ),
             ),
             db,
-            _member_user(),
+            _admin_user(),
         )
 
         assert response.success is True

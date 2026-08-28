@@ -1,5 +1,5 @@
 """
-@Time       : 2026/08/10 16:20
+@Time       : 2026/08/28 13:20
 @Author     : zhanglp8181
 @File       : router.py
 @CallChain  : AgentLoop → Router → LLMClient → RouterDecision
@@ -8,9 +8,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from app import paths
+from app.cancellation import TurnCancellationRequested, raise_if_cancelled
 from app.core.context_projection import (
     compact_awaiting_input,
     compact_conversation_context,
@@ -40,7 +42,11 @@ class Router:
         model_config: ModelConfig,
         conversation_context: dict[str, object] | None = None,
         memory_context: list[dict[str, object]] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> RouterDecision:
+        """调用路由模型并在规范化前检查取消，阻止迟到路由改变会话状态。"""
+
+        raise_if_cancelled(is_cancelled)
         payload = stage_payload(
             phase="Router",
             user_message=message,
@@ -55,10 +61,15 @@ class Router:
         )
         try:
             with llm_operation("router.scene"):
+                generate_kwargs = (
+                    {"is_cancelled": is_cancelled} if is_cancelled is not None else {}
+                )
                 raw = LLMClient(model_config).generate_json(
-                    unified_system_prompt(), payload
+                    unified_system_prompt(), payload, **generate_kwargs
                 )
             decision = RouterDecision.model_validate(raw)
+        except TurnCancellationRequested:
+            raise
         except Exception as exc:
             if isinstance(exc, LLMError):
                 raise

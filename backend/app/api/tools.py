@@ -1,5 +1,5 @@
 """
-@Time       : 2026/07/22 22:18
+@Time       : 2026/08/28 13:20
 @Author     : zhanglp8181
 @File       : tools.py
 @CallChain  : 工具管理页/Agent Loop → Tools API → ToolExecutor/数据库
@@ -8,7 +8,9 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -43,9 +45,20 @@ from app.security.permissions import (
     require_tenant_admin,
 )
 from app.security.tenant import ensure_tenant
+from app.security.outbound import (
+    OutboundTargetError,
+    allowed_hosts_from_settings,
+    is_same_origin,
+    prepare_outbound_request,
+)
 from app.tools import ToolExecutor
 from app.tools.http_request import prepare_get_request
-from app.tools.mcp_client import MCPClientError, execute_mcp_tool, list_mcp_tools
+from app.tools.mcp_client import (
+    MCPClientError,
+    execute_mcp_tool,
+    list_mcp_tools,
+    normalize_transport,
+)
 from app.tools.managed_workspace import ManagedCodeWorkspaceError, ManagedCodeWorkspaceService
 from app.tools.tool_schema import (
     MCPDiscoverRequest,
@@ -233,12 +246,18 @@ def probe_tool(
 ) -> ToolProbeResponse:
     ensure_current_user_tenant(request.tenant_id, current_user)
     ensure_tenant(db, request.tenant_id)
+    settings = get_settings()
+    if _contains_secret_reference(request.headers, request.auth, request.mcp_config):
+        raise HTTPException(status_code=400, detail="临时探测不允许引用服务端密钥。")
     if request.tool_type == "mcp":
+        if normalize_transport(request.mcp_config) != "builtin":
+            ensure_open_gallery_admin(request.tenant_id, current_user)
         try:
             data = execute_mcp_tool(
                 request.mcp_config,
                 request.sample_arguments,
-                timeout_seconds=get_settings().tool_timeout_seconds,
+                timeout_seconds=settings.tool_timeout_seconds,
+                allowed_hosts=allowed_hosts_from_settings(settings),
             )
         except MCPClientError as exc:
             return ToolProbeResponse(
@@ -259,23 +278,41 @@ def probe_tool(
             inferred_output_schema=_infer_json_schema(data),
             error=None,
         )
-    headers = ToolExecutor(db)._resolve_headers(request.headers, request.auth)  # noqa: SLF001
     url = _normalize_probe_url(request.url)
+    if not _is_member_safe_probe_url(url, settings, current_user):
+        ensure_open_gallery_admin(request.tenant_id, current_user)
+    headers = _probe_headers(request.headers, request.auth)
     try:
-        with httpx.Client(timeout=get_settings().tool_timeout_seconds) as client:
-            if request.method.upper() == "GET":
-                request_url, request_kwargs = prepare_get_request(url, request.sample_arguments)
-                response = client.request(
-                    request.method.upper(), request_url, headers=headers, **request_kwargs
-                )
-            else:
-                response = client.request(
-                    request.method.upper(), url, headers=headers, json=request.sample_arguments
-                )
+        if request.method.upper() == "GET":
+            request_url, request_kwargs = prepare_get_request(url, request.sample_arguments)
+        else:
+            request_url = url
+            request_kwargs = {"json": request.sample_arguments}
+        target = prepare_outbound_request(
+            request_url,
+            allowed_hosts=allowed_hosts_from_settings(settings),
+        )
+        with httpx.Client(
+            timeout=settings.tool_timeout_seconds,
+            follow_redirects=False,
+        ) as client:
+            response = client.request(
+                request.method.upper(),
+                target.request_url,
+                headers={**headers, **target.headers},
+                **request_kwargs,
+                **({"extensions": target.extensions} if target.extensions else {}),
+            )
     except httpx.TimeoutException:
         return ToolProbeResponse(
             success=False,
             error=ToolError(code="TIMEOUT", message="工具探测超时。"),
+        )
+    except OutboundTargetError as exc:
+        return ToolProbeResponse(
+            success=False,
+            status_code=400,
+            error=ToolError(code="OUTBOUND_TARGET_BLOCKED", message=str(exc)),
         )
     except Exception as exc:
         return ToolProbeResponse(
@@ -760,6 +797,46 @@ def _normalize_probe_url(url: str) -> str:
     return stripped
 
 
+def _is_member_safe_probe_url(url: str, settings: object, current_user: User) -> bool:
+    """仅允许普通成员探测同源受保护 mock 路径，外部目标必须由管理员操作。"""
+
+    if current_user.role == "admin":
+        return True
+    try:
+        target = urlsplit(url)
+    except ValueError:
+        return False
+    return target.path.startswith("/api/mock/") and is_same_origin(
+        url, str(getattr(settings, "normalized_tool_base_url", ""))
+    )
+
+
+def _probe_headers(headers: dict[str, str], auth: dict[str, Any]) -> dict[str, str]:
+    """整理临时探测头并支持不含服务端密钥引用的显式认证值。"""
+
+    resolved = {str(key): str(value) for key, value in headers.items()}
+    if auth.get("type") == "bearer" and auth.get("token"):
+        resolved["Authorization"] = f"Bearer {auth['token']}"
+    if auth.get("type") == "api_key" and auth.get("value"):
+        header_name = str(auth.get("header") or "X-API-Key")
+        resolved[header_name] = str(auth["value"])
+    return resolved
+
+
+def _contains_secret_reference(*values: object) -> bool:
+    """递归检测临时探测配置，阻止把服务端密钥送往任意目标。"""
+
+    pattern = re.compile(r"\$\{secret\.[A-Z0-9_]+\}")
+    for value in values:
+        if isinstance(value, str) and pattern.search(value):
+            return True
+        if isinstance(value, dict) and _contains_secret_reference(*value.keys(), *value.values()):
+            return True
+        if isinstance(value, (list, tuple, set)) and _contains_secret_reference(*value):
+            return True
+    return False
+
+
 def _response_preview(response: httpx.Response) -> Any:
     try:
         return response.json()
@@ -966,6 +1043,8 @@ def discover_mcp_tools_adhoc(
             success=False,
             error=ToolError(code="MISSING_CONNECTION", message="缺少 MCP 连接配置。"),
         )
+    if request.connection.transport != "builtin":
+        ensure_open_gallery_admin(request.tenant_id, current_user)
     return _discover_response(request.connection)
 
 
@@ -1093,7 +1172,12 @@ def sync_mcp_tools(
 def _discover_response(connection: MCPServerConnection) -> MCPDiscoverResponse:
     config = _connection_to_client_config(connection)
     try:
-        tools = list_mcp_tools(config, timeout_seconds=get_settings().tool_timeout_seconds)
+        settings = get_settings()
+        tools = list_mcp_tools(
+            config,
+            timeout_seconds=settings.tool_timeout_seconds,
+            allowed_hosts=allowed_hosts_from_settings(settings),
+        )
     except MCPClientError as exc:
         return MCPDiscoverResponse(
             success=False,

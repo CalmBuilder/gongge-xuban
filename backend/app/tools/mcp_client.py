@@ -1,16 +1,31 @@
+"""
+@Time       : 2026/08/28 11:00
+@Author     : zhanglp8181
+@File       : mcp_client.py
+@CallChain  : Tool API/Agent Loop → MCP Client → builtin/stdio/HTTP/SSE Server
+@Description: 统一 MCP 传输、出网目标校验、JSON-RPC 会话和可取消资源关闭边界。
+"""
+
 from __future__ import annotations
 
 import json
 import os
 import selectors
+import signal
 import subprocess
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import suppress
 from typing import Any
 
 import httpx
 
+from app.cancellation import (
+    TurnCancellationRequested,
+    raise_if_cancelled,
+    run_cancellable,
+)
+from app.security.outbound import OutboundTargetError, PinnedOutboundTarget, prepare_outbound_request
 from app.tools.mcp_builtin import (
     BuiltinMCPError,
     builtin_mcp_tool_definitions,
@@ -56,6 +71,8 @@ def execute_mcp_tool(
     arguments: dict[str, Any],
     timeout_seconds: float = 10,
     tool_name: str | None = None,
+    allowed_hosts: Iterable[str] | None = None,
+    is_cancelled: Callable[[], bool] | None = None,
 ) -> Any:
     """连接 MCP server 并调用单个工具。
 
@@ -68,28 +85,40 @@ def execute_mcp_tool(
     name = _resolve_tool_name(normalized, tool_name)
 
     if transport == "builtin":
+        raise_if_cancelled(is_cancelled)
         try:
-            return execute_builtin_mcp({**normalized, "tool": name}, arguments)
+            result = execute_builtin_mcp({**normalized, "tool": name}, arguments)
+            raise_if_cancelled(is_cancelled)
+            return result
         except BuiltinMCPError as exc:
             raise MCPClientError(str(exc)) from exc
     if transport == "stdio":
-        return _StdioSession(normalized, timeout_seconds).call_tool(name, arguments)
+        return _StdioSession(
+            normalized, timeout_seconds, allowed_hosts=allowed_hosts, is_cancelled=is_cancelled
+        ).call_tool(name, arguments)
     if transport in {"http", "streamable_http"}:
-        return _HttpSession(normalized, timeout_seconds).call_tool(name, arguments)
+        return _HttpSession(
+            normalized, timeout_seconds, allowed_hosts=allowed_hosts, is_cancelled=is_cancelled
+        ).call_tool(name, arguments)
     if transport == "sse":
-        return _SseSession(normalized, timeout_seconds).call_tool(name, arguments)
+        return _SseSession(
+            normalized, timeout_seconds, allowed_hosts=allowed_hosts, is_cancelled=is_cancelled
+        ).call_tool(name, arguments)
     raise MCPClientError(f"不支持的 MCP transport：{transport or '<empty>'}")
 
 
 def list_mcp_tools(
     config: dict[str, Any],
     timeout_seconds: float = 10,
+    allowed_hosts: Iterable[str] | None = None,
+    is_cancelled: Callable[[], bool] | None = None,
 ) -> list[dict[str, Any]]:
     """连接 MCP server 并通过 tools/list 发现工具列表。
 
     返回标准化后的工具定义列表，每项包含 name / description /
     input_schema / output_schema（若 server 提供）。
     """
+    raise_if_cancelled(is_cancelled)
     normalized = dict(config or {})
     transport = normalize_transport(normalized)
 
@@ -99,14 +128,21 @@ def list_mcp_tools(
         except BuiltinMCPError as exc:
             raise MCPClientError(str(exc)) from exc
     elif transport == "stdio":
-        raw = _StdioSession(normalized, timeout_seconds).list_tools()
+        raw = _StdioSession(
+            normalized, timeout_seconds, allowed_hosts=allowed_hosts, is_cancelled=is_cancelled
+        ).list_tools()
     elif transport in {"http", "streamable_http"}:
-        raw = _HttpSession(normalized, timeout_seconds).list_tools()
+        raw = _HttpSession(
+            normalized, timeout_seconds, allowed_hosts=allowed_hosts, is_cancelled=is_cancelled
+        ).list_tools()
     elif transport == "sse":
-        raw = _SseSession(normalized, timeout_seconds).list_tools()
+        raw = _SseSession(
+            normalized, timeout_seconds, allowed_hosts=allowed_hosts, is_cancelled=is_cancelled
+        ).list_tools()
     else:
         raise MCPClientError(f"不支持的 MCP transport：{transport or '<empty>'}")
 
+    raise_if_cancelled(is_cancelled)
     return [_normalize_tool_definition(item) for item in raw if isinstance(item, dict)]
 
 
@@ -138,11 +174,21 @@ class _MCPSession:
     子类实现 `_request`（单次 JSON-RPC 请求/响应）和资源管理。
     """
 
-    def __init__(self, config: dict[str, Any], timeout_seconds: float) -> None:
+    def __init__(
+        self,
+        config: dict[str, Any],
+        timeout_seconds: float,
+        *,
+        allowed_hosts: Iterable[str] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
+    ) -> None:
         self.config = config
         self.timeout_seconds = timeout_seconds
+        self.allowed_hosts = tuple(allowed_hosts or ())
+        self.is_cancelled = is_cancelled
 
     def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        raise_if_cancelled(self.is_cancelled)
         with self:
             self._initialize()
             result = self._request(
@@ -152,6 +198,7 @@ class _MCPSession:
             return _extract_tool_result(result)
 
     def list_tools(self) -> list[dict[str, Any]]:
+        raise_if_cancelled(self.is_cancelled)
         with self:
             self._initialize()
             result = self._request("tools/list", {})
@@ -159,6 +206,7 @@ class _MCPSession:
             return tools if isinstance(tools, list) else []
 
     def _initialize(self) -> None:
+        raise_if_cancelled(self.is_cancelled)
         self._request("initialize", _initialize_params())
         self._notify("notifications/initialized", {})
 
@@ -181,12 +229,25 @@ class _MCPSession:
 # --------------------------------------------------------------------------- #
 
 class _StdioSession(_MCPSession):
-    def __init__(self, config: dict[str, Any], timeout_seconds: float) -> None:
-        super().__init__(config, timeout_seconds)
+    def __init__(
+        self,
+        config: dict[str, Any],
+        timeout_seconds: float,
+        *,
+        allowed_hosts: Iterable[str] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
+    ) -> None:
+        super().__init__(
+            config,
+            timeout_seconds,
+            allowed_hosts=allowed_hosts,
+            is_cancelled=is_cancelled,
+        )
         self._proc: subprocess.Popen[str] | None = None
         self._next_id = 0
 
     def __enter__(self) -> "_StdioSession":
+        raise_if_cancelled(self.is_cancelled)
         command = _stdio_command(self.config)
         env = os.environ.copy()
         raw_env = self.config.get("env")
@@ -202,6 +263,7 @@ class _StdioSession(_MCPSession):
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
+            **_process_group_kwargs(),
         )
         return self
 
@@ -215,7 +277,12 @@ class _StdioSession(_MCPSession):
         self._next_id += 1
         request_id = self._next_id
         _send_json(proc, {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
-        response = _read_response(proc, expected_id=request_id, timeout_seconds=self.timeout_seconds)
+        response = _read_response(
+            proc,
+            expected_id=request_id,
+            timeout_seconds=self.timeout_seconds,
+            is_cancelled=self.is_cancelled,
+        )
         _raise_json_rpc_error(response)
         return response.get("result")
 
@@ -248,14 +315,26 @@ def _stdio_command(config: dict[str, Any]) -> list[str]:
 # --------------------------------------------------------------------------- #
 
 class _HttpSession(_MCPSession):
-    def __init__(self, config: dict[str, Any], timeout_seconds: float) -> None:
-        super().__init__(config, timeout_seconds)
+    def __init__(
+        self,
+        config: dict[str, Any],
+        timeout_seconds: float,
+        *,
+        allowed_hosts: Iterable[str] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
+    ) -> None:
+        super().__init__(
+            config,
+            timeout_seconds,
+            allowed_hosts=allowed_hosts,
+            is_cancelled=is_cancelled,
+        )
         self._client: httpx.Client | None = None
         self._next_id = 0
         self._session_id: str | None = None
 
     def __enter__(self) -> "_HttpSession":
-        self._client = httpx.Client(timeout=self.timeout_seconds)
+        self._client = httpx.Client(timeout=self.timeout_seconds, follow_redirects=False)
         return self
 
     def __exit__(self, *exc: Any) -> None:
@@ -286,10 +365,24 @@ class _HttpSession(_MCPSession):
         self._next_id += 1
         payload = {"jsonrpc": "2.0", "id": self._next_id, "method": method, "params": params}
         try:
-            response = client.post(self._endpoint(), headers=self._headers(), json=payload)
+            target = self._target(self._endpoint())
+            response = run_cancellable(
+                lambda: client.post(
+                    target.request_url,
+                    headers={**self._headers(), **target.headers},
+                    json=payload,
+                    **_target_extensions(target),
+                ),
+                self.is_cancelled,
+                on_cancel=lambda: _best_effort_close_client(client),
+            )
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             raise MCPClientError(f"HTTP MCP 返回异常状态码：{exc.response.status_code}") from exc
+        except TurnCancellationRequested:
+            raise
+        except OutboundTargetError as exc:
+            raise MCPClientError(str(exc)) from exc
         except Exception as exc:
             raise MCPClientError(str(exc)) from exc
         session_id = response.headers.get("mcp-session-id")
@@ -304,8 +397,30 @@ class _HttpSession(_MCPSession):
     def _notify(self, method: str, params: dict[str, Any]) -> None:
         client = self._require_client()
         payload = {"jsonrpc": "2.0", "method": method, "params": params}
-        with suppress(Exception):
-            client.post(self._endpoint(), headers=self._headers(), json=payload)
+        try:
+            target = self._target(self._endpoint())
+            run_cancellable(
+                lambda: client.post(
+                    target.request_url,
+                    headers={**self._headers(), **target.headers},
+                    json=payload,
+                    **_target_extensions(target),
+                ),
+                self.is_cancelled,
+                on_cancel=lambda: _best_effort_close_client(client),
+            )
+        except TurnCancellationRequested:
+            raise
+        except Exception:
+            return
+
+    def _target(self, url: str) -> PinnedOutboundTarget:
+        """校验并固定当前 HTTP MCP JSON-RPC 请求的目标地址。"""
+
+        try:
+            return prepare_outbound_request(url, allowed_hosts=self.allowed_hosts)
+        except OutboundTargetError as exc:
+            raise MCPClientError(str(exc)) from exc
 
     def _require_client(self) -> httpx.Client:
         if self._client is None:
@@ -339,8 +454,20 @@ class _SseSession(_MCPSession):
     响应通过 SSE 流按 id 匹配返回。
     """
 
-    def __init__(self, config: dict[str, Any], timeout_seconds: float) -> None:
-        super().__init__(config, timeout_seconds)
+    def __init__(
+        self,
+        config: dict[str, Any],
+        timeout_seconds: float,
+        *,
+        allowed_hosts: Iterable[str] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
+    ) -> None:
+        super().__init__(
+            config,
+            timeout_seconds,
+            allowed_hosts=allowed_hosts,
+            is_cancelled=is_cancelled,
+        )
         self._client: httpx.Client | None = None
         self._stream_ctx: Any = None
         self._events: Any = None
@@ -348,14 +475,32 @@ class _SseSession(_MCPSession):
         self._next_id = 0
 
     def __enter__(self) -> "_SseSession":
-        self._client = httpx.Client(timeout=httpx.Timeout(self.timeout_seconds, read=None))
+        raise_if_cancelled(self.is_cancelled)
         url = str(self.config.get("url") or self.config.get("endpoint") or "").strip()
         if not url:
             raise MCPClientError("SSE MCP 连接缺少 url/endpoint。")
+        target = self._target(url)
+        self._client = httpx.Client(
+            timeout=httpx.Timeout(self.timeout_seconds, read=None),
+            follow_redirects=False,
+        )
         raw = self.config.get("headers") if isinstance(self.config.get("headers"), dict) else {}
-        headers = {"Accept": "text/event-stream", **{str(k): str(v) for k, v in raw.items()}}
-        self._stream_ctx = self._client.stream("GET", url, headers=headers)
-        response = self._stream_ctx.__enter__()
+        headers = {
+            "Accept": "text/event-stream",
+            **{str(k): str(v) for k, v in raw.items()},
+            **target.headers,
+        }
+        self._stream_ctx = self._client.stream(
+            "GET",
+            target.request_url,
+            headers=headers,
+            **_target_extensions(target),
+        )
+        response = run_cancellable(
+            self._stream_ctx.__enter__,
+            self.is_cancelled,
+            on_cancel=lambda: _best_effort_close_client(self._client),
+        )
         response.raise_for_status()
         self._events = _iter_sse_events(response)
         self._message_url = self._await_endpoint(url)
@@ -373,11 +518,21 @@ class _SseSession(_MCPSession):
 
     def _await_endpoint(self, base_url: str) -> str:
         deadline = time.monotonic() + max(self.timeout_seconds, 0.1)
-        for event, data in self._events:
-            if event == "endpoint":
-                return _resolve_endpoint(base_url, data.strip())
+        while True:
+            raise_if_cancelled(self.is_cancelled)
             if time.monotonic() > deadline:
                 break
+            try:
+                item = run_cancellable(
+                    lambda: next(self._events),
+                    self.is_cancelled,
+                    on_cancel=lambda: _best_effort_close_client(self._client),
+                )
+            except StopIteration:
+                break
+            event, data = item
+            if event == "endpoint":
+                return _resolve_endpoint(base_url, data.strip())
         raise MCPClientError("SSE MCP 未返回 endpoint 事件。")
 
     def _post_headers(self) -> dict[str, str]:
@@ -390,10 +545,24 @@ class _SseSession(_MCPSession):
         request_id = self._next_id
         payload = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
         try:
-            posted = client.post(str(self._message_url), headers=self._post_headers(), json=payload)
+            target = self._target(str(self._message_url))
+            posted = run_cancellable(
+                lambda: client.post(
+                    target.request_url,
+                    headers={**self._post_headers(), **target.headers},
+                    json=payload,
+                    **_target_extensions(target),
+                ),
+                self.is_cancelled,
+                on_cancel=lambda: _best_effort_close_client(client),
+            )
             posted.raise_for_status()
         except httpx.HTTPStatusError as exc:
             raise MCPClientError(f"SSE MCP 返回异常状态码：{exc.response.status_code}") from exc
+        except TurnCancellationRequested:
+            raise
+        except OutboundTargetError as exc:
+            raise MCPClientError(str(exc)) from exc
         except Exception as exc:
             raise MCPClientError(str(exc)) from exc
         body = self._await_response(request_id)
@@ -403,20 +572,52 @@ class _SseSession(_MCPSession):
     def _notify(self, method: str, params: dict[str, Any]) -> None:
         client = self._require_client()
         payload = {"jsonrpc": "2.0", "method": method, "params": params}
-        with suppress(Exception):
-            client.post(str(self._message_url), headers=self._post_headers(), json=payload)
+        try:
+            target = self._target(str(self._message_url))
+            run_cancellable(
+                lambda: client.post(
+                    target.request_url,
+                    headers={**self._post_headers(), **target.headers},
+                    json=payload,
+                    **_target_extensions(target),
+                ),
+                self.is_cancelled,
+                on_cancel=lambda: _best_effort_close_client(client),
+            )
+        except TurnCancellationRequested:
+            raise
+        except Exception:
+            return
 
     def _await_response(self, expected_id: int) -> dict[str, Any]:
         deadline = time.monotonic() + max(self.timeout_seconds, 0.1)
-        for event, data in self._events:
+        while True:
+            raise_if_cancelled(self.is_cancelled)
+            if time.monotonic() > deadline:
+                break
+            try:
+                item = run_cancellable(
+                    lambda: next(self._events),
+                    self.is_cancelled,
+                    on_cancel=lambda: _best_effort_close_client(self._client),
+                )
+            except StopIteration:
+                break
+            event, data = item
             if event in {"message", ""}:
                 with suppress(json.JSONDecodeError):
                     payload = json.loads(data)
                     if isinstance(payload, dict) and payload.get("id") == expected_id:
                         return payload
-            if time.monotonic() > deadline:
-                break
         raise MCPClientError(f"SSE MCP 等待响应超时：id={expected_id}")
+
+    def _target(self, url: str) -> PinnedOutboundTarget:
+        """校验并固定 SSE 建连或消息 POST 的动态端点。"""
+
+        try:
+            return prepare_outbound_request(url, allowed_hosts=self.allowed_hosts)
+        except OutboundTargetError as exc:
+            raise MCPClientError(str(exc)) from exc
 
     def _require_client(self) -> httpx.Client:
         if self._client is None or self._message_url is None:
@@ -485,7 +686,10 @@ def _read_response(
     proc: subprocess.Popen[str],
     expected_id: int,
     timeout_seconds: float,
+    is_cancelled: Any = None,
 ) -> dict[str, Any]:
+    """读取 stdio JSON-RPC 响应，并在选择器等待期间轮询 Turn 取消。"""
+
     if proc.stdout is None:
         raise MCPClientError("MCP stdio stdout 不可用。")
     selector = selectors.DefaultSelector()
@@ -493,6 +697,7 @@ def _read_response(
     deadline = time.monotonic() + max(timeout_seconds, 0.1)
     try:
         while True:
+            raise_if_cancelled(is_cancelled)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise MCPClientError(f"MCP stdio 等待响应超时：id={expected_id}")
@@ -567,15 +772,56 @@ def _content_text(content: Any) -> str:
 
 
 def _close_process(proc: subprocess.Popen[str]) -> None:
+    """优先终止 MCP 子进程组，避免子进程脱离父进程继续运行。"""
+
     if proc.poll() is not None:
         return
-    proc.terminate()
+    _signal_process_group(proc, force=False)
     with suppress(subprocess.TimeoutExpired):
         proc.wait(timeout=1)
         return
-    proc.kill()
+    _signal_process_group(proc, force=True)
     with suppress(Exception):
         proc.wait(timeout=1)
+
+
+def _process_group_kwargs() -> dict[str, int | bool]:
+    """为 MCP stdio 会话创建独立进程组，兼容 POSIX 与 Windows。"""
+
+    if os.name == "nt":
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
+
+
+def _signal_process_group(proc: subprocess.Popen[str], *, force: bool) -> None:
+    """向 MCP 进程组发送软终止或强制终止信号，失败时回退到父进程。"""
+
+    try:
+        if os.name == "nt":
+            if not force:
+                proc.send_signal(signal.CTRL_BREAK_EVENT)
+            else:
+                proc.kill()
+            return
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL if force else signal.SIGTERM)
+    except (AttributeError, OSError, ProcessLookupError):
+        with suppress(Exception):
+            proc.kill() if force else proc.terminate()
+
+
+def _target_extensions(target: PinnedOutboundTarget) -> dict[str, object]:
+    """仅在域名被固定时向 HTTPX 传递 TLS SNI 等底层连接扩展。"""
+
+    return {"extensions": target.extensions} if target.extensions else {}
+
+
+def _best_effort_close_client(client: httpx.Client | None) -> None:
+    """取消同步 HTTPX 外呼时尽快关闭连接池，避免后台请求继续占用连接。"""
+
+    if client is None:
+        return
+    with suppress(Exception):
+        client.close()
 
 
 def _read_stderr(proc: subprocess.Popen[str]) -> str:

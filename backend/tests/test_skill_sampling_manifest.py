@@ -34,9 +34,10 @@ def test_manifest_is_read_only_and_excludes_in_progress_skills() -> None:
     manifest = module.build_manifest()
 
     assert manifest["execution_policy"] == "read_only_inventory_no_skill_content_execution"
-    assert manifest["skill_count"] == 35
+    assert manifest["source_revision"] == "6654f6b60cd9d5be8b54c6fafe44346dabeb3b76"
+    assert manifest["skill_count"] == 37
     assert manifest["eligible_candidate_count"] == 29
-    assert manifest["category_counts"]["in-progress"] == 6
+    assert manifest["category_counts"]["in-progress"] == 8
     assert manifest["frozen_sample"]["sample_size"] == 20
     assert manifest["frozen_sample"]["category_quotas"] == {
         "engineering": 12,

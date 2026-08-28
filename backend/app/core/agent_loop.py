@@ -1,5 +1,5 @@
 """
-@Time       : 2026/07/22 20:45
+@Time       : 2026/08/28 13:20
 @Author     : zhanglp8181
 @File       : agent_loop.py
 @CallChain  : Chat API → AgentLoop → Router/Runtime/Tool/ResponseGenerator → Message/Event
@@ -33,7 +33,12 @@ from app.agents.branching import (
 from app.agents.session_snapshot import anchor_chat_session
 from app.audit.service import append_user_management_audit
 from app.config import get_settings
-from app.core.cancellation import TurnCancellationToken, clear_chat_turn_cancelled
+from app.core.cancellation import (
+    TurnCancellationRequested,
+    TurnCancellationToken,
+    clear_chat_turn_cancelled,
+    raise_if_cancelled,
+)
 from app.core.conversation_context import build_conversation_context
 from app.core.non_sop_capability import (
     LlmDynamicTaskShadowSelector,
@@ -322,6 +327,18 @@ class AgentLoop:
         self.deterministic_runtime = DeterministicSopCoordinator(db)
         self.memory = MemoryService(db)
         self._validated_general_skill_calls: set[tuple[str, str, str]] = set()
+        self._active_cancellation_token: TurnCancellationToken | None = None
+
+    def _active_turn_cancel_callback(self) -> Callable[[], bool] | None:
+        """返回当前流式 Turn 的取消探针，供所有同步阶段共享同一取消事实。"""
+
+        token = getattr(self, "_active_cancellation_token", None)
+        return token.is_cancelled if token is not None else None
+
+    def _raise_if_active_turn_cancelled(self) -> None:
+        """在阶段边界阻断已取消 Turn，避免迟到结果继续写入或推进状态机。"""
+
+        raise_if_cancelled(self._active_turn_cancel_callback())
 
     def _turn_payload(self, payload: dict[str, Any], user_message_id: str | None) -> dict[str, Any]:
         data = dict(payload)
@@ -1419,6 +1436,7 @@ class AgentLoop:
                     event_sink=general_skill_sink,
                     conversation_context=conversation_context,
                     memory_context=memory_context,
+                    is_cancelled=is_cancelled,
                 )
                 general_skill_events.put(("complete", response))
             except Exception as exc:  # pragma: no cover - defensive stream boundary
@@ -1587,7 +1605,10 @@ class AgentLoop:
         completed_skill_ids_this_turn: set[str] | None = None,
         user_message_id: str | None = None,
         turn_task_frames: list[PendingTask] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> Iterator[dict[str, object]]:
+        is_cancelled = is_cancelled or self._active_turn_cancel_callback()
+        raise_if_cancelled(is_cancelled)
         remaining_turn_frames = list(turn_task_frames or [])
         uses_turn_frames = turn_task_frames is not None
         if uses_turn_frames and not remaining_turn_frames:
@@ -1605,6 +1626,7 @@ class AgentLoop:
         tool_result: ToolResult | None = None
 
         for queue_round in range(max_actions):
+            raise_if_cancelled(is_cancelled)
             if uses_turn_frames:
                 if not remaining_turn_frames:
                     break
@@ -1703,7 +1725,9 @@ class AgentLoop:
                     memory_context,
                     conversation_context,
                     repair_stream_events,
+                    is_cancelled=is_cancelled,
                 )
+                raise_if_cancelled(is_cancelled)
                 yield self._stream_event(
                     "step_result",
                     chat_session,
@@ -1729,7 +1753,9 @@ class AgentLoop:
                         tool_stream_events,
                         conversation_context=conversation_context,
                         memory_context=memory_context,
+                        is_cancelled=is_cancelled,
                     )
+                    raise_if_cancelled(is_cancelled)
                     for event_name, payload in tool_stream_events:
                         yield self._stream_event(
                             event_name, chat_session, self._turn_payload(payload, user_message_id)
@@ -1767,7 +1793,9 @@ class AgentLoop:
                     reflection_stream_events,
                     completed_skill_ids_this_turn,
                     memory_context=memory_context,
+                    is_cancelled=is_cancelled,
                 )
+                raise_if_cancelled(is_cancelled)
                 for event_name, payload in reflection_stream_events:
                     yield self._stream_event(event_name, chat_session, payload)
 
@@ -1791,7 +1819,9 @@ class AgentLoop:
                     conversation_context,
                     graph_stream_events,
                     completed_skill_ids_this_turn,
+                    is_cancelled=is_cancelled,
                 )
+                raise_if_cancelled(is_cancelled)
                 for event_name, payload in graph_stream_events:
                     yield self._stream_event(
                         event_name, chat_session, self._turn_payload(payload, user_message_id)
@@ -1876,6 +1906,16 @@ class AgentLoop:
         )
 
     def handle_turn_stream(self, request: ChatTurnRequest) -> Iterator[dict[str, object]]:
+        """运行一个流式 Turn，并在结束时释放本 Loop 上的活动取消探针。"""
+
+        try:
+            yield from self._handle_turn_stream(request)
+        finally:
+            self._active_cancellation_token = None
+
+    def _handle_turn_stream(self, request: ChatTurnRequest) -> Iterator[dict[str, object]]:
+        """执行流式 Turn 的实际编排逻辑，阶段取消由统一 token 向下传播。"""
+
         router_decision: RouterDecision | None = None
         step_result = StepAgentResult()
         tool_result: ToolResult | None = None
@@ -2100,7 +2140,7 @@ class AgentLoop:
                     events = cancel_db.exec(
                         select(AgentEvent).where(
                             AgentEvent.tenant_id == request.tenant_id,
-                            AgentEvent.session_id == chat_session.id,
+                            AgentEvent.session_id == stable_session_id,
                             AgentEvent.event_type == "stream_cancelled",
                         )
                     ).all()
@@ -2123,6 +2163,7 @@ class AgentLoop:
                 client_turn_id=str(request.client_turn_id or "").strip(),
                 persistent_probe=persistent_cancel_probe,
             )
+            self._active_cancellation_token = cancellation_token
             bind_event_turn = getattr(self.events, "bind_turn", None)
             if callable(bind_event_turn):
                 bind_event_turn(user_message.id, request.client_turn_id)
@@ -2213,7 +2254,13 @@ class AgentLoop:
                     forced_general_skill_id=(
                         request.forced_general_skill_id if request.channel == "web" else None
                     ),
+                    is_cancelled=(
+                        cancellation_token.is_cancelled
+                        if cancellation_token is not None
+                        else None
+                    ),
                 )
+                self._raise_if_active_turn_cancelled()
                 dynamic_response = self._try_handle_dynamic_task(
                     request,
                     chat_session,
@@ -2222,6 +2269,7 @@ class AgentLoop:
                     user_message.id,
                     memory_context=memory_context,
                 )
+                self._raise_if_active_turn_cancelled()
                 if dynamic_response is not None:
                     yield self._stream_status(
                         chat_session,
@@ -2284,8 +2332,13 @@ class AgentLoop:
                         no_skill_context,
                         persona_prompt,
                         user_message.id,
-                        mark_current_turn_cancelled,
+                        (
+                            cancellation_token.is_cancelled
+                            if cancellation_token is not None
+                            else None
+                        ),
                     )
+                    mark_current_turn_cancelled()
                     return
                 router_decision = RouterDecision(
                     decision="answer_only",
@@ -2384,6 +2437,9 @@ class AgentLoop:
                 model_config,
                 conversation_context,
                 memory_context,
+                is_cancelled=(
+                    cancellation_token.is_cancelled if cancellation_token is not None else None
+                ),
             )
             router_decision = self._protect_deterministic_runtime_route(
                 chat_session,
@@ -2426,7 +2482,13 @@ class AgentLoop:
                     forced_general_skill_id=(
                         request.forced_general_skill_id if request.channel == "web" else None
                     ),
+                    is_cancelled=(
+                        cancellation_token.is_cancelled
+                        if cancellation_token is not None
+                        else None
+                    ),
                 )
+                self._raise_if_active_turn_cancelled()
                 dynamic_response = self._try_handle_dynamic_task(
                     request,
                     chat_session,
@@ -2435,6 +2497,7 @@ class AgentLoop:
                     user_message.id,
                     memory_context=memory_context,
                 )
+                self._raise_if_active_turn_cancelled()
                 if dynamic_response is not None:
                     yield self._stream_status(
                         chat_session,
@@ -2494,8 +2557,13 @@ class AgentLoop:
                         conversation_context,
                         persona_prompt,
                         user_message.id,
-                        mark_current_turn_cancelled,
+                        (
+                            cancellation_token.is_cancelled
+                            if cancellation_token is not None
+                            else None
+                        ),
                     )
+                    mark_current_turn_cancelled()
                     return
 
             before_skill = chat_session.active_skill_id
@@ -2776,6 +2844,11 @@ class AgentLoop:
                         "",
                         user_message_id=user_message_id,
                         turn_task_frames=turn_followup_frames,
+                        is_cancelled=(
+                            cancellation_token.is_cancelled
+                            if cancellation_token is not None
+                            else None
+                        ),
                     )
                 if continuation and response_task_results is not None:
                     response_task_results.extend(continuation.task_results)
@@ -2808,6 +2881,11 @@ class AgentLoop:
                         conversation_context,
                         "",
                         user_message_id=user_message_id,
+                        is_cancelled=(
+                            cancellation_token.is_cancelled
+                            if cancellation_token is not None
+                            else None
+                        ),
                     )
                 if continuation:
                     if response_task_results is not None:
@@ -2879,6 +2957,9 @@ class AgentLoop:
                 except Exception:
                     self.db.rollback()
             raise
+        except TurnCancellationRequested:
+            record_current_turn_cancelled(request.client_turn_id)
+            return
         except LLMStreamCancelled:
             record_current_turn_cancelled(request.client_turn_id)
             return
@@ -4260,7 +4341,10 @@ class AgentLoop:
         stream_events: list[tuple[str, dict[str, object]]] | None = None,
         completed_skill_ids_this_turn: set[str] | None = None,
         memory_context: list[dict[str, object]] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> tuple[Skill | None, RouterDecision, StepAgentResult, ToolResult | None]:
+        is_cancelled = is_cancelled or self._active_turn_cancel_callback()
+        raise_if_cancelled(is_cancelled)
         if conversation_context is None:
             conversation_context = self._conversation_context(chat_session)
         completed_skill_ids_this_turn = completed_skill_ids_this_turn or set()
@@ -4317,6 +4401,7 @@ class AgentLoop:
                 stream_events,
                 completed_skill_ids_this_turn,
                 memory_context,
+                is_cancelled=is_cancelled,
             )
             if not retried:
                 break
@@ -4337,12 +4422,16 @@ class AgentLoop:
         conversation_context: dict[str, object] | None = None,
         stream_events: list[tuple[str, dict[str, object]]] | None = None,
         completed_skill_ids_this_turn: set[str] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> tuple[Skill | None, RouterDecision, StepAgentResult, ToolResult | None]:
+        is_cancelled = is_cancelled or self._active_turn_cancel_callback()
+        raise_if_cancelled(is_cancelled)
         if conversation_context is None:
             conversation_context = self._conversation_context(chat_session)
         completed_skill_ids_this_turn = completed_skill_ids_this_turn or set()
         max_actions = max(1, self._get_agent_loop_max_actions(request.tenant_id))
         for iteration in range(max_actions):
+            raise_if_cancelled(is_cancelled)
             active_skill = self._get_active_skill(
                 request.tenant_id, chat_session.active_skill_id, chat_session.agent_id
             )
@@ -4397,6 +4486,7 @@ class AgentLoop:
                 memory_context,
                 conversation_context,
                 repair_events,
+                is_cancelled=is_cancelled,
             )
             self.db.commit()
             self.db.refresh(chat_session)
@@ -4417,6 +4507,7 @@ class AgentLoop:
                     memory_context,
                     conversation_context,
                     knowledge_events,
+                    is_cancelled=is_cancelled,
                 )
                 self.db.commit()
                 self.db.refresh(chat_session)
@@ -4437,6 +4528,7 @@ class AgentLoop:
                     tool_events,
                     conversation_context=conversation_context,
                     memory_context=memory_context,
+                    is_cancelled=is_cancelled,
                 )
                 self.db.commit()
                 self.db.refresh(chat_session)
@@ -4461,6 +4553,7 @@ class AgentLoop:
                 reflection_events,
                 completed_skill_ids_this_turn,
                 memory_context,
+                is_cancelled,
             )
             if reflection_events:
                 stream_events.extend(reflection_events)
@@ -4492,7 +4585,10 @@ class AgentLoop:
         stream_events: list[tuple[str, dict[str, object]]] | None = None,
         completed_skill_ids_this_turn: set[str] | None = None,
         memory_context: list[dict[str, object]] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> tuple[Skill | None, RouterDecision, StepAgentResult, ToolResult | None, bool]:
+        is_cancelled = is_cancelled or self._active_turn_cancel_callback()
+        raise_if_cancelled(is_cancelled)
         if conversation_context is None:
             conversation_context = self._conversation_context(chat_session)
         completed_skill_ids_this_turn = completed_skill_ids_this_turn or set()
@@ -4512,7 +4608,10 @@ class AgentLoop:
                 model_config,
                 conversation_context,
                 memory_context,
+                **({"is_cancelled": is_cancelled} if is_cancelled is not None else {}),
             )
+        except TurnCancellationRequested:
+            raise
         except LLMError as exc:
             self.events.record(
                 request.tenant_id,
@@ -4567,6 +4666,7 @@ class AgentLoop:
                 model_config,
                 conversation_context,
                 memory_context,
+                is_cancelled=is_cancelled,
             )
             return (*retry_result, True)
 
@@ -4588,6 +4688,7 @@ class AgentLoop:
                 conversation_context,
                 stream_events,
                 memory_context,
+                is_cancelled=is_cancelled,
             )
             return (*retry_result, True)
 
@@ -4604,6 +4705,7 @@ class AgentLoop:
                 model_config,
                 conversation_context,
                 memory_context,
+                is_cancelled=is_cancelled,
             )
             return (*retry_result, True)
 
@@ -4632,7 +4734,10 @@ class AgentLoop:
         model_config: ModelConfig | None = None,
         conversation_context: dict[str, object] | None = None,
         memory_context: list[dict[str, object]] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> tuple[Skill | None, RouterDecision, StepAgentResult, ToolResult | None]:
+        is_cancelled = is_cancelled or self._active_turn_cancel_callback()
+        raise_if_cancelled(is_cancelled)
         retry_step_result = StepAgentResult(
             tool_call=retry_tool_call,
             next_step_id=chat_session.active_step_id,
@@ -4658,6 +4763,7 @@ class AgentLoop:
             stream_events,
             conversation_context=conversation_context,
             memory_context=memory_context,
+            is_cancelled=is_cancelled,
         )
         return active_skill, router_decision, retry_step_result, retry_tool_result
 
@@ -4683,7 +4789,10 @@ class AgentLoop:
         conversation_context: dict[str, object],
         stream_events: list[tuple[str, dict[str, object]]] | None = None,
         memory_context: list[dict[str, object]] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> tuple[Skill | None, RouterDecision, StepAgentResult, ToolResult | None]:
+        is_cancelled = is_cancelled or self._active_turn_cancel_callback()
+        raise_if_cancelled(is_cancelled)
         self.events.record(
             request.tenant_id,
             chat_session.id,
@@ -4753,6 +4862,7 @@ class AgentLoop:
             memory_context=memory_context,
             conversation_context=conversation_context,
             stream_events=stream_events,
+            is_cancelled=is_cancelled,
         )
         self.db.commit()
         self.db.refresh(chat_session)
@@ -4769,6 +4879,7 @@ class AgentLoop:
                 stream_events,
                 conversation_context=conversation_context,
                 memory_context=memory_context,
+                is_cancelled=is_cancelled,
             )
         return active_skill, router_decision, step_result, tool_result
 
@@ -4796,14 +4907,18 @@ class AgentLoop:
         status_callback: StatusCallback | None = None,
         conversation_context: dict[str, object] | None = None,
         memory_context: list[dict[str, object]] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> tuple[StepAgentResult, ToolResult | None]:
         """执行受限工具循环，并在确定性工具回执产生知识计划时于同轮继续处理。"""
 
+        is_cancelled = is_cancelled or self._active_turn_cancel_callback()
+        raise_if_cancelled(is_cancelled)
         tool_result: ToolResult | None = None
         current_knowledge = list(step_result.knowledge_results or [])
         seen_calls: set[str] = set()
         max_actions = self._get_agent_loop_max_actions(request.tenant_id)
         for iteration in range(max_actions):
+            raise_if_cancelled(is_cancelled)
             tool_call = step_result.tool_call
             if not tool_call:
                 break
@@ -4840,7 +4955,9 @@ class AgentLoop:
                 stream_events=stream_events,
                 conversation_context=conversation_context,
                 memory_context=memory_context,
+                is_cancelled=is_cancelled,
             )
+            raise_if_cancelled(is_cancelled)
             self._record_tool_result_in_slots(chat_session, tool_call, tool_result)
             runtime_plan = None
             if DeterministicSopCoordinator.is_enabled(active_skill):
@@ -4912,6 +5029,7 @@ class AgentLoop:
                         conversation_context,
                         stream_events,
                         status_callback,
+                        is_cancelled,
                     )
                     current_knowledge = list(step_result.knowledge_results or [])
                     self.db.commit()
@@ -4956,6 +5074,7 @@ class AgentLoop:
                         conversation_context=conversation_context,
                         current_knowledge=current_knowledge,
                         allow_general_skill_selection=False,
+                        is_cancelled=is_cancelled,
                     )
                     self._apply_step_result(
                         request.tenant_id,
@@ -4995,6 +5114,7 @@ class AgentLoop:
                 conversation_context=conversation_context,
                 current_knowledge=current_knowledge,
                 allow_general_skill_selection=False,
+                is_cancelled=is_cancelled,
             )
             if current_knowledge and not continuation_result.knowledge_results:
                 continuation_result.knowledge_results = current_knowledge
@@ -5049,9 +5169,12 @@ class AgentLoop:
         conversation_context: dict[str, object] | None = None,
         stream_events: list[tuple[str, dict[str, object]]] | None = None,
         status_callback: StatusCallback | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> StepAgentResult:
         """执行一次知识检索；确定性 SOP 必须先落回执再按冻结定义继续。"""
 
+        is_cancelled = is_cancelled or self._active_turn_cancel_callback()
+        raise_if_cancelled(is_cancelled)
         query = step_result.knowledge_query
         if not query or not query.query.strip():
             return step_result
@@ -5074,6 +5197,7 @@ class AgentLoop:
             chat_session.agent_id,
             audit=True,
         )
+        raise_if_cancelled(is_cancelled)
         if (
             self._agent_requires_resource_filter(request.tenant_id, chat_session.agent_id)
             and not knowledge_base_ids
@@ -5094,6 +5218,9 @@ class AgentLoop:
                 if original_message and original_message not in search_query:
                     search_query = f"{search_query}\n{original_message}"
             try:
+                search_kwargs = (
+                    {"is_cancelled": is_cancelled} if is_cancelled is not None else {}
+                )
                 search_response = KnowledgeService(self.db).search(
                     KnowledgeSearchRequest(
                         tenant_id=request.tenant_id,
@@ -5111,7 +5238,10 @@ class AgentLoop:
                         need_evidence_pack=True,
                     ),
                     model_config,
+                    **search_kwargs,
                 )
+            except TurnCancellationRequested:
+                raise
             except Exception as error:
                 if not DeterministicSopCoordinator.is_enabled(active_skill):
                     raise
@@ -5148,6 +5278,7 @@ class AgentLoop:
                         is_step_completed=False,
                     ).mark_runtime_control_reply("RUNTIME_KNOWLEDGE_RESULT_NOT_RECORDED")
                 return self.deterministic_runtime.merge_plan(step_result, runtime_plan)
+        raise_if_cancelled(is_cancelled)
         knowledge_items = {
             "query": query.model_dump(mode="json"),
             "source_message": request.message,
@@ -5220,7 +5351,9 @@ class AgentLoop:
             conversation_context=conversation_context,
             current_knowledge=[knowledge_items],
             allow_general_skill_selection=False,
+            is_cancelled=is_cancelled,
         )
+        raise_if_cancelled(is_cancelled)
         continuation_result.knowledge_results = [knowledge_items]
         self._apply_step_result(request.tenant_id, chat_session, continuation_result, active_skill)
         return continuation_result
@@ -5234,9 +5367,12 @@ class AgentLoop:
         selection: GeneralSkillSelection | None,
         stream_events: list[tuple[str, dict[str, object]]] | None = None,
         status_callback: StatusCallback | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> StepAgentResult:
         """按 required/auto/disabled 模式执行完整检索或无模型词法预检索。"""
 
+        is_cancelled = is_cancelled or self._active_turn_cancel_callback()
+        raise_if_cancelled(is_cancelled)
         del router_decision
         knowledge_mode = selection.knowledge_mode if selection is not None else "auto"
         if selection is not None and selection.use_knowledge:
@@ -5283,6 +5419,7 @@ class AgentLoop:
                 request.message,
                 query,
                 None,
+                is_cancelled=is_cancelled,
             )
             self.events.record(
                 request.tenant_id,
@@ -5334,7 +5471,9 @@ class AgentLoop:
                 request.message,
                 query,
                 model_config,
+                is_cancelled=is_cancelled,
             )
+        raise_if_cancelled(is_cancelled)
         finished_payload = knowledge_items or {
             "query": query.model_dump(mode="json"),
             "source_message": request.message,
@@ -5374,9 +5513,13 @@ class AgentLoop:
         message: str,
         query: KnowledgeQuery | None = None,
         model_config: ModelConfig | None = None,
+        *,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> dict[str, Any] | None:
         """按数字员工可见版本执行通用知识查询并返回可持久化证据。"""
 
+        is_cancelled = is_cancelled or self._active_turn_cancel_callback()
+        raise_if_cancelled(is_cancelled)
         knowledge_base_ids, knowledge_base_version_ids = self._accessible_knowledge_scope(
             tenant_id,
             user_id,
@@ -5389,6 +5532,9 @@ class AgentLoop:
             reason="用户要求基于业务资料或规则回答",
             max_chunks=8,
             max_depth=3,
+        )
+        search_kwargs = (
+            {"is_cancelled": is_cancelled} if is_cancelled is not None else {}
         )
         search_response = KnowledgeService(self.db).search(
             KnowledgeSearchRequest(
@@ -5407,7 +5553,9 @@ class AgentLoop:
                 need_evidence_pack=True,
             ),
             model_config,
+            **search_kwargs,
         )
+        raise_if_cancelled(is_cancelled)
         if not (
             search_response.selected_concepts
             or search_response.okf_citations
@@ -5519,7 +5667,10 @@ class AgentLoop:
         memory_context: list[dict[str, object]] | None = None,
         conversation_context: dict[str, object] | None = None,
         stream_events: list[tuple[str, dict[str, object]]] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> StepAgentResult:
+        is_cancelled = is_cancelled or self._active_turn_cancel_callback()
+        raise_if_cancelled(is_cancelled)
         if conversation_context is None:
             conversation_context = self._conversation_context(chat_session)
         selected_general_result = self._preselect_general_skill_for_scene(
@@ -5532,6 +5683,7 @@ class AgentLoop:
             memory_context,
             conversation_context,
             stream_events,
+            is_cancelled,
         )
         if selected_general_result is not None:
             return selected_general_result
@@ -5551,7 +5703,9 @@ class AgentLoop:
             memory_context=memory_context,
             conversation_context=conversation_context,
             allow_general_skill_selection=False,
+            is_cancelled=is_cancelled,
         )
+        raise_if_cancelled(is_cancelled)
         if DeterministicSopCoordinator.is_enabled(active_skill):
             assert active_skill is not None
             normalized_updates = self.deterministic_runtime.normalize_model_slot_updates(
@@ -5607,7 +5761,9 @@ class AgentLoop:
                 memory_context=memory_context,
                 conversation_context=conversation_context,
                 allow_general_skill_selection=False,
+                is_cancelled=is_cancelled,
             )
+            raise_if_cancelled(is_cancelled)
             repaired_understanding = validation_result.model_copy(
                 update={
                     "slot_updates": self.deterministic_runtime.normalize_model_slot_updates(
@@ -5660,6 +5816,7 @@ class AgentLoop:
             step_result,
             memory_context,
             conversation_context,
+            is_cancelled,
         )
 
         return step_result
@@ -5675,7 +5832,10 @@ class AgentLoop:
         memory_context: list[dict[str, object]] | None,
         conversation_context: dict[str, object] | None,
         stream_events: list[tuple[str, dict[str, object]]] | None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> StepAgentResult | None:
+        is_cancelled = is_cancelled or self._active_turn_cancel_callback()
+        raise_if_cancelled(is_cancelled)
         if active_skill is None:
             return None
         general_query = str(router_decision.general_intent or "").strip()
@@ -5688,6 +5848,7 @@ class AgentLoop:
             conversation_context,
             memory_context,
             user_id=request.user_id,
+            is_cancelled=is_cancelled,
         )
         if skill is None:
             return None
@@ -5757,7 +5918,10 @@ class AgentLoop:
         step_result: StepAgentResult,
         memory_context: list[dict[str, object]] | None = None,
         conversation_context: dict[str, object] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> StepAgentResult:
+        is_cancelled = is_cancelled or self._active_turn_cancel_callback()
+        raise_if_cancelled(is_cancelled)
         missing_fields = self._missing_expected_fields(active_skill, chat_session)
         if (
             not missing_fields
@@ -5784,7 +5948,9 @@ class AgentLoop:
             memory_context=memory_context,
             conversation_context=conversation_context,
             allow_general_skill_selection=False,
+            is_cancelled=is_cancelled,
         )
+        raise_if_cancelled(is_cancelled)
         if not self._step_result_has_progress(
             validation_result
         ) and not self._step_result_has_reply_repair(
@@ -5880,7 +6046,10 @@ class AgentLoop:
         conversation_context: dict[str, object] | None = None,
         current_knowledge: list[dict[str, object]] | None = None,
         allow_general_skill_selection: bool = True,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> StepAgentResult:
+        is_cancelled = is_cancelled or self._active_turn_cancel_callback()
+        raise_if_cancelled(is_cancelled)
         if conversation_context is None:
             conversation_context = self._conversation_context(chat_session)
         recent_messages = [
@@ -5903,6 +6072,7 @@ class AgentLoop:
                 active_step_id=chat_session.active_step_id,
                 slots=chat_session.slots_json,
                 allow_general_skill_selection=allow_general_skill_selection,
+                is_cancelled=is_cancelled,
             ),
             model_config=model_config,
             router_decision=router_decision,
@@ -5911,7 +6081,9 @@ class AgentLoop:
             memory_context=memory_context,
             conversation_context=conversation_context,
             current_knowledge=current_knowledge,
+            **({"is_cancelled": is_cancelled} if is_cancelled is not None else {}),
         )
+        raise_if_cancelled(is_cancelled)
         payload = step_result.model_dump()
         if repair_reason:
             payload["repair_reason"] = repair_reason
@@ -5936,7 +6108,10 @@ class AgentLoop:
         active_step_id: str | None = None,
         slots: dict[str, object] | None = None,
         allow_general_skill_selection: bool = True,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> list[Tool]:
+        is_cancelled = is_cancelled or self._active_turn_cancel_callback()
+        raise_if_cancelled(is_cancelled)
         if active_skill is None:
             return []
         current_step = self._current_skill_step(active_skill, active_step_id)
@@ -5981,6 +6156,7 @@ class AgentLoop:
             general_skill_tools,
             conversation_context,
             memory_context,
+            is_cancelled,
         )
         if selected_general_tool:
             scoped_tools.extend(
@@ -5998,7 +6174,10 @@ class AgentLoop:
         general_skill_tools: list[Tool],
         conversation_context: dict[str, object] | None = None,
         memory_context: list[dict[str, object]] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> str | None:
+        is_cancelled = is_cancelled or self._active_turn_cancel_callback()
+        raise_if_cancelled(is_cancelled)
         message = str(user_message or "").strip()
         if not message or not model_config or not general_skill_tools:
             return None
@@ -6024,7 +6203,10 @@ class AgentLoop:
                 model_config,
                 conversation_context,
                 memory_context,
+                **({"is_cancelled": is_cancelled} if is_cancelled is not None else {}),
             )
+        except TurnCancellationRequested:
+            raise
         except LLMError:
             return None
         if not selection.use_general_skill or not selection.selected_slug:
@@ -6451,9 +6633,12 @@ class AgentLoop:
         stream_events: list[tuple[str, dict[str, object]]] | None = None,
         conversation_context: dict[str, object] | None = None,
         memory_context: list[dict[str, object]] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> ToolResult:
         """记录工具调用边界并执行适配器；确定性外部写额外传递账本生成的远端幂等键。"""
 
+        is_cancelled = is_cancelled or self._active_turn_cancel_callback()
+        raise_if_cancelled(is_cancelled)
         if (
             not tool_call.name.startswith(GENERAL_SKILL_TOOL_PREFIX)
             and chat_session.agent_id
@@ -6568,6 +6753,7 @@ class AgentLoop:
                 stream_events=stream_events,
                 conversation_context=conversation_context,
                 memory_context=memory_context,
+                is_cancelled=is_cancelled,
             )
         else:
             deterministic_runtime = getattr(self, "deterministic_runtime", None)
@@ -6584,14 +6770,18 @@ class AgentLoop:
                 if remote_idempotency_key
                 else {}
             )
+            executor_options = dict(execution_options)
+            if is_cancelled is not None:
+                executor_options["is_cancelled"] = is_cancelled
             tool_result = self.tool_executor.execute(
                 request.tenant_id,
                 tool_call,
                 chat_session.active_skill_id,
                 chat_session.agent_id,
                 request.user_id,
-                **execution_options,
+                **executor_options,
             )
+        raise_if_cancelled(is_cancelled)
         finished_payload = tool_result.model_dump(mode="json")
         if tool_call_id:
             finished_payload["tool_call_id"] = tool_call_id
@@ -6615,7 +6805,10 @@ class AgentLoop:
         stream_events: list[tuple[str, dict[str, object]]] | None = None,
         conversation_context: dict[str, object] | None = None,
         memory_context: list[dict[str, object]] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> ToolResult:
+        is_cancelled = is_cancelled or self._active_turn_cancel_callback()
+        raise_if_cancelled(is_cancelled)
         slug = tool_call.name.removeprefix(GENERAL_SKILL_TOOL_PREFIX).strip()
         if not slug:
             return ToolResult(
@@ -6668,6 +6861,7 @@ class AgentLoop:
             agent_id,
             conversation_context,
             memory_context,
+            is_cancelled,
         )
         if guard_result is not None:
             return guard_result
@@ -6691,15 +6885,22 @@ class AgentLoop:
             emit_general_skill_trace(trace_item)
 
         try:
+            runner_kwargs: dict[str, object] = {
+                "event_sink": trace_sink,
+                "conversation_context": conversation_context,
+                "memory_context": memory_context,
+            }
+            if is_cancelled is not None:
+                runner_kwargs["is_cancelled"] = is_cancelled
             response = self.general_skill_runner.run(
                 skill,
                 query,
                 model_config,
                 request.user_id,
-                event_sink=trace_sink,
-                conversation_context=conversation_context,
-                memory_context=memory_context,
+                **runner_kwargs,
             )
+        except TurnCancellationRequested:
+            raise
         except Exception as exc:
             return ToolResult(
                 tool_name=tool_call.name,
@@ -6760,7 +6961,10 @@ class AgentLoop:
         agent_id: str | None,
         conversation_context: dict[str, object] | None = None,
         memory_context: list[dict[str, object]] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> ToolResult | None:
+        is_cancelled = is_cancelled or self._active_turn_cancel_callback()
+        raise_if_cancelled(is_cancelled)
         call_key = self._general_skill_call_key(
             chat_session.id,
             tool_call.name,
@@ -6805,7 +7009,10 @@ class AgentLoop:
                 model_config,
                 conversation_context,
                 memory_context,
+                **({"is_cancelled": is_cancelled} if is_cancelled is not None else {}),
             )
+        except TurnCancellationRequested:
+            raise
         except LLMError:
             return None
         selected_slug = selection.selected_slug if selection.use_general_skill else None
@@ -7528,6 +7735,7 @@ class AgentLoop:
         *,
         user_id: str | None = None,
         user_message_id: str | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> tuple[GeneralSkill | None, GeneralSkillSelection]:
         """统一非 SOP 权威选择与脱敏 shadow；A 批只返回旧 GeneralSkill 行为。"""
 
@@ -7540,6 +7748,7 @@ class AgentLoop:
             memory_context,
             user_id=user_id,
             user_message_id=user_message_id,
+            is_cancelled=is_cancelled,
         )
         return route.selected_general_skill, route.general_selection
 
@@ -7555,9 +7764,12 @@ class AgentLoop:
         user_id: str | None = None,
         user_message_id: str | None = None,
         forced_general_skill_id: str | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> NonSopCapabilityRouteResult:
         """返回正交的 Skill 与执行模式决策，供 B1 委托且保持旧 tuple 兼容。"""
 
+        is_cancelled = is_cancelled or self._active_turn_cancel_callback()
+        raise_if_cancelled(is_cancelled)
         general_skills = self._list_published_general_skills(
             model_config.tenant_id, agent_id, user_id
         )
@@ -7629,7 +7841,9 @@ class AgentLoop:
             memory_context=memory_context,
             knowledge_capability=knowledge_capability,
             forced_general_skill=forced_general_skill,
+            is_cancelled=is_cancelled,
         )
+        raise_if_cancelled(is_cancelled)
         if route.shadow_decision is not None:
             self.events.record(
                 model_config.tenant_id,
@@ -8242,9 +8456,12 @@ class AgentLoop:
         memory_context: list[dict[str, object]] | None = None,
         *,
         user_id: str | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> tuple[GeneralSkill | None, GeneralSkillSelection]:
         """选择通用能力，并向选择器投影服务端验证过的知识可访问事实。"""
 
+        is_cancelled = is_cancelled or self._active_turn_cancel_callback()
+        raise_if_cancelled(is_cancelled)
         general_skills = self._list_published_general_skills(
             model_config.tenant_id, agent_id, user_id
         )
@@ -8261,7 +8478,10 @@ class AgentLoop:
                 model_config,
                 selector_context,
                 memory_context,
+                **({"is_cancelled": is_cancelled} if is_cancelled is not None else {}),
             )
+        except TurnCancellationRequested:
+            raise
         except LLMError as exc:
             return None, GeneralSkillSelection(
                 knowledge_mode="auto",

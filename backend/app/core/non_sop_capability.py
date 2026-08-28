@@ -1,5 +1,5 @@
 """
-@Time       : 2026/08/03 18:40
+@Time       : 2026/08/28 13:20
 @Author     : zhanglp8181
 @File       : non_sop_capability.py
 @CallChain  : AgentLoop 非 SOP 分支 → NonSopCapabilityRouter → GeneralSkill/动态任务 shadow
@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Callable
 from dataclasses import dataclass
 from time import perf_counter
 from typing import Literal, Protocol
@@ -16,6 +17,7 @@ from typing import Literal, Protocol
 from pydantic import BaseModel, Field
 
 from app import paths
+from app.cancellation import TurnCancellationRequested, raise_if_cancelled
 from app.core.context_projection import compact_conversation_context
 from app.db.models import GeneralSkill, ModelConfig
 from app.general_skills.schema import GeneralSkillSelection
@@ -49,6 +51,7 @@ class GeneralCapabilitySelector(Protocol):
         model_config: ModelConfig,
         conversation_context: dict[str, object] | None = None,
         memory_context: list[dict[str, object]] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> GeneralSkillSelection:
         """返回旧链路仍然权威的通用能力选择。"""
 
@@ -64,6 +67,7 @@ class DynamicTaskShadowSelector(Protocol):
         conversation_context: dict[str, object] | None,
         memory_context: list[dict[str, object]] | None,
         knowledge_capability: dict[str, object],
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> NonSopCapabilityDecision:
         """提出不具备执行权限的动态任务 shadow 决策。"""
 
@@ -145,9 +149,11 @@ class LlmDynamicTaskShadowSelector:
         conversation_context: dict[str, object] | None,
         memory_context: list[dict[str, object]] | None,
         knowledge_capability: dict[str, object],
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> NonSopCapabilityDecision:
         """基于能力元数据提出 answer/dynamic_task/clarify shadow 决策。"""
 
+        raise_if_cancelled(is_cancelled)
         selector_context = copy.deepcopy(
             conversation_context if isinstance(conversation_context, dict) else {}
         )
@@ -181,7 +187,16 @@ class LlmDynamicTaskShadowSelector:
             raw = LLMClient(
                 model_config,
                 timeout_seconds=self.timeout_seconds,
-            ).generate_json(unified_system_prompt(), payload)
+            ).generate_json(
+                unified_system_prompt(),
+                payload,
+                **(
+                    {"is_cancelled": is_cancelled}
+                    if is_cancelled is not None
+                    else {}
+                ),
+            )
+        raise_if_cancelled(is_cancelled)
         return NonSopCapabilityDecision.model_validate(raw)
 
 
@@ -214,9 +229,11 @@ class NonSopCapabilityRouter:
         memory_context: list[dict[str, object]] | None,
         knowledge_capability: dict[str, object],
         forced_general_skill: GeneralSkill | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> NonSopCapabilityRouteResult:
         """分别决定 Skill 与执行模式；结构化强制 Skill 不再短路动态任务判断。"""
 
+        raise_if_cancelled(is_cancelled)
         selector_context = compact_conversation_context(conversation_context)
         selector_context["knowledge_capability"] = knowledge_capability
         # 没有任何已发布通用 Skill 且成员/Agent 知识交集为空时，选择器没有可消费
@@ -238,12 +255,16 @@ class NonSopCapabilityRouter:
             )
         else:
             try:
+                selection_kwargs = (
+                    {"is_cancelled": is_cancelled} if is_cancelled is not None else {}
+                )
                 selection = general_skill_selector.decide(
                     message,
                     general_skills,
                     model_config,
                     selector_context,
                     memory_context,
+                    **selection_kwargs,
                 )
             except LLMError as exc:
                 selection = GeneralSkillSelection(
@@ -298,6 +319,7 @@ class NonSopCapabilityRouter:
 
         started = perf_counter()
         try:
+            raise_if_cancelled(is_cancelled)
             shadow = self.shadow_selector.decide(
                 message,
                 general_skills,
@@ -305,8 +327,15 @@ class NonSopCapabilityRouter:
                 selector_context,
                 memory_context,
                 knowledge_capability,
+                **(
+                    {"is_cancelled": is_cancelled}
+                    if is_cancelled is not None
+                    else {}
+                ),
             )
             shadow = self._validate_shadow(shadow, selection)
+        except TurnCancellationRequested:
+            raise
         except Exception:
             shadow = NonSopCapabilityDecision(
                 mode="answer",
@@ -316,6 +345,7 @@ class NonSopCapabilityRouter:
                 failure_code="dynamic_shadow_failed",
             )
         duration_ms = (perf_counter() - started) * 1000
+        raise_if_cancelled(is_cancelled)
         if self.execution_enabled and shadow.mode == "dynamic_task":
             effective = shadow
         return NonSopCapabilityRouteResult(

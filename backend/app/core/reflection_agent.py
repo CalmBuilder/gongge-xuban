@@ -1,8 +1,19 @@
+"""
+@Time       : 2026/08/28 11:30
+@Author     : zhanglp8181
+@File        : reflection_agent.py
+@CallChain  : AgentLoop → ReflectionAgent → LLMClient → ReflectionDecision
+@Description : 对工具、知识和步骤结果执行有界复核，决定是否重试或转向。
+"""
+
 from __future__ import annotations
+
+from collections.abc import Callable
 
 from pydantic import BaseModel
 
 from app import paths
+from app.cancellation import TurnCancellationRequested, raise_if_cancelled
 from app.core.context_projection import (
     compact_conversation_context,
     compact_current_step,
@@ -47,7 +58,11 @@ class ReflectionAgent:
         model_config: ModelConfig,
         conversation_context: dict[str, object] | None = None,
         memory_context: list[dict[str, object]] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> ReflectionDecision:
+        """复核当前执行结果，并在取消后不再产生新的重试决策。"""
+
+        raise_if_cancelled(is_cancelled)
         if not action_needs_reflection(router_decision, step_result, tool_result):
             return ReflectionDecision()
 
@@ -79,10 +94,16 @@ class ReflectionAgent:
         )
         try:
             with llm_operation("reflection.review"):
-                raw = LLMClient(model_config).generate_json(
-                    unified_system_prompt(), payload
+                generate_kwargs = (
+                    {"is_cancelled": is_cancelled} if is_cancelled is not None else {}
                 )
+                raw = LLMClient(model_config).generate_json(
+                    unified_system_prompt(), payload, **generate_kwargs
+                )
+            raise_if_cancelled(is_cancelled)
             return ReflectionDecision.model_validate(raw)
+        except TurnCancellationRequested:
+            raise
         except Exception as exc:
             if isinstance(exc, LLMError):
                 raise

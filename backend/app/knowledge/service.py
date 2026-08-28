@@ -1,5 +1,5 @@
 """
-@Time        : 2026-07-27
+@Time        : 2026/08/28 13:20
 @Author      : zhanglp8181
 @File        : service.py
 @CallChain   : Knowledge API / AgentLoop → KnowledgeService → 文档、知识桶与证据片段检索
@@ -12,6 +12,7 @@ import base64
 import json
 import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -23,6 +24,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from app import paths
+from app.cancellation import TurnCancellationRequested, raise_if_cancelled
 from app.agents.branching import (
     ensure_open_gallery_binding,
     ensure_private_resource_binding,
@@ -494,9 +496,16 @@ class KnowledgeService:
             )
             self._clear_embedded_content(job)
 
-    def search(self, request: KnowledgeSearchRequest, model_config: ModelConfig | None = None) -> KnowledgeSearchResponse:
+    def search(
+        self,
+        request: KnowledgeSearchRequest,
+        model_config: ModelConfig | None = None,
+        *,
+        is_cancelled: Callable[[], bool] | None = None,
+    ) -> KnowledgeSearchResponse:
         """执行有界知识检索，并统一标记证据结果和降级状态。"""
 
+        raise_if_cancelled(is_cancelled)
         with observed_span(
             "knowledge_span",
             "knowledge.search",
@@ -505,7 +514,8 @@ class KnowledgeService:
             max_buckets=request.max_buckets,
             max_depth=request.max_depth,
         ):
-            response = self._search(request, model_config)
+            response = self._search(request, model_config, is_cancelled=is_cancelled)
+            raise_if_cancelled(is_cancelled)
             phases = {
                 str(item.get("phase") or "")
                 for item in response.route_trace or response.trace
@@ -535,7 +545,16 @@ class KnowledgeService:
                 }
             )
 
-    def _search(self, request: KnowledgeSearchRequest, model_config: ModelConfig | None = None) -> KnowledgeSearchResponse:
+    def _search(
+        self,
+        request: KnowledgeSearchRequest,
+        model_config: ModelConfig | None = None,
+        *,
+        is_cancelled: Callable[[], bool] | None = None,
+    ) -> KnowledgeSearchResponse:
+        """执行知识候选加载、模型路由和证据整理，并在阶段间传播取消。"""
+
+        raise_if_cancelled(is_cancelled)
         query = request.query.strip()
         if not query:
             return KnowledgeSearchResponse()
@@ -547,6 +566,7 @@ class KnowledgeService:
         with observed_span("knowledge_span", "knowledge.load_concepts") as span:
             concepts = self._load_concepts_for_search(request)
             span.finish(candidate_count=len(concepts))
+        raise_if_cancelled(is_cancelled)
         with observed_span(
             "knowledge_span", "knowledge.route_concepts", candidate_count=len(concepts)
         ) as span:
@@ -567,6 +587,7 @@ class KnowledgeService:
         with observed_span("knowledge_span", "knowledge.load_documents") as span:
             documents = self._load_documents_for_search(request)
             span.finish(candidate_count=len(documents))
+        raise_if_cancelled(is_cancelled)
         if not documents and not selected_concepts:
             route_trace.append({"phase": "no_documents", "message": "没有可检索的知识文档或 OKF 概念"})
             return KnowledgeSearchResponse(trace=route_trace, route_trace=route_trace)
@@ -613,6 +634,7 @@ class KnowledgeService:
                     route_trace,
                     query_type=request.query_type,
                     desired_evidence=request.desired_evidence,
+                    is_cancelled=is_cancelled,
                 )
                 route_failed = any(
                     str(item.get("phase") or "") in {
@@ -673,6 +695,7 @@ class KnowledgeService:
         ) as span:
             buckets = self._load_buckets_for_search(request, selected_document_ids)
             span.finish(candidate_count=len(buckets))
+        raise_if_cancelled(is_cancelled)
         if not buckets:
             route_trace.append({"phase": "no_buckets", "message": "所选文档没有可展开的内部索引"})
             return KnowledgeSearchResponse(
@@ -718,6 +741,7 @@ class KnowledgeService:
                     route_trace,
                     query_type=request.query_type,
                     desired_evidence=request.desired_evidence,
+                    is_cancelled=is_cancelled,
                 )
                 route_failed = any(
                     str(item.get("phase") or "") in {
@@ -797,6 +821,7 @@ class KnowledgeService:
                 None,
             )
             span.finish(candidate_count=len(chunks))
+        raise_if_cancelled(is_cancelled)
         with observed_span(
             "knowledge_span", "knowledge.rank_chunks", candidate_count=len(chunks)
         ) as span:
@@ -1251,6 +1276,7 @@ class KnowledgeService:
         *,
         query_type: str = "answer",
         desired_evidence: str | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> list[str]:
         """让模型在受限候选中按查询用途和期望证据选择文档。"""
 
@@ -1263,9 +1289,16 @@ class KnowledgeService:
         }
         try:
             with llm_operation("knowledge.document_route", candidate_count=len(documents)):
-                raw = LLMClient(model_config).generate_json(
-                    DOCUMENT_ROUTE_PROMPT.read_text(encoding="utf-8"), payload
+                generate_kwargs = (
+                    {"is_cancelled": is_cancelled} if is_cancelled is not None else {}
                 )
+                raw = LLMClient(model_config).generate_json(
+                    DOCUMENT_ROUTE_PROMPT.read_text(encoding="utf-8"),
+                    payload,
+                    **generate_kwargs,
+                )
+        except TurnCancellationRequested:
+            raise
         except (LLMError, Exception) as exc:
             trace.append({"phase": "document_route_failed", "message": str(exc)})
             return []
@@ -1288,6 +1321,7 @@ class KnowledgeService:
         *,
         query_type: str = "answer",
         desired_evidence: str | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> list[str]:
         """让模型在受限知识桶中按查询用途和期望证据选择索引。"""
 
@@ -1314,9 +1348,16 @@ class KnowledgeService:
         }
         try:
             with llm_operation("knowledge.bucket_route", candidate_count=len(buckets)):
-                raw = LLMClient(model_config).generate_json(
-                    SEARCH_PROMPT.read_text(encoding="utf-8"), payload
+                generate_kwargs = (
+                    {"is_cancelled": is_cancelled} if is_cancelled is not None else {}
                 )
+                raw = LLMClient(model_config).generate_json(
+                    SEARCH_PROMPT.read_text(encoding="utf-8"),
+                    payload,
+                    **generate_kwargs,
+                )
+        except TurnCancellationRequested:
+            raise
         except (LLMError, Exception) as exc:
             trace.append({"phase": "bucket_selection_failed", "message": str(exc)})
             return []

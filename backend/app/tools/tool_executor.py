@@ -1,5 +1,5 @@
 """
-@Time       : 2026/07/22 22:18
+@Time       : 2026/08/28 13:20
 @Author     : zhanglp8181
 @File       : tool_executor.py
 @CallChain  : Agent Loop/Tool API → ToolExecutor → 授权边界 → HTTP/MCP
@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from contextlib import suppress
 import os
 import re
 from typing import Any
@@ -17,6 +19,7 @@ import httpx
 from sqlmodel import Session, select
 
 from app.agents.branching import visible_tool_rows
+from app.cancellation import TurnCancellationRequested, raise_if_cancelled, run_cancellable
 from app.config import get_settings
 from app.db.models import MCPServer, SopOperation, Tool
 from app.general_skills.proposals import (
@@ -28,6 +31,11 @@ from app.organization.agent_execution import (
     AgentExecutionAuthorizer,
     AgentExecutionDecision,
     AgentExecutionDenied,
+)
+from app.security.outbound import (
+    OutboundTargetError,
+    allowed_hosts_from_settings,
+    prepare_outbound_request,
 )
 from app.tools.http_request import prepare_get_request
 from app.tools.builtin_tools import execute_builtin_tool
@@ -61,9 +69,11 @@ class ToolExecutor:
         execution_org_unit_id: str | None = None,
         remote_idempotency_key: str | None = None,
         execution_id: str | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> ToolResult:
         """鉴权后执行工具，并仅向 HTTP 非 GET 写请求发送服务端远端幂等键。"""
 
+        raise_if_cancelled(is_cancelled)
         if tool_call.name == SKILL_PROPOSAL_TOOL_NAME:
             return self._publish_general_skill_proposal(
                 tenant_id=tenant_id,
@@ -109,9 +119,13 @@ class ToolExecutor:
                 return self._error(tool.name, exc.code, exc.message)
 
         if (tool.tool_type or "http") == "mcp":
-            return self._with_authorization(
-                self._execute_mcp_tool(tool, tool_call.arguments), authorization
+            result = self._execute_mcp_tool(
+                tool,
+                tool_call.arguments,
+                is_cancelled=is_cancelled,
             )
+            raise_if_cancelled(is_cancelled)
+            return self._with_authorization(result, authorization)
         if (tool.tool_type or "http") == "builtin":
             try:
                 data = execute_builtin_tool(
@@ -121,10 +135,13 @@ class ToolExecutor:
                     arguments=tool_call.arguments,
                     actor_user_id=actor_user_id,
                 )
+                raise_if_cancelled(is_cancelled)
                 return self._with_authorization(
                     ToolResult(tool_name=tool.name, success=True, data=data, error=None),
                     authorization,
                 )
+            except TurnCancellationRequested:
+                raise
             except Exception as exc:
                 error_code = str(getattr(exc, "code", "") or "BUILTIN_EXECUTION_ERROR")
                 return self._with_authorization(
@@ -132,17 +149,17 @@ class ToolExecutor:
                     authorization,
                 )
         if (tool.tool_type or "http") == "managed_workspace":
-            return self._with_authorization(
-                self._execute_managed_workspace(tool, tool_call.arguments, execution_id),
-                authorization,
-            )
+            result = self._execute_managed_workspace(tool, tool_call.arguments, execution_id)
+            raise_if_cancelled(is_cancelled)
+            return self._with_authorization(result, authorization)
         if (tool.tool_type or "http") != "http":
             return self._error(
                 tool.name, "UNSUPPORTED_TOOL_TYPE", f"不支持的工具类型：{tool.tool_type}"
             )
 
+        tool_url = self._normalize_tool_url(tool.url)
         headers = self._request_headers(
-            tool.url,
+            tool_url,
             self._resolve_headers(tool.headers_json or {}, tool.auth_json or {}),
         )
         if remote_idempotency_key and tool.method.upper() != "GET":
@@ -153,16 +170,39 @@ class ToolExecutor:
             }
             headers["Idempotency-Key"] = remote_idempotency_key
         try:
-            with httpx.Client(timeout=self.settings.tool_timeout_seconds) as client:
-                if tool.method.upper() == "GET":
-                    request_url, request_kwargs = prepare_get_request(tool.url, tool_call.arguments)
-                    response = client.request(
-                        tool.method.upper(), request_url, headers=headers, **request_kwargs
+            allowed_hosts = allowed_hosts_from_settings(self.settings)
+            with httpx.Client(
+                timeout=self.settings.tool_timeout_seconds,
+                follow_redirects=False,
+            ) as client:
+                def request_http() -> httpx.Response:
+                    """校验并固定目标后执行 HTTP 请求，供 Turn 取消轮询包装。"""
+
+                    if tool.method.upper() == "GET":
+                        request_url, request_kwargs = prepare_get_request(
+                            tool_url, tool_call.arguments
+                        )
+                    else:
+                        request_url = tool_url
+                        request_kwargs = {"json": tool_call.arguments}
+                    target = prepare_outbound_request(
+                        request_url,
+                        allowed_hosts=allowed_hosts,
                     )
-                else:
-                    response = client.request(
-                        tool.method.upper(), tool.url, headers=headers, json=tool_call.arguments
+                    return client.request(
+                        tool.method.upper(),
+                        target.request_url,
+                        headers={**headers, **target.headers},
+                        **request_kwargs,
+                        **({"extensions": target.extensions} if target.extensions else {}),
                     )
+
+                response = run_cancellable(
+                    request_http,
+                    is_cancelled,
+                    on_cancel=lambda: _best_effort_close_http_client(client),
+                )
+                raise_if_cancelled(is_cancelled)
                 response.raise_for_status()
                 return self._with_authorization(
                     ToolResult(
@@ -177,6 +217,10 @@ class ToolExecutor:
             return self._with_authorization(
                 self._error(tool.name, "TIMEOUT", "工具调用超时。"), authorization
             )
+        except OutboundTargetError as exc:
+            return self._with_authorization(
+                self._error(tool.name, "OUTBOUND_TARGET_BLOCKED", str(exc)), authorization
+            )
         except httpx.HTTPStatusError as exc:
             return self._with_authorization(
                 self._error(
@@ -186,6 +230,8 @@ class ToolExecutor:
                 ),
                 authorization,
             )
+        except TurnCancellationRequested:
+            raise
         except Exception as exc:
             return self._with_authorization(
                 self._error(tool.name, "EXECUTION_ERROR", str(exc)), authorization
@@ -371,7 +417,13 @@ class ToolExecutor:
             return result
         return result.model_copy(update={"authorization_context": decision.as_dict()})
 
-    def _execute_mcp_tool(self, tool: Tool, arguments: dict[str, Any]) -> ToolResult:
+    def _execute_mcp_tool(
+        self,
+        tool: Tool,
+        arguments: dict[str, Any],
+        *,
+        is_cancelled: Callable[[], bool] | None = None,
+    ) -> ToolResult:
         """调用已持久化配置的 MCP 工具，并把异常规范化为统一工具错误。"""
 
         try:
@@ -381,10 +433,14 @@ class ToolExecutor:
                 arguments,
                 timeout_seconds=self.settings.tool_timeout_seconds,
                 tool_name=tool_name,
+                allowed_hosts=allowed_hosts_from_settings(self.settings),
+                is_cancelled=is_cancelled,
             )
             return ToolResult(tool_name=tool.name, success=True, data=data, error=None)
         except MCPClientError as exc:
             return self._error(tool.name, "MCP_ERROR", str(exc))
+        except TurnCancellationRequested:
+            raise
         except Exception as exc:
             return self._error(tool.name, "MCP_EXECUTION_ERROR", str(exc))
 
@@ -446,6 +502,14 @@ class ToolExecutor:
         resolved[INTERNAL_SERVICE_HEADER] = internal_service_token()
         return resolved
 
+    def _normalize_tool_url(self, url: str) -> str:
+        """把保存工具支持的相对 mock 路径解析到配置的同源服务地址。"""
+
+        stripped = str(url or "").strip()
+        if stripped.startswith("/"):
+            return f"{self.settings.normalized_tool_base_url}{stripped}"
+        return stripped
+
     def _is_internal_mock_url(self, url: str) -> bool:
         """判断目标是否为当前部署同源且路径受限的公共 mock 接口。"""
 
@@ -493,3 +557,12 @@ def _default_port(scheme: str) -> int | None:
     """返回 HTTP/HTTPS 的默认端口，未知协议不推断端口。"""
 
     return 443 if scheme.lower() == "https" else 80 if scheme.lower() == "http" else None
+
+
+def _best_effort_close_http_client(client: object) -> None:
+    """取消 HTTP 工具调用时关闭真实客户端，兼容不提供 close 的测试替身。"""
+
+    close = getattr(client, "close", None)
+    if callable(close):
+        with suppress(Exception):
+            close()
