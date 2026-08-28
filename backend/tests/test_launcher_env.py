@@ -14,6 +14,7 @@ def _clean_runtime_env():
         "GONGGE_XUBAN_PORT_RANGE_START",
         "GONGGE_XUBAN_PORT_RANGE_END",
         "GONGGE_XUBAN_DOTENV",
+        "PUBLIC_MOCK_API_KEY",
     )
     saved = {k: os.environ.get(k) for k in keys}
     for k in keys:

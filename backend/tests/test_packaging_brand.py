@@ -75,6 +75,8 @@ def test_windows_build_has_native_installation_smoke_gate() -> None:
         "runtime\\python.exe",
         "/api/health",
         'product_id -eq "gongge-xuban"',
+        "GONGGE_XUBAN_DOTENV",
+        "PUBLIC_MOCK_API_KEY",
         "WINDOWS_NATIVE_SMOKE_PASS",
     ):
         assert marker in smoke_script

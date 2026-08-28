@@ -148,7 +148,9 @@ $environmentNames = @(
   "GONGGE_XUBAN_DATA_DIR",
   "GONGGE_XUBAN_PORT",
   "GONGGE_XUBAN_PORT_RANGE_START",
-  "GONGGE_XUBAN_PORT_RANGE_END"
+  "GONGGE_XUBAN_PORT_RANGE_END",
+  "GONGGE_XUBAN_DOTENV",
+  "PUBLIC_MOCK_API_KEY"
 )
 $previousEnvironment = @{}
 
@@ -180,6 +182,10 @@ try {
   [Environment]::SetEnvironmentVariable("GONGGE_XUBAN_PORT", "$port", "Process")
   [Environment]::SetEnvironmentVariable("GONGGE_XUBAN_PORT_RANGE_START", "$port", "Process")
   [Environment]::SetEnvironmentVariable("GONGGE_XUBAN_PORT_RANGE_END", "$port", "Process")
+  # 不让宿主机自定义 dotenv 改变默认桌面配置路径；用户配置由安装后的用户数据目录承载。
+  [Environment]::SetEnvironmentVariable("GONGGE_XUBAN_DOTENV", $null, "Process")
+  # 让冻结版验证自身的无 .env 默认配置路径，不把宿主机真实 mock key 带入测试。
+  [Environment]::SetEnvironmentVariable("PUBLIC_MOCK_API_KEY", $null, "Process")
 
   Write-Host "==> Starting installed frozen executable on loopback port $port"
   $processParameters = @{

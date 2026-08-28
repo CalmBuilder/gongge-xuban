@@ -161,6 +161,38 @@ def test_health_rejects_other_local_service(monkeypatch) -> None:
     assert desktop_launcher._health_ok("http://127.0.0.1:5175") is False
 
 
+def test_frozen_launcher_generates_ephemeral_mock_key_without_dotenv(monkeypatch, tmp_path) -> None:
+    """无用户配置文件的冻结桌面包应生成进程级 mock key 后再加载 Settings。"""
+
+    monkeypatch.setattr(desktop_launcher.sys, "frozen", True, raising=False)
+    monkeypatch.delenv("PUBLIC_MOCK_API_KEY", raising=False)
+    monkeypatch.setenv("GONGGE_XUBAN_DOTENV", str(tmp_path / "missing.env"))
+    monkeypatch.setattr(desktop_launcher.secrets, "token_urlsafe", lambda _size: "ephemeral-test")
+
+    desktop_launcher._ensure_frozen_public_mock_api_key()
+
+    assert desktop_launcher.os.environ["PUBLIC_MOCK_API_KEY"] == "desktop-ephemeral-test"
+
+
+def test_frozen_launcher_respects_existing_dotenv_without_injecting_key(monkeypatch, tmp_path) -> None:
+    """用户已有桌面配置文件时应让 Settings 从文件读取 key，不被随机值覆盖。"""
+
+    dotenv = tmp_path / ".env"
+    dotenv.write_text('PUBLIC_MOCK_API_KEY="configured-in-file"\n', encoding="utf-8")
+    monkeypatch.setattr(desktop_launcher.sys, "frozen", True, raising=False)
+    monkeypatch.delenv("PUBLIC_MOCK_API_KEY", raising=False)
+    monkeypatch.setenv("GONGGE_XUBAN_DOTENV", str(dotenv))
+    monkeypatch.setattr(
+        desktop_launcher.secrets,
+        "token_urlsafe",
+        lambda _size: (_ for _ in ()).throw(AssertionError("dotenv key must be preserved")),
+    )
+
+    desktop_launcher._ensure_frozen_public_mock_api_key()
+
+    assert "PUBLIC_MOCK_API_KEY" not in desktop_launcher.os.environ
+
+
 def test_preload_server_app_imports_reference_on_calling_thread(monkeypatch) -> None:
     app = object()
 

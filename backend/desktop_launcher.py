@@ -12,6 +12,7 @@ import importlib
 import json
 import logging
 import os
+import secrets
 import socket
 import sys
 import tempfile
@@ -69,6 +70,20 @@ def apply_runtime_env(cfg: dict | None = None) -> None:
     if getattr(sys, "frozen", False):
         from app import paths
         os.environ.setdefault("GONGGE_XUBAN_DOTENV", str(paths.user_data_dir() / ".env"))
+        _ensure_frozen_public_mock_api_key()
+
+
+def _ensure_frozen_public_mock_api_key() -> None:
+    """为无配置文件的桌面包生成进程级 mock key，同时尊重用户已有配置文件。"""
+
+    if os.environ.get("PUBLIC_MOCK_API_KEY", "").strip():
+        return
+    dotenv_value = os.environ.get("GONGGE_XUBAN_DOTENV", "").strip()
+    if dotenv_value and Path(dotenv_value).expanduser().exists():
+        return
+    # 桌面包默认只绑定 loopback；随机 key 仅用于满足本地 mock API 的认证契约，
+    # 不落盘、不打印，也不会成为可复用的公开凭据。
+    os.environ["PUBLIC_MOCK_API_KEY"] = f"desktop-{secrets.token_urlsafe(32)}"
 
 
 def port_in_use(host: str, port: int) -> bool:
