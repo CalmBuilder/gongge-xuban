@@ -28,9 +28,12 @@ APP_ID = DESKTOP_APP_ID
 APP_VERSION = "0.1.0"
 DEFAULT_PORT_RANGE_START = 5137
 DEFAULT_PORT_RANGE_END = 5199
+BROWSER_PAGE_TITLE = f"{APP_NAME}｜企业数字员工平台"
 _MACOS_DELEGATE_REF = None
 _MACOS_INSTANCE_LOCK_HANDLE = None
 _WINDOWS_INSTANCE_MUTEX_HANDLE = None
+_WINDOWS_BROWSER_OPENED = False
+_WINDOWS_BROWSER_OPEN_LOCK = threading.Lock()
 PRODUCT_ICON_PNG = ("packaging", "assets", "gongge-xuban.png")
 
 
@@ -182,6 +185,80 @@ def _wait_for_existing_app_url(host: str, attempts: int = 20, delay: float = 0.3
     return None
 
 
+def _focus_existing_browser_window() -> bool:
+    """在 Windows 上置前已经打开共格页面的浏览器窗口，避免重复创建标签页。"""
+
+    if sys.platform != "win32":
+        return False
+
+    import ctypes
+    from ctypes import wintypes
+
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+    except (AttributeError, OSError):
+        return False
+
+    user32.EnumWindows.argtypes = [
+        ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM),
+        wintypes.LPARAM,
+    ]
+    user32.EnumWindows.restype = wintypes.BOOL
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+    user32.GetWindowTextLengthW.restype = ctypes.c_int
+    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetWindowTextW.restype = ctypes.c_int
+    user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.ShowWindow.restype = wintypes.BOOL
+    user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+    user32.SetForegroundWindow.restype = wintypes.BOOL
+
+    found: list[wintypes.HWND] = []
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    @callback_type
+    def collect_window(hwnd, _lparam):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length <= 0:
+            return True
+        title = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, title, length + 1)
+        if BROWSER_PAGE_TITLE in title.value:
+            found.append(hwnd)
+            return False
+        return True
+
+    user32.EnumWindows(collect_window, 0)
+    if not found:
+        return False
+
+    browser_hwnd = found[0]
+    # 9=SW_RESTORE：已最小化时恢复，未最小化时保持窗口状态；随后请求前台激活。
+    user32.ShowWindow(browser_hwnd, 9)
+    user32.SetForegroundWindow(browser_hwnd)
+    return True
+
+
+def _open_windows_browser_once(target: str) -> bool:
+    """Windows 壳需要唤起页面时，优先复用浏览器且保证本进程最多新开一次。"""
+
+    global _WINDOWS_BROWSER_OPENED
+    if _focus_existing_browser_window():
+        return False
+    with _WINDOWS_BROWSER_OPEN_LOCK:
+        if _WINDOWS_BROWSER_OPENED:
+            return False
+        if _focus_existing_browser_window():
+            return False
+        _open_browser(target)
+        _WINDOWS_BROWSER_OPENED = True
+        return True
+
+
 def _acquire_macos_instance_lock() -> bool:
     if not _use_macos_dock_app():
         return True
@@ -243,9 +320,18 @@ def _open_browser_when_ready(url: str) -> None:
         time.sleep(0.5)
 
 
+def _open_windows_browser_when_ready(url: str) -> None:
+    """等待 Windows 冻结版服务健康后，以单次策略唤起或复用浏览器页面。"""
+
+    for _ in range(120):
+        if _health_ok(url):
+            _open_windows_browser_once(url + "/chat/")
+            return
+        time.sleep(0.5)
+
+
 def _open_browser(target: str) -> None:
-    """打开浏览器页面。点 Dock 图标每次都开一个新标签——最稳定、跨浏览器一致、
-    不依赖 macOS 自动化授权（adhoc 签名下自动化授权弹窗不可靠）。"""
+    """打开浏览器页面；macOS Dock 的重复唤起仍保持系统默认的标签页行为。"""
     webbrowser.open(target)
 
 
@@ -558,8 +644,8 @@ def _run_windows_taskbar_app(cfg: dict, url: str) -> int:
     @WNDPROC
     def window_proc(hwnd, message, wparam, lparam):
         if _is_windows_restore_command(message, wparam):
-            print(f"Taskbar activated; opening {APP_NAME} in the system default browser.")
-            _open_browser(url + "/chat/")
+            print(f"Taskbar or Alt+Tab activated; focusing {APP_NAME} in the system default browser.")
+            _open_windows_browser_once(url + "/chat/")
             user32.ShowWindow(hwnd, SW_SHOWMINNOACTIVE)
             return 0
         if message == WM_DESTROY:
@@ -610,7 +696,7 @@ def _run_windows_taskbar_app(cfg: dict, url: str) -> int:
     )
 
     threading.Thread(target=_serve, args=(cfg,), daemon=True).start()
-    threading.Thread(target=_open_browser_when_ready, args=(url,), daemon=True).start()
+    threading.Thread(target=_open_windows_browser_when_ready, args=(url,), daemon=True).start()
     user32.ShowWindow(hwnd, SW_SHOWMINIMIZED)
     user32.UpdateWindow(hwnd)
 
@@ -644,7 +730,7 @@ def main(argv: list[str] | None = None) -> int:
         existing_url = _wait_for_existing_app_url(host)
         if existing_url:
             print(f"{APP_NAME} 正在运行：{existing_url}")
-            _open_browser(existing_url + "/chat/")
+            _open_windows_browser_once(existing_url + "/chat/")
         else:
             print(f"{APP_NAME} 已有实例正在启动，当前实例退出。")
         return 0
@@ -652,7 +738,10 @@ def main(argv: list[str] | None = None) -> int:
     existing_url = _find_existing_app_url(host)
     if existing_url:
         print(f"{APP_NAME} 已在运行：{existing_url}/chat/")
-        _open_browser(existing_url + "/chat/")
+        if _use_windows_taskbar_app():
+            _open_windows_browser_once(existing_url + "/chat/")
+        else:
+            _open_browser(existing_url + "/chat/")
         return 0
 
     if _use_macos_dock_app() and not _acquire_macos_instance_lock():

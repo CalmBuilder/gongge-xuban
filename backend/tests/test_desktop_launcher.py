@@ -162,9 +162,10 @@ def test_health_rejects_other_local_service(monkeypatch) -> None:
 
 
 def test_windows_second_launch_reuses_primary_instance(monkeypatch) -> None:
-    """Windows 冻结版第二次启动应等待首实例并复用其浏览器地址，而不是启动第二个服务。"""
+    """Windows 冻结版第二次启动应置前已有浏览器，而不是再创建标签页或服务。"""
 
     opened = []
+    focused = []
     monkeypatch.setattr(desktop_launcher, "_use_windows_taskbar_app", lambda: True)
     monkeypatch.setattr(desktop_launcher, "_acquire_windows_instance_mutex", lambda: False)
     monkeypatch.setattr(
@@ -172,11 +173,42 @@ def test_windows_second_launch_reuses_primary_instance(monkeypatch) -> None:
         "_wait_for_existing_app_url",
         lambda _host: "http://127.0.0.1:5137",
     )
+    monkeypatch.setattr(
+        desktop_launcher,
+        "_focus_existing_browser_window",
+        lambda: focused.append(True) or True,
+    )
     monkeypatch.setattr(desktop_launcher, "_open_browser", opened.append)
     monkeypatch.setattr(desktop_launcher, "_redirect_logs_when_frozen", lambda: None)
 
     assert desktop_launcher.main([]) == 0
+    assert focused == [True]
+    assert opened == []
+
+
+def test_windows_browser_open_is_at_most_once_when_no_existing_window(monkeypatch) -> None:
+    """浏览器窗口尚未出现时，任务栏恢复事件重复到达也只能打开一个页面。"""
+
+    opened = []
+    monkeypatch.setattr(desktop_launcher, "_focus_existing_browser_window", lambda: False)
+    monkeypatch.setattr(desktop_launcher, "_open_browser", opened.append)
+    monkeypatch.setattr(desktop_launcher, "_WINDOWS_BROWSER_OPENED", False)
+
+    assert desktop_launcher._open_windows_browser_once("http://127.0.0.1:5137/chat/") is True
+    assert desktop_launcher._open_windows_browser_once("http://127.0.0.1:5137/chat/") is False
     assert opened == ["http://127.0.0.1:5137/chat/"]
+
+
+def test_windows_browser_open_focuses_existing_window_without_opening_tab(monkeypatch) -> None:
+    """已有共格浏览器窗口时，任务栏或 Alt+Tab 唤起不得再打开新标签页。"""
+
+    opened = []
+    monkeypatch.setattr(desktop_launcher, "_focus_existing_browser_window", lambda: True)
+    monkeypatch.setattr(desktop_launcher, "_open_browser", opened.append)
+    monkeypatch.setattr(desktop_launcher, "_WINDOWS_BROWSER_OPENED", False)
+
+    assert desktop_launcher._open_windows_browser_once("http://127.0.0.1:5137/chat/") is False
+    assert opened == []
 
 
 def test_frozen_launcher_generates_ephemeral_mock_key_without_dotenv(monkeypatch, tmp_path) -> None:
