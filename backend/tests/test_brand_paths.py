@@ -4,10 +4,21 @@ from app import paths
 
 
 def test_new_data_directory_is_used_for_fresh_install(monkeypatch, tmp_path: Path) -> None:
+    """默认数据目录应使用当前产品名，避免复用旧产品目录。"""
     monkeypatch.delenv("GONGGE_XUBAN_DATA_DIR", raising=False)
     monkeypatch.setattr(paths, "_platform_data_parent", lambda: tmp_path)
 
     assert paths.user_data_dir() == tmp_path / "Gongge-Xuban"
+
+
+def test_windows_data_directory_uses_appdata(monkeypatch, tmp_path: Path) -> None:
+    """Windows 原生安装应把用户数据放入 APPDATA 下的产品目录。"""
+
+    monkeypatch.delenv("GONGGE_XUBAN_DATA_DIR", raising=False)
+    monkeypatch.setattr(paths.sys, "platform", "win32")
+    monkeypatch.setenv("APPDATA", str(tmp_path / "Roaming"))
+
+    assert paths.user_data_dir() == tmp_path / "Roaming" / "Gongge-Xuban"
 
 
 def test_unrecognized_data_directory_is_not_reused(monkeypatch, tmp_path: Path) -> None:

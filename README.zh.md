@@ -151,7 +151,7 @@ FastAPI，并使用进程退出后自动清理的临时 SQLite 数据库，不�
 
 各平台打包入口位于 `packaging/`：`build_macos.sh`、`build_windows.ps1`、`build_linux.sh`。生成的桌面资产统一使用 `gongge-xuban` 标识，应用 ID 为 `cn.gongge.xuban.desktop`。
 
-在 macOS 原生构建机上运行 `bash packaging/build_macos.sh`：脚本会先按 `backend/pyproject.toml` 对齐打包环境，签名 `.app`，在构建机原生架构上启动该打包产物并校验产品专属健康响应，通过后才生成 DMG。Developer ID 签名与公证由 `MAC_SIGN_ID` 和 `NOTARY_PROFILE` 控制。Windows 签名由 `packaging/sign_windows.ps1` 处理，详见 [packaging/WINDOWS_SIGNING.md](packaging/WINDOWS_SIGNING.md)。
+在 macOS 原生构建机上运行 `bash packaging/build_macos.sh`：脚本会先按 `backend/pyproject.toml` 对齐打包环境，签名 `.app`，在构建机原生架构上启动该打包产物并校验产品专属健康响应，通过后才生成 DMG。Developer ID 签名与公证由 `MAC_SIGN_ID` 和 `NOTARY_PROFILE` 控制。Windows 签名由 `packaging/sign_windows.ps1` 处理，详见 [packaging/WINDOWS_SIGNING.md](packaging/WINDOWS_SIGNING.md)。原生 Windows 安装、冻结版 runtime 与卸载门禁由 `packaging/smoke_windows.ps1` 自动执行，详见 [packaging/WINDOWS_NATIVE_VALIDATION.md](packaging/WINDOWS_NATIVE_VALIDATION.md)。
 
 ## 目录结构
 
@@ -170,6 +170,7 @@ scripts/                 本地进程管理
 - [前端说明](frontend-enterprise/README.md)——前端工作区入口
 - [协作约定（AGENTS.md）](AGENTS.md)——架构规则、质量门禁、交付清单
 - [Windows 签名指南](packaging/WINDOWS_SIGNING.md)——证书与签名流水线
+- [Windows/native 验收](packaging/WINDOWS_NATIVE_VALIDATION.md)——安装、启动、runtime 与卸载门禁
 
 ## 安全与使用边界
 

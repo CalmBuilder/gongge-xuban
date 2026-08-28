@@ -3,6 +3,7 @@ from app.general_skills import runtime_env
 
 
 def test_bundled_python_used_when_frozen(monkeypatch, tmp_path) -> None:
+    """冻结态默认解析已注入的打包 runtime 路径。"""
     monkeypatch.setattr(paths, "is_frozen", lambda: True)
     bundled = tmp_path / "runtime" / "bin" / "python"
     bundled.parent.mkdir(parents=True)
@@ -10,6 +11,17 @@ def test_bundled_python_used_when_frozen(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(runtime_env, "_bundled_python", lambda: bundled)
     resolved = runtime_env._resolve_runtime_python("", "")
     assert resolved == bundled
+
+
+def test_windows_frozen_runtime_uses_executable_sibling(monkeypatch, tmp_path) -> None:
+    """Windows 冻结版应从 exe 同级 runtime/python.exe 解析技能解释器。"""
+
+    executable = tmp_path / "gongge-xuban.exe"
+    monkeypatch.setattr(runtime_env.sys, "platform", "win32")
+    monkeypatch.setattr(runtime_env.sys, "executable", str(executable))
+    monkeypatch.setattr(runtime_env.sys, "frozen", True, raising=False)
+
+    assert runtime_env._bundled_python() == tmp_path / "runtime" / "python.exe"
 
 
 def test_network_install_disabled_skips_pip(monkeypatch, tmp_path) -> None:

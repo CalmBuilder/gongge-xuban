@@ -48,6 +48,7 @@ def test_packaging_configs_use_new_application_identity() -> None:
 
 
 def test_build_scripts_emit_gongge_xuban_artifacts() -> None:
+    """构建入口必须输出当前产品的跨平台发布产物。"""
     contents = "\n".join(
         (PACKAGING / name).read_text(encoding="utf-8")
         for name in ("build_linux.sh", "build_macos.sh", "build_windows.ps1")
@@ -55,6 +56,26 @@ def test_build_scripts_emit_gongge_xuban_artifacts() -> None:
     assert "Gongge-Xuban-linux-x86_64" in contents
     assert "Gongge-Xuban-macos-" in contents
     assert "Gongge-Xuban-windows-x64-setup.exe" in contents
+
+
+def test_windows_build_has_native_installation_smoke_gate() -> None:
+    """Windows 构建必须在原生机安装、启动、检查 runtime 后再允许收口。"""
+
+    build_script = (PACKAGING / "build_windows.ps1").read_text(encoding="utf-8")
+    smoke_script = (PACKAGING / "smoke_windows.ps1").read_text(encoding="utf-8")
+
+    assert (PACKAGING / "smoke_windows.ps1").is_file()
+    assert "smoke_windows.ps1" in build_script
+    assert "Windows native smoke test" in build_script
+    for marker in (
+        "Invoke-Installer",
+        "Invoke-Uninstaller",
+        "runtime\\python.exe",
+        "/api/health",
+        'product_id -eq "gongge-xuban"',
+        "WINDOWS_NATIVE_SMOKE_PASS",
+    ):
+        assert marker in smoke_script
 
 
 def test_macos_build_aligns_dependencies_and_smoke_tests_signed_app() -> None:

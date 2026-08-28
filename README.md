@@ -192,6 +192,9 @@ product-specific health response, and only then creates the DMG. Developer ID
 signing and notarization remain controlled by `MAC_SIGN_ID` and
 `NOTARY_PROFILE`. Windows signing is handled by `packaging/sign_windows.ps1`;
 see [packaging/WINDOWS_SIGNING.md](packaging/WINDOWS_SIGNING.md).
+Native Windows installation and frozen-runtime validation is enforced by
+`packaging/smoke_windows.ps1`; see
+[packaging/WINDOWS_NATIVE_VALIDATION.md](packaging/WINDOWS_NATIVE_VALIDATION.md).
 
 ## Project structure
 
@@ -210,6 +213,7 @@ Product manuals and reference sources are maintained outside the git tree.
 - [Frontend README](frontend-enterprise/README.md) — frontend workspace entry points
 - [Contributor conventions (AGENTS.md)](AGENTS.md) — architecture rules, quality gates, delivery checklist
 - [Windows signing guide](packaging/WINDOWS_SIGNING.md) — certificate and signing pipeline
+- [Windows/native validation](packaging/WINDOWS_NATIVE_VALIDATION.md) — install, smoke, and uninstall gate
 
 ## Security and limitations
 

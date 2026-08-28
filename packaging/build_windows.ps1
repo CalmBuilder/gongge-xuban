@@ -152,7 +152,7 @@ if (-not (Test-Path $unsignedInstaller)) {
   throw "Inno Setup completed without producing $unsignedInstaller."
 }
 
-Write-Host "==> [6/6] Name the release artifact"
+Write-Host "==> [6/7] Name the release artifact"
 $out = "packaging\out\Gongge-Xuban-windows-x64-setup.exe"
 if (Test-Path -LiteralPath $out) { Remove-Item -LiteralPath $out -Force }
 Move-Item -LiteralPath $unsignedInstaller -Destination $out
@@ -163,5 +163,11 @@ if ($signingConfigured) {
   }
   Write-Host "Authenticode signature valid: $($signature.SignerCertificate.Subject)"
 }
+Write-Host "==> [7/7] Smoke-test installation, frozen runtime, health and uninstall"
+$smokeScript = (Resolve-Path packaging\smoke_windows.ps1).Path
+$resolvedOut = (Resolve-Path -LiteralPath $out).Path
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $smokeScript `
+  -InstallerPath $resolvedOut
+Assert-NativeCommandSucceeded "Windows native smoke test"
 Write-Host "built $out"
 Get-ChildItem packaging\out\Gongge-Xuban-windows-x64-setup.exe
