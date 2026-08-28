@@ -28,6 +28,7 @@ APP_ID = DESKTOP_APP_ID
 APP_VERSION = "0.1.0"
 DEFAULT_PORT_RANGE_START = 5137
 DEFAULT_PORT_RANGE_END = 5199
+WINDOWS_FIXED_FALLBACK_PORT = 59137
 LOOPBACK_PORT_PROBE_TIMEOUT_SECONDS = 0.2
 BROWSER_PAGE_TITLE = f"{APP_NAME}｜企业数字员工平台"
 _MACOS_DELEGATE_REF = None
@@ -128,7 +129,20 @@ def _port_candidates() -> list[int]:
     if start > end:
         start, end = end, start
 
-    candidates = list(range(start, end + 1))
+    has_custom_range = bool(
+        desktop_env_value("PORT_RANGE_START", "")
+        or desktop_env_value("PORT_RANGE_END", "")
+    )
+    if (
+        sys.platform == "win32"
+        and getattr(sys, "frozen", False)
+        and not has_custom_range
+        and start == DEFAULT_PORT_RANGE_START
+        and end == DEFAULT_PORT_RANGE_END
+    ):
+        candidates = [DEFAULT_PORT_RANGE_START, WINDOWS_FIXED_FALLBACK_PORT]
+    else:
+        candidates = list(range(start, end + 1))
     explicit = desktop_env_value("PORT", "")
     if explicit:
         port = _env_int("PORT", DEFAULT_PORT_RANGE_START)
@@ -147,8 +161,8 @@ def find_available_port(host: str) -> int:
                     candidates[0],
                 )
             return port
-    first, last = candidates[0], candidates[-1]
-    raise RuntimeError(f"{APP_NAME} 可用端口耗尽：{first}-{last} 都已被占用")
+    candidate_label = ",".join(str(port) for port in candidates)
+    raise RuntimeError(f"{APP_NAME} 可用端口耗尽：{candidate_label} 都已被占用")
 
 
 def _resource_path(*parts: str) -> str | None:
@@ -766,9 +780,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if _use_windows_taskbar_app():
         _log_startup_phase("instance_lock_acquired", startup_started_at)
-    # Windows 冻结版已有命名互斥锁，正常首启只需确认首选端口；只有首选端口
-    # 被占用时才进入完整回退范围，避免每次启动无意义地探测 5137–5199。
-    existing_ports = _port_candidates()[:1] if _use_windows_taskbar_app() else None
+    # Windows 冻结版只确认固定候选端口（默认 5137/59137），开发态和 macOS
+    # 继续使用可配置的完整端口范围。
+    existing_ports = _port_candidates() if _use_windows_taskbar_app() else None
     existing_url = _find_existing_app_url(host, existing_ports)
     if existing_url:
         print(f"{APP_NAME} 已在运行：{existing_url}/chat/")

@@ -26,6 +26,40 @@ def test_build_server_config_defaults(monkeypatch) -> None:
     assert cfg["app"] == "single_port_app:app"
 
 
+def test_frozen_windows_uses_dedicated_fallback_port(monkeypatch) -> None:
+    """Windows 冻结版首选 5137 被占用时只回退到专用的 59137。"""
+
+    _clear_port_env(monkeypatch)
+    monkeypatch.setattr(desktop_launcher.sys, "platform", "win32")
+    monkeypatch.setattr(desktop_launcher.sys, "frozen", True, raising=False)
+    checked = []
+
+    def fake_port_in_use(_host, port):
+        checked.append(port)
+        return port == 5137
+
+    monkeypatch.setattr(desktop_launcher, "port_in_use", fake_port_in_use)
+
+    cfg = desktop_launcher.build_server_config()
+
+    assert cfg["port"] == 59137
+    assert checked == [5137, 59137]
+
+
+def test_frozen_windows_reports_both_dedicated_ports_when_blocked(monkeypatch) -> None:
+    """Windows 冻结版两个专用端口均被占用时应明确失败而不强杀占用者。"""
+
+    _clear_port_env(monkeypatch)
+    monkeypatch.setattr(desktop_launcher.sys, "platform", "win32")
+    monkeypatch.setattr(desktop_launcher.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(desktop_launcher, "port_in_use", lambda _host, _port: True)
+
+    import pytest
+
+    with pytest.raises(RuntimeError, match="5137,59137"):
+        desktop_launcher.build_server_config()
+
+
 def test_build_server_config_env_override(monkeypatch) -> None:
     _clear_port_env(monkeypatch)
     monkeypatch.setenv("GONGGE_XUBAN_PORT", "6000")
