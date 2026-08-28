@@ -9,7 +9,8 @@ Windows PE 产物、Inno Setup 安装行为、Windows 用户目录和 taskbar �
 在仓库根目录打开 Windows PowerShell，准备以下工具：
 
 1. Python 3.11+（x64）和 Node.js；
-2. Inno Setup 6，并让 `ISCC.exe` 位于默认安装目录或通过 `ISCC` 指定；
+2. Inno Setup 6，并让 `ISCC.exe` 位于默认安装目录或通过 `ISCC` 指定；官方下载页为
+   <https://jrsoftware.org/isdl.php>，也可使用 `winget install --id JRSoftware.InnoSetup -e -s winget -i`；
 3. Windows SDK（仅公开发布或配置签名时需要 `signtool.exe`）；
 4. 可访问 GitHub release 和 Python/npm 包源的网络。
 
@@ -145,6 +146,37 @@ Get-Content "$env:APPDATA\Gongge-Xuban\logs\gongge-xuban.log" -Tail 100
 冒烟失败时保留脚本提示的临时诊断目录（使用 `-KeepArtifacts`），重点检查
 `launcher.stdout.log`、`launcher.stderr.log` 和运行日志；不要手工删除正在使用的
 安装目录或数据库文件。
+
+### Inno Setup 下载、安装或 `ISCC.exe` 识别失败
+
+构建脚本不是从网络自动下载 Inno Setup，而是查找本机的 `ISCC.exe`。官方下载页的
+下载链接可能跳转到 GitHub；如果浏览器打不开、下载被代理或安全软件拦截，可在能访问
+包源的 Windows 主机使用官方页面提供的 `winget` 安装方式，或在另一台可信机器下载后
+通过受控介质传输并校验签名。不要从不明镜像下载编译器。
+
+安装后若构建仍提示 `Inno Setup 6 was not found`，先确认编译器存在，再把完整路径传给
+脚本支持的 `ISCC` 环境变量：
+
+```powershell
+Get-ChildItem "$env:ProgramFiles", "${env:ProgramFiles(x86)}", "$env:LOCALAPPDATA\Programs" `
+  -Filter ISCC.exe -Recurse -ErrorAction SilentlyContinue |
+  Select-Object -First 5 -ExpandProperty FullName
+
+$env:ISCC = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+Test-Path $env:ISCC
+& $env:ISCC /?
+```
+
+如果安装的是 Inno Setup 7，脚本不会假定其目录名；请将 `$env:ISCC` 指向实际的
+`ISCC.exe` 后再构建，并先用同一版本完成一次本地冒烟。若安装器下载后无法运行，先在
+文件属性中核对数字签名和发布者，再处理 Windows SmartScreen 提示；不要通过关闭系统
+安全防护来绕过校验。
+
+如果 `ISCC.exe` 能单独执行但构建仍失败，确认是在仓库根目录运行
+`packaging\build_windows.ps1`，并检查 `packaging\installer\gongge-xuban.iss` 的
+`SetupIconFile`、`Source` 路径和 `VERSION` 是否存在。构建成功必须同时看到安装器文件
+和 `WINDOWS_NATIVE_SMOKE_PASS`；仅看到 Inno Setup 的编译成功信息不能替代安装、启动、
+健康检查和卸载验收。
 
 ## 发布 GitHub Release
 
