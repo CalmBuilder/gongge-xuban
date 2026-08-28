@@ -20,6 +20,11 @@ $env:VERSION = "0.1.0"
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File packaging\build_windows.ps1
 ```
 
+上面的变量赋值是 PowerShell 语法。不要把 `$env:VERSION = ...` 直接粘贴到
+`cmd.exe`；如果当前窗口提示“文件名、目录名或卷标语法不正确”，请打开 Windows
+PowerShell 后重试，或者在 cmd 中先执行 `set VERSION=0.1.0`，再调用
+`powershell.exe -File packaging\build_windows.ps1`。
+
 构建脚本会先校验宿主机和 Python 均为 x64，并在 PyInstaller 前停止同名的旧版
 `gongge-xuban` 进程、清理旧的产品输出目录；随后按 `backend/pyproject.toml` 安装依赖，使用
 PyInstaller 的 `--clean` 生成并校验 PE machine=`0x8664` 的 x64 可执行文件，最后生成
@@ -69,6 +74,99 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
 
 安装器启用 `CloseApplications=yes`，更新安装时只请求关闭占用共格·序伴安装文件的
 应用；不会按端口号强杀未知进程。
+
+## 已知问题处理
+
+下面记录构建和原生验收中实际遇到过的问题。处理原则是修复源码或构建契约后重新
+构建，不通过手工修改 `packaging\out`、放宽架构检查或强杀未知进程来“通过”验收。
+
+### 前端构建找不到 `gsap`
+
+如果出现 `src/lib/gsap.ts: Cannot find module 'gsap'`，通常是依赖声明或锁文件未随
+当前提交同步，不能只在本机遗留的 `node_modules` 中补包。先确认已拉取包含依赖声明的
+最新提交，然后清理并按锁文件安装：
+
+```powershell
+git pull --ff-only origin main
+npm ci --prefix frontend-enterprise --no-audit --no-fund
+npm --prefix frontend-enterprise run build
+```
+
+构建脚本本身已经执行 `npm ci`；若仍失败，应检查 `frontend-enterprise/package.json`
+和 `package-lock.json` 是否同时包含 `gsap`，修复后再运行完整构建。
+
+### 冻结程序提示 `public_mock_api_key` 缺失
+
+这是旧版冻结包在没有 `.env` 时未满足本地 mock API 配置契约的表现。当前版本在冻结
+启动早期生成进程级临时 key，并把用户配置放在 `%APPDATA%\Gongge-Xuban\.env`；不会把
+真实 API key 写进源码或安装包。遇到该堆栈时不要把密钥写入仓库，直接拉取最新代码并
+重新构建；仍失败时保留启动器 stdout/stderr 及用户日志供定位。
+
+### PE 架构检查误报 `t32.exe` 或 `t64.exe`
+
+`pip\_vendor\distlib` 和 setuptools 中的 `t32/t64`、`cli/gui` 是生成入口脚本的
+多架构模板，并非应用运行时。构建脚本只对这些确定路径记录“跳过”，其余 `.exe`、`.dll`、
+`.pyd`、`.node` 仍必须是 AMD64 (`0x8664`)。出现其他路径的 `0x014C` 或 ARM 架构时，
+必须修复 Python/依赖来源或打包配置，不能把整个 PE 检查关闭。
+
+### 重复进程、重复标签页或 Alt+Tab 再开页面
+
+构建前脚本只停止进程名恰为 `gongge-xuban` 的旧产品进程；运行时通过 Windows 命名
+互斥锁保证单实例，并将 taskbar/Alt+Tab 操作聚焦到已有的共格浏览器窗口。人工验收
+看到重复实例时，先退出旧安装或仅结束确认过的 `gongge-xuban.exe`，再检查：
+
+- 再次点击快捷方式不应产生第二个服务进程；
+- 再次点击 taskbar 或 Alt+Tab 应置前已有页面，不应新建标签页；
+- 关闭浏览器后再次点击，才允许重新打开一个页面。
+
+不要通过结束所有同名或所有浏览器进程来排障。
+
+### 启动变慢或出现 5138 端口
+
+旧版冻结包会扫描 `5137-5199`，所以可能落到 `5138`；当前 Windows 冻结版只按
+`5137 → 59137` 两个确定候选端口运行。确认测试的是最新安装包，并查看：
+
+```powershell
+Get-NetTCPConnection -State Listen -LocalPort 5137,59137 |
+  Select-Object LocalAddress,LocalPort,OwningProcess
+Get-Content "$env:APPDATA\Gongge-Xuban\logs\gongge-xuban.log" -Tail 100
+```
+
+日志中的 `port_selected`、`app_preloaded`、`database_initialized`、`demo_data_seeded`
+和 `workers_started` 可区分端口探测、Python 导入和数据库阶段的耗时。5137 被非共格
+服务占用时使用 59137；已有健康的共格服务则复用；两个端口都占用时应明确失败，不能
+按端口号盲目 `kill`。只有确认 PID 的进程名和路径均为共格·序伴时，才可人工结束该
+产品旧进程后重试。
+
+### 安装或卸载失败
+
+构建输出目录被运行中的产品锁定时，退出共格·序伴后重新运行构建脚本。安装器的
+`CloseApplications=yes` 只处理占用共格安装文件的应用，不负责关闭端口上的第三方服务。
+冒烟失败时保留脚本提示的临时诊断目录（使用 `-KeepArtifacts`），重点检查
+`launcher.stdout.log`、`launcher.stderr.log` 和运行日志；不要手工删除正在使用的
+安装目录或数据库文件。
+
+## 发布 GitHub Release
+
+原生构建和人工浏览器验收均通过后，安装包作为 Release Asset 上传，不提交到 Git 历史。
+建议让 GitHub tag 与安装器版本一致，例如：
+
+1. 在 Windows 拉取目标提交，执行构建并确认 `WINDOWS_NATIVE_SMOKE_PASS`；
+2. 在仓库的 **Releases → Draft a new release** 中创建 tag `v0.1.0`，目标为 `main`；
+3. 上传 `packaging\out\Gongge-Xuban-windows-x64-setup.exe`，标题使用“共格·序伴 v0.1.0”；
+4. 发布后从干净 Windows 用户环境下载并安装一次，确认附件可下载、安装器版本和
+   `/chat/` 浏览器验收结果与本次构建一致。
+
+可选地生成并上传 SHA-256 校验文件：
+
+```powershell
+$exe = "packaging\out\Gongge-Xuban-windows-x64-setup.exe"
+$hash = (Get-FileHash $exe -Algorithm SHA256).Hash
+"$hash  $(Split-Path $exe -Leaf)" | Set-Content "$exe.sha256" -Encoding ascii
+```
+
+未配置 Authenticode 证书时，Release 说明必须明确安装包为 `UNSIGNED`；不能把本地
+冒烟通过表述为已签名或已完成 Windows 安全发布。
 
 ## 当前 Linux 主机的边界
 
