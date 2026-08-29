@@ -31,6 +31,8 @@ playwright-report/
 test-results/
 agency-agents-zh/*
 agency-agents-import/*
+agency-agents-zh-*/
+agency-agents-import-*/
 .pnpm-store/
 /frontend-site/
 /official-site/

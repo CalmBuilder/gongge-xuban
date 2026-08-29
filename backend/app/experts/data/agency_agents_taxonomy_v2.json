@@ -1,0 +1,78 @@
+{
+  "version": 2,
+  "source_code": "agency-agents",
+  "source_commit": "3c9588880b7cafaec325a104899fd8bbe27e7d72",
+  "base_taxonomy": "agency_agents_taxonomy_v1.json",
+  "experts": [
+    {
+      "upstream_path": "design/design-ui-finish-gate-reviewer.md",
+      "category": "设计创意",
+      "subcategory": "用户体验",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-data-visualization-engineer.md",
+      "category": "工程研发",
+      "subcategory": "前端与客户端",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-knowledge-graph-engineer.md",
+      "category": "工程研发",
+      "subcategory": "AI 与智能体",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-llm-post-training-engineer.md",
+      "category": "工程研发",
+      "subcategory": "AI 与智能体",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-privacy-engineer.md",
+      "category": "工程研发",
+      "subcategory": "安全与身份",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "engineering/engineering-rust-refactoring-specialist.md",
+      "category": "工程研发",
+      "subcategory": "开发效能",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "game-development/economy-designer.md",
+      "category": "游戏开发",
+      "subcategory": "游戏设计与内容",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "research/research-synthesist.md",
+      "category": "学术研究",
+      "subcategory": "统计与方法",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/healthcare-aging-parent-care-companion.md",
+      "category": "专业服务",
+      "subcategory": "行业解决方案",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    },
+    {
+      "upstream_path": "specialized/specialized-master-plan-architect.md",
+      "category": "专业服务",
+      "subcategory": "战略与管理咨询",
+      "subcategory_original": "",
+      "basis": "curated_role_mapping"
+    }
+  ]
+}

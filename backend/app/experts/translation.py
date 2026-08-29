@@ -1,4 +1,10 @@
-"""使用平台模型生成结构化中文专家内容并执行保真校验。"""
+"""
+@Time       : 2026/08/29 12:00
+@Author     : zhanglp8181
+@File       : translation.py
+@CallChain  : 专家导入准备 → 确定性/模型翻译 → 中文字段与能力证据校验
+@Description: 生成结构化中文专家内容，保留上游约束并提供可审计的能力分析。
+"""
 
 from __future__ import annotations
 
@@ -36,6 +42,7 @@ CATEGORY_LABELS = {
     "specialized": "专业服务",
     "support": "客户支持",
     "testing": "测试质量",
+    "research": "学术研究",
 }
 ORCHESTRATION_RE = re.compile(
     r"\b(?:spawn\b.{0,100}\bagent|"

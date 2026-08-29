@@ -13,9 +13,11 @@ import { basename, dirname, isAbsolute, resolve } from 'node:path';
 
 const ENABLED = process.env.Q1_AGENT_QUALITY_E2E === '1';
 const TENANT_ID = 'tenant_demo';
-const CONTROL_AGENT_ID = process.env.Q1_CONTROL_AGENT_ID || 'agent_q1_codebase_control';
-const TREATMENT_AGENT_ID = process.env.Q1_TREATMENT_AGENT_ID || 'agent_skill_demo_a_docs';
-const SAME_AGENT_AB = CONTROL_AGENT_ID === TREATMENT_AGENT_ID;
+const CONTROL_AGENT_ID = 'agent_q1_codebase_control';
+const ACTIVE_CONTROL_AGENT_ID = process.env.Q1_CONTROL_AGENT_ID || CONTROL_AGENT_ID;
+const TREATMENT_AGENT_ID = 'agent_skill_demo_a_docs';
+const ACTIVE_TREATMENT_AGENT_ID = process.env.Q1_TREATMENT_AGENT_ID || TREATMENT_AGENT_ID;
+const SAME_AGENT_AB = ACTIVE_CONTROL_AGENT_ID === ACTIVE_TREATMENT_AGENT_ID;
 const ORDER_SEED = process.env.Q1_ORDER_SEED || 'q1-codebase-default';
 const CERTIFICATION_RUN_ID = process.env.Q1_CERTIFICATION_RUN_ID || '';
 const EVIDENCE_DIR = resolve('../docs/manuals/evidence');
@@ -248,7 +250,7 @@ async function importSkill(page: Page): Promise<SkillIdentity> {
     };
     const rows = Array.isArray(value) ? value : (value.items || []);
     return rows.find((item) => item.name === name)?.id || '';
-  }, { agentId: TREATMENT_AGENT_ID, name: source.name, tenantId: TENANT_ID });
+  }, { agentId: ACTIVE_TREATMENT_AGENT_ID, name: source.name, tenantId: TENANT_ID });
   expect(id).not.toBe('');
   return {
     id, name: source.name, installed_revision_ids: body.installed_revision_ids || [],
@@ -458,7 +460,7 @@ async function runScenario(page: Page, testInfo: TestInfo, variant: Variant, inp
 
   const scenario = `${inputMode}-${variant}`;
   const prompt = inputMode === 'inline' ? INLINE_PROMPT : ATTACHMENT_PROMPT;
-  const agentId = variant === 'treatment' ? TREATMENT_AGENT_ID : CONTROL_AGENT_ID;
+  const agentId = variant === 'treatment' ? ACTIVE_TREATMENT_AGENT_ID : ACTIVE_CONTROL_AGENT_ID;
   await login(page, agentId);
   const sessionId = await createSession(page, `Q1 codebase ${scenario}`, agentId);
   await page.goto(`/workspace/chat/${sessionId}`);
@@ -525,7 +527,7 @@ test('Q1 codebase-design 四象限真实模型探索批', async ({ page }, testI
   /** 先完成两个无 Skill 对照，再导入固定 Skill 完成两个处理组。 */
 
   await page.goto('/enterprise/dashboard');
-  await login(page, CONTROL_AGENT_ID);
+  await login(page, ACTIVE_CONTROL_AGENT_ID);
   const onlyScenario = process.env.Q1_ONLY_SCENARIO?.trim() || '';
   const scenarios = [
     { variant: 'control' as const, inputMode: 'inline' as const },
@@ -540,7 +542,7 @@ test('Q1 codebase-design 四象限真实模型探索批', async ({ page }, testI
   report.execution_order = selected.map((item) => `${item.inputMode}-${item.variant}`);
   for (const item of selected) {
     if (item.variant === 'treatment' && !report.skill) {
-      await login(page, TREATMENT_AGENT_ID);
+      await login(page, ACTIVE_TREATMENT_AGENT_ID);
       report.skill = await importSkill(page);
     }
     report.scenarios.push(await runScenario(

@@ -16,9 +16,11 @@ const Q1_PROFILE = process.env.Q1_PROFILE || 'writing';
 const EVIDENCE_DIR = resolve('../docs/manuals/evidence');
 const EVIDENCE_FILE = basename(process.env.Q1_AGENT_QUALITY_EVIDENCE_FILE
   || 'agent-quality-q1-writing-matched-exploration.json');
-const CONTROL_AGENT_ID = process.env.Q1_CONTROL_AGENT_ID || 'agent_q1_writing_control';
-const TREATMENT_AGENT_ID = process.env.Q1_TREATMENT_AGENT_ID || 'agent_skill_demo_a_docs';
-const SAME_AGENT_AB = CONTROL_AGENT_ID === TREATMENT_AGENT_ID;
+const CONTROL_AGENT_ID = 'agent_q1_writing_control';
+const ACTIVE_CONTROL_AGENT_ID = process.env.Q1_CONTROL_AGENT_ID || CONTROL_AGENT_ID;
+const TREATMENT_AGENT_ID = 'agent_skill_demo_a_docs';
+const ACTIVE_TREATMENT_AGENT_ID = process.env.Q1_TREATMENT_AGENT_ID || TREATMENT_AGENT_ID;
+const SAME_AGENT_AB = ACTIVE_CONTROL_AGENT_ID === ACTIVE_TREATMENT_AGENT_ID;
 const ORDER_SEED = process.env.Q1_ORDER_SEED || 'q1-writing-default';
 const CERTIFICATION_RUN_ID = process.env.Q1_CERTIFICATION_RUN_ID || '';
 const WRITING_BENCHMARK = process.env.Q1_WRITING_BENCHMARK || 'matched-v1';
@@ -419,7 +421,7 @@ async function importWritingSkill(page: Page): Promise<SkillIdentity> {
       | { items?: Array<{ id: string; name: string }> };
     const rows = Array.isArray(body) ? body : (body.items || []);
     return rows.find((item) => item.name === name)?.id || '';
-  }, { agentId: TREATMENT_AGENT_ID, name: source.name, tenantId: TENANT_ID });
+  }, { agentId: ACTIVE_TREATMENT_AGENT_ID, name: source.name, tenantId: TENANT_ID });
   expect(skillId).not.toBe('');
   return {
     id: skillId,
@@ -900,7 +902,7 @@ async function runScenario(
   // 前一轮 waiting 或流式组件残留影响下一组独立会话。
   await page.goto('/enterprise/dashboard');
   await page.waitForLoadState('domcontentloaded');
-  const agentId = variant === 'treatment' ? TREATMENT_AGENT_ID : CONTROL_AGENT_ID;
+  const agentId = variant === 'treatment' ? ACTIVE_TREATMENT_AGENT_ID : ACTIVE_CONTROL_AGENT_ID;
   await loginAsMember(page, agentId);
   const sessionId = await createSession(page, `Q1 ${scenario}`, agentId);
   await page.goto(`/workspace/chat/${sessionId}`);
@@ -996,7 +998,7 @@ test('Q1 writing-for-agents 四象限真实模型探索批', async ({ page }, te
   /** 按固定 seed 交错执行四象限，避免固定 control 先行造成顺序偏差。 */
 
   await page.goto('/enterprise/dashboard');
-  await loginAsMember(page, CONTROL_AGENT_ID);
+  await loginAsMember(page, ACTIVE_CONTROL_AGENT_ID);
   const onlyScenario = process.env.Q1_ONLY_SCENARIO?.trim() || '';
   const scenarios = [
     { variant: 'control' as const, inputMode: 'inline' as const },
@@ -1011,7 +1013,7 @@ test('Q1 writing-for-agents 四象限真实模型探索批', async ({ page }, te
   report.execution_order = selected.map((item) => `${item.inputMode}-${item.variant}`);
   for (const item of selected) {
     if (item.variant === 'treatment' && !report.skill) {
-      await loginAsMember(page, TREATMENT_AGENT_ID);
+      await loginAsMember(page, ACTIVE_TREATMENT_AGENT_ID);
       report.skill = await importWritingSkill(page);
     }
     report.scenarios.push(await runScenario(

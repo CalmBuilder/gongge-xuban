@@ -1,4 +1,10 @@
-"""Agency Agents 固定二级分类词表、模式与加载校验。"""
+"""
+@Time       : 2026/08/29 12:00
+@Author     : zhanglp8181
+@File       : taxonomy_schema.py
+@CallChain  : 分类 CLI/API → 版本化 taxonomy JSON → AgentProfile 分类校验
+@Description: 定义 Agency Agents 分类词表、版本继承规则与跨版本加载校验。
+"""
 
 from __future__ import annotations
 
@@ -10,8 +16,12 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 
 AGENCY_AGENTS_SOURCE_COMMIT = "459dce837db3bdfdc4763d3fefd1fd854e73c8f1"
+AGENCY_AGENTS_CURRENT_SOURCE_COMMIT = "3c9588880b7cafaec325a104899fd8bbe27e7d72"
 DEFAULT_TAXONOMY_PATH = (
     Path(__file__).resolve().parent / "data" / "agency_agents_taxonomy_v1.json"
+)
+TAXONOMY_V2_PATH = (
+    Path(__file__).resolve().parent / "data" / "agency_agents_taxonomy_v2.json"
 )
 
 AGENCY_AGENTS_TAXONOMY: dict[str, frozenset[str]] = {
@@ -92,13 +102,14 @@ class TaxonomyEntry(BaseModel):
 
 
 class TaxonomyDocument(BaseModel):
-    """一版完整的 Agency Agents 分类文档。"""
+    """一版完整或基于旧版本增量继承的 Agency Agents 分类文档。"""
 
     model_config = ConfigDict(frozen=True)
 
-    version: Literal[1]
+    version: Literal[1, 2]
     source_code: Literal["agency-agents"]
-    source_commit: Literal[AGENCY_AGENTS_SOURCE_COMMIT]
+    source_commit: str
+    base_taxonomy: str | None = None
     experts: list[TaxonomyEntry]
 
 
@@ -173,8 +184,9 @@ def load_agency_agents_taxonomy(
     path: Path | None = None,
     *,
     expected_count: int | None = 263,
+    _seen_paths: frozenset[Path] = frozenset(),
 ) -> TaxonomyDocument:
-    """读取并完整校验版本化分类文档。"""
+    """读取并完整校验版本化分类文档，必要时解析同目录的安全基线继承。"""
 
     source = path or DEFAULT_TAXONOMY_PATH
     try:
@@ -182,6 +194,46 @@ def load_agency_agents_taxonomy(
         taxonomy = TaxonomyDocument.model_validate(value)
     except (OSError, json.JSONDecodeError, ValidationError) as exc:
         raise ExpertTaxonomyError(f"Invalid taxonomy document: {exc}") from exc
+    expected_commit = {
+        1: AGENCY_AGENTS_SOURCE_COMMIT,
+        2: AGENCY_AGENTS_CURRENT_SOURCE_COMMIT,
+    }[taxonomy.version]
+    if taxonomy.source_commit != expected_commit:
+        raise ExpertTaxonomyError(
+            f"Taxonomy version {taxonomy.version} must use source commit {expected_commit}"
+        )
+    resolved_source = source.resolve()
+    if resolved_source in _seen_paths:
+        raise ExpertTaxonomyError(f"Taxonomy inheritance cycle: {source}")
+    if taxonomy.base_taxonomy:
+        base_name = PurePosixPath(taxonomy.base_taxonomy)
+        if (
+            base_name.is_absolute()
+            or ".." in base_name.parts
+            or base_name.name != taxonomy.base_taxonomy
+            or base_name.suffix != ".json"
+        ):
+            raise ExpertTaxonomyError(f"Invalid base taxonomy path: {taxonomy.base_taxonomy}")
+        base = load_agency_agents_taxonomy(
+            source.parent / base_name.name,
+            expected_count=None,
+            _seen_paths=_seen_paths | {resolved_source},
+        )
+        if base.source_code != taxonomy.source_code or base.version >= taxonomy.version:
+            raise ExpertTaxonomyError("Taxonomy base must be an older version of the same source")
+        override_paths = {entry.upstream_path for entry in taxonomy.experts}
+        taxonomy = taxonomy.model_copy(
+            update={
+                "experts": [
+                    *[
+                        entry
+                        for entry in base.experts
+                        if entry.upstream_path not in override_paths
+                    ],
+                    *taxonomy.experts,
+                ],
+            }
+        )
     if expected_count is not None and len(taxonomy.experts) != expected_count:
         raise ExpertTaxonomyError(
             f"Expected {expected_count} taxonomy entries, got {len(taxonomy.experts)}"
