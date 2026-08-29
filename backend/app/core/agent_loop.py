@@ -39,7 +39,7 @@ from app.core.cancellation import (
     clear_chat_turn_cancelled,
     raise_if_cancelled,
 )
-from app.core.conversation_context import build_conversation_context
+from app.core.conversation_context import ConversationContextSettings, build_conversation_context
 from app.core.non_sop_capability import (
     LlmDynamicTaskShadowSelector,
     NonSopCapabilityDecision,
@@ -100,7 +100,9 @@ from app.knowledge.access import (
     resolve_knowledge_access,
 )
 from app.knowledge.citations import (
+    SOURCE_FOOTER_PATTERN,
     compact_knowledge_citation_labels,
+    knowledge_citation_identity,
     knowledge_citations_from_results,
     restore_truncated_atomic_references,
 )
@@ -327,6 +329,7 @@ class AgentLoop:
         self.deterministic_runtime = DeterministicSopCoordinator(db)
         self.memory = MemoryService(db)
         self._validated_general_skill_calls: set[tuple[str, str, str]] = set()
+        self._conversation_context_settings_by_tenant: dict[str, ConversationContextSettings] = {}
         self._active_cancellation_token: TurnCancellationToken | None = None
 
     def _active_turn_cancel_callback(self) -> Callable[[], bool] | None:
@@ -2106,6 +2109,7 @@ class AgentLoop:
         try:
             chat_session = self._get_or_create_session(request)
             stable_session_id = chat_session.id
+            self._assert_agent_available_for_final_write(chat_session, request.tenant_id)
             self._mark_session_running(chat_session)
             yield self._stream_event(
                 "session_created",
@@ -3052,6 +3056,10 @@ class AgentLoop:
         if user_message_id:
             payload = self._turn_payload(payload, user_message_id)
             if phase != "received":
+                self._assert_agent_available_for_final_write(
+                    chat_session,
+                    chat_session.tenant_id,
+                )
                 self.events.record(
                     chat_session.tenant_id, chat_session.id, "stream_status", payload
                 )
@@ -3070,6 +3078,27 @@ class AgentLoop:
     ) -> dict[str, object]:
         """投影单个 SSE 事件，并以持久取消事实阻断迟到正文与序号回退。"""
 
+        persisted_stream_events = {
+            "agent_loop_completed",
+            "agent_loop_continued",
+            "general_skill_run_finished",
+            "general_skill_trace",
+            "knowledge_result",
+            "reflection_decision",
+            "skill_state",
+            "step_result",
+            "stream_delta",
+            "stream_replace",
+            "stream_end",
+            "tool_result",
+        }
+        if kind in persisted_stream_events and (
+            payload.get("turn_id") or payload.get("user_message_id")
+        ):
+            self._assert_agent_available_for_final_write(
+                chat_session,
+                chat_session.tenant_id,
+            )
         if kind == "stream_delta" and (payload.get("turn_id") or payload.get("user_message_id")):
             turn_id = str(payload.get("turn_id") or payload.get("user_message_id"))
             lock_result = self.db.exec(
@@ -3128,20 +3157,6 @@ class AgentLoop:
             next_sequence = max(int(sequence_by_turn.get(turn_id, 0)), persisted_sequence) + 1
             sequence_by_turn[turn_id] = next_sequence
             payload = {**payload, "seq": next_sequence}
-        persisted_stream_events = {
-            "agent_loop_completed",
-            "agent_loop_continued",
-            "general_skill_run_finished",
-            "general_skill_trace",
-            "knowledge_result",
-            "reflection_decision",
-            "skill_state",
-            "step_result",
-            "stream_delta",
-            "stream_replace",
-            "stream_end",
-            "tool_result",
-        }
         if kind in persisted_stream_events and (
             payload.get("turn_id") or payload.get("user_message_id")
         ):
@@ -3187,6 +3202,7 @@ class AgentLoop:
                 status_callback(phase, payload or {})
 
         chat_session = self._get_or_create_session(request)
+        self._assert_agent_available_for_final_write(chat_session, request.tenant_id)
         self._mark_session_running(chat_session)
         status("received", {"session_id": chat_session.id})
         user_message = self._append_message(
@@ -3620,6 +3636,7 @@ class AgentLoop:
         active_skill: Skill | None,
         step_result: StepAgentResult,
     ) -> HumanHandoffRequest:
+        self._assert_agent_available_for_final_write(chat_session, tenant_id)
         existing = self.db.exec(
             select(HumanHandoffRequest)
             .where(HumanHandoffRequest.tenant_id == tenant_id)
@@ -7314,27 +7331,56 @@ class AgentLoop:
         return None
 
     def _get_or_create_session(self, request: ChatTurnRequest) -> ChatSession:
-        """获取本轮会话；首次创建或绑定员工时固化非敏感能力版本锚点。"""
+        """校验租户和活动 Agent 后获取会话，拒绝墓碑 Agent 重新进入 Agent Loop。"""
 
         session_id = request.session_id or new_id("session")
         chat_session = self.db.get(ChatSession, session_id)
         if not chat_session:
+            agent = self._active_request_agent(request.agent_id, request.tenant_id)
             chat_session = ChatSession(
                 id=session_id,
                 tenant_id=request.tenant_id,
                 user_id=request.user_id,
                 agent_id=request.agent_id,
             )
-            agent = self.db.get(AgentProfile, request.agent_id) if request.agent_id else None
-            if agent and agent.tenant_id == request.tenant_id:
+            if agent is not None:
                 anchor_chat_session(self.db, chat_session, agent, origin="direct")
             self.db.add(chat_session)
             self.db.flush()
-        elif not chat_session.agent_id and request.agent_id:
-            agent = self.db.get(AgentProfile, request.agent_id)
-            if agent and agent.tenant_id == request.tenant_id:
+        else:
+            if chat_session.tenant_id != request.tenant_id:
+                raise AgentLoopPreconditionError("session_tenant_mismatch", "会话不属于当前租户。")
+            if (
+                chat_session.agent_id
+                and request.agent_id
+                and chat_session.agent_id != request.agent_id
+            ):
+                raise AgentLoopPreconditionError("session_agent_mismatch", "会话已绑定其他数字员工。")
+            agent = self._active_request_agent(
+                chat_session.agent_id or request.agent_id,
+                request.tenant_id,
+            )
+            if not chat_session.agent_id and request.agent_id and agent is not None:
                 anchor_chat_session(self.db, chat_session, agent, origin="direct")
         return chat_session
+
+    def _active_request_agent(
+        self,
+        agent_id: str | None,
+        tenant_id: str,
+    ) -> AgentProfile | None:
+        """读取请求或会话的 Agent，并以 active 状态作为进入执行链的必要条件。"""
+
+        if not agent_id:
+            return None
+        agent = self.db.get(AgentProfile, agent_id)
+        if (
+            agent is None
+            or agent.tenant_id != tenant_id
+            or agent.status != "active"
+        ):
+            raise AgentLoopPreconditionError("agent_unavailable", "数字员工当前不可用。")
+        return agent
 
     def _finish_stale_completed_skill(
         self, tenant_id: str, chat_session: ChatSession, skills: list[Skill]
@@ -7578,6 +7624,22 @@ class AgentLoop:
         row = self.db.get(UIConfig, tenant_id)
         value = row.agent_loop_max_actions if row else MAX_TOOL_ACTIONS_PER_TURN
         return max(1, min(int(value), 20))
+
+    def _get_conversation_context_settings(
+        self, tenant_id: str
+    ) -> ConversationContextSettings:
+        """读取租户上下文压缩配置，并在单次 AgentLoop 生命周期内复用安全快照。"""
+
+        cache = getattr(self, "_conversation_context_settings_by_tenant", {})
+        cached = cache.get(tenant_id)
+        if cached is not None:
+            return cached
+        db = getattr(self, "db", None)
+        row = db.get(UIConfig, tenant_id) if hasattr(db, "get") else None
+        settings = ConversationContextSettings.from_ui_config(row)
+        cache[tenant_id] = settings
+        self._conversation_context_settings_by_tenant = cache
+        return settings
 
     def _list_published_skills(self, tenant_id: str, agent_id: str | None = None) -> list[Skill]:
         return visible_published_skills(self.db, tenant_id, agent_id)
@@ -8752,7 +8814,9 @@ class AgentLoop:
         model_config: ModelConfig | None = None,
     ) -> dict[str, object]:
         if not hasattr(self, "db") or not hasattr(self.db, "exec"):
-            return build_conversation_context([])
+            return build_conversation_context(
+                [], settings=self._get_conversation_context_settings(chat_session.tenant_id)
+            )
         rows = list(
             self.db.exec(
                 select(Message)
@@ -8769,6 +8833,7 @@ class AgentLoop:
             summary_builder=self._context_summary_builder(model_config)
             if model_config
             else None,
+            settings=self._get_conversation_context_settings(chat_session.tenant_id),
         )
         latest_user = next((row for row in reversed(rows) if row.role == "user"), None)
         if latest_user is not None and hasattr(self.db, "get") and hasattr(self.db, "add"):
@@ -8893,16 +8958,7 @@ class AgentLoop:
         for citation in citations:
             if not isinstance(citation, dict):
                 continue
-            identity = str(
-                citation.get("title")
-                or citation.get("section_path")
-                or citation.get("summary")
-                or citation.get("excerpt")
-                or citation.get("source_path")
-                or citation.get("concept_id")
-                or citation.get("id")
-                or ""
-            )
+            identity = knowledge_citation_identity(citation)
             key = re.sub(r"\s+", " ", identity).strip().lower()
             if not key or key in seen:
                 continue
@@ -8942,6 +8998,7 @@ class AgentLoop:
 
         if not user_message_id:
             return None
+        self._assert_agent_available_for_final_write(chat_session, tenant_id)
         user_message = self.db.get(Message, user_message_id)
         if (
             not user_message
@@ -9338,6 +9395,7 @@ class AgentLoop:
     ) -> str:
         """规范化并持久化唯一最终回复，返回消息与事件实际使用的文本。"""
 
+        self._assert_agent_available_for_final_write(chat_session, tenant_id)
         chat_session.updated_at = utc_now()
         if chat_session.status != "handoff":
             chat_session.status = "active"
@@ -9410,6 +9468,42 @@ class AgentLoop:
         )
         return reply
 
+    def _assert_agent_available_for_final_write(
+        self,
+        chat_session: ChatSession,
+        tenant_id: str,
+    ) -> None:
+        """锁定最终回复所属 Agent，阻断墓碑完成与删除流程竞态中的迟到写。"""
+
+        if chat_session.tenant_id != tenant_id:
+            raise AgentLoopPreconditionError(
+                "TENANT_MISMATCH",
+                "会话与最终回复租户不一致，已拒绝持久化。",
+            )
+        if not chat_session.agent_id or not callable(getattr(self.db, "get", None)):
+            return
+        with self.db.no_autoflush:
+            agent = self.db.exec(
+                select(AgentProfile)
+                .where(
+                    AgentProfile.tenant_id == tenant_id,
+                    AgentProfile.id == chat_session.agent_id,
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            ).first()
+        deletion = (agent.metadata_json or {}).get("agent_deletion") if agent else None
+        deletion_state = deletion.get("state") if isinstance(deletion, dict) else None
+        if (
+            agent is None
+            or agent.status != "active"
+            or deletion_state in {"deleting", "deletion_pending", "deleted"}
+        ):
+            raise AgentLoopPreconditionError(
+                "AGENT_NOT_AVAILABLE",
+                "数字员工当前不可用，已拒绝迟到回复。",
+            )
+
     def _mark_session_running(self, chat_session: ChatSession) -> None:
         if chat_session.status == "handoff":
             return
@@ -9427,22 +9521,19 @@ class AgentLoop:
     def _normalize_reply_citation_labels(self, reply: str, citations: object) -> str:
         if not isinstance(citations, list) or not citations:
             return reply
-        max_label = len(citations)
+        supported_labels: set[int] = set()
+        for index, citation in enumerate(citations, start=1):
+            if not isinstance(citation, dict):
+                continue
+            match = re.fullmatch(r"\[(\d+)\]", str(citation.get("label") or "").strip())
+            supported_labels.add(int(match.group(1)) if match else index)
 
         def replace(match: re.Match[str]) -> str:
-            try:
-                value = int(match.group(1))
-            except ValueError:
-                return match.group(0)
-            if 1 <= value <= max_label:
-                return match.group(0)
-            return f"[{max_label if max_label > 1 else 1}]"
+            return match.group(0) if int(match.group(1)) in supported_labels else ""
 
         return re.sub(r"\[(\d+)\]", replace, reply)
 
     def _strip_trailing_citation_summary(self, reply: str) -> str:
-        return re.sub(
-            r"(?:\n|\s){0,3}(?:参考资料|引用来源|资料来源)\s*[:：]\s*(?:\[\d+\]\s*)+$",
-            "",
-            reply.rstrip(),
-        ).rstrip()
+        """移除模型重复生成的来源尾巴，避免与结构化引用卡片重复。"""
+
+        return SOURCE_FOOTER_PATTERN.sub("", reply.rstrip()).rstrip()

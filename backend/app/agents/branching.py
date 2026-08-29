@@ -370,7 +370,25 @@ def visible_skill_rows(
     agent_id: str | None = None,
     include_inactive: bool = True,
 ) -> list[Skill]:
-    agent = get_agent(db, tenant_id, agent_id)
+    """返回租户或指定活动 Agent 可见的 Skill，归档 Agent 不再暴露资源。"""
+
+    if agent_id:
+        agent = db.exec(
+            select(AgentProfile).where(
+                AgentProfile.tenant_id == tenant_id,
+                AgentProfile.id == agent_id,
+            )
+        ).first()
+        deletion = (agent.metadata_json or {}).get("agent_deletion") if agent else None
+        deletion_state = deletion.get("state") if isinstance(deletion, dict) else None
+        if (
+            agent is None
+            or agent.status != "active"
+            or deletion_state in {"deleting", "deletion_pending", "deleted"}
+        ):
+            return []
+    else:
+        agent = None
     if not agent or agent.is_overall:
         status_clause = (
             Skill.status != "deleted" if include_inactive else Skill.status == "published"
@@ -393,6 +411,8 @@ def visible_skill_rows(
                 row, "agent_branch_meta", {"metadata": metadata_by_id.get(row.id, {})}
             )
         return visible_rows
+    if agent.status != "active":
+        return []
     rows: list[Skill] = []
     bindings = db.exec(
         select(AgentResourceBinding).where(
@@ -474,8 +494,12 @@ def visible_tool_rows(
     agent_id: str | None = None,
     include_inactive: bool = True,
 ) -> list[Tool]:
+    """返回租户或指定活动 Agent 可见的 Tool，并阻断归档 Agent 目录读取。"""
+
     agent = get_agent(db, tenant_id, agent_id)
     if agent_id and not agent:
+        return []
+    if agent is not None and agent.status != "active":
         return []
     if not agent or agent.is_overall:
         rows = db.exec(

@@ -29,6 +29,7 @@ from app.scheduled_tasks.schema import (
     ScheduledTaskUpdateRequest,
 )
 from app.scheduled_tasks.service import (
+    archive_scheduled_task,
     create_scheduled_task,
     detect_scheduled_task_draft,
     scheduled_task_read,
@@ -274,12 +275,10 @@ def archive_enterprise_scheduled_task(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_session),
 ) -> dict[str, bool]:
+    """归档任务并在服务端锁序下停止未来唤醒、收敛未绑定 Execution 的运行。"""
+
     row = _get_task(db, tenant_id, task_id, current_user)
-    row.status = "archived"
-    row.next_run_at = None
-    row.updated_at = utc_now()
-    db.add(row)
-    db.commit()
+    archive_scheduled_task(db, row, current_user)
     return {"ok": True}
 
 

@@ -19,6 +19,7 @@ from sqlalchemy.sql.elements import ColumnElement
 from sqlmodel import Session, select
 
 from app.audit.service import append_user_management_audit
+from app.agents.deletion import AgentDeletionService, agent_deletion_state
 from app.agents.schema import (
     AgentGalleryPublicationRequest,
     AgentGalleryFacetsRead,
@@ -431,7 +432,7 @@ def create_agent(
         if request.source_mode == "blank":
             pass
         elif copy_from_agent_id:
-            source_agent = _get_agent(db, request.tenant_id, copy_from_agent_id)
+            source_agent = _get_agent_for_mutation(db, request.tenant_id, copy_from_agent_id)
             _ensure_can_copy_from_agent(source_agent, user)
             row.source_agent_id = source_agent.id
             row.source_agent_version = str(source_agent.profile_revision)
@@ -572,7 +573,7 @@ def update_agent(
     current_user: User = Depends(get_current_user),
 ) -> AgentProfileRead:
     """更新可管理数字员工的普通资料，同时保留服务端治理与责任字段。"""
-    row = _get_agent(db, request.tenant_id, agent_id)
+    row = _get_agent_for_mutation(db, request.tenant_id, agent_id)
     user = current_user
     _ensure_can_manage_agent(row, user)
     if request.name is not None:
@@ -627,13 +628,14 @@ def set_agent_responsibility(
 ) -> AgentProfileRead:
     """设置治理责任组织；该事实不扩展数字员工的可见、执行或知识权限。"""
 
-    row = _get_agent(db, request.tenant_id, agent_id)
+    row = _get_agent_for_mutation(db, request.tenant_id, agent_id)
     ensure_governance_permission(
         db,
         tenant_id=request.tenant_id,
         current_user=current_user,
         permission_code="agent.manage",
     )
+    _ensure_agent_not_tombstoned(row)
     if row.is_overall:
         raise HTTPException(
             status_code=422,
@@ -703,13 +705,14 @@ def set_agent_gallery_publication(
     current_user: User = Depends(get_current_user),
 ) -> AgentProfileRead:
     """由租户管理员执行数字员工广场发布或下架，并记录真实治理操作者。"""
-    row = _get_agent(db, request.tenant_id, agent_id)
+    row = _get_agent_for_mutation(db, request.tenant_id, agent_id)
     ensure_governance_permission(
         db,
         tenant_id=request.tenant_id,
         current_user=current_user,
         permission_code="agent.manage",
     )
+    _ensure_agent_not_tombstoned(row)
     if row.is_overall:
         raise HTTPException(status_code=400, detail="Overall agent cannot be published to gallery")
     before = {
@@ -772,19 +775,29 @@ def delete_agent(
     tenant_id: str = Query(...),
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
-) -> dict[str, str]:
-    row = _get_agent(db, tenant_id, agent_id)
-    _ensure_can_manage_agent(row, current_user)
+) -> dict[str, object]:
+    row = _get_agent_for_mutation(db, tenant_id, agent_id)
+    _ensure_can_manage_agent(row, current_user, allow_tombstone=True)
     if row.is_overall:
         raise HTTPException(status_code=400, detail="Overall agent cannot be deleted")
-    bindings = db.exec(
-        select(AgentResourceBinding).where(AgentResourceBinding.agent_id == row.id)
-    ).all()
-    for binding in bindings:
-        db.delete(binding)
-    db.delete(row)
+    before_status = row.status
+    result = AgentDeletionService(db).delete(row, actor_user_id=current_user.id)
+    append_user_management_audit(
+        db,
+        current_user=current_user,
+        tenant_id=tenant_id,
+        permission_code="agent.manage",
+        action="agent.delete",
+        action_kind="delete",
+        outcome="success" if result.status == "deleted" else "pending",
+        resource_type="agent_profile",
+        resource_id=row.id,
+        before={"status": before_status},
+        after=result.as_dict(),
+        detail={"lifecycle": "tombstone_first"},
+    )
     db.commit()
-    return {"status": "deleted"}
+    return result.as_dict()
 
 
 @enterprise_router.get("/{agent_id}/resources", response_model=list[AgentResourceBindingRead])
@@ -812,7 +825,7 @@ def update_agent_resources(
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> list[AgentResourceBindingRead]:
-    agent = _get_agent(db, request.tenant_id, agent_id)
+    agent = _get_agent_for_mutation(db, request.tenant_id, agent_id)
     _ensure_can_manage_agent(agent, current_user)
     if agent.is_overall:
         raise HTTPException(status_code=400, detail="Overall agent uses the global resource pool")
@@ -882,8 +895,13 @@ def _import_agent_resources_once(
     db: Session,
     current_user: User | object,
 ) -> dict[str, object]:
-    target_agent = _get_agent(db, request.tenant_id, agent_id)
-    source_agent = _get_agent(db, request.tenant_id, request.source_agent_id)
+    agents = _get_agents_for_mutation(
+        db,
+        request.tenant_id,
+        (agent_id, request.source_agent_id),
+    )
+    target_agent = agents[agent_id]
+    source_agent = agents[request.source_agent_id]
     user = current_user
     _ensure_can_import_to_agent(target_agent, user)
     _ensure_can_copy_from_agent(source_agent, user)
@@ -970,7 +988,7 @@ def sync_agent_skill_from_overall(
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> dict[str, object]:
-    agent = _get_agent(db, tenant_id, agent_id)
+    agent = _get_agent_for_mutation(db, tenant_id, agent_id)
     _ensure_can_manage_agent(agent, current_user)
     if agent.is_overall:
         raise HTTPException(status_code=400, detail="Overall agent is already the trunk")
@@ -993,7 +1011,8 @@ def promote_agent_skill_to_overall(
     current_user: User = Depends(get_current_user),
 ) -> dict[str, object]:
     _ensure_admin_user(tenant_id, current_user)
-    agent = _get_agent(db, tenant_id, agent_id)
+    agent = _get_agent_for_mutation(db, tenant_id, agent_id)
+    _ensure_agent_not_tombstoned(agent)
     if agent.is_overall:
         raise HTTPException(
             status_code=400, detail="Overall agent does not have a branch to promote"
@@ -1020,7 +1039,7 @@ def rollback_agent_skill(
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> dict[str, object]:
-    agent = _get_agent(db, request.tenant_id, agent_id)
+    agent = _get_agent_for_mutation(db, request.tenant_id, agent_id)
     _ensure_can_manage_agent(agent, current_user)
     if agent.is_overall:
         raise HTTPException(
@@ -1068,7 +1087,7 @@ def update_agent_models(
 ) -> dict[str, object]:
     """更新模型角色绑定，并仅在有效能力配置变化时递增资料版本。"""
 
-    agent = _get_agent(db, request.tenant_id, agent_id)
+    agent = _get_agent_for_mutation(db, request.tenant_id, agent_id)
     _ensure_can_manage_agent(agent, current_user)
     changed = False
     for item in request.bindings:
@@ -1152,7 +1171,7 @@ def use_chat_agent(
     if tenant_id != current_user.tenant_id:
         raise HTTPException(status_code=403, detail="Tenant mismatch")
     ensure_tenant(db, tenant_id)
-    row = _get_agent(db, tenant_id, agent_id)
+    row = _get_agent_for_mutation(db, tenant_id, agent_id)
     if (
         row.is_overall
         or row.status != "active"
@@ -1860,20 +1879,43 @@ def _ensure_can_access_agent(row: AgentProfile, user: User) -> None:
 
 def _ensure_can_copy_from_agent(row: AgentProfile, user: User) -> None:
     _ensure_request_tenant(row.tenant_id, user)
+    _ensure_agent_not_tombstoned(row)
     if row.is_overall or _agent_owned_by_user(row, user) or _agent_published_to_gallery(row):
         return
     raise HTTPException(status_code=403, detail="Cannot copy resources from this agent")
 
 
-def _ensure_can_manage_agent(row: AgentProfile, user: User) -> None:
+def _ensure_can_manage_agent(
+    row: AgentProfile,
+    user: User,
+    *,
+    allow_tombstone: bool = False,
+) -> None:
     _ensure_request_tenant(row.tenant_id, user)
     if row.is_overall:
         if _is_admin_user(user):
             return
         raise HTTPException(status_code=403, detail="Only administrator can manage overall agent")
     if _agent_owned_by_user(row, user):
+        if not allow_tombstone:
+            _ensure_agent_not_tombstoned(row)
         return
     raise HTTPException(status_code=403, detail="Only the owner can manage this staff")
+
+
+def _ensure_agent_not_tombstoned(row: AgentProfile) -> None:
+    """阻断删除墓碑的所有普通管理写入，避免 PUT 或治理命令复活 Agent。"""
+
+    state = agent_deletion_state(row)
+    if state is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "AGENT_TOMBSTONE_IMMUTABLE",
+                "message": "数字员工已进入不可逆删除流程，不能恢复或继续修改。",
+                "state": state,
+            },
+        )
 
 
 def _ensure_can_import_to_agent(row: AgentProfile, user: User) -> None:
@@ -2548,6 +2590,51 @@ def _get_agent(db: Session, tenant_id: str, agent_id: str) -> AgentProfile:
     if not row or row.tenant_id != tenant_id:
         raise HTTPException(status_code=404, detail="Agent not found")
     return row
+
+
+def _get_agent_for_mutation(db: Session, tenant_id: str, agent_id: str) -> AgentProfile:
+    """以 tenant、主键和行锁读取最新 Agent，避免删除提交后被旧快照复活。"""
+
+    ensure_tenant(db, tenant_id)
+    row = db.exec(
+        select(AgentProfile)
+        .where(
+            AgentProfile.tenant_id == tenant_id,
+            AgentProfile.id == agent_id,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    return row
+
+
+def _get_agents_for_mutation(
+    db: Session,
+    tenant_id: str,
+    agent_ids: tuple[str, ...],
+) -> dict[str, AgentProfile]:
+    """按稳定主键顺序锁定多个 Agent，保证资源复制与删除使用一致锁序。"""
+
+    ensure_tenant(db, tenant_id)
+    unique_ids = tuple(sorted(set(agent_ids)))
+    if not unique_ids:
+        return {}
+    rows = db.exec(
+        select(AgentProfile)
+        .where(
+            AgentProfile.tenant_id == tenant_id,
+            AgentProfile.id.in_(unique_ids),
+        )
+        .order_by(AgentProfile.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).all()
+    by_id = {row.id: row for row in rows}
+    if len(by_id) != len(unique_ids):
+        raise HTTPException(status_code=404, detail="Agent not found")
+    return by_id
 
 
 def _bindings_by_agent(

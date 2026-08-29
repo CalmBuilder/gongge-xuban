@@ -97,6 +97,7 @@ def process_one_outbound(*, worker_id: str) -> bool:
             if refreshed is not None and refreshed.lease_owner == worker_id:
                 service.finish_delivery(
                     refreshed,
+                    worker_id=worker_id,
                     status="dead_letter",
                     error_code=exc.code,
                 )

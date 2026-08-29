@@ -27,6 +27,7 @@ from sqlmodel import Session, select
 
 from app.audit.service import append_management_audit
 from app.db.models import (
+    AgentProfile,
     AgentResourceBinding,
     GeneralSkill,
     GeneralSkillDependency,
@@ -151,6 +152,7 @@ class GeneralSkillImportService:
             request.target_agent_id,
             current_user,
         )
+        self._lock_active_target_agent(request.tenant_id, request.target_agent_id)
         target_skill = self._validated_upgrade_target(request, current_user)
         key = _validated_idempotency_key(idempotency_key)
         if request.filename is None:
@@ -331,6 +333,7 @@ class GeneralSkillImportService:
             job.target_agent_id,
             current_user,
         )
+        self._lock_active_target_agent(job.tenant_id, job.target_agent_id)
         confirmation_checksum = _confirmation_request_checksum(request)
         if job.status == ImportJobStatus.INSTALLED:
             if job.preview_json.get("confirmation_request_checksum") == confirmation_checksum:
@@ -613,6 +616,7 @@ class GeneralSkillImportService:
             request.target_agent_id,
             current_user,
         )
+        self._lock_active_target_agent(request.tenant_id, request.target_agent_id)
         target_skill = self._validated_upgrade_target(request, current_user)
         key = _validated_idempotency_key(idempotency_key)
         source_url = request.source_url.strip()
@@ -1402,6 +1406,26 @@ class GeneralSkillImportService:
                 "GENERAL_SKILL_NOT_AVAILABLE", "import job is not available", 404
             )
         return job
+
+    def _lock_active_target_agent(self, tenant_id: str, agent_id: str) -> AgentProfile:
+        """在导入确认或创建作业前锁定活动 Agent，避免删除竞态写入新绑定。"""
+
+        agent = self.db.exec(
+            select(AgentProfile)
+            .where(
+                AgentProfile.tenant_id == tenant_id,
+                AgentProfile.id == agent_id,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        ).first()
+        if agent is None or agent.status != "active":
+            raise GeneralSkillImportError(
+                "GENERAL_SKILL_FORBIDDEN",
+                "target agent is not active",
+                409,
+            )
+        return agent
 
     def _install_candidate(
         self,

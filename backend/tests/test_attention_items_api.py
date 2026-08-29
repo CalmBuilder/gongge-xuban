@@ -20,7 +20,7 @@ from app.api.attention_items import (
     resolve_attention_item,
 )
 from app.api.work_items import list_work_items
-from app.db.models import ExecutionSignal, SopInstance, Tenant, User
+from app.db.models import AgentProfile, ExecutionSignal, SopInstance, Tenant, User
 from app.sop_runtime.execution_control import ExecutionControlService
 from app.sop_runtime.execution_store import SopExecutionStore
 
@@ -43,6 +43,14 @@ def _seed_attention(db: Session):
     """创建动态 Execution、候选人、旁观者和一条 clarification Attention。"""
 
     db.add(Tenant(id="tenant_demo", name="Demo"))
+    db.add(
+        AgentProfile(
+            id="agent_demo",
+            tenant_id="tenant_demo",
+            name="Attention agent",
+            status="active",
+        )
+    )
     candidate = User(
         id="user_candidate",
         tenant_id="tenant_demo",

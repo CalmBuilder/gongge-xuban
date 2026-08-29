@@ -22,6 +22,7 @@ from app.api.executions import (
     issue_execution_command,
 )
 from app.db.models import (
+    AgentProfile,
     DynamicReadDispatchBatch,
     DynamicReadDispatchItem,
     DynamicReadDispatchResult,
@@ -57,6 +58,14 @@ def _seed_execution(db: Session, *, suffix: str = "cancel"):
 
     if db.get(Tenant, "tenant_demo") is None:
         db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.add(
+            AgentProfile(
+                id="agent_demo",
+                tenant_id="tenant_demo",
+                name="Execution API agent",
+                status="active",
+            )
+        )
         db.add(
             User(
                 id="user_owner",

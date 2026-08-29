@@ -138,6 +138,12 @@ def resolve_attention_item(
     control = ExecutionControlService(db, store)
     worker_id = f"attention-{item.id[-16:]}"
     was_completed = item.status == "completed"
+    reconciliation_attention = control.is_external_reconciliation_attention(instance, item)
+    lease_context = (
+        store.owned_for_reconciliation(instance, worker_id=worker_id)
+        if reconciliation_attention
+        else store.owned(instance, worker_id=worker_id)
+    )
     try:
         replay = control.replayed_attention_resolution(
             item,
@@ -147,7 +153,7 @@ def resolve_attention_item(
         )
         if replay is not None:
             return _attention_read(db, item, current_user.id)
-        with store.owned(instance, worker_id=worker_id):
+        with lease_context:
             _, completed = control.resolve_attention(
                 instance,
                 item,

@@ -372,15 +372,15 @@ def test_handbook_s5_apply_step_result_merges_slots_and_repairs_invalid_next_ste
 # ---------------------------------------------------------------- §4.4 收尾
 
 
-def test_handbook_s4_reply_citation_labels_are_clamped() -> None:
-    """§4.4：回复中越界的引用编号收敛到实际引用数，合法编号保留。"""
+def test_handbook_s4_reply_citation_labels_remove_unsupported_references() -> None:
+    """§4.4：回复中没有证据的引用编号删除，合法编号保留。"""
     loop = _loop_off_init()
     citations = [{"label": "员工手册"}, {"label": "考勤制度"}]
     reply = "按制度[1]执行，另见[2]，以及编造来源[9]。"
     normalized = loop._normalize_reply_citation_labels(reply, citations)
     assert "[1]" in normalized and "[2]" in normalized
     assert "[9]" not in normalized
-    assert normalized.count("[2]") == 2  # [9] 被收敛为 [2]
+    assert normalized.count("[2]") == 1  # [9] 没有对应证据，不能改写成其他来源
     # 无引用时不做处理
     assert loop._normalize_reply_citation_labels(reply, []) == reply
 

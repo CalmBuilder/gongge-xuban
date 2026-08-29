@@ -242,7 +242,7 @@ def issue_execution_command(
             source_message_id=request.source_message_id,
         )
         if command.command_type == "cancel" and command.status == "pending":
-            with store.owned(
+            with store.owned_for_cancellation(
                 instance,
                 worker_id=f"command-{command.id[-16:]}",
             ):

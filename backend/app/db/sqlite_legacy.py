@@ -139,6 +139,21 @@ def migrate_sqlite_skill_schema(engine: Engine) -> None:
                 conn.execute(
                     text("ALTER TABLE ui_configs ADD COLUMN agent_loop_max_actions INTEGER NOT NULL DEFAULT 6")
                 )
+            if "context_token_budget" not in ui_columns:
+                conn.execute(
+                    text("ALTER TABLE ui_configs ADD COLUMN context_token_budget INTEGER NOT NULL DEFAULT 32000")
+                )
+            if "context_compaction_trigger_ratio" not in ui_columns:
+                conn.execute(
+                    text(
+                        "ALTER TABLE ui_configs ADD COLUMN "
+                        "context_compaction_trigger_ratio FLOAT NOT NULL DEFAULT 0.7"
+                    )
+                )
+            if "context_recent_round_limit" not in ui_columns:
+                conn.execute(
+                    text("ALTER TABLE ui_configs ADD COLUMN context_recent_round_limit INTEGER NOT NULL DEFAULT 6")
+                )
 
         if "skill_feedback" in tables:
             feedback_columns = {column["name"] for column in inspector.get_columns("skill_feedback")}

@@ -1,3 +1,11 @@
+"""
+@Time       : 2026/08/28
+@Author     : zhanglp8181
+@File       : skill_distiller.py
+@CallChain  : Skill 蒸馏 API → SkillDistiller → 模型生成、闭环校验和工具建议
+@Description: 将原始流程整理为可执行 Skill，并在目录与模型输出边界保持安全和可回归。
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -10,6 +18,12 @@ from urllib.parse import urlparse
 from app import paths
 from app.db.models import ModelConfig
 from app.llm import LLMClient, LLMError
+from app.skills.generation_safety import (
+    sanitize_generation_schema,
+    sanitize_generation_text,
+    sanitize_generation_url,
+    sanitize_generation_value,
+)
 from app.skills.llm_limits import skill_model_config
 from app.skills.skill_reflection import reflect_skill_response, reflect_skill_response_stream
 from app.skills.skill_schema import SkillDistillRequest, SkillDistillResponse, SkillCard, SkillGraphNode, ToolSuggestion
@@ -344,7 +358,9 @@ class SkillDistiller:
             warnings=_compact_warnings(warnings),
             tool_suggestions=tool_suggestions,
         )
-        return response
+        return SkillDistillResponse.model_validate(
+            sanitize_generation_value(response.model_dump(mode="json"))
+        )
 
     def _ensure_closed_loop_nodes(
         self, nodes: list[dict[str, Any]], request: SkillDistillRequest
@@ -696,12 +712,16 @@ def _compact_available_tools(
         if not name or name in seen_names:
             continue
         seen_names.add(name)
-        description = _limited_text(tool.get("description"), MODEL_TOOL_DESCRIPTION_CHAR_LIMIT)
+        description = sanitize_generation_text(
+            _limited_text(tool.get("description"), MODEL_TOOL_DESCRIPTION_CHAR_LIMIT)
+        )
         projected: dict[str, Any] = {
             "name": name,
-            "display_name": _limited_text(tool.get("display_name"), 120),
+            "display_name": sanitize_generation_text(_limited_text(tool.get("display_name"), 120)),
             "description": description,
-            "input_schema": _compact_tool_input_schema(tool.get("input_schema")),
+            "input_schema": sanitize_generation_schema(
+                _compact_tool_input_schema(tool.get("input_schema"))
+            ),
         }
         if tool.get("requires_confirmation") is True:
             projected["requires_confirmation"] = True
@@ -1001,53 +1021,81 @@ def _tool_resolution_warnings(suggestions: list[ToolSuggestion]) -> list[str]:
 
 
 def _tool_mention_to_resolution(item: dict[str, Any], request: Any) -> ToolSuggestion | None:
-    name = _string(item.get("name"), "") or _string(item.get("inferred_name"), "")
-    display_name = _string(item.get("display_name"), "") or _string(item.get("label"), "")
-    description = _string(item.get("description"), "") or _string(item.get("purpose"), "")
-    url = _string(item.get("url"), "")
+    name = sanitize_generation_text(
+        _string(item.get("name"), "") or _string(item.get("inferred_name"), "")
+    )
+    display_name = sanitize_generation_text(
+        _string(item.get("display_name"), "") or _string(item.get("label"), "")
+    )
+    description = sanitize_generation_text(
+        _string(item.get("description"), "") or _string(item.get("purpose"), "")
+    )
+    raw_url = _string(item.get("url"), "")
+    url = sanitize_generation_url(raw_url)
     method = _tool_method(item.get("method"), "POST")
-    input_schema = item.get("input_schema")
-    output_schema = item.get("output_schema")
-    source_excerpt = _string(item.get("source_excerpt"), "") or None
-    reason = _string(item.get("reason"), "") or _string(item.get("purpose"), "") or "模型从技能文档中抽取到该工具提及。"
+    input_schema = sanitize_generation_schema(item.get("input_schema"))
+    output_schema = sanitize_generation_schema(item.get("output_schema"))
+    source_excerpt = sanitize_generation_text(_string(item.get("source_excerpt"), "")) or None
+    reason = sanitize_generation_text(
+        _string(item.get("reason"), "")
+        or _string(item.get("purpose"), "")
+        or "模型从技能文档中抽取到该工具提及。"
+    )
 
-    matched_tool = _match_available_tool(name, url, request.available_tools)
+    matched_tool = _match_available_tool(name, raw_url, request.available_tools)
     if matched_tool is not None:
         matched_name = _string(matched_tool.get("name"), name)
         return ToolSuggestion(
-            name=matched_name,
-            display_name=_string(matched_tool.get("display_name"), display_name or matched_name),
-            description=_string(matched_tool.get("description"), description),
+            name=sanitize_generation_text(matched_name),
+            display_name=sanitize_generation_text(
+                _string(matched_tool.get("display_name"), display_name or matched_name)
+            ),
+            description=sanitize_generation_text(_string(matched_tool.get("description"), description)),
             method=_tool_method(matched_tool.get("method"), method),
-            url=_string(matched_tool.get("url"), url),
-            input_schema=matched_tool.get("input_schema") if isinstance(matched_tool.get("input_schema"), dict) else {},
-            output_schema=matched_tool.get("output_schema") if isinstance(matched_tool.get("output_schema"), dict) else {},
-            sample_arguments=item.get("sample_arguments") if isinstance(item.get("sample_arguments"), dict) else {},
+            url=sanitize_generation_url(_string(matched_tool.get("url"), url)),
+            input_schema=sanitize_generation_schema(matched_tool.get("input_schema"))
+            if isinstance(matched_tool.get("input_schema"), dict)
+            else {},
+            output_schema=sanitize_generation_schema(matched_tool.get("output_schema"))
+            if isinstance(matched_tool.get("output_schema"), dict)
+            else {},
+            sample_arguments=sanitize_generation_value(item.get("sample_arguments"))
+            if isinstance(item.get("sample_arguments"), dict)
+            else {},
             source_excerpt=source_excerpt,
-            probe_result=item.get("probe_result") if isinstance(item.get("probe_result"), dict) else None,
+            probe_result=sanitize_generation_value(item.get("probe_result"))
+            if isinstance(item.get("probe_result"), dict)
+            else None,
             reason="已匹配到现有工具配置。",
             resolution_status="existing",
-            matched_tool_id=_string(matched_tool.get("id"), "") or None,
-            matched_tool_name=matched_name,
-            matched_tool_display_name=_string(matched_tool.get("display_name"), "") or None,
+            matched_tool_id=sanitize_generation_text(_string(matched_tool.get("id"), "")) or None,
+            matched_tool_name=sanitize_generation_text(matched_name),
+            matched_tool_display_name=sanitize_generation_text(
+                _string(matched_tool.get("display_name"), "")
+            )
+            or None,
         )
 
     if not name and not display_name and not url:
         return None
 
-    missing_reasons = _tool_mention_missing_reasons(url, input_schema, output_schema, request)
+    missing_reasons = _tool_mention_missing_reasons(raw_url, input_schema, output_schema, request)
     if missing_reasons:
         return ToolSuggestion(
             name=name or _tool_name_from_url(url) or display_name or "incomplete_tool",
             display_name=display_name or name or _tool_name_from_url(url) or "未完整配置的工具",
             description=description,
             method=method,
-            url=url if _tool_suggestion_url_in_source(url, request) else "",
+            url=url if _tool_suggestion_url_in_source(raw_url, request) else "",
             input_schema=input_schema if isinstance(input_schema, dict) else {},
             output_schema=output_schema if isinstance(output_schema, dict) else {},
-            sample_arguments=item.get("sample_arguments") if isinstance(item.get("sample_arguments"), dict) else {},
+            sample_arguments=sanitize_generation_value(item.get("sample_arguments"))
+            if isinstance(item.get("sample_arguments"), dict)
+            else {},
             source_excerpt=source_excerpt,
-            probe_result=item.get("probe_result") if isinstance(item.get("probe_result"), dict) else None,
+            probe_result=sanitize_generation_value(item.get("probe_result"))
+            if isinstance(item.get("probe_result"), dict)
+            else None,
             reason=reason,
             resolution_status="incomplete",
             missing_reason="；".join(missing_reasons),
@@ -1061,9 +1109,13 @@ def _tool_mention_to_resolution(item: dict[str, Any], request: Any) -> ToolSugge
         url=url,
         input_schema=input_schema,
         output_schema=output_schema,
-        sample_arguments=item.get("sample_arguments") if isinstance(item.get("sample_arguments"), dict) else {},
+        sample_arguments=sanitize_generation_value(item.get("sample_arguments"))
+        if isinstance(item.get("sample_arguments"), dict)
+        else {},
         source_excerpt=source_excerpt,
-        probe_result=item.get("probe_result") if isinstance(item.get("probe_result"), dict) else None,
+        probe_result=sanitize_generation_value(item.get("probe_result"))
+        if isinstance(item.get("probe_result"), dict)
+        else None,
         reason=reason,
         resolution_status="new_candidate",
     )

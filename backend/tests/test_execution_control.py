@@ -17,6 +17,7 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, select
 
 from app.db.models import (
+    AgentProfile,
     AgentEvent,
     EventOutbox,
     ExecutionCommand,
@@ -53,6 +54,13 @@ def db() -> Session:
 def _instance(db: Session, *, suffix: str = "one") -> SopInstance:
     """建立可抢占租约的动态 Execution 测试聚合。"""
 
+    db.add(
+        AgentProfile(
+            id="agent_demo",
+            tenant_id="tenant_demo",
+            name="Execution control agent",
+        )
+    )
     instance = SopInstance(
         id=f"sopinst_{suffix}",
         tenant_id="tenant_demo",
@@ -247,8 +255,23 @@ def test_cancellation_discards_ordinary_signal_instead_of_resuming(db: Session) 
         causation_id="timer_cancelled",
     )
     service.claim_signal(signal, worker_id="worker_a")
-    with store.owned(instance, worker_id="worker_a"):
+    with store.owned_for_cancellation(instance, worker_id="worker_a"):
         assert service.consume_signal(instance, signal, worker_id="worker_a") == "discarded"
+
+
+def test_cancellation_requested_execution_cannot_be_claimed_again(db: Session) -> None:
+    """取消请求已落库后，新的 worker 不能重新取得执行租约。"""
+
+    instance = _instance(db, suffix="claim_after_cancel")
+    instance.cancellation_requested_at = utc_now()
+    instance.cancellation_requested_by = "user_owner"
+    instance.cancellation_reason = "user_requested"
+    instance.cancellation_disposition = "requested"
+    db.add(instance)
+    db.commit()
+
+    with pytest.raises(SopExecutionConflictError):
+        SopExecutionStore(db).claim(instance, worker_id="late-worker")
 
 
 def test_stale_worker_cannot_offer_attention_or_freeze_result(db: Session) -> None:
@@ -537,6 +560,7 @@ def test_signal_and_outbox_exhaust_attempt_budget_into_dead_letter(db: Session) 
             error={"code": "PERMANENT"},
         ) == "dead_letter"
 
+    db.refresh(instance)
     service.issue_command(
         instance,
         command_id="outbox_dead",
@@ -608,7 +632,8 @@ def test_cancellation_closes_active_attention_and_discards_all_resume_signals(db
             allowed_commands=["answer"],
             candidate_user_ids=["user_owner"],
         )
-    db.commit()
+        db.commit()
+    db.refresh(instance)
     command, _ = service.issue_command(
         instance,
         command_id="cancel_with_attention",

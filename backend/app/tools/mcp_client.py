@@ -37,6 +37,10 @@ class MCPClientError(RuntimeError):
     pass
 
 
+MCP_TOOLS_LIST_MAX_PAGES = 128
+MCP_TOOLS_LIST_MAX_ITEMS = 2_000
+
+
 # --------------------------------------------------------------------------- #
 # Transport 归一化
 # --------------------------------------------------------------------------- #
@@ -198,12 +202,50 @@ class _MCPSession:
             return _extract_tool_result(result)
 
     def list_tools(self) -> list[dict[str, Any]]:
+        """分页读取完整工具目录，并对恶意或损坏的 cursor 响应快速失败。"""
+
         raise_if_cancelled(self.is_cancelled)
         with self:
             self._initialize()
-            result = self._request("tools/list", {})
-            tools = result.get("tools") if isinstance(result, dict) else None
-            return tools if isinstance(tools, list) else []
+            all_tools: list[dict[str, Any]] = []
+            seen_tool_names: set[str] = set()
+            seen_cursors: set[str] = set()
+            cursor: str | None = None
+            for _page_no in range(MCP_TOOLS_LIST_MAX_PAGES):
+                raise_if_cancelled(self.is_cancelled)
+                params = {"cursor": cursor} if cursor else {}
+                result = self._request("tools/list", params)
+                if not isinstance(result, dict):
+                    raise MCPClientError("MCP tools/list 返回格式无效。")
+                page_tools = result.get("tools")
+                if not isinstance(page_tools, list):
+                    raise MCPClientError("MCP tools/list 缺少 tools 数组。")
+                for item in page_tools:
+                    if not isinstance(item, dict):
+                        raise MCPClientError("MCP tools/list 包含无效工具定义。")
+                    name = str(item.get("name") or "").strip()
+                    if not name:
+                        raise MCPClientError("MCP tools/list 包含空工具名。")
+                    if name in seen_tool_names:
+                        continue
+                    seen_tool_names.add(name)
+                    all_tools.append(item)
+                    if len(all_tools) > MCP_TOOLS_LIST_MAX_ITEMS:
+                        raise MCPClientError("MCP tools/list 工具数量超过安全上限。")
+
+                raw_cursor = result.get("nextCursor")
+                if raw_cursor is None:
+                    raw_cursor = result.get("next_cursor")
+                if raw_cursor is None or str(raw_cursor).strip() == "":
+                    return all_tools
+                if not isinstance(raw_cursor, str):
+                    raise MCPClientError("MCP tools/list nextCursor 格式无效。")
+                next_cursor = raw_cursor.strip()
+                if next_cursor in seen_cursors:
+                    raise MCPClientError("MCP tools/list 返回重复 cursor。")
+                seen_cursors.add(next_cursor)
+                cursor = next_cursor
+            raise MCPClientError("MCP tools/list 分页超过安全上限。")
 
     def _initialize(self) -> None:
         raise_if_cancelled(self.is_cancelled)

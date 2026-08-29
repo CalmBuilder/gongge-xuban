@@ -693,6 +693,30 @@ def _resume_human_handoff_async(handoff_id: str) -> None:
     thread.start()
 
 
+def _active_handoff_agent(
+    db: Session,
+    handoff: HumanHandoffRequest,
+    chat_session: ChatSession,
+) -> AgentProfile | None:
+    """锁定并校验 handoff 的直接或会话 Agent，删除竞态下禁止恢复新一轮对话。"""
+
+    if handoff.agent_id and chat_session.agent_id and handoff.agent_id != chat_session.agent_id:
+        return None
+    agent_id = handoff.agent_id or chat_session.agent_id
+    if not agent_id:
+        return None
+    return db.exec(
+        select(AgentProfile)
+        .where(
+            AgentProfile.tenant_id == handoff.tenant_id,
+            AgentProfile.id == agent_id,
+            AgentProfile.status == "active",
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).first()
+
+
 def _resume_human_handoff_worker(handoff_id: str) -> None:
     try:
         with Session(engine) as db:
@@ -701,6 +725,8 @@ def _resume_human_handoff_worker(handoff_id: str) -> None:
                 return
             chat_session = db.get(ChatSession, handoff.session_id)
             if not chat_session or chat_session.tenant_id != handoff.tenant_id:
+                return
+            if _active_handoff_agent(db, handoff, chat_session) is None:
                 return
             metadata = dict(handoff.metadata_json or {})
             if metadata.get("resume_started_at"):
@@ -725,6 +751,9 @@ def _resume_human_handoff_worker(handoff_id: str) -> None:
             )
             db.commit()
 
+            chat_session = db.get(ChatSession, handoff.session_id)
+            if not chat_session or _active_handoff_agent(db, handoff, chat_session) is None:
+                return
             request = ChatTurnRequest(
                 tenant_id=handoff.tenant_id,
                 session_id=handoff.session_id,
@@ -2034,14 +2063,8 @@ def _persist_chat_turn_cancelled(
     requested_turn_id = requested_turn_id.strip()
     if not requested_turn_id:
         return False
-    db.exec(
-        select(ChatSession)
-        .where(
-            ChatSession.id == chat_session.id,
-            ChatSession.tenant_id == tenant_id,
-        )
-        .with_for_update()
-    ).one()
+    if not _lock_chat_session_lifecycle(db, tenant_id, chat_session):
+        return False
 
     events = db.exec(
         select(AgentEvent)
@@ -2254,6 +2277,8 @@ def _persist_chat_turn_interrupted(
     reason: str,
     error_details: dict[str, object] | None = None,
 ) -> bool:
+    if not _lock_chat_session_lifecycle(db, tenant_id, chat_session):
+        return False
     message_id, client_turn_id = _resolve_turn_ids_from_events(db, tenant_id, chat_session.id, requested_turn_id)
     if not message_id:
         message_id = requested_turn_id.strip()
@@ -2294,6 +2319,45 @@ def _persist_chat_turn_interrupted(
     chat_session.status = "active"
     chat_session.updated_at = now
     db.add(chat_session)
+    return True
+
+
+def _lock_chat_session_lifecycle(
+    db: Session,
+    tenant_id: str,
+    chat_session: ChatSession,
+) -> bool:
+    """按 Agent→ChatSession 锁序校验聊天写入主体仍可用，阻断墓碑后的迟到消息。"""
+
+    if chat_session.tenant_id != tenant_id:
+        return False
+    if chat_session.agent_id:
+        agent = db.exec(
+            select(AgentProfile)
+            .where(
+                AgentProfile.tenant_id == tenant_id,
+                AgentProfile.id == chat_session.agent_id,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        ).first()
+        if agent is None or agent.status != "active":
+            return False
+    current = db.exec(
+        select(ChatSession)
+        .where(
+            ChatSession.id == chat_session.id,
+            ChatSession.tenant_id == tenant_id,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).first()
+    if current is None:
+        return False
+    if current is not chat_session:
+        chat_session.status = current.status
+        chat_session.summary = current.summary
+        chat_session.updated_at = current.updated_at
     return True
 
 
@@ -2914,6 +2978,8 @@ def reply_human_handoff(
     chat_session = db.get(ChatSession, row.session_id)
     if not chat_session or chat_session.tenant_id != request.tenant_id:
         raise HTTPException(status_code=409, detail="Original handoff session is not available")
+    if _active_handoff_agent(db, row, chat_session) is None:
+        raise HTTPException(status_code=409, detail="AGENT_NOT_AVAILABLE")
 
     now = utc_now()
     row.status = "answered"
@@ -3143,7 +3209,15 @@ def _ensure_chat_agent_available(
     if not agent_id:
         raise HTTPException(status_code=400, detail="Agent is required")
     ensure_tenant(db, tenant_id)
-    row = db.get(AgentProfile, agent_id)
+    row = db.exec(
+        select(AgentProfile)
+        .where(
+            AgentProfile.tenant_id == tenant_id,
+            AgentProfile.id == agent_id,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).first()
     if not row or row.tenant_id != tenant_id or row.status != "active" or row.is_overall:
         raise HTTPException(status_code=404, detail="Agent not available")
     if not _chat_agent_visible_to_user(db, row, current_user):
@@ -3160,6 +3234,7 @@ def _bind_request_to_session_agent(
     if chat_session.agent_id:
         if request.agent_id and request.agent_id != chat_session.agent_id:
             raise HTTPException(status_code=409, detail="Session is already bound to another agent")
+        _ensure_chat_agent_available(db, request.tenant_id, chat_session.agent_id, current_user)
         return request.model_copy(update={"agent_id": chat_session.agent_id})
 
     agent = _ensure_chat_agent_available(db, request.tenant_id, request.agent_id, current_user)

@@ -63,6 +63,7 @@ const PRIMARY_NAV: NavItem[] = [
 
 const PROFILE_NAV: NavItem[] = [
   { route: EnterpriseRoute.Dashboard, label: '员工档案', Icon: IconFile },
+  { route: EnterpriseRoute.Persona, label: '岗位人设', Icon: IconEdit },
   { route: EnterpriseRoute.ScheduledTasks, label: '定时任务', Icon: IconAlarm },
   { route: EnterpriseRoute.Memories, label: '记忆', Icon: IconHistory },
   { route: EnterpriseRoute.Feedback, label: '对话日志', Icon: IconCalendar },

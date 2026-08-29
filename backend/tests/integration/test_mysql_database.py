@@ -20,6 +20,8 @@ from sqlalchemy import inspect, text
 from sqlmodel import Session, create_engine, select
 
 from app.api.model_configs import set_default_model_config
+from app.api.ui_config import UIConfigUpdateRequest, get_or_create_ui_config, update_enterprise_ui_config
+from app.core.conversation_context import ConversationContextSettings, build_conversation_context
 from app.db.models import (
     ActionProposalRecord,
     AttachmentUploadDailyUsage,
@@ -51,6 +53,7 @@ from app.db.models import (
     SopOperationEffect,
     SopWorkItem,
     Tenant,
+    UIConfig,
     User,
 )
 from app.dynamic_tasks.artifacts import ArtifactService
@@ -289,6 +292,7 @@ def test_alembic_upgrades_empty_mysql_database(mysql_database_url: str) -> None:
     }
     agent_columns = {item["name"]: item for item in inspector.get_columns("agent_profiles")}
     session_columns = {item["name"]: item for item in inspector.get_columns("sessions")}
+    ui_config_columns = {item["name"] for item in inspector.get_columns("ui_configs")}
     knowledge_columns = {
         item["name"]: item for item in inspector.get_columns("knowledge_bases")
     }
@@ -307,6 +311,11 @@ def test_alembic_upgrades_empty_mysql_database(mysql_database_url: str) -> None:
     assert "uq_agent_resource" in resource_constraints
     assert "uq_model_configs_tenant_default" in model_indexes
     assert model_columns["default_tenant_id"].get("computed") is not None
+    assert {
+        "context_token_budget",
+        "context_compaction_trigger_ratio",
+        "context_recent_round_limit",
+    }.issubset(ui_config_columns)
     assert {
         "membership_status",
         "member_category_code",
@@ -432,6 +441,66 @@ def test_alembic_upgrades_empty_mysql_database(mysql_database_url: str) -> None:
             connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
             == current_head_revision()
         )
+
+
+def test_mysql_context_compaction_config_round_trips_into_runtime(
+    mysql_database_url: str,
+) -> None:
+    """验证 MySQL 8.4 可读写上下文配置，并把租户值传入实际压缩元数据。"""
+
+    upgrade(mysql_database_url)
+    engine = create_engine(mysql_database_url, pool_pre_ping=True)
+    tenant_id = "tenant_context_mysql"
+    admin = User(
+        id="user_context_mysql",
+        tenant_id=tenant_id,
+        username="context-admin",
+        role="admin",
+        password_hash="test-password-hash",
+    )
+    with Session(engine) as db:
+        db.add(Tenant(id=tenant_id, name="MySQL Context Tenant"))
+        db.add(admin)
+        db.commit()
+
+        defaults = get_or_create_ui_config(db, tenant_id)
+        assert defaults.context_token_budget == 32_000
+        updated = update_enterprise_ui_config(
+            UIConfigUpdateRequest(
+                tenant_id=tenant_id,
+                context_token_budget=8_192,
+                context_compaction_trigger_ratio=0.50,
+                context_recent_round_limit=3,
+            ),
+            db,
+            admin,
+        )
+        assert updated.context_token_budget == 8_192
+        assert updated.context_compaction_trigger_ratio == 0.50
+        assert updated.context_recent_round_limit == 3
+
+        stored = db.get(UIConfig, tenant_id)
+        assert stored is not None
+        settings = ConversationContextSettings.from_ui_config(stored)
+        context = build_conversation_context(
+            [
+                {
+                    "id": f"context-message-{index}",
+                    "role": "user" if index % 2 == 0 else "assistant",
+                    "content": "MySQL 上下文回归记录 " * 300,
+                }
+                for index in range(12)
+            ],
+            settings=settings,
+        )
+
+        metadata = context["metadata"]
+        assert metadata["token_budget"] == 8_192
+        assert metadata["compaction_trigger_ratio"] == 0.50
+        assert metadata["recent_round_limit"] == 3
+        assert context["context_state"]["compaction_count"] == 1
+
+    engine.dispose()
 
 
 def test_mysql_attachment_upload_quota_is_cross_session_atomic(
@@ -852,7 +921,7 @@ def test_mysql_operation_unknown_reconcile_and_cancellation_are_consistent(
         instance = session.get(SopInstance, instance_id)
         operation = session.get(SopOperation, operation_id)
         assert instance is not None and operation is not None
-        with store.owned(instance, worker_id="mysql-b02-b"):
+        with store.owned_for_reconciliation(instance, worker_id="mysql-b02-b"):
             settled = store.reconcile_operation(
                 instance,
                 operation,
@@ -986,6 +1055,14 @@ def test_mysql_execution_control_signal_result_and_outbox_round_trip(
             current_plan_checksum="a" * 64,
             capability_snapshot_json={"capabilities": []},
             status="running",
+        )
+        db.add(
+            AgentProfile(
+                id="agent_b05",
+                tenant_id="tenant_b05",
+                name="MySQL control agent",
+                status="active",
+            )
         )
         db.add(instance)
         db.commit()
@@ -2307,6 +2384,12 @@ def test_mysql_execution_artifact_and_exact_lineage_round_trip(
             username="mysql-artifact-owner",
             password_hash="x",
         )
+        agent = AgentProfile(
+            id="mysql_agent_artifact",
+            tenant_id=owner.tenant_id,
+            name="MySQL Artifact Agent",
+            owner_user_id=owner.id,
+        )
         instance = SopInstance(
             id="mysql_execution_artifact",
             tenant_id=owner.tenant_id,
@@ -2367,6 +2450,7 @@ def test_mysql_execution_artifact_and_exact_lineage_round_trip(
             acl_revision=0,
         )
         db.add(owner)
+        db.add(agent)
         db.add(instance)
         db.add(node)
         db.add(resource)

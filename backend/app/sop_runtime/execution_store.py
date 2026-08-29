@@ -17,12 +17,13 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Literal
 
-from sqlalchemy import func, or_, update
+from sqlalchemy import and_, func, or_, update
 from sqlalchemy.orm.attributes import set_committed_value
 from sqlmodel import Session, select
 
 from app.db.models import (
     ActionProposalRecord,
+    ChatSession,
     ExecutionCommand,
     ExecutionPlanRevision,
     ExecutionMutationRejection,
@@ -30,6 +31,7 @@ from app.db.models import (
     GeneralSkillUse,
     InputResourceSnapshot,
     InputResourceExtraction,
+    AgentProfile,
     ManagedInputResource,
     MessageInputResourceLink,
     SelectedResourceExtraction,
@@ -139,6 +141,7 @@ class SopExecutionStore:
 
         self.db = db
         self._lease: ExecutionLease | None = None
+        self._allow_archived_agent_mutations = False
 
     def authorize_mutation(self, instance: SopInstance, action: str) -> None:
         """供同一 Runtime 的扩展聚合复用 execution revision、租约和 fencing 写屏障。"""
@@ -165,6 +168,40 @@ class SopExecutionStore:
     ) -> Iterator[ExecutionLease]:
         """原子取得 execution 所有权，并在作用域结束时仅释放本 token 的租约。"""
 
+        with self._owned(instance, worker_id=worker_id, ttl_seconds=ttl_seconds) as lease:
+            yield lease
+
+    @contextmanager
+    def owned_for_reconciliation(
+        self,
+        instance: SopInstance,
+        *,
+        worker_id: str,
+        ttl_seconds: int = 30,
+    ) -> Iterator[ExecutionLease]:
+        """仅为已进入外部效果对账流程的 Execution 开放一次受限恢复租约。"""
+
+        with self._owned(
+            instance,
+            worker_id=worker_id,
+            ttl_seconds=ttl_seconds,
+            allow_cancellation=True,
+            allow_archived_agent=True,
+        ) as lease:
+            yield lease
+
+    @contextmanager
+    def _owned(
+        self,
+        instance: SopInstance,
+        *,
+        worker_id: str,
+        ttl_seconds: int,
+        allow_cancellation: bool = False,
+        allow_archived_agent: bool = False,
+    ) -> Iterator[ExecutionLease]:
+        """实现普通、取消、对账租约的共同释放和 fencing 处理。"""
+
         if ttl_seconds < 1:
             raise ValueError("execution lease TTL 必须大于零。")
         if self._lease is not None:
@@ -172,8 +209,15 @@ class SopExecutionStore:
                 raise SopExecutionConflictError("同一 Store 不能同时推进两个 SOP 实例。")
             yield self._lease
             return
-        lease = self.claim(instance, worker_id=worker_id, ttl_seconds=ttl_seconds)
+        lease = self.claim(
+            instance,
+            worker_id=worker_id,
+            ttl_seconds=ttl_seconds,
+            _allow_cancellation=allow_cancellation,
+            _allow_archived_agent=allow_archived_agent,
+        )
         self._lease = lease
+        self._allow_archived_agent_mutations = allow_archived_agent
         fenced = False
         try:
             yield lease
@@ -186,6 +230,43 @@ class SopExecutionStore:
                     self.release(lease)
             finally:
                 self._lease = None
+                self._allow_archived_agent_mutations = False
+
+    def lock_agent_for_runtime(
+        self,
+        instance: SopInstance,
+        *,
+        allow_archived: bool = False,
+    ) -> bool:
+        """按 Agent→Execution 的固定顺序锁定生命周期行并返回是否仍可运行。"""
+
+        agent_id = instance.agent_id
+        if not agent_id:
+            session = self.db.get(ChatSession, instance.session_id)
+            if session is not None:
+                if session.tenant_id != instance.tenant_id:
+                    return False
+                agent_id = session.agent_id
+        if not agent_id:
+            return True
+        with self.db.no_autoflush:
+            agent = self.db.exec(
+                select(AgentProfile)
+                .where(
+                    AgentProfile.tenant_id == instance.tenant_id,
+                    AgentProfile.id == agent_id,
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            ).first()
+        if agent is None:
+            return False
+        deletion = (agent.metadata_json or {}).get("agent_deletion")
+        deletion_state = deletion.get("state") if isinstance(deletion, dict) else None
+        return allow_archived or (
+            agent.status == "active"
+            and deletion_state not in {"deleting", "deletion_pending", "deleted"}
+        )
 
     def claim(
         self,
@@ -193,6 +274,8 @@ class SopExecutionStore:
         *,
         worker_id: str,
         ttl_seconds: int = 30,
+        _allow_cancellation: bool = False,
+        _allow_archived_agent: bool = False,
     ) -> ExecutionLease:
         """以数据库当前时间原子抢占空闲或过期租约，并单调增加 fencing token。"""
 
@@ -201,6 +284,21 @@ class SopExecutionStore:
             raise ValueError("execution lease worker_id 不能为空。")
         if ttl_seconds < 1:
             raise ValueError("execution lease TTL 必须大于零。")
+        if _allow_archived_agent and not _allow_cancellation:
+            raise SopExecutionConflictError("仅外部效果对账允许使用归档 Agent 的恢复租约。")
+        if _allow_archived_agent:
+            unknown_external_write = self.db.exec(
+                select(SopOperation.id).where(
+                    SopOperation.tenant_id == instance.tenant_id,
+                    SopOperation.instance_id == instance.id,
+                    SopOperation.status == OperationStatus.UNKNOWN.value,
+                    SopOperation.effect_kind == "external_write",
+                )
+            ).first()
+            if unknown_external_write is None:
+                raise SopExecutionConflictError("只有 unknown 外部写才允许使用对账恢复租约。")
+        if not _allow_archived_agent and not self.lock_agent_for_runtime(instance):
+            raise SopExecutionConflictError("SOP 实例所属 Agent 当前不可用。")
         database_now = self._database_now()
         expires_at = database_now + timedelta(seconds=ttl_seconds)
         with self.db.no_autoflush:
@@ -210,6 +308,12 @@ class SopExecutionStore:
                     SopInstance.id == instance.id,
                     SopInstance.tenant_id == instance.tenant_id,
                     SopInstance.status.in_(ACTIVE_INSTANCE_STATUSES),
+                    *(
+                        ()
+                        if _allow_cancellation
+                        else (SopInstance.cancellation_requested_at.is_(None),)
+                    ),
+                    *(() if _allow_archived_agent else (self.active_agent_predicate(),)),
                     or_(
                         SopInstance.lease_owner.is_(None),
                         SopInstance.lease_expires_at <= database_now,
@@ -244,13 +348,17 @@ class SopExecutionStore:
         *,
         worker_id: str,
         ttl_seconds: int = 30,
+        allow_archived_agent: bool = False,
     ) -> Iterator[ExecutionLease]:
         """让已认证取消命令抢占活动租约，并以新fencing token阻断旧worker迟到写。"""
 
         if self._lease is not None:
             raise SopExecutionConflictError("同一 Store 不能嵌套取消抢占租约。")
+        self._assert_instance_tenant(instance)
         if not worker_id.strip() or ttl_seconds < 1:
             raise ValueError("取消 worker 和租约 TTL 必须有效。")
+        if not allow_archived_agent and not self.lock_agent_for_runtime(instance):
+            raise SopExecutionConflictError("SOP 实例所属 Agent 当前不可用。")
         database_now = self._database_now()
         expires_at = database_now + timedelta(seconds=ttl_seconds)
         expected_revision = instance.revision
@@ -261,6 +369,7 @@ class SopExecutionStore:
                 SopInstance.tenant_id == instance.tenant_id,
                 SopInstance.status.in_(ACTIVE_INSTANCE_STATUSES),
                 SopInstance.revision == expected_revision,
+                *(() if allow_archived_agent else (self.active_agent_predicate(),)),
             )
             .values(
                 lease_owner=worker_id,
@@ -285,6 +394,7 @@ class SopExecutionStore:
             expires_at=expires_at,
         )
         self._lease = lease
+        self._allow_archived_agent_mutations = allow_archived_agent
         fenced = False
         try:
             yield lease
@@ -297,18 +407,31 @@ class SopExecutionStore:
                     self.release(lease)
             finally:
                 self._lease = None
+                self._allow_archived_agent_mutations = False
 
     def renew(self, lease: ExecutionLease, *, ttl_seconds: int = 30) -> ExecutionLease:
         """仅允许当前未过期 token 续租，并继续使用数据库权威时间。"""
 
         if ttl_seconds < 1:
             raise ValueError("execution lease TTL 必须大于零。")
+        instance = self.db.get(SopInstance, lease.instance_id)
+        if (
+            instance is None
+            or instance.tenant_id != lease.tenant_id
+            or not self.lock_agent_for_runtime(instance)
+        ):
+            self._persist_fencing_rejection(lease, "lease.renew")
+            raise self._fenced_error(lease, "lease.renew")
         database_now = self._database_now()
         expires_at = database_now + timedelta(seconds=ttl_seconds)
         with self.db.no_autoflush:
             result = self.db.exec(
                 update(SopInstance)
-                .where(*self._lease_predicates(lease, database_now, require_unexpired=True))
+                .where(
+                    *self._lease_predicates(lease, database_now, require_unexpired=True),
+                    SopInstance.cancellation_requested_at.is_(None),
+                    self.active_agent_predicate(),
+                )
                 .values(
                     lease_heartbeat_at=database_now,
                     lease_expires_at=expires_at,
@@ -366,9 +489,16 @@ class SopExecutionStore:
         source_ref: str | None = None,
         slots: Mapping[str, object] | None = None,
         context: Mapping[str, object] | None = None,
+        enforce_agent_lifecycle: bool = True,
     ) -> tuple[SopInstance, bool]:
         """创建并启动实例；相同会话和技能版本的活动实例按幂等方式复用。"""
 
+        self._lock_active_agent(
+            tenant_id,
+            agent_id,
+            session_id=session_id,
+            enforce_agent_lifecycle=enforce_agent_lifecycle,
+        )
         active = self._active_instance(tenant_id, session_id)
         if active is not None:
             if active.skill_version_id != skill_version_id:
@@ -418,11 +548,18 @@ class SopExecutionStore:
         capability_snapshot: Mapping[str, object],
         source_kind: str = "chat",
         source_ref: str | None = None,
+        enforce_agent_lifecycle: bool = True,
     ) -> tuple[SopInstance, ExecutionPlanRevision]:
         """原子创建动态 Execution 与首个活动计划，不伪造 SkillVersion 身份。"""
 
         if not agent_id.strip() or not initiator_user_id.strip():
             raise SopExecutionConflictError("动态 Execution 必须绑定 Agent 和发起人。")
+        self._lock_active_agent(
+            tenant_id,
+            agent_id,
+            session_id=session_id,
+            enforce_agent_lifecycle=enforce_agent_lifecycle,
+        )
         capability_payload = dict(capability_snapshot)
         if not capability_payload:
             raise SopExecutionConflictError("动态 Execution 必须冻结非空能力快照。")
@@ -496,6 +633,45 @@ class SopExecutionStore:
         self.db.add(revision)
         self.db.flush()
         return instance, revision
+
+    def _lock_active_agent(
+        self,
+        tenant_id: str,
+        agent_id: str | None,
+        *,
+        session_id: str | None = None,
+        enforce_agent_lifecycle: bool,
+    ) -> None:
+        """在创建 Execution 前锁定并校验 Agent，防止删除墓碑与新运行并发穿透。"""
+
+        resolved_agent_id = agent_id
+        if not resolved_agent_id and session_id:
+            chat_session = self.db.exec(
+                select(ChatSession)
+                .where(ChatSession.tenant_id == tenant_id, ChatSession.id == session_id)
+                .with_for_update()
+            ).first()
+            if chat_session is not None:
+                resolved_agent_id = chat_session.agent_id
+                if enforce_agent_lifecycle and not resolved_agent_id:
+                    raise SopExecutionConflictError(
+                        "Execution 所属会话没有绑定 Agent，拒绝创建。"
+                    )
+        if not resolved_agent_id:
+            return
+        agent = self.db.exec(
+            select(AgentProfile)
+            .where(AgentProfile.id == resolved_agent_id)
+            .with_for_update()
+        ).first()
+        if agent is None:
+            if enforce_agent_lifecycle:
+                raise SopExecutionConflictError("Execution 绑定的 Agent 不存在。")
+            return
+        if agent.tenant_id != tenant_id:
+            raise SopExecutionConflictError("Execution 绑定的 Agent 不属于当前租户。")
+        if agent.status != "active":
+            raise SopExecutionConflictError("已归档的 Agent 不允许创建新 Execution。")
 
     def append_plan_revision(
         self,
@@ -1684,7 +1860,7 @@ class SopExecutionStore:
         actor_user_id: str,
         reason: str,
     ) -> bool:
-        """登记取消请求，零调用动作直接取消，已发外部写转入 unknown 等待对账。"""
+        """登记取消请求，外部写转入 unknown 并保留异常对账工作项。"""
 
         self._guard_mutation(instance, "instance.request_cancellation")
         now = utc_now()
@@ -1710,6 +1886,20 @@ class SopExecutionStore:
                     )
                 else:
                     self._cancel_running_read(operation)
+        unknown_operations = [
+            operation
+            for operation in operations
+            if (
+                operation.status == OperationStatus.UNKNOWN.value
+                and operation.effect_kind == "external_write"
+            )
+        ]
+        for operation in unknown_operations:
+            self._ensure_external_effect_reconciliation_attention(
+                instance,
+                operation,
+                actor_user_id=actor_user_id,
+            )
         active_attentions = self.db.exec(
             select(SopWorkItem).where(
                 SopWorkItem.tenant_id == instance.tenant_id,
@@ -1718,6 +1908,8 @@ class SopExecutionStore:
             )
         ).all()
         for attention in active_attentions:
+            if attention.attention_kind == "exception":
+                continue
             attention.status = "cancelled"
             attention.assignee_user_id = None
             attention.resolution_json = {
@@ -1736,6 +1928,8 @@ class SopExecutionStore:
             )
         ).all()
         for signal in active_signals:
+            if self._is_external_reconciliation_signal(signal, instance):
+                continue
             signal.status = "discarded"
             signal.lease_owner = None
             signal.lease_expires_at = None
@@ -1760,6 +1954,174 @@ class SopExecutionStore:
         self.db.add(instance)
         self.aggregate_effect_state(instance)
         return self._settle_requested_cancellation(instance)
+
+    def _ensure_external_effect_reconciliation_attention(
+        self,
+        instance: SopInstance,
+        operation: SopOperation,
+        *,
+        actor_user_id: str,
+    ) -> SopWorkItem | None:
+        """为取消时新发现的 unknown 外部写补齐可办理的异常对账工作项。"""
+
+        if (
+            operation.instance_id != instance.id
+            or operation.tenant_id != instance.tenant_id
+            or operation.status != OperationStatus.UNKNOWN.value
+            or operation.effect_kind != "external_write"
+        ):
+            return None
+        existing = self.db.exec(
+            select(SopWorkItem)
+            .where(
+                SopWorkItem.tenant_id == instance.tenant_id,
+                SopWorkItem.instance_id == instance.id,
+                SopWorkItem.attention_kind == "exception",
+                SopWorkItem.source_ref == operation.id,
+            )
+            .order_by(SopWorkItem.created_at.desc(), SopWorkItem.id.desc())
+        ).first()
+        now = self.database_now()
+        if existing is not None:
+            if existing.status in {"cancelled", "expired"}:
+                existing.status = "offered"
+                existing.assignee_user_id = None
+                existing.claimed_at = None
+                existing.outcome = None
+                existing.comment = None
+                existing.resolution_json = {}
+                existing.completed_at = None
+                existing.expired_at = None
+                existing.revision += 1
+                existing.updated_at = now
+                self.db.add(existing)
+                self.db.flush()
+            return existing
+
+        from app.organization.governance import has_governance_permission
+        from app.sop_runtime.execution_control import ExecutionControlService
+
+        control = ExecutionControlService(self.db, self)
+
+        candidate_user_ids = [
+            user.id
+            for user in self.db.exec(
+                select(User).where(
+                    User.tenant_id == instance.tenant_id,
+                    User.membership_status == "active",
+                )
+            ).all()
+            if has_governance_permission(
+                self.db,
+                tenant_id=instance.tenant_id,
+                user_id=user.id,
+                permission_code="connection_profile.manage",
+            )
+        ]
+        if not candidate_user_ids:
+            blocked = {
+                "status": "blocked_no_candidate",
+                "code": "RECONCILIATION_CANDIDATE_REQUIRED",
+                "operation_id": operation.id,
+                "required_permission": "connection_profile.manage",
+                "last_checked_at": now.isoformat(),
+            }
+            reconciliation = dict(
+                (instance.context_json or {}).get("external_effect_reconciliation") or {}
+            )
+            if reconciliation.get(operation.id) != blocked:
+                reconciliation[operation.id] = blocked
+                instance.context_json = {
+                    **(instance.context_json or {}),
+                    "external_effect_reconciliation": reconciliation,
+                }
+                self.db.add(instance)
+                control.append_execution_event(
+                    instance,
+                    event_type="external_write_reconciliation_blocked",
+                    causation_id=f"reconciliation-candidate:{operation.id}",
+                    payload={
+                        "operation_id": operation.id,
+                        "code": blocked["code"],
+                        "required_permission": blocked["required_permission"],
+                    },
+                )
+                self.db.flush()
+            return None
+        step = self.db.get(SopNodeExecution, operation.node_execution_id)
+        step_key = step.step_key if step is not None else operation.node_execution_id
+        error_json = operation.error_json if isinstance(operation.error_json, dict) else {}
+        error_code = str(error_json.get("code") or "CANCELLED_WHILE_IN_FLIGHT")
+        attention, _ = control.offer_attention(
+            instance,
+            attention_kind="exception",
+            attention_key=f"{step_key}:write_unknown:{operation.id}",
+            title="核对外部写入是否已经生效",
+            payload={
+                "operation_id": operation.id,
+                "operation_name": operation.operation_name,
+                "node_execution_id": operation.node_execution_id,
+                "error_code": error_code,
+                "request_fingerprint": operation.request_fingerprint,
+                "cancellation_requested_by": actor_user_id,
+                "instruction": "请依据外部系统证据确认是否已生效；系统不会自动重发。",
+            },
+            allowed_commands=["confirm_applied", "confirm_not_applied"],
+            candidate_user_ids=candidate_user_ids,
+            source_type="agent_deletion",
+            source_ref=operation.id,
+            node_execution=None,
+        )
+        if (
+            step is not None
+            and step.status in {
+                NodeExecutionStatus.SCHEDULED.value,
+                NodeExecutionStatus.RUNNING.value,
+            }
+            and instance.status in ACTIVE_INSTANCE_STATUSES
+        ):
+            self.wait_for_work_item(instance, step, work_item_id=attention.id)
+        reconciliation = dict(
+            (instance.context_json or {}).get("external_effect_reconciliation") or {}
+        )
+        reconciliation[operation.id] = {
+            "status": "offered",
+            "operation_id": operation.id,
+            "attention_id": attention.id,
+            "required_permission": "connection_profile.manage",
+        }
+        instance.context_json = {
+            **(instance.context_json or {}),
+            "external_effect_reconciliation": reconciliation,
+        }
+        self.db.add(instance)
+        self.db.flush()
+        return attention
+
+    def _is_external_reconciliation_signal(
+        self,
+        signal: ExecutionSignal,
+        instance: SopInstance,
+    ) -> bool:
+        """判断 signal 是否精确指向当前实例的 unknown 外部写对账工作项。"""
+
+        if signal.signal_type != "attention_decided":
+            return False
+        attention_id = str((signal.payload_json or {}).get("attention_id") or "")
+        attention = self.db.get(SopWorkItem, attention_id)
+        if attention is None or attention.instance_id != instance.id:
+            return False
+        operation_id = str((attention.payload_json or {}).get("operation_id") or "")
+        operation = self.db.get(SopOperation, operation_id)
+        return (
+            attention.tenant_id == instance.tenant_id
+            and attention.attention_kind == "exception"
+            and operation is not None
+            and operation.tenant_id == instance.tenant_id
+            and operation.instance_id == instance.id
+            and operation.status == OperationStatus.UNKNOWN.value
+            and operation.effect_kind == "external_write"
+        )
 
     def aggregate_effect_state(self, instance: SopInstance) -> str:
         """聚合外部写效果事实；unknown 优先，其次区分部分完成、全部完成与无效果。"""
@@ -2505,7 +2867,7 @@ class SopExecutionStore:
         self._guard_mutation(instance, action)
 
     def _guard_mutation(self, instance: SopInstance, action: str) -> None:
-        """以 revision、未过期 lease 和 fencing token 的单条 CAS 授权一次权威写。"""
+        """以 Agent 生命周期、revision、租约和 fencing token 的单条 CAS 授权一次权威写。"""
 
         lease = self._lease
         if (
@@ -2514,6 +2876,8 @@ class SopExecutionStore:
             or lease.tenant_id != instance.tenant_id
         ):
             raise SopExecutionConflictError("权威执行写入必须位于 execution lease 作用域内。")
+        if not self._allow_archived_agent_mutations and not self.lock_agent_for_runtime(instance):
+            raise SopExecutionConflictError("SOP 实例所属 Agent 当前不可用，拒绝迟到写入。")
         database_now = self._database_now()
         expected_revision = instance.revision
         with self.db.no_autoflush:
@@ -2522,6 +2886,11 @@ class SopExecutionStore:
                 .where(
                     *self._lease_predicates(lease, database_now, require_unexpired=True),
                     SopInstance.revision == expected_revision,
+                    *(
+                        ()
+                        if self._allow_archived_agent_mutations
+                        else (self.active_agent_predicate(),)
+                    ),
                 )
                 .values(
                     revision=SopInstance.revision + 1,
@@ -2534,6 +2903,56 @@ class SopExecutionStore:
             raise self._fenced_error(lease, action)
         set_committed_value(instance, "revision", expected_revision + 1)
         set_committed_value(instance, "updated_at", database_now)
+
+    @staticmethod
+    def active_agent_predicate(instance_model: type[SopInstance] = SopInstance) -> object:
+        """构造 Execution 直接或会话继承 Agent 的活动状态谓词，兼容无 Agent 历史实例。"""
+
+        direct_agent = select(AgentProfile.id).where(
+            AgentProfile.tenant_id == instance_model.tenant_id,
+            AgentProfile.id == instance_model.agent_id,
+            AgentProfile.status == "active",
+        ).exists()
+        session_has_agent = select(ChatSession.id).where(
+            ChatSession.tenant_id == instance_model.tenant_id,
+            ChatSession.id == instance_model.session_id,
+            ChatSession.agent_id.is_not(None),
+        ).exists()
+        session_agent_is_active = (
+            select(AgentProfile.id)
+            .join(ChatSession, ChatSession.agent_id == AgentProfile.id)
+            .where(
+                AgentProfile.tenant_id == instance_model.tenant_id,
+                AgentProfile.status == "active",
+                ChatSession.tenant_id == instance_model.tenant_id,
+                ChatSession.id == instance_model.session_id,
+            )
+            .exists()
+        )
+        return or_(
+            direct_agent,
+            and_(
+                instance_model.agent_id.is_(None),
+                or_(~session_has_agent, session_agent_is_active),
+            ),
+        )
+
+    def agent_is_available(self, instance: SopInstance) -> bool:
+        """读取当前 Execution 的 Agent 生命周期，供命令和 signal 创建前阻断墓碑写入。"""
+
+        if not self.lock_agent_for_runtime(instance):
+            return False
+        with self.db.no_autoflush:
+            return (
+                self.db.exec(
+                    select(SopInstance.id).where(
+                        SopInstance.id == instance.id,
+                        SopInstance.tenant_id == instance.tenant_id,
+                        self.active_agent_predicate(),
+                    )
+                ).first()
+                is not None
+            )
 
     def _database_now(self) -> datetime:
         """读取数据库当前时间，禁止以 worker 本地时钟裁决跨进程所有权。"""

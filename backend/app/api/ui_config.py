@@ -1,3 +1,11 @@
+"""
+@Time       : 2026/08/28 15:00
+@Author     : zhanglp8181
+@File       : ui_config.py
+@CallChain  : Enterprise/Chat UI → UIConfig API → UIConfig → AgentLoop 上下文与执行限制
+@Description: 提供租户级展示、执行上限和会话上下文压缩配置的读写接口。
+"""
+
 from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -25,6 +33,9 @@ class UIConfigRead(BaseModel):
     show_tool_trace: bool
     reflection_max_rounds: int
     agent_loop_max_actions: int
+    context_token_budget: int
+    context_compaction_trigger_ratio: float
+    context_recent_round_limit: int
     updated_at: str
 
     model_config = ConfigDict(from_attributes=True)
@@ -37,9 +48,14 @@ class UIConfigUpdateRequest(BaseModel):
     show_tool_trace: bool = True
     reflection_max_rounds: int = Field(default=1, ge=0, le=5)
     agent_loop_max_actions: int = Field(default=6, ge=1, le=20)
+    context_token_budget: int | None = Field(default=None, ge=4_096, le=32_000)
+    context_compaction_trigger_ratio: float | None = Field(default=None, ge=0.45, le=0.95)
+    context_recent_round_limit: int | None = Field(default=None, ge=1, le=20)
 
 
 def ui_config_read(row: UIConfig) -> UIConfigRead:
+    """把数据库中的租户配置转换为管理端和聊天端共用的响应契约。"""
+
     return UIConfigRead(
         tenant_id=row.tenant_id,
         show_thinking_trace=row.show_thinking_trace,
@@ -47,6 +63,9 @@ def ui_config_read(row: UIConfig) -> UIConfigRead:
         show_tool_trace=row.show_tool_trace,
         reflection_max_rounds=row.reflection_max_rounds,
         agent_loop_max_actions=row.agent_loop_max_actions,
+        context_token_budget=row.context_token_budget,
+        context_compaction_trigger_ratio=row.context_compaction_trigger_ratio,
+        context_recent_round_limit=row.context_recent_round_limit,
         updated_at=row.updated_at.isoformat(),
     )
 
@@ -75,6 +94,8 @@ def update_enterprise_ui_config(
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> UIConfigRead:
+    """校验租户管理员权限后更新展示、执行和上下文压缩配置。"""
+
     ensure_tenant_admin(request.tenant_id, current_user)
     row = get_or_create_ui_config(db, request.tenant_id)
     row.show_thinking_trace = request.show_thinking_trace
@@ -82,6 +103,12 @@ def update_enterprise_ui_config(
     row.show_tool_trace = request.show_tool_trace
     row.reflection_max_rounds = request.reflection_max_rounds
     row.agent_loop_max_actions = request.agent_loop_max_actions
+    if request.context_token_budget is not None:
+        row.context_token_budget = request.context_token_budget
+    if request.context_compaction_trigger_ratio is not None:
+        row.context_compaction_trigger_ratio = request.context_compaction_trigger_ratio
+    if request.context_recent_round_limit is not None:
+        row.context_recent_round_limit = request.context_recent_round_limit
     row.updated_at = utc_now()
     db.add(row)
     db.commit()

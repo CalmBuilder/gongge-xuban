@@ -27,8 +27,15 @@ from app.tools.tool_schema import (
     MCPDiscoverRequest,
     MCPServerConnection,
     MCPServerCreateRequest,
+    MCPServerUpdateRequest,
     MCPSyncRequest,
     ToolCall,
+)
+from app.api.tools import (
+    _mask_mcp_url,
+    _mask_mcp_connection,
+    _merge_masked_mcp_connection,
+    update_mcp_server,
 )
 
 
@@ -59,6 +66,153 @@ def test_discover_builtin_mcp_server_lists_tools() -> None:
         assert {"echo", "sum", "product_lookup"} <= names
         echo = next(tool for tool in response.tools if tool.name == "echo")
         assert echo.input_schema["properties"]["text"]["type"] == "string"
+
+
+def test_mcp_server_read_masks_credentials_and_update_preserves_them() -> None:
+    """MCP 管理读取不得回显密钥，管理页回传占位符时仍应沿用服务端原值。"""
+
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.commit()
+
+        server = create_mcp_server(
+            MCPServerCreateRequest(
+                tenant_id="tenant_demo",
+                name="remote_secret",
+                connection=MCPServerConnection(
+                    transport="streamable_http",
+                    url="https://user:password@example.test/mcp?token=query-secret&mode=full",
+                    headers={"Authorization": "Bearer header-secret", "X-Trace": "trace"},
+                    env={"MCP_TOKEN": "env-secret"},
+                ),
+            ),
+            db,
+            _admin_user(),
+        )
+
+        assert server.connection.headers == {"Authorization": "********", "X-Trace": "********"}
+        assert server.connection.env == {"MCP_TOKEN": "********"}
+        assert "header-secret" not in str(server.model_dump())
+        assert "env-secret" not in str(server.model_dump())
+        assert server.credential_state.header_keys == ["Authorization", "X-Trace"]
+        assert server.credential_state.env_keys == ["MCP_TOKEN"]
+        assert "query-secret" not in (server.connection.url or "")
+        assert "password" not in (server.connection.url or "")
+        assert _mask_mcp_url("/mcp?token=query-secret") == "/mcp?token=%2A%2A%2A%2A%2A%2A%2A%2A"
+        assert _mask_mcp_url("//user:password@example.test/mcp?token=query-secret") == (
+            "//********@example.test/mcp?token=%2A%2A%2A%2A%2A%2A%2A%2A"
+        )
+        assert _mask_mcp_url("https://example.test/mcp/token/path-secret") == (
+            "https://example.test/mcp/token/********"
+        )
+
+        updated = update_mcp_server(
+            server.id,
+            MCPServerUpdateRequest(
+                tenant_id="tenant_demo",
+                name="remote_secret",
+                description="updated without replacing credentials",
+                connection=MCPServerConnection(
+                    transport="streamable_http",
+                    url=server.connection.url,
+                    headers=server.connection.headers,
+                    env=server.connection.env,
+                ),
+            ),
+            db,
+            _admin_user(),
+        )
+        persisted = db.get(MCPServer, server.id)
+        assert persisted is not None
+        assert persisted.headers_json == {
+            "Authorization": "Bearer header-secret",
+            "X-Trace": "trace",
+        }
+        assert persisted.env_json == {"MCP_TOKEN": "env-secret"}
+        assert updated.description == "updated without replacing credentials"
+
+
+def test_mcp_masked_credentials_are_not_reused_after_endpoint_switch() -> None:
+    """MCP 切换 transport、命令或端点后，脱敏占位符不得继承旧连接密钥。"""
+
+    previous = MCPServerConnection(
+        transport="streamable_http",
+        url="https://user:password@example.test/mcp?token=query-secret&mode=full",
+        headers={"Authorization": "Bearer header-secret"},
+        env={"MCP_TOKEN": "env-secret"},
+    )
+    same_endpoint = MCPServerConnection(
+        transport="streamable_http",
+        url="https://********@example.test/mcp?token=%2A%2A%2A%2A%2A%2A%2A%2A&mode=%2A%2A%2A%2A%2A%2A%2A%2A",
+        headers={"Authorization": "********"},
+        env={"MCP_TOKEN": "********"},
+    )
+    preserved = _merge_masked_mcp_connection(previous, same_endpoint)
+    assert preserved.headers == previous.headers
+    assert preserved.env == previous.env
+    assert preserved.url == previous.url
+
+    switched_endpoint = MCPServerConnection(
+        transport="streamable_http",
+        url="https://new.example.test/mcp?token=********",
+        headers={"Authorization": "********"},
+        env={"MCP_TOKEN": "********"},
+    )
+    switched = _merge_masked_mcp_connection(previous, switched_endpoint)
+    assert switched.headers == {}
+    assert switched.env == {}
+    assert switched.url == "https://new.example.test/mcp"
+    assert "header-secret" not in str(switched.model_dump())
+    assert "env-secret" not in str(switched.model_dump())
+
+
+def test_mcp_stdio_argument_credentials_are_masked_and_not_cross_endpoint_reused() -> None:
+    """MCP stdio 的命令参数密钥应脱敏，并在命令参数变化后拒绝旧值回填。"""
+
+    previous = MCPServerConnection(
+        transport="stdio",
+        command="node",
+        args=["server.js", "--token", "stdio-secret", "--config", "safe.json"],
+        env={"MCP_TOKEN": "env-secret"},
+    )
+    masked = _mask_mcp_connection(previous)
+    assert masked.args == ["server.js", "--token", "********", "--config", "safe.json"]
+    assert "stdio-secret" not in str(masked.model_dump())
+
+    mixed_case = _mask_mcp_connection(
+        MCPServerConnection(
+            transport="stdio",
+            command="node",
+            args=[
+                "server.js",
+                "BEARER upper-secret",
+                "HTTP://example.test/mcp?token=query-secret",
+            ],
+        )
+    )
+    assert mixed_case.args == [
+        "server.js",
+        "BEARER ********",
+        "http://example.test/mcp?token=%2A%2A%2A%2A%2A%2A%2A%2A",
+    ]
+    assert "upper-secret" not in str(mixed_case.model_dump())
+    assert "query-secret" not in str(mixed_case.model_dump())
+
+    preserved = _merge_masked_mcp_connection(previous, masked)
+    assert preserved.args == previous.args
+
+    switched = _merge_masked_mcp_connection(
+        previous,
+        MCPServerConnection(
+            transport="stdio",
+            command="node",
+            args=["server-v2.js", "--token", "********", "--config", "safe.json"],
+            env={"MCP_TOKEN": "********"},
+        ),
+    )
+    assert switched.args == ["server-v2.js", "--config", "safe.json"]
+    assert switched.env == {}
+    assert "stdio-secret" not in str(switched.model_dump())
 
 
 def test_discover_stdio_mcp_server_lists_tools() -> None:

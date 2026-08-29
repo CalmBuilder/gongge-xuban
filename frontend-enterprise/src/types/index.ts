@@ -242,6 +242,14 @@ export type AgentProfileRead = {
   updated_at: string;
 };
 
+export type AgentDeletionResult = {
+  status: 'deleted' | 'deletion_pending';
+  agent_id: string;
+  cleaned_session_count: number;
+  pending_execution_ids: string[];
+  pending_resource_ids: string[];
+};
+
 export type AgentGalleryFacetRead = {
   value: string;
   label: string;
@@ -597,6 +605,9 @@ export type UIConfigRead = {
   show_tool_trace: boolean;
   reflection_max_rounds: number;
   agent_loop_max_actions: number;
+  context_token_budget: number;
+  context_compaction_trigger_ratio: number;
+  context_recent_round_limit: number;
   updated_at: string;
 };
 
@@ -704,6 +715,12 @@ export type MCPServerConnection = {
   cwd?: string | null;
 };
 
+export type MCPServerCredentialState = {
+  configured_fields: Array<'headers' | 'env'>;
+  header_keys: string[];
+  env_keys: string[];
+};
+
 export type MCPServerRead = {
   id: string;
   tenant_id: string;
@@ -712,6 +729,7 @@ export type MCPServerRead = {
   description?: string;
   bucket: string;
   connection: MCPServerConnection;
+  credential_state: MCPServerCredentialState;
   enabled: boolean;
   last_synced_at?: string | null;
   tool_count: number;

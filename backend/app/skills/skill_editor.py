@@ -1,3 +1,11 @@
+"""
+@Time       : 2026/08/28
+@Author     : zhanglp8181
+@File       : skill_editor.py
+@CallChain  : Skill 改写 API → SkillEditor → 模型校验、工具建议归一和闭环草稿
+@Description: 负责局部 Skill 改写，并在模型输入输出边界统一保护工具目录和凭据安全。
+"""
+
 from __future__ import annotations
 
 import json
@@ -8,6 +16,7 @@ from typing import Any, Iterator
 from app import paths
 from app.db.models import ModelConfig
 from app.llm import LLMClient, LLMError
+from app.skills.generation_safety import sanitize_generation_value
 from app.skills.llm_limits import skill_model_config
 from app.skills.skill_reflection import reflect_skill_response, reflect_skill_response_stream
 from app.skills.skill_schema import SkillCard, SkillRewriteRequest, SkillRewriteResponse
@@ -130,13 +139,13 @@ class SkillEditor:
 
     def _payload(self, request: SkillRewriteRequest) -> dict[str, Any]:
         return {
-            "current_skill": request.current_skill.model_dump(mode="json"),
+            "current_skill": sanitize_generation_value(request.current_skill.model_dump(mode="json")),
             "instruction": request.instruction,
             "target_path": request.target_path,
             "target_paths": _target_paths(request),
             "target_label": request.target_label,
-            "conversation": request.conversation[-12:],
-            "available_tools": request.available_tools,
+            "conversation": sanitize_generation_value(request.conversation[-12:]),
+            "available_tools": sanitize_generation_value(request.available_tools),
         }
 
     def _normalize_response(
@@ -185,12 +194,15 @@ class SkillEditor:
         tool_suggestions = [
             item for item in tool_resolutions if item.resolution_status in {"existing", "new_candidate"}
         ]
-        return SkillRewriteResponse(
+        response = SkillRewriteResponse(
             draft_skill=merged,
             assistant_message=assistant_message,
             changed_paths=changed_paths,
             warnings=warnings,
             tool_suggestions=tool_suggestions,
+        )
+        return SkillRewriteResponse.model_validate(
+            sanitize_generation_value(response.model_dump(mode="json"))
         )
 
 

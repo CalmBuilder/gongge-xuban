@@ -1,3 +1,11 @@
+"""
+@Time       : 2026/08/28
+@Author     : zhanglp8181
+@File       : jobs.py
+@CallChain  : Agent Loop → async job queue → MemoryService → MemoryRecord
+@Description: 执行后台记忆提取，并在会话或数字员工删除后安全丢弃迟到任务。
+"""
+
 from __future__ import annotations
 
 from typing import Any
@@ -6,8 +14,8 @@ from sqlmodel import Session, select
 
 from app.async_jobs import AsyncJob, enqueue_async_job
 from app.db import engine
-from app.db.models import AgentEvent, ChatSession, Message, ModelConfig
-from app.memory.service import MemoryService, memory_read
+from app.db.models import AgentEvent, AgentProfile, ChatSession, Message, ModelConfig
+from app.memory.service import MemoryAgentUnavailable, MemoryService, memory_read
 from app.observability import EventLog
 from app.observability.spans import bind_span_sink
 from app.session.session_schema import ChatTurnRequest, StepAgentResult
@@ -41,6 +49,8 @@ def enqueue_memory_capture(
 
 
 def run_memory_capture_job(payload: dict[str, Any]) -> None:
+    """校验任务血缘仍处于活动状态后提取记忆，删除竞态下不写孤儿事件或记忆。"""
+
     request = ChatTurnRequest.model_validate(payload["request"])
     session_id = str(payload["session_id"])
     model_config_id = str(payload["model_config_id"])
@@ -50,7 +60,21 @@ def run_memory_capture_job(payload: dict[str, Any]) -> None:
         events = EventLog(db)
         chat_session = db.get(ChatSession, session_id)
         model_config = db.get(ModelConfig, model_config_id)
-        if not chat_session or not model_config:
+        if (
+            chat_session is None
+            or chat_session.tenant_id != request.tenant_id
+            or (request.agent_id and chat_session.agent_id != request.agent_id)
+        ):
+            return
+        if chat_session.agent_id:
+            agent = db.get(AgentProfile, chat_session.agent_id)
+            if (
+                agent is None
+                or agent.tenant_id != request.tenant_id
+                or agent.status != "active"
+            ):
+                return
+        if model_config is None or model_config.tenant_id != request.tenant_id:
             events.record(
                 request.tenant_id,
                 session_id,
@@ -126,6 +150,9 @@ def run_memory_capture_job(payload: dict[str, Any]) -> None:
                     model_config,
                     conversation_messages,
                 )
+        except MemoryAgentUnavailable:
+            db.rollback()
+            return
         except Exception as exc:  # noqa: BLE001 - persist failure without affecting the request path.
             events.record(
                 request.tenant_id,

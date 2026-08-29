@@ -1,4 +1,5 @@
 from app.scheduled_tasks.service import (
+    archive_scheduled_task,
     create_scheduled_task,
     detect_scheduled_task_draft,
     due_scheduled_tasks,
@@ -9,6 +10,7 @@ from app.scheduled_tasks.service import (
 )
 
 __all__ = [
+    "archive_scheduled_task",
     "create_scheduled_task",
     "detect_scheduled_task_draft",
     "due_scheduled_tasks",

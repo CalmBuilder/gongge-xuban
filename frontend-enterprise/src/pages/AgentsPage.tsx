@@ -34,7 +34,13 @@ import {
 } from '../employee';
 import { EnterpriseRoute } from '../enums/routes';
 import { emitAgentScopeChange, persistSharedAgentScope } from '../lib/agent-scope-storage';
-import type { AgentManagementPageRead, AgentProfileRead, ExpertTaxonomyAssignmentResult, ExpertTaxonomyRead } from '../types';
+import type {
+  AgentDeletionResult,
+  AgentManagementPageRead,
+  AgentProfileRead,
+  ExpertTaxonomyAssignmentResult,
+  ExpertTaxonomyRead,
+} from '../types';
 
 const ENTERPRISE_AGENT_STORAGE_KEY = 'gongge_enterprise_agent_scope';
 const AGENT_PAGE_SIZE = 12;
@@ -52,7 +58,6 @@ type AgentPublicationRelease = {
   description: string;
   components: Array<{ resource_type: string; resource_id: string; metadata?: Record<string, unknown> }>;
 };
-
 const EMPLOYEE_VIEWS: EmployeeFilter[] = [
   'all',
   'online',
@@ -350,7 +355,9 @@ export default function AgentsPage({
     if (!row) return;
     setDeleting(true);
     try {
-      await api.delete(`/api/enterprise/agents/${row.id}?tenant_id=${getRequestTenantId()}`);
+      const result = await api.delete<AgentDeletionResult>(
+        `/api/enterprise/agents/${row.id}?tenant_id=${getRequestTenantId()}`,
+      );
       if (window.localStorage.getItem(ENTERPRISE_AGENT_STORAGE_KEY) === row.id) {
         const nextAgent = employees.find((item) => item.id !== row.id && item.status === 'active')
           || employees.find((item) => item.id !== row.id);
@@ -362,7 +369,11 @@ export default function AgentsPage({
           window.dispatchEvent(new CustomEvent('gongge-enterprise-agent-scope-change', { detail: { agentId: '' } }));
         }
       }
-      notify.success('员工已删除');
+      notify.success(
+        result.status === 'deletion_pending'
+          ? `员工入口已关闭，后台将自动重试清理${result.pending_execution_ids.length || result.pending_resource_ids.length ? `（待处理执行 ${result.pending_execution_ids.length}、资源 ${result.pending_resource_ids.length}）` : ''}`
+          : '员工已删除，历史审计与执行记录仍保留',
+      );
       setDeleteTarget(null);
       await load();
       window.dispatchEvent(new Event('gongge-enterprise-agent-scope-refresh'));
@@ -751,7 +762,7 @@ export default function AgentsPage({
         }}
         loading={deleting}
         title={`删除员工「${deleteTarget ? employeeDisplayName(deleteTarget) : ''}」？`}
-        description="删除后该员工的所有配置将一并移除，操作不可撤销。"
+        description="删除会立即关闭员工入口并清理可回收配置；历史审计、执行记录和未能立即确认的外部资源会保留对账状态。"
         onConfirm={() => void confirmDelete()}
       />
       <Dialog open={publicationOpen} onOpenChange={(open) => !publicationBusy && setPublicationOpen(open)}>

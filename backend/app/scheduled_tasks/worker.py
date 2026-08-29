@@ -15,6 +15,7 @@ from time import sleep
 
 from sqlmodel import Session
 
+from app.agents.deletion import reconcile_pending_agent_deletions
 from app.db import engine, init_db
 from app.db.models import SopWorkItem
 from app.db.seed import seed_demo_data
@@ -64,6 +65,7 @@ def run_worker(*, once: bool = False, poll_seconds: float = WORKER_SLEEP_SECONDS
             _process_due_dynamic_signals(db, once=once)
             reconcile_parallel_read_batches(db)
             reconcile_scheduled_dynamic_runs(db)
+            reconcile_pending_agent_deletions(db)
             expired_work_items = SopWorkItemService(db).expire_due()
             for work_item in expired_work_items:
                 process_expired_work_item(db, work_item)

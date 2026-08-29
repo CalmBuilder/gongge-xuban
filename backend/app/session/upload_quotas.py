@@ -166,6 +166,31 @@ class AttachmentUploadQuotaService:
             consumed_bytes=actual_bytes if succeeded else 0,
         )
 
+    def release_for_deletion(
+        self,
+        reservation: AttachmentUploadQuotaReservation,
+    ) -> None:
+        """在 Agent 删除时无条件释放仍活动的上传预留，不受原 reservation TTL 阻断。"""
+
+        now = utc_now()
+        result = self.db.exec(
+            update(AttachmentUploadQuotaReservation)
+            .where(
+                AttachmentUploadQuotaReservation.id == reservation.id,
+                AttachmentUploadQuotaReservation.tenant_id == reservation.tenant_id,
+                AttachmentUploadQuotaReservation.fencing_token == reservation.fencing_token,
+                AttachmentUploadQuotaReservation.status == "active",
+            )
+            .values(status="released", actual_bytes=0, settled_at=now)
+        )
+        if result.rowcount == 1:
+            self._release_accounting(reservation, consumed_bytes=0)
+            return
+        current = self.db.get(AttachmentUploadQuotaReservation, reservation.id)
+        if current is not None and current.status in {"completed", "released", "expired"}:
+            return
+        raise AttachmentUploadQuotaError("ATTACHMENT_UPLOAD_RESERVATION_FENCED")
+
     def reap_expired(self, *, tenant_id: str) -> int:
         """CAS回收已过期active reservation，重复worker不会重复扣减reserved字节。"""
 

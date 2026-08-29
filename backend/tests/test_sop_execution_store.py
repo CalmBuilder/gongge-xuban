@@ -17,6 +17,7 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from app.db.models import (
+    AgentProfile,
     ExecutionMutationRejection,
     SopInstance,
     SopNodeExecution,
@@ -651,6 +652,67 @@ def test_cancel_prepared_operation_and_reconcile_running_write() -> None:
     assert settled is True
     assert instance_status == "cancelled"
     assert active_slot_key is None
+
+
+def test_reconciliation_lease_can_settle_unknown_after_agent_tombstone() -> None:
+    """归档 Agent 仍可为已有 unknown 外部写取得受限对账租约，但不能走普通运行路径。"""
+
+    with _test_session() as db:
+        agent = AgentProfile(
+            id="agent_reconcile_tombstone",
+            tenant_id="tenant_demo",
+            name="对账员工",
+            status="active",
+        )
+        db.add(agent)
+        db.commit()
+        store = SopExecutionStore(db)
+        instance, created = store.start_instance(
+            tenant_id="tenant_demo",
+            session_id="session_reconcile_tombstone",
+            skill_id="skill_reconcile_tombstone",
+            skill_version_id="skillver_reconcile_tombstone",
+            skill_version="1.0.0",
+            definition_checksum="a" * 64,
+            start_node_id="submit",
+            agent_id=agent.id,
+            initiator_user_id="user_demo",
+        )
+        assert created is True
+        with store.owned(instance, worker_id="worker-test"):
+            execution = store.enter_node(instance, "submit", input_snapshot={})
+            operation, _ = store.prepare_operation(
+                instance,
+                execution,
+                operation_name="expense.submit",
+                request={"request_id": "REQ-TOMBSTONE-RECON"},
+                logical_action_id="action-tombstone-recon",
+                effect_kind="external_write",
+            )
+            store.start_operation(operation)
+            store.mark_operation_unknown(operation, error={"code": "REMOTE_TIMEOUT"})
+        db.commit()
+
+        agent.status = "archived"
+        agent.metadata_json = {"agent_deletion": {"state": "deleted"}}
+        db.add(agent)
+        db.commit()
+
+        with store.owned_for_reconciliation(instance, worker_id="reconcile-worker") as lease:
+            assert lease.worker_id == "reconcile-worker"
+            settled = store.reconcile_operation(
+                instance,
+                operation,
+                succeeded=False,
+                error={"code": "REMOTE_NOT_APPLIED"},
+                effect_confirmed=False,
+            )
+            assert settled is False
+        db.commit()
+        db.refresh(operation)
+
+    assert operation.status == "failed"
+    assert operation.cancellation_disposition == "reconciled"
 
 
 def test_effect_state_reports_partial_and_unknown_external_effects() -> None:

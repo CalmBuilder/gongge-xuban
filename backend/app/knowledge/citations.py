@@ -23,13 +23,22 @@ TRUNCATED_EMAIL_PATTERN = re.compile(
     r"(?P<ellipsis>\.{3}|…)",
     re.IGNORECASE,
 )
+SOURCE_FOOTER_PATTERN = re.compile(
+    r"(?:\n|\s){0,3}(?:参考来源|参考资料|引用来源|资料来源)\s*[:：]?\s*"
+    r"(?:(?:\n\s*(?:[-*+]\s+|\d+[.)]\s+)?\[\d+\][^\n]*)+|"
+    r"(?:\[\d+\](?:\s*(?:-|–|—|至)\s*\[\d+\])?\s*)+)$"
+)
+CITATION_REFERENCE_PATTERN = re.compile(
+    r"\[(\d+)\](?:\s*(?:-|–|—|至)\s*\[(\d+)\])?"
+)
 
 
 def compact_knowledge_citation_labels(
     content: str,
     citations: object,
 ) -> tuple[str, list[dict[str, Any]]]:
-    """Keep cited sources and renumber them by first appearance in the reply."""
+    """清理引用尾巴、展开范围并按正文首次出现顺序重编号。"""
+    content = SOURCE_FOOTER_PATTERN.sub("", content.rstrip()).rstrip()
     if not isinstance(citations, list) or not citations:
         return content, []
 
@@ -42,22 +51,29 @@ def compact_knowledge_citation_labels(
         citations_by_label.setdefault(label, citation)
 
     ordered_labels: list[int] = []
-    for match in re.finditer(r"\[(\d+)\]", content):
-        label = int(match.group(1))
-        if label in citations_by_label and label not in ordered_labels:
-            ordered_labels.append(label)
+    for match in CITATION_REFERENCE_PATTERN.finditer(content):
+        start_label = int(match.group(1))
+        end_label = int(match.group(2)) if match.group(2) else start_label
+        step = 1 if end_label >= start_label else -1
+        for label in range(start_label, end_label + step, step):
+            if label in citations_by_label and label not in ordered_labels:
+                ordered_labels.append(label)
 
     if not ordered_labels:
-        return content, []
+        ordered_labels = list(citations_by_label)
+        if not ordered_labels:
+            return content, []
 
     label_mapping = {old_label: index for index, old_label in enumerate(ordered_labels, start=1)}
 
     def replace_label(match: re.Match[str]) -> str:
         old_label = int(match.group(1))
         new_label = label_mapping.get(old_label)
-        return f"[{new_label}]" if new_label is not None else match.group(0)
+        return f"[{new_label}]" if new_label is not None else ""
 
     compacted_content = re.sub(r"\[(\d+)\]", replace_label, content)
+    compacted_content = re.sub(r"\s*[-–—至]\s*(?=\s|[，。,.;；!?！？\n]|$)", "", compacted_content)
+    compacted_content = re.sub(r"[ \t]+(?=\n|$)", "", compacted_content).rstrip()
     compacted_citations = [
         {**citations_by_label[old_label], "label": f"[{label_mapping[old_label]}]"}
         for old_label in ordered_labels
@@ -116,6 +132,27 @@ def _display_title(value: str) -> str:
     return _compact(value, 72)
 
 
+def knowledge_citation_identity(citation: dict[str, Any]) -> str:
+    """返回跨后端与前端可复用的引用身份，避免同标题切片被误合并。"""
+
+    kind = str(citation.get("kind") or "citation").strip().lower()
+    chunk_id = str(citation.get("chunk_id") or "").strip()
+    if chunk_id:
+        return f"{kind}:chunk:{chunk_id}"
+    concept_id = str(citation.get("concept_id") or "").strip()
+    if concept_id:
+        return f"{kind}:concept:{concept_id}"
+    parts = (
+        str(citation.get("document_id") or "").strip(),
+        str(citation.get("source_path") or "").strip(),
+        str(citation.get("section_path") or "").strip(),
+        str(citation.get("title") or "").strip(),
+        str(citation.get("summary") or "").strip(),
+        str(citation.get("excerpt") or citation.get("content") or "").strip(),
+    )
+    return f"{kind}:" + "|".join(parts)
+
+
 def knowledge_citations_from_results(
     knowledge_results: list[dict[str, Any]],
     limit: int = 4,
@@ -128,10 +165,13 @@ def knowledge_citations_from_results(
             return
         normalized = _normalize_identity(identity)
         title_identity = _normalize_identity(str(payload.get("title") or ""))
-        if not normalized or normalized in seen_identities or (title_identity and title_identity in seen_identities):
+        has_stable_identity = bool(payload.get("chunk_id") or payload.get("concept_id"))
+        if not normalized or normalized in seen_identities or (
+            not has_stable_identity and title_identity and title_identity in seen_identities
+        ):
             return
         seen_identities.add(normalized)
-        if title_identity:
+        if title_identity and not has_stable_identity:
             seen_identities.add(title_identity)
         citations.append(
             {
@@ -178,7 +218,9 @@ def knowledge_citations_from_results(
             source_path = str(item.get("source_path") or "").strip()
             chunk_id = str(item.get("chunk_id") or "").strip()
             title = _display_title(section_path or source_path or summary or "知识片段")
-            identity = _semantic_identity(section_path or summary or f"{source_path}:{excerpt[:120]}" or chunk_id)
+            identity = _semantic_identity(
+                chunk_id or section_path or summary or f"{source_path}:{excerpt[:120]}"
+            )
             add(
                 "evidence",
                 identity,

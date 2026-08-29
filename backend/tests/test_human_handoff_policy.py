@@ -1,3 +1,13 @@
+"""
+@Time       : 2026/08/28
+@Author     : zhanglp8181
+@File       : test_human_handoff_policy.py
+@CallChain  : pytest → AgentLoop/人工交接策略 → HumanHandoffRequest/会话状态
+@Description: 验证人工交接声明、幂等复用、权限筛选和迟到生命周期写屏障。
+"""
+
+from contextlib import nullcontext
+
 import pytest
 from fastapi import HTTPException
 from sqlalchemy.pool import StaticPool
@@ -40,6 +50,12 @@ class FakeDb:
         self.added: list[object] = []
         self.commits = 0
         self.refreshed: list[object] = []
+
+    @property
+    def no_autoflush(self):
+        """为轻量 FakeDb 提供与 SQLAlchemy 会话兼容的无自动 flush 上下文。"""
+
+        return nullcontext()
 
     def exec(self, _statement: object) -> FakeExecResult:
         if self.exec_results:
@@ -113,6 +129,15 @@ def _seed_handoff_users(db: Session) -> tuple[User, User, User]:
     db.add(admin)
     db.add(user)
     db.add(other)
+    db.add(
+        AgentProfile(
+            id="agent_demo",
+            tenant_id="tenant_demo",
+            name="演示员工",
+            owner_user_id=user.id,
+            status="active",
+        )
+    )
     db.commit()
     return admin, user, other
 
@@ -197,6 +222,14 @@ def test_handoff_finalize_creates_pending_request_for_declared_step():
     loop = AgentLoop.__new__(AgentLoop)
     db = FakeDb(
         exec_results=[
+            [
+                AgentProfile(
+                    id="agent_demo",
+                    tenant_id="tenant_demo",
+                    name="演示员工",
+                    status="active",
+                )
+            ],  # active Agent for final-write fencing
             [],  # no existing pending handoff
             [],  # no agent owner metadata
             [],  # no tenant admin in FakeDb, fall back to requester
@@ -250,7 +283,19 @@ def test_handoff_finalize_reuses_existing_pending_request():
         session_id="session_handoff",
         pending_question="之前已经创建的人工请求",
     )
-    loop.db = FakeDb(exec_results=[[existing]])
+    loop.db = FakeDb(
+        exec_results=[
+            [
+                AgentProfile(
+                    id="agent_demo",
+                    tenant_id="tenant_demo",
+                    name="演示员工",
+                    status="active",
+                )
+            ],
+            [existing],
+        ]
+    )
     loop.events = FakeEvents()
     session = _handoff_session()
 
@@ -485,6 +530,14 @@ def test_reply_human_handoff_restores_session_and_schedules_resume(monkeypatch):
         awaiting_input_json={"type": "human_handoff", "handoff_id": "handoff_reply"},
     )
     db = FakeDb(
+        exec_results=[[
+            AgentProfile(
+                id="agent_demo",
+                tenant_id="tenant_demo",
+                name="演示员工",
+                status="active",
+            )
+        ]],
         get_rows={
             (HumanHandoffRequest, "handoff_reply"): handoff,
             (ChatSession, "session_handoff"): session,

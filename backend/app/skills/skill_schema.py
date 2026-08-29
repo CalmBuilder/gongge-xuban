@@ -192,6 +192,7 @@ class SkillVersionRead(BaseModel):
 
 class SkillDistillRequest(BaseModel):
     tenant_id: str
+    agent_id: Optional[str] = None
     title: str
     raw_content: str
     business_domain: Optional[str] = None
@@ -207,6 +208,7 @@ class SkillDistillResponse(BaseModel):
 
 class SkillRewriteRequest(BaseModel):
     tenant_id: str
+    agent_id: Optional[str] = None
     current_skill: SkillCard
     instruction: str
     model_config_id: Optional[str] = None

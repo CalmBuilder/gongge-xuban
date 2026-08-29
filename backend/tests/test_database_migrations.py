@@ -3247,6 +3247,52 @@ def test_desktop_sqlite_rebuilds_legacy_work_item_as_typed_attention(tmp_path) -
         ).scalar_one_or_none() is None
 
 
+def test_context_compaction_migration_resumes_after_partial_ddl(tmp_path) -> None:
+    """验证 0072 在 MySQL 风格逐列 DDL 中断后可跳过已完成列并继续升级。"""
+
+    database_url = f"sqlite:///{tmp_path / 'context-compaction-partial.db'}"
+    config = Config(str(BACKEND_DIR / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
+    config.attributes["database_url"] = database_url
+    engine = create_engine(database_url)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE TABLE ui_configs ("
+                "id VARCHAR(128) PRIMARY KEY, tenant_id VARCHAR(128) NOT NULL)"
+            )
+        )
+        connection.execute(
+            text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)")
+        )
+        connection.execute(text("INSERT INTO alembic_version VALUES ('20260820_0071')"))
+        connection.execute(
+            text(
+                "ALTER TABLE ui_configs ADD COLUMN context_token_budget "
+                "INTEGER NOT NULL DEFAULT 32000"
+            )
+        )
+
+    command.upgrade(config, "20260828_0072")
+    command.upgrade(config, "20260828_0072")
+    with engine.connect() as connection:
+        columns = {column["name"] for column in inspect(connection).get_columns("ui_configs")}
+        assert {
+            "context_token_budget",
+            "context_compaction_trigger_ratio",
+            "context_recent_round_limit",
+        } <= columns
+
+    command.downgrade(config, "20260820_0071")
+    with engine.connect() as connection:
+        columns = {column["name"] for column in inspect(connection).get_columns("ui_configs")}
+        assert not {
+            "context_token_budget",
+            "context_compaction_trigger_ratio",
+            "context_recent_round_limit",
+        } & columns
+
+
 def _prepare_0039_execution_control_database(engine, config: Config) -> None:
     """建立避开早期 SQLite 方言缺陷、但字段与 0039 一致的控制迁移基线。"""
 

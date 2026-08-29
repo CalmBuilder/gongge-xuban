@@ -71,6 +71,10 @@ _scheduled_dispatch_executor = ThreadPoolExecutor(
 _scheduled_dispatch_slots = BoundedSemaphore(SCHEDULE_DISPATCH_CAPACITY)
 
 
+class _ScheduledRunSuperseded(RuntimeError):
+    """表示删除或暂停已先把调度运行推进到终态，迟到 worker 应安静退出。"""
+
+
 class _LLMScheduledTaskDraft(BaseModel):
     should_create: bool = False
     title: str = ""
@@ -215,6 +219,13 @@ def update_scheduled_task(
     request: ScheduledTaskUpdateRequest,
     current_user: User,
 ) -> ScheduledTask:
+    """在 Agent→Task 锁序下更新任务，并把暂停/归档后的未启动运行收敛为 skipped。"""
+
+    _ensure_task_access(row, current_user)
+    if request.agent_id is not None and request.agent_id != row.agent_id:
+        _lock_agent_rows_for_mutation(db, request.tenant_id, (row.agent_id, request.agent_id))
+    _ensure_task_agent_mutable(db, row)
+    row = _lock_scheduled_task_for_mutation(db, row)
     _ensure_task_access(row, current_user)
     if request.agent_id is not None and request.agent_id != row.agent_id:
         _ensure_agent_access(db, request.tenant_id, request.agent_id, current_user)
@@ -248,6 +259,33 @@ def update_scheduled_task(
         row.metadata_json = request.metadata
     row.updated_at = utc_now()
     row.next_run_at = compute_next_run_at(row, after=utc_now()) if row.status == "active" else None
+    if row.status != "active":
+        _skip_unstarted_scheduled_runs(db, row, reason=f"SCHEDULE_TASK_{row.status.upper()}")
+        row.lease_owner = None
+        row.lease_until = None
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def archive_scheduled_task(
+    db: Session,
+    row: ScheduledTask,
+    current_user: User,
+) -> ScheduledTask:
+    """在锁定 Agent 后归档任务，停止未来唤醒并收敛没有 Execution 的活动运行。"""
+
+    _ensure_task_access(row, current_user)
+    _ensure_task_agent_mutable(db, row)
+    row = _lock_scheduled_task_for_mutation(db, row)
+    _ensure_task_access(row, current_user)
+    _skip_unstarted_scheduled_runs(db, row, reason="SCHEDULE_TASK_ARCHIVED")
+    row.status = "archived"
+    row.next_run_at = None
+    row.lease_owner = None
+    row.lease_until = None
+    row.updated_at = utc_now()
     db.add(row)
     db.commit()
     db.refresh(row)
@@ -300,10 +338,15 @@ def detect_scheduled_task_draft(
 
 
 def due_scheduled_tasks(db: Session, now: datetime | None = None, limit: int = 10) -> list[ScheduledTask]:
+    """领取到期且归属活动 Agent 的任务，避免墓碑 Agent 继续产生调度运行。"""
+
     now = now or utc_now()
     candidate_ids = db.exec(
         select(ScheduledTask.id)
+        .join(AgentProfile, AgentProfile.id == ScheduledTask.agent_id)
         .where(
+            AgentProfile.tenant_id == ScheduledTask.tenant_id,
+            AgentProfile.status == "active",
             ScheduledTask.status == "active",
             ScheduledTask.next_run_at <= now,  # type: ignore[operator]
             or_(ScheduledTask.lease_until == None, ScheduledTask.lease_until < now),  # noqa: E711
@@ -314,11 +357,25 @@ def due_scheduled_tasks(db: Session, now: datetime | None = None, limit: int = 1
     lease_owner = f"{socket.gethostname()}:{new_id('worker')}"
     claimed: list[ScheduledTask] = []
     for task_id in candidate_ids:
+        candidate = db.get(ScheduledTask, task_id)
+        if candidate is None:
+            continue
+        prepared = _lock_scheduled_task_for_preparation(db, candidate)
+        if prepared is None:
+            continue
+        locked_task, _agent = prepared
         result = db.exec(
             update(ScheduledTask)
             .where(
                 ScheduledTask.id == task_id,
                 ScheduledTask.status == "active",
+                select(AgentProfile.id)
+                .where(
+                    AgentProfile.id == ScheduledTask.agent_id,
+                    AgentProfile.tenant_id == ScheduledTask.tenant_id,
+                    AgentProfile.status == "active",
+                )
+                .exists(),
                 ScheduledTask.next_run_at <= now,  # type: ignore[operator]
                 or_(ScheduledTask.lease_until == None, ScheduledTask.lease_until < now),  # noqa: E711
             )
@@ -330,9 +387,10 @@ def due_scheduled_tasks(db: Session, now: datetime | None = None, limit: int = 1
         )
         if getattr(result, "rowcount", 0) != 1:
             continue
-        row = db.get(ScheduledTask, task_id)
-        if row:
-            claimed.append(row)
+        locked_task.lease_owner = lease_owner
+        locked_task.lease_until = now + timedelta(seconds=LEASE_SECONDS)
+        locked_task.updated_at = now
+        claimed.append(locked_task)
     if claimed:
         db.commit()
         for row in claimed:
@@ -346,12 +404,29 @@ def execute_scheduled_task(
     *,
     scheduled_for: datetime | None = None,
     manual: bool = False,
-) -> ScheduledTaskRun:
+) -> ScheduledTaskRun | None:
+    """幂等准备并执行一次调度任务；Agent 归档时返回空并不创建新事实。"""
+
     scheduled_for = scheduled_for or task.next_run_at or utc_now()
-    run = _prepare_scheduled_task_run(db, task, scheduled_for, manual)
+    dispatch_owner = None if manual else task.lease_owner
+    run = _prepare_scheduled_task_run(
+        db,
+        task,
+        scheduled_for,
+        manual,
+        lease_owner=dispatch_owner,
+    )
+    if run is None:
+        return None
     if run.status != "running" or not run.session_id:
         return run
-    return _execute_prepared_scheduled_task(db, task, run, manual=manual)
+    return _execute_prepared_scheduled_task(
+        db,
+        task,
+        run,
+        manual=manual,
+        lease_owner=dispatch_owner,
+    )
 
 
 def start_scheduled_task_async(
@@ -363,19 +438,28 @@ def start_scheduled_task_async(
 ) -> ScheduledTaskRun | None:
     """在有界执行池中启动调度入口；容量耗尽时释放租约并保留到期事实重试。"""
 
+    dispatch_owner = None if manual else task.lease_owner
+    if not manual and not _task_lease_is_current(task, dispatch_owner):
+        return None
     if not _scheduled_dispatch_slots.acquire(blocking=False):
-        task.lease_owner = None
-        task.lease_until = None
-        task.updated_at = utc_now()
-        db.add(task)
+        _release_scheduled_task_lease(db, task, dispatch_owner)
         db.commit()
         return None
     scheduled_for = scheduled_for or task.next_run_at or utc_now()
     try:
-        run = _prepare_scheduled_task_run(db, task, scheduled_for, manual)
+        run = _prepare_scheduled_task_run(
+            db,
+            task,
+            scheduled_for,
+            manual,
+            lease_owner=dispatch_owner,
+        )
     except Exception:
         _scheduled_dispatch_slots.release()
         raise
+    if run is None:
+        _scheduled_dispatch_slots.release()
+        return None
     if run.status != "running" or not run.session_id:
         _scheduled_dispatch_slots.release()
         return run
@@ -385,13 +469,11 @@ def start_scheduled_task_async(
             task.id,
             run.id,
             manual,
+            dispatch_owner,
         )
     except RuntimeError:
         _scheduled_dispatch_slots.release()
-        task.lease_owner = None
-        task.lease_until = None
-        task.updated_at = utc_now()
-        db.add(task)
+        _release_scheduled_task_lease(db, task, dispatch_owner)
         db.commit()
         raise
     return run
@@ -402,9 +484,18 @@ def _prepare_scheduled_task_run(
     task: ScheduledTask,
     scheduled_for: datetime,
     manual: bool,
-) -> ScheduledTaskRun:
+    lease_owner: str | None = None,
+) -> ScheduledTaskRun | None:
     """幂等准备调度运行，并为新会话固化 scheduled 来源与员工能力版本。"""
 
+    prepared = _lock_scheduled_task_for_preparation(db, task)
+    if prepared is None:
+        db.rollback()
+        return None
+    task, _agent = prepared
+    if lease_owner is not None and not _task_lease_is_current(task, lease_owner):
+        db.rollback()
+        return None
     existing = db.exec(
         select(ScheduledTaskRun).where(
             ScheduledTaskRun.scheduled_task_id == task.id,
@@ -446,6 +537,22 @@ def _prepare_scheduled_task_run(
 
     run = _create_run(db, task, scheduled_for, "running", manual=manual)
     try:
+        # 在同一事务中先落 Run、会话和 Agent 能力锚点，避免删除赢得竞态后留下无会话的运行事实。
+        db.flush()
+        session = ChatSession(
+            id=new_id("session"),
+            tenant_id=task.tenant_id,
+            user_id=task.created_by_user_id,
+            agent_id=task.agent_id,
+            title=f"自动任务：{task.title}",
+            status="active",
+        )
+        anchor_chat_session(db, session, _agent, origin="scheduled")
+        db.add(session)
+        db.flush()
+        run.session_id = session.id
+        run.updated_at = utc_now()
+        db.add(run)
         db.commit()
     except IntegrityError:
         db.rollback()
@@ -459,29 +566,134 @@ def _prepare_scheduled_task_run(
             return existing
         raise
     db.refresh(run)
-    session = ChatSession(
-        id=new_id("session"),
-        tenant_id=task.tenant_id,
-        user_id=task.created_by_user_id,
-        agent_id=task.agent_id,
-        title=f"自动任务：{task.title}",
-        status="active",
-    )
-    agent = db.get(AgentProfile, task.agent_id)
-    if agent and agent.tenant_id == task.tenant_id:
-        anchor_chat_session(db, session, agent, origin="scheduled")
-    db.add(session)
-    db.commit()
-    db.refresh(session)
-    run.session_id = session.id
-    run.updated_at = utc_now()
-    db.add(run)
-    db.commit()
-    db.refresh(run)
     return run
 
 
-def _execute_prepared_scheduled_task_in_background(task_id: str, run_id: str, manual: bool) -> None:
+def _lock_scheduled_task_for_preparation(
+    db: Session,
+    task: ScheduledTask,
+) -> tuple[ScheduledTask, AgentProfile] | None:
+    """在创建新 Run 前按 Agent→Task 加锁，阻断删除竞态制造半成品事实。"""
+
+    agent = db.exec(
+        select(AgentProfile)
+        .where(
+            AgentProfile.tenant_id == task.tenant_id,
+            AgentProfile.id == task.agent_id,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).first()
+    current_task = db.exec(
+        select(ScheduledTask)
+        .where(
+            ScheduledTask.tenant_id == task.tenant_id,
+            ScheduledTask.id == task.id,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).first()
+    if (
+        agent is None
+        or agent.status != "active"
+        or agent.is_overall
+        or _agent_deletion_state(agent) in {"deleting", "deletion_pending", "deleted"}
+        or current_task is None
+        or current_task.status != "active"
+    ):
+        return None
+    return current_task, agent
+
+
+def _lock_scheduled_task_for_mutation(db: Session, task: ScheduledTask) -> ScheduledTask:
+    """在 Agent 已锁定后锁定最新 Task 行，避免更新请求覆盖并发的任务状态。"""
+
+    current = db.exec(
+        select(ScheduledTask)
+        .where(
+            ScheduledTask.tenant_id == task.tenant_id,
+            ScheduledTask.id == task.id,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).first()
+    if current is None:
+        raise HTTPException(status_code=404, detail="自动任务不存在")
+    return current
+
+
+def _skip_unstarted_scheduled_runs(
+    db: Session,
+    task: ScheduledTask,
+    *,
+    reason: str,
+) -> None:
+    """任务停止接收新唤醒时，终结尚未绑定 Execution 的活动 Run，防止无人消费。"""
+
+    now = utc_now()
+    rows = db.exec(
+        select(ScheduledTaskRun)
+        .where(
+            ScheduledTaskRun.tenant_id == task.tenant_id,
+            ScheduledTaskRun.scheduled_task_id == task.id,
+            ScheduledTaskRun.execution_id.is_(None),
+            ScheduledTaskRun.status.in_(("queued", "running", "waiting")),
+        )
+        .with_for_update()
+    ).all()
+    for row in rows:
+        row.status = "skipped"
+        row.error = reason[:1000]
+        row.finished_at = now
+        row.updated_at = now
+        db.add(row)
+
+
+def _task_lease_is_current(task: ScheduledTask, lease_owner: str | None) -> bool:
+    """判断异步派发 token 是否仍是活动任务当前持有者。"""
+
+    return bool(
+        lease_owner
+        and task.lease_owner == lease_owner
+        and task.lease_until is not None
+        and task.lease_until > utc_now()
+    )
+
+
+def _release_scheduled_task_lease(
+    db: Session,
+    task: ScheduledTask,
+    lease_owner: str | None,
+) -> bool:
+    """仅以 owner CAS 释放任务 lease，迟到 worker 不能清掉新 owner 的租约。"""
+
+    if not lease_owner:
+        return False
+    now = utc_now()
+    result = db.exec(
+        update(ScheduledTask)
+        .where(
+            ScheduledTask.tenant_id == task.tenant_id,
+            ScheduledTask.id == task.id,
+            ScheduledTask.lease_owner == lease_owner,
+        )
+        .values(lease_owner=None, lease_until=None, updated_at=now)
+        .execution_options(synchronize_session=False)
+    )
+    if getattr(result, "rowcount", 0) == 1:
+        task.lease_owner = None
+        task.lease_until = None
+        task.updated_at = now
+        return True
+    return False
+
+
+def _execute_prepared_scheduled_task_in_background(
+    task_id: str,
+    run_id: str,
+    manual: bool,
+    lease_owner: str | None,
+) -> None:
     """使用独立会话推进已持久化运行，并确保任何退出路径都会归还有界容量。"""
 
     try:
@@ -490,7 +702,13 @@ def _execute_prepared_scheduled_task_in_background(task_id: str, run_id: str, ma
             run = db.get(ScheduledTaskRun, run_id)
             if not task or not run:
                 return
-            _execute_prepared_scheduled_task(db, task, run, manual=manual)
+            _execute_prepared_scheduled_task(
+                db,
+                task,
+                run,
+                manual=manual,
+                lease_owner=lease_owner,
+            )
     finally:
         _scheduled_dispatch_slots.release()
 
@@ -501,7 +719,15 @@ def _execute_prepared_scheduled_task(
     run: ScheduledTaskRun,
     *,
     manual: bool,
+    lease_owner: str | None = None,
 ) -> ScheduledTaskRun:
+    """执行已准备的调度运行，并在每个外部阶段用 Agent/Run/Task 锁保护终态。"""
+
+    if not _lock_scheduled_run_for_execution(db, task, run, lease_owner=lease_owner):
+        if lease_owner is not None:
+            _release_scheduled_task_lease(db, task, lease_owner)
+            db.commit()
+        return run
     try:
         if not run.session_id:
             raise RuntimeError("自动任务缺少独立会话")
@@ -519,7 +745,14 @@ def _execute_prepared_scheduled_task(
         )
         result: ChatTurnResponse | None = None
         for seq, item in enumerate(AgentLoop(db).handle_turn_stream(request), start=1):
-            _record_scheduled_task_stream_event(db, run, run.session_id, seq, item)
+            _record_scheduled_task_stream_event(
+                db,
+                run,
+                run.session_id,
+                seq,
+                item,
+                lease_owner=lease_owner,
+            )
             if item.get("event") in {"complete", "done"} and isinstance(item.get("data"), dict):
                 result = ChatTurnResponse.model_validate(item["data"])
         if result is None:
@@ -535,6 +768,8 @@ def _execute_prepared_scheduled_task(
             "session_state": result.session_state.model_dump(mode="json"),
             "execution_id": dynamic_execution.id if dynamic_execution is not None else None,
         }
+        if not _lock_scheduled_run_for_execution(db, task, run, lease_owner=lease_owner):
+            return run
         if dynamic_execution is not None and dynamic_execution.status in {
             "created",
             "running",
@@ -546,29 +781,108 @@ def _execute_prepared_scheduled_task(
             run.status = "succeeded"
             run.finished_at = utc_now()
             _finish_task_schedule(db, task, run.scheduled_for, "succeeded", manual)
+    except _ScheduledRunSuperseded:
+        db.rollback()
+        return run
     except Exception as exc:
+        if not _lock_scheduled_run_for_execution(db, task, run, lease_owner=lease_owner):
+            db.rollback()
+            return run
+        if run.session_id:
+            try:
+                _record_scheduled_task_stream_event(
+                    db,
+                    run,
+                    run.session_id,
+                    0,
+                    {"event": "error", "data": {"message": str(exc), "sessionId": run.session_id}},
+                    lease_owner=lease_owner,
+                )
+            except _ScheduledRunSuperseded:
+                db.rollback()
+                return run
         run.status = "failed"
         run.error = str(exc)
         run.finished_at = utc_now()
-        if run.session_id:
-            _record_scheduled_task_stream_event(
-                db,
-                run,
-                run.session_id,
-                0,
-                {"event": "error", "data": {"message": str(exc), "sessionId": run.session_id}},
-            )
         _finish_task_schedule(db, task, run.scheduled_for, "failed", manual)
     finally:
-        task.lease_owner = None
-        task.lease_until = None
+        if lease_owner is not None:
+            _release_scheduled_task_lease(db, task, lease_owner)
         run.updated_at = utc_now()
-        task.updated_at = utc_now()
-        db.add(task)
-        db.add(run)
+        if run.status in {"queued", "running", "waiting", "succeeded", "failed", "skipped"}:
+            db.add(run)
         db.commit()
         db.refresh(run)
     return run
+
+
+def _lock_scheduled_run_for_execution(
+    db: Session,
+    task: ScheduledTask,
+    run: ScheduledTaskRun,
+    *,
+    lease_owner: str | None = None,
+) -> bool:
+    """按 Agent→Run→Task 顺序加锁并刷新状态，阻止迟到 worker 覆盖删除终态。"""
+
+    agent = db.exec(
+        select(AgentProfile)
+        .where(
+            AgentProfile.tenant_id == task.tenant_id,
+            AgentProfile.id == task.agent_id,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).first()
+    current_run = db.exec(
+        select(ScheduledTaskRun)
+        .where(
+            ScheduledTaskRun.tenant_id == run.tenant_id,
+            ScheduledTaskRun.id == run.id,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).first()
+    current_task = db.exec(
+        select(ScheduledTask)
+        .where(
+            ScheduledTask.tenant_id == task.tenant_id,
+            ScheduledTask.id == task.id,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).first()
+    if (
+        agent is None
+        or agent.status != "active"
+        or _agent_deletion_state(agent) in {"deleting", "deletion_pending", "deleted"}
+        or current_run is None
+        or current_run.status not in {"queued", "running", "waiting"}
+        or current_task is None
+        or current_task.status not in {"active", "paused", "completed", "archived"}
+    ):
+        return False
+    if (
+        lease_owner is not None
+        and current_task.status == "active"
+        and not _task_lease_is_current(current_task, lease_owner)
+    ):
+        return False
+    if current_run is not run:
+        run.status = current_run.status
+        run.updated_at = current_run.updated_at
+    if current_task is not task:
+        task.status = current_task.status
+        task.lease_owner = current_task.lease_owner
+        task.lease_until = current_task.lease_until
+    return True
+
+
+def _agent_deletion_state(agent: AgentProfile) -> str | None:
+    """读取 Agent 删除墓碑状态，兼容历史 metadata 中缺失或异常的值。"""
+
+    deletion = (agent.metadata_json or {}).get("agent_deletion")
+    return deletion.get("state") if isinstance(deletion, dict) else None
 
 
 def reconcile_scheduled_dynamic_runs(db: Session, *, limit: int = 100) -> int:
@@ -585,8 +899,21 @@ def reconcile_scheduled_dynamic_runs(db: Session, *, limit: int = 100) -> int:
     ).all()
     settled = 0
     for run in runs:
-        execution = db.get(SopInstance, run.execution_id)
-        if execution is None or execution.tenant_id != run.tenant_id:
+        task = db.get(ScheduledTask, run.scheduled_task_id)
+        if task is None or task.tenant_id != run.tenant_id:
+            continue
+        if not _lock_scheduled_run_for_execution(db, task, run):
+            continue
+        execution = db.exec(
+            select(SopInstance)
+            .where(
+                SopInstance.tenant_id == run.tenant_id,
+                SopInstance.id == run.execution_id,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        ).first()
+        if execution is None:
             continue
         if execution.status in {"created", "running", "waiting"}:
             if run.status != "waiting":
@@ -631,7 +958,17 @@ def _record_scheduled_task_stream_event(
     session_id: str,
     seq: int,
     item: dict[str, Any],
+    *,
+    lease_owner: str | None = None,
 ) -> None:
+    task = db.get(ScheduledTask, run.scheduled_task_id)
+    if task is None or not _lock_scheduled_run_for_execution(
+        db,
+        task,
+        run,
+        lease_owner=lease_owner,
+    ):
+        raise _ScheduledRunSuperseded("调度运行已被删除或暂停")
     event = str(item.get("event") or "")
     data = item.get("data")
     if not isinstance(data, dict):
@@ -826,7 +1163,15 @@ def _ensure_scheduled_execution_access(
     """每次到期重新校验发起成员与 Agent 使用关系，历史配置不能永久授权。"""
 
     user = db.get(User, task.created_by_user_id)
-    agent = db.get(AgentProfile, task.agent_id)
+    agent = db.exec(
+        select(AgentProfile)
+        .where(
+            AgentProfile.tenant_id == task.tenant_id,
+            AgentProfile.id == task.agent_id,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).first()
     if (
         user is None
         or user.tenant_id != task.tenant_id
@@ -858,12 +1203,22 @@ def _refresh_latest_task_status(db: Session, run: ScheduledTaskRun) -> None:
     db.add(task)
 
 
-def _finish_task_schedule(db: Session, task: ScheduledTask, scheduled_for: datetime, status: str, manual: bool) -> None:
+def _finish_task_schedule(
+    db: Session,
+    task: ScheduledTask,
+    scheduled_for: datetime,
+    status: str,
+    manual: bool,
+) -> None:
+    """记录本轮结果；任务已暂停/归档时绝不重新设置下一次唤醒时间。"""
+
     now = utc_now()
     task.last_run_at = now
     task.last_status = status
     task.run_count += 1
-    if not manual:
+    if task.status != "active":
+        task.next_run_at = None
+    elif not manual:
         next_run = compute_next_run_at(task, after=scheduled_for + timedelta(seconds=1))
         if task.max_runs is not None and task.run_count >= task.max_runs:
             task.status = "completed"
@@ -989,8 +1344,16 @@ def _dt(value: datetime | None) -> str | None:
 
 
 def _ensure_agent_access(db: Session, tenant_id: str, agent_id: str, current_user: User) -> AgentProfile:
-    agent = db.get(AgentProfile, agent_id)
-    if not agent or agent.tenant_id != tenant_id or agent.is_overall or agent.status != "active":
+    agent = db.exec(
+        select(AgentProfile)
+        .where(
+            AgentProfile.tenant_id == tenant_id,
+            AgentProfile.id == agent_id,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).first()
+    if not agent or agent.is_overall or agent.status != "active":
         raise HTTPException(status_code=404, detail="员工不可用")
     if _is_admin_user(current_user):
         return agent
@@ -1007,3 +1370,59 @@ def _ensure_task_access(row: ScheduledTask, current_user: User) -> None:
         return
     if row.created_by_user_id != current_user.id:
         raise HTTPException(status_code=403, detail="无权访问该自动任务")
+
+
+def _ensure_task_agent_mutable(db: Session, row: ScheduledTask) -> AgentProfile:
+    """按 Agent→Task 锁序阻断墓碑员工关联任务的迟到修改。"""
+
+    agent = db.exec(
+        select(AgentProfile)
+        .where(
+            AgentProfile.tenant_id == row.tenant_id,
+            AgentProfile.id == row.agent_id,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).first()
+    deletion = (agent.metadata_json or {}).get("agent_deletion") if agent else None
+    deletion_state = deletion.get("state") if isinstance(deletion, dict) else None
+    if (
+        agent is None
+        or agent.status != "active"
+        or deletion_state in {"deleting", "deletion_pending", "deleted"}
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "AGENT_TOMBSTONE_IMMUTABLE",
+                "message": "数字员工已进入不可逆删除流程，关联自动任务不能继续修改。",
+                "state": deletion_state or "unavailable",
+            },
+        )
+    return agent
+
+
+def _lock_agent_rows_for_mutation(
+    db: Session,
+    tenant_id: str,
+    agent_ids: tuple[str, ...],
+) -> dict[str, AgentProfile]:
+    """按稳定 Agent 主键顺序预锁定调度迁移涉及的员工，避免双向换绑死锁。"""
+
+    unique_ids = tuple(sorted(set(agent_ids)))
+    if not unique_ids:
+        return {}
+    rows = db.exec(
+        select(AgentProfile)
+        .where(
+            AgentProfile.tenant_id == tenant_id,
+            AgentProfile.id.in_(unique_ids),
+        )
+        .order_by(AgentProfile.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).all()
+    by_id = {row.id: row for row in rows}
+    if len(by_id) != len(unique_ids):
+        raise HTTPException(status_code=404, detail="员工不可用")
+    return by_id

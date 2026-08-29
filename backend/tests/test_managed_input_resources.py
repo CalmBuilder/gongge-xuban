@@ -443,14 +443,25 @@ def test_snapshot_read_rejects_cross_tenant_agent_and_disk_tampering(tmp_path) -
         )
         store = SopExecutionStore(db)
         instance, _ = _start(store)
+        db.add(
+            AgentProfile(
+                id="agent_other",
+                tenant_id="tenant_other",
+                name="其他租户 Agent",
+            )
+        )
+        db.flush()
         wrong_tenant, _ = store.start_dynamic_instance(
             tenant_id="tenant_other",
             session_id="session_other",
-            agent_id="agent_legal",
+            agent_id="agent_other",
             initiator_user_id="user_owner",
             plan=_plan(),
             capability_snapshot={"general_skills": []},
         )
+        # 这里故意把已创建的历史 Execution 改成跨租户脏归属，验证输入读取层仍会拒绝；
+        # 生产入口默认开启 Agent 生命周期门禁，不允许创建该状态。
+        wrong_tenant.agent_id = "agent_legal"
         with pytest.raises(InputResourceAccessDenied, match="不可用"):
             service.resolve_for_execution(resource.id, instance=wrong_tenant)
         instance.agent_id = "agent_other"

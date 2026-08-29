@@ -20,6 +20,7 @@ from app.connectors.wecom import WeComCallResult
 from app.db.models import (
     ExecutionResult,
     ExecutionSignal,
+    AgentProfile,
     ModelConfig,
     SopInstance,
     SopOperation,
@@ -725,6 +726,12 @@ def _write_runtime(
                 tenant_id="tenant_write",
                 username="approver",
                 password_hash="x",
+            ),
+            AgentProfile(
+                id="agent-write",
+                tenant_id="tenant_write",
+                name="写入测试 Agent",
+                is_overall=False,
             ),
             model,
         ]

@@ -1408,18 +1408,42 @@ export function canRateMessage(item: ChatMessage): boolean {
 }
 
 export function stripTrailingCitationSummary(content: string): string {
-  return content;
+  const citationHeading = '(?:参考来源|参考资料|引用来源|资料来源)';
+  const citationLabel = String.raw`\[\d+\](?:\s*(?:-|–|—|至)\s*\[\d+\])?`;
+  const labelFooter = new RegExp(
+    `(?:^|\\n)\\s*${citationHeading}\\s*[:：]\\s*(?:${citationLabel}\\s*)+\\s*$`,
+    'u',
+  );
+  const citationSection = new RegExp(
+    `(?:^|\\n)\\s{0,3}(?:#{1,6}\\s*)?${citationHeading}\\s*[:：]?\\s*`
+      + `(?:\\n\\s*(?:[-*+]\\s+|\\d+[.)]\\s+)?\\[\\d+\\][^\\n]*)+\\s*$`,
+    'u',
+  );
+
+  let stripped = content.trimEnd();
+  let previous = '';
+  while (stripped !== previous) {
+    previous = stripped;
+    stripped = stripped.replace(labelFooter, '').trimEnd();
+    stripped = stripped.replace(citationSection, '').trimEnd();
+  }
+  return stripped;
 }
 
 function citationLabelsInContent(content: string): Set<number> {
   const labels = new Set<number>();
-  content.replace(/\[(\d+)\]/g, (_match, value: string) => {
-    const label = Number(value);
-    if (Number.isInteger(label) && label >= 1) {
+  const referencePattern = /\[(\d+)\](?:\s*(?:-|–|—|至)\s*\[(\d+)\])?/g;
+  for (const match of content.matchAll(referencePattern)) {
+    const start = Number(match[1]);
+    const end = match[2] ? Number(match[2]) : start;
+    if (!Number.isInteger(start) || start < 1 || !Number.isInteger(end) || end < 1) {
+      continue;
+    }
+    const step = end >= start ? 1 : -1;
+    for (let label = start; label !== end + step; label += step) {
       labels.add(label);
     }
-    return _match;
-  });
+  }
   return labels;
 }
 
@@ -1439,16 +1463,17 @@ export function knowledgeCitations(item: ChatMessage, content: string): Knowledg
   const citations = item.metadata?.knowledge_citations;
   if (!Array.isArray(citations)) return [];
   const usedLabels = citationLabelsInContent(content);
-  if (usedLabels.size === 0) return [];
   const seen = new Set<string>();
   const result: KnowledgeCitation[] = [];
   citations.forEach((citation, index) => {
     if (!citation || !citation.id) return;
     const labelNumber = citationLabelNumber(citation, index + 1);
-    if (!usedLabels.has(labelNumber)) return;
-    const identity = (
-      citation.title || citation.section_path || citation.summary || citation.excerpt || citation.source_path || citation.concept_id || citation.id
-    );
+    if (usedLabels.size > 0 && !usedLabels.has(labelNumber)) return;
+    const identity = citation.chunk_id
+      ? `chunk:${citation.chunk_id}`
+      : citation.concept_id
+        ? `concept:${citation.concept_id}`
+        : (citation.title || citation.section_path || citation.summary || citation.excerpt || citation.source_path || citation.id);
     const key = normalizeMessageText(identity).toLowerCase();
     if (!key || seen.has(key)) return;
     seen.add(key);

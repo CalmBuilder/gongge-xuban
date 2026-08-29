@@ -387,6 +387,9 @@ class DeterministicSopCoordinator:
             context={"identity": identity_resolution.audit_context}
             if identity_resolution.audit_context
             else None,
+            # 历史无 Agent 绑定的会话仍由旧 SOP 兼容路径托管；一旦会话带有
+            # Agent 身份，则必须经过墓碑/租户/状态门禁，避免删除并发穿透。
+            enforce_agent_lifecycle=chat_session.agent_id is not None,
         )
         source_message_id = self._latest_user_message_id(chat_session)
         with self._owned(instance):
@@ -1815,8 +1818,12 @@ class DeterministicSopCoordinator:
             skill_version=version.version,
             definition_checksum=definition.checksum,
             start_node_id=definition.start_node_id,
+            agent_id=chat_session.agent_id,
             slots=sanitized_slots,
             context={"identity": identity_error},
+            # 身份失败也要沿用同一条兼容边界：Agent-scoped 会话受生命周期
+            # 门禁保护，历史无 Agent 会话不因新增门禁而无法收口失败事实。
+            enforce_agent_lifecycle=chat_session.agent_id is not None,
         )
         with self._owned(instance):
             instance.context_json = {

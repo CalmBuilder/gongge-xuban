@@ -13,8 +13,9 @@ import { basename, dirname, isAbsolute, resolve } from 'node:path';
 
 const ENABLED = process.env.Q1_AGENT_QUALITY_E2E === '1';
 const TENANT_ID = 'tenant_demo';
-const CONTROL_AGENT_ID = 'agent_q1_codebase_control';
-const TREATMENT_AGENT_ID = 'agent_skill_demo_a_docs';
+const CONTROL_AGENT_ID = process.env.Q1_CONTROL_AGENT_ID || 'agent_q1_codebase_control';
+const TREATMENT_AGENT_ID = process.env.Q1_TREATMENT_AGENT_ID || 'agent_skill_demo_a_docs';
+const SAME_AGENT_AB = CONTROL_AGENT_ID === TREATMENT_AGENT_ID;
 const ORDER_SEED = process.env.Q1_ORDER_SEED || 'q1-codebase-default';
 const CERTIFICATION_RUN_ID = process.env.Q1_CERTIFICATION_RUN_ID || '';
 const EVIDENCE_DIR = resolve('../docs/manuals/evidence');
@@ -526,12 +527,15 @@ test('Q1 codebase-design 四象限真实模型探索批', async ({ page }, testI
   await page.goto('/enterprise/dashboard');
   await login(page, CONTROL_AGENT_ID);
   const onlyScenario = process.env.Q1_ONLY_SCENARIO?.trim() || '';
-  const selected = seededOrder([
+  const scenarios = [
     { variant: 'control' as const, inputMode: 'inline' as const },
     { variant: 'control' as const, inputMode: 'attachment' as const },
     { variant: 'treatment' as const, inputMode: 'inline' as const },
     { variant: 'treatment' as const, inputMode: 'attachment' as const },
-  ].filter((item) => !onlyScenario || `${item.inputMode}-${item.variant}` === onlyScenario), ORDER_SEED);
+  ].filter((item) => !onlyScenario || `${item.inputMode}-${item.variant}` === onlyScenario);
+  // 严格A/B使用同一个AgentProfile时固定control先行，Skill导入只发生在控制组完成后，
+  // 从而隔离persona、模型、UIConfig、权限和资源配置差异。
+  const selected = SAME_AGENT_AB ? scenarios : seededOrder(scenarios, ORDER_SEED);
   expect(selected.length, `unknown Q1_ONLY_SCENARIO: ${onlyScenario}`).toBeGreaterThan(0);
   report.execution_order = selected.map((item) => `${item.inputMode}-${item.variant}`);
   for (const item of selected) {

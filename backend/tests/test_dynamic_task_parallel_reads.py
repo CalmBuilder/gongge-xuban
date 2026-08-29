@@ -355,6 +355,14 @@ def test_expired_parallel_wave_is_reconciled_without_running_orphans(
         )
         db.add(tenant)
         db.add(user)
+        db.add(
+            AgentProfile(
+                id="agent_recovery",
+                tenant_id=tenant.id,
+                name="恢复测试 Agent",
+                is_overall=False,
+            )
+        )
         plan = _ParallelPlanner().create_plan(
             goal="恢复读取",
             success_criteria=(

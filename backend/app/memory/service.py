@@ -15,7 +15,7 @@ from typing import Any
 from sqlmodel import Session, select
 
 from app import paths
-from app.db.models import ChatSession, MemoryRecord, ModelConfig, Tool, User, utc_now
+from app.db.models import AgentProfile, ChatSession, MemoryRecord, ModelConfig, Tool, User, utc_now
 from app.llm import LLMClient
 from app.observability.spans import llm_operation
 from app.session.session_schema import ChatTurnRequest, StepAgentResult
@@ -28,8 +28,16 @@ PROFILE_NAME_KEY = "preferred_name"
 ALLOWED_MEMORY_KINDS = {"profile", "preference", "fact"}
 
 
+class MemoryAgentUnavailable(RuntimeError):
+    """表示记忆所属 Agent 已归档或租户不匹配，迟到任务必须丢弃。"""
+
+
 class MemoryService:
+    """提供按租户、用户和 Agent 隔离的记忆读取与写入能力。"""
+
     def __init__(self, db: Session):
+        """保存当前请求使用的数据库会话。"""
+
         self.db = db
 
     def recall(
@@ -40,6 +48,8 @@ class MemoryService:
         limit: int | None = None,
         agent_id: str | None = None,
     ) -> list[MemoryRecord]:
+        """读取当前用户可用于上下文的长期记忆，并校验 Agent 生命周期。"""
+
         del query, limit
         return self.context_memories(tenant_id, user_id, agent_id=agent_id)
 
@@ -50,6 +60,9 @@ class MemoryService:
         *,
         agent_id: str | None = None,
     ) -> list[MemoryRecord]:
+        """按租户、用户和可选 Agent 返回去重后的结构化记忆。"""
+
+        self._assert_agent_available(tenant_id, agent_id)
         return [
             row
             for row in self._list_user_memories(
@@ -70,12 +83,15 @@ class MemoryService:
         model_config: ModelConfig,
         conversation_messages: list[dict[str, str]],
     ) -> list[MemoryRecord]:
+        """提取一轮对话记忆，并在 Agent 归档竞态中拒绝迟到模型写入。"""
+
         from app.core.context_projection import compact_step_result
 
         if not request.user_id:
             return []
 
-        agent_id = session.agent_id
+        agent_id = session.agent_id or request.agent_id
+        self._assert_agent_available(request.tenant_id, agent_id)
         user = self.db.get(User, request.user_id)
         username = user.username if user else request.user_id
         existing_rows = self._list_user_memories(
@@ -176,6 +192,7 @@ class MemoryService:
     ) -> MemoryRecord:
         """按用户、员工和结构化键更新记忆，并同步可索引的员工归属。"""
 
+        self._assert_agent_available(tenant_id, agent_id)
         existing, duplicates = self._find_keyed_memory_candidates(tenant_id, user_id, kind, key, agent_id=agent_id)
         now = utc_now()
         if existing:
@@ -215,6 +232,9 @@ class MemoryService:
         key: str,
         agent_id: str | None = None,
     ) -> None:
+        """删除指定员工和结构化键的记忆，归档竞态下不执行迟到清理。"""
+
+        self._assert_agent_available(tenant_id, agent_id)
         existing, duplicates = self._find_keyed_memory_candidates(tenant_id, user_id, kind, key, agent_id=agent_id)
         for row in [existing, *duplicates]:
             if row:
@@ -258,6 +278,7 @@ class MemoryService:
     ) -> MemoryRecord:
         """更新指定员工的用户摘要，并保持列字段与兼容 metadata 一致。"""
 
+        self._assert_agent_available(tenant_id, agent_id)
         summary_rows = list(
             self.db.exec(
                 select(MemoryRecord)
@@ -302,6 +323,23 @@ class MemoryService:
         )
         self.db.add(record)
         return record
+
+    def _assert_agent_available(self, tenant_id: str, agent_id: str | None) -> None:
+        """以 Agent 行锁作为记忆写屏障，归档事务优先时拒绝迟到写入。"""
+
+        if not agent_id:
+            return
+        agent = self.db.exec(
+            select(AgentProfile)
+            .where(
+                AgentProfile.tenant_id == tenant_id,
+                AgentProfile.id == agent_id,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        ).first()
+        if agent is None or agent.status != "active":
+            raise MemoryAgentUnavailable("MEMORY_AGENT_UNAVAILABLE")
 
     def _memory_matches_agent(self, record: MemoryRecord, agent_id: str | None) -> bool:
         if memory_matches_agent(record, agent_id):

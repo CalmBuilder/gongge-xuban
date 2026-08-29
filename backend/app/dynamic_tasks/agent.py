@@ -2346,6 +2346,8 @@ class DynamicTaskAgent:
     ) -> SopWorkItem | None:
         """提交长期授权事实后唯一外呼，并将成功、确定失败或 unknown 各自持久闭合。"""
 
+        if not self.store.lock_agent_for_runtime(instance):
+            raise DynamicTaskAgentError("DYNAMIC_AGENT_UNAVAILABLE")
         try:
             result = self.connection_service.send_wecom_approved_message(
                 tenant_id=instance.tenant_id,
@@ -2570,7 +2572,11 @@ class DynamicTaskAgent:
                 actor_user_id=instance.initiator_user_id,
             )
         control = ExecutionControlService(self.db, self.store)
-        control.claim_signal(signal, worker_id=worker_id, ttl_seconds=300)
+        control.claim_signal(
+            signal,
+            worker_id=worker_id,
+            ttl_seconds=300,
+        )
         self.db.commit()
         with self.store.owned(instance, worker_id=worker_id):
             attention = self.db.get(
@@ -2724,6 +2730,8 @@ class DynamicTaskAgent:
             self._consume_call_budget(instance, "tool_calls")
         self.db.commit()
         full_payload = dict(attention.payload_json or {})
+        if not self.store.lock_agent_for_runtime(instance):
+            raise DynamicTaskAgentError("DYNAMIC_AGENT_UNAVAILABLE")
         try:
             result = self.connection_service.send_wecom_approved_message(
                 tenant_id=instance.tenant_id,
@@ -2814,7 +2822,11 @@ class DynamicTaskAgent:
                 actor_user_id=instance.initiator_user_id,
             )
         control = ExecutionControlService(self.db, self.store)
-        control.claim_signal(signal, worker_id=worker_id, ttl_seconds=300)
+        control.claim_signal(
+            signal,
+            worker_id=worker_id,
+            ttl_seconds=300,
+        )
         self.db.commit()
         with self.store.owned(instance, worker_id=worker_id):
             attention = self.db.get(
@@ -3206,17 +3218,29 @@ class DynamicTaskAgent:
             raise DynamicTaskAgentError("DYNAMIC_RECONCILE_SIGNAL_INVALID")
         control = ExecutionControlService(self.db, self.store)
         if signal.status == "consumed":
-            if instance.status == "failed":
-                return DynamicRunOutcome("failed", instance.id)
+            if instance.cancellation_requested_at is not None or instance.status in {
+                "succeeded",
+                "failed",
+                "timed_out",
+                "cancelled",
+            }:
+                return DynamicRunOutcome(instance.status, instance.id)
             return self.run_until_blocked_or_complete(
                 execution_id=instance.id,
                 model_config=model_config,
                 worker_id=worker_id,
                 actor_user_id=instance.initiator_user_id,
             )
-        control.claim_signal(signal, worker_id=worker_id, ttl_seconds=300)
+        control.claim_signal(
+            signal,
+            worker_id=worker_id,
+            ttl_seconds=300,
+            allow_archived_agent=True,
+        )
         self.db.commit()
-        with self.store.owned(instance, worker_id=worker_id):
+        applied = False
+        cancellation_requested = instance.cancellation_requested_at is not None
+        with self.store.owned_for_reconciliation(instance, worker_id=worker_id):
             attention = self.db.get(
                 SopWorkItem,
                 str(signal.payload_json.get("attention_id") or ""),
@@ -3249,8 +3273,9 @@ class DynamicTaskAgent:
             command = str(attention.resolution_json.get("command") or "")
             if command not in {"confirm_applied", "confirm_not_applied"}:
                 raise DynamicTaskAgentError("DYNAMIC_RECONCILE_COMMAND_INVALID")
-            self.store.resume_waiting_node(instance, step, slots=instance.slots_json or {})
             applied = command == "confirm_applied"
+            if not cancellation_requested:
+                self.store.resume_waiting_node(instance, step, slots=instance.slots_json or {})
             evidence = {
                 "code": "MANUAL_RECONCILIATION",
                 "actor_user_id": actor_user_id,
@@ -3261,7 +3286,8 @@ class DynamicTaskAgent:
                 "delivery_status": "manually_confirmed",
                 "message_id": operation.external_reference or "",
             }
-            self.store.reconcile_operation(
+            control.consume_signal(instance, signal, worker_id=worker_id)
+            settled = self.store.reconcile_operation(
                 instance,
                 operation,
                 succeeded=applied,
@@ -3269,8 +3295,14 @@ class DynamicTaskAgent:
                 error=None if applied else evidence,
                 effect_confirmed=applied,
             )
-            control.consume_signal(instance, signal, worker_id=worker_id)
-            if applied:
+            if cancellation_requested or settled or instance.status in {
+                "succeeded",
+                "failed",
+                "timed_out",
+                "cancelled",
+            }:
+                pass
+            elif applied:
                 self.store.complete_node(instance, step, output={"data": data})
             else:
                 self.store.fail_node(instance, step, error=evidence)
@@ -3281,6 +3313,13 @@ class DynamicTaskAgent:
                     context_patch={"failure_code": "DYNAMIC_WRITE_NOT_APPLIED"},
                 )
         self.db.commit()
+        if cancellation_requested or instance.status in {
+            "succeeded",
+            "failed",
+            "timed_out",
+            "cancelled",
+        }:
+            return DynamicRunOutcome(instance.status, instance.id)
         if not applied:
             return DynamicRunOutcome("failed", instance.id)
         return self.run_until_blocked_or_complete(
@@ -4770,6 +4809,7 @@ class DynamicTaskAgent:
             capability_snapshot=snapshot,
             source_kind=source_kind,
             source_ref=source_ref or session_id,
+            enforce_agent_lifecycle=True,
         )
         for use_id in loaded_use_ids:
             use = self.db.get(GeneralSkillUse, use_id)

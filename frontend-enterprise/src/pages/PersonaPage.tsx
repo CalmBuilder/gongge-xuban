@@ -28,6 +28,9 @@ type UiConfigForm = {
   show_tool_trace: boolean;
   reflection_max_rounds: string;
   agent_loop_max_actions: string;
+  context_token_budget: string;
+  context_compaction_trigger_ratio: string;
+  context_recent_round_limit: string;
 };
 
 const BLANK_PERSONA: PersonaForm = { agent_name: '', agent_description: '', system_prompt: '' };
@@ -37,6 +40,9 @@ const DEFAULT_UI_CONFIG: UiConfigForm = {
   show_tool_trace: true,
   reflection_max_rounds: '1',
   agent_loop_max_actions: '6',
+  context_token_budget: '32000',
+  context_compaction_trigger_ratio: '0.70',
+  context_recent_round_limit: '6',
 };
 
 function formatDateOnly(value: string): string {
@@ -74,6 +80,9 @@ export default function PersonaPage() {
           show_tool_trace: row.show_tool_trace,
           reflection_max_rounds: String(row.reflection_max_rounds),
           agent_loop_max_actions: String(row.agent_loop_max_actions),
+          context_token_budget: String(row.context_token_budget),
+          context_compaction_trigger_ratio: String(row.context_compaction_trigger_ratio),
+          context_recent_round_limit: String(row.context_recent_round_limit),
         });
         setUiUpdatedAt(row.updated_at);
       })
@@ -181,8 +190,23 @@ export default function PersonaPage() {
   async function saveUiConfig() {
     const reflectionMaxRounds = Number(uiForm.reflection_max_rounds);
     const agentLoopMaxActions = Number(uiForm.agent_loop_max_actions);
-    if (Number.isNaN(reflectionMaxRounds) || Number.isNaN(agentLoopMaxActions)) {
-      notify.error('反思轮数与单轮最大动作数必须是数字');
+    const contextTokenBudget = Number(uiForm.context_token_budget);
+    const contextCompactionTriggerRatio = Number(uiForm.context_compaction_trigger_ratio);
+    const contextRecentRoundLimit = Number(uiForm.context_recent_round_limit);
+    if (
+      Number.isNaN(reflectionMaxRounds) ||
+      Number.isNaN(agentLoopMaxActions) ||
+      !Number.isInteger(contextTokenBudget) ||
+      contextTokenBudget < 4096 ||
+      contextTokenBudget > 32000 ||
+      !Number.isFinite(contextCompactionTriggerRatio) ||
+      contextCompactionTriggerRatio < 0.45 ||
+      contextCompactionTriggerRatio > 0.95 ||
+      !Number.isInteger(contextRecentRoundLimit) ||
+      contextRecentRoundLimit < 1 ||
+      contextRecentRoundLimit > 20
+    ) {
+      notify.error('执行与上下文配置必须是安全范围内的有效数字');
       return;
     }
     setUiLoading(true);
@@ -194,6 +218,9 @@ export default function PersonaPage() {
         show_tool_trace: uiForm.show_tool_trace,
         reflection_max_rounds: reflectionMaxRounds,
         agent_loop_max_actions: agentLoopMaxActions,
+        context_token_budget: contextTokenBudget,
+        context_compaction_trigger_ratio: contextCompactionTriggerRatio,
+        context_recent_round_limit: contextRecentRoundLimit,
       });
       setUiUpdatedAt(row.updated_at);
       notify.success('展示设置已保存');
@@ -266,6 +293,48 @@ export default function PersonaPage() {
               onChange={(event) => updateUiConfig({ agent_loop_max_actions: event.target.value })}
             />
           </LabeledField>
+          <LabeledField label="上下文最大 token" hint="控制单轮发送给模型的会话上下文上限，允许范围为 4096–32000。" hintId="context-token-budget-hint">
+            <Input
+              id="context-token-budget"
+              name="context_token_budget"
+              aria-label="上下文最大 token"
+              aria-describedby="context-token-budget-hint"
+              type="number"
+              min={4096}
+              max={32000}
+              step={1024}
+              value={uiForm.context_token_budget}
+              onChange={(event) => updateUiConfig({ context_token_budget: event.target.value })}
+            />
+          </LabeledField>
+          <LabeledField label="触发压缩比例" hint="上下文达到该比例时开始摘要压缩，允许范围为 0.45–0.95。" hintId="context-compaction-ratio-hint">
+            <Input
+              id="context-compaction-ratio"
+              name="context_compaction_trigger_ratio"
+              aria-label="触发压缩比例"
+              aria-describedby="context-compaction-ratio-hint"
+              type="number"
+              min={0.45}
+              max={0.95}
+              step={0.05}
+              value={uiForm.context_compaction_trigger_ratio}
+              onChange={(event) => updateUiConfig({ context_compaction_trigger_ratio: event.target.value })}
+            />
+          </LabeledField>
+          <LabeledField label="保留近期轮数" hint="压缩时原样保留的最近用户对话轮数，允许范围为 1–20。" hintId="context-recent-round-hint">
+            <Input
+              id="context-recent-round-limit"
+              name="context_recent_round_limit"
+              aria-label="保留近期轮数"
+              aria-describedby="context-recent-round-hint"
+              type="number"
+              min={1}
+              max={20}
+              step={1}
+              value={uiForm.context_recent_round_limit}
+              onChange={(event) => updateUiConfig({ context_recent_round_limit: event.target.value })}
+            />
+          </LabeledField>
           <UIButton className="self-start" disabled={uiLoading} onClick={() => void saveUiConfig()}>
             <SaveOutlined />
             保存设置
@@ -277,11 +346,11 @@ export default function PersonaPage() {
   );
 }
 
-function LabeledField({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
+function LabeledField({ label, hint, hintId, children }: { label: string; hint?: string; hintId?: string; children: ReactNode }) {
   return (
     <label className="flex flex-col gap-[6px]">
       <span className="text-[12px] font-medium text-[#464c5e]">{label}</span>
-      {hint && <span className="text-[11px] leading-[16px] text-muted-foreground">{hint}</span>}
+      {hint && <span id={hintId} className="text-[11px] leading-[16px] text-muted-foreground">{hint}</span>}
       {children}
     </label>
   );

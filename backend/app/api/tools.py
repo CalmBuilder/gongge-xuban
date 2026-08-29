@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import re
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -65,6 +65,7 @@ from app.tools.tool_schema import (
     MCPDiscoverResponse,
     MCPDiscoveredTool,
     MCPServerConnection,
+    MCPServerCredentialState,
     MCPServerCreateRequest,
     MCPServerRead,
     MCPServerUpdateRequest,
@@ -85,6 +86,19 @@ from app.tools.tool_schema import (
 
 router = APIRouter(prefix="/api/enterprise/tools", tags=["enterprise:tools"])
 mcp_router = APIRouter(prefix="/api/enterprise/mcp-servers", tags=["enterprise:mcp-servers"])
+MCP_CREDENTIAL_MASK = "********"
+_MCP_PATH_SECRET_RE = re.compile(
+    r"(?i)(/(?:access[_-]?token|api[_-]?key|credential|password|refresh[_-]?token|secret|token)"
+    r"(?:/|=|:))[^/?#]+"
+)
+_MCP_SENSITIVE_ARG_RE = re.compile(
+    r"(?i)^(?:--?|/)?(?:access[_-]?token|api[_-]?key|apikey|authorization|credential|password|"
+    r"refresh[_-]?token|secret|secret[_-]?key|token)$"
+)
+_MCP_SENSITIVE_ASSIGNMENT_RE = re.compile(
+    r"(?i)^((?:--?|/)?(?:access[_-]?token|api[_-]?key|apikey|authorization|credential|password|"
+    r"refresh[_-]?token|secret|secret[_-]?key|token)\s*[=:])(.+)$"
+)
 
 
 def tool_read(row: Tool, metadata: dict[str, Any] | None = None) -> ToolRead:
@@ -880,6 +894,224 @@ def _server_connection(row: MCPServer) -> MCPServerConnection:
     )
 
 
+def _mask_mcp_url(url: str | None) -> str | None:
+    """脱敏 URL 中的用户信息、查询值和敏感路径段，保留可定位端点的结构。"""
+
+    if not url:
+        return url
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return MCP_CREDENTIAL_MASK
+    netloc = parsed.netloc
+    if parsed.username is not None or parsed.password is not None:
+        host = parsed.hostname or ""
+        if parsed.port is not None:
+            host = f"{host}:{parsed.port}"
+        netloc = f"{MCP_CREDENTIAL_MASK}@{host}"
+    query = parsed.query
+    if query:
+        query = urlencode(
+            [(key, MCP_CREDENTIAL_MASK if value else value) for key, value in parse_qsl(query, keep_blank_values=True)]
+        )
+    path = _MCP_PATH_SECRET_RE.sub(rf"\1{MCP_CREDENTIAL_MASK}", parsed.path)
+    return urlunsplit((parsed.scheme, netloc, path, query, ""))
+
+
+def _merge_masked_mcp_url(previous: str | None, incoming: str | None) -> str | None:
+    """更新 MCP URL 时仅把脱敏占位值还原为服务端已有值。"""
+
+    if incoming is None:
+        return None
+    if previous is None or incoming == MCP_CREDENTIAL_MASK:
+        return incoming if previous is None else previous
+    masked_previous = _mask_mcp_url(previous)
+    if incoming != masked_previous:
+        return _strip_mcp_mask_placeholders(incoming)
+    return previous
+
+
+def _strip_mcp_mask_placeholders(url: str) -> str:
+    """切换 MCP 端点时移除未能安全继承的 URL 占位凭据。"""
+
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return url
+    netloc = parsed.netloc
+    if MCP_CREDENTIAL_MASK in netloc:
+        host = parsed.hostname or ""
+        if parsed.port is not None:
+            host = f"{host}:{parsed.port}"
+        netloc = host
+    query = urlencode(
+        [(key, value) for key, value in parse_qsl(parsed.query, keep_blank_values=True) if value != MCP_CREDENTIAL_MASK]
+    )
+    path = _MCP_PATH_SECRET_RE.sub(
+        lambda match: match.group(1).rstrip("/") if match.group(0).endswith(MCP_CREDENTIAL_MASK) else match.group(0),
+        parsed.path,
+    )
+    return urlunsplit((parsed.scheme, netloc, path, query, ""))
+
+
+def _mask_mcp_arg(value: str, *, next_value: str | None = None) -> str:
+    """脱敏 stdio 参数中的凭据赋值，同时保留参数名和非敏感参数。"""
+
+    if value == MCP_CREDENTIAL_MASK:
+        return value
+    assignment = _MCP_SENSITIVE_ASSIGNMENT_RE.match(value)
+    if assignment:
+        return f"{assignment.group(1)}{MCP_CREDENTIAL_MASK}"
+    if _MCP_SENSITIVE_ARG_RE.fullmatch(value) and next_value is not None:
+        return value
+    bearer = re.search(r"(?i)\bbearer\s+", value)
+    if bearer:
+        return f"{value[:bearer.end()]}{MCP_CREDENTIAL_MASK}"
+    if re.match(r"(?i)^(?:https?|wss?)://", value) or value.startswith(("/", "//")):
+        return _mask_mcp_url(value) or value
+    return value
+
+
+def _mask_mcp_args(args: list[str]) -> list[str]:
+    """生成 stdio 管理读取契约，避免命令参数中的密钥回显。"""
+
+    masked: list[str] = []
+    index = 0
+    while index < len(args):
+        value = args[index]
+        next_value = args[index + 1] if index + 1 < len(args) else None
+        if _MCP_SENSITIVE_ARG_RE.fullmatch(value) and next_value is not None:
+            masked.extend((value, MCP_CREDENTIAL_MASK))
+            index += 2
+            continue
+        masked.append(_mask_mcp_arg(value, next_value=next_value))
+        index += 1
+    return masked
+
+
+def _strip_mcp_masked_args(args: list[str]) -> list[str]:
+    """切换 stdio 端点时移除未能安全继承的参数占位凭据。"""
+
+    stripped: list[str] = []
+    index = 0
+    while index < len(args):
+        value = args[index]
+        if value == MCP_CREDENTIAL_MASK:
+            index += 1
+            continue
+        if _MCP_SENSITIVE_ARG_RE.fullmatch(value) and index + 1 < len(args):
+            if args[index + 1] == MCP_CREDENTIAL_MASK:
+                index += 2
+                continue
+        assignment = _MCP_SENSITIVE_ASSIGNMENT_RE.match(value)
+        if assignment and assignment.group(2) == MCP_CREDENTIAL_MASK:
+            index += 1
+            continue
+        stripped.append(value)
+        index += 1
+    return stripped
+
+
+def _merge_masked_mcp_args(
+    previous: list[str], incoming: list[str], *, reuse_credentials: bool
+) -> list[str]:
+    """按 stdio 命令参数的完全一致性回填密钥，否则丢弃占位参数。"""
+
+    if reuse_credentials and incoming == _mask_mcp_args(list(previous)):
+        return list(previous)
+    return _strip_mcp_masked_args(list(incoming))
+
+
+def _mcp_credentials_share_endpoint(
+    previous: MCPServerConnection,
+    incoming: MCPServerConnection,
+) -> bool:
+    """只有 transport 和实际端点完全一致时才允许回填脱敏凭据。"""
+
+    if previous.transport != incoming.transport:
+        return False
+    if previous.transport in {"streamable_http", "sse"}:
+        return bool(previous.url and incoming.url and incoming.url == _mask_mcp_url(previous.url))
+    if previous.transport == "stdio":
+        return (
+            previous.command == incoming.command
+            and list(incoming.args) == _mask_mcp_args(list(previous.args))
+            and previous.cwd == incoming.cwd
+        )
+    return False
+
+
+def _merge_masked_mcp_fields(
+    previous: dict[str, str],
+    incoming: dict[str, str],
+    *,
+    reuse_credentials: bool,
+) -> dict[str, str]:
+    """按端点一致性合并 headers/env，切换端点时不保存无效占位符。"""
+
+    merged: dict[str, str] = {}
+    for key, value in incoming.items():
+        if value != MCP_CREDENTIAL_MASK:
+            merged[key] = value
+        elif reuse_credentials and key in previous:
+            merged[key] = previous[key]
+    return merged
+
+
+def _mask_mcp_connection(connection: MCPServerConnection) -> MCPServerConnection:
+    """生成 MCP 管理读取契约，保留字段形状但不暴露连接凭据。"""
+
+    return MCPServerConnection(
+        transport=connection.transport,
+        url=_mask_mcp_url(connection.url),
+        headers={key: MCP_CREDENTIAL_MASK for key in connection.headers},
+        command=connection.command,
+        args=_mask_mcp_args(list(connection.args)),
+        env={key: MCP_CREDENTIAL_MASK for key in connection.env},
+        cwd=connection.cwd,
+    )
+
+
+def _mcp_credential_state(connection: MCPServerConnection) -> MCPServerCredentialState:
+    """生成不含凭据值的 MCP 配置摘要。"""
+
+    return MCPServerCredentialState(
+        configured_fields=[
+            field for field, values in (("headers", connection.headers), ("env", connection.env)) if values
+        ],
+        header_keys=sorted(str(key) for key in connection.headers),
+        env_keys=sorted(str(key) for key in connection.env),
+    )
+
+
+def _merge_masked_mcp_connection(
+    previous: MCPServerConnection,
+    incoming: MCPServerConnection,
+) -> MCPServerConnection:
+    """合并管理页回传的脱敏连接，确保未修改的服务端密钥继续可执行。"""
+
+    reuse_credentials = _mcp_credentials_share_endpoint(previous, incoming)
+    return MCPServerConnection(
+        transport=incoming.transport,
+        url=_merge_masked_mcp_url(previous.url, incoming.url),
+        headers=_merge_masked_mcp_fields(
+            previous.headers,
+            incoming.headers,
+            reuse_credentials=reuse_credentials,
+        ),
+        command=incoming.command,
+        args=_merge_masked_mcp_args(
+            list(previous.args), list(incoming.args), reuse_credentials=reuse_credentials
+        ),
+        env=_merge_masked_mcp_fields(
+            previous.env,
+            incoming.env,
+            reuse_credentials=reuse_credentials,
+        ),
+        cwd=incoming.cwd,
+    )
+
+
 def _connection_to_client_config(connection: MCPServerConnection) -> dict[str, Any]:
     """把结构化连接配置转成 mcp_client 认识的扁平 config。"""
     config: dict[str, Any] = {"transport": connection.transport}
@@ -900,6 +1132,7 @@ def _connection_to_client_config(connection: MCPServerConnection) -> dict[str, A
 
 
 def mcp_server_read(row: MCPServer, db: Session) -> MCPServerRead:
+    connection = _server_connection(row)
     tool_count = len(db.exec(select(Tool.id).where(Tool.mcp_server_id == row.id)).all())
     return MCPServerRead(
         id=row.id,
@@ -908,7 +1141,8 @@ def mcp_server_read(row: MCPServer, db: Session) -> MCPServerRead:
         display_name=row.display_name,
         description=row.description,
         bucket=row.bucket or "MCP 工具",
-        connection=_server_connection(row),
+        connection=_mask_mcp_connection(connection),
+        credential_state=_mcp_credential_state(connection),
         enabled=row.enabled,
         last_synced_at=row.last_synced_at.isoformat() if row.last_synced_at else None,
         tool_count=tool_count,
@@ -988,7 +1222,7 @@ def update_mcp_server(
 ) -> MCPServerRead:
     row = _get_mcp_server(db, request.tenant_id, server_id)
     ensure_open_gallery_admin(request.tenant_id, current_user)
-    conn = request.connection
+    conn = _merge_masked_mcp_connection(_server_connection(row), request.connection)
     row.name = request.name
     row.display_name = request.display_name
     row.description = request.description
@@ -1058,7 +1292,11 @@ def discover_mcp_tools(
     """已保存 Server：拉取 tools/list，并标注哪些已导入为 Tool。"""
     row = _get_mcp_server(db, request.tenant_id, server_id)
     ensure_open_gallery_admin(request.tenant_id, current_user)
-    connection = request.connection or _server_connection(row)
+    connection = (
+        _merge_masked_mcp_connection(_server_connection(row), request.connection)
+        if request.connection is not None
+        else _server_connection(row)
+    )
     response = _discover_response(connection)
     if response.success:
         row.discovered_tools_json = [tool.model_dump() for tool in response.tools]
@@ -1086,6 +1324,11 @@ def sync_mcp_tools(
     """把发现到的工具落成 Tool 行（新建/更新 schema），可选择导入的子集。"""
     row = _get_mcp_server(db, request.tenant_id, server_id)
     ensure_open_gallery_admin(request.tenant_id, current_user)
+    scoped_agent = (
+        ensure_agent_scope_manager(db, row.tenant_id, agent_id, current_user)
+        if agent_id
+        else None
+    )
     connection = _server_connection(row)
     discovery = _discover_response(connection)
     if not discovery.success:
@@ -1141,7 +1384,7 @@ def sync_mcp_tools(
     # 与 create_tool 一致：按当前 agent 范围绑定——员工范围内只对该员工私有可见，
     # 否则落到工具广场（open gallery），所有人可见。已存在的工具也一并补绑定，
     # 避免「先在广场导入，再切到员工同步」时员工侧仍然看不到。
-    agent = get_agent(db, row.tenant_id, agent_id)
+    agent = scoped_agent
     creator_metadata = user_creator_metadata(current_user)
     for tool_id in touched_tool_ids:
         if agent and not agent.is_overall:

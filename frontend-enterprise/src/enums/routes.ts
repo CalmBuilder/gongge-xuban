@@ -5,6 +5,7 @@ export enum EnterpriseRoute {
   Gallery = '/workspace/gallery',
   Agents = '/enterprise/agents',
   Dashboard = '/enterprise/dashboard',
+  Persona = '/enterprise/persona',
   ScheduledTasks = '/enterprise/scheduled-tasks',
   Memories = '/enterprise/memories',
   Feedback = '/enterprise/feedback',

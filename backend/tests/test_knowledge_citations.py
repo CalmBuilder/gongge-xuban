@@ -9,6 +9,7 @@
 from app.knowledge.citations import (
     CITATION_EXCERPT_CHAR_LIMIT,
     compact_knowledge_citation_labels,
+    knowledge_citation_identity,
     knowledge_citations_from_results,
     restore_truncated_atomic_references,
 )
@@ -43,6 +44,69 @@ def test_compact_knowledge_citation_labels_supports_historical_filtered_metadata
 
     assert content == "排查步骤来自手册。[1] 区域故障需要报修。[2]"
     assert [item["label"] for item in citations] == ["[1]", "[2]"]
+
+
+def test_compact_knowledge_citation_labels_supports_ranges_and_removes_footer() -> None:
+    """范围引用按顺序展开，来源尾巴不重复出现在正文中。"""
+
+    content, citations = compact_knowledge_citation_labels(
+        "请假制度依据员工手册。[1]-[4]\n\n参考来源：[1]-[4] [9]",
+        [
+            {"id": f"kref_{index}", "label": f"[{index}]", "title": f"来源 {index}"}
+            for index in range(1, 6)
+        ],
+    )
+
+    assert content == "请假制度依据员工手册。[1]-[4]"
+    assert [item["label"] for item in citations] == ["[1]", "[2]", "[3]", "[4]"]
+
+
+def test_compact_knowledge_citation_labels_keeps_authoritative_metadata_without_inline_labels() -> None:
+    """模型漏写正文引用时仍保留服务端检索到的权威来源卡片。"""
+
+    content, citations = compact_knowledge_citation_labels(
+        "制度规定七天内可以申请退款。",
+        [{"id": "kref_4", "label": "[4]", "title": "退款政策"}],
+    )
+
+    assert content == "制度规定七天内可以申请退款。"
+    assert citations == [{"id": "kref_4", "label": "[1]", "title": "退款政策"}]
+
+
+def test_knowledge_citations_keep_same_title_chunks_when_chunk_ids_differ() -> None:
+    """同标题的不同知识切片不能因展示标题相同而错误合并。"""
+
+    citations = knowledge_citations_from_results(
+        [
+            {
+                "evidence_pack": [
+                    {
+                        "chunk_id": "chunk-a",
+                        "source_path": "policy.md",
+                        "section_path": "退款政策",
+                        "excerpt": "第一段",
+                    },
+                    {
+                        "chunk_id": "chunk-b",
+                        "source_path": "policy.md",
+                        "section_path": "退款政策",
+                        "excerpt": "第二段",
+                    },
+                ]
+            }
+        ]
+    )
+
+    assert [item["chunk_id"] for item in citations] == ["chunk-a", "chunk-b"]
+
+
+def test_knowledge_citation_identity_keeps_same_title_chunks_in_final_agent_dedupe() -> None:
+    """最终 AgentLoop 去重必须沿用切片身份，不能再次按展示标题截断证据。"""
+
+    first = {"kind": "evidence", "title": "退款政策", "chunk_id": "chunk-a"}
+    second = {"kind": "evidence", "title": "退款政策", "chunk_id": "chunk-b"}
+
+    assert knowledge_citation_identity(first) != knowledge_citation_identity(second)
 
 
 def test_restore_truncated_email_from_unique_cited_evidence() -> None:

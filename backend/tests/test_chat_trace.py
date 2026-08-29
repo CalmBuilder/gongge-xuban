@@ -43,6 +43,7 @@ from app.api import chat as chat_api
 from app.db import get_session
 from app.db.models import (
     AgentEvent,
+    AgentProfile,
     ChatSession,
     ExecutionCommand,
     KnowledgeConcept,
@@ -1335,6 +1336,14 @@ def test_chat_cancel_bridges_to_active_dynamic_execution() -> None:
         status="running",
         source_ref="msg_dynamic",
     )
+    db.add(
+        AgentProfile(
+            id="agent_demo",
+            tenant_id="tenant_demo",
+            name="Chat trace agent",
+            status="active",
+        )
+    )
     db.add(session_row)
     db.add(instance)
     db.commit()
@@ -1376,6 +1385,14 @@ def test_chat_cancel_preempts_model_worker_lease_and_fences_late_write() -> None
         capability_snapshot_json={"capabilities": []},
         status="running",
         source_ref="msg_dynamic_preempt",
+    )
+    db.add(
+        AgentProfile(
+            id="agent_demo",
+            tenant_id="tenant_demo",
+            name="Chat trace preempt agent",
+            status="active",
+        )
     )
     db.add(session_row)
     db.add(instance)

@@ -480,40 +480,89 @@ class ManagedInputResourceService:
             raise InputResourceAccessDenied("附件销毁作业已被其他worker接管。")
         self.db.commit()
         self.db.refresh(job)
-        job.status = "purging"
-        job.updated_at = utc_now()
-        self.db.add(job)
+        claim_fencing_token = job.fencing_token
+        transitioned = self.db.exec(
+            update(InputResourcePurgeJob)
+            .where(
+                InputResourcePurgeJob.id == job.id,
+                InputResourcePurgeJob.status == "claimed",
+                InputResourcePurgeJob.lease_owner == worker_id,
+                InputResourcePurgeJob.fencing_token == claim_fencing_token,
+                InputResourcePurgeJob.lease_expires_at > utc_now(),
+            )
+            .values(status="purging", updated_at=utc_now())
+        )
+        if getattr(transitioned, "rowcount", 0) != 1:
+            self.db.rollback()
+            raise InputResourceAccessDenied("附件销毁作业已被其他worker接管。")
         self.db.commit()
+        self.db.refresh(job)
         try:
             self._purge_session_resource_now(
                 resource,
                 session_id=session_id,
                 actor_user_id=actor_user_id,
                 purge_job_id=job.id,
+                worker_id=worker_id,
+                fencing_token=claim_fencing_token,
             )
-            job.status = "succeeded"
-            job.finished_at = utc_now()
-            job.lease_owner = None
-            job.lease_expires_at = None
-            job.updated_at = utc_now()
-            self.db.add(job)
+            finished_at = utc_now()
+            finished = self.db.exec(
+                update(InputResourcePurgeJob)
+                .where(
+                    InputResourcePurgeJob.id == job.id,
+                    InputResourcePurgeJob.status == "purging",
+                    InputResourcePurgeJob.lease_owner == worker_id,
+                    InputResourcePurgeJob.fencing_token == claim_fencing_token,
+                    InputResourcePurgeJob.lease_expires_at > finished_at,
+                )
+                .values(
+                    status="succeeded",
+                    finished_at=finished_at,
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    updated_at=finished_at,
+                )
+            )
+            if getattr(finished, "rowcount", 0) != 1:
+                self.db.rollback()
+                raise InputResourceAccessDenied("附件销毁作业已被其他worker接管。")
             self.db.commit()
         except Exception as exc:
             self.db.rollback()
             job = self.db.get(InputResourcePurgeJob, job.id)
-            if job is not None and job.status in {"claimed", "purging"}:
-                job.status = "failed"
-                job.error_code = (
-                    "ATTACHMENT_PURGE_BLOCKED"
-                    if isinstance(exc, InputResourceAccessDenied)
-                    else "ATTACHMENT_PURGE_FAILED"
+            if (
+                job is not None
+                and job.status in {"claimed", "purging"}
+                and job.lease_owner == worker_id
+                and job.fencing_token == claim_fencing_token
+                and job.lease_expires_at is not None
+                and job.lease_expires_at > utc_now()
+            ):
+                failed_at = utc_now()
+                self.db.exec(
+                    update(InputResourcePurgeJob)
+                    .where(
+                        InputResourcePurgeJob.id == job.id,
+                        InputResourcePurgeJob.status.in_(("claimed", "purging")),
+                        InputResourcePurgeJob.lease_owner == worker_id,
+                        InputResourcePurgeJob.fencing_token == claim_fencing_token,
+                        InputResourcePurgeJob.lease_expires_at > failed_at,
+                    )
+                    .values(
+                        status="failed",
+                        error_code=(
+                            "ATTACHMENT_PURGE_BLOCKED"
+                            if isinstance(exc, InputResourceAccessDenied)
+                            else "ATTACHMENT_PURGE_FAILED"
+                        ),
+                        error_detail_json={"detail": str(exc)[:500]},
+                        finished_at=failed_at,
+                        lease_owner=None,
+                        lease_expires_at=None,
+                        updated_at=failed_at,
+                    )
                 )
-                job.error_detail_json = {"detail": str(exc)[:500]}
-                job.finished_at = utc_now()
-                job.lease_owner = None
-                job.lease_expires_at = None
-                job.updated_at = utc_now()
-                self.db.add(job)
                 self.db.commit()
             raise
 
@@ -524,6 +573,8 @@ class ManagedInputResourceService:
         session_id: str,
         actor_user_id: str,
         purge_job_id: str | None = None,
+        worker_id: str | None = None,
+        fencing_token: int | None = None,
     ) -> None:
         """在已取得销毁作业fencing后级联清理在线副本并保留资源墓碑。"""
 
@@ -632,6 +683,12 @@ class ManagedInputResourceService:
             managed_unlink(self.storage_root, resource.storage_locator, missing_ok=True)
         except ManagedStorageError as exc:
             raise InputResourceAccessDenied("输入资源不可用。") from exc
+        if purge_job_id and worker_id and fencing_token is not None:
+            self._assert_purge_job_lease(
+                purge_job_id,
+                worker_id=worker_id,
+                fencing_token=fencing_token,
+            )
         resource.access_status = "revoked"
         resource.destruction_status = "purged"
         resource.ingestion_status = "revoked"
@@ -651,6 +708,30 @@ class ManagedInputResourceService:
         resource.updated_at = utc_now()
         self.db.add(resource)
         self.db.flush()
+
+    def _assert_purge_job_lease(
+        self,
+        purge_job_id: str,
+        *,
+        worker_id: str,
+        fencing_token: int,
+    ) -> None:
+        """在物理 unlink 后再次 CAS 校验销毁租约，阻止迟到 worker 写入资源终态。"""
+
+        now = utc_now()
+        result = self.db.exec(
+            update(InputResourcePurgeJob)
+            .where(
+                InputResourcePurgeJob.id == purge_job_id,
+                InputResourcePurgeJob.status == "purging",
+                InputResourcePurgeJob.lease_owner == worker_id,
+                InputResourcePurgeJob.fencing_token == fencing_token,
+                InputResourcePurgeJob.lease_expires_at > now,
+            )
+            .values(updated_at=now)
+        )
+        if getattr(result, "rowcount", 0) != 1:
+            raise InputResourceAccessDenied("附件销毁作业已被其他worker接管。")
 
     def resolve_snapshot(
         self,

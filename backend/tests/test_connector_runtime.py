@@ -336,3 +336,55 @@ def test_worker_starts_only_after_connector_runtime_schema_is_complete() -> None
     assert connector_runtime_schema_ready(empty_engine) is False
     SQLModel.metadata.create_all(empty_engine)
     assert connector_runtime_schema_ready(empty_engine) is True
+
+
+def test_deleted_agent_cannot_settle_in_flight_delivery(db: Session) -> None:
+    """删除 Agent 与回发终态并发时，迟到 settled 只能收敛为 unknown。"""
+
+    db.add(
+        ConnectorThreadBinding(
+            id="thread_retire",
+            tenant_id="tenant_a",
+            provider="wecom",
+            profile_id="profile_a",
+            sender_ref_hash="sender-retire",
+            encrypted_recipient_ref=encrypt_secret(SENDER),
+            user_id="user_a",
+            agent_id="agent_a",
+            session_id="session_retire",
+        )
+    )
+    db.add(
+        ConnectorOutboundDelivery(
+            id="delivery_retire",
+            tenant_id="tenant_a",
+            provider="wecom",
+            profile_id="profile_a",
+            thread_binding_id="thread_retire",
+            source_type="assistant_message",
+            source_ref="message_missing_after_purge",
+            payload_checksum="a" * 64,
+        )
+    )
+    db.commit()
+
+    service = ConnectorRuntimeService(db)
+    delivery = service.claim_due_delivery(worker_id="outbound-worker")
+    assert delivery is not None
+    agent = db.get(AgentProfile, "agent_a")
+    assert agent is not None
+    agent.status = "archived"
+    agent.metadata_json = {"agent_deletion": {"state": "deleted"}}
+    db.add(agent)
+    db.commit()
+
+    finished = service.finish_delivery(
+        delivery,
+        worker_id="outbound-worker",
+        status="settled",
+        receipt={"provider_message_id": "must-not-settle"},
+    )
+
+    assert finished.status == "unknown"
+    assert finished.settled_at is None
+    assert finished.error_json == {"code": "AGENT_NOT_AVAILABLE"}

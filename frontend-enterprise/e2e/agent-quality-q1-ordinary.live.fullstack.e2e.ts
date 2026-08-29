@@ -14,8 +14,9 @@ import { basename, dirname, isAbsolute, resolve } from 'node:path';
 const ENABLED = process.env.Q1_AGENT_QUALITY_E2E === '1'
   && process.env.Q1_PROFILE === 'ordinary';
 const TENANT_ID = 'tenant_demo';
-const CONTROL_AGENT_ID = 'agent_q1_writing_control';
-const TREATMENT_AGENT_ID = 'agent_skill_demo_a_docs';
+const CONTROL_AGENT_ID = process.env.Q1_CONTROL_AGENT_ID || 'agent_q1_writing_control';
+const TREATMENT_AGENT_ID = process.env.Q1_TREATMENT_AGENT_ID || 'agent_skill_demo_a_docs';
+const SAME_AGENT_AB = CONTROL_AGENT_ID === TREATMENT_AGENT_ID;
 const ORDER_SEED = process.env.Q1_ORDER_SEED || 'q1-ordinary-default';
 const EVIDENCE_DIR = resolve('../docs/manuals/evidence');
 const EVIDENCE_FILE = basename(
@@ -872,12 +873,15 @@ test('Q1 ordinary AgentLoop普通/附件四象限真实模型同题A/B', async (
   await page.goto('/enterprise/dashboard');
   await loginAsMember(page, CONTROL_AGENT_ID);
   const onlyScenario = process.env.Q1_ONLY_SCENARIO?.trim() || '';
-  const selected = seededOrder([
+  const scenarios = [
     { variant: 'control' as const, inputMode: 'inline' as const },
-    { variant: 'treatment' as const, inputMode: 'inline' as const },
     { variant: 'control' as const, inputMode: 'attachment' as const },
+    { variant: 'treatment' as const, inputMode: 'inline' as const },
     { variant: 'treatment' as const, inputMode: 'attachment' as const },
-  ].filter((item) => !onlyScenario || `${item.inputMode}-${item.variant}` === onlyScenario), ORDER_SEED);
+  ].filter((item) => !onlyScenario || `${item.inputMode}-${item.variant}` === onlyScenario);
+  // 同一Agent的严格A/B必须先完成control，再导入并选择Skill，避免AgentProfile差异
+  // 污染普通对话和附件对话的增益比较。
+  const selected = SAME_AGENT_AB ? scenarios : seededOrder(scenarios, ORDER_SEED);
   expect(selected.length, `unknown Q1_ONLY_SCENARIO: ${onlyScenario}`).toBeGreaterThan(0);
   for (const item of selected) {
     if (item.variant === 'treatment' && !report.skill) {

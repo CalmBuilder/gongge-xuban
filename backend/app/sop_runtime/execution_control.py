@@ -93,6 +93,30 @@ class ExecutionControlService:
         self.db = db
         self.store = store or SopExecutionStore(db)
 
+    def is_external_reconciliation_attention(
+        self,
+        instance: SopInstance,
+        attention: SopWorkItem | None,
+    ) -> bool:
+        """确认 Attention 是否精确关联当前实例的 unknown 外部写对账。"""
+
+        if (
+            attention is None
+            or attention.tenant_id != instance.tenant_id
+            or attention.instance_id != instance.id
+            or attention.attention_kind != "exception"
+        ):
+            return False
+        operation_id = str((attention.payload_json or {}).get("operation_id") or "")
+        operation = self.db.get(SopOperation, operation_id)
+        return (
+            operation is not None
+            and operation.tenant_id == instance.tenant_id
+            and operation.instance_id == instance.id
+            and operation.status == "unknown"
+            and operation.effect_kind == "external_write"
+        )
+
     def offer_attention(
         self,
         instance: SopInstance,
@@ -228,6 +252,26 @@ class ExecutionControlService:
                 "COMMAND_TYPE_INVALID",
                 "仅支持 cancel、steer 或 add_skill 命令。",
             )
+        if not self.store.lock_agent_for_runtime(instance):
+            raise ExecutionControlError(
+                "AGENT_NOT_AVAILABLE",
+                "已归档的 Agent 不允许创建新的控制命令。",
+            )
+        locked_instance = self.db.exec(
+            select(SopInstance)
+            .where(
+                SopInstance.tenant_id == instance.tenant_id,
+                SopInstance.id == instance.id,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        ).first()
+        if locked_instance is None:
+            raise ExecutionControlError(
+                "EXECUTION_NOT_FOUND",
+                "命令所属 Execution 不存在。",
+            )
+        instance = locked_instance
         body = dict(payload or {})
         if command_type == "steer":
             instruction = str(body.get("instruction") or body.get("message") or "").strip()
@@ -282,6 +326,16 @@ class ExecutionControlService:
                     "command_id 已绑定不同命令语义。",
                 )
             return existing, False
+        if not self.store.agent_is_available(instance):
+            raise ExecutionControlError(
+                "AGENT_NOT_AVAILABLE",
+                "已归档的 Agent 不允许创建新的控制命令。",
+            )
+        if instance.cancellation_requested_at is not None and command_type != "cancel":
+            raise ExecutionControlError(
+                "EXECUTION_CANCELLING",
+                "Execution 已请求取消，不能再追加 steer 或 Skill 命令。",
+            )
         if instance.revision != expected_execution_revision:
             raise ExecutionControlError(
                 "EXECUTION_REVISION_CONFLICT",
@@ -378,6 +432,10 @@ class ExecutionControlService:
             }
             self.db.add(resolved)
             causation_id = f"{resolved.id}:{resolved.revision}"
+            allow_archived_agent = self.is_external_reconciliation_attention(
+                instance,
+                resolved,
+            )
             signal = self.enqueue_signal(
                 instance,
                 signal_type="attention_decided",
@@ -389,6 +447,7 @@ class ExecutionControlService:
                     "command": command,
                     "revision": resolved.revision,
                 },
+                allow_archived_agent=allow_archived_agent,
             )
             self._append_event(
                 instance,
@@ -446,11 +505,32 @@ class ExecutionControlService:
         priority: int = 0,
         max_attempts: int = 8,
         available_at: datetime | None = None,
+        allow_archived_agent: bool = False,
     ) -> ExecutionSignal:
-        """按因果事实去重写入恢复信号；signal 本身不授予 execution 推进权。"""
+        """按因果事实去重写入恢复信号；归档例外仅限已验证的外部效果对账。"""
 
         self._assert_instance(instance)
         body = dict(payload or {})
+        if allow_archived_agent:
+            attention = self.db.get(
+                SopWorkItem,
+                str(body.get("attention_id") or ""),
+            )
+            if (
+                signal_type != "attention_decided"
+                or causation_type != "attention_resolution"
+                or attention is None
+                or not self.is_external_reconciliation_attention(instance, attention)
+            ):
+                raise ExecutionControlError(
+                    "SIGNAL_RECONCILIATION_REQUIRED",
+                    "归档 Agent 仅允许为当前 unknown 外部写创建对账 signal。",
+                )
+        elif not self.store.agent_is_available(instance):
+            raise ExecutionControlError(
+                "AGENT_NOT_AVAILABLE",
+                "已归档的 Agent 不允许创建新的 Execution signal。",
+            )
         dedupe_key = canonical_checksum(
             {
                 "tenant_id": instance.tenant_id,
@@ -499,11 +579,30 @@ class ExecutionControlService:
         *,
         worker_id: str,
         ttl_seconds: int = 30,
+        allow_archived_agent: bool = False,
     ) -> ExecutionSignal:
-        """以数据库时间 CAS 认领待处理或租约过期信号，但不触碰 Execution lease。"""
+        """以数据库时间 CAS 认领信号；归档 Agent 只允许外部效果对账专用调用方使用。"""
 
         if ttl_seconds < 1 or not worker_id.strip():
             raise ExecutionControlError("SIGNAL_LEASE_INVALID", "signal worker 和 TTL 必须有效。")
+        instance = self.db.get(SopInstance, signal.execution_id)
+        if instance is None or instance.tenant_id != signal.tenant_id:
+            raise ExecutionControlError("SIGNAL_EXECUTION_MISSING", "signal 所属 Execution 不存在。")
+        if allow_archived_agent:
+            attention = self.db.get(
+                SopWorkItem,
+                str((signal.payload_json or {}).get("attention_id") or ""),
+            )
+            if not self.is_external_reconciliation_attention(instance, attention):
+                raise ExecutionControlError(
+                    "SIGNAL_RECONCILIATION_REQUIRED",
+                    "归档 Agent 仅允许认领当前 unknown 外部写的对账 signal。",
+                )
+        if not allow_archived_agent and not self.store.agent_is_available(instance):
+            raise ExecutionControlError(
+                "AGENT_NOT_AVAILABLE",
+                "已归档的 Agent 不允许认领 Execution signal。",
+            )
         now = self.store.database_now()
         result = self.db.exec(
             update(ExecutionSignal)
@@ -511,6 +610,15 @@ class ExecutionControlService:
                 ExecutionSignal.id == signal.id,
                 ExecutionSignal.tenant_id == signal.tenant_id,
                 ExecutionSignal.available_at <= now,
+                *(() if allow_archived_agent else (
+                    select(SopInstance.id)
+                    .where(
+                        SopInstance.id == ExecutionSignal.execution_id,
+                        SopInstance.tenant_id == ExecutionSignal.tenant_id,
+                        SopExecutionStore.active_agent_predicate(),
+                    )
+                    .exists(),
+                )),
                 or_(
                     ExecutionSignal.status == "pending",
                     (ExecutionSignal.status == "claimed")
@@ -544,6 +652,16 @@ class ExecutionControlService:
 
         if ttl_seconds < 1 or not worker_id.strip():
             raise ExecutionControlError("SIGNAL_LEASE_INVALID", "signal worker 和 TTL 必须有效。")
+        instance = self.db.get(SopInstance, signal.execution_id)
+        if (
+            instance is None
+            or instance.tenant_id != signal.tenant_id
+            or not self.store.lock_agent_for_runtime(instance)
+        ):
+            raise ExecutionControlError(
+                "AGENT_NOT_AVAILABLE",
+                "已归档的 Agent 不允许续租 Execution signal。",
+            )
         now = self.store.database_now()
         result = self.db.exec(
             update(ExecutionSignal)
@@ -578,7 +696,10 @@ class ExecutionControlService:
         self._assert_signal_owner(instance, signal, worker_id)
         self.store.authorize_mutation(instance, "signal.consume")
         now = self.store.database_now()
-        if instance.cancellation_requested_at is not None and signal.signal_type != "command":
+        if instance.cancellation_requested_at is not None and not (
+            signal.signal_type == "command"
+            and (signal.payload_json or {}).get("command_type") == "cancel"
+        ):
             status = "discarded"
         else:
             status = "consumed"

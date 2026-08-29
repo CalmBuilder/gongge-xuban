@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.core.conversation_context import build_conversation_context
+from app.core.conversation_context import ConversationContextSettings, build_conversation_context
 from app.knowledge.citations import EMAIL_PATTERN
 from app.llm.stage_protocol import TURN_STAGE_MESSAGES_KEY
 
@@ -53,12 +53,17 @@ def compact_step_result(payload: dict[str, Any]) -> dict[str, Any]:
 def compact_conversation_context(
     context: dict[str, object] | None,
     *,
-    token_budget: int = CONTROL_CONTEXT_TOKEN_BUDGET,
+    token_budget: int | None = None,
+    settings: ConversationContextSettings | None = None,
 ) -> dict[str, object]:
     """投影控制阶段上下文，并阻止附件正文绕过Provider外发账本。"""
 
+    context_metadata = context.get("metadata") if isinstance(context, dict) else None
+    effective_settings = settings or ConversationContextSettings.from_metadata(context_metadata)
+    if token_budget is not None:
+        effective_settings = effective_settings.with_token_budget(token_budget)
     if not isinstance(context, dict):
-        return build_conversation_context([], token_budget)
+        return build_conversation_context([], settings=effective_settings)
     projected_context = {
         key: value for key, value in context.items() if key not in CONTROL_ONLY_ATTACHMENT_KEYS
     }
@@ -71,7 +76,7 @@ def compact_conversation_context(
     metadata = projected_context.get("metadata")
     if (
         isinstance(metadata, dict)
-        and int(metadata.get("estimated_tokens") or 0) <= token_budget
+        and int(metadata.get("estimated_tokens") or 0) <= effective_settings.token_budget
     ):
         return projected_context
     compacted = build_conversation_context(
@@ -80,7 +85,7 @@ def compact_conversation_context(
             for message in projected_context["messages"]
             if isinstance(message, dict)
         ],
-        token_budget,
+        settings=effective_settings,
     )
     compacted[TURN_STAGE_MESSAGES_KEY] = turn_messages
     return compacted

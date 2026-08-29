@@ -35,6 +35,7 @@ from app.agents.branching import (
     rollback_branch,
     update_branch_skill,
     user_creator_metadata,
+    visible_tool_rows,
     visible_skill_rows,
 )
 from app.async_jobs import enqueue_async_job
@@ -63,6 +64,7 @@ from app.security.permissions import (
 )
 from app.security.tenant import ensure_tenant
 from app.skills import SkillDistiller, SkillEditor
+from app.skills.generation_safety import sanitize_generation_schema, sanitize_generation_text
 from app.skills.skill_schema import (
     SkillCard,
     SkillCreateRequest,
@@ -854,8 +856,7 @@ def distill_skill(
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> SkillDistillResponse:
-    ensure_current_user_tenant(request.tenant_id, current_user)
-    ensure_tenant(db, request.tenant_id)
+    request = _prepare_skill_generation_request(db, request, current_user)
     model_config = _get_request_model(db, request.tenant_id, request.model_config_id)
     request = _with_available_tools(db, request)
     try:
@@ -867,9 +868,10 @@ def distill_skill(
 @router.post("/distill/stream")
 def distill_skill_stream(
     request: SkillDistillRequest,
+    db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> StreamingResponse:
-    ensure_current_user_tenant(request.tenant_id, current_user)
+    request = _prepare_skill_generation_request(db, request, current_user)
     job_id = _start_distill_stream_job(request, current_user)
     return StreamingResponse(_stream_skill_job(job_id), media_type="text/event-stream")
 
@@ -878,13 +880,14 @@ def distill_skill_stream(
 def rewrite_skill_stream(
     skill_id: str,
     request: SkillRewriteRequest,
+    db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> StreamingResponse:
     if request.current_skill.skill_id != skill_id:
         raise HTTPException(
             status_code=400, detail="Path skill_id must match current_skill.skill_id"
         )
-    ensure_current_user_tenant(request.tenant_id, current_user)
+    request = _prepare_skill_generation_request(db, request, current_user, skill_id=skill_id)
     job_id = _start_rewrite_stream_job(skill_id, request, current_user)
     return StreamingResponse(_stream_skill_job(job_id), media_type="text/event-stream")
 
@@ -892,9 +895,10 @@ def rewrite_skill_stream(
 @router.post("/distill/jobs")
 def create_distill_job(
     request: SkillDistillRequest,
+    db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> dict[str, str]:
-    ensure_current_user_tenant(request.tenant_id, current_user)
+    request = _prepare_skill_generation_request(db, request, current_user)
     return {"job_id": _start_distill_stream_job(request, current_user)}
 
 
@@ -902,13 +906,14 @@ def create_distill_job(
 def create_rewrite_job(
     skill_id: str,
     request: SkillRewriteRequest,
+    db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> dict[str, str]:
     if request.current_skill.skill_id != skill_id:
         raise HTTPException(
             status_code=400, detail="Path skill_id must match current_skill.skill_id"
         )
-    ensure_current_user_tenant(request.tenant_id, current_user)
+    request = _prepare_skill_generation_request(db, request, current_user, skill_id=skill_id)
     return {"job_id": _start_rewrite_stream_job(skill_id, request, current_user)}
 
 
@@ -961,8 +966,7 @@ def rewrite_skill(
         raise HTTPException(
             status_code=400, detail="Path skill_id must match current_skill.skill_id"
         )
-    ensure_current_user_tenant(request.tenant_id, current_user)
-    ensure_tenant(db, request.tenant_id)
+    request = _prepare_skill_generation_request(db, request, current_user, skill_id=skill_id)
     model_config = _get_request_model(db, request.tenant_id, request.model_config_id)
     request = _with_available_tools_for_rewrite(db, request)
     try:
@@ -1014,7 +1018,7 @@ def _run_distill_stream_job(job_id: str, request_data: dict[str, object]) -> Non
     try:
         request = SkillDistillRequest.model_validate(request_data)
         with Session(get_session_engine()) as db:
-            ensure_tenant(db, request.tenant_id)
+            request = _prepare_skill_generation_request(db, request, None)
             model_config = _get_request_model(db, request.tenant_id, request.model_config_id)
             enriched_request = _with_available_tools(db, request)
             stream_jobs.append(job_id, "status", {"text": "正在调用模型生成新技能"})
@@ -1036,7 +1040,7 @@ def _run_rewrite_stream_job(job_id: str, skill_id: str, request_data: dict[str, 
         if request.current_skill.skill_id != skill_id:
             raise ValueError("Path skill_id must match current_skill.skill_id")
         with Session(get_session_engine()) as db:
-            ensure_tenant(db, request.tenant_id)
+            request = _prepare_skill_generation_request(db, request, None, skill_id=skill_id)
             model_config = _get_request_model(db, request.tenant_id, request.model_config_id)
             enriched_request = _with_available_tools_for_rewrite(db, request)
             stream_jobs.append(job_id, "status", {"text": "正在调用模型分析改写要求"})
@@ -1148,53 +1152,72 @@ def _sync_skill_tool_bindings(
 
 
 def _with_available_tools(db: Session, request: SkillDistillRequest) -> SkillDistillRequest:
-    tools = db.exec(
-        select(Tool).where(Tool.tenant_id == request.tenant_id, Tool.enabled == True)  # noqa: E712
-    ).all()
-    available_tools = [
-        *request.available_tools,
-        *[
-            {
-                "id": tool.id,
-                "name": tool.name,
-                "display_name": tool.display_name,
-                "description": tool.description,
-                "bucket": tool.bucket or "未分桶",
-                "method": tool.method,
-                "url": tool.url,
-                "input_schema": tool.input_schema,
-                "output_schema": tool.output_schema,
-            }
-            for tool in tools
-        ],
-    ]
+    """只把服务端确认可见的工具注入 Skill 生成上下文，客户端目录不能扩权。"""
+
+    available_tools = [_tool_generation_payload(tool) for tool in visible_tool_rows(
+        db, request.tenant_id, request.agent_id, include_inactive=False
+    )]
     return request.model_copy(update={"available_tools": available_tools})
 
 
 def _with_available_tools_for_rewrite(
     db: Session, request: SkillRewriteRequest
 ) -> SkillRewriteRequest:
-    tools = db.exec(
-        select(Tool).where(Tool.tenant_id == request.tenant_id, Tool.enabled == True)  # noqa: E712
-    ).all()
-    available_tools = [
-        *request.available_tools,
-        *[
-            {
-                "id": tool.id,
-                "name": tool.name,
-                "display_name": tool.display_name,
-                "description": tool.description,
-                "bucket": tool.bucket or "未分桶",
-                "method": tool.method,
-                "url": tool.url,
-                "input_schema": tool.input_schema,
-                "output_schema": tool.output_schema,
-            }
-            for tool in tools
-        ],
-    ]
+    """只把服务端确认可见的工具注入改写上下文，避免租户级工具泄露。"""
+
+    available_tools = [_tool_generation_payload(tool) for tool in visible_tool_rows(
+        db, request.tenant_id, request.agent_id, include_inactive=False
+    )]
     return request.model_copy(update={"available_tools": available_tools})
+
+
+def _tool_generation_payload(tool: Tool) -> dict[str, object]:
+    """构造不含端点和示例秘密的工具生成快照，供 distill/rewrite 共同使用。"""
+
+    return {
+        "id": sanitize_generation_text(tool.id),
+        "name": sanitize_generation_text(tool.name),
+        "display_name": sanitize_generation_text(tool.display_name or ""),
+        "description": sanitize_generation_text(tool.description or ""),
+        "bucket": sanitize_generation_text(tool.bucket or "未分桶"),
+        "method": tool.method,
+        "input_schema": sanitize_generation_schema(tool.input_schema or {}),
+        "output_schema": sanitize_generation_schema(tool.output_schema or {}),
+    }
+
+
+def _prepare_skill_generation_request(
+    db: Session,
+    request: SkillDistillRequest | SkillRewriteRequest,
+    current_user: User | None,
+    *,
+    skill_id: str | None = None,
+) -> SkillDistillRequest | SkillRewriteRequest:
+    """校验生成范围并用数据库中的可见 Skill 替换客户端伪造的当前内容。"""
+
+    if current_user is not None:
+        ensure_current_user_tenant(request.tenant_id, current_user)
+    ensure_tenant(db, request.tenant_id)
+    agent = get_agent(db, request.tenant_id, request.agent_id)
+    if request.agent_id and not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    if agent is not None and agent.status != "active":
+        raise HTTPException(status_code=409, detail="Agent is not active")
+    if current_user is not None:
+        managed_agent = ensure_agent_scope_manager(
+            db, request.tenant_id, request.agent_id, current_user
+        )
+        if managed_agent is None or managed_agent.is_overall:
+            ensure_open_gallery_admin(request.tenant_id, current_user)
+    if skill_id is None:
+        return request
+    if not isinstance(request, SkillRewriteRequest):
+        raise HTTPException(status_code=400, detail="Rewrite request is required")
+    visible_skill = _get_visible_skill_for_scope(
+        db, request.tenant_id, skill_id, request.agent_id
+    )
+    server_skill = SkillCard.model_validate(visible_skill.content_json)
+    return request.model_copy(update={"current_skill": server_skill})
 
 
 def _sse(event: object, data: object) -> str:

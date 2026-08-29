@@ -20,7 +20,9 @@ from sqlalchemy import update
 from sqlmodel import Session, select
 
 from app.db.models import (
+    AgentProfile,
     ArtifactRendererJob,
+    ChatSession,
     ExecutionArtifact,
     ExecutionResult,
     InputResourceSnapshot,
@@ -291,14 +293,32 @@ class ArtifactRendererService:
             or result.result_json.get("markdown") != markdown
         ):
             raise ArtifactRenderError("ARTIFACT_RENDER_SOURCE_INVALID")
+        self._lock_active_lineage_agent(instance)
         job.status = "rendering"
         self.db.add(job)
         self.db.flush()
         data = render_verified_markdown(markdown, job.mime_type)
-        job.staged_checksum = hashlib.sha256(data).hexdigest()
-        job.status = "staged"
-        self.db.add(job)
-        self.db.flush()
+        staged_checksum = hashlib.sha256(data).hexdigest()
+        staged = self.db.exec(
+            update(ArtifactRendererJob)
+            .where(
+                ArtifactRendererJob.id == job.id,
+                ArtifactRendererJob.tenant_id == job.tenant_id,
+                ArtifactRendererJob.status == "rendering",
+                ArtifactRendererJob.lease_owner == worker_id,
+                ArtifactRendererJob.fencing_token == fencing_token,
+                ArtifactRendererJob.lease_expires_at > utc_now(),
+            )
+            .values(
+                staged_checksum=staged_checksum,
+                status="staged",
+                updated_at=utc_now(),
+            )
+        )
+        if getattr(staged, "rowcount", 0) != 1:
+            self.db.rollback()
+            raise ArtifactRenderError("ARTIFACT_RENDER_JOB_FENCED")
+        self.db.refresh(job)
         artifact, _ = self.artifacts.register(
             instance=instance,
             source_node=source_node,
@@ -311,14 +331,52 @@ class ArtifactRendererService:
         )
         if artifact.content_checksum != job.staged_checksum:
             raise ArtifactRenderError("ARTIFACT_RENDER_STAGING_CHECKSUM_MISMATCH")
-        job.artifact_id = artifact.id
-        job.status = "ready"
-        job.lease_owner = None
-        job.lease_expires_at = None
-        job.updated_at = utc_now()
-        self.db.add(job)
-        self.db.flush()
+        ready = self.db.exec(
+            update(ArtifactRendererJob)
+            .where(
+                ArtifactRendererJob.id == job.id,
+                ArtifactRendererJob.tenant_id == job.tenant_id,
+                ArtifactRendererJob.status == "staged",
+                ArtifactRendererJob.lease_owner == worker_id,
+                ArtifactRendererJob.fencing_token == fencing_token,
+                ArtifactRendererJob.lease_expires_at > utc_now(),
+            )
+            .values(
+                artifact_id=artifact.id,
+                status="ready",
+                lease_owner=None,
+                lease_expires_at=None,
+                updated_at=utc_now(),
+            )
+        )
+        if getattr(ready, "rowcount", 0) != 1:
+            self.db.rollback()
+            raise ArtifactRenderError("ARTIFACT_RENDER_JOB_FENCED")
+        self.db.refresh(job)
         return artifact
+
+    def _lock_active_lineage_agent(self, instance: SopInstance) -> AgentProfile | None:
+        """锁定 Execution 直接或会话继承的 Agent，渲染期间阻断墓碑竞态。"""
+
+        agent_id = instance.agent_id
+        if agent_id is None:
+            session = self.db.get(ChatSession, instance.session_id)
+            if session is not None and session.tenant_id == instance.tenant_id:
+                agent_id = session.agent_id
+        if agent_id is None:
+            return None
+        agent = self.db.exec(
+            select(AgentProfile)
+            .where(
+                AgentProfile.tenant_id == instance.tenant_id,
+                AgentProfile.id == agent_id,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        ).first()
+        if agent is None or agent.status != "active" or agent.is_overall:
+            raise ArtifactRenderError("ARTIFACT_RENDER_AGENT_DELETED")
+        return agent
 
 
 def render_verified_markdown(markdown: str, mime_type: str) -> bytes:

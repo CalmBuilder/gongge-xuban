@@ -2135,6 +2135,7 @@ def _model_capabilities() -> dict[str, object]:
 def _instance(db: Session, snapshot: CapabilitySnapshot):
     """创建只含一个 read 步骤的统一动态 Execution。"""
 
+    _ensure_dynamic_agent(db)
     plan = NormalizedPlan(
         goal="生成续约风险简报",
         success_criteria=(
@@ -2158,6 +2159,21 @@ def _instance(db: Session, snapshot: CapabilitySnapshot):
         plan=plan,
         capability_snapshot={"tools": [snapshot.model_dump(mode="json")]},
     )[0]
+
+
+def _ensure_dynamic_agent(db: Session, *, agent_id: str = "agent_demo") -> None:
+    """为动态 Runtime 单测准备活动 Agent，覆盖生命周期门禁所需的真实归属。"""
+
+    if db.get(AgentProfile, agent_id) is None:
+        db.add(
+            AgentProfile(
+                id=agent_id,
+                tenant_id="tenant_demo",
+                name="动态测试 Agent",
+                is_overall=False,
+            )
+        )
+        db.flush()
 
 
 def test_file_sqlite_model_heartbeat_prevents_duplicate_claim_and_then_expires(
@@ -2218,6 +2234,13 @@ def test_file_sqlite_signal_heartbeat_prevents_slow_planner_reclaim(
     SQLModel.metadata.create_all(engine)
     monkeypatch.setattr("app.dynamic_tasks.agent._signal_lease_ttl_seconds", lambda: 3)
     with Session(engine, expire_on_commit=False) as owner_db:
+        owner_db.add(
+            AgentProfile(
+                id="agent_demo",
+                tenant_id="tenant_demo",
+                name="Signal heartbeat agent",
+            )
+        )
         instance = SopInstance(
             id="sopinst_signal_heartbeat",
             tenant_id="tenant_demo",
@@ -2891,6 +2914,7 @@ def test_start_task_uses_preflight_catalog_and_reuses_same_active_execution() ->
     engine = create_engine("sqlite://", poolclass=StaticPool)
     SQLModel.metadata.create_all(engine)
     with Session(engine, expire_on_commit=False) as db:
+        _ensure_dynamic_agent(db)
         capabilities = _model_capabilities()
         model = ModelConfig(
             id="model_demo",
@@ -2944,6 +2968,7 @@ def test_start_task_without_tools_can_create_clarification_and_answer_plan() -> 
     engine = create_engine("sqlite://", poolclass=StaticPool)
     SQLModel.metadata.create_all(engine)
     with Session(engine, expire_on_commit=False) as db:
+        _ensure_dynamic_agent(db)
         capabilities = _model_capabilities()
         model = ModelConfig(
             id="model_empty_catalog",
@@ -2988,6 +3013,7 @@ def test_advance_connects_plan_provider_view_proposal_and_read_operation() -> No
     engine = create_engine("sqlite://", poolclass=StaticPool)
     SQLModel.metadata.create_all(engine)
     with Session(engine, expire_on_commit=False) as db:
+        _ensure_dynamic_agent(db)
         capabilities = _model_capabilities()
         model = ModelConfig(
             id="model_advance",
@@ -3042,6 +3068,7 @@ def test_completed_read_result_is_schema_projected_into_answer_context() -> None
     engine = create_engine("sqlite://", poolclass=StaticPool)
     SQLModel.metadata.create_all(engine)
     with Session(engine, expire_on_commit=False) as db:
+        _ensure_dynamic_agent(db)
         capabilities = _model_capabilities()
         model = ModelConfig(
             id="model_projected_result",
@@ -3107,6 +3134,7 @@ def test_verified_result_message_publication_and_terminal_state_commit_together(
     engine = create_engine("sqlite://", poolclass=StaticPool)
     SQLModel.metadata.create_all(engine)
     with Session(engine, expire_on_commit=False) as db:
+        _ensure_dynamic_agent(db)
         capabilities = _model_capabilities()
         model = ModelConfig(
             id="model_result",
@@ -3198,6 +3226,7 @@ def test_connector_result_waits_for_required_external_publication() -> None:
     engine = create_engine("sqlite://", poolclass=StaticPool)
     SQLModel.metadata.create_all(engine)
     with Session(engine, expire_on_commit=False) as db:
+        _ensure_dynamic_agent(db)
         capabilities = _model_capabilities()
         model = ModelConfig(
             id="model_connector_result",
@@ -3315,6 +3344,7 @@ def test_artifact_integrity_failure_rolls_back_result_message_and_terminal_state
     engine = create_engine("sqlite://", poolclass=StaticPool)
     SQLModel.metadata.create_all(engine)
     with Session(engine, expire_on_commit=False) as db:
+        _ensure_dynamic_agent(db)
         capabilities = _model_capabilities()
         model = ModelConfig(
             id="model_artifact_failure",
@@ -3397,6 +3427,7 @@ def test_run_loop_serially_reaches_verified_terminal_result() -> None:
     engine = create_engine("sqlite://", poolclass=StaticPool)
     SQLModel.metadata.create_all(engine)
     with Session(engine, expire_on_commit=False) as db:
+        _ensure_dynamic_agent(db)
         capabilities = _model_capabilities()
         model = ModelConfig(
             id="model_loop",
@@ -3449,6 +3480,7 @@ def test_run_loop_repairs_invalid_result_once_and_settles_skill_use() -> None:
     engine = create_engine("sqlite://", poolclass=StaticPool)
     SQLModel.metadata.create_all(engine)
     with Session(engine, expire_on_commit=False) as db:
+        _ensure_dynamic_agent(db)
         capabilities = _model_capabilities()
         model = ModelConfig(
             id="model_result_repair",
@@ -3643,6 +3675,7 @@ def test_fail_execution_settles_active_skill_use_with_stable_reason() -> None:
     engine = create_engine("sqlite://", poolclass=StaticPool)
     SQLModel.metadata.create_all(engine)
     with Session(engine, expire_on_commit=False) as db:
+        _ensure_dynamic_agent(db)
         capabilities = _model_capabilities()
         model = ModelConfig(
             id="model_failure_settlement",
@@ -3707,6 +3740,7 @@ def test_fail_execution_reentry_settles_skill_use_after_child_already_failed() -
     engine = create_engine("sqlite://", poolclass=StaticPool)
     SQLModel.metadata.create_all(engine)
     with Session(engine, expire_on_commit=False) as db:
+        _ensure_dynamic_agent(db)
         model = ModelConfig(
             id="model_failure_reentry",
             tenant_id="tenant_demo",
@@ -3955,6 +3989,7 @@ def test_persistent_model_and_token_budgets_block_before_unbounded_followup_call
     engine = create_engine("sqlite://", poolclass=StaticPool)
     SQLModel.metadata.create_all(engine)
     with Session(engine, expire_on_commit=False) as db:
+        _ensure_dynamic_agent(db)
         capabilities = _model_capabilities()
         model = ModelConfig(
             id="model_budget",
@@ -5485,6 +5520,7 @@ def _steering_execution(db: Session):
         actor_user_id=user.id,
     )
     db.commit()
+    db.refresh(instance)
     return agent, instance, model, user, executor, proposer
 
 
@@ -6211,6 +6247,7 @@ def test_steer_cancels_prepared_unsent_operation_before_plan_revision() -> None:
             )
             db.add(operation)
             db.flush()
+        db.refresh(instance)
         command, _ = ExecutionControlService(db).issue_command(
             instance,
             command_id="steer_prepared",
@@ -6326,6 +6363,7 @@ def test_steer_rolls_back_prepared_cancellation_when_plan_append_fails(monkeypat
             )
             db.add(operation)
             db.flush()
+        db.refresh(instance)
         command, _ = ExecutionControlService(db).issue_command(
             instance,
             command_id="steer_append_failure",

@@ -405,6 +405,9 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     show_tool_trace: true,
     reflection_max_rounds: 1,
     agent_loop_max_actions: 6,
+    context_token_budget: 32000,
+    context_compaction_trigger_ratio: 0.7,
+    context_recent_round_limit: 6,
     updated_at: '',
   });
   const chatMessagesRef = useRef<HTMLDivElement>(null);

@@ -19,6 +19,7 @@ from sqlmodel import Session, select
 from app.config import get_settings
 from app.db.models import (
     AgentEvent,
+    AgentProfile,
     ChatSession,
     GeneralSkill,
     GeneralSkillDependency,
@@ -1227,8 +1228,27 @@ class GeneralSkillRuntimeService:
         return payload
 
     def _session(self, current_user: User, *, session_id: str, agent_id: str) -> ChatSession:
-        """验证会话固定属于当前 tenant/user/agent，拒绝由请求重绑。"""
+        """按 Agent→会话锁序验证活动生命周期，拒绝墓碑旁路和由请求重绑。"""
 
+        agent = self.db.exec(
+            select(AgentProfile)
+            .where(
+                AgentProfile.tenant_id == current_user.tenant_id,
+                AgentProfile.id == agent_id,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        ).first()
+        deletion = (agent.metadata_json or {}).get("agent_deletion") if agent else None
+        deletion_state = deletion.get("state") if isinstance(deletion, dict) else None
+        if (
+            agent is None
+            or agent.status != "active"
+            or deletion_state in {"deleting", "deletion_pending", "deleted"}
+        ):
+            raise GeneralSkillRuntimeError(
+                "GENERAL_SKILL_NOT_AVAILABLE", "agent skill scope is unavailable", 404
+            )
         row = self.db.get(ChatSession, session_id)
         if (
             row is None

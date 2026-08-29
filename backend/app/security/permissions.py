@@ -48,8 +48,19 @@ def require_agent_scope_viewer(
     ensure_current_user_tenant(tenant_id, current_user)
     if not agent_id:
         return current_user
-    row = db.get(AgentProfile, agent_id)
+    row = db.exec(
+        select(AgentProfile)
+        .where(AgentProfile.tenant_id == tenant_id, AgentProfile.id == agent_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).first()
     if not row or row.tenant_id != tenant_id:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    if row.status != "active" or _agent_deletion_state(row) in {
+        "deleting",
+        "deletion_pending",
+        "deleted",
+    }:
         raise HTTPException(status_code=404, detail="Agent not found")
     if (
         is_admin_user(current_user)
@@ -74,9 +85,27 @@ def ensure_agent_scope_manager(
     ensure_current_user_tenant(tenant_id, current_user)
     if not agent_id:
         return None
-    row = db.get(AgentProfile, agent_id)
+    row = db.exec(
+        select(AgentProfile)
+        .where(AgentProfile.tenant_id == tenant_id, AgentProfile.id == agent_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).first()
     if not row or row.tenant_id != tenant_id:
         raise HTTPException(status_code=404, detail="Agent not found")
+    if row.status != "active" or _agent_deletion_state(row) in {
+        "deleting",
+        "deletion_pending",
+        "deleted",
+    }:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "AGENT_TOMBSTONE_IMMUTABLE",
+                "message": "数字员工已进入不可逆删除流程，不能继续写入或绑定资源。",
+                "state": _agent_deletion_state(row) or "unavailable",
+            },
+        )
     if is_admin_user(current_user):
         return row
     if row.is_overall:
@@ -92,6 +121,13 @@ def agent_owned_by_user(row: AgentProfile, user: User) -> bool:
     return agent_owner_user_id(row) == user.id
 
 
+def _agent_deletion_state(row: AgentProfile) -> str | None:
+    """读取 Agent 删除状态，兼容历史记录中缺失或非对象形式的 metadata。"""
+
+    deletion = (row.metadata_json or {}).get("agent_deletion")
+    return deletion.get("state") if isinstance(deletion, dict) else None
+
+
 def can_use_agent_in_chat(
     db: Session,
     row: AgentProfile,
@@ -99,7 +135,12 @@ def can_use_agent_in_chat(
 ) -> bool:
     """统一判断用户能否在交互入口使用 Agent，防止连接器绕过聊天使用关系。"""
 
-    if row.tenant_id != user.tenant_id or row.status != "active" or row.is_overall:
+    if (
+        row.tenant_id != user.tenant_id
+        or row.status != "active"
+        or _agent_deletion_state(row) in {"deleting", "deletion_pending", "deleted"}
+        or row.is_overall
+    ):
         return False
     adopted_release_id = (row.metadata_json or {}).get("adopted_release_id")
     if isinstance(adopted_release_id, str):

@@ -15,7 +15,9 @@ from sqlmodel import Session, select
 
 from app import paths
 from app.db.models import (
+    AgentProfile,
     ArtifactInputLink,
+    ChatSession,
     ExecutionArtifact,
     InputResourceSnapshot,
     ManagedInputResource,
@@ -194,6 +196,17 @@ class ArtifactService:
         artifact = self.db.get(ExecutionArtifact, artifact_id)
         if artifact is None or artifact.tenant_id != tenant_id or artifact.status != "ready":
             raise ArtifactAccessDenied("ARTIFACT_NOT_FOUND")
+        instance = self.db.get(SopInstance, artifact.execution_id)
+        if instance is None or instance.tenant_id != tenant_id:
+            raise ArtifactAccessDenied("ARTIFACT_NOT_FOUND")
+        lineage_agent_id = instance.agent_id
+        if lineage_agent_id is None:
+            session = self.db.get(ChatSession, instance.session_id)
+            if session is not None and session.tenant_id != tenant_id:
+                raise ArtifactAccessDenied("ARTIFACT_NOT_FOUND")
+            lineage_agent_id = session.agent_id if session is not None else None
+        if lineage_agent_id and self._agent_is_unavailable(lineage_agent_id, tenant_id):
+            raise ArtifactAccessDenied("ARTIFACT_NOT_FOUND")
         actor = self.db.exec(
             select(User).where(
                 User.id == actor_user_id,
@@ -226,6 +239,12 @@ class ArtifactService:
         except ManagedStorageError as exc:
             raise ArtifactAccessDenied("ARTIFACT_NOT_FOUND") from exc
         return artifact
+
+    def _agent_is_unavailable(self, agent_id: str, tenant_id: str) -> bool:
+        """判断已知的产物所属 Agent 是否进入墓碑状态。"""
+
+        agent = self.db.get(AgentProfile, agent_id)
+        return agent is None or agent.tenant_id != tenant_id or agent.status != "active"
 
     def lineage(self, artifact: ExecutionArtifact) -> list[ArtifactInputLink]:
         """返回同 tenant、同 Execution 的精确输入血缘边。"""

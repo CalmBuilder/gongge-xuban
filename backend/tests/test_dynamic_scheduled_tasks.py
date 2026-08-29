@@ -12,6 +12,7 @@ from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
+from fastapi import HTTPException
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
@@ -38,6 +39,7 @@ from app.dynamic_tasks.worker import due_dynamic_task_signals
 from app.dynamic_tasks import worker as dynamic_worker
 from app.general_skills.schema import GeneralSkillSelection
 from app.scheduled_tasks import service as scheduled_service
+from app.scheduled_tasks.schema import ScheduledTaskUpdateRequest
 from app.scheduled_tasks import worker as scheduled_worker
 from app.session.session_schema import ChatTurnRequest
 from app.sop_runtime.execution_control import ExecutionControlService, canonical_checksum
@@ -89,6 +91,112 @@ def test_skip_misfire_creates_terminal_run_without_agent_call(monkeypatch) -> No
         assert "misfire" in str(run.error)
         assert run.session_id is None
         assert task.run_count == 1
+
+
+def test_archived_agent_cannot_create_scheduled_run_or_session() -> None:
+    """员工在准备阶段被归档时不得留下新的 Run 或自动会话。"""
+
+    with _session() as db:
+        task = _seed_task(db)
+        agent = db.get(AgentProfile, task.agent_id)
+        assert agent is not None
+        agent.status = "archived"
+        db.add(agent)
+        db.commit()
+
+        run = scheduled_service._prepare_scheduled_task_run(
+            db,
+            task,
+            utc_now() + timedelta(minutes=1),
+            False,
+        )
+
+        assert run is None
+        assert db.exec(select(ScheduledTaskRun)).all() == []
+        assert db.exec(select(ChatSession)).all() == []
+
+
+def test_archived_agent_cannot_update_existing_scheduled_task() -> None:
+    """员工进入墓碑状态后，已有自动任务也不能被迟到请求改写。"""
+
+    with _session() as db:
+        task = _seed_task(db)
+        agent = db.get(AgentProfile, task.agent_id)
+        assert agent is not None
+        agent.status = "archived"
+        agent.metadata_json = {"agent_deletion": {"state": "deleted"}}
+        db.add(agent)
+        db.commit()
+
+        current_user = db.get(User, task.created_by_user_id)
+        assert current_user is not None
+        with pytest.raises(HTTPException) as caught:
+            scheduled_service.update_scheduled_task(
+                db,
+                task,
+                ScheduledTaskUpdateRequest(
+                    tenant_id=task.tenant_id,
+                    title="迟到修改",
+                ),
+                current_user,
+            )
+
+        assert getattr(caught.value, "status_code", None) == 409
+
+
+def test_pausing_task_skips_unstarted_runs_without_leaving_active_fact() -> None:
+    """暂停任务应终结未绑定 Execution 的运行，避免没有 worker 可以继续消费。"""
+
+    with _session() as db:
+        task = _seed_task(db)
+        run = scheduled_service._create_run(
+            db,
+            task,
+            utc_now() + timedelta(minutes=1),
+            "running",
+            manual=False,
+        )
+        db.add(run)
+        db.commit()
+        owner = db.get(User, task.created_by_user_id)
+        assert owner is not None
+
+        updated = scheduled_service.update_scheduled_task(
+            db,
+            task,
+            ScheduledTaskUpdateRequest(
+                tenant_id=task.tenant_id,
+                status="paused",
+            ),
+            owner,
+        )
+
+        db.refresh(run)
+        assert updated.status == "paused"
+        assert updated.next_run_at is None
+        assert run.status == "skipped"
+        assert run.error == "SCHEDULE_TASK_PAUSED"
+        assert run.finished_at is not None
+
+
+def test_scheduled_task_lease_release_is_owner_compare_and_swap() -> None:
+    """旧异步 worker 释放 lease 时不能清掉后来 worker 已接管的租约。"""
+
+    with _session() as db:
+        task = _seed_task(db)
+        task.lease_owner = "new-worker"
+        task.lease_until = utc_now() + timedelta(minutes=5)
+        db.add(task)
+        db.commit()
+
+        assert scheduled_service._release_scheduled_task_lease(db, task, "old-worker") is False
+        db.refresh(task)
+        assert task.lease_owner == "new-worker"
+
+        assert scheduled_service._release_scheduled_task_lease(db, task, "new-worker") is True
+        db.refresh(task)
+        assert task.lease_owner is None
+        assert task.lease_until is None
 
 
 def test_schedule_dispatch_capacity_releases_lease_without_losing_due_fact(monkeypatch) -> None:
@@ -277,6 +385,47 @@ def test_runtime_reauthorizes_creator_and_fails_before_agent(monkeypatch) -> Non
         assert run.status == "failed"
         assert run.error == "SCHEDULE_INITIATOR_INACTIVE"
         assert run.execution_id is None
+
+
+def test_late_worker_cannot_overwrite_agent_deleted_run(monkeypatch) -> None:
+    """Agent 删除后迟到的 worker 只能退出，不能把 skipped 运行改回 failed/succeeded。"""
+
+    monkeypatch.setattr(
+        scheduled_service,
+        "AgentLoop",
+        lambda _db: (_ for _ in ()).throw(AssertionError("deleted run must not call AgentLoop")),
+    )
+    with _session() as db:
+        task = _seed_task(db)
+        run = scheduled_service._prepare_scheduled_task_run(
+            db,
+            task,
+            utc_now() + timedelta(seconds=1),
+            False,
+        )
+        agent = db.get(AgentProfile, task.agent_id)
+        assert agent is not None
+        agent.status = "archived"
+        task.status = "paused"
+        task.next_run_at = None
+        run.status = "skipped"
+        run.error = "AGENT_DELETED"
+        run.finished_at = utc_now()
+        db.add(agent)
+        db.add(task)
+        db.add(run)
+        db.commit()
+
+        result = scheduled_service._execute_prepared_scheduled_task(
+            db,
+            task,
+            run,
+            manual=False,
+        )
+
+        assert result.status == "skipped"
+        assert result.error == "AGENT_DELETED"
+        assert db.get(ScheduledTask, task.id).next_run_at is None
 
 
 def test_agent_loop_resolves_scheduled_run_as_dynamic_source() -> None:

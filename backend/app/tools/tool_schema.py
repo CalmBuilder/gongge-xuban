@@ -167,6 +167,14 @@ class MCPServerConnection(BaseModel):
     cwd: Optional[str] = None
 
 
+class MCPServerCredentialState(BaseModel):
+    """只披露 MCP 凭据是否配置及其键名，不返回任何凭据值。"""
+
+    configured_fields: list[Literal["headers", "env"]] = Field(default_factory=list)
+    header_keys: list[str] = Field(default_factory=list)
+    env_keys: list[str] = Field(default_factory=list)
+
+
 class MCPServerCreateRequest(BaseModel):
     tenant_id: str
     name: str
@@ -200,6 +208,7 @@ class MCPServerRead(BaseModel):
     description: Optional[str] = None
     bucket: str
     connection: MCPServerConnection
+    credential_state: MCPServerCredentialState = Field(default_factory=MCPServerCredentialState)
     enabled: bool
     last_synced_at: Optional[str] = None
     tool_count: int = 0

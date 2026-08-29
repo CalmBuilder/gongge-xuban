@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from sqlalchemy import or_, update
 from sqlalchemy.exc import IntegrityError
@@ -219,6 +219,26 @@ class ConnectorRuntimeService:
             return None
         previous_status = candidate.status
         previous_lease = candidate.lease_until
+        if not self._lock_inbound_event_agent(candidate):
+            conditions = [
+                ConnectorInboundEvent.id == candidate.id,
+                ConnectorInboundEvent.status == previous_status,
+            ]
+            if previous_status == "processing":
+                conditions.append(ConnectorInboundEvent.lease_until == previous_lease)
+            self.db.exec(
+                update(ConnectorInboundEvent)
+                .where(*conditions)
+                .values(
+                    status="dead_letter",
+                    last_error_code="AGENT_NOT_AVAILABLE",
+                    lease_owner=None,
+                    lease_until=None,
+                    updated_at=now,
+                )
+            )
+            self.db.commit()
+            return None
         conditions = [ConnectorInboundEvent.id == candidate.id]
         if previous_status == "processing":
             conditions.extend(
@@ -285,6 +305,8 @@ class ConnectorRuntimeService:
             raise ConnectorRuntimeError("CONNECTOR_PRINCIPAL_INACTIVE")
         if route is None or not self._route_binding_active(event, route):
             raise ConnectorRuntimeError("CONNECTOR_INBOUND_ROUTE_UNRESOLVED")
+        if not self._lock_agent(event.tenant_id, route.agent_id):
+            raise ConnectorRuntimeError("CONNECTOR_AGENT_ACCESS_DENIED")
         agent = self.db.get(AgentProfile, route.agent_id)
         if agent is None or not can_use_agent_in_chat(self.db, agent, user):
             raise ConnectorRuntimeError("CONNECTOR_AGENT_ACCESS_DENIED")
@@ -350,6 +372,8 @@ class ConnectorRuntimeService:
         if event is None:
             raise ConnectorRuntimeError("CONNECTOR_INBOUND_EVENT_NOT_FOUND")
         self._assert_event_owner(event, worker_id)
+        if not self._lock_agent(dispatch.tenant_id, dispatch.agent_id):
+            raise ConnectorRuntimeError("CONNECTOR_AGENT_ACCESS_DENIED")
         messages = self.db.exec(
             select(Message)
             .where(
@@ -431,6 +455,9 @@ class ConnectorRuntimeService:
             .order_by(ConnectorOutboundDelivery.created_at, ConnectorOutboundDelivery.id)
         ).first()
         if candidate is None:
+            self.db.commit()
+            return None
+        if not self._lock_delivery_agent(candidate):
             self.db.commit()
             return None
         result = self.db.exec(
@@ -518,6 +545,7 @@ class ConnectorRuntimeService:
         ):
             return self.finish_delivery(
                 delivery,
+                worker_id=worker_id,
                 status="dead_letter",
                 error_code="CONNECTOR_THREAD_UNAVAILABLE",
             )
@@ -525,20 +553,30 @@ class ConnectorRuntimeService:
         if hashlib.sha256(content.encode("utf-8")).hexdigest() != delivery.payload_checksum:
             return self.finish_delivery(
                 delivery,
+                worker_id=worker_id,
                 status="dead_letter",
                 error_code="CONNECTOR_DELIVERY_PAYLOAD_CHANGED",
             )
         if len(content) > 4000:
             return self.finish_delivery(
                 delivery,
+                worker_id=worker_id,
                 status="dead_letter",
                 error_code="CONNECTOR_DELIVERY_CONTENT_TOO_LARGE",
+            )
+        if not self._lock_delivery_agent(delivery):
+            return self.finish_delivery(
+                delivery,
+                worker_id=worker_id,
+                status="unknown",
+                error_code="AGENT_NOT_AVAILABLE",
             )
         try:
             recipient_ref = decrypt_secret(thread.encrypted_recipient_ref)
         except (TypeError, ValueError):
             return self.finish_delivery(
                 delivery,
+                worker_id=worker_id,
                 status="dead_letter",
                 error_code="CONNECTOR_RECIPIENT_UNAVAILABLE",
             )
@@ -552,6 +590,7 @@ class ConnectorRuntimeService:
         if result.success:
             return self.finish_delivery(
                 delivery,
+                worker_id=worker_id,
                 status="settled",
                 receipt={
                     "provider_message_id": str(result.data.get("message_id") or ""),
@@ -562,23 +601,22 @@ class ConnectorRuntimeService:
                 },
             )
         if result.error_code == "WECOM_RATE_LIMITED":
-            delivery.status = "pending"
-            delivery.available_at = result.rate_limited_until or (utc_now() + timedelta(seconds=60))
-            delivery.error_json = {"code": "WECOM_RATE_LIMITED"}
-            delivery.lease_owner = None
-            delivery.lease_until = None
-            delivery.updated_at = utc_now()
-            self.db.add(delivery)
-            self.db.commit()
-            return delivery
+            return self.retry_delivery(
+                delivery,
+                worker_id=worker_id,
+                available_at=result.rate_limited_until or (utc_now() + timedelta(seconds=60)),
+                error_code="WECOM_RATE_LIMITED",
+            )
         if result.error_code == "WECOM_DELIVERY_UNKNOWN":
             return self.finish_delivery(
                 delivery,
+                worker_id=worker_id,
                 status="unknown",
                 error_code="WECOM_DELIVERY_UNKNOWN",
             )
         return self.finish_delivery(
             delivery,
+            worker_id=worker_id,
             status="dead_letter",
             error_code=str(result.error_code or "WECOM_DELIVERY_FAILED"),
         )
@@ -748,33 +786,185 @@ class ConnectorRuntimeService:
         self,
         delivery: ConnectorOutboundDelivery,
         *,
+        worker_id: str,
         status: str,
         error_code: str | None = None,
         receipt: dict[str, object] | None = None,
     ) -> ConnectorOutboundDelivery:
-        """持久化回发终态；只有 settled 才能作为 required publication 完成证据。"""
+        """以当前 worker 的 owner/租约 CAS 持久化回发终态，拒绝迟到 worker 覆盖删除结果。"""
 
         now = utc_now()
-        delivery.status = status
-        delivery.receipt_json = dict(receipt or {})
-        delivery.error_json = {"code": error_code} if error_code else {}
-        delivery.settled_at = now if status == "settled" else None
-        delivery.lease_owner = None
-        delivery.lease_until = None
-        delivery.updated_at = now
-        self.db.add(delivery)
+        if status not in {"settled", "unknown", "dead_letter"}:
+            raise ConnectorRuntimeError("CONNECTOR_DELIVERY_STATUS_INVALID")
+        if not self._lock_delivery_agent(delivery):
+            result = self.db.exec(
+                update(ConnectorOutboundDelivery)
+                .where(
+                    ConnectorOutboundDelivery.id == delivery.id,
+                    ConnectorOutboundDelivery.tenant_id == delivery.tenant_id,
+                    ConnectorOutboundDelivery.status == "delivering",
+                    ConnectorOutboundDelivery.lease_owner == worker_id,
+                    ConnectorOutboundDelivery.lease_until > now,
+                )
+                .values(
+                    status="unknown",
+                    receipt_json={},
+                    error_json={"code": "AGENT_NOT_AVAILABLE"},
+                    settled_at=None,
+                    lease_owner=None,
+                    lease_until=None,
+                    updated_at=now,
+                )
+            )
+            if getattr(result, "rowcount", 0) != 1:
+                self.db.rollback()
+                raise ConnectorRuntimeError("CONNECTOR_DELIVERY_LEASE_LOST")
+            self.db.commit()
+            current = self.db.get(ConnectorOutboundDelivery, delivery.id)
+            if current is None:
+                raise ConnectorRuntimeError("CONNECTOR_DELIVERY_MISSING")
+            if current.source_type == "execution_publication":
+                self.sync_execution_delivery_status(
+                    current,
+                    worker_id="connector-publication-status",
+                )
+            return current
+        result = self.db.exec(
+            update(ConnectorOutboundDelivery)
+            .where(
+                ConnectorOutboundDelivery.id == delivery.id,
+                ConnectorOutboundDelivery.tenant_id == delivery.tenant_id,
+                ConnectorOutboundDelivery.status == "delivering",
+                ConnectorOutboundDelivery.lease_owner == worker_id,
+                ConnectorOutboundDelivery.lease_until > now,
+            )
+            .values(
+                status=status,
+                receipt_json=dict(receipt or {}),
+                error_json={"code": error_code} if error_code else {},
+                settled_at=now if status == "settled" else None,
+                lease_owner=None,
+                lease_until=None,
+                updated_at=now,
+            )
+        )
+        if getattr(result, "rowcount", 0) != 1:
+            self.db.rollback()
+            raise ConnectorRuntimeError("CONNECTOR_DELIVERY_LEASE_LOST")
         self.db.commit()
-        if status == "settled" and delivery.source_type == "execution_publication":
-            self.settle_execution_delivery(delivery, worker_id="connector-publication-settler")
+        current = self.db.get(ConnectorOutboundDelivery, delivery.id)
+        if current is None:
+            raise ConnectorRuntimeError("CONNECTOR_DELIVERY_MISSING")
+        if status == "settled" and current.source_type == "execution_publication":
+            self.settle_execution_delivery(current, worker_id="connector-publication-settler")
         elif (
             status in {"unknown", "dead_letter"}
-            and delivery.source_type == "execution_publication"
+            and current.source_type == "execution_publication"
         ):
             self.sync_execution_delivery_status(
-                delivery,
+                current,
                 worker_id="connector-publication-status",
             )
-        return delivery
+        return current
+
+    def _lock_delivery_agent(self, delivery: ConnectorOutboundDelivery) -> bool:
+        """在外部发送或终态 CAS 前锁定线程所属 Agent，形成删除竞态的同一锁序。"""
+
+        thread = self.db.get(ConnectorThreadBinding, delivery.thread_binding_id)
+        if (
+            thread is None
+            or thread.tenant_id != delivery.tenant_id
+            or not thread.agent_id
+        ):
+            return False
+        return self._lock_agent(delivery.tenant_id, thread.agent_id)
+
+    def _lock_inbound_event_agent(self, event: ConnectorInboundEvent) -> bool:
+        """根据已绑定线程或活动路由锁定入站事件所属 Agent，拒绝墓碑事件继续认领。"""
+
+        agent_id: str | None = None
+        if event.thread_binding_id:
+            thread = self.db.get(ConnectorThreadBinding, event.thread_binding_id)
+            if thread is not None and thread.tenant_id == event.tenant_id:
+                agent_id = thread.agent_id
+        if agent_id is None:
+            route = self.db.exec(
+                select(ConnectorInboundRoute)
+                .where(
+                    ConnectorInboundRoute.tenant_id == event.tenant_id,
+                    ConnectorInboundRoute.provider == event.provider,
+                    ConnectorInboundRoute.profile_id == event.profile_id,
+                    ConnectorInboundRoute.enabled.is_(True),
+                )
+            ).first()
+            agent_id = route.agent_id if route is not None else None
+        return agent_id is None or self._lock_agent(event.tenant_id, agent_id)
+
+    def _lock_agent(self, tenant_id: str, agent_id: str) -> bool:
+        """按 tenant 和主键锁定 Agent 最新生命周期，供 Connector 控制面共用。"""
+
+        with self.db.no_autoflush:
+            agent = self.db.exec(
+                select(AgentProfile)
+                .where(
+                    AgentProfile.tenant_id == tenant_id,
+                    AgentProfile.id == agent_id,
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            ).first()
+        deletion = (agent.metadata_json or {}).get("agent_deletion") if agent else None
+        deletion_state = deletion.get("state") if isinstance(deletion, dict) else None
+        return bool(
+            agent is not None
+            and agent.status == "active"
+            and deletion_state not in {"deleting", "deletion_pending", "deleted"}
+        )
+
+    def retry_delivery(
+        self,
+        delivery: ConnectorOutboundDelivery,
+        *,
+        worker_id: str,
+        available_at: datetime,
+        error_code: str,
+    ) -> ConnectorOutboundDelivery:
+        """以当前 worker 的 owner/租约 CAS 将可重试投递重新放回 pending。"""
+
+        if not self._lock_delivery_agent(delivery):
+            return self.finish_delivery(
+                delivery,
+                worker_id=worker_id,
+                status="unknown",
+                error_code="AGENT_NOT_AVAILABLE",
+            )
+        now = utc_now()
+        result = self.db.exec(
+            update(ConnectorOutboundDelivery)
+            .where(
+                ConnectorOutboundDelivery.id == delivery.id,
+                ConnectorOutboundDelivery.tenant_id == delivery.tenant_id,
+                ConnectorOutboundDelivery.status == "delivering",
+                ConnectorOutboundDelivery.lease_owner == worker_id,
+                ConnectorOutboundDelivery.lease_until > now,
+            )
+            .values(
+                status="pending",
+                available_at=available_at,
+                error_json={"code": error_code},
+                lease_owner=None,
+                lease_until=None,
+                updated_at=now,
+            )
+        )
+        if getattr(result, "rowcount", 0) != 1:
+            self.db.rollback()
+            raise ConnectorRuntimeError("CONNECTOR_DELIVERY_LEASE_LOST")
+        self.db.commit()
+        current = self.db.get(ConnectorOutboundDelivery, delivery.id)
+        if current is None:
+            raise ConnectorRuntimeError("CONNECTOR_DELIVERY_MISSING")
+        return current
 
     def sync_execution_delivery_status(
         self,

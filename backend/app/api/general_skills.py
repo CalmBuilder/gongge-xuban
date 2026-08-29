@@ -43,7 +43,7 @@ from app.agents.branching import (
     user_creator_metadata,
 )
 from app.db import get_session
-from app.db.models import AgentResourceBinding, GeneralSkill, ModelConfig, User, utc_now
+from app.db.models import AgentProfile, AgentResourceBinding, GeneralSkill, ModelConfig, User, utc_now
 from app.dynamic_tasks.capability_catalog import capability_checksum
 from app.general_skills import (
     GeneralSkillClawHubImportRequest,
@@ -833,7 +833,21 @@ def _ensure_general_skill_visible(
     row: GeneralSkill,
     agent_id: str | None,
 ) -> None:
-    agent = get_agent(db, tenant_id, _agent_id_or_none(agent_id))
+    requested_agent_id = _agent_id_or_none(agent_id)
+    if requested_agent_id:
+        agent = db.get(AgentProfile, requested_agent_id)
+        deletion = (agent.metadata_json or {}).get("agent_deletion") if agent else None
+        deletion_state = deletion.get("state") if isinstance(deletion, dict) else None
+        if agent is None or agent.tenant_id != tenant_id:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        if agent.status != "active" or deletion_state in {
+            "deleting",
+            "deletion_pending",
+            "deleted",
+        }:
+            raise HTTPException(status_code=404, detail="Agent not found")
+    else:
+        agent = None
     if not agent or agent.is_overall:
         if is_open_gallery_resource(db, tenant_id, "general_skill", row):
             return

@@ -16,8 +16,9 @@ const Q1_PROFILE = process.env.Q1_PROFILE || 'writing';
 const EVIDENCE_DIR = resolve('../docs/manuals/evidence');
 const EVIDENCE_FILE = basename(process.env.Q1_AGENT_QUALITY_EVIDENCE_FILE
   || 'agent-quality-q1-writing-matched-exploration.json');
-const CONTROL_AGENT_ID = 'agent_q1_writing_control';
-const TREATMENT_AGENT_ID = 'agent_skill_demo_a_docs';
+const CONTROL_AGENT_ID = process.env.Q1_CONTROL_AGENT_ID || 'agent_q1_writing_control';
+const TREATMENT_AGENT_ID = process.env.Q1_TREATMENT_AGENT_ID || 'agent_skill_demo_a_docs';
+const SAME_AGENT_AB = CONTROL_AGENT_ID === TREATMENT_AGENT_ID;
 const ORDER_SEED = process.env.Q1_ORDER_SEED || 'q1-writing-default';
 const CERTIFICATION_RUN_ID = process.env.Q1_CERTIFICATION_RUN_ID || '';
 const WRITING_BENCHMARK = process.env.Q1_WRITING_BENCHMARK || 'matched-v1';
@@ -997,12 +998,15 @@ test('Q1 writing-for-agents 四象限真实模型探索批', async ({ page }, te
   await page.goto('/enterprise/dashboard');
   await loginAsMember(page, CONTROL_AGENT_ID);
   const onlyScenario = process.env.Q1_ONLY_SCENARIO?.trim() || '';
-  const selected = seededOrder([
+  const scenarios = [
     { variant: 'control' as const, inputMode: 'inline' as const },
     { variant: 'control' as const, inputMode: 'attachment' as const },
     { variant: 'treatment' as const, inputMode: 'inline' as const },
     { variant: 'treatment' as const, inputMode: 'attachment' as const },
-  ].filter((item) => !onlyScenario || `${item.inputMode}-${item.variant}` === onlyScenario), ORDER_SEED);
+  ].filter((item) => !onlyScenario || `${item.inputMode}-${item.variant}` === onlyScenario);
+  // 同一Agent做严格A/B时，先完成无Skill控制组再导入并选择Skill；这样唯一变化
+  // 是本轮Skill绑定，不把两个AgentProfile的persona/配置差异混入增益判断。
+  const selected = SAME_AGENT_AB ? scenarios : seededOrder(scenarios, ORDER_SEED);
   expect(selected.length, `unknown Q1_ONLY_SCENARIO: ${onlyScenario}`).toBeGreaterThan(0);
   report.execution_order = selected.map((item) => `${item.inputMode}-${item.variant}`);
   for (const item of selected) {

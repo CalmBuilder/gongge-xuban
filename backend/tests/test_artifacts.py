@@ -16,6 +16,7 @@ from sqlmodel import Session, SQLModel, create_engine, select
 
 from app.api.artifacts import download_artifact, get_artifact, list_artifacts, preview_artifact
 from app.db.models import (
+    AgentProfile,
     ArtifactInputLink,
     ExecutionArtifact,
     InputResourceSnapshot,
@@ -57,6 +58,13 @@ def _facts(db: Session):
         tenant_id="tenant_artifact",
         username="outsider",
         password_hash="x",
+    )
+    agent = AgentProfile(
+        id="agent_artifact",
+        tenant_id="tenant_artifact",
+        name="产物员工",
+        owner_user_id=owner.id,
+        status="active",
     )
     instance = SopInstance(
         id="execution_artifact",
@@ -115,6 +123,7 @@ def _facts(db: Session):
     )
     db.add(owner)
     db.add(outsider)
+    db.add(agent)
     db.add(instance)
     db.add(node)
     db.add(snapshot)

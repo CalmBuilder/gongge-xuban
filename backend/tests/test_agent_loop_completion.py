@@ -1498,6 +1498,48 @@ def test_finalize_turn_keeps_only_inline_knowledge_citations() -> None:
     assert [item["label"] for item in message.metadata_json["knowledge_citations"]] == ["[1]"]
 
 
+def test_finalize_turn_keeps_same_title_knowledge_chunks() -> None:
+    """最终回复保留同标题但不同切片身份的全部正文引用。"""
+
+    loop = object.__new__(AgentLoop)
+    loop.db = FakeDb()
+    loop.events = FakeEvents()
+    session = ChatSession(id="session_test", tenant_id="tenant_demo")
+    step_result = StepAgentResult(
+        knowledge_results=[
+            {
+                "evidence_pack": [
+                    {
+                        "chunk_id": "chunk-a",
+                        "section_path": "退款政策",
+                        "excerpt": "第一段规则。",
+                    },
+                    {
+                        "chunk_id": "chunk-b",
+                        "section_path": "退款政策",
+                        "excerpt": "第二段规则。",
+                    },
+                ]
+            }
+        ]
+    )
+
+    loop._finalize_turn(
+        session,
+        "tenant_demo",
+        "两段规则分别适用于不同情形。[1]-[2]",
+        step_result=step_result,
+        source_message="退款政策是什么？",
+    )
+
+    message = loop.db.added[-1]
+    assert isinstance(message, Message)
+    assert [item["chunk_id"] for item in message.metadata_json["knowledge_citations"]] == [
+        "chunk-a",
+        "chunk-b",
+    ]
+
+
 def test_finalize_turn_restores_unique_truncated_email_from_citation() -> None:
     """最终落库前应从唯一引用恢复被模型省略号截断的邮箱。"""
 

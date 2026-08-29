@@ -132,6 +132,45 @@ def test_only_owner_can_update_and_delete_agent_while_admin_is_governance_only()
         assert delete_error.value.status_code == 403
 
 
+def test_deleted_agent_cannot_be_reactivated_or_governed() -> None:
+    """删除墓碑一旦完成，资料 PUT 和治理发布都必须拒绝，不能重新激活员工。"""
+
+    with _test_session() as db:
+        owner, _other, admin = _seed_users(db)
+        agent = AgentProfile(
+            id="agent_immutable_tombstone",
+            tenant_id="tenant_demo",
+            name="不可复活员工",
+            owner_user_id=owner.id,
+        )
+        db.add(agent)
+        db.commit()
+
+        result = delete_agent(agent.id, tenant_id="tenant_demo", db=db, current_user=owner)
+        assert result["status"] == "deleted"
+
+        with pytest.raises(HTTPException) as restore_error:
+            update_agent(
+                agent.id,
+                AgentProfileUpdateRequest(tenant_id="tenant_demo", status="active"),
+                db=db,
+                current_user=owner,
+            )
+        assert restore_error.value.status_code == 409
+        assert restore_error.value.detail["code"] == "AGENT_TOMBSTONE_IMMUTABLE"
+
+        with pytest.raises(HTTPException) as publish_error:
+            set_agent_gallery_publication(
+                agent.id,
+                AgentGalleryPublicationRequest(tenant_id="tenant_demo", published=True),
+                db=db,
+                current_user=admin,
+            )
+        assert publish_error.value.status_code == 409
+        db.refresh(agent)
+        assert agent.status == "archived"
+
+
 def test_gallery_publication_requires_independent_admin_command() -> None:
     """普通 owner 不能借通用 metadata 发布，管理员只能通过治理命令变更广场状态。"""
     with _test_session() as db:

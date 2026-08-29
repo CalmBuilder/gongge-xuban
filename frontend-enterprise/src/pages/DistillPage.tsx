@@ -886,7 +886,12 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     try {
       await streamPost(
         '/api/enterprise/skills/distill/stream',
-        { tenant_id: getRequestTenantId(), ...payload, model_config_id: selectedRewriteModelId || undefined },
+        {
+          tenant_id: getRequestTenantId(),
+          agent_id: activeAgentId || undefined,
+          ...payload,
+          model_config_id: selectedRewriteModelId || undefined,
+        },
         (item) => {
           trackActiveJobEvent(item, baseJob);
           if (item.event === 'status') {
@@ -1005,6 +1010,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
         `/api/enterprise/skills/${encodeURIComponent(editableDraft.skill_id)}/rewrite/stream`,
         {
           tenant_id: getRequestTenantId(),
+          agent_id: activeAgentId || undefined,
           current_skill: editableDraft,
           instruction: text,
           model_config_id: selectedRewriteModelId || undefined,
@@ -2296,6 +2302,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
                       <UIButton
                         size="icon"
                         variant="ghost"
+                        aria-label={`取消上传 ${attachment.name}`}
                         onClick={() => cancelAttachment(attachment.id)}
                       >
                         <CloseOutlined />
@@ -2306,6 +2313,8 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
               )}
               <Textarea
                 className={CHAT_TEXTAREA_CLASS}
+                aria-label={draft ? '改写选中内容' : 'SOP 流程说明'}
+                aria-describedby="distill-composer-status"
                 value={input}
                 onChange={(event) => setInput(event.target.value)}
                 onPaste={handleComposerPaste}
@@ -2323,7 +2332,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
                 }
               />
               <div className={CHAT_ACTIONS_CLASS}>
-                <span className="min-w-0 truncate text-[12px] text-[#858b9c]">{streamStatus}</span>
+                <span id="distill-composer-status" role="status" aria-live="polite" className="min-w-0 truncate text-[12px] text-[#858b9c]">{streamStatus}</span>
                 <div className={CHAT_ACTIONS_GROUP_CLASS}>
                   <label>
                     <input
