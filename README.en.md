@@ -70,7 +70,7 @@ The loop routes a turn, loads only eligible published revisions, executes or wai
 ## Why it fits enterprise work
 
 - **Digital employees as capability boundaries** — each employee combines role/persona, model, knowledge, Skills, SOPs, tools, memory, and work records. Tenant, role, organization, ownership, and resource bindings define what can run.
-- **Skills and experts with governance** — `SKILL.md` packages can enter through local files, ZIPs, or fixed GitHub revisions, then move through review, publication, binding, and immutable revision checksums. The repository also ships offline, versioned Agency Agents snapshots and curated role resources; it does not live-sync GitHub at runtime.
+- **Skills and experts with governance** — `SKILL.md` packages can enter through local files, ZIPs, or fixed GitHub revisions, then move through review, publication, binding, and immutable revision checksums. A deployment can additionally load offline, versioned Agency Agents snapshots and curated role resources; it does not live-sync GitHub at runtime.
 - **Evidence-aware answers and deliverables** — managed knowledge supports document parsing, navigation, citations, and access control. Dynamic results can be checked against success criteria, evidence, artifacts, and applied Skill guidance.
 - **Risk-aware tool execution** — HTTP, MCP, and built-in capabilities describe read, local write, execute, external write, and destructive risk classes together with confirmation, idempotency, reconciliation, timeout, and concurrency policy. Read-only tools can run on the normal dynamic path; higher-risk writes are governed separately.
 - **Durable waiting and recovery** — persisted executions, leases, fencing tokens, idempotency keys, retries/backoff, recovery signals, dead letters, and external-effect reconciliation protect waiting work and late workers.
@@ -138,12 +138,15 @@ Lifecycle commands are `./app.sh`, `./app.sh status`, and `./app.sh stop` on mac
 ## Documentation
 
 - [Chinese product README](README.md)
-- [Module overview](docs/Module_Description/README.md)
-- [Agent Loop](docs/Module_Description/agent_loop.md)
-- [Product capabilities and business scenarios](docs/manuals/共格·序伴项目能力与业务场景手册.md)
-- [Skill closure and acceptance guide](docs/manuals/Skill五闭环演示场景与验收手册.md)
+- [Agent Loop source](backend/app/core/agent_loop.py)
+- [SOP Runtime source](backend/app/sop_runtime/)
+- [DynamicTask source](backend/app/dynamic_tasks/)
+- [General Skills source](backend/app/general_skills/)
+- [Knowledge source](backend/app/knowledge/)
 - [Backend development guide](backend/README.md)
 - [Frontend development guide](frontend-enterprise/README.md)
+
+Design, acceptance, and Agency Agents snapshot materials are local or deployment-side assets and are intentionally not distributed in this GitHub repository. The public entry points are the READMEs, source tree, tests, and module guides.
 
 ## Boundaries
 

@@ -26,16 +26,10 @@
 </p>
 
 <p align="center">
-  <a href="docs/manuals/Skill五闭环演示场景与验收手册.md">查看动态任务验收路径</a>
+  <a href="backend/app/dynamic_tasks/">查看动态任务执行源码</a>
 </p>
 
 共格·序伴（Gongge Xuban）把岗位知识、SOP、审批、工具和通用 Skill 组合成可执行、可治理、可复用的组织能力。用户从对话或定时任务进入，平台根据任务性质选择合适的运行方式，并把执行过程、依据、人工介入和结果沉淀下来。
-
-<p align="center">
-  <img src="docs/manuals/assets/skill-five-closure/05-real-dynamic-skill-closure.png" width="900" alt="动态 Skill 任务完成与结果验证示例" />
-</p>
-
-<p align="center"><em>验收示例：动态任务加载固定 Skill、生成交付物并完成结果校验（详见验收手册）</em></p>
 
 ## 先记住这件事
 
@@ -102,9 +96,9 @@ flowchart LR
 
 ### 2. Skill 和专家让动态任务更有方法
 
-平台支持以 `SKILL.md` 为核心的通用能力包，以及随项目交付的本地化专家快照和精选岗位资源。Skill 可以从本地文件、ZIP 或固定版本的 GitHub 来源进入候选、审核、发布和绑定流程；运行时固定 revision 与 checksum。Skill 提供的指导属于受审查的 guidance，不能覆盖平台安全策略、租户权限、SOP 或用户明确指令。
+平台支持以 `SKILL.md` 为核心的通用能力包，以及可由部署侧提供的本地化专家快照和精选岗位资源。Skill 可以从本地文件、ZIP 或固定版本的 GitHub 来源进入候选、审核、发布和绑定流程；运行时固定 revision 与 checksum。Skill 提供的指导属于受审查的 guidance，不能覆盖平台安全策略、租户权限、SOP 或用户明确指令。
 
-可运行的 Skill 由 Python/Bash runner 承载，执行受到受控运行环境、依赖/包策略、超时、路径与 shell 规则、权限和取消收敛约束。项目内的 Agency Agents 专家是离线、版本化的导入资产，不是运行时自动跟随 GitHub 更新的连接器。
+可运行的 Skill 由 Python/Bash runner 承载，执行受到受控运行环境、依赖/包策略、超时、路径与 shell 规则、权限和取消收敛约束。Agency Agents 专家可作为部署侧离线、版本化的导入资产接入，不是运行时自动跟随 GitHub 更新的连接器。
 
 ### 3. 知识回答和任务结果都尽量留下依据
 
@@ -205,7 +199,7 @@ cd ..
 - `destructive`：按更高风险等级单独授权和灰度，遵守平台禁止/人工介入策略。
 - `DYNAMIC_TASK_EXECUTION_ENABLED`：仅在故障处置时作为全局 kill switch 使用；恢复后应重新开放正常动态主线。
 
-动态任务的配额、超时、取消、租约、恢复 signal 和审计仍然持续生效。完整的高风险 Skill/工具验收路径见 [Skill 五闭环演示手册](docs/manuals/Skill五闭环演示场景与验收手册.md)。
+动态任务的配额、超时、取消、租约、恢复 signal 和审计仍然持续生效。实现入口见 [`backend/app/dynamic_tasks/`](backend/app/dynamic_tasks/) 与 [`backend/app/general_skills/`](backend/app/general_skills/)。
 
 ## 数据库与部署形态
 
@@ -239,15 +233,14 @@ cd backend
 
 ## 文档导航
 
-- [模块总览](docs/Module_Description/README.md)——后端、前端和 Agent Loop 的入口
-- [Agent Loop 说明](docs/Module_Description/agent_loop.md)——路由、SOP、Skill、知识、工具与回复阶段
-- [项目能力与业务场景手册](docs/manuals/共格·序伴项目能力与业务场景手册.md)——产品边界、配置方式和落地建议
-- [SOP 从零搭建与业务闭环](docs/manuals/共格·序伴SOP从零搭建与业务闭环手册.md)——流程型业务的建模与验收
-- [开放广场与能力组合](docs/manuals/共格·序伴开放广场平台使用与能力组合手册.md)——资源发布、复制、绑定和回滚
-- [Skill 五闭环演示与验收](docs/manuals/Skill五闭环演示场景与验收手册.md)——固定版本导入、审核、动态消费和审计证据
-- [动态任务与 OpenWorker 验收](docs/manuals/OpenWorker运行时增强三场景验收手册.md)——暂停、恢复、容量和运行时边界
-- [Agency Agents 专家快照库](agency-agents-library/README.md)——离线版本化专家包与升级说明
+- [Agent Loop 源码](backend/app/core/agent_loop.py)——路由、SOP、Skill、知识、工具与回复阶段
+- [SOP Runtime 源码](backend/app/sop_runtime/)——状态机、版本、执行存储、工作项与确认
+- [DynamicTask 源码](backend/app/dynamic_tasks/)——动态计划、持久执行、恢复与结果验证
+- [General Skills 源码](backend/app/general_skills/)——Skill 导入、审核、发布、运行时与 runner
+- [知识库源码](backend/app/knowledge/)——知识解析、检索、概念与引用
 - [后端开发说明](backend/README.md) · [前端开发说明](frontend-enterprise/README.md)
+
+仓库内的设计、验收材料和 Agency Agents 专家快照属于本地/部署侧资产，按仓库策略不随 GitHub 源码发布；公开入口以 README、源码、测试和各模块 README 为准。
 
 ## 开发检查
 

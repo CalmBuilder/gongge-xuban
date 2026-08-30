@@ -74,32 +74,14 @@ MySQL 标记测试会创建随机测试数据库和运行账号，测试结束�
 回环连接，应将该变量设为 `127.0.0.1`，或为测试来源配置对应的 MySQL `root@host` 账户。
 测试夹具只操作随机临时库，不操作正式租户库。
 
-## Agency Agents 专家快照离线升级
+## Agency Agents 专家快照（可选本地资产）
 
-专家是项目内置的 `AgentProfile` 快照。升级必须使用
-`../agency-agents-library/` 下按提交号保存的本地导入包和同批次中文化包，先生成只读计划，
-再逐路径批准 `apply`；快照移除只会进入报告，不会自动删除租户专家。产品不连接 GitHub，
-SQLite 与 MySQL 使用同一套本地快照迁移逻辑：
+Agency Agents 专家包属于部署侧离线、版本化资产，目录
+`../agency-agents-library/` 不随 GitHub 仓库发布，运行时也不会自动连接 GitHub。若部署环境
+另行提供经过审核的本地导入包，可使用 `app.experts.sync_cli` 按提交号生成计划、审核、应用和
+回滚；同步流程只处理本地输入，不执行远程获取。快照移除只会进入报告，不会自动删除租户专家。
 
-```bash
-.venv/bin/python -m app.experts.sync_cli plan \
-  --tenant-id tenant_demo --admin-username admin \
-  --input ../agency-agents-library/agency-agents-import-<commit> \
-  --baseline-input ../agency-agents-library/agency-agents-import-<old-commit> \
-  --baseline-localization ../agency-agents-library/agency-agents-zh-<old-commit> \
-  --output /tmp/agency-agents-sync-plan.json
-
-.venv/bin/python -m app.experts.sync_cli apply \
-  --tenant-id tenant_demo --admin-username admin \
-  --input ../agency-agents-library/agency-agents-import-<commit> \
-  --plan /tmp/agency-agents-sync-plan.json \
-  --localization ../agency-agents-library/agency-agents-zh-<commit> \
-  --approve-path path/to/expert.md \
-  --acknowledge-review path/to/expert.md=high_risk_content
-```
-
-每次 apply 结果包含更新前快照、应用后内容/元数据摘要和版本号；需要撤销时使用。上述
-`sync_cli` 只处理本地输入，不执行远程获取：
+每次 apply 结果包含更新前快照、应用后内容/元数据摘要和版本号；需要撤销时使用：
 
 ```bash
 .venv/bin/python -m app.experts.sync_cli rollback \
