@@ -72,10 +72,10 @@ export default function PlatformSection({
         <span className="flex h-[30px] shrink-0 items-center justify-center text-[#464c5e]">
           {icon}
         </span>
-        <p className="shrink-0 text-[14px] font-semibold text-[#252a3c]">{title}</p>
+        <p className="shrink-0 gg-type-body font-semibold text-[#252a3c]">{title}</p>
         <span
           className={cn(
-            'flex h-[20px] min-w-[28px] shrink-0 items-center justify-center rounded-full border bg-[#fbfcfe] px-[8px] text-[11px] font-semibold leading-none',
+            'flex h-[20px] min-w-[28px] shrink-0 items-center justify-center rounded-full border bg-[#fbfcfe] px-[8px] gg-type-caption font-semibold',
             PILL_TONES[tone],
           )}
         >
@@ -88,7 +88,7 @@ export default function PlatformSection({
               {filters.map((filter) => (
                 <span
                   key={filter}
-                  className="rounded-[20px] border border-[var(--gg-border)] bg-[#fbfcfe] px-[8px] py-[2px] text-[11px] leading-[normal] text-[#757f9c]"
+                  className="rounded-[20px] border border-[var(--gg-border)] bg-[#fbfcfe] px-[8px] py-[2px] gg-type-caption  text-[#757f9c]"
                 >
                   {filter}
                 </span>
@@ -99,7 +99,7 @@ export default function PlatformSection({
             <button
               type="button"
               onClick={onViewAll}
-              className="flex shrink-0 items-center gap-[2px] rounded-[10px] px-[8px] py-[4px] text-[12px] text-[#757f9c] transition-colors hover:bg-[#f4f6fc] hover:text-[#18181a]"
+              className="flex shrink-0 items-center gap-[2px] rounded-[10px] px-[8px] py-[4px] gg-type-meta text-[#757f9c] transition-colors hover:bg-[#f4f6fc] hover:text-[#18181a]"
             >
               查看全部
               <IconChevronDown className="size-[14px] shrink-0 -rotate-90" />
@@ -113,7 +113,7 @@ export default function PlatformSection({
           <PlatformSectionSkeleton />
         ) : isEmpty ? (
           <div className="flex min-h-[88px] w-full items-center justify-center rounded-[14px] border border-dashed border-[#dfe4ee] bg-[#fbfcfd] px-[18px] py-[20px] text-center">
-            <p className="text-[12px] leading-[18px] text-[#8a93a6]">
+            <p className="gg-type-meta  text-[#8a93a6]">
               {emptyText}
               <span className="ml-[6px] text-[#a7adbb]">发布内容后会在这里展示</span>
             </p>

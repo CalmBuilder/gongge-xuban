@@ -161,7 +161,14 @@ describe('Skill 管理', () => {
     renderPage();
     const user = userEvent.setup();
 
-    expect(await screen.findByText('文档摘要')).toBeInTheDocument();
+    const title = await screen.findByText('文档摘要');
+    const card = title.closest('article');
+    expect(card).not.toBeNull();
+    expect(card?.querySelector('[data-resource-identity]')).toHaveClass(
+      'grid-cols-[56px_minmax(0,1fr)_auto]',
+      'overflow-hidden',
+    );
+    expect(card?.querySelector('[data-resource-identity] svg')).toBeInTheDocument();
     await user.click(screen.getByRole('link', { name: '查看详情' }));
 
     expect(await screen.findByText('Skill 文档')).toBeInTheDocument();

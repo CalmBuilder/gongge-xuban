@@ -134,33 +134,33 @@ export function SkillGovernanceDialog({ row, agentId, onClose, onChanged, onUpgr
   return (
     <Dialog open={Boolean(row)} onOpenChange={(open) => !open && onClose()}>
       <DialogContent aria-describedby={undefined} className="max-h-[88vh] w-[calc(100%-2rem)] overflow-y-auto rounded-2xl p-0 sm:max-w-[720px]">
-        <DialogTitle className="flex items-center gap-2 border-b border-border px-6 py-4 text-[17px] font-semibold">
+        <DialogTitle className="flex items-center gap-2 border-b border-border px-6 py-4 gg-type-section-title font-semibold">
           <ShieldCheck className="size-5 text-[var(--gg-cobalt)]" />
           版本与调用策略
         </DialogTitle>
         <div className="grid gap-5 p-6">
           <div>
-            <p className="text-[15px] font-semibold text-foreground">{row?.name}</p>
-            <p className="mt-1 text-[12px] leading-5 text-muted-foreground">
+            <p className="gg-type-body font-semibold text-foreground">{row?.name}</p>
+            <p className="mt-1 gg-type-meta text-muted-foreground">
               固定版本适合严格复现；跟随最新会在管理员发布或回滚后自动切换。停用后立即从对话和任务目录移除。
             </p>
           </div>
           <div className="grid gap-4 rounded-xl border border-border bg-muted/20 p-4 sm:grid-cols-3">
-            <label className="grid gap-2 text-[12px] font-medium">
+            <label className="grid gap-2 gg-type-meta font-medium">
               绑定状态
               <Select value={status} onValueChange={(value) => setStatus(value as typeof status)}>
                 <SelectTrigger aria-label="绑定状态"><SelectValue /></SelectTrigger>
                 <SelectContent><SelectItem value="active">启用</SelectItem><SelectItem value="inactive">停用</SelectItem></SelectContent>
               </Select>
             </label>
-            <label className="grid gap-2 text-[12px] font-medium">
+            <label className="grid gap-2 gg-type-meta font-medium">
               版本策略
               <Select value={revisionPolicy} onValueChange={(value) => setRevisionPolicy(value as typeof revisionPolicy)}>
                 <SelectTrigger aria-label="版本策略"><SelectValue /></SelectTrigger>
                 <SelectContent><SelectItem value="pinned">固定版本</SelectItem><SelectItem value="follow_latest">跟随最新</SelectItem></SelectContent>
               </Select>
             </label>
-            <label className="grid gap-2 text-[12px] font-medium">
+            <label className="grid gap-2 gg-type-meta font-medium">
               调用策略
               <Select value={invocationPolicy} onValueChange={(value) => setInvocationPolicy(value as typeof invocationPolicy)}>
                 <SelectTrigger aria-label="调用策略"><SelectValue /></SelectTrigger>
@@ -169,7 +169,7 @@ export function SkillGovernanceDialog({ row, agentId, onClose, onChanged, onUpgr
             </label>
           </div>
           {revisionPolicy === 'pinned' ? (
-            <label className="grid gap-2 text-[12px] font-medium">
+            <label className="grid gap-2 gg-type-meta font-medium">
               固定修订
               <Select value={pinnedRevisionId} onValueChange={setPinnedRevisionId}>
                 <SelectTrigger aria-label="固定修订"><SelectValue placeholder="选择已审核修订" /></SelectTrigger>
@@ -182,13 +182,13 @@ export function SkillGovernanceDialog({ row, agentId, onClose, onChanged, onUpgr
             </label>
           ) : null}
           <section aria-label="修订历史" className="grid gap-2">
-            <div className="flex items-center gap-2 text-[13px] font-semibold"><History className="size-4" />修订历史</div>
-            {loading ? <p className="text-[12px] text-muted-foreground">正在读取修订…</p> : revisions.map((revision) => (
+            <div className="flex items-center gap-2 gg-type-control font-semibold"><History className="size-4" />修订历史</div>
+            {loading ? <p className="gg-type-meta text-muted-foreground">正在读取修订…</p> : revisions.map((revision) => (
               <div key={revision.id} className="flex flex-wrap items-center gap-3 rounded-xl border border-border px-4 py-3">
                 <div className="min-w-0 flex-1">
-                  <p className="text-[13px] font-semibold">v{revision.revision_number} · {revision.status}</p>
-                  <p className="mt-1 truncate font-mono text-[11px] text-muted-foreground" title={revision.content_checksum}>{revision.content_checksum}</p>
-                  <p className="mt-1 text-[11px] text-muted-foreground">{formatDateTime(revision.published_at || revision.created_at)}</p>
+                  <p className="gg-type-control font-semibold">v{revision.revision_number} · {revision.status}</p>
+                  <p className="mt-1 truncate font-mono gg-type-caption text-muted-foreground" title={revision.content_checksum}>{revision.content_checksum}</p>
+                  <p className="mt-1 gg-type-caption text-muted-foreground">{formatDateTime(revision.published_at || revision.created_at)}</p>
                 </div>
                 {revision.status === 'superseded' ? <Button variant="outline" size="sm" disabled={saving} onClick={() => void rollback(revision)}>回滚到此版本</Button> : null}
                 {['published', 'superseded'].includes(revision.status) ? <Button variant="outline" size="sm" disabled={saving} onClick={() => void revoke(revision)}>撤销</Button> : null}

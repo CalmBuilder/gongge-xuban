@@ -10,6 +10,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { CheckCircle2, Clock3, GitPullRequestArrow, UserCheck, UsersRound } from 'lucide-react';
 
 import AppHeader from '@/components/AppHeader';
+import { PageShell } from '@/components/enterprise/PageShell';
 import { DataTable, type DataTableColumn } from '@/components/DataTable';
 import { Paginator } from '@/components/Paginator';
 import { Dialog, DialogContent, DialogTitle, Textarea } from '@/components/ui';
@@ -187,8 +188,8 @@ export default function WorkItemsPage({
       width: 280,
       render: (item) => (
         <button type="button" onClick={() => setSelected(item)} className="grid min-w-0 text-left">
-          <strong className="truncate text-[13px] font-semibold text-[#18181a]">{item.skill_id}</strong>
-          <span className="truncate text-[11px] text-[#858b9c]">{item.node_id} · {item.skill_version}</span>
+          <strong className="truncate gg-type-control font-semibold text-[#18181a]">{item.skill_id}</strong>
+          <span className="truncate gg-type-caption text-[#858b9c]">{item.node_id} · {item.skill_version}</span>
         </button>
       ),
     },
@@ -234,7 +235,7 @@ export default function WorkItemsPage({
   ];
 
   return (
-    <div className="min-h-full box-border px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]" aria-busy={loading}>
+    <PageShell template="management" aria-busy={loading}>
       <AppHeader onLogout={onLogout} userName={currentUser?.username} title="待我处理中心" />
 
       <AttentionCenter />
@@ -245,11 +246,11 @@ export default function WorkItemsPage({
             <GitPullRequestArrow className="size-[18px]" />
           </span>
           <span className="min-w-0">
-            <strong className="block text-[14px] font-semibold text-[#18181a]">SOP 流程任务</strong>
-            <span className="mt-[2px] block text-[12px] leading-[1.5] text-[#858b9c]">平台管理员不会自动进入候选池；角色变更不改写已经创建的历史任务。</span>
+            <strong className="block gg-type-body font-semibold text-[#18181a]">SOP 流程任务</strong>
+            <span className="mt-[2px] block gg-type-meta  text-[#858b9c]">平台管理员不会自动进入候选池；角色变更不改写已经创建的历史任务。</span>
           </span>
         </div>
-        <span className="shrink-0 rounded-full bg-[#eaf8ef] px-[11px] py-[5px] text-[12px] font-medium text-[#018434]">
+        <span className="shrink-0 rounded-full bg-[#eaf8ef] px-[11px] py-[5px] gg-type-meta font-medium text-[#018434]">
           本页 {actionableCount} 项可处理
         </span>
       </section>
@@ -268,7 +269,7 @@ export default function WorkItemsPage({
                 setView(option.value);
               }}
               className={cn(
-                'inline-flex h-[34px] items-center gap-[6px] rounded-[10px] border px-[13px] text-[12px] transition-colors',
+                'inline-flex h-[34px] items-center gap-[6px] rounded-[10px] border px-[13px] gg-type-meta transition-colors',
                 view === option.value
                   ? 'border-[#3157e8] bg-[#eef1fb] font-semibold text-[#244bc7]'
                   : 'border-[#e3e7f1] bg-white text-[#757f9c] hover:text-[#18181a]',
@@ -310,8 +311,8 @@ export default function WorkItemsPage({
             <>
               <div className="flex items-start justify-between gap-[12px]">
                 <div>
-                  <DialogTitle className="text-[15px] font-semibold text-[#18181a]">{selected.skill_id}</DialogTitle>
-                  <p className="mt-[4px] font-mono text-[11px] text-[#858b9c]">{selected.node_id} · {selected.id}</p>
+                  <DialogTitle className="gg-type-card-title font-semibold text-[#18181a]">{selected.skill_id}</DialogTitle>
+                  <p className="mt-[4px] font-mono gg-type-caption text-[#858b9c]">{selected.node_id} · {selected.id}</p>
                 </div>
                 <StatusPill status={selected.status} outcome={selected.outcome} options={selected.outcome_options} />
               </div>
@@ -324,14 +325,14 @@ export default function WorkItemsPage({
               </div>
 
               <section className="rounded-[12px] border border-[#e8ebf2] bg-[#fafbfc] p-[12px]">
-                <div className="mb-[9px] flex items-center gap-[6px] text-[12px] font-semibold text-[#464c5e]">
+                <div className="mb-[9px] flex items-center gap-[6px] gg-type-meta font-semibold text-[#464c5e]">
                   <UsersRound className="size-[14px]" />候选来源快照
                 </div>
                 <div className="grid gap-[7px]">
                   {selected.candidates.map((candidate) => (
-                    <div key={candidate.user_id} className="flex items-center justify-between gap-[10px] rounded-[9px] bg-white px-[10px] py-[8px] text-[12px]">
-                      <span className="font-medium text-[#18181a]">{candidate.user_id}</span>
-                      <span className="truncate text-[#858b9c]">{candidate.source_role_codes.join('、') || '直接指定'}</span>
+                    <div key={candidate.user_id} className="flex items-center justify-between gap-[10px] rounded-[9px] bg-white px-[10px] py-[8px] gg-type-meta">
+                      <span className="gg-type-meta font-medium text-[#18181a]">{candidate.user_id}</span>
+                      <span className="truncate gg-type-caption text-[#858b9c]">{candidate.source_role_codes.join('、') || '直接指定'}</span>
                     </div>
                   ))}
                 </div>
@@ -339,14 +340,14 @@ export default function WorkItemsPage({
 
               {selected.decisions.length ? (
                 <section className="grid gap-[7px]">
-                  <h3 className="text-[12px] font-semibold text-[#464c5e]">处理记录</h3>
+                  <h3 className="gg-type-card-title font-semibold text-[#464c5e]">处理记录</h3>
                   {selected.decisions.map((decision) => (
-                    <div key={`${decision.actor_user_id}-${decision.created_at}`} className="rounded-[10px] border border-[#e8ebf2] px-[11px] py-[9px] text-[12px]">
+                    <div key={`${decision.actor_user_id}-${decision.created_at}`} className="rounded-[10px] border border-[#e8ebf2] px-[11px] py-[9px] gg-type-meta">
                       <div className="flex justify-between gap-[10px]">
-                        <strong className="text-[#18181a]">{decision.actor_user_id} · {outcomeLabel(decision.outcome, selected.outcome_options)}</strong>
-                        <span className="text-[#858b9c]">{formatDateTime(decision.created_at)}</span>
+                        <strong className="gg-type-meta text-[#18181a]">{decision.actor_user_id} · {outcomeLabel(decision.outcome, selected.outcome_options)}</strong>
+                        <span className="gg-type-caption text-[#858b9c]">{formatDateTime(decision.created_at)}</span>
                       </div>
-                      {decision.comment ? <p className="mt-[5px] text-[#464c5e]">{decision.comment}</p> : null}
+                      {decision.comment ? <p className="mt-[5px] gg-type-body text-[#464c5e]">{decision.comment}</p> : null}
                     </div>
                   ))}
                 </section>
@@ -354,7 +355,7 @@ export default function WorkItemsPage({
 
               {selected.outcome_options.some((option) => selected.allowed_actions.includes(option.value)) ? (
                 <label className="grid gap-[5px]">
-                  <span className="text-[12px] font-medium text-[#464c5e]">处理说明</span>
+                  <span className="gg-type-meta font-medium text-[#464c5e]">处理说明</span>
                   <Textarea value={comment} onChange={(event) => setComment(event.target.value)} placeholder={selected.outcome_options.some((option) => option.comment_required && selected.allowed_actions.includes(option.value)) ? '请填写本次处理结果和依据' : '填写本次处理说明，选填'} rows={3} />
                 </label>
               ) : null}
@@ -379,7 +380,7 @@ export default function WorkItemsPage({
           ) : null}
         </DialogContent>
       </Dialog>
-    </div>
+    </PageShell>
   );
 }
 
@@ -388,7 +389,7 @@ function StatusPill({ status, outcome, options }: { status: string; outcome?: st
   const rejected = outcome === 'rejected';
   return (
     <span className={cn(
-      'inline-flex w-fit items-center rounded-full px-[9px] py-[3px] text-[11px] font-medium',
+      'inline-flex w-fit items-center rounded-full px-[9px] py-[3px] gg-type-caption font-medium',
       rejected
         ? 'bg-[#fce7e7] text-[#b40a0a]'
         : completed
@@ -405,8 +406,8 @@ function StatusPill({ status, outcome, options }: { status: string; outcome?: st
 function Detail({ label, value }: { label: string; value: string }) {
   return (
     <div className="grid gap-[3px] rounded-[10px] bg-[#fafbfc] px-[11px] py-[9px]">
-      <span className="text-[11px] text-[#858b9c]">{label}</span>
-      <strong className="text-[12px] font-medium text-[#18181a]">{value}</strong>
+      <span className="gg-type-caption text-[#858b9c]">{label}</span>
+      <strong className="gg-type-meta font-medium text-[#18181a]">{value}</strong>
     </div>
   );
 }

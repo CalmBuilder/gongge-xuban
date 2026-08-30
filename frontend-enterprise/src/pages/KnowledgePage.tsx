@@ -22,6 +22,7 @@ import { useNavigate, useSearchParams } from 'react-router-dom';
 import { api, ApiError, getRequestTenantId } from '../api/client';
 import { hasGovernancePermission, isEnterpriseAdmin, type EnterpriseAuthUser } from '../auth';
 import AppHeader from '@/components/AppHeader';
+import { PageShell } from '@/components/enterprise/PageShell';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { DataTable, type DataTableColumn } from '@/components/DataTable';
 import { ModelConfigDropdown } from '@/components/ModelConfigDropdown';
@@ -1102,9 +1103,9 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
       title: '名称',
       render: (row) => (
         <div className="min-w-0">
-          <strong className="block truncate text-[13px] font-medium text-[#18181a]">{row.name}</strong>
+          <strong className="block truncate gg-type-control font-medium text-[#18181a]">{row.name}</strong>
           {row.description ? (
-            <span className="mt-[2px] block truncate text-[12px] text-[#858b9c]">{row.description}</span>
+            <span className="mt-[2px] block truncate gg-type-meta text-[#858b9c]">{row.description}</span>
           ) : null}
         </div>
       ),
@@ -1168,9 +1169,9 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
     >
       <div className="flex min-w-0 items-start justify-between gap-[10px]">
         <div className="min-w-0">
-          <strong className="block truncate text-[14px] font-semibold text-[#18181a]">{item.name}</strong>
-          <span className="mt-[2px] block truncate text-[12px] text-[#858b9c]">{item.description || '未填写描述'}</span>
-          <span className="mt-[2px] block truncate text-[12px] text-[#858b9c]">创建者：{resourceCreatorName(item) || '-'}</span>
+          <strong className="block truncate gg-type-body font-semibold text-[#18181a]">{item.name}</strong>
+          <span className="mt-[2px] block truncate gg-type-meta text-[#858b9c]">{item.description || '未填写描述'}</span>
+          <span className="mt-[2px] block truncate gg-type-meta text-[#858b9c]">创建者：{resourceCreatorName(item) || '-'}</span>
         </div>
         <span onClick={(event) => event.stopPropagation()} onKeyDown={(event) => event.stopPropagation()}>
           {renderKnowledgeBaseActions(item)}
@@ -1190,7 +1191,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
   );
 
   return (
-    <div className="min-h-full box-border px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]" aria-busy={loading}>
+    <PageShell template="management" aria-busy={loading}>
       <AppHeader
         onLogout={onLogout}
         userName={currentUser?.username}
@@ -1224,7 +1225,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
         </UIButton>
         {canManageCurrentScope && (
           <DropdownMenu>
-            <DropdownMenuTrigger className="flex h-[34px] items-center gap-[4px] rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-[20px] text-[12px] font-semibold text-white outline-none transition-colors hover:bg-[#244bc7]">
+            <DropdownMenuTrigger className="flex h-[34px] items-center gap-[4px] rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-[20px] gg-type-meta font-semibold text-white outline-none transition-colors hover:bg-[#244bc7]">
               <IconAdd className="size-[14px]" />
               新增
               <IconChevronDown className="size-[12px]" />
@@ -1259,7 +1260,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
         {isOverallAgent && canGovernKnowledge ? (
           <div
             role="note"
-            className="rounded-[12px] border border-[#dbe4ff] bg-[#f5f7ff] px-[14px] py-[10px] text-[12px] leading-5 text-[#4f5f8f]"
+            className="rounded-[12px] border border-[#dbe4ff] bg-[#f5f7ff] px-[14px] py-[10px] gg-type-meta text-[#4f5f8f]"
           >
             正文访问由成员范围、当前数字员工绑定和请求范围共同决定；“仅可治理”不代表可以读取、检索或导出正文。
           </div>
@@ -1274,7 +1275,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
         <div className="flex flex-col gap-[18px]">
           <div className="flex items-center gap-[6px] px-[12px] text-[#757f9c]">
             <PlazaResourceIcon kind="knowledge" size="compact" />
-            <span className="text-[14px] font-normal leading-none">{listLabel}</span>
+            <span className="gg-type-body font-normal">{listLabel}</span>
           </div>
 
           <label className="flex h-[34px] w-[300px] max-w-full items-center gap-[8px] overflow-hidden rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[12px] transition-colors focus-within:border-[var(--gg-cobalt)]">
@@ -1283,7 +1284,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
               value={documentSearch}
               placeholder="搜索知识库名称、描述、状态或版本"
               onChange={(event) => setDocumentSearch(event.target.value)}
-              className="h-full min-w-0 flex-1 bg-transparent text-[12px] text-[#17191f] outline-none placeholder:text-[#c0c6d4]"
+              className="h-full min-w-0 flex-1 bg-transparent gg-type-meta text-[#17191f] outline-none placeholder:text-[#c0c6d4]"
             />
             {documentSearch && (
               <button
@@ -1301,7 +1302,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
             {filteredKnowledgeBases.length ? (
               pagination.pagedItems.map(renderMobileKnowledgeBaseCard)
             ) : (
-              <div className="py-[40px] text-center text-[13px] text-[#858b9c]">{listEmptyText}</div>
+              <div className="py-[40px] text-center gg-type-control text-[#858b9c]">{listEmptyText}</div>
             )}
           </div>
 
@@ -1426,9 +1427,9 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
           disabled={okfImporting}
           onFiles={(files) => files[0] && void importOkfFile(files[0])}
         >
-          <FileMarkdownOutlined className="mb-[8px] text-[28px] text-[#1a71ff]" />
-          <p className="m-0 text-[14px] font-medium text-foreground">选择或拖入知识库备份包（.zip）</p>
-          <p className="mt-[4px] mb-0 text-[12px] text-[#858b9c]">导入后会生成知识图谱、知识索引和引用来源。</p>
+          <FileMarkdownOutlined className="mb-[8px] gg-type-metric text-[#1a71ff]" />
+          <p className="m-0 gg-type-body font-medium text-foreground">选择或拖入知识库备份包（.zip）</p>
+          <p className="mt-[4px] mb-0 gg-type-meta text-[#858b9c]">导入后会生成知识图谱、知识索引和引用来源。</p>
         </FileDropzone>
       </KDialog>
       <KDialog
@@ -1439,7 +1440,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
         footer={<KDialogCancelButton onClick={() => setOkfLintReportOpen(false)}>关闭</KDialogCancelButton>}
       >
         <div className="flex flex-col gap-[14px]">
-          <p className="text-[13px] leading-[1.6] text-[#858b9c]">
+          <p className="gg-type-control  text-[#858b9c]">
             用于检查当前知识库的知识图谱结构，发现断链、孤立页、重复主题等问题。检查结果仅作参考，不会自动修改数据。
           </p>
           {okfLintIssues.length === 0 ? (
@@ -1452,14 +1453,14 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
                   key={`${issue.issue_type || 'issue'}-${issue.concept_id || index}`}
                 >
                   <KTag color="gold">{issue.issue_type || 'warning'}</KTag>
-                  <strong className="text-[13px] font-semibold wrap-break-word text-[#18181a]">
+                  <strong className="gg-type-control font-semibold wrap-break-word text-[#18181a]">
                     {issue.title || issue.concept_id || '知识图谱检查'}
                   </strong>
-                  <span className="text-[12px] wrap-break-word text-[#858b9c]">
+                  <span className="gg-type-meta wrap-break-word text-[#858b9c]">
                     {issue.message || '待处理'}
                   </span>
                   {issue.concept_id ? (
-                    <small className="font-mono text-[12px] wrap-break-word text-[#858b9c]">
+                    <small className="font-mono gg-type-meta wrap-break-word text-[#858b9c]">
                       {issue.concept_id}
                     </small>
                   ) : null}
@@ -1491,8 +1492,8 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
         title={
           editingConcept ? (
             <div className="flex min-w-0 flex-col gap-[4px]">
-              <span className="text-[13px] font-semibold text-[#858b9c]">编辑知识图谱</span>
-              <strong className="line-clamp-2 text-[20px] font-semibold leading-[1.35] text-[#18181a]">
+              <span className="gg-type-control font-semibold text-[#858b9c]">编辑知识图谱</span>
+              <strong className="line-clamp-2 gg-type-section-title font-semibold  text-[#18181a]">
                 {conceptEditorTitle || editingConcept.concept_id}
               </strong>
             </div>
@@ -1512,28 +1513,28 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
         {editingConcept && (
           <div className="grid min-w-0 grid-cols-1 gap-[16px] lg:grid-cols-[260px_minmax(0,1fr)]">
             <aside className="flex flex-col gap-[16px] rounded-[12px] border border-[#eceef1] bg-[#fafbfc] p-[16px]">
-              <div className="inline-flex w-fit items-center gap-[8px] rounded-[10px] border border-[#1a71ff]/25 bg-[#1a71ff]/8 px-[11px] py-[8px] text-[13px] font-medium text-[#1a71ff]">
+              <div className="inline-flex w-fit items-center gap-[8px] rounded-[10px] border border-[#1a71ff]/25 bg-[#1a71ff]/8 px-[11px] py-[8px] gg-type-control font-medium text-[#1a71ff]">
                 <FileMarkdownOutlined />
                 <span>{conceptTypeLabel(conceptEditorType)}</span>
               </div>
               <div className="grid grid-cols-[72px_minmax(0,1fr)] gap-x-[12px] gap-y-[10px]">
-                <span className="text-[12px] font-semibold text-[#858b9c]">页面路径</span>
-                <strong className="text-[13px] wrap-break-word text-[#18181a]">{editingConcept.concept_id}</strong>
-                <span className="text-[12px] font-semibold text-[#858b9c]">链接</span>
-                <strong className="text-[13px] text-[#18181a]">{editingConcept.links.length} 个</strong>
-                <span className="text-[12px] font-semibold text-[#858b9c]">引用</span>
-                <strong className="text-[13px] text-[#18181a]">{editingConcept.citations.length} 个</strong>
-                <span className="text-[12px] font-semibold text-[#858b9c]">更新时间</span>
-                <strong className="text-[13px] text-[#18181a]">{formatDateTime(editingConcept.updated_at)}</strong>
+                <span className="gg-type-meta font-semibold text-[#858b9c]">页面路径</span>
+                <strong className="gg-type-control wrap-break-word text-[#18181a]">{editingConcept.concept_id}</strong>
+                <span className="gg-type-meta font-semibold text-[#858b9c]">链接</span>
+                <strong className="gg-type-control text-[#18181a]">{editingConcept.links.length} 个</strong>
+                <span className="gg-type-meta font-semibold text-[#858b9c]">引用</span>
+                <strong className="gg-type-control text-[#18181a]">{editingConcept.citations.length} 个</strong>
+                <span className="gg-type-meta font-semibold text-[#858b9c]">更新时间</span>
+                <strong className="gg-type-control text-[#18181a]">{formatDateTime(editingConcept.updated_at)}</strong>
               </div>
-              <div className="rounded-[12px] border border-[#eceef1] bg-white p-[12px] text-[13px] leading-[1.65] text-[#858b9c]">
+              <div className="rounded-[12px] border border-[#eceef1] bg-white p-[12px] gg-type-control  text-[#858b9c]">
                 知识图谱以结构化文本保存，标题和摘要会同步写入内容。
               </div>
             </aside>
             <section className="flex min-w-0 flex-col gap-[16px]">
               <div className="grid grid-cols-1 gap-[14px] sm:grid-cols-[minmax(0,1.4fr)_minmax(180px,0.6fr)]">
                 <label className="flex flex-col gap-[8px]">
-                  <span className="text-[13px] font-semibold text-[#464c5e]">页面标题</span>
+                  <span className="gg-type-control font-semibold text-[#464c5e]">页面标题</span>
                   <Input
                     value={conceptEditorTitle}
                     onChange={(event) =>
@@ -1543,7 +1544,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
                   />
                 </label>
                 <label className="flex flex-col gap-[8px]">
-                  <span className="text-[13px] font-semibold text-[#464c5e]">页面类型</span>
+                  <span className="gg-type-control font-semibold text-[#464c5e]">页面类型</span>
                   <UISelect
                     value={conceptEditorType}
                     onValueChange={(value) => setConceptDraft((prev) => updateOkfFrontmatterValue(prev, 'type', value))}
@@ -1559,7 +1560,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
                   </UISelect>
                 </label>
                 <label className="flex flex-col gap-[8px] sm:col-span-full">
-                  <span className="text-[13px] font-semibold text-[#464c5e]">页面摘要</span>
+                  <span className="gg-type-control font-semibold text-[#464c5e]">页面摘要</span>
                   <Textarea
                     value={conceptEditorDescription}
                     rows={3}
@@ -1571,9 +1572,9 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
                 </label>
               </div>
               <label className="flex flex-col gap-[8px]">
-                <span className="text-[13px] font-semibold text-[#464c5e]">知识图谱源码</span>
+                <span className="gg-type-control font-semibold text-[#464c5e]">知识图谱源码</span>
                 <Textarea
-                  className="min-h-[420px] resize-y font-mono text-[13px] leading-[1.55]"
+                  className="min-h-[420px] resize-y font-mono gg-type-control "
                   value={conceptDraft}
                   rows={18}
                   onChange={(event) => setConceptDraft(event.target.value)}
@@ -1641,8 +1642,8 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
         <div className="grid gap-[18px] lg:grid-cols-[360px_minmax(0,1fr)]">
           <section className="rounded-[14px] border border-[#e5e9f2] bg-[#fafbfe] p-[12px]">
             <div className="mb-[10px]">
-              <strong className="block text-[13px] text-[#303748]">选择组织</strong>
-              <span className="text-[11px] text-[#858b9c]">按层加载，不会一次拉取整棵大组织树</span>
+              <strong className="block gg-type-control text-[#303748]">选择组织</strong>
+              <span className="gg-type-caption text-[#858b9c]">按层加载，不会一次拉取整棵大组织树</span>
             </div>
             <OrganizationTreeNavigator
               tenantId={getRequestTenantId()}
@@ -1653,7 +1654,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
           </section>
           <section className="grid content-start gap-[14px]">
             <label className="grid gap-[6px]">
-              <span className="text-[12px] font-semibold text-[#464c5e]">访问范围</span>
+              <span className="gg-type-meta font-semibold text-[#464c5e]">访问范围</span>
               <UISelect
                 value={governanceDraft.accessScope}
                 onValueChange={(value) => setGovernanceDraft((current) => ({
@@ -1671,12 +1672,12 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
                   <SelectItem value="tenant">全企业成员</SelectItem>
                 </SelectContent>
               </UISelect>
-              <span className="text-[11px] leading-[1.6] text-[#858b9c]">
+              <span className="gg-type-caption  text-[#858b9c]">
                 最终可用范围还会与当前用户和数字员工绑定求交；保存治理范围不会直接授予正文权限。
               </span>
             </label>
             <label className="grid gap-[6px]">
-              <span className="text-[12px] font-semibold text-[#464c5e]">下载策略</span>
+              <span className="gg-type-meta font-semibold text-[#464c5e]">下载策略</span>
               <UISelect
                 value={governanceDraft.downloadPolicy}
                 onValueChange={(value) => setGovernanceDraft((current) => ({
@@ -1694,9 +1695,9 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
               </UISelect>
             </label>
             <div className="grid gap-[7px]">
-              <span className="text-[12px] font-semibold text-[#464c5e]">责任组织</span>
+              <span className="gg-type-meta font-semibold text-[#464c5e]">责任组织</span>
               <div className="flex flex-wrap items-center gap-[8px]">
-                <span className="min-w-0 flex-1 truncate rounded-[9px] border border-[#e5e9f2] bg-white px-[10px] py-[8px] text-[12px] text-[#596174]">
+                <span className="min-w-0 flex-1 truncate rounded-[9px] border border-[#e5e9f2] bg-white px-[10px] py-[8px] gg-type-meta text-[#596174]">
                   {governanceDraft.responsibleOrgUnitId
                     ? governanceOrgNames[governanceDraft.responsibleOrgUnitId]
                       || governanceDraft.responsibleOrgUnitId
@@ -1718,7 +1719,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
             {governanceDraft.accessScope === 'organization' ? (
               <div className="grid gap-[8px]">
                 <div className="flex items-center justify-between gap-[8px]">
-                  <span className="text-[12px] font-semibold text-[#464c5e]">访问组织根</span>
+                  <span className="gg-type-meta font-semibold text-[#464c5e]">访问组织根</span>
                   <UIButton
                     disabled={!governanceSelectedUnit}
                     onClick={addGovernanceAccessRoot}
@@ -1734,10 +1735,10 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
                       className="flex flex-wrap items-center gap-[8px] rounded-[10px] border border-[#e5e9f2] bg-white px-[10px] py-[8px]"
                       key={item.orgUnitId}
                     >
-                      <span className="min-w-0 flex-1 truncate text-[12px] text-[#303748]">
+                      <span className="min-w-0 flex-1 truncate gg-type-meta text-[#303748]">
                         {governanceOrgNames[item.orgUnitId] || item.orgUnitId}
                       </span>
-                      <label className="flex items-center gap-[5px] text-[11px] text-[#596174]">
+                      <label className="flex items-center gap-[5px] gg-type-caption text-[#596174]">
                         <input
                           checked={item.includeDescendants}
                           onChange={(event) => setGovernanceDraft((current) => ({
@@ -1769,13 +1770,13 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
                     </div>
                   ))
                 ) : (
-                  <p className="rounded-[10px] border border-dashed border-[#dce2ee] px-[12px] py-[16px] text-[12px] text-[#858b9c]">
+                  <p className="rounded-[10px] border border-dashed border-[#dce2ee] px-[12px] py-[16px] gg-type-meta text-[#858b9c]">
                     从左侧选择组织并加入；可配置多个组织根。
                   </p>
                 )}
               </div>
             ) : null}
-            <p className="text-[11px] text-[#858b9c]">
+            <p className="gg-type-caption text-[#858b9c]">
               当前修订：{governingKnowledgeBase?.revision || 1}。若他人已保存新修订，本次提交会要求刷新。
             </p>
           </section>
@@ -1877,7 +1878,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
                 key={chunk.id}
               >
                 <div className="flex items-center justify-between gap-[10px]">
-                  <strong className="text-[13px] font-semibold text-[#18181a]">引用来源 {chunk.chunk_index + 1}</strong>
+                  <strong className="gg-type-control font-semibold text-[#18181a]">引用来源 {chunk.chunk_index + 1}</strong>
                   <KTag>{chunk.source_ref || 'chunk'}</KTag>
                 </div>
                 <Textarea
@@ -1918,7 +1919,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
         confirmText={isOverallAgent ? '删除' : '移除'}
         onConfirm={() => void runDeleteKnowledgeBase()}
       />
-    </div>
+    </PageShell>
   );
 }
 
@@ -2162,8 +2163,8 @@ export function KnowledgeAddPage({ currentUser }: KnowledgePageProps = {}) {
         <div className="knowledge-floating-head">
           <div>
             <span className="section-kicker">知识库 / 新建</span>
-            <h3 className="my-[4px] text-[20px] font-semibold text-foreground">新建知识库</h3>
-            <span className="text-[13px] text-[#858b9c]">上传业务文档后，系统会先生成知识图谱，再刷新目录索引、引用来源与自发现建议。</span>
+            <h3 className="my-[4px] gg-type-section-title font-semibold text-foreground">新建知识库</h3>
+            <span className="gg-type-control text-[#858b9c]">上传业务文档后，系统会先生成知识图谱，再刷新目录索引、引用来源与自发现建议。</span>
           </div>
             <UIButton variant="outline" onClick={() => navigate('/enterprise/knowledge')}>
               <RightOutlined />
@@ -2174,8 +2175,8 @@ export function KnowledgeAddPage({ currentUser }: KnowledgePageProps = {}) {
         <KCard className="knowledge-upload-card" bodyClassName="flex flex-col gap-[16px]">
           <div className="knowledge-upload-controls">
             <div>
-              <strong className="block text-[14px] font-semibold text-foreground">上传文档即创建知识库</strong>
-              <span className="text-[13px] text-[#858b9c]">一个文件对应一份独立知识库；回到知识库后可查看文档卡片、知识索引和知识图谱。</span>
+              <strong className="block gg-type-body font-semibold text-foreground">上传文档即创建知识库</strong>
+              <span className="gg-type-control text-[#858b9c]">一个文件对应一份独立知识库；回到知识库后可查看文档卡片、知识索引和知识图谱。</span>
             </div>
             <UIButton variant="outline" onClick={() => navigate('/enterprise/knowledge')}>管理已有知识库</UIButton>
           </div>
@@ -2265,8 +2266,8 @@ function KnowledgeJobCard({
     <div className="knowledge-job">
       <div className="knowledge-job-head">
         <div>
-          <strong className="text-[14px] font-semibold text-foreground">{job.filename}</strong>
-          <span className="text-[13px] text-[#858b9c]"> · {stageLabel}</span>
+          <strong className="gg-type-body font-semibold text-foreground">{job.filename}</strong>
+          <span className="gg-type-control text-[#858b9c]"> · {stageLabel}</span>
         </div>
         <div className="flex shrink-0 items-center gap-[8px]">
           {statusTag(job.status)}
@@ -2294,8 +2295,8 @@ function KnowledgeJobCard({
           </div>
         ))}
       </div>
-      {stageDetail && <span className="knowledge-job-detail text-[13px] text-[#858b9c]">{stageDetail}</span>}
-      {job.error && <span className="text-[13px] text-[#d20b0b]">{job.error}</span>}
+      {stageDetail && <span className="knowledge-job-detail gg-type-control text-[#858b9c]">{stageDetail}</span>}
+      {job.error && <span className="gg-type-control text-[#d20b0b]">{job.error}</span>}
     </div>
   );
 }
@@ -2341,7 +2342,7 @@ function SmoothProgress({ job }: { job: KnowledgeIngestJobRead }) {
         className="h-[8px] flex-1"
         indicatorClassName={indicatorClassName}
       />
-      <span className={cn('text-[12px] tabular-nums', valueClassName)}>
+      <span className={cn('gg-type-meta tabular-nums', valueClassName)}>
         {displayProgress}%
       </span>
     </div>
@@ -2548,8 +2549,8 @@ function 目录索引Overview({
     <div className="knowledge-pageindex">
       <div className="knowledge-pageindex-card">
         <div className="knowledge-document-card-body">
-          <span className="text-[13px] text-[#858b9c]">文档卡片</span>
-          <h5 className="my-[4px] text-[15px] font-semibold text-foreground">{documentTitle}</h5>
+          <span className="gg-type-control text-[#858b9c]">文档卡片</span>
+          <h5 className="my-[4px] gg-type-card-title font-semibold text-foreground">{documentTitle}</h5>
           <div className="knowledge-document-card-markdown is-preview">
             <MarkdownPreview markdown={documentSummary} />
           </div>
@@ -2605,7 +2606,7 @@ function 目录索引Overview({
             <KTag>{activeContent.count}</KTag>
             <button
               type="button"
-              className="text-[13px] text-[#1a71ff] transition-colors hover:text-[#4a8dff]"
+              className="gg-type-control text-[#1a71ff] transition-colors hover:text-[#4a8dff]"
               onClick={() => openContentDetail(activeContentView)}
             >
               查看全部
@@ -2677,8 +2678,8 @@ function 目录索引Overview({
           <div className="knowledge-detail-stack">
             <div className="knowledge-detail-header">
               <div>
-                <span className="text-[13px] text-[#858b9c]">文档卡片</span>
-                <h4 className="my-[4px] text-[16px] font-semibold text-foreground">{documentTitle}</h4>
+                <span className="gg-type-control text-[#858b9c]">文档卡片</span>
+                <h4 className="my-[4px] gg-type-card-title font-semibold text-foreground">{documentTitle}</h4>
               </div>
               <UIButton variant="outline" className={OUTLINE_ACTION_BUTTON_SM_CLASS} onClick={() => onEditDocument(document)}>
                 <EditOutlined />
@@ -2777,7 +2778,7 @@ function 目录索引Overview({
                           {bucketStatusTag(bucket)}
                           <KTag>{bucket.chunk_count} 个切片</KTag>
                         </div>
-                        <h5 className="mt-[6px] mb-0 text-[15px] font-semibold text-foreground">
+                        <h5 className="mt-[6px] mb-0 gg-type-card-title font-semibold text-foreground">
                           {bucket.title || bucket.bucket_key || '引用来源'}
                         </h5>
                       </div>
@@ -2791,7 +2792,7 @@ function 目录索引Overview({
                       </UIButton>
                     </div>
                     {bucket.summary ? (
-                      <p className="my-[6px] text-[13px] leading-[1.65] text-[#858b9c]">{bucket.summary}</p>
+                      <p className="my-[6px] gg-type-control  text-[#858b9c]">{bucket.summary}</p>
                     ) : null}
                     <KnowledgeBucketLinks bucket={bucket} evidenceOnly />
                     <section className="mt-[12px] rounded-[14px] border border-[#eceef1] bg-white p-[14px]">
@@ -2830,7 +2831,7 @@ function 目录索引Overview({
                         <KTag color={conceptTypeColor(concept.concept_type)}>{conceptTypeLabel(concept.concept_type)}</KTag>
                         {statusTag(concept.status)}
                       </div>
-                      <h5 className="mt-[6px] mb-0 text-[15px] font-semibold text-foreground">{concept.title || concept.concept_id}</h5>
+                      <h5 className="mt-[6px] mb-0 gg-type-card-title font-semibold text-foreground">{concept.title || concept.concept_id}</h5>
                     </div>
                     <UIButton
                       variant="outline"
@@ -2844,7 +2845,7 @@ function 目录索引Overview({
                       编辑
                     </UIButton>
                   </div>
-                  <p className="my-[6px] text-[13px] text-[#858b9c]">{concept.description || conceptSummary(concept)}</p>
+                  <p className="my-[6px] gg-type-control text-[#858b9c]">{concept.description || conceptSummary(concept)}</p>
                   <div className="flex flex-wrap items-center gap-[6px]">
                     <KTag>{concept.concept_id}</KTag>
                     <KTag>{concept.links.length} 个链接</KTag>
@@ -2865,11 +2866,11 @@ function 目录索引Overview({
 function WikiViewerTitle({ concept }: { concept: KnowledgeConceptRead }) {
   return (
     <div className="flex min-w-0 flex-col gap-[4px]">
-      <span className="text-[13px] font-semibold text-[#1a71ff]">{conceptTypeLabel(concept.concept_type)}</span>
-      <strong className="line-clamp-2 text-[20px] font-semibold leading-[1.35] text-[#18181a]">
+      <span className="gg-type-control font-semibold text-[#1a71ff]">{conceptTypeLabel(concept.concept_type)}</span>
+      <strong className="line-clamp-2 gg-type-section-title font-semibold  text-[#18181a]">
         {concept.title || concept.concept_id}
       </strong>
-      <small className="font-mono text-[12px] wrap-break-word text-[#858b9c]">{concept.concept_id}</small>
+      <small className="font-mono gg-type-meta wrap-break-word text-[#858b9c]">{concept.concept_id}</small>
     </div>
   );
 }
@@ -2890,8 +2891,8 @@ function WikiConceptViewer({ concept }: { concept: KnowledgeConceptRead }) {
             <KTag key={String(tag)}>{String(tag)}</KTag>
           ))}
         </div>
-        <h3 className="text-[20px] font-semibold text-[#18181a]">{concept.title || concept.concept_id}</h3>
-        <p className="text-[14px] leading-[1.65] text-[#18181a]">{concept.description || conceptSummary(concept)}</p>
+        <h3 className="gg-type-section-title font-semibold text-[#18181a]">{concept.title || concept.concept_id}</h3>
+        <p className="gg-type-body  text-[#18181a]">{concept.description || conceptSummary(concept)}</p>
       </section>
 
       <section className="grid min-w-0 gap-[10px] grid-cols-[repeat(auto-fit,minmax(160px,1fr))]" aria-label="知识图谱元信息">
@@ -2905,8 +2906,8 @@ function WikiConceptViewer({ concept }: { concept: KnowledgeConceptRead }) {
             key={item.label}
             className="flex min-w-0 flex-col gap-[6px] overflow-hidden rounded-[14px] border border-[#eceef1] bg-white px-[14px] py-[13px]"
           >
-            <span className="text-[12px] font-semibold text-[#858b9c]">{item.label}</span>
-            <strong className="wrap-break-word text-[14px] text-[#18181a]">{item.value}</strong>
+            <span className="gg-type-meta font-semibold text-[#858b9c]">{item.label}</span>
+            <strong className="wrap-break-word gg-type-body text-[#18181a]">{item.value}</strong>
           </div>
         ))}
       </section>
@@ -2919,7 +2920,7 @@ function WikiConceptViewer({ concept }: { concept: KnowledgeConceptRead }) {
         <section className="grid min-w-0 grid-cols-1 gap-[10px] xl:grid-cols-3" aria-label="知识链接与引用">
           {links.length > 0 && (
             <div className="flex min-w-0 flex-col gap-[10px] overflow-hidden rounded-[14px] border border-[#eceef1] bg-white p-[14px]">
-              <strong className="text-[13px] font-semibold text-[#18181a]">关联页面</strong>
+              <strong className="gg-type-control font-semibold text-[#18181a]">关联页面</strong>
               <div className="flex max-h-[220px] min-w-0 max-w-full flex-wrap gap-[6px] overflow-x-hidden overflow-y-auto pr-[2px]">
                 {links.slice(0, 12).map((item, index) => (
                   <KnowledgeRelationChip key={`link-${index}`}>{recordLabel(item, ['target', 'concept_id', 'id'])}</KnowledgeRelationChip>
@@ -2929,7 +2930,7 @@ function WikiConceptViewer({ concept }: { concept: KnowledgeConceptRead }) {
           )}
           {citations.length > 0 && (
             <div className="flex min-w-0 flex-col gap-[10px] overflow-hidden rounded-[14px] border border-[#eceef1] bg-white p-[14px]">
-              <strong className="text-[13px] font-semibold text-[#18181a]">引用</strong>
+              <strong className="gg-type-control font-semibold text-[#18181a]">引用</strong>
               <div className="flex max-h-[220px] min-w-0 max-w-full flex-wrap gap-[6px] overflow-x-hidden overflow-y-auto pr-[2px]">
                 {citations.slice(0, 12).map((item, index) => (
                   <KnowledgeRelationChip key={`citation-${index}`}>{recordLabel(item, ['label', 'source', 'uri', 'id'])}</KnowledgeRelationChip>
@@ -2939,7 +2940,7 @@ function WikiConceptViewer({ concept }: { concept: KnowledgeConceptRead }) {
           )}
           {sourceRefs.length > 0 && (
             <div className="flex min-w-0 flex-col gap-[10px] overflow-hidden rounded-[14px] border border-[#eceef1] bg-white p-[14px]">
-              <strong className="text-[13px] font-semibold text-[#18181a]">来源</strong>
+              <strong className="gg-type-control font-semibold text-[#18181a]">来源</strong>
               <div className="flex max-h-[220px] min-w-0 max-w-full flex-wrap gap-[6px] overflow-x-hidden overflow-y-auto pr-[2px]">
                 {sourceRefs.slice(0, 12).map((item, index) => (
                   <KnowledgeRelationChip key={`source-${index}`}>{recordLabel(item, ['document_id', 'section_id', 'source', 'id'])}</KnowledgeRelationChip>
@@ -2977,7 +2978,7 @@ function recordLabel(item: unknown, keys: string[]) {
 
 function KnowledgeRelationChip({ children }: { children: ReactNode }) {
   return (
-    <span className="inline-block min-w-0 max-w-full rounded-[6px] bg-[#f2f3f5] px-[8px] py-px text-[12px] font-medium leading-[18px] whitespace-normal wrap-anywhere text-[#5b6273]">
+    <span className="inline-block min-w-0 max-w-full rounded-[6px] bg-[#f2f3f5] px-[8px] py-px gg-type-meta font-medium  whitespace-normal wrap-anywhere text-[#5b6273]">
       {children}
     </span>
   );
@@ -2990,7 +2991,7 @@ function KnowledgeBucketLinks({ bucket, evidenceOnly = false }: { bucket: Knowle
     <div className="knowledge-bucket-link-grid">
       {!evidenceOnly && (
         <>
-          <span className="text-[13px] text-[#858b9c]">覆盖来源</span>
+          <span className="gg-type-control text-[#858b9c]">覆盖来源</span>
           <div>
             {sourceSections.length === 0 ? (
               <KTag>暂无来源路径</KTag>
@@ -3000,7 +3001,7 @@ function KnowledgeBucketLinks({ bucket, evidenceOnly = false }: { bucket: Knowle
           </div>
         </>
       )}
-      <span className="text-[13px] text-[#858b9c]">{evidenceOnly ? '引用来源' : '代表引用'}</span>
+      <span className="gg-type-control text-[#858b9c]">{evidenceOnly ? '引用来源' : '代表引用'}</span>
       <div className="knowledge-evidence-token-list">
         {representativeChunks.length === 0 ? (
           bucket.chunk_count > 0 ? <KTag>{bucket.chunk_count} 个引用来源</KTag> : <KTag>暂无可读代表来源</KTag>
@@ -3107,7 +3108,7 @@ function KnowledgeSearchDebug({
   compact?: boolean;
 }) {
   if (loading) {
-    return <span className="text-[13px] text-[#858b9c]">正在按目录索引和知识图谱检索，并整理引用来源...</span>;
+    return <span className="gg-type-control text-[#858b9c]">正在按目录索引和知识图谱检索，并整理引用来源...</span>;
   }
   if (!result) {
     return <EmptyState description="尚未运行检索" />;
@@ -3158,9 +3159,9 @@ function KnowledgeSearchDebug({
             <div className="knowledge-evidence-list">
               {result.evidence_pack.map((item) => (
                 <div className="knowledge-evidence-item" key={item.chunk_id}>
-                  <strong className="text-[13px] font-semibold text-foreground">{item.section_path || item.source_path || item.chunk_id}</strong>
-                  <p className="m-0 text-[13px] text-foreground">{item.excerpt}</p>
-                  <span className="text-[13px] text-[#858b9c]">{item.confidence_reason}</span>
+                  <strong className="gg-type-control font-semibold text-foreground">{item.section_path || item.source_path || item.chunk_id}</strong>
+                  <p className="m-0 gg-type-control text-foreground">{item.excerpt}</p>
+                  <span className="gg-type-control text-[#858b9c]">{item.confidence_reason}</span>
                 </div>
               ))}
             </div>
@@ -3205,7 +3206,7 @@ function DiscoveryColumn({
             <div className={`knowledge-discovery ${item.suggestion_type}`} key={item.id}>
               <div className="knowledge-discovery-header">
                 <div className="flex flex-wrap items-center gap-[8px]">
-                  <strong className="text-[14px] font-semibold text-foreground">{item.title}</strong>
+                  <strong className="gg-type-body font-semibold text-foreground">{item.title}</strong>
                   <KTag>{typeLabel(item.suggestion_type)}</KTag>
                   {statusTag(item.status)}
                 </div>
@@ -3234,7 +3235,7 @@ function DiscoveryColumn({
                   </div>
                 )}
               </div>
-              {item.reason && <p className="my-[6px] text-[13px] text-[#858b9c]">{item.reason}</p>}
+              {item.reason && <p className="my-[6px] gg-type-control text-[#858b9c]">{item.reason}</p>}
               <Accordion type="single" collapsible>
                 <AccordionItem value="payload" className="border-b-0">
                   <AccordionTrigger className="py-[6px]">查看详情</AccordionTrigger>
@@ -3327,7 +3328,7 @@ function KTag({ color = 'default', children }: { color?: string; children: React
   return (
     <span
       className={cn(
-        'inline-flex items-center gap-[4px] rounded-[6px] px-[8px] py-px text-[12px] font-medium leading-[18px]',
+        'inline-flex items-center gap-[4px] rounded-[6px] px-[8px] py-px gg-type-meta font-medium ',
         KTAG_TONE_CLASS[color] || KTAG_TONE_CLASS.default,
       )}
     >
@@ -3360,7 +3361,7 @@ function KCard({
     >
       {(title || extra) && (
         <div className="flex min-h-[54px] items-center justify-between gap-[12px] border-b border-[#eceef1] px-[20px] py-[10px]">
-          <div className="min-w-0 text-[14px] font-medium text-[#18181a]">{title}</div>
+          <div className="min-w-0 gg-type-body font-medium text-[#18181a]">{title}</div>
           {extra ? <div className="shrink-0 text-[#858b9c]">{extra}</div> : null}
         </div>
       )}
@@ -3420,7 +3421,7 @@ function KDialog({
           className,
         )}
       >
-        <DialogTitle className="px-[24px] py-[16px] text-[16px] font-semibold text-foreground" asChild={typeof title !== 'string'}>
+        <DialogTitle className="px-[24px] py-[16px] gg-type-card-title font-semibold text-foreground" asChild={typeof title !== 'string'}>
           {typeof title === 'string' ? title : <div>{title}</div>}
         </DialogTitle>
         <div className="min-h-0 flex-1 overflow-y-auto px-[24px] pb-[16px]">{children}</div>
@@ -3432,7 +3433,7 @@ function KDialog({
 
 function EmptyState({ description }: { description: ReactNode }) {
   return (
-    <div className="flex flex-col items-center justify-center gap-[6px] py-[36px] text-center text-[13px] text-[#858b9c]">
+    <div className="flex flex-col items-center justify-center gap-[6px] py-[36px] text-center gg-type-control text-[#858b9c]">
       {description}
     </div>
   );

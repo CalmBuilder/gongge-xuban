@@ -19,7 +19,7 @@ export type PaginatorProps = {
 };
 
 const PILL_CLASS =
-  'flex h-[20px] min-w-[20px] items-center justify-center rounded-[6px] px-[12px] text-[10px] leading-none transition-colors';
+  'flex h-[20px] min-w-[20px] items-center justify-center rounded-[6px] px-[12px] gg-type-caption transition-colors';
 const ARROW_CLASS =
   'flex size-[14px] shrink-0 items-center justify-center text-[#464c5e] transition-opacity disabled:cursor-not-allowed disabled:opacity-30';
 
@@ -83,7 +83,7 @@ export function Paginator({
             <PaginationItem key={`ellipsis-${index}`}>
               <span
                 aria-hidden="true"
-                className="flex h-[20px] items-center justify-center px-[4px] text-[10px] leading-none text-[#999]"
+                className="flex h-[20px] items-center justify-center px-[4px] gg-type-caption text-[#999]"
               >
                 ···
               </span>

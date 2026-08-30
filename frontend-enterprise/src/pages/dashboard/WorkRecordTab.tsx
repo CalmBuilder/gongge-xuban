@@ -115,9 +115,9 @@ const CAPABILITY_VISUALS: Record<CapabilityTone, {
 
 const capabilityCardClass = 'group relative flex h-[230px] w-full min-w-0 appearance-none flex-col items-stretch gap-[10px] overflow-hidden rounded-[20px] border px-[24px] py-[20px] text-left shadow-[0_4px_10px_rgba(15,23,42,0.035)] transition-[transform,box-shadow] duration-[180ms] ease-[ease] hover:-translate-y-[2px]';
 const capabilityArrowClass = 'pointer-events-none absolute top-[14px] right-[10px] size-[20px]';
-const capabilityNameClass = 'min-w-0 truncate text-[14px] font-medium';
+const capabilityNameClass = 'min-w-0 truncate gg-type-body font-medium';
 const capabilityBarClass = 'block h-[4px] w-full overflow-hidden rounded-[90px] bg-white/75 in-data-[theme=dark]:bg-white/15';
-const capabilityDescClass = 'line-clamp-5 min-w-0 overflow-hidden text-[10px] leading-[16px] font-normal text-[#596579] [overflow-wrap:anywhere] in-data-[theme=dark]:text-[#c6ccda]';
+const capabilityDescClass = 'line-clamp-5 min-w-0 overflow-hidden gg-type-caption  font-normal text-[#596579] [overflow-wrap:anywhere] in-data-[theme=dark]:text-[#c6ccda]';
 
 function CapabilityMark({ tone }: { tone: CapabilityTone }) {
   const resourceKind = tone === 'knowledge'
@@ -229,7 +229,7 @@ export default function WorkRecordTab({
       </div>
       <ActivityTimeline events={activityEvents} />
       <div className="flex w-full min-w-0 max-w-full flex-col gap-[10px] mt-[20px]">
-        <div className="inline-flex items-center gap-[6px] self-start text-[14px] capitalize leading-none text-[#757f9c] in-data-[theme=dark]:text-[#8b93a6]">
+        <div className="inline-flex items-center gap-[6px] self-start gg-type-body capitalize text-[#757f9c] in-data-[theme=dark]:text-[#8b93a6]">
           <IconGrowthArrow className="size-[14px] shrink-0" />
           成长记录
         </div>
@@ -239,14 +239,14 @@ export default function WorkRecordTab({
               {growthItems.map((item) => (
                 <div className="relative flex flex-col items-center gap-[8px]" key={item.id}>
                   <span className="pointer-events-none absolute left-[-10px] right-[-10px] top-[28px] z-0 h-px bg-[#e3e7f1] in-data-[theme=dark]:bg-[#363a45]" />
-                  <p className="m-0 text-center text-[12px] font-medium leading-[16px] text-[#18181a] in-data-[theme=dark]:text-[#f0f2f6]">
+                  <p className="m-0 text-center gg-type-meta font-medium  text-[#18181a] in-data-[theme=dark]:text-[#f0f2f6]">
                     {formatMonthDay(item.timestamp)}
                   </p>
                   <span className="relative z-10 size-[8px] shrink-0 rounded-full bg-[#18181a] in-data-[theme=dark]:bg-[#f0f2f6]" />
                   <div className="relative flex w-[136px] flex-col gap-[4px] rounded-[14px] bg-[#f6f6f6] px-[16px] py-[10px] in-data-[theme=dark]:bg-[#2b2d33]">
                     <span className="absolute top-[-8px] left-1/2 size-0 -translate-x-1/2 border-x-6 border-b-8 border-x-transparent border-b-[#f6f6f6] in-data-[theme=dark]:border-b-[#2b2d33]" />
-                    <span className="truncate text-[10px] leading-none text-[#757f9c]">{item.kind}</span>
-                    <span className="truncate text-[12px] leading-none text-[#464c5e] in-data-[theme=dark]:text-[#c9cede]">
+                    <span className="truncate gg-type-caption text-[#757f9c]">{item.kind}</span>
+                    <span className="truncate gg-type-meta text-[#464c5e] in-data-[theme=dark]:text-[#c9cede]">
                       {normalizeProductDisplayText(item.title)}
                     </span>
                   </div>
@@ -277,7 +277,7 @@ export default function WorkRecordTab({
                 <span className={`${capabilityNameClass} ${visual.accent}`}>{item.title}</span>
               </span>
               <span className="flex flex-col gap-[6px]">
-                <strong className="text-[24px] leading-none font-semibold text-[#202737] in-data-[theme=dark]:text-white">{item.count}</strong>
+                <strong className="gg-type-page-title font-semibold text-[#202737] in-data-[theme=dark]:text-white">{item.count}</strong>
                 <span className={capabilityBarClass}><span className={`block h-full w-[20px] rounded-[90px] ${visual.fill}`} /></span>
               </span>
             </span>
@@ -325,8 +325,8 @@ function ClickableMetric({
       onClick={onClick}
       className={`flex min-w-px flex-[1_0_0] cursor-pointer flex-col justify-center gap-[4px] rounded-[20px] px-[32px] py-[16px] text-left transition-colors ${metricToneClass[tone]}`}
     >
-      <strong className={`text-[18px] font-medium leading-none ${metricValueToneClass[tone]}`}>{value}{suffix}</strong>
-      <span className="text-[12px] leading-none text-[#757f9c] in-data-[theme=dark]:text-[#8b93a6]">{label}</span>
+      <strong className={`gg-type-section-title font-medium ${metricValueToneClass[tone]}`}>{value}{suffix}</strong>
+      <span className="gg-type-meta text-[#757f9c] in-data-[theme=dark]:text-[#8b93a6]">{label}</span>
     </button>
   );
 }
@@ -446,7 +446,7 @@ function ActivityTimeline({ events }: ActivityTimelineProps) {
   return (
     <div className="flex w-full min-w-0 flex-col gap-[16px]">
       <div className="flex h-[36px] flex-wrap items-center justify-between gap-[12px]">
-        <div className="flex items-center gap-[6px] text-[14px] text-[#858b9c] in-data-[theme=dark]:text-[#8b93a6]">
+        <div className="flex items-center gap-[6px] gg-type-body text-[#858b9c] in-data-[theme=dark]:text-[#8b93a6]">
           <IconProfileCalendar className="size-[14px] shrink-0" />
           {formatAnchorLabel(mode, range)}
         </div>
@@ -480,7 +480,7 @@ function ActivityTimeline({ events }: ActivityTimelineProps) {
               type="button"
               key={item.key}
               onClick={() => changeMode(item.key)}
-              className={`flex w-[50px] items-center justify-center px-[8px] text-[12px] transition-colors ${
+              className={`flex w-[50px] items-center justify-center px-[8px] gg-type-meta transition-colors ${
                 mode === item.key
                   ? 'font-medium text-[#464c5e] in-data-[theme=dark]:text-[#f0f2f6]'
                   : 'text-[#757f9c] hover:text-[#464c5e] in-data-[theme=dark]:text-[#8b93a6]'
@@ -519,7 +519,7 @@ function ActivityTimeline({ events }: ActivityTimelineProps) {
                             style={{ left: `${segment.left}%`, width: `${segment.width}%` }}
                           >
                             <span className={`size-[6px] shrink-0 rounded-full ${track.dot}`} />
-                            <span className="truncate text-[10px] leading-none capitalize text-[#464c5e] in-data-[theme=dark]:text-[#f0f2f6]">
+                            <span className="truncate gg-type-caption capitalize text-[#464c5e] in-data-[theme=dark]:text-[#f0f2f6]">
                               {label}
                             </span>
                           </div>
@@ -527,10 +527,10 @@ function ActivityTimeline({ events }: ActivityTimelineProps) {
                         <HoverCardContent align="start" sideOffset={6} className="w-auto max-w-[300px] p-[10px]">
                           <div className="mb-[8px] flex items-center gap-[6px]">
                             <span className={`size-[6px] shrink-0 rounded-full ${track.dot}`} />
-                            <span className="text-[12px] font-medium text-[#18181a] in-data-[theme=dark]:text-[#f0f2f6]">
+                            <span className="gg-type-meta font-medium text-[#18181a] in-data-[theme=dark]:text-[#f0f2f6]">
                               {track.label}
                             </span>
-                            <span className="text-[11px] text-[#858b9c]">
+                            <span className="gg-type-caption text-[#858b9c]">
                               共{segment.count}
                               {track.unit}
                             </span>
@@ -539,7 +539,7 @@ function ActivityTimeline({ events }: ActivityTimelineProps) {
                             {segment.events.slice(0, 12).map((event, eventIndex) => (
                               <div
                                 key={`${track.key}-${event.time}-${eventIndex}`}
-                                className="flex items-start gap-[8px] text-[11px] leading-[15px]"
+                                className="flex items-start gap-[8px] gg-type-caption "
                               >
                                 <span className="shrink-0 tabular-nums text-[#858b9c]">
                                   {formatHm(new Date(event.time))}
@@ -550,7 +550,7 @@ function ActivityTimeline({ events }: ActivityTimelineProps) {
                               </div>
                             ))}
                             {segment.events.length > 12 && (
-                              <div className="text-[11px] text-[#858b9c]">…等{segment.events.length}项</div>
+                              <div className="gg-type-caption text-[#858b9c]">…等{segment.events.length}项</div>
                             )}
                           </div>
                         </HoverCardContent>
@@ -562,7 +562,7 @@ function ActivityTimeline({ events }: ActivityTimelineProps) {
             </div>
           </div>
 
-          <div className="flex h-[16px] w-full items-center justify-between px-[12px] text-[12px] leading-none text-[#858b9c] in-data-[theme=dark]:text-[#8b93a6]">
+          <div className="flex h-[16px] w-full items-center justify-between px-[12px] gg-type-meta text-[#858b9c] in-data-[theme=dark]:text-[#8b93a6]">
             {ticks.map((tick, index) => (
               <span key={`tick-${index}`} className="relative w-0">
                 <span className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 whitespace-nowrap">
@@ -581,7 +581,7 @@ function TimelineEmptyState({ text }: { text: string }) {
   return (
     <div className="flex min-h-[178px] w-full flex-col items-center justify-center gap-[10px] rounded-[20px] border border-dashed border-[#e3e7f1] in-data-[theme=dark]:border-[#343741]">
       <IconProfileCalendar className="size-[24px] text-[#c0c5d2] in-data-[theme=dark]:text-[#5b606d]" />
-      <span className="text-[13px] leading-none text-[#858b9c] in-data-[theme=dark]:text-[#8b93a6]">
+      <span className="gg-type-control text-[#858b9c] in-data-[theme=dark]:text-[#8b93a6]">
         {text}
       </span>
     </div>
@@ -630,7 +630,7 @@ function WeekCalendar({
                 isToday ? 'bg-[#e8f0ff] in-data-[theme=dark]:bg-[#1d2c47]' : ''
               }`}
             >
-              <span className="text-[14px] leading-none text-[#858b9c] in-data-[theme=dark]:text-[#8b93a6]">
+              <span className="gg-type-body text-[#858b9c] in-data-[theme=dark]:text-[#8b93a6]">
                 {date.getDate()}
               </span>
               <div className="flex w-full flex-col gap-[2px]">
@@ -639,7 +639,7 @@ function WeekCalendar({
                     <HoverCardTrigger asChild>
                       <div className="flex cursor-default items-center gap-[6px] rounded-[8px] p-[4px] transition-colors hover:bg-[#f6f6f6] in-data-[theme=dark]:hover:bg-[#2b2d33]">
                         <span className={`size-[6px] shrink-0 rounded-full ${item.dot}`} />
-                        <span className="truncate text-[10px] leading-none capitalize text-[#757f9c] in-data-[theme=dark]:text-[#8b93a6]">
+                        <span className="truncate gg-type-caption capitalize text-[#757f9c] in-data-[theme=dark]:text-[#8b93a6]">
                           {item.label}
                         </span>
                       </div>
@@ -647,7 +647,7 @@ function WeekCalendar({
                     <HoverCardContent align="start" sideOffset={6} className="w-auto max-w-[300px] p-[10px]">
                       <div className="flex items-start gap-[8px]">
                         <span className={`mt-[4px] size-[6px] shrink-0 rounded-full ${item.dot}`} />
-                        <span className="flex-1 break-words text-[12px] leading-[17px] text-[#464c5e] in-data-[theme=dark]:text-[#c9cede]">
+                        <span className="flex-1 break-words gg-type-meta  text-[#464c5e] in-data-[theme=dark]:text-[#c9cede]">
                           {item.time ? (
                             <span className="mr-[6px] tabular-nums text-[#858b9c]">{item.time}</span>
                           ) : null}
@@ -663,7 +663,7 @@ function WeekCalendar({
                     onClick={() => toggle(key)}
                     className="flex items-center gap-[6px] rounded-[8px] p-[4px] text-left transition-colors hover:bg-[#f6f6f6] in-data-[theme=dark]:hover:bg-[#2b2d33]"
                   >
-                    <span className="truncate text-[10px] leading-none text-[#757f9c] in-data-[theme=dark]:text-[#8b93a6]">
+                    <span className="truncate gg-type-caption text-[#757f9c] in-data-[theme=dark]:text-[#8b93a6]">
                       还有{overflow}项
                     </span>
                   </button>
@@ -674,7 +674,7 @@ function WeekCalendar({
                     onClick={() => toggle(key)}
                     className="flex items-center gap-[6px] rounded-[8px] p-[4px] text-left transition-colors hover:bg-[#f6f6f6] in-data-[theme=dark]:hover:bg-[#2b2d33]"
                   >
-                    <span className="truncate text-[10px] leading-none text-[#757f9c] in-data-[theme=dark]:text-[#8b93a6]">
+                    <span className="truncate gg-type-caption text-[#757f9c] in-data-[theme=dark]:text-[#8b93a6]">
                       收起
                     </span>
                   </button>
@@ -705,7 +705,7 @@ function MonthCalendar({
         {['周日', '周一', '周二', '周三', '周四', '周五', '周六'].map((day) => (
           <div
             key={day}
-            className="px-[12px] py-[8px] text-[12px] leading-none text-[#757f9c] in-data-[theme=dark]:text-[#8b93a6]"
+            className="px-[12px] py-[8px] gg-type-meta text-[#757f9c] in-data-[theme=dark]:text-[#8b93a6]"
           >
             {day}
           </div>
@@ -729,7 +729,7 @@ function MonthCalendar({
                 key={key}
                 className={`flex min-h-[136px] flex-col gap-[8px] px-[12px] py-[10px] ${inMonth ? '' : 'opacity-45'}`}
               >
-                <span className="text-[14px] leading-none text-[#858b9c] in-data-[theme=dark]:text-[#8b93a6]">
+                <span className="gg-type-body text-[#858b9c] in-data-[theme=dark]:text-[#8b93a6]">
                   {dayLabel}
                 </span>
                 <div className="flex flex-col gap-[2px]">
@@ -738,7 +738,7 @@ function MonthCalendar({
                       <HoverCardTrigger asChild>
                         <div className="flex cursor-default items-center gap-[6px] rounded-[8px] p-[4px] transition-colors hover:bg-[#f6f6f6] in-data-[theme=dark]:hover:bg-[#2b2d33]">
                           <span className={`size-[6px] shrink-0 rounded-full ${item.dot}`} />
-                          <span className="truncate text-[10px] leading-none capitalize text-[#757f9c] in-data-[theme=dark]:text-[#8b93a6]">
+                          <span className="truncate gg-type-caption capitalize text-[#757f9c] in-data-[theme=dark]:text-[#8b93a6]">
                             {item.label}
                           </span>
                         </div>
@@ -746,7 +746,7 @@ function MonthCalendar({
                       <HoverCardContent align="start" sideOffset={6} className="w-auto max-w-[300px] p-[10px]">
                         <div className="flex items-start gap-[8px]">
                           <span className={`mt-[4px] size-[6px] shrink-0 rounded-full ${item.dot}`} />
-                          <span className="flex-1 break-words text-[12px] leading-[17px] text-[#464c5e] in-data-[theme=dark]:text-[#c9cede]">
+                          <span className="flex-1 break-words gg-type-meta  text-[#464c5e] in-data-[theme=dark]:text-[#c9cede]">
                             {item.time ? (
                               <span className="mr-[6px] tabular-nums text-[#858b9c]">{item.time}</span>
                             ) : null}
@@ -762,7 +762,7 @@ function MonthCalendar({
                       onClick={() => toggle(key)}
                       className="flex items-center gap-[6px] rounded-[8px] p-[4px] text-left transition-colors hover:bg-[#f6f6f6] in-data-[theme=dark]:hover:bg-[#2b2d33]"
                     >
-                      <span className="truncate text-[10px] leading-none text-[#757f9c] in-data-[theme=dark]:text-[#8b93a6]">
+                      <span className="truncate gg-type-caption text-[#757f9c] in-data-[theme=dark]:text-[#8b93a6]">
                         还有{overflow}项
                       </span>
                     </button>
@@ -773,7 +773,7 @@ function MonthCalendar({
                       onClick={() => toggle(key)}
                       className="flex items-center gap-[6px] rounded-[8px] p-[4px] text-left transition-colors hover:bg-[#f6f6f6] in-data-[theme=dark]:hover:bg-[#2b2d33]"
                     >
-                      <span className="truncate text-[10px] leading-none text-[#757f9c] in-data-[theme=dark]:text-[#8b93a6]">
+                      <span className="truncate gg-type-caption text-[#757f9c] in-data-[theme=dark]:text-[#8b93a6]">
                         收起
                       </span>
                     </button>
@@ -978,7 +978,7 @@ function TimelineDatePicker({
       <PopoverTrigger asChild>
         <button
           type="button"
-          className="text-[12px] whitespace-nowrap text-[#464c5e] transition-colors hover:text-[#18181a] in-data-[theme=dark]:text-[#c9cede]"
+          className="gg-type-meta whitespace-nowrap text-[#464c5e] transition-colors hover:text-[#18181a] in-data-[theme=dark]:text-[#c9cede]"
         >
           {label}
         </button>
@@ -993,7 +993,7 @@ function TimelineDatePicker({
           >
             <TimelineChevron direction="left" />
           </button>
-          <span className="text-[13px] font-medium text-[#18181a] in-data-[theme=dark]:text-[#f0f2f6]">
+          <span className="gg-type-control font-medium text-[#18181a] in-data-[theme=dark]:text-[#f0f2f6]">
             {mode === 'month'
               ? `${viewDate.getFullYear()}年`
               : `${viewDate.getFullYear()}年${viewDate.getMonth() + 1}月`}
@@ -1017,7 +1017,7 @@ function TimelineDatePicker({
                   key={index}
                   type="button"
                   onClick={() => commit(new Date(viewDate.getFullYear(), index, 1))}
-                  className={`flex h-[36px] w-[64px] items-center justify-center rounded-[8px] text-[12px] transition-colors ${
+                  className={`flex h-[36px] w-[64px] items-center justify-center rounded-[8px] gg-type-meta transition-colors ${
                     isSelected
                       ? 'bg-[#4f92ff] text-white'
                       : 'text-[#464c5e] hover:bg-[#f6f6f6] in-data-[theme=dark]:text-[#c9cede] in-data-[theme=dark]:hover:bg-[#2b2d33]'
@@ -1034,7 +1034,7 @@ function TimelineDatePicker({
               {['日', '一', '二', '三', '四', '五', '六'].map((day) => (
                 <span
                   key={day}
-                  className="flex size-[32px] items-center justify-center text-[11px] text-[#a7adbd] in-data-[theme=dark]:text-[#6b7080]"
+                  className="flex size-[32px] items-center justify-center gg-type-caption text-[#a7adbd] in-data-[theme=dark]:text-[#6b7080]"
                 >
                   {day}
                 </span>
@@ -1060,7 +1060,7 @@ function TimelineDatePicker({
                       key={dateKey(date)}
                       type="button"
                       onClick={() => commit(date)}
-                      className={`flex size-[32px] items-center justify-center text-[12px] transition-colors ${tone}`}
+                      className={`flex size-[32px] items-center justify-center gg-type-meta transition-colors ${tone}`}
                     >
                       {date.getDate()}
                     </button>
@@ -1077,7 +1077,7 @@ function TimelineDatePicker({
               key={shortcut.label}
               type="button"
               onClick={() => commit(shortcut.date)}
-              className="rounded-[6px] px-[10px] py-[4px] text-[12px] text-[#464c5e] transition-colors hover:bg-[#f6f6f6] in-data-[theme=dark]:text-[#c9cede] in-data-[theme=dark]:hover:bg-[#2b2d33]"
+              className="rounded-[6px] px-[10px] py-[4px] gg-type-meta text-[#464c5e] transition-colors hover:bg-[#f6f6f6] in-data-[theme=dark]:text-[#c9cede] in-data-[theme=dark]:hover:bg-[#2b2d33]"
             >
               {shortcut.label}
             </button>

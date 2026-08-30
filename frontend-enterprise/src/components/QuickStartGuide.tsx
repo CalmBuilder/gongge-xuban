@@ -104,13 +104,31 @@ const QUICK_START_STEPS: QuickStartStep[] = [
   },
 ];
 
-function findVisibleGuideTarget(target: string): HTMLElement | undefined {
-  return Array.from(
-    document.querySelectorAll<HTMLElement>(`[data-guide-target="${target}"]`),
-  ).find((element) => {
-    const rect = element.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-  });
+function findGuideTarget(target: string): HTMLElement | undefined {
+  return Array.from(document.querySelectorAll<HTMLElement>(`[data-guide-target="${target}"]`))
+    .find((element) => {
+      const rect = element.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    });
+}
+
+function scrollGuideTargetIntoView(target: HTMLElement): void {
+  let parent = target.parentElement;
+  while (parent && parent !== document.body) {
+    const style = window.getComputedStyle(parent);
+    const scrollable = /(auto|scroll|overlay)/.test(`${style.overflowY} ${style.overflowX}`)
+      && parent.scrollHeight > parent.clientHeight;
+    if (scrollable) {
+      const targetRect = target.getBoundingClientRect();
+      const parentRect = parent.getBoundingClientRect();
+      if (targetRect.top < parentRect.top) {
+        parent.scrollTop -= parentRect.top - targetRect.top;
+      } else if (targetRect.bottom > parentRect.bottom) {
+        parent.scrollTop += targetRect.bottom - parentRect.bottom;
+      }
+    }
+    parent = parent.parentElement;
+  }
 }
 
 export default function QuickStartGuide({ isAdmin }: { isAdmin: boolean }) {
@@ -154,8 +172,9 @@ export default function QuickStartGuide({ isAdmin }: { isAdmin: boolean }) {
     const updateAnchor = () => {
       window.cancelAnimationFrame(frame);
       frame = window.requestAnimationFrame(() => {
-        const target = findVisibleGuideTarget(current.target);
+        const target = findGuideTarget(current.target);
         if (!target) return;
+        scrollGuideTargetIntoView(target);
         const rect = target.getBoundingClientRect();
         setAnchorRect({ top: rect.top, left: rect.left, width: rect.width, height: rect.height });
         setAnchorReady(true);
@@ -204,7 +223,7 @@ export default function QuickStartGuide({ isAdmin }: { isAdmin: boolean }) {
       window.setTimeout(() => window.dispatchEvent(new Event(actionEvent)), 0);
       return;
     }
-    window.setTimeout(() => findVisibleGuideTarget(current.target)?.click(), 80);
+    window.setTimeout(() => findGuideTarget(current.target)?.click(), 80);
   }
 
   return (
@@ -244,13 +263,13 @@ export default function QuickStartGuide({ isAdmin }: { isAdmin: boolean }) {
         </Button>
 
         <div className="pr-[34px]">
-          <span className="text-[10px] font-semibold tracking-[0.16em] text-[var(--gg-cobalt)]">
+          <span className="gg-type-caption font-semibold tracking-[0.16em] text-[var(--gg-cobalt)]">
             {t('员工成长路径')}
           </span>
-          <PopoverTitle className="mt-[7px] text-[17px] font-semibold leading-[24px] text-[var(--gg-ink)]">
+          <PopoverTitle className="mt-[7px] gg-type-section-title font-semibold  text-[var(--gg-ink)]">
             {t(current.title)}
           </PopoverTitle>
-          <PopoverDescription className="mt-[6px] text-[13px] leading-[21px] text-[var(--gg-slate)]">
+          <PopoverDescription className="mt-[6px] gg-type-control  text-[var(--gg-slate)]">
             {t(current.description)}
           </PopoverDescription>
         </div>
@@ -265,7 +284,7 @@ export default function QuickStartGuide({ isAdmin }: { isAdmin: boolean }) {
         </div>
 
         <div className="flex items-center justify-between gap-[12px]">
-          <span className="shrink-0 text-[11px] font-medium tabular-nums text-[var(--gg-slate)]">
+          <span className="shrink-0 gg-type-caption font-medium tabular-nums text-[var(--gg-slate)]">
             {stepIndex + 1} / {steps.length}
           </span>
           <div className="flex min-w-0 items-center gap-[8px]">
@@ -273,14 +292,14 @@ export default function QuickStartGuide({ isAdmin }: { isAdmin: boolean }) {
               type="button"
               variant="outline"
               onClick={stepIndex === 0 ? runFirstAction : goPrevious}
-              className="h-[34px] rounded-[var(--gg-radius-control)] border-[var(--gg-border)] bg-[var(--gg-paper)] px-[14px] text-[12px] font-medium text-[var(--gg-slate)] hover:border-[#bfcbea] hover:bg-[var(--gg-cloud)] hover:text-[var(--gg-cobalt)]"
+              className="h-[34px] rounded-[var(--gg-radius-control)] border-[var(--gg-border)] bg-[var(--gg-paper)] px-[14px] gg-type-meta font-medium text-[var(--gg-slate)] hover:border-[#bfcbea] hover:bg-[var(--gg-cloud)] hover:text-[var(--gg-cobalt)]"
             >
               {t(stepIndex === 0 ? (isAdmin ? '配置模型' : '查看入口') : '上一步')}
             </Button>
             <Button
               type="button"
               onClick={goNext}
-              className="h-[34px] rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-[16px] text-[12px] font-semibold text-white shadow-[0_8px_18px_rgba(49,87,232,0.22)] hover:bg-[#244bc7]"
+              className="h-[34px] rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-[16px] gg-type-meta font-semibold text-white shadow-[0_8px_18px_rgba(49,87,232,0.22)] hover:bg-[#244bc7]"
             >
               {t(current.nextLabel ?? (isLast ? '完成' : '下一步'))}
             </Button>

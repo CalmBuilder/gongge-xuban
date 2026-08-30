@@ -215,7 +215,7 @@ function PrimaryNavButton({
         isActive={selected === item.route}
         onClick={() => onNavigate(item.route)}
         className={cn(
-          'gongge-primary-nav h-[40px] gap-[8px] rounded-[var(--gg-radius-control)] px-[16px] py-[10px] text-[13px] leading-[20px] text-sidebar-foreground',
+          'gongge-primary-nav h-[40px] gap-[var(--gg-sidebar-control-gap)] rounded-[var(--gg-radius-control)] px-[16px] py-[10px] gg-type-control  text-sidebar-foreground',
           'hover:bg-sidebar-accent hover:text-sidebar-accent-foreground',
           'data-active:bg-sidebar-accent data-active:text-sidebar-accent-foreground data-active:font-normal',
           attention && selected !== item.route && 'bg-[var(--gg-state-warning-soft)] text-[var(--gg-state-warning)] ring-1 ring-[var(--gg-state-warning)]',
@@ -225,7 +225,7 @@ function PrimaryNavButton({
         <item.Icon className="size-[16px]!" />
         <span>{item.label}</span>
         {attention && (
-          <span className="ml-auto size-[6px] rounded-full bg-[#f59e0b] group-data-[collapsible=icon]:hidden" />
+          <span className="ml-auto size-[6px] rounded-full bg-[var(--gg-state-warning)] group-data-[collapsible=icon]:hidden" />
         )}
       </SidebarMenuButton>
     </SidebarMenuItem>
@@ -249,7 +249,7 @@ function CardNavButton({
         isActive={selected === item.route}
         onClick={() => onNavigate(item.route)}
         className={cn(
-          'gongge-card-nav h-[36px] gap-[8px] rounded-[10px] px-[12px] py-[4px] text-[12px] text-sidebar-foreground',
+          'gongge-card-nav h-[36px] gap-[var(--gg-sidebar-secondary-control-gap)] rounded-[10px] px-[12px] py-[4px] gg-type-meta text-sidebar-foreground',
           'hover:bg-sidebar-accent hover:text-sidebar-accent-foreground',
           'data-active:bg-sidebar-accent data-active:text-sidebar-accent-foreground data-active:font-normal',
           'group-data-[collapsible=icon]:px-0!',
@@ -319,8 +319,8 @@ function AgentSwitcher({
             </div>
           )}
           <span className="flex min-w-0 flex-1 flex-col gap-[4px] group-data-[collapsible=icon]:hidden">
-            <span className="text-[10px] leading-none text-[#757f9c]">{caption}</span>
-            <span className="block truncate text-[12px] font-medium leading-none text-[#464c5e]">
+            <span className="gg-type-caption text-[#757f9c]">{caption}</span>
+            <span className="block truncate gg-type-meta font-medium text-[#464c5e]">
               {nameLabel}
             </span>
           </span>
@@ -340,10 +340,10 @@ function AgentSwitcher({
           >
             <EmployeeAvatar agent={agent} size={28} />
             <span className="flex min-w-0 flex-col">
-              <strong className="truncate text-[12px] font-medium">
+              <strong className="truncate gg-type-meta font-medium">
                 {employeeDisplayNameWithCreator(agent)}
               </strong>
-              <small className="truncate text-[10px] text-muted-foreground">
+              <small className="truncate gg-type-caption text-muted-foreground">
                 {agentContextLabel(agent)}
               </small>
             </span>
@@ -368,7 +368,7 @@ function SidebarFooterActions({ onOpenChat }: { onOpenChat: () => void }) {
         onClick={onOpenChat}
         title="对话端"
         className={cn(
-          'flex h-[40px] w-[130px] items-center justify-center gap-[6px] rounded-[10px] border-[0.5px] border-[#E3E7F1] bg-[#F6F6F6] px-[20px] py-[4px] text-[14px] text-sidebar-accent-foreground transition-opacity hover:opacity-70',
+          'flex h-[40px] w-[130px] items-center justify-center gap-[6px] rounded-[10px] border-[0.5px] border-[#E3E7F1] bg-[#F6F6F6] px-[20px] py-[4px] gg-type-body text-sidebar-accent-foreground transition-opacity hover:opacity-70',
           'group-data-[collapsible=icon]:size-[40px] group-data-[collapsible=icon]:w-[40px] group-data-[collapsible=icon]:px-0',
         )}
       >
@@ -390,7 +390,7 @@ function SidebarFooterActions({ onOpenChat }: { onOpenChat: () => void }) {
 
 function CollapsedGroupLabel({ children }: { children: string }) {
   return (
-    <span className="text-[10px] leading-none text-[#464c5e]">
+    <span className="gg-type-caption text-[#464c5e]">
       {children}
     </span>
   );
@@ -467,7 +467,7 @@ function CollapsedAgentSwitcher({
               <IconAdd className="size-[16px]" />
             </span>
           )}
-          <span className="w-[34px] text-center text-[10px] font-medium leading-tight wrap-break-word text-[#18181a]">
+          <span className="w-[34px] text-center gg-type-caption font-medium  wrap-break-word text-[#18181a]">
             {nameLabel}
           </span>
         </button>
@@ -482,10 +482,10 @@ function CollapsedAgentSwitcher({
           >
             <EmployeeAvatar agent={agent} size={28} />
             <span className="flex min-w-0 flex-col">
-              <strong className="truncate text-[12px] font-medium">
+              <strong className="truncate gg-type-meta font-medium">
                 {employeeDisplayNameWithCreator(agent)}
               </strong>
-              <small className="truncate text-[10px] text-muted-foreground">
+              <small className="truncate gg-type-caption text-muted-foreground">
                 {agentContextLabel(agent)}
               </small>
             </span>
@@ -661,7 +661,12 @@ function ManagementSidebar({
   return (
     <Sidebar collapsible="icon" className={SIDEBAR_SHELL_CLASS}>
       <div className="flex h-full w-(--sidebar-width) shrink-0 flex-col">
-      <SidebarHeader className="h-[min(54vh,680px)] min-h-[420px] shrink-0 gap-[24px] overflow-hidden px-[20px] pt-[10px] group-data-[collapsible=icon]:px-[20px]">
+      {/*
+       * The primary area owns the remaining height. Its menu scrolls when new
+       * entries no longer fit, while the lower agent/profile panel keeps its
+       * intrinsic height and never gets pushed below the chat footer.
+       */}
+      <SidebarHeader className="min-h-0 flex-1 gap-[24px] overflow-hidden px-[20px] pt-[10px] group-data-[collapsible=icon]:px-[20px]">
         <div className="flex items-center justify-between">
           <button type="button" title="开放广场">
             <BrandLogo context="management" wordmarkClassName="group-data-[collapsible=icon]:hidden" />
@@ -680,7 +685,7 @@ function ManagementSidebar({
         </div>
 
         <div className="flex min-h-0 flex-1 flex-col gap-[18px]">
-          <SidebarMenu className="no-scrollbar min-h-0 flex-1 gap-[6px] overflow-y-auto overscroll-contain pr-[4px]">
+          <SidebarMenu className="no-scrollbar min-h-0 flex-1 gap-[var(--gg-sidebar-primary-item-gap)] overflow-y-auto overscroll-contain pr-[4px]">
             {primaryItems.map((item) => (
               <PrimaryNavButton
                 key={item.route}
@@ -695,10 +700,10 @@ function ManagementSidebar({
         </div>
       </SidebarHeader>
 
-      <SidebarContent className="min-h-0 flex-1 overflow-y-auto px-[20px] group-data-[collapsible=icon]:px-[20px]">
+      <SidebarContent className="min-h-0 flex-none! overflow-visible! overscroll-contain px-[20px] group-data-[collapsible=icon]:px-[20px]">
         <div
           className={cn(
-            'mt-[36px] mb-[24px] flex flex-col gap-[8px] rounded-[var(--gg-radius-panel)] border border-[var(--gg-line)] bg-sidebar px-[4px] pt-[6px] pb-[8px]',
+            'mt-[var(--gg-sidebar-lower-top-gap)] mb-[var(--gg-sidebar-lower-bottom-gap)] flex flex-col gap-[8px] rounded-[var(--gg-radius-panel)] border border-[var(--gg-line)] bg-sidebar px-[4px] pt-[6px] pb-[8px]',
             'group-data-[collapsible=icon]:mt-[24px] group-data-[collapsible=icon]:border-transparent group-data-[collapsible=icon]:bg-transparent group-data-[collapsible=icon]:p-0 group-data-[collapsible=icon]:shadow-none',
           )}
         >
@@ -712,14 +717,14 @@ function ManagementSidebar({
 
           <div className="flex flex-col gap-[2px] px-[10px] group-data-[collapsible=icon]:px-0">
             <GroupLabel>基本资料</GroupLabel>
-            <SidebarMenu className="gap-[2px]">
+            <SidebarMenu className="gap-[var(--gg-sidebar-secondary-item-gap)]">
               {PROFILE_NAV.map((item) => (
                 <CardNavButton key={item.route} item={item} selected={selected} onNavigate={onNavigate} />
               ))}
             </SidebarMenu>
 
             <GroupLabel>员工能力</GroupLabel>
-            <SidebarMenu className="gap-[2px]">
+            <SidebarMenu className="gap-[var(--gg-sidebar-secondary-item-gap)]">
               {CAPABILITY_NAV.map((item) => (
                 <CardNavButton key={item.route} item={item} selected={selected} onNavigate={onNavigate} />
               ))}
@@ -728,7 +733,7 @@ function ManagementSidebar({
         </div>
       </SidebarContent>
 
-      <SidebarFooter className="px-[20px] pb-[20px] group-data-[collapsible=icon]:px-[20px]">
+      <SidebarFooter className="min-h-[var(--gg-sidebar-footer-slot)] shrink-0 px-[20px] pb-[20px] group-data-[collapsible=icon]:px-[20px]">
         <SidebarFooterActions onOpenChat={onOpenChat} />
       </SidebarFooter>
       </div>
@@ -787,9 +792,9 @@ function ChatSessionFilter({
             className="flex h-[40px] w-full items-center justify-between rounded-[14px] border-[0.5px] border-[#e3e7f1] bg-[#f6f6f6] px-[20px] py-[10px] text-left transition-colors hover:border-[#c9d2e4]"
           >
             <span className="flex min-w-0 items-center gap-[6px]">
-              <span className="truncate text-[14px] text-[#464c5e]">{namePart}</span>
+              <span className="truncate gg-type-body text-[#464c5e]">{namePart}</span>
               {countPart && (
-                <span className="inline-flex h-[18px] min-w-[30px] items-center justify-center rounded-full bg-white px-[4px] text-[12px] text-[#757f9c]">
+                <span className="inline-flex h-[18px] min-w-[30px] items-center justify-center rounded-full bg-white px-[4px] gg-type-meta text-[#757f9c]">
                   {countPart}
                 </span>
               )}
@@ -821,7 +826,7 @@ function ChatSessionFilter({
             >
               <span
                 className={cn(
-                  'truncate text-[12px] leading-none',
+                  'truncate gg-type-meta',
                   active
                     ? 'text-[#18181a]!'
                     : 'text-[#858b9c]!',
@@ -832,7 +837,7 @@ function ChatSessionFilter({
               {optionCount && (
                 <span
                   className={cn(
-                    'inline-flex h-[14px] items-center justify-center rounded-full px-[8px] text-[10px] leading-none text-[#757f9c]! capitalize',
+                    'inline-flex h-[14px] items-center justify-center rounded-full px-[8px] gg-type-caption text-[#757f9c]! capitalize',
                     active
                       ? 'bg-white'
                       : 'bg-[#f6f6f6] group-focus/filter:bg-white',
@@ -873,7 +878,7 @@ function ChatHandoffButton({
           >
             <IconChatBubble className="size-[16px]!" />
             {count > 0 && (
-              <span className="absolute -right-[3px] -top-[4px] inline-flex h-[16px] min-w-[16px] items-center justify-center rounded-full bg-[#f5483b] px-[4px] text-[9px] leading-none text-white ring-[2px] ring-sidebar">
+              <span className="absolute -right-[3px] -top-[4px] inline-flex h-[16px] min-w-[16px] items-center justify-center rounded-full bg-[#f5483b] px-[4px] gg-type-caption text-white ring-[2px] ring-sidebar">
                 {badge}
               </span>
             )}
@@ -890,14 +895,14 @@ function ChatHandoffButton({
     <button
       type="button"
       onClick={onOpen}
-      className="flex items-center justify-between gap-[12px] rounded-[8px] px-[20px] py-[10px] text-left text-[14px] text-[#858b9c] transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
+      className="flex items-center justify-between gap-[12px] rounded-[8px] px-[20px] py-[10px] text-left gg-type-body text-[#858b9c] transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
     >
       <span className="flex min-w-0 items-center gap-[12px]">
         <IconChatBubble className="size-[16px]! shrink-0" />
         <span className="truncate">待回答</span>
       </span>
       {count > 0 && (
-        <span className="inline-flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-white px-[6px] text-[11px] leading-none text-[#f5483b] shadow-[0_0_0_0.5px_rgba(245,72,59,0.18)]">
+        <span className="inline-flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-white px-[6px] gg-type-caption text-[#f5483b] shadow-[0_0_0_0.5px_rgba(245,72,59,0.18)]">
           {badge}
         </span>
       )}
@@ -951,10 +956,10 @@ function ChatSessionRow({
         )}
       </span>
       <span className="flex min-w-0 flex-1 flex-col justify-between self-stretch py-[3px]">
-        <span className="truncate text-[14px] leading-none text-[#464c5e] capitalize" title={title}>
+        <span className="truncate gg-type-body text-[#464c5e] capitalize" title={title}>
           {title}
         </span>
-        <span className="truncate text-[12px] leading-none text-[#757f9c]" title={subtitle}>
+        <span className="truncate gg-type-meta text-[#757f9c]" title={subtitle}>
           {subtitle}
         </span>
       </span>
@@ -1018,7 +1023,7 @@ function ChatFooterActions({ onOpenAdmin }: { onOpenAdmin: () => void }) {
         type="button"
         onClick={onOpenAdmin}
         title="管理端"
-        className="flex h-[40px] w-[130px] items-center justify-center gap-[6px] rounded-[10px] border-[0.5px] border-[#E3E7F1] bg-[#F6F6F6] px-[20px] py-[4px] text-[14px] text-[#858b9c] transition-opacity hover:opacity-70"
+        className="flex h-[40px] w-[130px] items-center justify-center gap-[6px] rounded-[10px] border-[0.5px] border-[#E3E7F1] bg-[#F6F6F6] px-[20px] py-[4px] gg-type-body text-[#858b9c] transition-opacity hover:opacity-70"
       >
         <IconViewMasonry className="size-[16px]!" />
         <span>管理端</span>
@@ -1113,7 +1118,7 @@ function CollapsedChatSidebar({
           onSessionFilterChange={onSessionFilterChange}
         />
 
-        <span className="text-[10px] leading-none text-[#464c5e]">会话</span>
+        <span className="gg-type-caption text-[#464c5e]">会话</span>
 
         <div className="no-scrollbar mx-[-8px] flex min-h-0 w-[calc(100%+16px)] flex-1 flex-col items-center gap-[10px] overflow-y-auto py-[2px]">
           {sessionsLoading
@@ -1228,7 +1233,7 @@ function ChatSidebarVariant({
   return (
     <Sidebar collapsible="icon" className={SIDEBAR_SHELL_CLASS}>
       <div className="flex h-full w-(--sidebar-width) shrink-0 flex-col">
-        <SidebarHeader className="h-[min(36vh,360px)] min-h-[240px] shrink-0 gap-[24px] overflow-hidden px-[20px] pt-[10px]">
+        <SidebarHeader className="h-[clamp(240px,36vh,360px)] min-h-[240px] shrink-0 gap-[24px] overflow-hidden px-[20px] pt-[10px]">
           <div className="flex items-center justify-between">
             <button type="button" title="数字员工广场" onClick={onOpenGallery}>
               <BrandLogo context="workspace" />
@@ -1250,7 +1255,7 @@ function ChatSidebarVariant({
               onClick={onOpenGallery}
               aria-current={galleryActive ? 'page' : undefined}
               className={cn(
-                'flex items-center gap-[12px] rounded-[8px] px-[20px] py-[10px] text-left text-[14px] transition-colors',
+                'flex items-center gap-[12px] rounded-[8px] px-[20px] py-[10px] text-left gg-type-body transition-colors',
                 galleryActive
                   ? 'bg-sidebar-accent text-sidebar-accent-foreground'
                   : 'text-[#858b9c] hover:bg-sidebar-accent hover:text-sidebar-accent-foreground',
@@ -1266,16 +1271,16 @@ function ChatSidebarVariant({
               sessionFilterOptions={sessionFilterOptions}
               onSessionFilterChange={onSessionFilterChange}
             />
-            <span className="text-[12px] leading-none text-[#858b9c]">员工会话</span>
+            <span className="gg-type-meta text-[#858b9c]">员工会话</span>
           </div>
         </SidebarHeader>
 
-        <SidebarContent className="px-[20px]">
+        <SidebarContent className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-[20px]">
           <div className="flex flex-col gap-[2px] pb-[10px]">
             {showSkeleton ? (
               <ChatSessionSkeletonList />
             ) : sessions.length === 0 ? (
-              <div className="flex flex-col items-center gap-[8px] py-[28px] text-center text-[12px] text-[#a2a8b8]">
+              <div className="flex flex-col items-center gap-[8px] py-[28px] text-center gg-type-meta text-[#a2a8b8]">
                 <ProductIcon name="inbox" size={22} />
                 <span>暂无历史会话</span>
               </div>
@@ -1298,7 +1303,7 @@ function ChatSidebarVariant({
           </div>
         </SidebarContent>
 
-        <SidebarFooter className="px-[20px]">
+        <SidebarFooter className="min-h-[var(--gg-sidebar-footer-slot)] shrink-0 px-[20px]">
           <ChatFooterActions onOpenAdmin={onOpenAdmin} />
         </SidebarFooter>
       </div>

@@ -4,6 +4,7 @@ import { notify } from '@/components/ui/app-toast';
 import { getClientTimeZone } from '@/lib/timezone';
 
 import AppHeader from '@/components/AppHeader';
+import { PageShell } from '@/components/enterprise/PageShell';
 import { Button } from '@/components/ui/button';
 import {
   Checkbox,
@@ -50,9 +51,9 @@ type FormErrors = Partial<Record<'title' | 'prompt' | 'run_at' | 'time' | 'weekd
 
 const CARD_CLASS =
   'rounded-[14px] border border-[#eceef1] bg-white p-[20px]';
-const CARD_TITLE_CLASS = 'mb-[16px] text-[14px] font-medium text-[#18181a]';
-const FIELD_LABEL_CLASS = 'text-[13px] font-medium text-[#18181a]';
-const FIELD_ERROR_CLASS = 'text-[12px] leading-none text-[#d20b0b]';
+const CARD_TITLE_CLASS = 'mb-[16px] gg-type-body font-medium text-[#18181a]';
+const FIELD_LABEL_CLASS = 'gg-type-control font-medium text-[#18181a]';
+const FIELD_ERROR_CLASS = 'gg-type-meta text-[#d20b0b]';
 
 function ScheduledTaskEditorPage({
   mode,
@@ -169,10 +170,7 @@ function ScheduledTaskEditorPage({
   }
 
   return (
-    <div
-      className="min-h-full box-border px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]"
-      aria-busy={loading || saving}
-    >
+    <PageShell template="detail" aria-busy={loading || saving}>
       <AppHeader
         onLogout={onLogout}
         userName={currentUser?.username}
@@ -183,7 +181,7 @@ function ScheduledTaskEditorPage({
         <Button
           variant="outline"
           onClick={() => navigate('/enterprise/scheduled-tasks')}
-          className="h-8 gap-1 rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-5 text-[12px] font-normal text-[#757f9c] hover:border-[#cbd3e6] hover:bg-white hover:text-[#18181a]"
+          className="h-8 gap-1 rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-5 gg-type-meta font-normal text-[#757f9c] hover:border-[#cbd3e6] hover:bg-white hover:text-[#18181a]"
         >
           <IconArrowRight className="size-3.5 rotate-180" />
           返回定时任务
@@ -191,7 +189,7 @@ function ScheduledTaskEditorPage({
         <Button
           onClick={() => void save()}
           disabled={saving}
-          className="h-8 gap-1 rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-5 text-[12px] font-semibold text-white hover:bg-[#244bc7]"
+          className="h-8 gap-1 rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-5 gg-type-meta font-semibold text-white hover:bg-[#244bc7]"
         >
           保存
         </Button>
@@ -238,7 +236,7 @@ function ScheduledTaskEditorPage({
                 ) : (
                   <span />
                 )}
-                <span className="text-[12px] leading-none text-[#858b9c]">
+                <span className="gg-type-meta text-[#858b9c]">
                   {values.prompt.length}/10000
                 </span>
               </div>
@@ -272,7 +270,7 @@ function ScheduledTaskEditorPage({
                   checked={values.status !== 'paused'}
                   onCheckedChange={(checked) => update('status', checked ? 'active' : 'paused')}
                 />
-                <span className="text-[13px] text-[#858b9c]">
+                <span className="gg-type-control text-[#858b9c]">
                   {values.status !== 'paused' ? '启用' : '暂停'}
                 </span>
               </div>
@@ -335,7 +333,7 @@ function ScheduledTaskEditorPage({
                   {WEEKDAY_OPTIONS.map((option) => (
                     <label
                       key={option.value}
-                      className="flex cursor-pointer items-center gap-[6px] text-[13px] text-[#18181a]"
+                      className="flex cursor-pointer items-center gap-[6px] gg-type-control text-[#18181a]"
                     >
                       <Checkbox
                         checked={values.weekdays.includes(option.value)}
@@ -384,12 +382,12 @@ function ScheduledTaskEditorPage({
               />
             </div>
 
-            <div className="rounded-[12px] border border-[#eef0f4] bg-[#fafbfc] px-[14px] py-[12px] text-[13px] leading-[1.6] text-[#858b9c]">
+            <div className="rounded-[12px] border border-[#eef0f4] bg-[#fafbfc] px-[14px] py-[12px] gg-type-control  text-[#858b9c]">
               默认使用 forbid 并发策略：上一轮未结束时跳过本次唤醒，避免同一员工重复处理同一批任务。
             </div>
           </div>
         </section>
       </div>
-    </div>
+    </PageShell>
   );
 }

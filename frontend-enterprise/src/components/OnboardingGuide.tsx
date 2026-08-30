@@ -130,8 +130,8 @@ function CapabilityVisual() {
       <div className="relative z-10 flex items-center gap-[10px]">
         <BrandMark />
         <div>
-          <p className="text-[15px] font-semibold tracking-[0.02em]">共格·序伴</p>
-          <p className="mt-[2px] text-[9px] tracking-[0.16em] text-blue-100/55">企业数字员工平台</p>
+          <p className="gg-type-body font-semibold tracking-[0.02em]">共格·序伴</p>
+          <p className="mt-[2px] gg-type-caption tracking-[0.16em] text-blue-100/55">企业数字员工平台</p>
         </div>
       </div>
 
@@ -159,8 +159,8 @@ function CapabilityVisual() {
                 <Icon className="size-[15px]" />
               </span>
               <div>
-                <p className="text-[12px] font-semibold">{label}</p>
-                <p className="mt-[2px] text-[9px] text-blue-100/55">{detail}</p>
+                <p className="gg-type-meta font-semibold">{label}</p>
+                <p className="mt-[2px] gg-type-caption text-blue-100/55">{detail}</p>
               </div>
             </div>
           </div>
@@ -171,17 +171,17 @@ function CapabilityVisual() {
             <span className="grid size-[38px] place-items-center rounded-[12px] bg-[var(--gg-cobalt)] text-white">
               <Bot className="size-[20px]" />
             </span>
-            <span className="flex items-center gap-[4px] rounded-full bg-[#7be7f5]/12 px-[7px] py-[4px] text-[8px] font-semibold text-[#7be7f5]">
+            <span className="flex items-center gap-[4px] rounded-full bg-[#7be7f5]/12 px-[7px] py-[4px] gg-type-caption font-semibold text-[#7be7f5]">
               <i className="size-[5px] rounded-full bg-[#7be7f5]" />
               在岗
             </span>
           </div>
-          <p className="mt-[14px] text-[15px] font-semibold">你的数字员工</p>
-          <p className="mt-[5px] text-[10px] leading-[16px] text-blue-100/60">理解岗位，遵循流程，协同执行</p>
+          <p className="mt-[14px] gg-type-body font-semibold">你的数字员工</p>
+          <p className="mt-[5px] gg-type-caption  text-blue-100/60">理解岗位，遵循流程，协同执行</p>
         </div>
       </div>
 
-      <div className="relative z-10 flex items-center gap-[8px] border-t border-white/10 pt-[18px] text-[10px] text-blue-100/55">
+      <div className="relative z-10 flex items-center gap-[8px] border-t border-white/10 pt-[18px] gg-type-caption text-blue-100/55">
         <ShieldCheck className="size-[13px] text-[#7be7f5]" />
         权限可控 · 过程可查 · 结果可追溯
       </div>
@@ -199,14 +199,14 @@ function LifecycleVisual() {
       <div className="relative z-10 flex items-center gap-[10px]">
         <BrandMark />
         <div>
-          <p className="text-[15px] font-semibold tracking-[0.02em]">共格·序伴</p>
-          <p className="mt-[2px] text-[9px] tracking-[0.16em] text-blue-100/55">工作闭环</p>
+          <p className="gg-type-body font-semibold tracking-[0.02em]">共格·序伴</p>
+          <p className="mt-[2px] gg-type-caption tracking-[0.16em] text-blue-100/55">工作闭环</p>
         </div>
       </div>
 
       <div className="relative z-10 mt-[54px]">
-        <p className="text-[10px] font-semibold tracking-[0.2em] text-[#7be7f5]">DIGITAL EMPLOYEE LOOP</p>
-        <h3 className="mt-[10px] max-w-[300px] text-[27px] font-semibold leading-[1.25] tracking-[-0.035em]">
+        <p className="gg-type-caption font-semibold tracking-[0.2em] text-[#7be7f5]">DIGITAL EMPLOYEE LOOP</p>
+        <h3 className="mt-[10px] max-w-[300px] gg-type-page-title font-semibold tracking-[-0.035em]">
           从企业经验出发，
           <br />
           回到可复用的经验。
@@ -224,16 +224,16 @@ function LifecycleVisual() {
             </span>
             <div className="flex min-w-0 flex-1 items-center justify-between border-b border-white/8 pb-[15px]">
               <div>
-                <p className="text-[13px] font-semibold">{label}</p>
-                <p className="mt-[3px] text-[10px] text-blue-100/55">{detail}</p>
+                <p className="gg-type-control font-semibold">{label}</p>
+                <p className="mt-[3px] gg-type-caption text-blue-100/55">{detail}</p>
               </div>
-              <span className="font-mono text-[9px] text-blue-100/35">0{index + 1}</span>
+              <span className="font-mono gg-type-caption text-blue-100/35">0{index + 1}</span>
             </div>
           </div>
         ))}
       </div>
 
-      <div className="relative z-10 mt-auto flex items-center gap-[8px] rounded-[12px] border border-white/10 bg-white/6 px-[12px] py-[10px] text-[10px] text-blue-100/65">
+      <div className="relative z-10 mt-auto flex items-center gap-[8px] rounded-[12px] border border-white/10 bg-white/6 px-[12px] py-[10px] gg-type-caption text-blue-100/65">
         <CircleCheck className="size-[14px] text-[#7be7f5]" />
         每一次执行，都为下一次协作积累上下文
       </div>
@@ -319,15 +319,15 @@ export default function OnboardingGuide() {
           </button>
 
           <div className="mt-[28px]">
-            <span className="inline-flex items-center gap-[8px] text-[11px] font-semibold tracking-[0.14em] text-[var(--gg-cobalt)]">
+            <span className="inline-flex items-center gap-[8px] gg-type-caption font-semibold tracking-[0.14em] text-[var(--gg-cobalt)]">
               <i className="h-px w-[22px] bg-[var(--gg-cobalt)]" />
               {current.eyebrow}
             </span>
-            <h2 className="mt-[14px] max-w-[410px] text-[clamp(28px,3vw,36px)] font-semibold leading-[1.22] tracking-[-0.045em] text-[var(--gg-ink)]">
+            <h2 className="mt-[14px] max-w-[410px] gg-type-page-title font-semibold tracking-[-0.045em] text-[var(--gg-ink)]">
               {current.title}
               <span className="text-[var(--gg-cobalt)]">。</span>
             </h2>
-            <p className="mt-[14px] max-w-[415px] text-[13px] leading-[22px] text-[var(--gg-slate)]">
+            <p className="mt-[14px] max-w-[415px] gg-type-control  text-[var(--gg-slate)]">
               {current.description}
             </p>
           </div>
@@ -342,8 +342,8 @@ export default function OnboardingGuide() {
                   <Icon className="size-[17px]" />
                 </span>
                 <div className="min-w-0">
-                  <p className="text-[13px] font-semibold text-[var(--gg-ink)]">{title}</p>
-                  <p className="mt-[3px] text-[11px] leading-[17px] text-[var(--gg-slate)]">
+                  <p className="gg-type-control font-semibold text-[var(--gg-ink)]">{title}</p>
+                  <p className="mt-[3px] gg-type-caption  text-[var(--gg-slate)]">
                     {description}
                   </p>
                 </div>
@@ -361,7 +361,7 @@ export default function OnboardingGuide() {
                   }`}
                 />
               ))}
-              <span className="ml-[2px] text-[10px] tabular-nums text-[var(--gg-slate)]">
+              <span className="ml-[2px] gg-type-caption tabular-nums text-[var(--gg-slate)]">
                 0{step + 1} / 0{STEPS.length}
               </span>
             </div>
@@ -380,7 +380,7 @@ export default function OnboardingGuide() {
                 <button
                   type="button"
                   onClick={finish}
-                  className="h-[38px] rounded-[var(--gg-radius-control)] px-[12px] text-[12px] font-medium text-[var(--gg-slate)] hover:bg-[var(--gg-cloud)] hover:text-[var(--gg-ink)]"
+                  className="h-[38px] rounded-[var(--gg-radius-control)] px-[12px] gg-type-meta font-medium text-[var(--gg-slate)] hover:bg-[var(--gg-cloud)] hover:text-[var(--gg-ink)]"
                 >
                   稍后了解
                 </button>
@@ -388,7 +388,7 @@ export default function OnboardingGuide() {
               <button
                 type="button"
                 onClick={goNext}
-                className="flex h-[38px] min-w-[118px] items-center justify-center gap-[8px] rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-[18px] text-[12px] font-semibold text-white shadow-[0_10px_24px_rgba(49,87,232,.24)] hover:-translate-y-px hover:bg-[#244bc7] motion-reduce:transform-none"
+                className="flex h-[38px] min-w-[118px] items-center justify-center gap-[8px] rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-[18px] gg-type-meta font-semibold text-white shadow-[0_10px_24px_rgba(49,87,232,.24)] hover:-translate-y-px hover:bg-[#244bc7] motion-reduce:transform-none"
               >
                 {isLast ? '开始使用' : '下一步'}
                 {isLast ? <CircleCheck className="size-[15px]" /> : <ChevronRight className="size-[15px]" />}

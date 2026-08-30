@@ -310,7 +310,7 @@ export default function ConversationLogsTab() {
           variant="link"
           disabled={detailLoading}
           onClick={() => void openDetail(row)}
-          className="h-auto p-0 text-[12px] font-normal text-[#1a71ff] hover:text-[#4a8dff] hover:no-underline disabled:text-[#c0c6d4]"
+          className="h-auto p-0 gg-type-meta font-normal text-[#1a71ff] hover:text-[#4a8dff] hover:no-underline disabled:text-[#c0c6d4]"
         >
           查看
         </UIButton>
@@ -321,7 +321,7 @@ export default function ConversationLogsTab() {
   const renderMobileCard = (row: ConversationLogRow) => (
     <article className={MOBILE_CARD_CLASS} key={row.id}>
       <div className="flex min-w-0 items-start justify-between gap-[10px]">
-        <strong className="min-w-0 wrap-break-word text-[14px] font-semibold text-[#18181a]">
+        <strong className="min-w-0 wrap-break-word gg-type-body font-semibold text-[#18181a]">
           {row.title || row.summary || row.last_agent_question || row.id}
         </strong>
         <div className="flex shrink-0 flex-wrap justify-end gap-[4px]">
@@ -330,14 +330,14 @@ export default function ConversationLogsTab() {
           {!row.upFeedback && !row.downFeedback && <StatusBadge tone="blue">未评价</StatusBadge>}
         </div>
       </div>
-      <p className="mt-[8px] line-clamp-2 text-[12px] leading-[1.55] text-[#858b9c]">
+      <p className="mt-[8px] line-clamp-2 gg-type-meta  text-[#858b9c]">
         {row.downFeedback?.latest_message ||
           row.upFeedback?.latest_message ||
           row.summary ||
           row.last_agent_question ||
           '-'}
       </p>
-      <div className="mt-[10px] flex items-center justify-between gap-[10px] text-[12px] text-[#858b9c]">
+      <div className="mt-[10px] flex items-center justify-between gap-[10px] gg-type-meta text-[#858b9c]">
         <span className="truncate" title={agentLabel(row)}>{agentLabel(row)}</span>
         <span className="shrink-0">{formatDateTime(row.updated_at)}</span>
       </div>
@@ -346,7 +346,7 @@ export default function ConversationLogsTab() {
           variant="link"
           disabled={detailLoading}
           onClick={() => void openDetail(row)}
-          className="h-auto p-0 text-[12px] font-normal text-[#1a71ff] hover:text-[#4a8dff] hover:no-underline disabled:text-[#c0c6d4]"
+          className="h-auto p-0 gg-type-meta font-normal text-[#1a71ff] hover:text-[#4a8dff] hover:no-underline disabled:text-[#c0c6d4]"
         >
           查看
         </UIButton>
@@ -362,7 +362,7 @@ export default function ConversationLogsTab() {
       >
         <div className="flex items-center gap-[6px] px-[12px] text-[#757f9c]">
           <IconCalendar className="size-[14px] shrink-0" />
-          <span className="text-[14px] font-normal leading-none">对话记录</span>
+          <span className="gg-type-body font-normal">对话记录</span>
         </div>
 
         <div className="flex flex-wrap items-stretch gap-[20px]" aria-label="对话反馈统计">
@@ -375,7 +375,7 @@ export default function ConversationLogsTab() {
         {summary && (summary.summary || summary.bucket_counts.length > 0) && (
           <div className="flex flex-col gap-[12px] rounded-[14px] border border-[#eef0f4] bg-[#fafbfc] px-[20px] py-[16px]">
             {summary.summary && (
-              <p className="wrap-break-word text-[13px] leading-[1.7] text-[#464c5e]">
+              <p className="wrap-break-word gg-type-control  text-[#464c5e]">
                 {summary.summary}
               </p>
             )}
@@ -408,7 +408,7 @@ export default function ConversationLogsTab() {
           {rows.length ? (
             rows.map(renderMobileCard)
           ) : (
-            <div className="py-[40px] text-center text-[13px] text-[#858b9c]">暂无对话日志</div>
+            <div className="py-[40px] text-center gg-type-control text-[#858b9c]">暂无对话日志</div>
           )}
         </div>
 
@@ -466,7 +466,7 @@ function FeedbackDetailDialog({
       >
         <div className="flex items-center gap-[6px] px-[12px] text-[#757f9c]">
           <Clock className="size-[14px] shrink-0" />
-          <DialogTitle className="text-[14px] font-normal leading-none text-[#757f9c]">
+          <DialogTitle className="gg-type-card-title font-normal text-[#757f9c]">
             对话日志详情
           </DialogTitle>
         </div>
@@ -591,7 +591,7 @@ function FeedbackMessage({
                 variant="outline"
                 disabled={reanalyzing}
                 onClick={() => onReanalyze(item.feedback_id as string)}
-                className="mt-[8px] h-[30px] gap-[4px] rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[14px] text-[12px] font-normal text-[#757f9c] hover:border-[#cbd3e6] hover:text-[#18181a]"
+                className="mt-[8px] h-[30px] gap-[4px] rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[14px] gg-type-meta font-normal text-[#757f9c] hover:border-[#cbd3e6] hover:text-[#18181a]"
               >
                 <RefreshCw className={cn('size-3.5', reanalyzing && 'animate-spin')} />
                 重新分析

@@ -1,6 +1,7 @@
 import type { ReactNode } from 'react';
 
 import { Sheet, SheetContent } from '@/components/ui';
+import { DETAIL_ACTIONS_CLASS, DETAIL_FACT_CARD_CLASS } from '@/lib/enterprise-ui';
 import { cn } from '@/lib/utils';
 import { XIcon } from 'lucide-react';
 
@@ -40,7 +41,7 @@ export type PlatformEmployeeDrawerProps = {
 };
 
 function DrawerDivider() {
-  return <div className="h-px w-full shrink-0 bg-[#e3e7f1]" />;
+  return <div className="h-px w-full shrink-0 bg-[var(--gg-line)]" />;
 }
 
 function NavChevron({
@@ -60,7 +61,7 @@ function NavChevron({
       aria-label={label}
       disabled={disabled}
       onClick={onClick}
-      className="grid size-[14px] place-items-center text-[#757f9c] transition-colors enabled:hover:text-[#18181a] disabled:cursor-not-allowed disabled:opacity-35"
+      className="grid size-[24px] place-items-center rounded-[var(--gg-radius-control)] text-[var(--gg-text-muted)] transition-colors enabled:hover:bg-[var(--gg-surface-subtle)] enabled:hover:text-[var(--gg-text-primary)] disabled:cursor-not-allowed disabled:opacity-35 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--gg-interaction)]"
     >
       <IconChevronDown
         className={cn('size-[14px]', direction === 'prev' ? 'rotate-90' : '-rotate-90')}
@@ -99,17 +100,18 @@ export default function PlatformEmployeeDrawer({
   const effectiveStatusKind: EmployeeStatusKind = statusKind
     || (statusLabel ? 'available' : online ? 'online' : 'offline');
   const statusPresentation = {
-    online: { badge: 'border-[#96d9b0] bg-[#e9f7ef] text-[#2cb360]', dot: 'bg-[#22c55e]' },
-    available: { badge: 'border-[#c7d4f5] bg-[#f0f4ff] text-[#526bc4]', dot: 'bg-[#5474dd]' },
-    offline: { badge: 'border-[#d1d5db] bg-[#f3f4f6] text-[#757f9c]', dot: 'bg-[#9ca3af]' },
+    online: { badge: 'border-[var(--gg-capability-line)] bg-[var(--gg-state-success-soft)] text-[var(--gg-state-success)]', dot: 'bg-[var(--gg-state-success)]' },
+    available: { badge: 'border-[var(--gg-line)] bg-[var(--gg-interaction-soft)] text-[var(--gg-interaction)]', dot: 'bg-[var(--gg-interaction)]' },
+    offline: { badge: 'border-[var(--gg-line)] bg-[var(--gg-state-neutral-soft)] text-[var(--gg-text-muted)]', dot: 'bg-[var(--gg-text-muted)]' },
   }[effectiveStatusKind];
   return (
     <Sheet open={open} onOpenChange={(next) => { if (!next) onClose(); }}>
       <SheetContent
         side="right"
         showCloseButton={false}
+        data-detail-container="drawer"
         className={cn(
-          'platform-employee-drawer flex w-[400px] flex-col gap-[10px] border-[0.5px] border-[#e3e7f1] bg-white p-[16px_20px] shadow-[0_4px_15px_rgba(0,0,0,0.25)] sm:max-w-[400px]',
+          'platform-employee-drawer gg-detail-surface gg-detail-surface--drawer flex w-[400px] flex-col gap-[10px] border border-[var(--gg-line)] bg-[var(--gg-surface)] p-[16px_20px] shadow-[0_12px_32px_rgba(24,33,61,0.14)] sm:max-w-[400px]',
           'top-[24px]! right-[24px]! bottom-[24px]! left-auto! h-auto! max-h-[calc(100vh-48px)] rounded-[20px]',
           '',
         )}
@@ -117,7 +119,7 @@ export default function PlatformEmployeeDrawer({
         <div className="flex w-full shrink-0 flex-col gap-[10px]">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-[4px]">
-              <span className="text-[12px] font-medium capitalize text-[#464c5e]">
+              <span className="gg-type-meta capitalize text-[var(--gg-text-secondary)]">
                 {platformTitle}
               </span>
               <NavChevron direction="prev" disabled={!hasPrev} onClick={onPrev} label="上一位员工" />
@@ -127,7 +129,7 @@ export default function PlatformEmployeeDrawer({
               type="button"
               aria-label="关闭"
               onClick={onClose}
-              className="grid size-[14px] place-items-center text-[#757f9c] transition-colors hover:text-[#18181a]"
+              className="grid size-[24px] place-items-center rounded-[var(--gg-radius-control)] text-[var(--gg-text-muted)] transition-colors hover:bg-[var(--gg-surface-subtle)] hover:text-[var(--gg-text-primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--gg-interaction)]"
             >
               <XIcon className="size-[14px]" strokeWidth={1.75} />
             </button>
@@ -135,7 +137,7 @@ export default function PlatformEmployeeDrawer({
           <DrawerDivider />
         </div>
 
-        <div className="flex min-h-0 flex-1 flex-col gap-[10px] overflow-auto px-[4px] pt-[48px]">
+        <div className="flex min-h-0 flex-1 flex-col gap-[10px] overflow-auto overscroll-contain px-[4px] pt-[48px]">
           <div className="flex w-full items-end gap-[10px] pb-[4px]">
             <div className="flex h-[117.5px] w-[100px] shrink-0 items-end justify-center overflow-hidden">
               <EmployeeAvatar
@@ -149,16 +151,16 @@ export default function PlatformEmployeeDrawer({
             </div>
             <div className="flex min-w-0 flex-1 flex-col justify-center gap-[8px] pb-[2px]">
               <div className="flex flex-col gap-[4px]">
-                <p className="truncate text-[16px] font-medium capitalize text-[#464c5e]">
+                <p className="gg-type-card-title truncate capitalize">
                   {name}
                 </p>
-                <p className="line-clamp-2 text-[12px] leading-[18px] text-[#757f9c]">
+                <p className="gg-type-body line-clamp-2">
                   {description}
                 </p>
               </div>
               <span
                 className={cn(
-                  'inline-flex w-fit items-center gap-[4px] rounded-[90px] border-[0.5px] px-[10px] py-[4px]',
+                  'gg-type-caption inline-flex w-fit items-center gap-[4px] rounded-full border px-[10px] py-[4px]',
                   statusPresentation.badge,
                 )}
               >
@@ -166,7 +168,7 @@ export default function PlatformEmployeeDrawer({
                   className={cn('size-[4px] shrink-0 rounded-full shadow-[inset_1px_1px_2px_0.5px_rgba(0,0,0,0.05)]', statusPresentation.dot)}
                   aria-hidden="true"
                 />
-                <span className="text-[10px] capitalize">{statusLabel || (online ? '在线' : '下线')}</span>
+                <span className="capitalize">{statusLabel || (online ? '在线' : '下线')}</span>
               </span>
             </div>
           </div>
@@ -176,60 +178,58 @@ export default function PlatformEmployeeDrawer({
               <div
                 key={stat.label}
                 className={cn(
-                  'flex h-[60px] flex-1 flex-col justify-center gap-[4px] border-[0.5px] border-[#e3e7f1] px-[20px] py-[8px]',
+                  'gg-type-control flex h-[60px] flex-1 flex-col justify-center gap-[4px] border border-[var(--gg-line)] bg-[var(--gg-surface-subtle)] px-[20px] py-[8px]',
                   index === 0 && 'rounded-l-[14px]',
                   index === stats.length - 1 && 'rounded-r-[14px]',
                   index > 0 && 'border-l-0',
                 )}
               >
-                <strong className="text-[18px] font-medium text-[#18181a]">{stat.value}</strong>
-                <span className="text-[10px] text-[#464c5e]">{stat.label}</span>
+                <strong className="gg-type-section-title font-semibold text-[var(--gg-text-primary)]">{stat.value}</strong>
+                <span className="gg-type-caption text-[var(--gg-text-secondary)]">{stat.label}</span>
               </div>
             ))}
           </div>
 
           <div className="grid grid-cols-2 gap-[10px]">
-            <div className="flex min-h-[60px] flex-col justify-center gap-[4px] rounded-[14px] border-[0.5px] border-[#e3e7f1] px-[16px] py-[8px]">
-              <span className="text-[10px] leading-[13px] text-[#464c5e]">分类</span>
-              <strong className="truncate text-[12px] leading-[16px] font-medium text-[#18181a]">{platformTitle}</strong>
+            <div className={cn('flex min-h-[60px] flex-col justify-center gap-[4px] px-[16px] py-[8px]', DETAIL_FACT_CARD_CLASS)}>
+              <span className="gg-type-caption text-[var(--gg-text-secondary)]">分类</span>
+              <strong className="gg-type-control truncate font-semibold text-[var(--gg-text-primary)]">{platformTitle}</strong>
             </div>
-            <div className="flex min-h-[60px] flex-col justify-center gap-[4px] rounded-[14px] border-[0.5px] border-[#e3e7f1] px-[16px] py-[8px]">
-              <span className="text-[10px] leading-[13px] text-[#464c5e]">分类</span>
-              <strong className="truncate text-[12px] leading-[16px] font-medium text-[#18181a]">{role}</strong>
+            <div className={cn('flex min-h-[60px] flex-col justify-center gap-[4px] px-[16px] py-[8px]', DETAIL_FACT_CARD_CLASS)}>
+              <span className="gg-type-caption text-[var(--gg-text-secondary)]">分类</span>
+              <strong className="gg-type-control truncate font-semibold text-[var(--gg-text-primary)]">{role}</strong>
             </div>
           </div>
 
           <div className="flex min-h-0 flex-1 flex-col gap-[8px]">
-            <span className="text-[12px] capitalize text-[#464c5e]">说明</span>
+            <span className="gg-type-control capitalize text-[var(--gg-text-primary)]">说明</span>
             <div className="flex min-h-0 flex-1 flex-col gap-[10px]">
               {workStyles.length > 0 && (
                 <div className="flex flex-wrap gap-[10px]">
                   {workStyles.slice(0, 3).map((tag) => (
                     <span
                       key={tag}
-                      className="rounded-[10px] bg-[#f6f6f6] px-[12px] py-[4px] text-[12px] text-[#757f9c]"
+                      className="gg-type-caption rounded-[var(--gg-radius-control)] bg-[var(--gg-state-neutral-soft)] px-[12px] py-[4px]"
                     >
                       {tag}
                     </span>
                   ))}
                 </div>
               )}
-              <p className="text-[12px] leading-[20px] text-[#757f9c]">
+              <p className="gg-type-body">
                 {detailText}
               </p>
             </div>
           </div>
         </div>
 
-        <DrawerDivider />
-
-        <div className="flex shrink-0 justify-end gap-[10px]">
+        <div className={DETAIL_ACTIONS_CLASS}>
           {canManage && onDelete && (
             <button
               type="button"
               disabled={deleting}
               onClick={onDelete}
-              className="inline-flex h-[34px] w-[80px] items-center justify-center gap-[4px] rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white text-[12px] text-[#757f9c] transition-colors hover:border-[#d20b0b] hover:text-[#d20b0b] disabled:cursor-not-allowed disabled:opacity-50"
+              className="gg-type-control inline-flex h-[34px] w-[80px] items-center justify-center gap-[4px] rounded-[var(--gg-radius-control)] border border-[var(--gg-line)] bg-[var(--gg-surface)] text-[var(--gg-text-muted)] transition-colors hover:border-[var(--gg-state-danger)] hover:bg-[var(--gg-state-danger-soft)] hover:text-[var(--gg-state-danger)] disabled:cursor-not-allowed disabled:opacity-50"
             >
               <IconTrash className="size-[14px]" />
               删除
@@ -238,14 +238,14 @@ export default function PlatformEmployeeDrawer({
           <button
             type="button"
             onClick={onCopy}
-            className="inline-flex h-[34px] items-center justify-center rounded-[var(--gg-radius-control)] border border-[#d7deed] bg-white px-[14px] text-[12px] font-semibold text-[#52617d] transition-colors hover:border-[var(--gg-cobalt)] hover:text-[var(--gg-cobalt)]"
+            className="gg-type-control inline-flex h-[34px] items-center justify-center rounded-[var(--gg-radius-control)] border border-[var(--gg-line)] bg-[var(--gg-surface)] px-[14px] font-semibold text-[var(--gg-text-secondary)] transition-colors hover:border-[var(--gg-interaction)] hover:bg-[var(--gg-interaction-soft)] hover:text-[var(--gg-interaction)]"
           >
             复制并定制
           </button>
           <button
             type="button"
             onClick={onUse}
-            className="inline-flex h-[34px] items-center justify-center rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-[14px] text-[12px] font-semibold text-white transition-colors hover:bg-[#244bc7]"
+            className="gg-type-control inline-flex h-[34px] items-center justify-center rounded-[var(--gg-radius-control)] bg-[var(--gg-interaction)] px-[14px] font-semibold text-white transition-colors hover:bg-[var(--gg-interaction-hover)]"
           >
             添加使用并开始对话
           </button>

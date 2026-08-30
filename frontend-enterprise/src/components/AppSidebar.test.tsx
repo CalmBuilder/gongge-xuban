@@ -80,3 +80,19 @@ it('管理员通过平级入口管理平台内置专家模板', () => {
   expect(screen.getByText('Skill 管理')).toBeInTheDocument();
   expect(screen.queryByText('专家广场')).not.toBeInTheDocument();
 });
+
+it('keeps the lower management panel intrinsic and lets only primary navigation scroll', () => {
+  renderSidebar([]);
+
+  const header = document.querySelector('[data-sidebar="header"]');
+  const content = document.querySelector('[data-sidebar="content"]');
+  const footer = document.querySelector('[data-sidebar="footer"]');
+  const primaryButton = screen.getByRole('button', { name: '开放广场平台' });
+
+  expect(header).toHaveClass('min-h-0', 'flex-1', 'overflow-hidden');
+  expect(header).not.toHaveClass('h-[var(--gg-sidebar-primary-slot)]', 'shrink-0');
+  expect(content).toHaveClass('min-h-0', 'flex-none!', 'overflow-visible!', 'overscroll-contain');
+  expect(content).not.toHaveClass('flex-1', 'overflow-y-auto');
+  expect(footer).toHaveClass('min-h-[var(--gg-sidebar-footer-slot)]', 'shrink-0');
+  expect(primaryButton).toHaveClass('h-[40px]', 'gap-[var(--gg-sidebar-control-gap)]', 'px-[16px]');
+});

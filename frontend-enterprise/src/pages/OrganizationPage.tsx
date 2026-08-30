@@ -11,6 +11,7 @@ import {
 } from 'lucide-react';
 
 import AppHeader from '@/components/AppHeader';
+import { PageShell } from '@/components/enterprise/PageShell';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { OrganizationTreeNavigator } from '@/components/OrganizationTreeNavigator';
 import { Paginator } from '@/components/Paginator';
@@ -480,20 +481,20 @@ export default function OrganizationPage({
   }
 
   return (
-    <div className="min-h-full box-border px-[32px] pt-[28px] pb-[40px] max-[900px]:px-[14px]">
+    <PageShell template="management">
       <AppHeader onLogout={onLogout} userName={currentUser?.username} title="组织与岗位" />
 
       <div className="mt-[18px] overflow-hidden rounded-[24px] border border-[#e5e9f2] bg-white shadow-[0_22px_60px_rgba(32,48,86,0.08)]">
         <header className="flex items-center justify-between gap-[18px] border-b border-[#edf0f6] bg-[linear-gradient(110deg,#f4f7ff_0%,#ffffff_58%,#fff9ed_100%)] px-[24px] py-[20px]">
           <div>
-            <div className="flex items-center gap-[8px] text-[11px] font-semibold tracking-[0.16em] text-[#68769e]">
+            <div className="gg-type-caption flex items-center gap-[8px] font-semibold tracking-[0.16em] text-[#68769e]">
               <GitBranch className="size-[14px]" />
               企业责任链
             </div>
-            <h1 className="mt-[7px] text-[20px] font-semibold tracking-[-0.02em] text-[#1d2433]">
+            <h1 className="gg-type-section-title mt-[7px]">
               谁在什么组织、以什么岗位承担工作
             </h1>
-            <p className="mt-[5px] text-[12px] text-[#778095]">
+            <p className="gg-type-meta mt-[5px]">
               调岗追加任期历史；岗位默认角色决定流程候选资格，不改变平台管理员身份。
             </p>
           </div>
@@ -506,7 +507,7 @@ export default function OrganizationPage({
         <div className="grid min-h-[610px] grid-cols-[280px_minmax(0,1fr)] max-[980px]:grid-cols-1">
           <aside className="border-r border-[#edf0f6] bg-[#fbfcff] p-[16px] max-[980px]:border-r-0 max-[980px]:border-b">
             <div className="flex items-center justify-between px-[6px] pb-[12px]">
-              <span className="text-[12px] font-semibold text-[#424b61]">企业组织树</span>
+              <span className="gg-type-control font-semibold text-[#424b61]">企业组织树</span>
               <Button
                 size="sm"
                 variant="ghost"
@@ -531,12 +532,12 @@ export default function OrganizationPage({
                 <div className="flex flex-wrap items-start justify-between gap-[12px] border-b border-[#edf0f6] pb-[17px]">
                   <div>
                     <div className="flex items-center gap-[8px]">
-                      <h2 className="text-[18px] font-semibold text-[#202637]">{selectedUnit.name}</h2>
-                      <span className="rounded-full bg-[#f1f4fa] px-[8px] py-[3px] font-mono text-[10px] text-[#727b90]">
+                      <h2 className="gg-type-section-title">{selectedUnit.name}</h2>
+                      <span className="gg-type-code rounded-full bg-[#f1f4fa] px-[8px] py-[3px] text-[#727b90]">
                         {selectedUnit.code}
                       </span>
                     </div>
-                    <p className="mt-[5px] text-[11px] text-[#8a92a4]">
+                    <p className="gg-type-meta mt-[5px]">
                       直属 {summary?.direct_member_count ?? '—'} 人 · 子树 {summary?.subtree_member_count ?? '—'} 人
                       {' · '}{unitPositions.length} 个岗位 · {summary?.current_leader_count ?? '—'} 名当前负责人
                     </p>
@@ -574,7 +575,7 @@ export default function OrganizationPage({
                   <DetailPanel
                     title="组织负责人（当前与历史）"
                     icon={<UserRoundPlus className="size-[15px]" />}
-                    action={<span className="text-[9px] text-[#9299aa]">责任关系，不自动授予角色或权限</span>}
+                    action={<span className="gg-type-meta">责任关系，不自动授予角色或权限</span>}
                   >
                     {leaders.length ? leaders.map((leader) => {
                       const member = memberByProfile.get(leader.employee_profile_id);
@@ -586,13 +587,13 @@ export default function OrganizationPage({
                             leader.status === 'active' ? 'bg-[#2eaf72]' : 'bg-[#c7ccd6]',
                           )} />
                           <div className="min-w-0 flex-1">
-                            <p className="truncate text-[12px] font-medium text-[#3d4558]">
+                            <p className="gg-type-control truncate text-[#3d4558]">
                               {member?.employee_name || member?.display_name || '成员信息未加载'}
-                              <span className="ml-[7px] text-[10px] font-normal text-[#6677a8]">
+                              <span className="gg-type-meta ml-[7px] text-[#6677a8]">
                                 {type?.name || leader.leader_type_code}
                               </span>
                             </p>
-                            <p className="mt-[2px] text-[9px] text-[#949bad]">
+                            <p className="gg-type-meta mt-[2px]">
                               {formatDateTime(leader.effective_from)}
                               {leader.effective_until ? ` — ${formatDateTime(leader.effective_until)}` : ' — 至今'}
                             </p>
@@ -600,7 +601,7 @@ export default function OrganizationPage({
                           {leader.status === 'active' ? (
                             <button
                               type="button"
-                              className="text-[10px] text-[#9a6370] hover:text-[#bd2948]"
+                              className="gg-type-control text-[#9a6370] hover:text-[#bd2948]"
                               onClick={() => setStopTarget({
                                 kind: 'leader',
                                 id: leader.id,
@@ -613,7 +614,7 @@ export default function OrganizationPage({
                         </div>
                       );
                     }) : (
-                      <p className="py-[14px] text-[11px] text-[#8b93a5]">
+                      <p className="gg-type-meta py-[14px]">
                         尚未明确负责人。平台不会根据岗位名称或组织层级自动推断。
                       </p>
                     )}
@@ -635,8 +636,8 @@ export default function OrganizationPage({
 
                 <section className="mt-[18px]">
                   <div className="mb-[10px] flex items-center justify-between">
-                    <h3 className="text-[12px] font-semibold text-[#4e566b]">岗位目录</h3>
-                    <span className="text-[10px] text-[#9299aa]">选择岗位查看任职与默认角色</span>
+                    <h3 className="gg-type-card-title">岗位目录</h3>
+                    <span className="gg-type-meta">选择岗位查看任职与默认角色</span>
                   </div>
                   {unitPositions.length ? (
                     <div className="grid grid-cols-2 gap-[10px] max-[760px]:grid-cols-1">
@@ -654,10 +655,10 @@ export default function OrganizationPage({
                           onClick={() => setSelectedPositionId(position.id)}
                         >
                           <div className="flex items-center justify-between gap-[10px]">
-                            <span className="text-[13px] font-semibold text-[#303749]">{position.name}</span>
-                            <span className="font-mono text-[9px] text-[#8c94a6]">{position.code}</span>
+                            <span className="gg-type-control font-semibold text-[#303749]">{position.name}</span>
+                            <span className="gg-type-code text-[#8c94a6]">{position.code}</span>
                           </div>
-                          <p className="mt-[7px] line-clamp-2 text-[11px] leading-[17px] text-[#7b8395]">
+                          <p className="gg-type-meta mt-[7px] line-clamp-2">
                             {position.responsibility || '尚未填写岗位职责'}
                           </p>
                         </button>
@@ -669,17 +670,17 @@ export default function OrganizationPage({
                 </section>
 
                 <section className="mt-[18px]">
-                  <h3 className="mb-[9px] text-[12px] font-semibold text-[#4e566b]">当前组织成员</h3>
+                  <h3 className="gg-type-card-title mb-[9px]">当前组织成员</h3>
                   <div className="flex flex-wrap gap-[7px]">
                     {currentOrgAssignments.length ? currentOrgAssignments.map((assignment) => {
                       const member = memberByProfile.get(assignment.employee_profile_id);
                       const label = member?.employee_name || member?.display_name || '成员信息未加载';
                       return (
-                        <span key={assignment.id} className="flex items-center gap-[7px] rounded-full border border-[#e1e6f0] bg-[#fafbfe] px-[10px] py-[5px] text-[10px] text-[#596174]">
+                        <span key={assignment.id} className="gg-type-control flex items-center gap-[7px] rounded-full border border-[#e1e6f0] bg-[#fafbfe] px-[10px] py-[5px] text-[#596174]">
                           {label}
                           <button
                             type="button"
-                            className="text-[#9a6370] hover:text-[#bd2948]"
+                            className="gg-type-control text-[#9a6370] hover:text-[#bd2948]"
                             onClick={() => setStopTarget({
                               kind: 'org-assignment',
                               id: assignment.id,
@@ -690,7 +691,7 @@ export default function OrganizationPage({
                           </button>
                         </span>
                       );
-                    }) : <span className="text-[11px] text-[#8b93a5]">暂无当前成员。</span>}
+                    }) : <span className="gg-type-meta">暂无当前成员。</span>}
                   </div>
                   {memberTotal > ORGANIZATION_MEMBER_PAGE_SIZE ? (
                     <Paginator
@@ -732,10 +733,10 @@ export default function OrganizationPage({
                                 assignment.status === 'active' ? 'bg-[#2eaf72]' : 'bg-[#c7ccd6]',
                               )} />
                               <div className="min-w-0 flex-1">
-                                <p className="truncate text-[12px] font-medium text-[#3d4558]">
+                                <p className="gg-type-control truncate text-[#3d4558]">
                                   {member?.employee_name || member?.display_name || '成员信息未加载'}
                                 </p>
-                                <p className="mt-[2px] text-[9px] text-[#949bad]">
+                                <p className="gg-type-meta mt-[2px]">
                                   {formatDateTime(assignment.effective_from)}
                                   {assignment.effective_until ? ` — ${formatDateTime(assignment.effective_until)}` : ' — 至今'}
                                 </p>
@@ -743,7 +744,7 @@ export default function OrganizationPage({
                               {assignment.status === 'active' ? (
                                 <button
                                   type="button"
-                                  className="text-[10px] text-[#9a6370] hover:text-[#bd2948]"
+                                  className="gg-type-control text-[#9a6370] hover:text-[#bd2948]"
                                   onClick={() => setStopTarget({
                                     kind: 'position-assignment',
                                     id: assignment.id,
@@ -757,7 +758,7 @@ export default function OrganizationPage({
                           );
                         })
                       ) : (
-                        <p className="py-[14px] text-[11px] text-[#8b93a5]">暂无任职记录。</p>
+                        <p className="gg-type-meta py-[14px]">暂无任职记录。</p>
                       )}
                       <PositionMemberPicker
                         key={`position-member-${selectedUnit.id}-${currentOrgAssignments.length}`}
@@ -781,15 +782,15 @@ export default function OrganizationPage({
                       {selectedBindings.length ? selectedBindings.map((binding) => (
                         <div key={binding.id} className="flex items-center justify-between gap-[10px] border-b border-[#eef1f5] py-[9px] last:border-0">
                           <div>
-                            <p className="text-[12px] font-medium text-[#3d4558]">{binding.business_role_name}</p>
-                            <p className="mt-[2px] font-mono text-[9px] text-[#949bad]">{binding.business_role_code}</p>
+                            <p className="gg-type-control text-[#3d4558]">{binding.business_role_name}</p>
+                            <p className="gg-type-code mt-[2px] text-[#949bad]">{binding.business_role_code}</p>
                           </div>
-                          <span className="rounded-full bg-[#fff4da] px-[8px] py-[3px] text-[9px] text-[#8c6209]">
+                          <span className="gg-type-control rounded-full bg-[#fff4da] px-[8px] py-[3px] text-[#8c6209]">
                             岗位带入
                           </span>
                           <button
                             type="button"
-                            className="text-[10px] text-[#9a6370] hover:text-[#bd2948]"
+                            className="gg-type-control text-[#9a6370] hover:text-[#bd2948]"
                             onClick={() => setStopTarget({
                               kind: 'binding',
                               id: binding.id,
@@ -803,7 +804,7 @@ export default function OrganizationPage({
                           </button>
                         </div>
                       )) : (
-                        <p className="py-[14px] text-[11px] text-[#8b93a5]">未配置默认角色，不会由此岗位进入流程候选。</p>
+                        <p className="gg-type-meta py-[14px]">未配置默认角色，不会由此岗位进入流程候选。</p>
                       )}
                     </DetailPanel>
                   </section>
@@ -867,7 +868,7 @@ export default function OrganizationPage({
         loading={saving}
         onConfirm={() => void confirmStop()}
       />
-    </div>
+    </PageShell>
   );
 }
 
@@ -890,8 +891,8 @@ function ResponsibilityImpactRail({
     >
       <div className="flex flex-wrap items-center gap-[8px]">
         <Workflow className="size-[17px] text-[#3157e8]" />
-        <h3 className="text-[13px] font-semibold text-[#30384c]">责任闭环轨道</h3>
-        <span className="text-[11px] text-[#69738a]">
+        <h3 className="gg-type-card-title">责任闭环轨道</h3>
+        <span className="gg-type-meta">
           这里展示真实绑定会进入哪些 SOP 人工节点，不根据岗位名称推断职责。
         </span>
       </div>
@@ -899,27 +900,27 @@ function ResponsibilityImpactRail({
         <ImpactNode eyebrow="组织岗位" title={position.name} detail={position.code} tone="blue" />
         <ImpactArrow label="带入" />
         <div className="rounded-[14px] border border-[#eadfca] bg-[#fffaf0] p-[13px]">
-          <p className="text-[11px] font-medium text-[#9a6a18]">默认业务角色</p>
+          <p className="gg-type-control text-[#9a6a18]">默认业务角色</p>
           <div className="mt-[8px] flex flex-wrap gap-[6px]">
             {bindings.length ? bindings.map((binding) => (
-              <span key={binding.id} className="rounded-full border border-[#ead9b8] bg-white px-[9px] py-[4px] text-[11px] font-medium text-[#6e5528]">
+              <span key={binding.id} className="gg-type-control rounded-full border border-[#ead9b8] bg-white px-[9px] py-[4px] text-[#6e5528]">
                 {binding.business_role_name}
               </span>
-            )) : <span className="text-[12px] text-[#8d7a58]">尚未绑定</span>}
+            )) : <span className="gg-type-meta text-[#8d7a58]">尚未绑定</span>}
           </div>
         </div>
         <ImpactArrow label="参与" />
         <div className="rounded-[14px] border border-[#d9e9e3] bg-[#f5fbf8] p-[13px]">
-          <p className="text-[11px] font-medium text-[#2c8065]">SOP 人工责任</p>
+          <p className="gg-type-control text-[#2c8065]">SOP 人工责任</p>
           {uniqueImpacts.length ? (
             <div className="mt-[7px] grid gap-[6px]">
               {uniqueImpacts.map((impact) => (
-                <div key={`${impact.skillId}:${impact.participant.node_id}`} className="flex flex-wrap items-center gap-x-[8px] gap-y-[3px] text-[12px] text-[#344a43]">
-                  <span className="font-semibold">{impact.skillName}</span>
-                  <span className="font-mono text-[11px] text-[#6d817a]">{impact.participant.node_id}</span>
+                <div key={`${impact.skillId}:${impact.participant.node_id}`} className="gg-type-control flex flex-wrap items-center gap-x-[8px] gap-y-[3px] text-[#344a43]">
+                  <span className="gg-type-control font-semibold">{impact.skillName}</span>
+                  <span className="gg-type-code text-[#6d817a]">{impact.participant.node_id}</span>
                   {impact.participant.context_count ? (
                     <span className={cn(
-                      'rounded-full px-[7px] py-[2px] text-[11px]',
+                      'gg-type-control rounded-full px-[7px] py-[2px]',
                       impact.participant.covered_context_count === impact.participant.context_count
                         ? 'bg-[#dcf5e9] text-[#237657]'
                         : 'bg-[#fff0e1] text-[#a15a16]',
@@ -931,7 +932,7 @@ function ResponsibilityImpactRail({
               ))}
             </div>
           ) : (
-            <div className="mt-[8px] flex items-center gap-[7px] text-[12px] text-[#71817b]">
+            <div className="gg-type-meta mt-[8px] flex items-center gap-[7px] text-[#71817b]">
               <CircleAlert className="size-[15px]" />
               当前角色尚未被已发布 SOP 的人工节点引用。
             </div>
@@ -958,16 +959,16 @@ function ImpactNode({
       'rounded-[14px] border p-[13px]',
       tone === 'blue' && 'border-[#d8e0f5] bg-[#f5f7ff]',
     )}>
-      <p className="text-[11px] font-medium text-[#5570c4]">{eyebrow}</p>
-      <p className="mt-[5px] text-[13px] font-semibold text-[#30384c]">{title}</p>
-      <p className="mt-[3px] font-mono text-[11px] text-[#78839a]">{detail}</p>
+      <p className="gg-type-caption text-[#5570c4]">{eyebrow}</p>
+      <p className="gg-type-control mt-[5px] font-semibold text-[#30384c]">{title}</p>
+      <p className="gg-type-code mt-[3px] text-[#78839a]">{detail}</p>
     </div>
   );
 }
 
 function ImpactArrow({ label }: { label: string }) {
   return (
-    <div className="flex items-center justify-center text-[11px] font-medium text-[#8190b2] lg:flex-col">
+    <div className="gg-type-caption flex items-center justify-center text-[#8190b2] lg:flex-col">
       <span>{label}</span>
       <span aria-hidden="true">→</span>
     </div>
@@ -998,7 +999,7 @@ function DetailPanel({
     <div className="rounded-[16px] border border-[#e5e9f1] bg-[#fcfdff] p-[14px]">
       <div className="flex min-h-[30px] items-center gap-[7px] border-b border-[#edf0f5] pb-[9px] text-[#59647d]">
         {icon}
-        <h3 className="text-[12px] font-semibold">{title}</h3>
+        <h3 className="gg-type-card-title">{title}</h3>
         <div className="ml-auto">{action}</div>
       </div>
       {children}
@@ -1008,7 +1009,7 @@ function DetailPanel({
 
 function EmptyState({ text }: { text: string }) {
   return (
-    <div className="rounded-[14px] border border-dashed border-[#d8deea] bg-[#fafbfe] px-[18px] py-[28px] text-center text-[11px] text-[#8b93a5]">
+    <div className="gg-type-meta rounded-[14px] border border-dashed border-[#d8deea] bg-[#fafbfe] px-[18px] py-[28px] text-center">
       {text}
     </div>
   );
@@ -1330,8 +1331,8 @@ function EditorDialog({
               />
             </Field>
             <div className="rounded-[14px] border border-[#dce4f4] bg-[#f7f9ff] p-[12px]">
-              <p className="text-[12px] font-semibold text-[#3c4a70]">绑定影响预览</p>
-              <p className="mt-[5px] text-[12px] leading-[18px] text-[#66718a]">
+              <p className="gg-type-control font-semibold text-[#3c4a70]">绑定影响预览</p>
+              <p className="gg-type-meta mt-[5px]">
                 {selectedRoleId
                   ? `${formatRoleImpactSummary(roleImpacts)}。保存后，当前岗位的有效任职人会在该岗位组织范围内获得此角色。`
                   : '选择角色后，系统会列出它关联的已发布 SOP 人工节点。'}
@@ -1342,7 +1343,7 @@ function EditorDialog({
                     `${impact.skillId}:${impact.participant.node_id}`,
                     impact,
                   ])).values()].map((impact) => (
-                    <span key={`${impact.skillId}:${impact.participant.node_id}`} className="rounded-full border border-[#d5def2] bg-white px-[8px] py-[3px] text-[11px] text-[#506083]">
+                    <span key={`${impact.skillId}:${impact.participant.node_id}`} className="gg-type-control rounded-full border border-[#d5def2] bg-white px-[8px] py-[3px] text-[#506083]">
                       {impact.skillName} · {impact.participant.node_id}
                     </span>
                   ))}
@@ -1364,7 +1365,7 @@ function EditorDialog({
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <label className="grid gap-[6px] text-[11px] font-medium text-[#616a7d]">
+    <label className="gg-type-control grid gap-[6px] text-[#616a7d]">
       {label}
       {children}
     </label>

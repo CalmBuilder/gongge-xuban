@@ -107,7 +107,7 @@ export default function MessageBubble({ chat, item, render }: MessageBubbleProps
           className={chatBubbleClass(item.role, item.isError)}
         >
           {statusOnly ? (
-            <div className="text-[13px] text-[#858b9c]">{visibleContent}</div>
+            <div className="gg-type-control text-[#858b9c]">{visibleContent}</div>
           ) : showInlineTrace && summary ? (
             <ExecutionRecord
               traceTurnId={traceTurnId}

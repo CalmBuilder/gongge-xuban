@@ -16,6 +16,8 @@ import ExpertCategoryRail from '../components/ExpertCategoryRail';
 import ExpertFilterBar from '../components/ExpertFilterBar';
 import EmployeeCard from '../components/EmployeeCard';
 import EmployeeProfileEditor from '../components/EmployeeProfileEditor';
+import { CatalogGrid } from '../components/enterprise/CatalogGrid';
+import { PageShell } from '../components/enterprise/PageShell';
 import { Paginator } from '../components/Paginator';
 import {
   canManageEmployeeAgent,
@@ -51,7 +53,7 @@ function tabLabel(text: string, count: number) {
     <span className="inline-flex items-center gap-[6px]">
       {text}
       {count > 0 && (
-        <span className="rounded-full bg-[#eff1f7] px-[6px] py-[1px] text-[11px] leading-[16px] text-[#757f9c]">
+        <span className="rounded-full bg-[#eff1f7] px-[6px] py-[1px] gg-type-caption  text-[#757f9c]">
           {count}
         </span>
       )}
@@ -152,11 +154,18 @@ export default function EmployeeGalleryPage({
         `/api/enterprise/agents/gallery-page?${params.toString()}`,
       );
       if (requestId !== loadRequestId.current) return;
-      setAgents(result.items);
-      setTotal(result.total);
-      setScopeCounts(result.scope_counts);
-      setFacets(result.facets);
-      const lastPage = Math.max(1, Math.ceil(result.total / result.page_size));
+      const items = Array.isArray(result.items) ? result.items : [];
+      const totalCount = Number.isFinite(result.total) ? result.total : 0;
+      const facets = result.facets || EMPTY_FACETS;
+      setAgents(items);
+      setTotal(totalCount);
+      setScopeCounts(result.scope_counts || EMPTY_SCOPE_COUNTS);
+      setFacets({
+        sources: Array.isArray(facets.sources) ? facets.sources : [],
+        departments: Array.isArray(facets.departments) ? facets.departments : [],
+        directions: Array.isArray(facets.directions) ? facets.directions : [],
+      });
+      const lastPage = Math.max(1, Math.ceil(totalCount / (result.page_size || GALLERY_PAGE_SIZE)));
       if (page > lastPage) setPage(lastPage);
     } catch (error) {
       if (requestId !== loadRequestId.current) return;
@@ -400,7 +409,7 @@ export default function EmployeeGalleryPage({
   function employeeGrid(expertView: boolean) {
     return (
       <>
-      <div ref={gridRef} className={RESOURCE_GRID_CLASS}>
+      <CatalogGrid ref={gridRef} family="resource" className={RESOURCE_GRID_CLASS}>
         {agents.map((employee) => (
           <EmployeeCard
             key={employee.id}
@@ -448,7 +457,7 @@ export default function EmployeeGalleryPage({
             onReset={expertView && (hasExpertFilter || hasSearchTerm) ? clearExpertFilters : undefined}
           />
         )}
-      </div>
+      </CatalogGrid>
       {total > 0 && (
         <Paginator
           page={page}
@@ -463,7 +472,7 @@ export default function EmployeeGalleryPage({
   }
 
   return (
-    <div className="min-h-full box-border px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]" aria-busy={loading}>
+    <PageShell template="catalog" aria-busy={loading}>
       <AppHeader
         onLogout={onLogout}
         userName={currentUser?.username}
@@ -475,7 +484,7 @@ export default function EmployeeGalleryPage({
               onChange={(event) => setSearchTerm(event.target.value)}
               placeholder={activeScope === 'expert' ? '搜索专家…' : '搜索数字员工…'}
               aria-label={activeScope === 'expert' ? '搜索专家' : '搜索数字员工'}
-              className="min-w-0 flex-1 border-0 bg-transparent text-[14px] text-[#18181A] outline-none placeholder:text-[#757F9C]"
+              className="min-w-0 flex-1 border-0 bg-transparent gg-type-body text-[#18181A] outline-none placeholder:text-[#757F9C]"
             />
           </div>
         )}
@@ -488,7 +497,7 @@ export default function EmployeeGalleryPage({
         value={view}
         onChange={handleViewChange}
         items={viewTabs}
-        tabClassName="w-auto min-w-[96px] text-[15px]"
+        tabClassName="w-auto min-w-[96px] gg-type-body"
       />
 
       <UnderlineTabs
@@ -497,7 +506,7 @@ export default function EmployeeGalleryPage({
         value={activeScope}
         onChange={handleSubChange}
         items={subTabItems}
-        tabClassName="w-auto px-[14px] max-[560px]:min-h-[54px] max-[560px]:flex-1 max-[560px]:px-[6px] max-[560px]:text-[12px] max-[560px]:leading-[16px]"
+        tabClassName="w-auto px-[14px] max-[560px]:min-h-[54px] max-[560px]:flex-1 max-[560px]:px-[6px]"
       />
 
       {activeScope === 'expert' ? (
@@ -563,7 +572,7 @@ export default function EmployeeGalleryPage({
         description="删除会立即关闭员工入口并清理可回收配置；历史审计、执行记录和未能立即确认的外部资源会保留对账状态。"
         onConfirm={() => void confirmDelete()}
       />
-    </div>
+    </PageShell>
   );
 }
 
@@ -582,14 +591,14 @@ function EmployeeGalleryEmptyState({
         <span className="grid size-[34px] place-items-center rounded-[12px] bg-white text-[#98a2b3] shadow-[0_1px_8px_rgba(70,76,94,0.06)] ring-1 ring-[#edf1f6]">
           <IconSearch className="size-[16px] shrink-0" />
         </span>
-        <p className="mt-[12px] text-[14px] font-medium leading-[20px] text-[#7f879a]">
+        <p className="mt-[12px] gg-type-body font-medium  text-[#7f879a]">
           {title}
         </p>
-        <p className="mt-[4px] text-[11px] leading-[17px] text-[#a7adbb]">
+        <p className="mt-[4px] gg-type-caption  text-[#a7adbb]">
           {description}
         </p>
         {onReset && (
-          <button type="button" onClick={onReset} className="mt-[10px] text-[11px] font-medium text-[var(--gg-cobalt)] hover:underline">
+          <button type="button" onClick={onReset} className="mt-[10px] gg-type-caption font-medium text-[var(--gg-cobalt)] hover:underline">
             清除筛选
           </button>
         )}

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { BookOpen, ChevronRight, Plus, RefreshCw } from 'lucide-react';
 
 import AppHeader from '@/components/AppHeader';
+import { PageShell } from '@/components/enterprise/PageShell';
 import {
   Dialog,
   DialogContent,
@@ -163,7 +164,7 @@ export default function ReferenceDataPage({
   }
 
   return (
-    <div className="min-h-full box-border px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]">
+    <PageShell template="management">
       <AppHeader onLogout={onLogout} userName={currentUser?.username} title="数据码表" />
       <section className="mt-[20px] overflow-hidden rounded-[20px] border border-[#e8ebf3] bg-white shadow-[0_16px_44px_rgba(24,39,75,0.07)]">
         <header className="flex items-start justify-between gap-[16px] border-b border-[#eef1f6] px-[22px] py-[20px]">
@@ -172,8 +173,8 @@ export default function ReferenceDataPage({
               <BookOpen className="size-[18px]" />
             </span>
             <div>
-              <h2 className="text-[15px] font-semibold text-[#18181a]">企业业务码表</h2>
-              <p className="mt-[4px] text-[12px] leading-[18px] text-[#858b9c]">
+              <h2 className="gg-type-card-title">企业业务码表</h2>
+              <p className="gg-type-meta mt-[4px]">
                 编码创建后不可修改；停用阻止新数据引用，历史记录仍保留原编码。
               </p>
             </div>
@@ -200,15 +201,15 @@ export default function ReferenceDataPage({
                 aria-current={selectedSetCode === codeSet.code ? 'page' : undefined}
                 onClick={() => setSelectedSetCode(codeSet.code)}
                 className={cn(
-                  'mb-[5px] flex w-full items-center gap-[8px] rounded-[11px] px-[11px] py-[10px] text-left',
+                  'gg-type-control mb-[5px] flex w-full items-center gap-[8px] rounded-[11px] px-[11px] py-[10px] text-left',
                   selectedSetCode === codeSet.code
                     ? 'bg-[#eaf0ff] text-[#3157e8]'
                     : 'text-[#586174] hover:bg-[#f0f3f9]',
                 )}
               >
                 <span className="min-w-0 flex-1">
-                  <strong className="block truncate text-[12px]">{codeSet.name}</strong>
-                  <code className="mt-[2px] block truncate text-[9px] opacity-65">{codeSet.code}</code>
+                  <strong className="gg-type-control block truncate">{codeSet.name}</strong>
+                  <code className="gg-type-code mt-[2px] block truncate opacity-65">{codeSet.code}</code>
                 </span>
                 <ChevronRight className="size-[13px]" />
               </button>
@@ -218,10 +219,10 @@ export default function ReferenceDataPage({
           <main className="p-[20px]">
             <div className="flex items-start justify-between gap-[12px]">
               <div>
-                <h3 className="text-[14px] font-semibold text-[#252838]">{selectedSet?.name || '请选择码表'}</h3>
-                <p className="mt-[4px] text-[11px] text-[#8b92a3]">{selectedSet?.description}</p>
+                <h3 className="gg-type-card-title">{selectedSet?.name || '请选择码表'}</h3>
+                <p className="gg-type-meta mt-[4px]">{selectedSet?.description}</p>
                 {selectedSetCode === 'agent_category' && (
-                  <p className="mt-[5px] text-[11px] font-medium text-[#5570bd]">
+                  <p className="gg-type-control mt-[5px] text-[#5570bd]">
                     数字员工业务分类用于检索与展示，分类本身不产生权限。
                   </p>
                 )}
@@ -237,19 +238,19 @@ export default function ReferenceDataPage({
                   key={item.code}
                   type="button"
                   onClick={() => openEdit(item)}
-                  className="rounded-[14px] border border-[#e8ebf3] bg-[#fbfcff] p-[14px] text-left transition hover:border-[#b9c8f4] focus-visible:outline-2 focus-visible:outline-[var(--gg-cobalt)]"
+                  className="min-w-0 rounded-[14px] border border-[#e8ebf3] bg-[#fbfcff] p-[14px] text-left transition hover:border-[#b9c8f4] focus-visible:outline-2 focus-visible:outline-[var(--gg-cobalt)]"
                 >
                   <span className="flex items-center justify-between gap-[8px]">
-                    <strong className="truncate text-[13px] text-[#252838]">{item.name}</strong>
+                    <strong className="gg-type-control min-w-0 truncate text-[#252838]">{item.name}</strong>
                     <span className={cn(
-                      'rounded-full px-[7px] py-[2px] text-[9px]',
+                      'gg-type-control rounded-full px-[7px] py-[2px]',
                       item.status === 'active' ? 'bg-[#eaf8f0] text-[#18864b]' : 'bg-[#f1f2f5] text-[#7b8190]',
                     )}>
                       {item.status === 'active' ? '启用' : '停用'}
                     </span>
                   </span>
-                  <code className="mt-[7px] block text-[10px] text-[#5570bd]">{item.code}</code>
-                  <span className="mt-[6px] block text-[10px] text-[#9aa1b5]">
+                  <code className="gg-type-code mt-[7px] block break-all text-[#5570bd]">{item.code}</code>
+                  <span className="gg-type-meta mt-[6px] block break-words">
                     {item.is_builtin ? '平台内置' : '企业自定义'} · 排序 {item.sort_order}
                   </span>
                 </button>
@@ -268,20 +269,20 @@ export default function ReferenceDataPage({
         <DialogContent aria-describedby={undefined} className="sm:max-w-[480px]">
           <DialogTitle>{editing ? `编辑码项：${editing.code}` : `新增${selectedSet?.name || '码项'}`}</DialogTitle>
           <div className="grid gap-[14px]">
-            <label className="grid gap-[6px] text-[12px] text-[#646b7d]">
+            <label className="gg-type-control grid gap-[6px] text-[#646b7d]">
               编码
               <Input value={draft.code} disabled={Boolean(editing)} onChange={(event) => setDraft((value) => ({ ...value, code: event.target.value }))} />
             </label>
-            <label className="grid gap-[6px] text-[12px] text-[#646b7d]">
+            <label className="gg-type-control grid gap-[6px] text-[#646b7d]">
               名称
               <Input value={draft.name} onChange={(event) => setDraft((value) => ({ ...value, name: event.target.value }))} />
             </label>
-            <label className="grid gap-[6px] text-[12px] text-[#646b7d]">
+            <label className="gg-type-control grid gap-[6px] text-[#646b7d]">
               说明
               <Textarea value={draft.description} onChange={(event) => setDraft((value) => ({ ...value, description: event.target.value }))} />
             </label>
             <div className="grid grid-cols-2 gap-[12px]">
-              <label className="grid gap-[6px] text-[12px] text-[#646b7d]">
+              <label className="gg-type-control grid gap-[6px] text-[#646b7d]">
                 状态
                 <Select value={draft.status} onValueChange={(status) => setDraft((value) => ({ ...value, status: status as ItemDraft['status'] }))}>
                   <SelectTrigger><SelectValue /></SelectTrigger>
@@ -291,7 +292,7 @@ export default function ReferenceDataPage({
                   </SelectContent>
                 </Select>
               </label>
-              <label className="grid gap-[6px] text-[12px] text-[#646b7d]">
+              <label className="gg-type-control grid gap-[6px] text-[#646b7d]">
                 排序
                 <Input inputMode="numeric" value={draft.sortOrder} onChange={(event) => setDraft((value) => ({ ...value, sortOrder: event.target.value }))} />
               </label>
@@ -308,6 +309,6 @@ export default function ReferenceDataPage({
           </div>
         </DialogContent>
       </Dialog>
-    </div>
+    </PageShell>
   );
 }

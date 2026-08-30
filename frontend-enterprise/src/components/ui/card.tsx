@@ -12,7 +12,7 @@ function Card({
       data-slot="card"
       data-size={size}
       className={cn(
-        "group/card flex flex-col gap-(--card-spacing) overflow-hidden rounded-[var(--gg-radius-card)] bg-[var(--gg-surface)] py-(--card-spacing) text-[13px] text-[var(--gg-text-primary)] ring-1 ring-[color-mix(in_srgb,var(--gg-line)_90%,transparent)] [--card-spacing:--spacing(4)] has-data-[slot=card-footer]:pb-0 has-[>img:first-child]:pt-0 data-[size=sm]:[--card-spacing:--spacing(3)] data-[size=sm]:has-data-[slot=card-footer]:pb-0 *:[img:first-child]:rounded-t-[var(--gg-radius-card)] *:[img:last-child]:rounded-b-[var(--gg-radius-card)]",
+        "group/card flex flex-col gap-(--card-spacing) overflow-hidden rounded-[var(--gg-radius-card)] bg-[var(--gg-surface)] py-(--card-spacing) gg-type-control text-[var(--gg-text-primary)] ring-1 ring-[color-mix(in_srgb,var(--gg-line)_90%,transparent)] [--card-spacing:--spacing(4)] has-data-[slot=card-footer]:pb-0 has-[>img:first-child]:pt-0 data-[size=sm]:[--card-spacing:--spacing(3)] data-[size=sm]:has-data-[slot=card-footer]:pb-0 *:[img:first-child]:rounded-t-[var(--gg-radius-card)] *:[img:last-child]:rounded-b-[var(--gg-radius-card)]",
         className
       )}
       {...props}
@@ -38,7 +38,7 @@ function CardTitle({ className, ...props }: React.ComponentProps<"div">) {
     <div
       data-slot="card-title"
       className={cn(
-        "gg-type-card-title group-data-[size=sm]/card:text-[13px]",
+        "gg-type-card-title",
         className
       )}
       {...props}

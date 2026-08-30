@@ -53,7 +53,7 @@ export default function DebugPage() {
   return (
     <>
       <div className="page-title">
-        <h3>Agent 调试</h3>
+        <h3 className="gg-type-page-title">Agent 调试</h3>
         <Input
           className="page-field w-[240px]"
           value={sessionId}

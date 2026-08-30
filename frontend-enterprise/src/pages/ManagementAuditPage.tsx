@@ -13,6 +13,7 @@ import {
 } from 'lucide-react';
 
 import AppHeader from '@/components/AppHeader';
+import { PageShell } from '@/components/enterprise/PageShell';
 import {
   Input,
   Select,
@@ -196,7 +197,7 @@ export default function ManagementAuditPage({
   const pageCount = Math.max(1, Math.ceil(total / pageSize));
 
   return (
-    <div className="min-h-full box-border px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]">
+    <PageShell template="management">
       <AppHeader onLogout={onLogout} userName={currentUser?.username} title="管理审计" />
       <OperationalRail
         snapshot={operations}
@@ -211,13 +212,13 @@ export default function ManagementAuditPage({
               <ShieldCheck className="size-[18px]" />
             </span>
             <div>
-              <h2 className="text-[15px] font-semibold text-[#18181a]">企业管理操作台账</h2>
-              <p className="mt-[4px] text-[12px] leading-[18px] text-[#858b9c]">
+              <h2 className="gg-type-section-title font-semibold text-[#18181a]">企业管理操作台账</h2>
+              <p className="mt-[4px] gg-type-meta  text-[#858b9c]">
                 仅展示当前治理授权范围内的脱敏事实；详情按需读取，不提供批量导出。
               </p>
             </div>
           </div>
-          <span className="rounded-full bg-[#f4f6fb] px-[11px] py-[6px] text-[11px] text-[#697084]">
+          <span className="rounded-full bg-[#f4f6fb] px-[11px] py-[6px] gg-type-caption text-[#697084]">
             共 {total} 条
           </span>
         </header>
@@ -297,7 +298,7 @@ export default function ManagementAuditPage({
         <div className="overflow-x-auto">
           <table className="w-full min-w-[900px] border-collapse text-left">
             <thead>
-              <tr className="bg-[#f7f8fb] text-[11px] font-medium text-[#70778a]">
+              <tr className="bg-[#f7f8fb] gg-type-caption font-medium text-[#70778a]">
                 <th className="w-[176px] px-[22px] py-[12px]">操作时间</th>
                 <th className="px-[14px] py-[12px]">操作人</th>
                 <th className="px-[14px] py-[12px]">操作</th>
@@ -309,7 +310,7 @@ export default function ManagementAuditPage({
             </thead>
             <tbody>
               {rows.map((row, index) => (
-                <tr key={row.id} className="border-t border-[#eef1f6] text-[12px] text-[#333746]">
+                <tr key={row.id} className="border-t border-[#eef1f6] gg-type-meta text-[#333746]">
                   <td className="relative px-[22px] py-[15px] align-top">
                     {index < rows.length - 1 && (
                       <span className="absolute top-[28px] bottom-[-16px] left-[28px] w-px bg-[#dde4f4]" />
@@ -321,24 +322,24 @@ export default function ManagementAuditPage({
                         row.outcome === 'denied' && 'bg-[#e09b31] ring-[#efca8d]',
                         row.outcome === 'failure' && 'bg-[#d95757] ring-[#eca7a7]',
                       )} />
-                      <time className="leading-[18px] text-[#626a7c]">{formatAuditTime(row.created_at)}</time>
+                      <time className=" text-[#626a7c]">{formatAuditTime(row.created_at)}</time>
                     </span>
                   </td>
                   <td className="px-[14px] py-[15px] align-top">
-                    <strong className="block font-medium text-[#252838]">{row.actor_display_name || '系统'}</strong>
-                    <span className="mt-[3px] block text-[10px] text-[#969daf]">{row.actor_user_id || row.actor_type}</span>
+                    <strong className="block gg-type-control font-medium text-[#252838]">{row.actor_display_name || '系统'}</strong>
+                    <span className="mt-[3px] block gg-type-caption text-[#969daf]">{row.actor_user_id || row.actor_type}</span>
                   </td>
                   <td className="px-[14px] py-[15px] align-top">
-                    <code className="font-medium text-[#3157e8]">{row.action}</code>
-                    <span className="mt-[4px] block text-[10px] text-[#969daf]">{ACTION_KIND_LABELS[row.action_kind]}</span>
+                    <code className="gg-type-meta font-medium text-[#3157e8]">{row.action}</code>
+                    <span className="mt-[4px] block gg-type-caption text-[#969daf]">{ACTION_KIND_LABELS[row.action_kind]}</span>
                   </td>
                   <td className="px-[14px] py-[15px] align-top">
                     <span className="block">{row.resource_type}</span>
-                    <code className="mt-[3px] block max-w-[190px] truncate text-[10px] text-[#969daf]">{row.resource_id || '-'}</code>
+                    <code className="mt-[3px] block max-w-[190px] truncate gg-type-caption text-[#969daf]">{row.resource_id || '-'}</code>
                   </td>
                   <td className="px-[14px] py-[15px] align-top">
-                    <code className="block text-[10px] text-[#596277]">{row.permission_code || '-'}</code>
-                    <span className="mt-[3px] block text-[10px] text-[#969daf]">{row.permission_source || '未记录来源'}</span>
+                    <code className="block gg-type-caption text-[#596277]">{row.permission_code || '-'}</code>
+                    <span className="mt-[3px] block gg-type-caption text-[#969daf]">{row.permission_source || '未记录来源'}</span>
                   </td>
                   <td className="px-[14px] py-[15px] align-top">
                     <OutcomeBadge outcome={row.outcome} />
@@ -354,14 +355,14 @@ export default function ManagementAuditPage({
             </tbody>
           </table>
           {!loading && rows.length === 0 && (
-            <div className="grid min-h-[240px] place-items-center text-[12px] text-[#9aa1b5]">暂无审计记录</div>
+            <div className="grid min-h-[240px] place-items-center gg-type-meta text-[#9aa1b5]">暂无审计记录</div>
           )}
           {loading && rows.length === 0 && (
-            <div className="grid min-h-[240px] place-items-center text-[12px] text-[#7c8497]">正在加载审计台账…</div>
+            <div className="grid min-h-[240px] place-items-center gg-type-meta text-[#7c8497]">正在加载审计台账…</div>
           )}
         </div>
 
-        <footer className="flex items-center justify-between border-t border-[#eef1f6] px-[22px] py-[14px] text-[11px] text-[#737b8e]">
+        <footer className="flex items-center justify-between border-t border-[#eef1f6] px-[22px] py-[14px] gg-type-caption text-[#737b8e]">
           <span>第 {page} / {pageCount} 页</span>
           <div className="flex gap-[6px]">
             <Button variant="outline" size="sm" disabled={page <= 1 || loading} onClick={() => setPage((value) => value - 1)}>
@@ -382,7 +383,7 @@ export default function ManagementAuditPage({
           </SheetHeader>
           {selected && (
             <div className="space-y-[18px] px-[4px] pb-[28px]">
-              <section className="grid grid-cols-2 gap-[10px] rounded-[14px] border border-[#e7eaf2] bg-[#fafbfe] p-[14px] text-[11px]">
+              <section className="grid grid-cols-2 gap-[10px] rounded-[14px] border border-[#e7eaf2] bg-[#fafbfe] p-[14px] gg-type-caption">
                 <AuditFact label="操作" value={selected.action} />
                 <AuditFact label="结果" value={OUTCOME_LABELS[selected.outcome]} />
                 <AuditFact label="请求 ID" value={selected.request_id || '-'} />
@@ -390,7 +391,7 @@ export default function ManagementAuditPage({
                 <AuditFact label="组织范围" value={selected.target_org_unit_id || '租户级'} />
                 <AuditFact label="权限来源" value={selected.permission_source || '-'} />
               </section>
-              {detailLoading && <p className="text-[11px] text-[#7d8598]">正在读取详情…</p>}
+              {detailLoading && <p className="gg-type-caption text-[#7d8598]">正在读取详情…</p>}
               <AuditJson title="变更前" value={selected.before} />
               <AuditJson title="变更后" value={selected.after} />
               <AuditJson title="补充事实" value={selected.detail} />
@@ -398,7 +399,7 @@ export default function ManagementAuditPage({
           )}
         </SheetContent>
       </Sheet>
-    </div>
+    </PageShell>
   );
 }
 
@@ -414,14 +415,13 @@ function OperationalRail({
   onRefresh: () => void;
 }) {
   const triggered = snapshot?.alerts.filter((item) => item.triggered) || [];
-  const hasCritical = triggered.some((item) => item.severity === 'critical');
-  const verdict = !snapshot?.thresholds_configured || !snapshot.quota_limits_configured
-    ? { label: '门禁未就绪', className: 'border-[#efd29a] bg-[#fff8e8] text-[#8d6118]' }
-    : hasCritical
-      ? { label: '停止扩大灰度', className: 'border-[#efb8b8] bg-[#fff2f2] text-[#a83c3c]' }
-      : triggered.length > 0
+  const verdict = snapshot?.base_execution_available
+        ? { label: '普通动态已开放', className: 'border-[#a9ddc2] bg-[#edf9f2] text-[#197449]' }
+        : snapshot?.runtime_capacity_available === false
+          ? { label: '运行容量不可用', className: 'border-[#efd29a] bg-[#fff8e8] text-[#8d6118]' }
+          : triggered.length > 0
         ? { label: '保持观察', className: 'border-[#efd29a] bg-[#fff8e8] text-[#8d6118]' }
-        : { label: '运行阈值内', className: 'border-[#a9ddc2] bg-[#edf9f2] text-[#197449]' };
+          : { label: '普通动态未开放', className: 'border-[#efd29a] bg-[#fff8e8] text-[#8d6118]' };
 
   return (
     <section
@@ -434,15 +434,15 @@ function OperationalRail({
             <Activity className="size-[17px]" />
           </span>
           <div>
-            <h2 className="text-[14px] font-semibold tracking-[0.01em]">动态任务运行门禁</h2>
-            <p className="mt-[3px] text-[11px] text-[#9aa7c4]">
-              直接读取统一 Runtime 权威状态；告警只观察，不改变执行结果。
+            <h2 className="gg-type-section-title font-semibold tracking-[0.01em]">动态任务运行门禁</h2>
+            <p className="mt-[3px] gg-type-caption text-[#9aa7c4]">
+              直接读取统一 Runtime 权威状态；告警只影响高风险灰度，不关闭普通动态能力。
             </p>
           </div>
         </div>
         <div className="flex items-center gap-[9px]">
           {snapshot ? (
-            <span className={cn('rounded-full border px-[10px] py-[5px] text-[10px] font-medium', verdict.className)}>
+            <span className={cn('rounded-full border px-[10px] py-[5px] gg-type-caption font-medium', verdict.className)}>
               {verdict.label}
             </span>
           ) : null}
@@ -460,8 +460,31 @@ function OperationalRail({
         </div>
       </header>
 
+      {snapshot ? (
+        <div className="grid gap-px border-b border-white/10 bg-white/10 sm:grid-cols-3">
+          <CapabilityReadiness
+            label="普通动态"
+            value={snapshot.base_execution_available ? '已开放' : '不可用'}
+            detail="不受模型配额或告警阈值限制"
+            positive={snapshot.base_execution_available}
+          />
+          <CapabilityReadiness
+            label="external write"
+            value={snapshot.high_risk_external_write_available ? '独立灰度中' : '默认关闭'}
+            detail={snapshot.high_risk_external_write_available ? '仍需逐次授权' : '需单独配置名单、阈值与连接'}
+            positive={snapshot.high_risk_external_write_available}
+          />
+          <CapabilityReadiness
+            label="destructive-gray"
+            value={snapshot.high_risk_destructive_available ? '隔离验证中' : '默认关闭'}
+            detail={snapshot.high_risk_destructive_available ? '仅 disposable/isolated provider' : '不继承 external write 灰度'}
+            positive={snapshot.high_risk_destructive_available}
+          />
+        </div>
+      ) : null}
+
       {denied ? (
-        <div className="px-[22px] py-[20px] text-[12px] text-[#c5cee2]">
+        <div className="px-[22px] py-[20px] gg-type-meta text-[#c5cee2]">
           运行聚合需要租户全域审计权限；当前账号仍可查看其组织授权范围内的管理台账。
         </div>
       ) : snapshot ? (
@@ -471,21 +494,43 @@ function OperationalRail({
           ))}
         </div>
       ) : (
-        <div className="px-[22px] py-[20px] text-[12px] text-[#aeb9d1]">
+        <div className="px-[22px] py-[20px] gg-type-meta text-[#aeb9d1]">
           {loading ? '正在读取运行快照…' : '尚未取得运行快照，请刷新重试。'}
         </div>
       )}
 
       {snapshot ? (
-        <footer className="flex flex-wrap items-center justify-between gap-[8px] border-t border-white/10 px-[22px] py-[11px] text-[10px] text-[#8996b4]">
+        <footer className="flex flex-wrap items-center justify-between gap-[8px] border-t border-white/10 px-[22px] py-[11px] gg-type-caption text-[#8996b4]">
           <span>
             活动执行 {activeExecutions(snapshot)} · 待处理 {activeAttentions(snapshot)} ·
-            配额租约 {activeQuotaLeases(snapshot)} · 最长等待 {formatDuration(snapshot.oldest_waiting_age_seconds)}
+            运行容量租约 {activeQuotaLeases(snapshot)} · 最长等待 {formatDuration(snapshot.oldest_waiting_age_seconds)}
           </span>
           <time dateTime={snapshot.observed_at}>快照时间 {formatAuditTime(snapshot.observed_at)}</time>
         </footer>
       ) : null}
     </section>
+  );
+}
+
+function CapabilityReadiness({
+  label,
+  value,
+  detail,
+  positive,
+}: {
+  label: string;
+  value: string;
+  detail: string;
+  positive: boolean;
+}) {
+  return (
+    <div className="bg-[#151b2b] px-[18px] py-[13px]">
+      <div className="gg-type-caption font-medium tracking-[0.08em] text-[#8996b4]">{label}</div>
+      <strong className={cn('mt-[5px] block gg-type-meta font-semibold', positive ? 'text-[#8ce0b1]' : 'text-[#f0c36b')}>
+        {value}
+      </strong>
+      <span className="mt-[3px] block gg-type-caption text-[#6f7c9b]">{detail}</span>
+    </div>
   );
 }
 
@@ -499,7 +544,7 @@ function OperationalCell({ alert }: { alert: DynamicTaskOperationalAlert }) {
   return (
     <div className="bg-[#151b2b] px-[18px] py-[16px]">
       <div className="flex items-center justify-between gap-[8px]">
-        <span className="text-[10px] font-medium tracking-[0.08em] text-[#8996b4]">
+        <span className="gg-type-caption font-medium tracking-[0.08em] text-[#8996b4]">
           {OPERATIONAL_ALERT_LABELS[alert.code] || alert.code}
         </span>
         {alert.triggered ? (
@@ -507,12 +552,12 @@ function OperationalCell({ alert }: { alert: DynamicTaskOperationalAlert }) {
         ) : null}
       </div>
       <strong className={cn(
-        'mt-[9px] block font-mono text-[22px] font-semibold leading-none',
+        'mt-[9px] block font-mono gg-type-section-title font-semibold',
         alert.triggered && alert.severity === 'critical' ? 'text-[#ff9b9b]' : 'text-white',
       )}>
         {value}
       </strong>
-      <span className="mt-[7px] block text-[10px] text-[#6f7c9b]">停止阈值 {threshold}</span>
+      <span className="mt-[7px] block gg-type-caption text-[#6f7c9b]">停止阈值 {threshold}</span>
     </div>
   );
 }
@@ -543,7 +588,7 @@ function OutcomeBadge({ outcome }: { outcome: ManagementAuditOutcome }) {
   const Icon = outcome === 'success' ? CheckCircle2 : XCircle;
   return (
     <span className={cn(
-      'inline-flex items-center gap-[4px] rounded-full px-[7px] py-[3px] text-[10px] font-medium',
+      'inline-flex items-center gap-[4px] rounded-full px-[7px] py-[3px] gg-type-caption font-medium',
       outcome === 'success' && 'bg-[#eaf8f0] text-[#18864b]',
       outcome === 'denied' && 'bg-[#fff4df] text-[#9a6414]',
       outcome === 'failure' && 'bg-[#fff0f0] text-[#b63d3d]',
@@ -557,8 +602,8 @@ function OutcomeBadge({ outcome }: { outcome: ManagementAuditOutcome }) {
 function AuditFact({ label, value }: { label: string; value: string }) {
   return (
     <span className="min-w-0">
-      <span className="block text-[#949bad]">{label}</span>
-      <code className="mt-[4px] block truncate text-[#353a49]" title={value}>{value}</code>
+      <span className="block gg-type-caption text-[#949bad]">{label}</span>
+      <code className="mt-[4px] block truncate gg-type-code text-[#353a49]" title={value}>{value}</code>
     </span>
   );
 }
@@ -566,8 +611,8 @@ function AuditFact({ label, value }: { label: string; value: string }) {
 function AuditJson({ title, value }: { title: string; value: Record<string, unknown> }) {
   return (
     <section>
-      <h3 className="mb-[7px] text-[12px] font-semibold text-[#303442]">{title}</h3>
-      <pre className="max-h-[240px] overflow-auto rounded-[12px] bg-[#151922] p-[13px] text-[10px] leading-[17px] text-[#d9e0f3]">
+      <h3 className="mb-[7px] gg-type-card-title font-semibold text-[#303442]">{title}</h3>
+      <pre className="max-h-[240px] overflow-auto rounded-[12px] bg-[#151922] p-[13px] gg-type-caption  text-[#d9e0f3]">
         {JSON.stringify(value, null, 2)}
       </pre>
     </section>

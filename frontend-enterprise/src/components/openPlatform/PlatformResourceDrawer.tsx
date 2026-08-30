@@ -103,7 +103,12 @@ export default function PlatformResourceDrawer({
 
   return (
     <Sheet open={open} onOpenChange={(next) => { if (!next) onClose(); }}>
-      <SheetContent side="right" showCloseButton={false} className={DRAWER_SHEET_CLASS}>
+      <SheetContent
+        side="right"
+        showCloseButton={false}
+        data-detail-container="drawer"
+        className={cn(DRAWER_SHEET_CLASS, 'gg-detail-surface gg-detail-surface--drawer')}
+      >
         <div className="flex w-full shrink-0 flex-col gap-[10px]">
           <div className="flex min-h-[24px] items-center justify-between">
             <div className="flex items-center gap-[4px]">
@@ -184,7 +189,7 @@ export default function PlatformResourceDrawer({
               type="button"
               disabled={deleting}
               onClick={onDelete}
-              className="inline-flex h-[34px] w-[80px] items-center justify-center gap-[4px] rounded-[var(--gg-radius-control)] border border-[var(--gg-state-danger)] bg-[var(--gg-surface)] text-[12px] font-medium text-[var(--gg-state-danger)] transition-colors hover:bg-[var(--gg-state-danger-soft)] disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--gg-state-danger)]"
+              className="inline-flex h-[34px] w-[80px] items-center justify-center gap-[4px] rounded-[var(--gg-radius-control)] border border-[var(--gg-state-danger)] bg-[var(--gg-surface)] gg-type-meta font-medium text-[var(--gg-state-danger)] transition-colors hover:bg-[var(--gg-state-danger-soft)] disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--gg-state-danger)]"
             >
               <IconTrash className="size-[14px]" />
               删除
@@ -193,7 +198,7 @@ export default function PlatformResourceDrawer({
           <button
             type="button"
             onClick={onUse}
-            className="inline-flex h-[34px] items-center justify-center rounded-[var(--gg-radius-control)] bg-[var(--gg-interaction)] px-[20px] text-[12px] font-semibold text-white transition-colors hover:bg-[var(--gg-interaction-hover)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--gg-interaction)]"
+            className="inline-flex h-[34px] items-center justify-center rounded-[var(--gg-radius-control)] bg-[var(--gg-interaction)] px-[20px] gg-type-meta font-semibold text-white transition-colors hover:bg-[var(--gg-interaction-hover)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--gg-interaction)]"
           >
             {useLabel}
           </button>

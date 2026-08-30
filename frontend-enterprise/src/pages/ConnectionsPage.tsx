@@ -49,6 +49,7 @@ import weComConnectionCardScreenshot from '@/assets/guides/wecom-connection-card
 import weComMessageRoutingScreenshot from '@/assets/guides/wecom-message-routing.png';
 import type { EnterpriseAuthUser } from '@/auth';
 import AppHeader from '@/components/AppHeader';
+import { PageShell } from '@/components/enterprise/PageShell';
 import { notify } from '@/components/ui/app-toast';
 import { Button } from '@/components/ui/button';
 import {
@@ -481,13 +482,13 @@ export default function ConnectionsPage({
   const bindableAgents = agents.filter((agent) => !boundAgentIds.has(agent.id));
 
   return (
-    <div className="min-h-full box-border px-[48px] pb-[43px] pt-[32px] max-[900px]:px-[16px]">
+    <PageShell template="management">
       <AppHeader onLogout={onLogout} userName={currentUser?.username} title="外部连接" />
 
       <div className="mt-[20px] flex flex-wrap items-center justify-between gap-[12px]">
         <div>
-          <h1 className="text-[20px] font-semibold tracking-[-0.02em] text-[var(--gg-ink)]">连接账号</h1>
-          <p className="mt-[4px] max-w-[680px] text-[12px] leading-[1.6] text-[var(--gg-slate)]">
+          <h1 className="gg-type-section-title font-semibold tracking-[-0.02em] text-[var(--gg-ink)]">连接账号</h1>
+          <p className="mt-[4px] max-w-[680px] gg-type-meta  text-[var(--gg-slate)]">
             每个外部应用独立验证身份和授权范围；数字员工只能使用明确绑定的连接。
           </p>
         </div>
@@ -507,9 +508,9 @@ export default function ConnectionsPage({
       <section className="mt-[18px] overflow-hidden rounded-[18px] border border-[#dbe4fb] bg-[linear-gradient(105deg,#f6f8ff_0%,#ffffff_56%,#f3f8ff_100%)] shadow-[0_10px_30px_rgba(39,71,152,0.06)]" aria-label="外部连接用途说明">
         <div className="grid grid-cols-[minmax(0,1.25fr)_minmax(340px,0.75fr)] items-center gap-[24px] px-[22px] py-[20px] max-[820px]:grid-cols-1">
           <div>
-            <span className="font-mono text-[10px] font-semibold uppercase tracking-[0.16em] text-[var(--gg-cobalt)]">企业微信 × 数字员工</span>
-            <h2 className="mt-[7px] text-[18px] font-semibold tracking-[-0.02em] text-[var(--gg-ink)]">让员工在企业微信里发起任务，由受控的数字员工继续处理</h2>
-            <p className="mt-[7px] max-w-[760px] text-[12px] leading-[1.75] text-[var(--gg-slate)]">连接负责验证企业应用身份、接收验签消息和提供明确授权的外部能力；它不会自动读取通讯录、开放全部聊天记录，也不会让未绑定的数字员工使用企业账号。</p>
+            <span className="font-mono gg-type-caption font-semibold uppercase tracking-[0.16em] text-[var(--gg-cobalt)]">企业微信 × 数字员工</span>
+            <h2 className="mt-[7px] gg-type-section-title font-semibold tracking-[-0.02em] text-[var(--gg-ink)]">让员工在企业微信里发起任务，由受控的数字员工继续处理</h2>
+            <p className="mt-[7px] max-w-[760px] gg-type-meta  text-[var(--gg-slate)]">连接负责验证企业应用身份、接收验签消息和提供明确授权的外部能力；它不会自动读取通讯录、开放全部聊天记录，也不会让未绑定的数字员工使用企业账号。</p>
             <Button variant="outline" className="mt-[13px] border-[#cbd8f8] bg-white text-[var(--gg-cobalt)] hover:bg-[#f5f8ff]" onClick={() => openGuideAt('connection-setup-title')}>
               查看从创建到测试成功的完整示例<ArrowRight className="size-[14px]" />
             </Button>
@@ -535,8 +536,8 @@ export default function ConnectionsPage({
           <div className="grid min-h-[220px] place-items-center rounded-[18px] border border-dashed border-[var(--gg-border)] bg-white px-[24px] text-center">
             <div>
               <span className="mx-auto grid size-[48px] place-items-center rounded-[15px] bg-[#edf2ff] text-[var(--gg-cobalt)]"><Link2 className="size-[20px]" /></span>
-              <h2 className="mt-[12px] text-[15px] font-semibold text-[var(--gg-ink)]">还没有外部连接</h2>
-              <p className="mt-[5px] text-[12px] text-[var(--gg-slate)]">连接企业微信自建应用，再把最小只读能力授权给指定数字员工。</p>
+              <h2 className="mt-[12px] gg-type-section-title font-semibold text-[var(--gg-ink)]">还没有外部连接</h2>
+              <p className="mt-[5px] gg-type-meta text-[var(--gg-slate)]">连接企业微信自建应用，再把最小只读能力授权给指定数字员工。</p>
               <Button className="mt-[14px] bg-[var(--gg-cobalt)] text-white hover:bg-[#244bc7]" onClick={openCreate}>连接企业微信</Button>
             </div>
           </div>
@@ -559,8 +560,8 @@ export default function ConnectionsPage({
           <div className="flex items-start gap-[12px]">
             <span className="grid size-[42px] shrink-0 place-items-center rounded-[14px] bg-[#eaf0ff] text-[var(--gg-cobalt)]"><BookOpen className="size-[19px]" /></span>
             <div>
-              <DialogTitle className="text-[20px] font-semibold tracking-[-0.02em] text-[var(--gg-ink)]">企业微信连接：从创建到一次真实任务</DialogTitle>
-              <p className="mt-[5px] text-[13px] leading-[1.75] text-[var(--gg-slate)]">以下流程来自“共格·序伴企业微信测试”真实联调，可按顺序完成应用建档、消息接入、数字员工绑定和最终回复验证。</p>
+              <DialogTitle className="gg-type-section-title font-semibold tracking-[-0.02em] text-[var(--gg-ink)]">企业微信连接：从创建到一次真实任务</DialogTitle>
+              <p className="mt-[5px] gg-type-control  text-[var(--gg-slate)]">以下流程来自“共格·序伴企业微信测试”真实联调，可按顺序完成应用建档、消息接入、数字员工绑定和最终回复验证。</p>
             </div>
           </div>
 
@@ -598,8 +599,8 @@ export default function ConnectionsPage({
               <GuideInstruction index="1" title="创建企业微信测试应用">注册测试企业，在“应用管理”创建自建应用，设置可见范围，并记下企业 ID（CorpID）、AgentId 和 Secret。</GuideInstruction>
               <GuideInstruction index="2" title="在本页建立连接">点击“连接企业微信”，填写显示名称和三项身份信息。系统会生成回调 Token 与 43 位 EncodingAESKey；点击“验证并连接”。</GuideInstruction>
               <GuideInstruction index="3" title="配置消息回调">先通过公网 HTTPS 地址打开本页面，再创建连接。建档后把一次性显示的 URL、Token、EncodingAESKey 原样填入企业微信“接收消息服务器”，选择需要接收的消息事件并保存验证。</GuideInstruction>
-              <GuideInstruction index="4" title="配置企业可信 IP">在运行后端的同一台机器执行 <code className="font-mono text-[11px] text-[#244bc7]">curl https://api.ipify.org</code>，把结果填入“企业可信 IP”。不要填写内网地址，也不要填写 Tunnel 域名解析出的 IP。</GuideInstruction>
-              <GuideInstruction index="5" title="确认连接健康">回到本页点击“健康检查”。卡片显示“连接健康”，并出现 <code className="font-mono text-[11px] text-[#244bc7]">application:read</code>，表示身份和最小读取授权已经验证。</GuideInstruction>
+              <GuideInstruction index="4" title="配置企业可信 IP">在运行后端的同一台机器执行 <code className="font-mono gg-type-caption text-[#244bc7]">curl https://api.ipify.org</code>，把结果填入“企业可信 IP”。不要填写内网地址，也不要填写 Tunnel 域名解析出的 IP。</GuideInstruction>
+              <GuideInstruction index="5" title="确认连接健康">回到本页点击“健康检查”。卡片显示“连接健康”，并出现 <code className="font-mono gg-type-caption text-[#244bc7]">application:read</code>，表示身份和最小读取授权已经验证。</GuideInstruction>
               <GuideInstruction index="6" title="绑定数字员工和消息入口">打开“Agent 绑定”选择数字员工；再打开“消息接入”，把该员工设为唯一接收路由。企业微信成员第一次发消息后，在待授权队列中关联对应的平台用户。</GuideInstruction>
               <GuideInstruction index="7" title="发送验证消息">在企业微信自建应用会话中发送“测试动态任务：查询当前企业微信应用信息”。首次发送者完成授权后原消息会自动恢复，无需重复创建任务。</GuideInstruction>
               <GuideInstruction index="8" title="核对成功标准">企业微信收到一条任务回复；系统内产生一条可追踪 Execution，外部调用有唯一 Operation/回执，页面仍不显示 Secret、原始外部用户标识或消息正文。</GuideInstruction>
@@ -607,58 +608,58 @@ export default function ConnectionsPage({
 
             <div className="grid grid-cols-2 gap-[10px] max-[680px]:grid-cols-1" aria-label="当前 Demo 网络配置示例">
               <div className="rounded-[12px] border border-[#dfe5f0] bg-white px-[13px] py-[12px]">
-                <small className="font-mono text-[10px] font-semibold text-[var(--gg-cobalt)]">企业可信 IP · 出站方向</small>
-                <p className="mt-[7px] text-[11px] leading-[1.65] text-[#59647a]">当前机器内网地址是 <code className="font-mono text-[#3a4254]">192.168.124.236</code>，经网关 NAT 后，企业微信 API 当前看到的公网出口是 <code className="font-mono font-semibold text-[#087a38]">103.62.49.138</code>。因此本次 Demo 应填写后者。</p>
-                <p className="mt-[6px] text-[10px] leading-[1.55] text-[#8a5700]">该值是 2026-08-11 的现场检测结果，不代表运营商保证固定。路由器重拨、宽带迁移或出口切换后要重新执行命令核对。</p>
+                <small className="font-mono gg-type-caption font-semibold text-[var(--gg-cobalt)]">企业可信 IP · 出站方向</small>
+              <p className="mt-[7px] gg-type-caption  text-[#59647a]">当前机器内网地址是 <code className="font-mono gg-type-code text-[#3a4254]">192.168.124.236</code>，经网关 NAT 后，企业微信 API 当前看到的公网出口是 <code className="font-mono gg-type-code font-semibold text-[#087a38]">103.62.49.138</code>。因此本次 Demo 应填写后者。</p>
+                <p className="mt-[6px] gg-type-caption  text-[#8a5700]">该值是 2026-08-11 的现场检测结果，不代表运营商保证固定。路由器重拨、宽带迁移或出口切换后要重新执行命令核对。</p>
               </div>
               <div className="rounded-[12px] border border-[#dfe5f0] bg-white px-[13px] py-[12px]">
-                <small className="font-mono text-[10px] font-semibold text-[var(--gg-cobalt)]">消息回调 URL · 入站方向</small>
-                <p className="mt-[7px] text-[11px] leading-[1.65] text-[#59647a]">公网 HTTPS 请求通过 Tunnel 转发到 <code className="font-mono text-[#3a4254]">127.0.0.1:5137</code>。上次联调地址 <code className="break-all font-mono text-[#3a4254]">people-elect-dolls-phones.trycloudflare.com</code> 已失效，重新联调必须先取得新的 HTTPS 地址。</p>
-                <p className={cn('mt-[6px] rounded-[8px] px-[9px] py-[7px] text-[10px] leading-[1.55]', isPublicHttpsOrigin() ? 'bg-[#edf8f1] text-[#087a38]' : 'bg-[#fff4df] text-[#8a5700]')}>当前页面来源：<code className="break-all font-mono">{window.location.origin}</code>。{isPublicHttpsOrigin() ? '可用于生成公网回调 URL。' : '不是公网 HTTPS 来源；此时生成的 URL 不能直接交给企业微信。'}</p>
+                <small className="font-mono gg-type-caption font-semibold text-[var(--gg-cobalt)]">消息回调 URL · 入站方向</small>
+              <p className="mt-[7px] gg-type-caption  text-[#59647a]">公网 HTTPS 请求通过 Tunnel 转发到 <code className="font-mono gg-type-code text-[#3a4254]">127.0.0.1:5137</code>。上次联调地址 <code className="break-all font-mono gg-type-code text-[#3a4254]">people-elect-dolls-phones.trycloudflare.com</code> 已失效，重新联调必须先取得新的 HTTPS 地址。</p>
+              <p className={cn('mt-[6px] rounded-[8px] px-[9px] py-[7px] gg-type-caption ', isPublicHttpsOrigin() ? 'bg-[#edf8f1] text-[#087a38]' : 'bg-[#fff4df] text-[#8a5700]')}>当前页面来源：<code className="break-all font-mono gg-type-code">{window.location.origin}</code>。{isPublicHttpsOrigin() ? '可用于生成公网回调 URL。' : '不是公网 HTTPS 来源；此时生成的 URL 不能直接交给企业微信。'}</p>
               </div>
             </div>
 
             <div className="rounded-[14px] border border-[#adc3f4] bg-[#f5f8ff] p-[15px]" aria-label="真实成功回调 URL 获取过程">
               <div className="flex items-start justify-between gap-[12px] max-[620px]:flex-col">
                 <div>
-                  <small className="font-mono text-[10px] font-semibold tracking-[0.08em] text-[var(--gg-cobalt)]">CALLBACK URL</small>
-                  <h4 className="mt-[4px] text-[14px] font-semibold text-[var(--gg-ink)]">真实成功回调 URL 是这样获得的</h4>
-                  <p className="mt-[5px] max-w-[760px] text-[11px] leading-[1.7] text-[#59647a]">它不是企业微信生成的，也不是把公网 IP 填进 URL。先由 HTTPS Tunnel 提供企业微信能访问的公网来源，再由共格·序伴为连接档案生成唯一 Profile ID，最后由系统自动拼成完整回调地址。</p>
+                  <small className="font-mono gg-type-caption font-semibold tracking-[0.08em] text-[var(--gg-cobalt)]">CALLBACK URL</small>
+                  <h4 className="mt-[4px] gg-type-card-title font-semibold text-[var(--gg-ink)]">真实成功回调 URL 是这样获得的</h4>
+                  <p className="mt-[5px] max-w-[760px] gg-type-caption  text-[#59647a]">它不是企业微信生成的，也不是把公网 IP 填进 URL。先由 HTTPS Tunnel 提供企业微信能访问的公网来源，再由共格·序伴为连接档案生成唯一 Profile ID，最后由系统自动拼成完整回调地址。</p>
                 </div>
-                <div className="shrink-0 rounded-[9px] border border-[#efd08e] bg-[#fff8e7] px-[10px] py-[8px] text-[10px] leading-[1.55] text-[#81590d]">截至 2026-08-11，本机没有运行 cloudflared；<br />下面的旧临时域名只用于复盘成功过程。</div>
+                <div className="shrink-0 rounded-[9px] border border-[#efd08e] bg-[#fff8e7] px-[10px] py-[8px] gg-type-caption  text-[#81590d]">截至 2026-08-11，本机没有运行 cloudflared；<br />下面的旧临时域名只用于复盘成功过程。</div>
               </div>
 
               <ol className="mt-[13px] grid grid-cols-2 gap-[10px] max-[760px]:grid-cols-1">
-                <GuideInstruction index="1" title="启动公网 HTTPS Tunnel">在运行共格·序伴的机器执行 <code className="break-all font-mono text-[#244bc7]">cloudflared tunnel --url http://127.0.0.1:5137</code>，保持该进程运行。本次真实联调时，命令返回的公网来源是 <code className="break-all font-mono text-[#244bc7]">https://people-elect-dolls-phones.trycloudflare.com</code>。</GuideInstruction>
-                <GuideInstruction index="2" title="从 Tunnel 地址进入本系统">浏览器打开 <code className="break-all font-mono text-[#244bc7]">https://people-elect-dolls-phones.trycloudflare.com/enterprise/connections</code>，再点击“连接企业微信”。不能从 <code className="font-mono">http://192.168.124.236:5137</code> 创建，否则浏览器来源仍是内网地址。</GuideInstruction>
-                <GuideInstruction index="3" title="系统创建唯一连接路径">建档成功后，本次真实连接取得 Profile ID <code className="font-mono text-[#244bc7]">connprofile_36a56f3b292f49a8</code>。页面将“公网来源”和固定回调路径自动拼接，不要求用户手写或猜测 ID。</GuideInstruction>
+                <GuideInstruction index="1" title="启动公网 HTTPS Tunnel">在运行共格·序伴的机器执行 <code className="break-all font-mono gg-type-code text-[#244bc7]">cloudflared tunnel --url http://127.0.0.1:5137</code>，保持该进程运行。本次真实联调时，命令返回的公网来源是 <code className="break-all font-mono gg-type-code text-[#244bc7]">https://people-elect-dolls-phones.trycloudflare.com</code>。</GuideInstruction>
+                <GuideInstruction index="2" title="从 Tunnel 地址进入本系统">浏览器打开 <code className="break-all font-mono gg-type-code text-[#244bc7]">https://people-elect-dolls-phones.trycloudflare.com/enterprise/connections</code>，再点击“连接企业微信”。不能从 <code className="font-mono gg-type-code">http://192.168.124.236:5137</code> 创建，否则浏览器来源仍是内网地址。</GuideInstruction>
+                <GuideInstruction index="3" title="系统创建唯一连接路径">建档成功后，本次真实连接取得 Profile ID <code className="font-mono gg-type-code text-[#244bc7]">connprofile_36a56f3b292f49a8</code>。页面将“公网来源”和固定回调路径自动拼接，不要求用户手写或猜测 ID。</GuideInstruction>
                 <GuideInstruction index="4" title="企业微信完成握手验证">把一次性弹窗中的完整 URL、Token 和 EncodingAESKey 原样填入“接收消息服务器”并保存。企业微信随后携带签名参数访问该 URL；系统验签、解密并返回 echostr，企业微信显示“保存成功”才表示这个 URL 真实可用。</GuideInstruction>
               </ol>
 
               <div className="mt-[12px] grid grid-cols-[minmax(0,1fr)_28px_minmax(0,1fr)] items-center gap-[8px] rounded-[11px] border border-[#d7e1f8] bg-white px-[12px] py-[11px] max-[720px]:grid-cols-1">
                 <div>
-                  <div className="text-[10px] font-semibold text-[#66738d]">① Tunnel 返回的公网来源</div>
-                  <code className="mt-[4px] block break-all font-mono text-[11px] leading-[1.6] text-[#244bc7]">https://people-elect-dolls-phones.trycloudflare.com</code>
+                  <div className="gg-type-caption font-semibold text-[#66738d]">① Tunnel 返回的公网来源</div>
+                  <code className="mt-[4px] block break-all font-mono gg-type-caption  text-[#244bc7]">https://people-elect-dolls-phones.trycloudflare.com</code>
                 </div>
-                <div className="text-center text-[16px] font-semibold text-[#8ca2d4] max-[720px]:rotate-90">+</div>
+                <div className="text-center gg-type-card-title font-semibold text-[#8ca2d4] max-[720px]:rotate-90">+</div>
                 <div>
-                  <div className="text-[10px] font-semibold text-[#66738d]">② 系统生成的连接回调路径</div>
-                  <code className="mt-[4px] block break-all font-mono text-[11px] leading-[1.6] text-[#244bc7]">/api/connectors/wecom/connprofile_36a56f3b292f49a8/callback</code>
+                  <div className="gg-type-caption font-semibold text-[#66738d]">② 系统生成的连接回调路径</div>
+                  <code className="mt-[4px] block break-all font-mono gg-type-caption  text-[#244bc7]">/api/connectors/wecom/connprofile_36a56f3b292f49a8/callback</code>
                 </div>
               </div>
               <div className="mt-[9px] rounded-[10px] bg-[#e9f0ff] px-[12px] py-[10px]">
-                <div className="text-[10px] font-semibold text-[#53698e]">本次真实联调最终填写并保存成功的 URL</div>
-                <code className="mt-[4px] block break-all font-mono text-[12px] font-semibold leading-[1.65] text-[#173fbd]">https://people-elect-dolls-phones.trycloudflare.com/api/connectors/wecom/connprofile_36a56f3b292f49a8/callback</code>
+                <div className="gg-type-caption font-semibold text-[#53698e]">本次真实联调最终填写并保存成功的 URL</div>
+                <code className="mt-[4px] block break-all font-mono gg-type-meta font-semibold  text-[#173fbd]">https://people-elect-dolls-phones.trycloudflare.com/api/connectors/wecom/connprofile_36a56f3b292f49a8/callback</code>
               </div>
-              <p className="mt-[9px] text-[10px] leading-[1.6] text-[#6f5b2b]">注意：Quick Tunnel 每次重启通常会得到新域名。新一轮联调必须用新域名重新打开本页并新建或轮换回调配置；不能继续使用上面的历史 URL。企业可信 IP 仍填写出站公网 IP <code className="font-mono font-semibold">103.62.49.138</code>，它与回调 URL 是两个方向、两套配置。</p>
+              <p className="mt-[9px] gg-type-caption  text-[#6f5b2b]">注意：Quick Tunnel 每次重启通常会得到新域名。新一轮联调必须用新域名重新打开本页并新建或轮换回调配置；不能继续使用上面的历史 URL。企业可信 IP 仍填写出站公网 IP <code className="font-mono gg-type-code font-semibold">103.62.49.138</code>，它与回调 URL 是两个方向、两套配置。</p>
             </div>
 
             <div className="overflow-hidden rounded-[13px] border border-[#cbd8f4] bg-white" aria-label="当前 Demo 实际填写值">
               <div className="border-b border-[#dce4f4] bg-[#f4f7ff] px-[15px] py-[11px]">
-                <h4 className="text-[13px] font-semibold text-[var(--gg-ink)]">当前 Demo：命令输出和实际填写值</h4>
-                <p className="mt-[3px] text-[11px] leading-[1.6] text-[var(--gg-slate)]">以下公网 IP 是 2026-08-11 在运行后端的同一台机器上用三个公网服务交叉核对的结果。</p>
+                <h4 className="gg-type-card-title font-semibold text-[var(--gg-ink)]">当前 Demo：命令输出和实际填写值</h4>
+                <p className="mt-[3px] gg-type-caption  text-[var(--gg-slate)]">以下公网 IP 是 2026-08-11 在运行后端的同一台机器上用三个公网服务交叉核对的结果。</p>
               </div>
-              <dl className="grid grid-cols-[190px_minmax(0,1fr)_minmax(0,1fr)] text-[12px] max-[760px]:grid-cols-1">
+              <dl className="grid grid-cols-[190px_minmax(0,1fr)_minmax(0,1fr)] gg-type-meta max-[760px]:grid-cols-1">
                 <DemoValueRow label="执行命令" value="curl -4 https://api.ipify.org" destination="在后端服务器终端执行" code />
                 <DemoValueRow label="本次命令输出" value="103.62.49.138" destination="这是企业微信 API 当前看到的公网出口" code strong />
                 <DemoValueRow label="企业可信 IP 填写" value="103.62.49.138" destination="企业微信应用 → 企业可信 IP" code strong />
@@ -667,17 +668,17 @@ export default function ConnectionsPage({
                 <DemoValueRow label="回调 Token" value="bbfca6••••••••••••••••••84c3f7" destination="从建档后的一次性弹窗完整复制；真实值不写入长期说明" code />
                 <DemoValueRow label="EncodingAESKey" value="hele5t7•••••••••••••••••••••bfRjAk" destination="从同一次弹窗完整复制，不能与另一轮 Token 混用" code />
               </dl>
-              <p className="border-t border-[#e2e7f1] bg-[#fff9ec] px-[15px] py-[10px] text-[11px] leading-[1.65] text-[#76510b]">重要：公网 IP 可以按上表直接填写；旧 Tunnel URL 只说明成功时的完整格式，不能再次使用。Token 和 EncodingAESKey 是回调验签/解密密钥，截图中暴露过的值应轮换，页面只展示脱敏结果。新建连接时必须把一次性弹窗当场生成的完整值原样填入企业微信。</p>
+              <p className="border-t border-[#e2e7f1] bg-[#fff9ec] px-[15px] py-[10px] gg-type-caption  text-[#76510b]">重要：公网 IP 可以按上表直接填写；旧 Tunnel URL 只说明成功时的完整格式，不能再次使用。Token 和 EncodingAESKey 是回调验签/解密密钥，截图中暴露过的值应轮换，页面只展示脱敏结果。新建连接时必须把一次性弹窗当场生成的完整值原样填入企业微信。</p>
             </div>
 
             <div className="rounded-[12px] border border-[#cfdaf5] bg-white px-[13px] py-[12px]" aria-label="回调配置值生成规则">
-              <h4 className="text-[12px] font-semibold text-[var(--gg-ink)]">URL、Token、EncodingAESKey 分别怎么生成</h4>
-              <dl className="mt-[9px] grid gap-[8px] text-[11px] leading-[1.65] text-[#59647a]">
-                <div className="grid grid-cols-[118px_1fr] gap-[8px] max-[520px]:grid-cols-1"><dt className="font-mono font-semibold text-[#3a4254]">URL</dt><dd>系统创建连接档案后取得唯一 Profile ID，再用“当前浏览器公网来源 + <code className="font-mono text-[#244bc7]">/api/connectors/wecom/&#123;profile_id&#125;/callback</code>”组成。它同时接收企业微信首次 GET 验证和后续 POST 消息。</dd></div>
-                <div className="grid grid-cols-[118px_1fr] gap-[8px] max-[520px]:grid-cols-1"><dt className="font-mono font-semibold text-[#3a4254]">Token</dt><dd>浏览器使用密码学安全随机数生成 16 字节，再编码为 32 位小写十六进制字符串。它不是 CorpSecret，也不是访问令牌；双方使用同一个 Token 校验回调签名。</dd></div>
-                <div className="grid grid-cols-[118px_1fr] gap-[8px] max-[520px]:grid-cols-1"><dt className="font-mono font-semibold text-[#3a4254]">EncodingAESKey</dt><dd>浏览器使用密码学安全随机数生成企业微信要求的 43 位字符，服务端补一个 <code className="font-mono">=</code> 后解码为 32 字节 AES-256 密钥，用于解密消息并校验企业 CorpID。</dd></div>
+              <h4 className="gg-type-card-title font-semibold text-[var(--gg-ink)]">URL、Token、EncodingAESKey 分别怎么生成</h4>
+              <dl className="mt-[9px] grid gap-[8px] gg-type-caption  text-[#59647a]">
+                <div className="grid grid-cols-[118px_1fr] gap-[8px] max-[520px]:grid-cols-1"><dt className="font-mono gg-type-caption font-semibold text-[#3a4254]">URL</dt><dd>系统创建连接档案后取得唯一 Profile ID，再用“当前浏览器公网来源 + <code className="font-mono gg-type-code text-[#244bc7]">/api/connectors/wecom/&#123;profile_id&#125;/callback</code>”组成。它同时接收企业微信首次 GET 验证和后续 POST 消息。</dd></div>
+                <div className="grid grid-cols-[118px_1fr] gap-[8px] max-[520px]:grid-cols-1"><dt className="font-mono gg-type-caption font-semibold text-[#3a4254]">Token</dt><dd>浏览器使用密码学安全随机数生成 16 字节，再编码为 32 位小写十六进制字符串。它不是 CorpSecret，也不是访问令牌；双方使用同一个 Token 校验回调签名。</dd></div>
+                <div className="grid grid-cols-[118px_1fr] gap-[8px] max-[520px]:grid-cols-1"><dt className="font-mono gg-type-caption font-semibold text-[#3a4254]">EncodingAESKey</dt><dd>浏览器使用密码学安全随机数生成企业微信要求的 43 位字符，服务端补一个 <code className="font-mono gg-type-code">=</code> 后解码为 32 字节 AES-256 密钥，用于解密消息并校验企业 CorpID。</dd></div>
               </dl>
-              <p className="mt-[9px] rounded-[9px] bg-[#f6f8fc] px-[10px] py-[8px] text-[10px] leading-[1.6] text-[#68738a]">三项值在点击“验证并连接”时一起提交并加密保存。建档后的完整值只在当前浏览器内存中显示一次；企业微信后台必须填写这一组完全相同的值。点击“重新生成”后，旧 Token 和 EncodingAESKey 立即作废，不要混用两轮结果。</p>
+              <p className="mt-[9px] rounded-[9px] bg-[#f6f8fc] px-[10px] py-[8px] gg-type-caption  text-[#68738a]">三项值在点击“验证并连接”时一起提交并加密保存。建档后的完整值只在当前浏览器内存中显示一次；企业微信后台必须填写这一组完全相同的值。点击“重新生成”后，旧 Token 和 EncodingAESKey 立即作废，不要混用两轮结果。</p>
             </div>
 
             <GuideScreenshot
@@ -691,7 +692,7 @@ export default function ConnectionsPage({
           <section className="grid gap-[12px] rounded-[15px] border border-[#cfe8d8] bg-[#f7fcf8] p-[15px]" aria-labelledby="connection-demo-title">
             <GuideSectionTitle index="03" title="演示场景：让数字员工查询企业微信应用信息" id="connection-demo-title" />
             <div className="rounded-[12px] border border-[#cfe8d8] bg-white px-[13px] py-[12px]">
-              <h4 className="text-[12px] font-semibold text-[var(--gg-ink)]">场景角色与接入方式</h4>
+              <h4 className="gg-type-card-title font-semibold text-[var(--gg-ink)]">场景角色与接入方式</h4>
               <ol className="mt-[10px] grid grid-cols-2 gap-[10px] max-[620px]:grid-cols-1">
                 <ScenarioStep index="1" title="管理员绑定真实数字员工">在连接卡片点击“Agent 绑定”，选择本次真实使用的“平台能力演示助手”。系统授予 application:read；本案例的“审批后发送”已经开启。</ScenarioStep>
                 <ScenarioStep index="2" title="消息路由">在“消息接入”选择同一个数字员工作为唯一接收路由，避免入口和工具权限指向不同 Agent。</ScenarioStep>
@@ -714,20 +715,20 @@ export default function ConnectionsPage({
                 description="先指定接收消息的数字员工，再把已验签发送者映射到平台用户；系统不在页面展示原始 UserID 或正文。"
               />
             </div>
-            <p className="text-[12px] leading-[1.7] text-[#68776e]">以上截图直接取自当前运行中的真实 Demo：连接“共格·序伴企业微信测试”绑定数字员工“平台能力演示助手”。点击任一截图可查看原始尺寸。</p>
+            <p className="gg-type-meta  text-[#68776e]">以上截图直接取自当前运行中的真实 Demo：连接“共格·序伴企业微信测试”绑定数字员工“平台能力演示助手”。点击任一截图可查看原始尺寸。</p>
 
             <div className="grid grid-cols-[minmax(0,0.75fr)_24px_minmax(0,1.25fr)] items-stretch gap-[8px] max-[680px]:grid-cols-1">
               <div className="rounded-[12px] bg-white px-[13px] py-[12px] shadow-[0_4px_14px_rgba(22,96,55,0.06)]">
-                <small className="font-mono text-[10px] text-[#087a38]">员工在企业微信发送</small>
-                <p className="mt-[6px] text-[13px] font-medium leading-[1.6] text-[var(--gg-ink)]">“测试动态任务：查询当前企业微信应用信息”</p>
+                <small className="font-mono gg-type-caption text-[#087a38]">员工在企业微信发送</small>
+                <p className="mt-[6px] gg-type-control font-medium  text-[var(--gg-ink)]">“测试动态任务：查询当前企业微信应用信息”</p>
               </div>
               <ArrowRight className="m-auto size-[15px] text-[#78a98b] max-[680px]:rotate-90" />
               <div className="rounded-[12px] bg-white px-[13px] py-[12px] shadow-[0_4px_14px_rgba(22,96,55,0.06)]">
-                <small className="font-mono text-[10px] text-[#087a38]">系统执行链</small>
-                <p className="mt-[6px] text-[12px] leading-[1.65] text-[#465267]">验签消息 → 确认发送者映射 → 路由到已绑定数字员工 → DynamicTaskAgent 规划只读查询 → 使用该连接执行 <code className="font-mono text-[11px] text-[#087a38]">wecom.application_info</code> → 将结果回复原会话并记录审计。</p>
+                <small className="font-mono gg-type-caption text-[#087a38]">系统执行链</small>
+                <p className="mt-[6px] gg-type-meta  text-[#465267]">验签消息 → 确认发送者映射 → 路由到已绑定数字员工 → DynamicTaskAgent 规划只读查询 → 使用该连接执行 <code className="font-mono gg-type-caption text-[#087a38]">wecom.application_info</code> → 将结果回复原会话并记录审计。</p>
               </div>
             </div>
-            <div className="rounded-[12px] border border-dashed border-[#b9dac5] px-[13px] py-[10px] text-[11px] leading-[1.65] text-[#446151]">演示通过标准：回复内容来自真实连接而非预置文案；同一消息只形成一次执行和一次外部效果；凭据不进入模型上下文；未绑定 Agent、未授权用户或停用连接均在调用前被拒绝。</div>
+            <div className="rounded-[12px] border border-dashed border-[#b9dac5] px-[13px] py-[10px] gg-type-caption  text-[#446151]">演示通过标准：回复内容来自真实连接而非预置文案；同一消息只形成一次执行和一次外部效果；凭据不进入模型上下文；未绑定 Agent、未授权用户或停用连接均在调用前被拒绝。</div>
           </section>
 
           <div className="flex flex-wrap justify-end gap-[8px]">
@@ -744,10 +745,10 @@ export default function ConnectionsPage({
           <div className="flex items-center gap-[10px]">
             <span className="grid size-[38px] place-items-center rounded-[12px] bg-[#edf2ff] text-[var(--gg-cobalt)]"><KeyRound className="size-[17px]" /></span>
             <div>
-              <DialogTitle className="text-[15px] font-semibold text-[var(--gg-ink)]">
+              <DialogTitle className="gg-type-card-title font-semibold text-[var(--gg-ink)]">
                 {secretMode === 'create' ? `连接${providerLabel(provider)}` : `重新授权 ${selectedProfile?.display_name || ''}`}
               </DialogTitle>
-              <p className="mt-[2px] text-[11px] text-[var(--gg-slate)]">凭据只发送到服务端密钥边界，不会显示在档案、日志或任务上下文中。</p>
+              <p className="mt-[2px] gg-type-caption text-[var(--gg-slate)]">凭据只发送到服务端密钥边界，不会显示在档案、日志或任务上下文中。</p>
             </div>
           </div>
           {secretMode === 'create' ? (
@@ -782,7 +783,7 @@ export default function ConnectionsPage({
               {secretMode === 'create' ? (
                 <div className="grid gap-[10px] rounded-[11px] border border-[#dfe5f0] bg-white p-[10px]">
                   <div className="flex items-center justify-between gap-[10px]">
-                    <span className="text-[11px] font-medium text-[#464c5e]">消息回调验证密钥</span>
+                    <span className="gg-type-caption font-medium text-[#464c5e]">消息回调验证密钥</span>
                     <Button
                       type="button"
                       size="sm"
@@ -795,12 +796,12 @@ export default function ConnectionsPage({
                     >重新生成</Button>
                   </div>
                   <LabeledField label="回调 Token">
-                    <Input readOnly value={callbackToken} className="font-mono text-[11px]" />
+                    <Input readOnly value={callbackToken} className="font-mono gg-type-caption" />
                   </LabeledField>
                   <LabeledField label="EncodingAESKey">
-                    <Input readOnly value={callbackEncodingAesKey} className="font-mono text-[11px]" />
+                    <Input readOnly value={callbackEncodingAesKey} className="font-mono gg-type-caption" />
                   </LabeledField>
-                  <p className="text-[10px] leading-[1.55] text-[var(--gg-slate)]">建档成功后会显示一次完整回调配置；服务端仅加密保存，之后不会回显密钥。</p>
+                  <p className="gg-type-caption  text-[var(--gg-slate)]">建档成功后会显示一次完整回调配置；服务端仅加密保存，之后不会回显密钥。</p>
                 </div>
               ) : null}
             </div>
@@ -809,8 +810,8 @@ export default function ConnectionsPage({
               <Input autoFocus={secretMode === 'reauthorize'} type="password" autoComplete="new-password" value={token} onChange={(event) => setToken(event.target.value)} placeholder="xoxb-…" />
             </LabeledField>
           )}
-          <div className="rounded-[12px] border border-[#dce5ff] bg-[#f7f9ff] px-[12px] py-[10px] text-[11px] leading-[1.6] text-[#52617f]">
-            {provider === 'wecom' ? <>本批只开放 <code className="font-mono text-[#244bc7]">application:read</code>，用于验证和读取当前自建应用基础信息；不会读取通讯录或发送消息。</> : <>本批只申请 <code className="font-mono text-[#244bc7]">channels:read</code>，用于读取频道基础信息；不会发送消息。</>}
+          <div className="rounded-[12px] border border-[#dce5ff] bg-[#f7f9ff] px-[12px] py-[10px] gg-type-caption  text-[#52617f]">
+            {provider === 'wecom' ? <>本批只开放 <code className="font-mono gg-type-code text-[#244bc7]">application:read</code>，用于验证和读取当前自建应用基础信息；不会读取通讯录或发送消息。</> : <>本批只申请 <code className="font-mono gg-type-code text-[#244bc7]">channels:read</code>，用于读取频道基础信息；不会发送消息。</>}
           </div>
           <div className="flex justify-end gap-[8px]">
             {provider === 'slack' ? <Button variant="outline" disabled={savingSecret} onClick={() => void beginOAuth()}>通过 Slack OAuth</Button> : null}
@@ -825,8 +826,8 @@ export default function ConnectionsPage({
       <Dialog open={weComSetup !== null} onOpenChange={(open) => !open && setWeComSetup(null)}>
         <DialogContent aria-describedby={undefined} className="gap-[16px] rounded-[16px] sm:max-w-[640px]">
           <div>
-            <DialogTitle className="text-[15px] font-semibold text-[var(--gg-ink)]">配置企业微信接收消息服务器</DialogTitle>
-            <p className="mt-[4px] text-[11px] leading-[1.6] text-[var(--gg-slate)]">以下密钥仅在当前浏览器内存中显示一次。先复制到企业微信并保存验证，再关闭窗口。</p>
+            <DialogTitle className="gg-type-card-title font-semibold text-[var(--gg-ink)]">配置企业微信接收消息服务器</DialogTitle>
+            <p className="mt-[4px] gg-type-caption  text-[var(--gg-slate)]">以下密钥仅在当前浏览器内存中显示一次。先复制到企业微信并保存验证，再关闭窗口。</p>
           </div>
           {weComSetup ? (
             <div className="grid gap-[10px]">
@@ -835,8 +836,8 @@ export default function ConnectionsPage({
               <CopyValue label="EncodingAESKey" value={weComSetup.callbackEncodingAesKey} />
             </div>
           ) : null}
-          {!isPublicHttpsOrigin() ? <div className="rounded-[12px] border border-[#f1d28f] bg-[#fff8e8] px-[12px] py-[10px] text-[11px] leading-[1.6] text-[#76510b]">当前页面不是公网 HTTPS 地址，因此上方 URL 仅能说明回调路径，不能直接保存到企业微信。请先建立新的 HTTPS Tunnel，通过该地址重新打开系统，再创建连接。</div> : null}
-          <div className="rounded-[12px] border border-[#f1d28f] bg-[#fff8e8] px-[12px] py-[10px] text-[11px] leading-[1.6] text-[#76510b]">企业微信保存成功后，再回到“企业可信 IP”填写固定公网出口 IP；在此之前连接会保持“连接受限”，不会被数字员工误用。</div>
+          {!isPublicHttpsOrigin() ? <div className="rounded-[12px] border border-[#f1d28f] bg-[#fff8e8] px-[12px] py-[10px] gg-type-caption  text-[#76510b]">当前页面不是公网 HTTPS 地址，因此上方 URL 仅能说明回调路径，不能直接保存到企业微信。请先建立新的 HTTPS Tunnel，通过该地址重新打开系统，再创建连接。</div> : null}
+          <div className="rounded-[12px] border border-[#f1d28f] bg-[#fff8e8] px-[12px] py-[10px] gg-type-caption  text-[#76510b]">企业微信保存成功后，再回到“企业可信 IP”填写固定公网出口 IP；在此之前连接会保持“连接受限”，不会被数字员工误用。</div>
           <div className="flex justify-end"><Button onClick={() => setWeComSetup(null)}>我已完成配置</Button></div>
         </DialogContent>
       </Dialog>
@@ -844,8 +845,8 @@ export default function ConnectionsPage({
       <Dialog open={bindingDialogOpen} onOpenChange={setBindingDialogOpen}>
         <DialogContent aria-describedby={undefined} className="gap-[16px] rounded-[16px] sm:max-w-[600px]">
           <div>
-            <DialogTitle className="text-[15px] font-semibold text-[var(--gg-ink)]">数字员工绑定</DialogTitle>
-            <p className="mt-[4px] text-[11px] text-[var(--gg-slate)]">{selectedProfile?.display_name} · 默认仅授予 {providerReadScope(selectedProfile?.provider)}；企业微信发送必须另行显式开启且每次审批。</p>
+            <DialogTitle className="gg-type-card-title font-semibold text-[var(--gg-ink)]">数字员工绑定</DialogTitle>
+            <p className="mt-[4px] gg-type-caption text-[var(--gg-slate)]">{selectedProfile?.display_name} · 默认仅授予 {providerReadScope(selectedProfile?.provider)}；企业微信发送必须另行显式开启且每次审批。</p>
           </div>
           <div className="flex gap-[8px] max-[620px]:flex-col">
             <Select value={selectedAgentId} onValueChange={setSelectedAgentId}>
@@ -860,17 +861,17 @@ export default function ConnectionsPage({
           </div>
           <div className="grid max-h-[320px] gap-[8px] overflow-y-auto">
             {bindings.length === 0 ? (
-              <div className="rounded-[12px] border border-dashed border-[var(--gg-border)] px-[14px] py-[24px] text-center text-[12px] text-[var(--gg-slate)]">此账号尚未绑定数字员工</div>
+              <div className="rounded-[12px] border border-dashed border-[var(--gg-border)] px-[14px] py-[24px] text-center gg-type-meta text-[var(--gg-slate)]">此账号尚未绑定数字员工</div>
             ) : bindings.map((binding) => (
               <div key={binding.id} className="flex items-center justify-between gap-[14px] rounded-[12px] border border-[var(--gg-border)] px-[13px] py-[11px]">
                 <div className="flex min-w-0 items-center gap-[10px]">
                   <span className="grid size-[32px] shrink-0 place-items-center rounded-[10px] bg-[#f0f3f9] text-[#5e6b86]"><Bot className="size-[15px]" /></span>
                   <span className="min-w-0">
-                    <strong className="block truncate text-[12px] font-semibold text-[var(--gg-ink)]">{agentNames.get(binding.agent_id) || binding.agent_id}</strong>
-                    <span className="mt-[2px] block text-[11px] text-[var(--gg-slate)]">{binding.allowed_scopes.join(', ')} · 修订 {binding.revision}</span>
+                    <strong className="block truncate gg-type-meta font-semibold text-[var(--gg-ink)]">{agentNames.get(binding.agent_id) || binding.agent_id}</strong>
+                    <span className="mt-[2px] block gg-type-caption text-[var(--gg-slate)]">{binding.allowed_scopes.join(', ')} · 修订 {binding.revision}</span>
                   </span>
                 </div>
-                <div className="grid shrink-0 gap-[7px] text-[11px] text-[var(--gg-slate)]">
+                <div className="grid shrink-0 gap-[7px] gg-type-caption text-[var(--gg-slate)]">
                   {selectedProfile?.provider === 'wecom' ? (
                     <label className="flex items-center justify-end gap-[8px]">
                       审批后发送
@@ -899,16 +900,16 @@ export default function ConnectionsPage({
           <div className="flex items-start gap-[11px]">
             <span className="grid size-[40px] shrink-0 place-items-center rounded-[13px] bg-[#edf2ff] text-[var(--gg-cobalt)]"><MessagesSquare className="size-[18px]" /></span>
             <div>
-              <DialogTitle className="text-[15px] font-semibold text-[var(--gg-ink)]">消息接入</DialogTitle>
-              <p className="mt-[3px] text-[11px] leading-[1.6] text-[var(--gg-slate)]">{selectedProfile?.display_name} · 先确定接收消息的数字员工，再授权已验签的发送者。</p>
+              <DialogTitle className="gg-type-card-title font-semibold text-[var(--gg-ink)]">消息接入</DialogTitle>
+              <p className="mt-[3px] gg-type-caption  text-[var(--gg-slate)]">{selectedProfile?.display_name} · 先确定接收消息的数字员工，再授权已验签的发送者。</p>
             </div>
           </div>
 
           <section className="grid grid-cols-[28px_1fr] gap-[10px] rounded-[14px] border border-[#dce5ff] bg-[#fbfcff] p-[13px]" aria-label="入站路由">
-            <span className="grid size-[25px] place-items-center rounded-full bg-[var(--gg-cobalt)] font-mono text-[10px] font-semibold text-white">01</span>
+            <span className="grid size-[25px] place-items-center rounded-full bg-[var(--gg-cobalt)] font-mono gg-type-caption font-semibold text-white">01</span>
             <div className="min-w-0">
-              <h3 className="text-[12px] font-semibold text-[var(--gg-ink)]">选择接收消息的数字员工</h3>
-              <p className="mt-[2px] text-[10px] leading-[1.5] text-[var(--gg-slate)]">这里只显示已获得此连接只读能力的数字员工，避免消息入口和工具权限分叉。</p>
+              <h3 className="gg-type-card-title font-semibold text-[var(--gg-ink)]">选择接收消息的数字员工</h3>
+              <p className="mt-[2px] gg-type-caption  text-[var(--gg-slate)]">这里只显示已获得此连接只读能力的数字员工，避免消息入口和工具权限分叉。</p>
               <div className="mt-[9px] flex gap-[8px] max-[620px]:flex-col">
                 <Select value={selectedInboundAgentId} onValueChange={setSelectedInboundAgentId}>
                   <SelectTrigger aria-label="接收消息的数字员工" className={cn(SELECT_TRIGGER_CLASS, 'flex-1')}>
@@ -922,21 +923,21 @@ export default function ConnectionsPage({
                 </Select>
                 <Button disabled={!selectedInboundAgentId || actingId === 'save-inbound-route'} onClick={() => void saveInboundRoute()} className="bg-[var(--gg-cobalt)] text-white hover:bg-[#244bc7]">保存消息路由</Button>
               </div>
-              {inboundRoute ? <p className="mt-[7px] text-[10px] text-[#087a38]">当前路由：{agentNames.get(inboundRoute.agent_id) || inboundRoute.agent_id}</p> : null}
+              {inboundRoute ? <p className="mt-[7px] gg-type-caption text-[#087a38]">当前路由：{agentNames.get(inboundRoute.agent_id) || inboundRoute.agent_id}</p> : null}
             </div>
           </section>
 
           <section className="grid grid-cols-[28px_1fr] gap-[10px] rounded-[14px] border border-[var(--gg-border)] p-[13px]" aria-label="发送者授权队列">
-            <span className="grid size-[25px] place-items-center rounded-full bg-[#eff2f7] font-mono text-[10px] font-semibold text-[#59647a]">02</span>
+            <span className="grid size-[25px] place-items-center rounded-full bg-[#eff2f7] font-mono gg-type-caption font-semibold text-[#59647a]">02</span>
             <div className="min-w-0">
-              <h3 className="text-[12px] font-semibold text-[var(--gg-ink)]">授权待处理发送者</h3>
-              <p className="mt-[2px] text-[10px] leading-[1.5] text-[var(--gg-slate)]">系统不显示企业微信 UserID 或消息正文；请选择它在本平台对应的活动用户。</p>
+            <h3 className="gg-type-card-title font-semibold text-[var(--gg-ink)]">授权待处理发送者</h3>
+              <p className="mt-[2px] gg-type-caption  text-[var(--gg-slate)]">系统不显示企业微信 UserID 或消息正文；请选择它在本平台对应的活动用户。</p>
               <div className="mt-[9px] grid max-h-[280px] gap-[8px] overflow-y-auto">
                 {inboundEvents.filter((event) => !event.principal_bound).length === 0 ? (
-                  <div className="rounded-[11px] border border-dashed border-[var(--gg-border)] px-[12px] py-[18px] text-center text-[11px] text-[var(--gg-slate)]">没有待授权发送者</div>
+                  <div className="rounded-[11px] border border-dashed border-[var(--gg-border)] px-[12px] py-[18px] text-center gg-type-caption text-[var(--gg-slate)]">没有待授权发送者</div>
                 ) : inboundEvents.filter((event) => !event.principal_bound).map((event) => (
                   <div key={event.id} className="grid grid-cols-[minmax(0,1fr)_minmax(180px,0.8fr)_auto] items-center gap-[8px] rounded-[11px] bg-[#f8f9fc] px-[10px] py-[9px] max-[620px]:grid-cols-1">
-                    <span className="min-w-0"><strong className="block text-[11px] font-medium text-[#3a4254]">企业微信发送者 · {formatDateTime(event.created_at)}</strong><small className="mt-[2px] block truncate font-mono text-[10px] text-[var(--gg-slate)]">{event.last_error_code || event.status}</small></span>
+                    <span className="min-w-0"><strong className="block gg-type-caption font-medium text-[#3a4254]">企业微信发送者 · {formatDateTime(event.created_at)}</strong><small className="mt-[2px] block truncate font-mono gg-type-caption text-[var(--gg-slate)]">{event.last_error_code || event.status}</small></span>
                     <Select value={eventUserSelections[event.id] || ''} onValueChange={(value) => setEventUserSelections((current) => ({ ...current, [event.id]: value }))}>
                       <SelectTrigger aria-label={`选择事件${event.id}对应用户`} className={SELECT_TRIGGER_CLASS}><SelectValue placeholder="对应的平台用户" /></SelectTrigger>
                       <SelectContent>{inboundUsers.map((user) => <SelectItem key={user.id} value={user.id}>{user.display_name || user.username}</SelectItem>)}</SelectContent>
@@ -956,8 +957,8 @@ export default function ConnectionsPage({
           <div className="flex items-start gap-[11px]">
             <span className="grid size-[38px] shrink-0 place-items-center rounded-[12px] bg-[#fdecec] text-[#b42318]"><Unplug className="size-[17px]" /></span>
             <div>
-              <DialogTitle className="text-[15px] font-semibold text-[var(--gg-ink)]">停用 {pendingDisable?.display_name || '连接'}</DialogTitle>
-              <p className="mt-[5px] text-[12px] leading-[1.65] text-[var(--gg-slate)]">所有数字员工绑定会立即失效，等待和新建任务都会在外部调用前被拒绝。历史执行与密钥修订记录仍会保留。</p>
+              <DialogTitle className="gg-type-card-title font-semibold text-[var(--gg-ink)]">停用 {pendingDisable?.display_name || '连接'}</DialogTitle>
+              <p className="mt-[5px] gg-type-meta  text-[var(--gg-slate)]">所有数字员工绑定会立即失效，等待和新建任务都会在外部调用前被拒绝。历史执行与密钥修订记录仍会保留。</p>
             </div>
           </div>
           <div className="flex justify-end gap-[8px]">
@@ -966,7 +967,7 @@ export default function ConnectionsPage({
           </div>
         </DialogContent>
       </Dialog>
-    </div>
+    </PageShell>
   );
 }
 
@@ -976,9 +977,9 @@ function GuideFlowStep({ icon: Icon, label, value, onClick }: { icon: typeof Bot
   return (
     <button type="button" onClick={onClick} aria-label={`查看${value}步骤`} className="group grid min-w-0 cursor-pointer place-items-center gap-[5px] rounded-[11px] border border-transparent px-[5px] py-[7px] text-center transition-colors hover:border-[#d7e1fb] hover:bg-[#f1f5ff] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--gg-cobalt)] focus-visible:ring-offset-2">
       <span className="grid size-[32px] place-items-center rounded-[11px] bg-[#edf2ff] text-[var(--gg-cobalt)]"><Icon className="size-[15px]" /></span>
-      <small className="text-[9px] text-[#8a93a8]">{label}</small>
-      <strong className="text-[11px] font-semibold text-[#3a4254]">{value}</strong>
-      <small className="text-[10px] font-medium text-[var(--gg-cobalt)]">查看步骤 →</small>
+      <small className="gg-type-caption text-[#8a93a8]">{label}</small>
+      <strong className="gg-type-caption font-semibold text-[#3a4254]">{value}</strong>
+      <small className="gg-type-caption font-medium text-[var(--gg-cobalt)]">查看步骤 →</small>
     </button>
   );
 }
@@ -988,8 +989,8 @@ function GuideSectionTitle({ index, title, id }: { index: string; title: string;
 
   return (
     <div className="flex items-center gap-[9px]">
-      <span className="grid size-[27px] shrink-0 place-items-center rounded-full bg-[var(--gg-cobalt)] font-mono text-[10px] font-semibold text-white">{index}</span>
-      <h3 id={id} className="text-[13px] font-semibold text-[var(--gg-ink)]">{title}</h3>
+      <span className="grid size-[27px] shrink-0 place-items-center rounded-full bg-[var(--gg-cobalt)] font-mono gg-type-caption font-semibold text-white">{index}</span>
+      <h3 id={id} className="gg-type-card-title font-semibold text-[var(--gg-ink)]">{title}</h3>
     </div>
   );
 }
@@ -1010,9 +1011,9 @@ function GuideBoundaryCard({
   const positive = tone === 'positive';
   return (
     <div className={cn('rounded-[12px] border px-[13px] py-[12px]', positive ? 'border-[#cfe8d8] bg-[#f7fcf8]' : 'border-[#ecd9d6] bg-[#fffafa]')}>
-      <h4 className={cn('flex items-center gap-[7px] text-[12px] font-semibold', positive ? 'text-[#087a38]' : 'text-[#a33a31]')}><Icon className="size-[15px]" />{title}</h4>
+      <h4 className={cn('flex items-center gap-[7px] gg-type-card-title font-semibold', positive ? 'text-[#087a38]' : 'text-[#a33a31]')}><Icon className="size-[15px]" />{title}</h4>
       <ul className="mt-[8px] grid gap-[6px]">
-        {items.map((item) => <li key={item} className="grid grid-cols-[8px_1fr] gap-[6px] text-[11px] leading-[1.6] text-[#59647a]"><span aria-hidden="true" className={cn('mt-[7px] size-[4px] rounded-full', positive ? 'bg-[#42a66a]' : 'bg-[#cf756d]')} />{item}</li>)}
+        {items.map((item) => <li key={item} className="grid grid-cols-[8px_1fr] gap-[6px] gg-type-caption  text-[#59647a]"><span aria-hidden="true" className={cn('mt-[7px] size-[4px] rounded-full', positive ? 'bg-[#42a66a]' : 'bg-[#cf756d]')} />{item}</li>)}
       </ul>
     </div>
   );
@@ -1023,8 +1024,8 @@ function GuideInstruction({ index, title, children }: { index: string; title: st
 
   return (
     <li className="grid grid-cols-[26px_1fr] gap-[10px] rounded-[11px] border border-[#e5e9f2] bg-white px-[11px] py-[10px]">
-      <span className="grid size-[24px] place-items-center rounded-[8px] bg-[#edf2ff] font-mono text-[10px] font-semibold text-[var(--gg-cobalt)]">{index}</span>
-      <span><strong className="block text-[13px] font-semibold text-[#3a4254]">{title}</strong><span className="mt-[3px] block text-[12px] leading-[1.75] text-[var(--gg-slate)]">{children}</span></span>
+      <span className="grid size-[24px] place-items-center rounded-[8px] bg-[#edf2ff] font-mono gg-type-caption font-semibold text-[var(--gg-cobalt)]">{index}</span>
+      <span><strong className="block gg-type-control font-semibold text-[#3a4254]">{title}</strong><span className="mt-[3px] block gg-type-meta  text-[var(--gg-slate)]">{children}</span></span>
     </li>
   );
 }
@@ -1034,9 +1035,9 @@ function ScenarioStep({ index, title, children }: { index: string; title: string
 
   return (
     <li className="rounded-[11px] bg-[#f4f9f6] px-[13px] py-[12px]">
-      <span className="font-mono text-[10px] font-semibold text-[#087a38]">STEP {index}</span>
-      <strong className="mt-[4px] block text-[13px] font-semibold text-[#34483b]">{title}</strong>
-      <span className="mt-[4px] block text-[12px] leading-[1.75] text-[#617267]">{children}</span>
+      <span className="font-mono gg-type-caption font-semibold text-[#087a38]">STEP {index}</span>
+      <strong className="mt-[4px] block gg-type-control font-semibold text-[#34483b]">{title}</strong>
+      <span className="mt-[4px] block gg-type-meta  text-[#617267]">{children}</span>
     </li>
   );
 }
@@ -1050,9 +1051,9 @@ function GuideScreenshot({ src, alt, title, description }: { src: string; alt: s
         <img src={src} alt={alt} className="h-auto w-auto max-w-full rounded-[6px] shadow-[0_2px_8px_rgba(35,52,88,0.08)] transition-opacity duration-200 group-hover:opacity-90 motion-reduce:transition-none" />
       </a>
       <figcaption className="border-t border-[#e8ecf3] px-[11px] py-[9px]">
-        <strong className="block text-[14px] font-semibold text-[#3a4254]">{title}</strong>
-        <span className="mt-[4px] block text-[12px] leading-[1.7] text-[var(--gg-slate)]">{description}</span>
-        <span className="mt-[6px] block text-[11px] font-medium text-[var(--gg-cobalt)]">点击截图可查看原图</span>
+        <strong className="block gg-type-body font-semibold text-[#3a4254]">{title}</strong>
+        <span className="mt-[4px] block gg-type-meta  text-[var(--gg-slate)]">{description}</span>
+        <span className="mt-[6px] block gg-type-caption font-medium text-[var(--gg-cobalt)]">点击截图可查看原图</span>
       </figcaption>
     </figure>
   );
@@ -1063,9 +1064,9 @@ function DemoValueRow({ label, value, destination, code = false, strong = false 
 
   return (
     <div className="contents max-[760px]:block">
-      <dt className="border-b border-r border-[#e5e9f2] bg-[#fafbfe] px-[14px] py-[11px] font-medium text-[#586176] max-[760px]:border-r-0 max-[760px]:pb-[4px]">{label}</dt>
-      <dd className={cn('break-all border-b border-r border-[#e5e9f2] px-[14px] py-[11px] text-[#30384c] max-[760px]:border-r-0 max-[760px]:py-[5px]', code && 'font-mono', strong && 'font-semibold text-[#087a38]')}>{value}</dd>
-      <dd className="border-b border-[#e5e9f2] px-[14px] py-[11px] leading-[1.65] text-[#68738a] max-[760px]:pt-[5px]">{destination}</dd>
+      <dt className="gg-type-meta border-b border-r border-[#e5e9f2] bg-[#fafbfe] px-[14px] py-[11px] font-medium text-[#586176] max-[760px]:border-r-0 max-[760px]:pb-[4px]">{label}</dt>
+      <dd className={cn('gg-type-body break-all border-b border-r border-[#e5e9f2] px-[14px] py-[11px] text-[#30384c] max-[760px]:border-r-0 max-[760px]:py-[5px]', code && 'font-mono gg-type-code', strong && 'font-semibold text-[#087a38]')}>{value}</dd>
+      <dd className="gg-type-meta border-b border-[#e5e9f2] px-[14px] py-[11px] text-[#68738a] max-[760px]:pt-[5px]">{destination}</dd>
     </div>
   );
 }
@@ -1099,15 +1100,15 @@ function ConnectionCard({
             <div className="flex min-w-0 items-center gap-[11px]">
               <span className={cn('grid size-[42px] shrink-0 place-items-center rounded-[13px] text-white', profile.provider === 'wecom' ? 'bg-[#2f73da]' : 'bg-[#4a154b]')}><Cable className="size-[18px]" /></span>
               <span className="min-w-0">
-                <strong className="block truncate text-[15px] font-semibold text-[var(--gg-ink)]">{profile.display_name}</strong>
-                <span className="mt-[2px] block truncate font-mono text-[11px] text-[var(--gg-slate)]">{providerLabel(profile.provider)} · {profile.account_id}</span>
+                <strong className="block truncate gg-type-body font-semibold text-[var(--gg-ink)]">{profile.display_name}</strong>
+                <span className="mt-[2px] block truncate font-mono gg-type-caption text-[var(--gg-slate)]">{providerLabel(profile.provider)} · {profile.account_id}</span>
               </span>
             </div>
-            <span className={cn('rounded-full px-[9px] py-[4px] text-[11px] font-medium', healthy ? 'bg-[#eaf8ef] text-[#087a38]' : profile.health_status === 'degraded' ? 'bg-[#fff4df] text-[#8a5700]' : 'bg-[#fdecec] text-[#b42318]')}>
+            <span className={cn('rounded-full px-[9px] py-[4px] gg-type-caption font-medium', healthy ? 'bg-[#eaf8ef] text-[#087a38]' : profile.health_status === 'degraded' ? 'bg-[#fff4df] text-[#8a5700]' : 'bg-[#fdecec] text-[#b42318]')}>
               {HEALTH_COPY[profile.health_status]}
             </span>
           </div>
-          <p className="mt-[12px] text-[11px] leading-[1.6] text-[var(--gg-slate)]">
+          <p className="mt-[12px] gg-type-caption  text-[var(--gg-slate)]">
             {connectionStatusDetail(profile)}
           </p>
         </div>
@@ -1121,7 +1122,7 @@ function ConnectionCard({
         </div>
       </div>
       <div className="flex flex-wrap items-center justify-between gap-[10px] border-t border-[#edf0f5] bg-[#fcfcfd] px-[18px] py-[10px]">
-        <span className="text-[11px] text-[var(--gg-slate)]">最近检查：{formatDateTime(profile.last_checked_at || undefined)}</span>
+        <span className="gg-type-caption text-[var(--gg-slate)]">最近检查：{formatDateTime(profile.last_checked_at || undefined)}</span>
         <div className="flex flex-wrap gap-[7px]">
           <Button size="sm" variant="outline" disabled={busy || profile.status === 'disabled'} onClick={onHealth}><Activity className="size-[13px]" />健康检查</Button>
           <Button size="sm" variant="outline" onClick={onBindings}><Bot className="size-[13px]" />Agent 绑定</Button>
@@ -1140,7 +1141,7 @@ function IdentityStep({ icon: Icon, label, value }: { icon: typeof ShieldCheck; 
   return (
     <span className="flex min-w-0 items-center gap-[8px]">
       <Icon className="size-[14px] shrink-0 text-[var(--gg-cobalt)]" />
-      <span className="min-w-0"><small className="block text-[10px] text-[#8a93a8]">{label}</small><strong className="mt-[1px] block truncate text-[11px] font-medium text-[#3a4254]">{value}</strong></span>
+      <span className="min-w-0"><small className="block gg-type-caption text-[#8a93a8]">{label}</small><strong className="mt-[1px] block truncate gg-type-caption font-medium text-[#3a4254]">{value}</strong></span>
     </span>
   );
 }
@@ -1151,7 +1152,7 @@ function ConnectionMetric({ icon: Icon, label, value, tone = 'neutral' }: { icon
   return (
     <div className="flex items-center gap-[11px] border-r border-[var(--gg-border)] px-[18px] py-[15px] last:border-r-0 max-[720px]:border-b max-[720px]:border-r-0 max-[720px]:last:border-b-0">
       <span className={cn('grid size-[36px] place-items-center rounded-[11px]', tone === 'healthy' ? 'bg-[#eaf8ef] text-[#087a38]' : tone === 'warning' ? 'bg-[#fff4df] text-[#8a5700]' : 'bg-[#edf2ff] text-[var(--gg-cobalt)]')}><Icon className="size-[16px]" /></span>
-      <span><strong className="block text-[19px] font-semibold text-[var(--gg-ink)]">{value}</strong><small className="text-[11px] text-[var(--gg-slate)]">{label}</small></span>
+      <span><strong className="block gg-type-section-title font-semibold text-[var(--gg-ink)]">{value}</strong><small className="gg-type-caption text-[var(--gg-slate)]">{label}</small></span>
     </div>
   );
 }
@@ -1159,7 +1160,7 @@ function ConnectionMetric({ icon: Icon, label, value, tone = 'neutral' }: { icon
 function LabeledField({ label, children }: { label: string; children: ReactNode }) {
   /** 为连接表单提供一致的可访问标签。 */
 
-  return <label className="grid gap-[6px]"><span className="text-[12px] font-medium text-[#464c5e]">{label}</span>{children}</label>;
+  return <label className="grid gap-[6px]"><span className="gg-type-meta font-medium text-[#464c5e]">{label}</span>{children}</label>;
 }
 
 function CopyValue({ label, value }: { label: string; value: string }) {
@@ -1167,9 +1168,9 @@ function CopyValue({ label, value }: { label: string; value: string }) {
 
   return (
     <div className="grid gap-[5px]">
-      <span className="text-[11px] font-medium text-[#464c5e]">{label}</span>
+      <span className="gg-type-caption font-medium text-[#464c5e]">{label}</span>
       <div className="flex min-w-0 items-center gap-[7px] rounded-[11px] border border-[#dfe5f0] bg-[#fafbfe] p-[7px]">
-        <code className="min-w-0 flex-1 break-all px-[4px] text-[11px] text-[#30384c]">{value}</code>
+        <code className="min-w-0 flex-1 break-all px-[4px] gg-type-caption text-[#30384c]">{value}</code>
         <Button
           type="button"
           size="sm"

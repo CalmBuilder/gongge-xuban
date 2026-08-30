@@ -221,18 +221,18 @@ export default function TutorialPage() {
   }, []);
 
   return (
-    <main className="tutorial-doc-page">
+    <main className="tutorial-doc-page gg-typography-scope" data-typography-contract="v1">
       <section className="tutorial-doc-hero" id="intro">
         <div className="tutorial-doc-hero-copy">
-          <span className="ui-typography tutorial-doc-eyebrow">共格·序伴 文档</span>
-          <h1 className="ui-typography">企业数字员工运行时，从配置到持续运营</h1>
-          <p className="ui-typography">
+          <span className="gg-type-caption tutorial-doc-eyebrow">共格·序伴 文档</span>
+          <h1 className="gg-type-display">企业数字员工运行时，从配置到持续运营</h1>
+          <p className="gg-type-body">
             共格·序伴把模型、数字员工、知识库、技能、SOP、工具、记忆、定时任务和 Trace 放到一条链路里，
             让企业拥有可配置、可验证、可复盘的业务流程对话系统。
           </p>
           <div className="tutorial-doc-actions">
-            <a className="tutorial-doc-primary-action" href="#quickstart">快速开始</a>
-            <a className="tutorial-doc-secondary-action" href="#core-features">查看核心功能</a>
+            <a className="tutorial-doc-primary-action gg-type-control" href="#quickstart">快速开始</a>
+            <a className="tutorial-doc-secondary-action gg-type-control" href="#core-features">查看核心功能</a>
           </div>
           <div className="tutorial-doc-proof-row">
             <span><strong>8</strong>核心模块</span>
@@ -280,9 +280,9 @@ export default function TutorialPage() {
 
       <section className="tutorial-doc-section tutorial-doc-intro-panel">
         <div>
-          <span className="ui-typography tutorial-doc-eyebrow">项目简介</span>
-          <h2 className="ui-typography">不是通用 Agent 框架，而是面向业务流程的企业对话运行时</h2>
-          <p className="ui-typography">
+          <span className="gg-type-caption tutorial-doc-eyebrow">项目简介</span>
+          <h2 className="gg-type-page-title">不是通用 Agent 框架，而是面向业务流程的企业对话运行时</h2>
+          <p className="gg-type-body">
             共格·序伴的核心不是“能聊天”，而是让一个真实岗位拥有自己的配置、资源、执行规则和运营记录。
             每个员工都可以有独立知识、SOP、工具和记忆；每次对话都能回看路由、工具调用、回复和反馈。
           </p>
@@ -336,8 +336,8 @@ export default function TutorialPage() {
             <article key={step.title} className="tutorial-doc-step">
               <em>{String(index + 1).padStart(2, '0')}</em>
               <div>
-                <h3 className="ui-typography">{step.title}</h3>
-                <p className="ui-typography">{step.body}</p>
+                <h3 className="gg-type-card-title">{step.title}</h3>
+                <p className="gg-type-body">{step.body}</p>
               </div>
               <strong>{step.outcome}</strong>
             </article>
@@ -460,8 +460,8 @@ export default function TutorialPage() {
         <div className="tutorial-doc-showcase-grid">
           {SCENARIOS.map((scenario) => (
             <article key={scenario.title}>
-              <h3 className="ui-typography">{scenario.title}</h3>
-              <p className="ui-typography">{scenario.body}</p>
+              <h3 className="gg-type-card-title">{scenario.title}</h3>
+              <p className="gg-type-body">{scenario.body}</p>
               <code>{scenario.stack}</code>
               <div>
                 {scenario.tags.map((tag) => <span key={tag} className="ui-tag">{tag}</span>)}
@@ -510,9 +510,9 @@ function FeatureMark({ feature }: { feature: Feature }) {
 function SectionHeading({ eyebrow, title, body }: { eyebrow: string; title: string; body: string }) {
   return (
     <div className="tutorial-doc-section-heading">
-      <span className="ui-typography tutorial-doc-eyebrow">{eyebrow}</span>
-      <h2 className="ui-typography">{title}</h2>
-      <p className="ui-typography">{body}</p>
+      <span className="gg-type-caption tutorial-doc-eyebrow">{eyebrow}</span>
+      <h2 className="gg-type-section-title">{title}</h2>
+      <p className="gg-type-body">{body}</p>
     </div>
   );
 }

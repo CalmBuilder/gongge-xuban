@@ -200,7 +200,7 @@ export default function ChatDialogs({ chat }: { chat: UseChatSession }) {
       >
         <DialogContent className="gap-0 overflow-hidden rounded-[16px] p-0">
           <DialogHeader className="px-[16px] pt-[16px] pb-[12px]">
-            <DialogTitle className="text-[14px] leading-[normal] font-medium text-[#18181a]">
+            <DialogTitle className="gg-type-card-title  font-medium text-[#18181a]">
               重命名
             </DialogTitle>
           </DialogHeader>
@@ -222,7 +222,7 @@ export default function ChatDialogs({ chat }: { chat: UseChatSession }) {
           <div className="flex items-center justify-end gap-[8px] pt-[12px] pr-[16px] pb-[16px] pl-[12px]">
             <Button
               variant="outline"
-              className="h-[32px] w-[80px] rounded-[10px] border-[#e3e7f1] bg-white px-[12px] py-[8px] text-[14px] font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-[#18181a]"
+              className="h-[32px] w-[80px] rounded-[10px] border-[#e3e7f1] bg-white px-[12px] py-[8px] gg-type-body font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-[#18181a]"
               onClick={() => {
                 setRenameSession(null);
                 setRenameTitle('');
@@ -231,7 +231,7 @@ export default function ChatDialogs({ chat }: { chat: UseChatSession }) {
               取消
             </Button>
             <Button
-              className="h-[36px] w-[80px] rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-[12px] py-[8px] text-[14px] font-semibold text-white hover:bg-[#244bc7]"
+              className="h-[36px] w-[80px] rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-[12px] py-[8px] gg-type-body font-semibold text-white hover:bg-[#244bc7]"
               onClick={() => void saveRename()}
             >
               保存

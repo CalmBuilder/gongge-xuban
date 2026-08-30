@@ -539,23 +539,24 @@ function Shell({
         modelSetupAttention={isAdmin && showModelSetupNotice}
       />
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-        <div
-          className={`content flex-1 ${isDistillRoute ? "flex min-h-0 flex-col overflow-hidden p-0!" : ""} ${selected === "/enterprise/dashboard" ? "gongge-dashboard-content" : ""} ${selected !== "/enterprise/dashboard" && !isDistillRoute ? "gongge-management-content" : ""}`}
-        >
+          <div
+          data-typography-contract="v1"
+          className={`content gg-typography-scope flex-1 ${isDistillRoute ? "flex min-h-0 flex-col overflow-hidden p-0!" : ""} ${selected === "/enterprise/dashboard" ? "gongge-dashboard-content" : ""} ${selected !== "/enterprise/dashboard" && !isDistillRoute ? "gongge-management-content" : ""}`}
+          >
           {showModelSetupNotice && (
             <div className="mx-[24px] mt-[18px] mb-[10px] flex shrink-0 flex-col items-start justify-between gap-[12px] rounded-[12px] border border-[#f3d28b] bg-[#fff8e8] px-[18px] py-[12px] text-[#6f4500] shadow-[0_8px_24px_rgba(92,62,0,0.08)] sm:flex-row sm:items-center">
               <div className="flex min-w-0 items-center gap-[10px]">
                 <span className="flex size-[28px] shrink-0 items-center justify-center rounded-[8px] bg-[#ffe7ad] text-[#8a4b00]">
                   <ProductIcon name="model" className="size-[15px]" />
                 </span>
-                <span className="min-w-0 text-[13px] leading-[20px]">{modelSetupNoticeText}</span>
+                <span className="min-w-0 gg-type-control">{modelSetupNoticeText}</span>
               </div>
               {isAdmin && (
                 <UIButton
                   type="button"
                   size="sm"
                   onClick={() => navigate(EnterpriseRoute.Models)}
-                  className="h-[32px] shrink-0 rounded-[8px] bg-[#1a71ff] px-[12px] text-[12px] text-white hover:bg-[#0f5ed7]"
+                  className="h-[32px] shrink-0 rounded-[8px] bg-[#1a71ff] px-[12px] gg-type-control text-white hover:bg-[#0f5ed7]"
                 >
                   {t("去配置")}
                 </UIButton>
@@ -890,7 +891,7 @@ function Shell({
       </div>
       <Dialog open={agentCreateOpen} onOpenChange={setAgentCreateOpen}>
         <DialogContent className="flex max-h-[calc(100dvh-32px)] w-[calc(100%-32px)] flex-col gap-0 overflow-hidden rounded-[16px] p-0 sm:max-w-[520px]">
-          <DialogTitle className="shrink-0 px-[24px] py-[16px] text-[16px] font-semibold text-foreground">
+          <DialogTitle className="shrink-0 px-[24px] py-[16px] gg-type-card-title font-semibold text-foreground">
             新建数字员工
           </DialogTitle>
           <div className="agent-editor-form min-h-0 flex-1 overflow-y-auto px-[24px] pb-[16px]">
@@ -906,7 +907,7 @@ function Shell({
                     type="button"
                     aria-pressed={agentForm.sourceMode === option.value}
                     className={cn(
-                      "rounded-[8px] px-[14px] py-[5px] text-[13px] font-medium transition-colors",
+                      "rounded-[8px] px-[14px] py-[5px] gg-type-control font-medium transition-colors",
                       agentForm.sourceMode === option.value
                         ? "bg-[var(--gg-cobalt)] text-white shadow-[0_4px_10px_rgba(49,87,232,0.18)]"
                         : "text-[var(--gg-slate)] hover:bg-[var(--gg-paper)] hover:text-[var(--gg-ink)]",

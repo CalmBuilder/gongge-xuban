@@ -46,19 +46,19 @@ function FilterSelect({
   onChange: (value: string) => void;
 }) {
   return (
-    <label className="flex items-center gap-[8px] text-[12px] text-[#727d94]">
+    <label className="flex items-center gap-[8px] gg-type-meta text-[#727d94]">
       <span className="shrink-0">{label}</span>
       <Select value={value || ALL_VALUE} onValueChange={(next) => onChange(next === ALL_VALUE ? '' : next)}>
         <SelectTrigger
           aria-label={label}
-          className="h-[36px] w-auto min-w-[136px] rounded-[10px] border-[var(--gg-border)] bg-white px-[10px] text-[12px] text-[#343a4b] shadow-none"
+          className="h-[36px] w-auto min-w-[136px] rounded-[10px] border-[var(--gg-border)] bg-white px-[10px] gg-type-meta text-[#343a4b] shadow-none"
         >
           <SelectValue placeholder={allLabel} />
         </SelectTrigger>
         <SelectContent position="popper" className="rounded-[12px]">
-          <SelectItem value={ALL_VALUE} className="text-[12px]">{allLabel}</SelectItem>
+          <SelectItem value={ALL_VALUE} className="gg-type-meta">{allLabel}</SelectItem>
           {options.map((option) => (
-            <SelectItem key={option.value} value={option.value} className="text-[12px]">
+            <SelectItem key={option.value} value={option.value} className="gg-type-meta">
               {option.label}（{option.count}）
             </SelectItem>
           ))}
@@ -85,9 +85,9 @@ export default function ExpertFilterBar({
   return (
     <div className="mb-[16px]">
       <div className="mb-[10px] flex flex-wrap items-center justify-between gap-[8px]">
-        <p className="text-[13px] font-semibold text-[#30394e]">
+        <p className="gg-type-control font-semibold text-[#30394e]">
           {department || '全部专家'}
-          <span className="ml-[6px] font-normal text-[#8a93a6]">{resultCount} 位</span>
+          <span className="ml-[6px] gg-type-meta font-normal text-[#8a93a6]">{resultCount} 位</span>
         </p>
         <div className="flex items-center gap-[10px]">
           {sourceOptions.length > 1 ? (
@@ -100,7 +100,7 @@ export default function ExpertFilterBar({
             />
           ) : null}
           {hasFilters && resultCount > 0 && (
-            <button type="button" onClick={onReset} className="text-[12px] font-medium text-[var(--gg-cobalt)] hover:underline">
+            <button type="button" onClick={onReset} className="gg-type-meta font-medium text-[var(--gg-cobalt)] hover:underline">
               清除筛选
             </button>
           )}
@@ -109,7 +109,7 @@ export default function ExpertFilterBar({
               <button
                 type="button"
                 aria-label="筛选专家"
-                className="hidden h-[34px] items-center rounded-[10px] border border-[var(--gg-border)] bg-white px-[12px] text-[12px] text-[#566178] max-[760px]:inline-flex"
+                className="hidden h-[34px] items-center rounded-[10px] border border-[var(--gg-border)] bg-white px-[12px] gg-type-meta text-[#566178] max-[760px]:inline-flex"
               >
                 筛选
               </button>
@@ -128,7 +128,7 @@ export default function ExpertFilterBar({
                   type="button"
                   aria-label="重置筛选"
                   onClick={onReset}
-                  className="h-[40px] rounded-[12px] border border-[var(--gg-border)] bg-white text-[12px] font-medium text-[#566178]"
+                  className="h-[40px] rounded-[12px] border border-[var(--gg-border)] bg-white gg-type-meta font-medium text-[#566178]"
                 >
                   重置筛选
                 </button>
@@ -148,7 +148,7 @@ export default function ExpertFilterBar({
               aria-pressed={direction === option.value}
               onClick={() => onDirectionChange(option.value)}
               className={cn(
-                'h-[32px] shrink-0 rounded-full border px-[12px] text-[12px] outline-none transition-colors focus-visible:ring-2 focus-visible:ring-[var(--gg-cobalt)] focus-visible:ring-offset-2',
+                'h-[32px] shrink-0 rounded-full border px-[12px] gg-type-meta outline-none transition-colors focus-visible:ring-2 focus-visible:ring-[var(--gg-cobalt)] focus-visible:ring-offset-2',
                 direction === option.value
                   ? 'border-[var(--gg-cobalt)] bg-[var(--gg-cobalt)] font-semibold text-white'
                   : 'border-[var(--gg-border)] bg-white text-[#657087] hover:border-[#b9c8f0] hover:text-[#343a4b]',

@@ -101,7 +101,7 @@ export function ResourceImportDialog({
       >
         <div className="flex items-center gap-[6px] px-[12px] text-[#757f9c]">
           {icon}
-          <DialogTitle className="text-[14px] font-normal leading-none text-[#757f9c]">
+          <DialogTitle className="gg-type-card-title font-normal text-[#757f9c]">
             {title}
           </DialogTitle>
         </div>
@@ -109,7 +109,7 @@ export function ResourceImportDialog({
         <div className="flex min-h-0 flex-1 flex-col gap-[14px] overflow-y-auto px-[12px]">
           {showTargetSelect && (
             <div className="flex flex-col gap-[6px]">
-              <span className="text-[11px] font-semibold text-[#858b9c]">{targetLabel}</span>
+              <span className="gg-type-caption font-semibold text-[#858b9c]">{targetLabel}</span>
               <Select value={targetId || undefined} onValueChange={onTargetChange}>
                 <SelectTrigger className={cn(SELECT_TRIGGER_CLASS, 'w-full')}>
                   <SelectValue placeholder={targetPlaceholder || targetLabel} />
@@ -126,7 +126,7 @@ export function ResourceImportDialog({
           )}
 
           <div className="flex flex-col gap-[6px]">
-            <span className="text-[11px] font-semibold text-[#858b9c]">复制来源</span>
+            <span className="gg-type-caption font-semibold text-[#858b9c]">复制来源</span>
             <div className="relative">
               <select
                 value={effectiveSourceId}
@@ -150,10 +150,10 @@ export function ResourceImportDialog({
           </div>
 
           <div className="flex flex-col gap-[6px]">
-            <span className="text-[11px] font-semibold text-[#858b9c]">{itemsLabel}</span>
+            <span className="gg-type-caption font-semibold text-[#858b9c]">{itemsLabel}</span>
             <div className="max-h-[300px] overflow-y-auto rounded-[10px] border border-[#eef0f4] p-[6px]">
               {items.length === 0 ? (
-                <div className="py-[28px] text-center text-[12px] text-[#858b9c]">
+                <div className="py-[28px] text-center gg-type-meta text-[#858b9c]">
                   {sourceId ? emptyText : emptySourceText}
                 </div>
               ) : (
@@ -166,7 +166,7 @@ export function ResourceImportDialog({
                       checked={selectedIds.includes(item.id)}
                       onCheckedChange={(checked) => toggle(item.id, checked === true)}
                     />
-                    <span className="min-w-0 flex-1 truncate text-[12px] text-[#18181a]">
+                    <span className="min-w-0 flex-1 truncate gg-type-meta text-[#18181a]">
                       {item.label}
                     </span>
                   </label>
@@ -175,7 +175,7 @@ export function ResourceImportDialog({
             </div>
           </div>
 
-          <p className="text-[12px] leading-[1.6] text-[#858b9c]">{note}</p>
+          <p className="gg-type-meta  text-[#858b9c]">{note}</p>
         </div>
 
         <div className="flex items-center justify-end gap-[8px] px-[12px]">
@@ -183,14 +183,14 @@ export function ResourceImportDialog({
             variant="outline"
             disabled={loading}
             onClick={onClose}
-            className="h-[32px] w-[80px] rounded-[10px] border-[#e3e7f1] bg-white px-[12px] text-[14px] font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-[#18181a]"
+            className="h-[32px] w-[80px] rounded-[10px] border-[#e3e7f1] bg-white px-[12px] gg-type-body font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-[#18181a]"
           >
             取消
           </Button>
           <Button
             disabled={loading}
             onClick={onSubmit}
-            className="h-[36px] w-[80px] rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-[12px] text-[14px] font-semibold text-white hover:bg-[#244bc7]"
+            className="h-[36px] w-[80px] rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-[12px] gg-type-body font-semibold text-white hover:bg-[#244bc7]"
           >
             {submitText}
           </Button>

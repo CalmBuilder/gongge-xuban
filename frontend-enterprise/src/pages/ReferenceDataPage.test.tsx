@@ -90,6 +90,9 @@ it('switches among the server-whitelisted business code sets', async () => {
   );
 
   expect(await screen.findByText('正式员工')).toBeVisible();
+  expect(screen.getByText('企业业务码表')).toHaveClass('gg-type-card-title');
+  expect(screen.getByText('正式员工')).toHaveClass('gg-type-control');
+  expect(screen.getByText(/平台内置 · 排序 10/)).toHaveClass('gg-type-meta');
   await user.click(screen.getByRole('button', { name: /负责人类型/ }));
   expect(await screen.findByText('主要负责人')).toBeVisible();
   expect(screen.getByText(/编码创建后不可修改/)).toBeVisible();

@@ -17,6 +17,7 @@ import type { AgentProfileRead, GeneralSkillRead, KnowledgeBaseRead, SkillRead, 
 
 import AppHeader from '@/components/AppHeader';
 import { ConceptHelp, ConceptNote } from '@/components/ConceptHelp';
+import { PageShell } from '@/components/enterprise/PageShell';
 import PlazaResourceArtwork from '@/components/openPlatform/PlazaResourceArtwork';
 import {
   PlatformEmployeeDrawer,
@@ -569,7 +570,7 @@ export default function OpenPlatformPage({
         <span className="inline-flex items-center gap-[6px]">
           {platform.title}
           {platform.count > 0 && (
-            <span className="rounded-full bg-[#eff1f7] px-[6px] py-[1px] text-[11px] leading-[16px] text-[#757f9c]">
+            <span className="rounded-full bg-[#eff1f7] px-[6px] py-[1px] gg-type-caption  text-[#757f9c]">
               {platform.count}
             </span>
           )}
@@ -584,7 +585,7 @@ export default function OpenPlatformPage({
   const selectedConfig = PLATFORM_BY_KIND.get(selectedKind) || PLATFORM_CONFIGS[0];
 
   return (
-    <div className="min-h-full box-border px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]">
+    <PageShell template="catalog">
       <AppHeader
         onLogout={onLogout}
         userName={currentUser?.username}
@@ -609,7 +610,7 @@ export default function OpenPlatformPage({
               : '广场资源只表示可发现；复制或安装后，才会绑定到目标数字员工。'}
         </ConceptNote>
         {selectedKind === 'experts' && isAdmin && (
-          <UIButton asChild variant="outline" className="h-[32px] rounded-[10px] px-[12px] text-[12px]">
+          <UIButton asChild variant="outline" className="h-[32px] rounded-[10px] px-[12px] gg-type-meta">
             <Link to="/enterprise/agents?view=expert">管理专家模板</Link>
           </UIButton>
         )}
@@ -640,7 +641,7 @@ export default function OpenPlatformPage({
       />
       {renderItemDrawer()}
       {renderConfirm()}
-    </div>
+    </PageShell>
   );
 }
 

@@ -7,7 +7,13 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui';
 import { cn } from '@/lib/utils';
-import { RESOURCE_CARD_CLASS, RESOURCE_CARD_IDENTITY_CLASS } from '@/lib/enterprise-ui';
+import {
+  MENU_ITEM_CLASS,
+  MENU_ITEM_DANGER_CLASS,
+  RESOURCE_CARD_AVATAR_SLOT_CLASS,
+  RESOURCE_CARD_CLASS,
+  RESOURCE_CARD_IDENTITY_CLASS,
+} from '@/lib/enterprise-ui';
 
 import IconChat from '../assets/icons/chat.svg?react';
 import IconEdit from '../assets/icons/edit.svg?react';
@@ -33,14 +39,6 @@ import {
 } from '../employee';
 import type { AgentProfileRead } from '../types';
 import EmployeeAvatar from './EmployeeAvatar';
-
-// Hover colors come from the scoped --accent / --accent-foreground overrides on
-// DropdownMenuContent (see below), so items only need layout + default color here.
-// Kept in sync with the ScheduledTasksTab action menu.
-const MENU_ITEM_CLASS =
-  'cursor-pointer gap-[4px] rounded-[10px] px-[12px] py-[6px] text-[12px] text-[#858b9c] focus:text-[#18181a]';
-const MENU_ITEM_DANGER_CLASS =
-  'cursor-pointer gap-[4px] rounded-[10px] px-[12px] py-[6px] text-[12px] text-[#d20b0b] focus:bg-[#fce7e7] focus:text-[#d20b0b] focus:[&_svg]:text-[#d20b0b]!';
 
 export type EmployeeCardProps = {
   employee: AgentProfileRead;
@@ -119,16 +117,16 @@ export default function EmployeeCard({
   const effectiveStatusKind: EmployeeStatusKind = statusKind || (statusLabel ? 'available' : online ? 'online' : 'offline');
   const statusPresentation = {
     online: {
-      badge: 'bg-white/80 text-[var(--gg-slate)]',
-      dot: 'bg-[#22c55e]',
+      badge: 'bg-[var(--gg-surface)] text-[var(--gg-text-muted)]',
+      dot: 'bg-[var(--gg-state-success)]',
     },
     available: {
-      badge: 'bg-[#f0f4ff] text-[#526bc4]',
-      dot: 'bg-[#5474dd]',
+      badge: 'bg-[var(--gg-interaction-soft)] text-[var(--gg-interaction)]',
+      dot: 'bg-[var(--gg-interaction)]',
     },
     offline: {
-      badge: 'bg-white/80 text-[var(--gg-slate)]',
-      dot: 'bg-[#9ca3af]',
+      badge: 'bg-[var(--gg-surface)] text-[var(--gg-text-muted)]',
+      dot: 'bg-[var(--gg-text-muted)]',
     },
   }[effectiveStatusKind];
   const isExpertTemplateManagement = cardMode === 'expert-template';
@@ -140,9 +138,9 @@ export default function EmployeeCard({
   const unresolvedRequirements = expertUnresolvedRequirements(employee);
   const sourceUrl = expertUpstreamUrl(employee);
   const readinessPresentation = {
-    ready: { label: '能力已就绪', className: 'border-[#bbebd0] bg-[#effaf3] text-[#237a48]' },
-    partial: { label: '部分能力待接入', className: 'border-[#f0d6a7] bg-[#fff8e8] text-[#9a6414]' },
-    blocked: { label: '核心执行能力待接入', className: 'border-[#d8deea] bg-[#f3f5f9] text-[#657087]' },
+    ready: { label: '能力已就绪', className: 'border-[var(--gg-capability-line)] bg-[var(--gg-state-success-soft)] text-[var(--gg-state-success)]' },
+    partial: { label: '部分能力待接入', className: 'border-[#F1D9B2] bg-[var(--gg-state-warning-soft)] text-[var(--gg-state-warning)]' },
+    blocked: { label: '核心执行能力待接入', className: 'border-[var(--gg-line)] bg-[var(--gg-state-neutral-soft)] text-[var(--gg-state-neutral)]' },
   }[readiness];
   const governanceBadge = employee.governance_form === 'organization_employee'
     ? '专家·组织数字员工'
@@ -194,7 +192,7 @@ export default function EmployeeCard({
       )}
     >
       {selectable && isExpert && (
-        <div className="absolute left-[12px] top-[12px] z-20 rounded-[7px] bg-white p-[5px] shadow-[0_3px_10px_rgba(49,87,232,0.12)]">
+        <div className="absolute left-[12px] top-[12px] z-20 rounded-[var(--gg-radius-control)] bg-[var(--gg-surface)] p-[5px] shadow-[0_3px_10px_rgba(49,87,232,0.12)]">
           <Checkbox
             aria-label={`选择${displayName}`}
             checked={checked}
@@ -204,39 +202,34 @@ export default function EmployeeCard({
           />
         </div>
       )}
-      {/* Header band (shorter than the avatar so the illustration overflows above it) */}
-      <div className={cn(
-        'gongge-employee-identity box-border p-[10px]',
+      {/* Header band: the portrait stays inside a fixed column so long names never pass beneath it. */}
+      <div data-resource-identity className={cn(
+        'gongge-employee-identity',
         RESOURCE_CARD_IDENTITY_CLASS,
         'bg-[var(--gg-interaction-soft)]',
       )}>
-
-        {/* Avatar illustration — absolutely positioned so its head pokes above the gray band */}
-        <div className='w-[80px] relative'>
-          <div className='absolute inset-0 flex items-end justify-center'>
-            <EmployeeAvatar
-              agent={employee}
-              width={80}
-              height={94}
-              fit="contain"
-              objectPosition="center bottom"
-              className="overflow-visible! rounded-none! border-0! bg-transparent! bg-none! shadow-none! after:hidden!"
-            />
-          </div>
-          
-
+        <div data-avatar-slot className={RESOURCE_CARD_AVATAR_SLOT_CLASS}>
+          <EmployeeAvatar
+            agent={employee}
+            width={56}
+            height={56}
+            radius="var(--gg-radius-avatar-card)"
+            fit="cover"
+            objectPosition="center bottom"
+            className="employee-resource-avatar border-0! bg-transparent! bg-none! shadow-none! after:hidden!"
+          />
         </div>
 
         {/* Name / role / status */}
-        <div className="flex-1 flex flex-col gap-[2px]">
+        <div className="min-w-0 flex flex-col gap-[2px]">
           <strong className="gg-type-card-title truncate">
             {employee.is_overall ? displayName : <span data-i18n-ignore>{displayName}</span>}
           </strong>
           <span className="gg-type-meta truncate">
             {rawRoleName === '待补充岗位' ? rawRoleName : <span data-i18n-ignore>{rawRoleName}</span>}
           </span>
-          <div className="leading-none">
-            <span className={cn('inline-flex items-center gap-[4px] rounded-[90px] px-[7px] py-[2px] text-[11px] font-medium', statusPresentation.badge)}>
+          <div>
+            <span className={cn('gg-type-caption inline-flex items-center gap-[4px] rounded-full px-[7px] py-[2px]', statusPresentation.badge)}>
               <i className={cn('size-[6px] shrink-0 rounded-full', statusPresentation.dot)} aria-hidden="true" />
               {statusLabel || (online ? '在线' : '下线')}
             </span>
@@ -252,7 +245,7 @@ export default function EmployeeCard({
             event.stopPropagation();
             onChat();
           }}
-          className="grid size-[30px] shrink-0 self-center place-items-center rounded-[10px] bg-white text-[var(--gg-cobalt)] shadow-[0_4px_12px_rgba(49,87,232,0.10)] transition-colors hover:bg-[var(--gg-cobalt)] hover:text-white disabled:cursor-not-allowed disabled:opacity-45 disabled:hover:bg-white disabled:hover:text-[var(--gg-slate)]"
+          className="grid size-[30px] shrink-0 self-center place-items-center rounded-[var(--gg-radius-control)] bg-[var(--gg-surface)] text-[var(--gg-interaction)] shadow-[0_4px_12px_rgba(49,87,232,0.10)] transition-colors hover:bg-[var(--gg-interaction)] hover:text-white disabled:cursor-not-allowed disabled:opacity-45 disabled:hover:bg-[var(--gg-surface)] disabled:hover:text-[var(--gg-text-muted)]"
         >
           <IconChat className="size-[16px]!" />
         </button>}
@@ -267,13 +260,13 @@ export default function EmployeeCard({
             aria-label="员工操作"
             onPointerDown={(event) => event.stopPropagation()}
             onClick={(event) => event.stopPropagation()}
-            className="grid size-7 place-items-center rounded-[10px] text-[#757F9C] transition-colors outline-none hover:bg-black/5 focus-visible:bg-black/5"
+            className="grid size-7 place-items-center rounded-[var(--gg-radius-control)] text-[var(--gg-text-muted)] transition-colors outline-none hover:bg-[var(--gg-surface-subtle)] focus-visible:bg-[var(--gg-surface-subtle)]"
           >
             <IconMore className="size-[16px]!" />
           </DropdownMenuTrigger>
           <DropdownMenuContent
             align="end"
-            className="flex w-auto min-w-[128px] flex-col gap-[4px] rounded-[14px] border-0 bg-white p-[4px] shadow-[0px_0px_8px_rgba(0,0,0,0.1)] ring-0 [--accent:#F6F6F6] [--accent-foreground:#18181A]"
+            className="flex w-auto min-w-[128px] flex-col gap-[4px] rounded-[var(--gg-radius-card)] border border-[var(--gg-line)] bg-[var(--gg-surface)] p-[4px] shadow-[var(--gg-shadow-card)] ring-0 [--accent:var(--gg-interaction-soft)] [--accent-foreground:var(--gg-text-primary)]"
             onCloseAutoFocus={(event) => event.preventDefault()}
           >
             {!isExpertTemplateManagement && <DropdownMenuItem
@@ -370,16 +363,16 @@ export default function EmployeeCard({
       )}
 
       {/* Description */}
-      <p className="mt-[12px] line-clamp-2 h-[38px] shrink-0 text-[12px] leading-[19px] text-[var(--gg-slate)]">
+      <p className="gg-type-body mt-[12px] line-clamp-3 min-h-[66px] shrink-0">
         {employee.description ? <span data-i18n-ignore>{displayDescription}</span> : displayDescription}
       </p>
 
       {relationLabels.length > 0 && (
-        <div className="mt-[9px] flex flex-wrap items-center gap-[5px] text-[11px] leading-[16px]">
+        <div className="gg-type-caption mt-[9px] flex flex-wrap items-center gap-[5px]">
           {relationLabels.map((label) => (
             <span
               key={label}
-              className="rounded-full border border-[#d7e1f5] bg-[#f4f7fd] px-[7px] py-[2px] font-medium text-[#52617d]"
+              className="gg-type-caption rounded-full border border-[var(--gg-line)] bg-[var(--gg-surface-subtle)] px-[7px] py-[2px] text-[var(--gg-text-secondary)]"
             >
               {label}
             </span>
@@ -394,35 +387,35 @@ export default function EmployeeCard({
             onUsageAction();
           }}
           disabled={busy}
-          className="mt-[8px] w-fit rounded-full border border-[#cbd8f2] bg-white px-[10px] py-[3px] text-[11px] font-medium text-[var(--gg-cobalt)] hover:bg-[#f3f6fd] disabled:opacity-50"
+          className="gg-type-caption mt-[8px] w-fit rounded-full border border-[var(--gg-line)] bg-[var(--gg-surface)] px-[10px] py-[3px] text-[var(--gg-interaction)] hover:bg-[var(--gg-interaction-soft)] disabled:opacity-50"
         >
           {usageActionLabel}
         </button>
       )}
 
       {isExpert && (
-        <div className="mt-[9px] flex flex-wrap items-center gap-[5px] text-[11px] leading-[16px]">
-          <span className="rounded-full border border-[#ccd9f4] bg-[#f2f6ff] px-[7px] py-[2px] font-semibold text-[var(--gg-cobalt)]">
+        <div className="gg-type-caption mt-[9px] flex flex-wrap items-center gap-[5px]">
+          <span className="gg-type-caption rounded-full border border-[var(--gg-line)] bg-[var(--gg-interaction-soft)] px-[7px] py-[2px] font-semibold text-[var(--gg-interaction)]">
             {governanceBadge}
           </span>
           {showExpertSource && expertSource && (
-            <span data-testid="expert-source-badge" className="rounded-full border border-[#e0e5ef] bg-white px-[7px] py-[2px] text-[#657087]" data-i18n-ignore>
+            <span data-testid="expert-source-badge" className="gg-type-caption rounded-full border border-[var(--gg-line)] bg-[var(--gg-surface)] px-[7px] py-[2px] text-[var(--gg-text-secondary)]" data-i18n-ignore>
               {expertSource}
             </span>
           )}
           <span
-            className={cn('rounded-full border px-[7px] py-[2px] font-medium', readinessPresentation.className)}
+            className={cn('gg-type-caption rounded-full border px-[7px] py-[2px]', readinessPresentation.className)}
             title={unresolvedRequirements.length ? `未接入能力：${unresolvedRequirements.join('、')}` : undefined}
           >
             {readinessPresentation.label}
           </span>
           {showExpertDepartment && expertDepartment && (
-            <span data-testid="expert-department-badge" className="max-w-[110px] truncate rounded-full bg-[#f5f6f9] px-[7px] py-[2px] text-[#7b8498]" data-i18n-ignore>
+            <span data-testid="expert-department-badge" className="gg-type-caption max-w-[110px] truncate rounded-full bg-[var(--gg-state-neutral-soft)] px-[7px] py-[2px] text-[var(--gg-text-muted)]" data-i18n-ignore>
               {expertDepartment}
             </span>
           )}
           {expertDirection && (
-            <span className="max-w-[120px] truncate rounded-full bg-[#eef8f7] px-[7px] py-[2px] text-[#39766f]" data-i18n-ignore>
+            <span className="gg-type-caption max-w-[120px] truncate rounded-full bg-[var(--gg-capability-soft)] px-[7px] py-[2px] text-[var(--gg-capability)]" data-i18n-ignore>
               {expertDirection}
             </span>
           )}
@@ -432,7 +425,7 @@ export default function EmployeeCard({
               target="_blank"
               rel="noreferrer"
               aria-label="查看原始来源"
-              className="ml-auto text-[11px] font-medium text-[var(--gg-cobalt)] underline decoration-[#b8c6f4] underline-offset-2 hover:decoration-[var(--gg-cobalt)]"
+              className="gg-type-caption ml-auto text-[var(--gg-interaction)] underline decoration-[var(--gg-interaction)] underline-offset-2 hover:decoration-[var(--gg-interaction-hover)]"
               onPointerDown={(event) => event.stopPropagation()}
               onClick={(event) => event.stopPropagation()}
             >
@@ -443,15 +436,15 @@ export default function EmployeeCard({
       )}
 
       {showGovernanceForm && !isExpert && (
-        <div className="mt-[9px] flex flex-wrap items-center gap-[5px] text-[11px] leading-[16px]">
+        <div className="gg-type-caption mt-[9px] flex flex-wrap items-center gap-[5px]">
           <span
-            className="rounded-full border border-[#ccd9f4] bg-[#f2f6ff] px-[7px] py-[2px] font-semibold text-[var(--gg-cobalt)]"
+            className="gg-type-caption rounded-full border border-[var(--gg-line)] bg-[var(--gg-interaction-soft)] px-[7px] py-[2px] font-semibold text-[var(--gg-interaction)]"
             title={governanceReasonText || undefined}
           >
             {governanceFormBadge}
           </span>
           {employee.governance_form === 'organization_pending' && governanceReasonText && (
-            <span className="rounded-full border border-[#f0d6a7] bg-[#fff8e8] px-[7px] py-[2px] text-[#9a6414]">
+            <span className="gg-type-caption rounded-full border border-[#F1D9B2] bg-[var(--gg-state-warning-soft)] px-[7px] py-[2px] text-[var(--gg-state-warning)]">
               需补齐组织前置
             </span>
           )}
@@ -463,7 +456,7 @@ export default function EmployeeCard({
         {profile.workStyles.slice(0, 3).map((item) => (
           <span
             key={item}
-            className="rounded-[20px] border border-[#dce5f7] bg-[#f7f9fe] px-[8px] py-[2px] text-[11px] leading-[15px] text-[var(--gg-slate)]"
+            className="gg-type-caption rounded-full border border-[var(--gg-line)] bg-[var(--gg-surface-subtle)] px-[8px] py-[2px]"
           >
             <span data-i18n-ignore>{item}</span>
           </span>
@@ -471,7 +464,7 @@ export default function EmployeeCard({
       </div>
 
       {/* Stats — pinned to the bottom of the card */}
-      <div className="mt-auto grid grid-cols-3 rounded-[12px] border border-[var(--gg-border)] bg-[#fbfcff]">
+      <div className="mt-auto grid grid-cols-3 rounded-[var(--gg-radius-card)] border border-[var(--gg-border)] bg-[var(--gg-surface-subtle)]">
         {stats.map((stat, index) => (
           <div
             key={stat.label}
@@ -480,8 +473,8 @@ export default function EmployeeCard({
               index < stats.length - 1 && 'border-r border-[var(--gg-border)]',
             )}
           >
-            <strong className="text-[18px] font-semibold leading-[24px] text-[var(--gg-ink)]">{stat.value}</strong>
-            <em className="text-[11px] not-italic text-[var(--gg-slate)]">{stat.label}</em>
+            <strong className="gg-type-section-title font-semibold  text-[var(--gg-text-primary)]">{stat.value}</strong>
+            <em className="gg-type-caption not-italic">{stat.label}</em>
           </div>
         ))}
       </div>

@@ -1,9 +1,8 @@
 import type { LucideIcon } from 'lucide-react';
-import { ArrowLeft } from 'lucide-react';
 import type { ReactNode } from 'react';
-import { Link } from 'react-router-dom';
 
 import AppHeader from './AppHeader';
+import { PageHeader } from './enterprise/PageHeader';
 
 type EnterpriseCatalogPageHeaderProps = {
   backTo: string;
@@ -30,19 +29,13 @@ export function EnterpriseCatalogPageHeader({
       onLogout={onLogout}
       userName={userName}
       left={(
-        <div className="flex flex-wrap items-center gap-[12px]">
-          <Link
-            to={backTo}
-            aria-label={backLabel}
-            className="grid size-[32px] place-items-center rounded-[10px] text-[var(--gg-slate)] transition-colors hover:bg-[var(--gg-cloud)] hover:text-[var(--gg-ink)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--gg-cobalt)]"
-          >
-            <ArrowLeft className="size-[16px]" />
-          </Link>
-          <div>
-            <h1 className="text-[16px] font-semibold text-[var(--gg-ink)]">{title}</h1>
-            <p className="mt-[4px] text-[13px] text-[var(--gg-slate)]">{description}</p>
-          </div>
-        </div>
+        <PageHeader
+          size="section"
+          backTo={backTo}
+          backLabel={backLabel}
+          title={title}
+          description={description}
+        />
       )}
     />
   );
@@ -65,18 +58,18 @@ export function EnterpriseCatalogHero({
   actions,
 }: EnterpriseCatalogHeroProps) {
   return (
-    <div className="border-b border-[#eef1f6] bg-[linear-gradient(110deg,#f2f6ff_0%,#fbfcff_58%,#f4fbf8_100%)] px-[22px] py-[22px]">
+    <div className="gg-catalog-hero px-[22px] py-[22px]">
       <div className="flex flex-wrap items-start justify-between gap-[18px]">
-        <div className="flex items-start gap-[12px]">
-          <span className="grid size-[40px] shrink-0 place-items-center rounded-[13px] bg-white text-[var(--gg-cobalt)] shadow-[0_8px_20px_rgba(49,87,232,0.12)]">
+        <div className="flex min-w-0 flex-1 items-start gap-[12px]">
+          <span className="grid size-[40px] shrink-0 place-items-center rounded-[var(--gg-radius-panel)] bg-[var(--gg-surface)] text-[var(--gg-interaction)] shadow-[0_8px_20px_rgba(49,87,232,0.12)]">
             <HeroIcon className="size-[19px]" aria-hidden="true" />
           </span>
-          <div>
-            <h2 className="text-[17px] font-semibold text-[var(--gg-ink)]">{title}</h2>
-            <p className="mt-[5px] max-w-[620px] text-[12px] leading-[19px] text-[var(--gg-slate)]">{description}</p>
+          <div className="min-w-0 flex-1">
+            <h2 className="gg-type-section-title">{title}</h2>
+            <p className="gg-type-body mt-[5px] max-w-none">{description}</p>
           </div>
         </div>
-        {actions ? <div className="flex items-center gap-[8px]">{actions}</div> : null}
+        {actions ? <div className="flex shrink-0 items-center gap-[8px]">{actions}</div> : null}
       </div>
     </div>
   );

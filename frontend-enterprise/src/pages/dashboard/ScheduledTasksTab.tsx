@@ -45,10 +45,10 @@ export {
 
 const MOBILE_CARD_HEAD_CLASS = 'flex min-w-0 items-start justify-between gap-[10px]';
 const MOBILE_META_CLASS =
-  'mt-[12px] grid grid-cols-2 gap-[8px] max-[520px]:grid-cols-1 [&>span]:min-w-0 [&>span]:rounded-[10px] [&>span]:border [&>span]:border-[#eef0f4] [&>span]:bg-[#fafbfc] [&>span]:px-[10px] [&>span]:py-[9px] [&>span]:text-[12px] [&>span]:leading-[1.45] [&>span]:text-[#18181a] [&>span]:[overflow-wrap:anywhere] [&_b]:mb-[3px] [&_b]:block [&_b]:text-[11px] [&_b]:font-semibold [&_b]:text-[#858b9c]';
+  'mt-[12px] grid grid-cols-2 gap-[8px] max-[520px]:grid-cols-1';
 const MOBILE_TITLE_CLASS =
-  'min-w-0 wrap-break-word text-[14px] font-semibold text-[#18181a]';
-const MOBILE_SUMMARY_CLASS = 'mt-[8px] line-clamp-2 text-[12px] leading-[1.55] text-[#858b9c]';
+  'min-w-0 wrap-break-word gg-type-body font-semibold text-[#18181a]';
+const MOBILE_SUMMARY_CLASS = 'mt-[8px] line-clamp-2 gg-type-meta  text-[#858b9c]';
 
 export default function ScheduledTasksTab() {
   const [rows, setRows] = useState<ScheduledTaskRead[]>([]);
@@ -325,7 +325,7 @@ export default function ScheduledTasksTab() {
       className: 'whitespace-normal',
       render: (row) => (
         <div className="flex min-w-0 flex-col gap-[4px]">
-          <span className="font-medium leading-[18px] text-[#18181a]">{row.title}</span>
+          <span className="gg-type-meta font-medium text-[#18181a]">{row.title}</span>
           <span className="truncate">{row.prompt}</span>
         </div>
       ),
@@ -397,7 +397,7 @@ export default function ScheduledTasksTab() {
           variant="link"
           disabled={!row.session_id}
           onClick={() => openChatSession(row.session_id)}
-          className="h-auto p-0 text-[12px] font-normal text-[#1a71ff] hover:text-[#4a8dff] hover:no-underline disabled:text-[#c0c6d4]"
+          className="h-auto p-0 gg-type-meta font-normal text-[#1a71ff] hover:text-[#4a8dff] hover:no-underline disabled:text-[#c0c6d4]"
         >
           查看会话
         </UIButton>
@@ -449,20 +449,20 @@ export default function ScheduledTasksTab() {
       </div>
       <p className={MOBILE_SUMMARY_CLASS}>{row.prompt}</p>
       <div className={MOBILE_META_CLASS}>
-        <span>
-          <b>计划</b>
+        <span className="gg-type-meta min-w-0 rounded-[10px] border border-[#eef0f4] bg-[#fafbfc] px-[10px] py-[9px] text-[#18181a] [overflow-wrap:anywhere]">
+          <b className="gg-type-caption mb-[3px] block font-semibold text-[#858b9c]">计划</b>
           {formatSchedule(row)}
         </span>
-        <span>
-          <b>下次</b>
+        <span className="gg-type-meta min-w-0 rounded-[10px] border border-[#eef0f4] bg-[#fafbfc] px-[10px] py-[9px] text-[#18181a] [overflow-wrap:anywhere]">
+          <b className="gg-type-caption mb-[3px] block font-semibold text-[#858b9c]">下次</b>
           {formatTime(row.next_run_at)}
         </span>
-        <span>
-          <b>已执行</b>
+        <span className="gg-type-meta min-w-0 rounded-[10px] border border-[#eef0f4] bg-[#fafbfc] px-[10px] py-[9px] text-[#18181a] [overflow-wrap:anywhere]">
+          <b className="gg-type-caption mb-[3px] block font-semibold text-[#858b9c]">已执行</b>
           {row.run_count || 0} 次
         </span>
-        <span>
-          <b>最近</b>
+        <span className="gg-type-meta min-w-0 rounded-[10px] border border-[#eef0f4] bg-[#fafbfc] px-[10px] py-[9px] text-[#18181a] [overflow-wrap:anywhere]">
+          <b className="gg-type-caption mb-[3px] block font-semibold text-[#858b9c]">最近</b>
           {row.last_status ? <TaskRunResultBadge status={row.last_status} /> : '暂无'}
         </span>
       </div>
@@ -482,12 +482,12 @@ export default function ScheduledTasksTab() {
         </div>
       )}
       <div className={MOBILE_META_CLASS}>
-        <span>
-          <b>计划时间</b>
+        <span className="gg-type-meta min-w-0 rounded-[10px] border border-[#eef0f4] bg-[#fafbfc] px-[10px] py-[9px] text-[#18181a] [overflow-wrap:anywhere]">
+          <b className="gg-type-caption mb-[3px] block font-semibold text-[#858b9c]">计划时间</b>
           {formatTime(row.scheduled_for)}
         </span>
-        <span>
-          <b>完成时间</b>
+        <span className="gg-type-meta min-w-0 rounded-[10px] border border-[#eef0f4] bg-[#fafbfc] px-[10px] py-[9px] text-[#18181a] [overflow-wrap:anywhere]">
+          <b className="gg-type-caption mb-[3px] block font-semibold text-[#858b9c]">完成时间</b>
           {formatTime(row.finished_at)}
         </span>
       </div>
@@ -497,7 +497,7 @@ export default function ScheduledTasksTab() {
           variant="link"
           disabled={!row.session_id}
           onClick={() => openChatSession(row.session_id)}
-          className="h-auto gap-1 p-0 text-[12px] font-normal text-[#1a71ff] hover:text-[#4a8dff] hover:no-underline disabled:text-[#c0c6d4]"
+          className="h-auto gap-1 p-0 gg-type-meta font-normal text-[#1a71ff] hover:text-[#4a8dff] hover:no-underline disabled:text-[#c0c6d4]"
         >
           <IconSearch className="size-3.5" />
           查看会话
@@ -511,7 +511,7 @@ export default function ScheduledTasksTab() {
       <UIButton
         onClick={() => navigate('/enterprise/scheduled-tasks/new')}
         disabled={createDisabled}
-        className="h-8 w-[100px] gap-1 rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-5 text-[12px] font-semibold text-white hover:bg-[#244bc7]"
+        className="h-8 w-[100px] gap-1 rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-5 gg-type-meta font-semibold text-white hover:bg-[#244bc7]"
       >
         <IconAdd className="size-3.5" />
         新增任务
@@ -520,7 +520,7 @@ export default function ScheduledTasksTab() {
   );
 
   const scheduledBody = selectedAgent?.is_overall ? (
-    <div className="flex min-h-[200px] items-center justify-center rounded-[14px] bg-[#f6f6f6] text-[13px] text-[#858b9c]">
+    <div className="flex min-h-[200px] items-center justify-center rounded-[14px] bg-[#f6f6f6] gg-type-control text-[#858b9c]">
       请先选择一个数字员工再配置定时任务。
     </div>
   ) : (
@@ -606,7 +606,7 @@ export default function ScheduledTasksTab() {
         >
           <div className="flex items-center gap-[6px] px-[12px] text-[#757f9c]">
             <IconAlignJustify className="size-[14px] shrink-0" />
-            <DialogTitle className="text-[14px] font-normal leading-none text-[#757f9c]">
+            <DialogTitle className="gg-type-card-title font-normal text-[#757f9c]">
               执行记录
             </DialogTitle>
           </div>

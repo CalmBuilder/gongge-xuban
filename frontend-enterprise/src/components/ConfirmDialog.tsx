@@ -65,13 +65,13 @@ export function ConfirmDialog({
       <AlertDialogContent className="gap-0 overflow-hidden rounded-[16px] p-0">
         <div className="flex items-start gap-[8px] px-[16px] pt-[16px] pb-[12px]">
           {leadingIcon}
-          <AlertDialogTitle className="min-w-0 flex-1 text-[14px] leading-[normal] font-medium text-[#18181a] [word-break:break-word]">
+          <AlertDialogTitle className="min-w-0 flex-1 gg-type-card-title  font-medium text-[#18181a] [word-break:break-word]">
             {title}
           </AlertDialogTitle>
         </div>
         {description != null && (
           <div className="px-[24px] pb-[12px]">
-            <AlertDialogDescription className="text-[14px] leading-[20px] text-[#4f5669] [word-break:break-word]">
+            <AlertDialogDescription className="gg-type-body  text-[#4f5669] [word-break:break-word]">
               {description}
             </AlertDialogDescription>
           </div>
@@ -81,7 +81,7 @@ export function ConfirmDialog({
             <Button
               variant="outline"
               disabled={loading}
-              className="h-[32px] w-[80px] rounded-[10px] border-[#e3e7f1] bg-white px-[12px] py-[8px] text-[14px] font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-[#18181a]"
+              className="h-[32px] w-[80px] rounded-[10px] border-[#e3e7f1] bg-white px-[12px] py-[8px] gg-type-body font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-[#18181a]"
             >
               {cancelText}
             </Button>
@@ -90,7 +90,7 @@ export function ConfirmDialog({
             <Button
               disabled={loading}
               className={cn(
-                'h-[32px] w-[80px] rounded-[10px] px-[12px] py-[8px] text-[14px] font-normal',
+                'h-[32px] w-[80px] rounded-[10px] px-[12px] py-[8px] gg-type-body font-normal',
                 destructive
                   ? 'bg-[#d20b0b] text-white hover:bg-[#b80909]'
                   : 'bg-[var(--gg-cobalt)] font-semibold text-white hover:bg-[#244bc7]',

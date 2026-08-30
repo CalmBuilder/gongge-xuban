@@ -24,7 +24,7 @@ const TOOL_TYPE_OPTIONS: ToolTypeOption[] = [
 export default function ToolTypeSwitcher({ active }: { active: ToolType }) {
   return (
     <div className="mb-[16px] min-w-0">
-      <p className="mb-[8px] text-[13px] font-medium text-[var(--gg-ink)]">工具类型</p>
+      <p className="mb-[8px] gg-type-control font-medium text-[var(--gg-ink)]">工具类型</p>
       <nav className="grid grid-cols-1 gap-[10px] sm:grid-cols-2" aria-label="工具类型">
         {TOOL_TYPE_OPTIONS.map((option) => {
           const isActive = option.value === active;
@@ -64,8 +64,8 @@ export default function ToolTypeSwitcher({ active }: { active: ToolType }) {
                 )}
               </span>
               <span className="flex min-w-0 flex-1 flex-col gap-[3px] pr-[24px]">
-                <span className="text-[13px] font-semibold text-[var(--gg-ink)]">{option.label}</span>
-                <span className="text-[12px] leading-[1.5] text-[var(--gg-slate)]">{option.hint}</span>
+                <span className="gg-type-control font-semibold text-[var(--gg-ink)]">{option.label}</span>
+                <span className="gg-type-meta  text-[var(--gg-slate)]">{option.hint}</span>
               </span>
               {isActive ? (
                 <span

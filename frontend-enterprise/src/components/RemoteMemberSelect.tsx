@@ -89,7 +89,7 @@ export function RemoteMemberSelect({
           ))}
         </SelectContent>
       </Select>
-      {error ? <p className="text-[11px] text-[#b42318]">{error}</p> : null}
+      {error ? <p className="gg-type-caption text-[#b42318]">{error}</p> : null}
     </div>
   );
 }

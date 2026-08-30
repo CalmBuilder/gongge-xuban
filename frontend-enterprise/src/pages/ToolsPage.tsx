@@ -16,6 +16,7 @@ import { pinyin } from 'pinyin-pro';
 import { api, getRequestTenantId } from '../api/client';
 import { isEnterpriseAdmin, type EnterpriseAuthUser } from '../auth';
 import AppHeader from '@/components/AppHeader';
+import { PageShell } from '@/components/enterprise/PageShell';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { DataTable, type DataTableColumn } from '@/components/DataTable';
 import { Paginator } from '@/components/Paginator';
@@ -478,10 +479,10 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
       className: 'text-[#18181a]',
       render: (row) => (
         <div className="flex min-w-0 flex-col gap-[2px]">
-          <span className="truncate font-medium leading-[18px] text-[#18181a]" title={row.display_name || row.name}>
+          <span className="truncate gg-type-meta font-medium text-[#18181a]" title={row.display_name || row.name}>
             {row.display_name || row.name}
           </span>
-          <span className="truncate text-[#858b9c]" title={row.name}>
+          <span className="truncate gg-type-caption text-[#858b9c]" title={row.name}>
             {row.name}
           </span>
         </div>
@@ -506,7 +507,7 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
       title: '创建者',
       width: 120,
       render: (row) => (
-        <span className="block truncate text-[#858b9c]" title={resourceCreatorName(row)}>
+        <span className="block truncate gg-type-meta text-[#858b9c]" title={resourceCreatorName(row)}>
           {resourceCreatorName(row) || '-'}
         </span>
       ),
@@ -516,7 +517,7 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
       key: 'url',
       title: 'URL',
       className: 'whitespace-normal',
-      render: (row) => <span className="line-clamp-1 wrap-break-word text-[#858b9c]">{row.url}</span>,
+      render: (row) => <span className="line-clamp-1 wrap-break-word gg-type-meta text-[#858b9c]">{row.url}</span>,
     },
     {
       key: 'enabled',
@@ -543,14 +544,14 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
       render: (row) => (
         <div className="flex min-w-0 flex-col gap-[4px]">
           <span className="flex w-full min-w-0 items-center gap-[6px]">
-            <span className="min-w-0 flex-1 truncate font-medium leading-[18px] text-[#18181a]" title={row.display_name || row.name}>
+            <span className="min-w-0 flex-1 truncate gg-type-meta font-medium text-[#18181a]" title={row.display_name || row.name}>
               {row.display_name || row.name}
             </span>
             <span className="shrink-0">
               <StatusBadge tone="blue">工具集</StatusBadge>
             </span>
           </span>
-          <span className="truncate text-[#858b9c]" title={row.name}>
+          <span className="truncate gg-type-caption text-[#858b9c]" title={row.name}>
             {row.name}
           </span>
         </div>
@@ -567,14 +568,14 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
       title: '端点',
       className: 'whitespace-normal',
       render: (row) => (
-        <span className="line-clamp-1 wrap-break-word text-[#858b9c]">{serverEndpoint(row.connection)}</span>
+        <span className="line-clamp-1 wrap-break-word gg-type-meta text-[#858b9c]">{serverEndpoint(row.connection)}</span>
       ),
     },
     {
       key: 'tool_count',
       title: '工具数',
       width: 110,
-      render: (row) => <span className="text-[#858b9c]">{row.tool_count} 个工具</span>,
+      render: (row) => <span className="gg-type-meta text-[#858b9c]">{row.tool_count} 个工具</span>,
     },
     {
       key: 'enabled',
@@ -620,11 +621,11 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
     <article className={MOBILE_CARD_CLASS} key={row.id}>
       <div className="flex min-w-0 items-start justify-between gap-[10px]">
         <div className="min-w-0">
-          <strong className="block truncate text-[14px] font-semibold text-[#18181a]">
+          <strong className="block truncate gg-type-body font-semibold text-[#18181a]">
             {row.display_name || row.name}
           </strong>
-          <span className="mt-[2px] block truncate text-[12px] text-[#858b9c]">{row.name}</span>
-          <span className="mt-[2px] block truncate text-[12px] text-[#858b9c]">创建者：{resourceCreatorName(row) || '-'}</span>
+          <span className="mt-[2px] block truncate gg-type-meta text-[#858b9c]">{row.name}</span>
+          <span className="mt-[2px] block truncate gg-type-meta text-[#858b9c]">创建者：{resourceCreatorName(row) || '-'}</span>
         </div>
         {renderActions(row)}
       </div>
@@ -633,7 +634,7 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
         <StatusBadge tone={row.tool_type === 'mcp' ? 'blue' : 'gray'}>{row.tool_type === 'mcp' ? 'MCP' : 'HTTP'}</StatusBadge>
         <StatusBadge tone={row.enabled ? 'green' : 'gray'}>{row.enabled ? '已启用' : '已停用'}</StatusBadge>
       </div>
-      <p className="mt-[8px] line-clamp-1 wrap-break-word text-[12px] text-[#858b9c]">
+      <p className="mt-[8px] line-clamp-1 wrap-break-word gg-type-meta text-[#858b9c]">
         {row.method} · {row.url}
       </p>
     </article>
@@ -644,7 +645,7 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
     : '当前员工暂无工具';
 
   return (
-    <div className="min-h-full box-border px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]">
+    <PageShell template="management">
       <AppHeader onLogout={onLogout} userName={currentUser?.username} title={pageTitle} />
 
       <div className="mt-[20px] mb-[16px] flex items-center justify-end gap-[12px]">
@@ -652,14 +653,14 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
           variant="outline"
           onClick={() => void load()}
           disabled={loading}
-          className="h-[34px] gap-[4px] rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[20px] text-[12px] font-normal text-[#757f9c] hover:border-[#cbd3e6] hover:bg-white hover:text-[#18181a]"
+          className="h-[34px] gap-[4px] rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[20px] gg-type-meta font-normal text-[#757f9c] hover:border-[#cbd3e6] hover:bg-white hover:text-[#18181a]"
         >
           <IconRefresh className={cn('size-[14px]', loading && 'animate-spin')} />
           刷新
         </UIButton>
         {canOpenCreateMenu && (
           <DropdownMenu>
-            <DropdownMenuTrigger className="flex h-[34px] items-center gap-[4px] rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-[20px] text-[12px] font-semibold text-white outline-none transition-colors hover:bg-[#244bc7]">
+            <DropdownMenuTrigger className="flex h-[34px] items-center gap-[4px] rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-[20px] gg-type-meta font-semibold text-white outline-none transition-colors hover:bg-[#244bc7]">
               <IconAdd className="size-[14px]" />
               新增
               <IconChevronDown className="size-[12px]" />
@@ -699,7 +700,7 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
           <div className="flex flex-col gap-[18px]">
             <div className="flex items-center gap-[6px] px-[12px] text-[#757f9c]">
               <ApiOutlined className="size-[14px] shrink-0" />
-              <span className="text-[14px] font-normal leading-none">MCP 服务器（工具集）</span>
+              <span className="gg-type-body font-normal">MCP 服务器（工具集）</span>
             </div>
             <div className="hidden md:block">
               <DataTable
@@ -716,10 +717,10 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
                 <article className={MOBILE_CARD_CLASS} key={row.id}>
                   <div className="flex min-w-0 items-start justify-between gap-[10px]">
                     <div className="min-w-0">
-                      <strong className="block truncate text-[14px] font-semibold text-[#18181a]">
+                      <strong className="block truncate gg-type-body font-semibold text-[#18181a]">
                         {row.display_name || row.name}
                       </strong>
-                      <span className="mt-[2px] block truncate text-[12px] text-[#858b9c]">{row.name}</span>
+                      <span className="mt-[2px] block truncate gg-type-meta text-[#858b9c]">{row.name}</span>
                     </div>
                     <span className="shrink-0">
                       <StatusBadge tone="blue">工具集</StatusBadge>
@@ -730,7 +731,7 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
                     <StatusBadge tone={row.enabled ? 'green' : 'gray'}>{row.enabled ? '已启用' : '已停用'}</StatusBadge>
                     <StatusBadge tone="gray">{row.tool_count} 个工具</StatusBadge>
                   </div>
-                  <p className="mt-[8px] line-clamp-1 wrap-break-word text-[12px] text-[#858b9c]">
+                  <p className="mt-[8px] line-clamp-1 wrap-break-word gg-type-meta text-[#858b9c]">
                     {serverEndpoint(row.connection)}
                   </p>
                   <div className="mt-[10px] flex items-center gap-[8px]">
@@ -763,7 +764,7 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
         <div className="flex flex-col gap-[18px]">
           <div className="flex items-center gap-[6px] px-[12px] text-[#757f9c]">
             <PlazaResourceIcon kind="tools" size="compact" />
-            <span className="text-[14px] font-normal leading-none">{listLabel}</span>
+            <span className="gg-type-body font-normal">{listLabel}</span>
           </div>
 
           <div className="flex flex-wrap items-center gap-[16px]">
@@ -773,7 +774,7 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
                 value={searchText}
                 placeholder="搜索工具名称、描述、URL 或分桶"
                 onChange={(event) => setSearchText(event.target.value)}
-                className="h-full min-w-0 flex-1 bg-transparent text-[12px] text-[#17191f] outline-none placeholder:text-[#c0c6d4]"
+                className="h-full min-w-0 flex-1 bg-transparent gg-type-meta text-[#17191f] outline-none placeholder:text-[#c0c6d4]"
               />
               {searchText && (
                 <button
@@ -804,7 +805,7 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
             {filteredRows.length ? (
               pagination.pagedItems.map(renderMobileCard)
             ) : (
-              <div className="py-[40px] text-center text-[13px] text-[#858b9c]">{listEmptyText}</div>
+              <div className="py-[40px] text-center gg-type-control text-[#858b9c]">{listEmptyText}</div>
             )}
           </div>
 
@@ -852,7 +853,7 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
           label: (
             <>
               {item.display_name || item.name}
-              <span className="text-[#858b9c]"> · {item.name}</span>
+              <span className="gg-type-caption text-[#858b9c]"> · {item.name}</span>
             </>
           ),
         }))}
@@ -898,7 +899,7 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
         confirmText="删除"
         onConfirm={() => void confirmDeleteServer()}
       />
-    </div>
+    </PageShell>
   );
 }
 
@@ -1004,7 +1005,7 @@ function ToolEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'edit' 
   }
 
   return (
-    <div className="min-h-full box-border px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]" aria-busy={loading}>
+    <PageShell template="detail" aria-busy={loading}>
       <AppHeader
         onLogout={onLogout}
         userName={currentUser?.username}
@@ -1038,7 +1039,7 @@ function ToolEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'edit' 
       <div className="grid grid-cols-1 items-start gap-[20px] xl:grid-cols-2">
         <SectionCard title="工具定义" loading={loading && isEdit && !tool}>
           {isEdit && tool?.credential_state?.configured_fields.length ? (
-            <div className="mb-[14px] rounded-[10px] border border-[#dbe5ff] bg-[#f5f8ff] px-[12px] py-[9px] text-[11px] leading-[18px] text-[#52617e]">
+            <div className="mb-[14px] rounded-[10px] border border-[#dbe5ff] bg-[#f5f8ff] px-[12px] py-[9px] gg-type-caption  text-[#52617e]">
               已保存的凭据不会回显。保持对应 JSON 为空会保留原配置；填写新值会安全替换。
               当前已配置：{tool.credential_state.configured_fields.join('、')}。
             </div>
@@ -1057,21 +1058,21 @@ function ToolEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'edit' 
           {isEdit && tool && <SavedToolTestCard tool={tool} />}
         </div>
       </div>
-    </div>
+    </PageShell>
   );
 }
 
 const CARD_CLASS =
   'rounded-[14px] border border-[#eceef1] bg-white';
-const CARD_TITLE_CLASS = 'text-[14px] font-medium text-[#18181a]';
-const FIELD_LABEL_CLASS = 'text-[13px] font-medium text-[#18181a]';
-const SUBSECTION_TITLE_CLASS = 'text-[13px] font-medium text-[#18181a]';
-const HINT_CLASS = 'text-[12px] leading-[1.55] text-[#858b9c]';
-const MONO_INPUT_CLASS = 'font-mono text-[12px] leading-[1.65]';
+const CARD_TITLE_CLASS = 'gg-type-body font-medium text-[#18181a]';
+const FIELD_LABEL_CLASS = 'gg-type-control font-medium text-[#18181a]';
+const SUBSECTION_TITLE_CLASS = 'gg-type-control font-medium text-[#18181a]';
+const HINT_CLASS = 'gg-type-meta  text-[#858b9c]';
+const MONO_INPUT_CLASS = 'font-mono gg-type-meta ';
 const RETURN_BUTTON_CLASS =
-  'h-8 gap-1 rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-5 text-[12px] font-normal text-[#757f9c] hover:border-[#cbd3e6] hover:bg-white hover:text-[#18181a]';
+  'h-8 gap-1 rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-5 gg-type-meta font-normal text-[#757f9c] hover:border-[#cbd3e6] hover:bg-white hover:text-[#18181a]';
 const PRIMARY_BUTTON_CLASS =
-  'h-8 gap-1 rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-5 text-[12px] font-semibold text-white hover:bg-[#244bc7]';
+  'h-8 gap-1 rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-5 gg-type-meta font-semibold text-white hover:bg-[#244bc7]';
 
 function SectionCard({
   title,
@@ -1098,7 +1099,7 @@ function SectionCard({
       )}
       <div className={cn('p-[20px]', bodyClassName)}>
         {loading ? (
-          <div className="py-[24px] text-center text-[13px] text-[#858b9c]">加载中…</div>
+          <div className="py-[24px] text-center gg-type-control text-[#858b9c]">加载中…</div>
         ) : (
           children
         )}
@@ -1151,7 +1152,7 @@ export function ToolTestPage({ currentUser, onLogout }: ToolPageProps = {}) {
   }, [agentQuery, toolId]);
 
   return (
-    <div className="min-h-full box-border px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]" aria-busy={loading}>
+    <PageShell template="detail" aria-busy={loading}>
       <AppHeader
         onLogout={onLogout}
         userName={currentUser?.username}
@@ -1179,15 +1180,15 @@ export function ToolTestPage({ currentUser, onLogout }: ToolPageProps = {}) {
           {tool && (
             <>
               <div className="grid grid-cols-[58px_minmax(0,1fr)] items-start gap-[16px] rounded-[14px] border border-[#eceef1] bg-[#fafbfc] p-[16px]">
-                <div className="grid size-[58px] place-items-center rounded-[16px] border border-[#eceef1] bg-white text-[24px] text-[#18181a]">
+                <div className="grid size-[58px] place-items-center rounded-[16px] border border-[#eceef1] bg-white gg-type-page-title text-[#18181a]">
                   <PlazaResourceIcon kind="tools" size="drawer" />
                 </div>
                 <div className="min-w-0">
-                  <span className="text-[12px] font-semibold text-[#1a71ff]">{tool.bucket || '未分桶'}</span>
-                  <h4 className="my-[4px] text-[18px] font-semibold wrap-break-word text-[#18181a]">
+                  <span className="gg-type-meta font-semibold text-[#1a71ff]">{tool.bucket || '未分桶'}</span>
+                  <h4 className="my-[4px] gg-type-section-title font-semibold wrap-break-word text-[#18181a]">
                     {tool.display_name || tool.name}
                   </h4>
-                  <p className="mb-[10px] text-[13px] leading-[1.65] wrap-break-word text-[#858b9c]">
+                  <p className="mb-[10px] gg-type-control  wrap-break-word text-[#858b9c]">
                     {tool.description || '暂无描述'}
                   </p>
                   <div className="flex flex-wrap items-center gap-[6px]">
@@ -1209,8 +1210,8 @@ export function ToolTestPage({ currentUser, onLogout }: ToolPageProps = {}) {
                     key={item.label}
                     className="flex min-h-[78px] flex-col gap-[8px] rounded-[12px] border border-[#eceef1] bg-white px-[14px] py-[13px]"
                   >
-                    <span className="text-[12px] font-semibold text-[#858b9c]">{item.label}</span>
-                    <strong className="text-[14px] leading-[1.35] wrap-break-word text-[#18181a]">
+                    <span className="gg-type-meta font-semibold text-[#858b9c]">{item.label}</span>
+                    <strong className="gg-type-body  wrap-break-word text-[#18181a]">
                       {item.value}
                     </strong>
                   </div>
@@ -1218,8 +1219,8 @@ export function ToolTestPage({ currentUser, onLogout }: ToolPageProps = {}) {
               </div>
 
               <div className="flex flex-col gap-[8px] rounded-[12px] border border-[#eceef1] bg-[#fafbfc] px-[16px] py-[14px]">
-                <span className="text-[12px] font-semibold text-[#858b9c]">调用地址</span>
-                <code className="block font-mono text-[13px] leading-[1.6] wrap-break-word text-[#18181a]">
+                <span className="gg-type-meta font-semibold text-[#858b9c]">调用地址</span>
+                <code className="block font-mono gg-type-control  wrap-break-word text-[#18181a]">
                   {tool.method} {tool.url}
                 </code>
               </div>
@@ -1239,7 +1240,7 @@ export function ToolTestPage({ currentUser, onLogout }: ToolPageProps = {}) {
         </SectionCard>
         {tool && <SavedToolTestCard tool={tool} standalone />}
       </div>
-    </div>
+    </PageShell>
   );
 }
 
@@ -1479,7 +1480,7 @@ function McpServerEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'e
       width: 220,
       className: 'whitespace-normal',
       render: (row) => (
-        <span className="block wrap-break-word font-medium text-[#18181a]" title={row.name}>
+        <span className="block wrap-break-word gg-type-control font-medium text-[#18181a]" title={row.name}>
           {row.name}
         </span>
       ),
@@ -1489,7 +1490,7 @@ function McpServerEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'e
       title: '描述',
       className: 'whitespace-normal',
       render: (row) => (
-        <span className="block wrap-break-word text-[#858b9c]">{row.description || '暂无描述'}</span>
+        <span className="block wrap-break-word gg-type-body text-[#858b9c]">{row.description || '暂无描述'}</span>
       ),
     },
     {
@@ -1503,7 +1504,7 @@ function McpServerEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'e
   ];
 
   return (
-    <div className="min-h-full box-border px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]" aria-busy={loading}>
+    <PageShell template="detail" aria-busy={loading}>
       <AppHeader
         onLogout={onLogout}
         userName={currentUser?.username}
@@ -1686,13 +1687,13 @@ function McpServerEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'e
               emptyText="未发现工具"
             />
           ) : (
-            <div className="grid min-h-[180px] place-items-center rounded-[12px] border border-dashed border-[#eceef1] p-[20px] text-center text-[13px] text-[#858b9c]">
+            <div className="grid min-h-[180px] place-items-center rounded-[12px] border border-dashed border-[#eceef1] p-[20px] text-center gg-type-control text-[#858b9c]">
               点击「发现工具」后，这里会列出该 MCP Server 提供的工具。
             </div>
           )}
         </SectionCard>
       </div>
-    </div>
+    </PageShell>
   );
 }
 
@@ -1896,7 +1897,7 @@ function ToolFormFields({
           </SelectContent>
         </UISelect>
         {selectedPermission && (
-          <p className="mt-[8px] text-[12px] leading-[1.6] text-[#596582]">
+          <p className="mt-[8px] gg-type-meta  text-[#596582]">
             {selectedPermission.description || `${selectedPermission.resource} 的 ${selectedPermission.action} 权限。`}
           </p>
         )}
@@ -1930,21 +1931,21 @@ function ToolFormFields({
           </div>
         )}
         {!canManagePermission && (
-          <p className="mt-[8px] text-[12px] leading-[1.6] text-[#858b9c]">
+          <p className="mt-[8px] gg-type-meta  text-[#858b9c]">
             执行权限边界由平台管理员维护，数字员工创建者只能查看当前配置。
           </p>
         )}
         {isProtected && (
           <div className="mt-[10px] flex flex-wrap items-center gap-[6px]" aria-label="受控执行条件">
             {['调用人有权', '数字员工 execute 角色', '有效监督者', 'SOP 白名单'].map((label) => (
-              <span key={label} className="rounded-full border border-[#d7dff7] bg-white px-[8px] py-[3px] text-[11px] text-[#4b5f96]">
+              <span key={label} className="rounded-full border border-[#d7dff7] bg-white px-[8px] py-[3px] gg-type-caption text-[#4b5f96]">
                 {label}
               </span>
             ))}
           </div>
         )}
         {isProtected && !String(values.allowed_skills || '').trim() && (
-          <p className="mt-[9px] text-[12px] font-medium text-[#b45309]">
+          <p className="mt-[9px] gg-type-meta font-medium text-[#b45309]">
             请在 Allowed Skills 中填写至少一个 SOP skill_id，否则无法保存。
           </p>
         )}
@@ -2108,7 +2109,7 @@ function SavedToolTestCard({ tool, standalone = false }: { tool: ToolRead; stand
       )}
     >
       <div className="flex items-start justify-between gap-[12px] rounded-[12px] border border-[#eceef1] bg-[#fafbfc] px-[14px] py-[12px]">
-        <span className="min-w-0 flex-1 wrap-break-word text-[13px] leading-[1.65] text-[#858b9c]">
+        <span className="min-w-0 flex-1 wrap-break-word gg-type-control  text-[#858b9c]">
           调用已保存的「{tool.display_name || tool.name}」，用于验证员工实际可用的工具返回。
         </span>
         <span className="shrink-0">
@@ -2132,7 +2133,7 @@ function SavedToolTestCard({ tool, standalone = false }: { tool: ToolRead; stand
         {testResult ? (
           <CodeBlock className="max-h-[340px] whitespace-pre-wrap wrap-break-word" code={testResult} language="json" />
         ) : (
-          <div className="grid min-h-[180px] place-items-center rounded-[12px] border border-dashed border-[#eceef1] p-[20px] text-center text-[13px] text-[#858b9c]">
+          <div className="grid min-h-[180px] place-items-center rounded-[12px] border border-dashed border-[#eceef1] p-[20px] text-center gg-type-control text-[#858b9c]">
             点击调用后，这里会显示工具返回、错误信息和原始 data。
           </div>
         )}

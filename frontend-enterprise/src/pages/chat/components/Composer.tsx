@@ -143,13 +143,13 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
               <span className="flex size-[26px] shrink-0 items-center justify-center rounded-[8px] bg-[#ffe7ad] text-[#8a4b00]">
                 <ProductIcon name="model" size={14} />
               </span>
-              <span className="min-w-0 text-[12px] leading-[18px]">{modelSetupNoticeText}</span>
+              <span className="min-w-0 gg-type-meta ">{modelSetupNoticeText}</span>
             </div>
             {canConfigureModels && (
               <button
                 type="button"
                 onClick={() => setModelSetupOpen(true)}
-                className="h-[30px] shrink-0 rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-[12px] text-[12px] font-semibold text-white transition-colors hover:bg-[#244bc7]"
+                className="h-[30px] shrink-0 rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-[12px] gg-type-meta font-semibold text-white transition-colors hover:bg-[#244bc7]"
               >
                 {t('配置模型')}
               </button>
@@ -185,11 +185,11 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
                         radius={30}
                         objectPosition="bottom"
                       />
-                      <div className="flex h-[36px] flex-col justify-center gap-[2px] whitespace-nowrap pb-[2px] text-[10px] capitalize leading-normal">
-                        <p className="font-medium text-[#464c5e]">
+                      <div className="flex h-[36px] flex-col justify-center gap-[2px] whitespace-nowrap pb-[2px] gg-type-caption capitalize ">
+                        <p className="gg-type-meta font-medium text-[#464c5e]">
                           {displayedAgent ? employeeDisplayName(displayedAgent) : displayedProfile.roleName}
                         </p>
-                        <p className="text-[#757f9c]">{displayedProfile.roleName}</p>
+                        <p className="gg-type-meta text-[#757f9c]">{displayedProfile.roleName}</p>
                       </div>
                     </div>
                   </div>
@@ -197,7 +197,7 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
               </div>
 
               <div className="flex w-full flex-col gap-[8px] px-[8px]">
-                <p className="w-full text-[10px] capitalize leading-[14px] text-[#757f9c]">
+                <p className="w-full gg-type-caption capitalize  text-[#757f9c]">
                   {emptyRoleSummary}
                 </p>
                 {emptyProfileTags.length > 0 && (
@@ -207,7 +207,7 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
                         key={`${tag}-${index}`}
                         className="flex h-[16px] items-center justify-center rounded-[10px] border-[0.5px] border-[#e3e7f1] px-[8px] py-[2px]"
                       >
-                        <span className="whitespace-nowrap text-[8px] capitalize leading-normal text-[#757f9c]">
+                        <span className="whitespace-nowrap gg-type-caption capitalize  text-[#757f9c]">
                           {tag}
                         </span>
                       </div>
@@ -217,7 +217,7 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
               </div>
 
               <div className="flex w-full flex-col px-[8px] pb-[8px]">
-                <div className="flex w-full items-start whitespace-nowrap capitalize leading-normal">
+                <div className="flex w-full items-start whitespace-nowrap capitalize ">
                   {emptyStats.map((item, index) => (
                     <div
                       key={item.label}
@@ -227,8 +227,8 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
                         index === emptyStats.length - 1 && 'rounded-r-[14px]',
                       )}
                     >
-                      <p className="text-[16px] font-medium text-[#18181a]">{item.value}</p>
-                      <p className="text-[10px] text-[#464c5e]">{item.label}</p>
+                      <p className="gg-type-card-title font-medium text-[#18181a]">{item.value}</p>
+                      <p className="gg-type-caption text-[#464c5e]">{item.label}</p>
                     </div>
                   ))}
                 </div>
@@ -279,7 +279,7 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
                   {attachment.uploadStatus === 'ready' && attachment.preview && (
                     <button
                       type="button"
-                      className="shrink-0 rounded-md px-1.5 py-1 text-[11px] font-medium text-[var(--gg-cobalt)] hover:bg-[#edf2ff]"
+                      className="shrink-0 rounded-md px-1.5 py-1 gg-type-caption font-medium text-[var(--gg-cobalt)] hover:bg-[#edf2ff]"
                       onClick={() => setPreviewAttachment(attachment)}
                     >
                       查看解析内容
@@ -301,12 +301,12 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
           <Dialog open={Boolean(previewAttachment)} onOpenChange={(open) => !open && setPreviewAttachment(null)}>
             <DialogContent className="max-w-[720px] rounded-[20px] p-0">
               <div className="border-b border-[#e8ebf2] px-6 py-5">
-                <DialogTitle className="text-base font-semibold text-[#18181a]">
+                <DialogTitle className="gg-type-card-title font-semibold text-[#18181a]">
                   {previewAttachment?.filename || '附件解析内容'}
                 </DialogTitle>
-                <p className="mt-1 text-xs text-[#757f9c]">内容来自服务端固定解析版本，仅作为不可信数据读取。</p>
+                <p className="mt-1 gg-type-caption text-[#757f9c]">内容来自服务端固定解析版本，仅作为不可信数据读取。</p>
               </div>
-              <pre className="max-h-[60vh] overflow-auto whitespace-pre-wrap break-words px-6 py-5 text-sm leading-6 text-[#303746]" data-i18n-ignore>
+              <pre className="max-h-[60vh] overflow-auto whitespace-pre-wrap break-words px-6 py-5 gg-type-code text-[#303746]" data-i18n-ignore>
                 {previewAttachment?.preview || '暂无可预览内容'}
               </pre>
             </DialogContent>
@@ -570,18 +570,18 @@ function GeneralSkillInstallDialog({
         <DialogTitle>安装 Skill 到当前分身</DialogTitle>
         {!activeIntent ? (
           <div className="grid gap-3">
-            <p className="text-[12px] leading-5 text-[#757f9c]">只接受固定 40 位 commit 和明确目录；系统先生成安全预览，不会直接执行包内脚本。</p>
-            <label className="grid gap-1 text-[12px]">GitHub 仓库地址<input aria-label="安装 Skill GitHub 仓库地址" value={sourceUrl} onChange={(event) => setSourceUrl(event.target.value)} className="h-10 rounded-lg border px-3" /></label>
-            <label className="grid gap-1 text-[12px]">完整 commit SHA<input aria-label="安装 Skill 完整 commit SHA" value={revision} onChange={(event) => setRevision(event.target.value)} className="h-10 rounded-lg border px-3 font-mono" /></label>
-            <label className="grid gap-1 text-[12px]">仓库内 Skill 目录<input aria-label="安装 Skill 仓库目录" value={subpath} onChange={(event) => setSubpath(event.target.value)} className="h-10 rounded-lg border px-3 font-mono" /></label>
+            <p className="gg-type-meta text-[#757f9c]">只接受固定 40 位 commit 和明确目录；系统先生成安全预览，不会直接执行包内脚本。</p>
+            <label className="grid gap-1 gg-type-meta">GitHub 仓库地址<input aria-label="安装 Skill GitHub 仓库地址" value={sourceUrl} onChange={(event) => setSourceUrl(event.target.value)} className="h-10 rounded-lg border px-3" /></label>
+            <label className="grid gap-1 gg-type-meta">完整 commit SHA<input aria-label="安装 Skill 完整 commit SHA" value={revision} onChange={(event) => setRevision(event.target.value)} className="h-10 rounded-lg border px-3 font-mono gg-type-code" /></label>
+            <label className="grid gap-1 gg-type-meta">仓库内 Skill 目录<input aria-label="安装 Skill 仓库目录" value={subpath} onChange={(event) => setSubpath(event.target.value)} className="h-10 rounded-lg border px-3 font-mono gg-type-code" /></label>
             <div className="flex justify-end gap-2"><UIButton variant="outline" onClick={onClose}>取消</UIButton><UIButton disabled={loading} onClick={() => void createIntent()}>生成安装预览</UIButton></div>
           </div>
         ) : (
           <section aria-label="Skill 安装确认卡" className="grid gap-4 rounded-xl border border-[#cbd8ff] bg-[#f8faff] p-4">
-            <div><strong>{activeIntent.candidates.map((item) => item.name).join('、') || 'Skill 安装'}</strong><p className="mt-1 break-all font-mono text-[11px] text-[#596078]">{activeIntent.source_reference_redacted}</p></div>
-            <dl className="grid grid-cols-2 gap-2 text-[12px]"><div><dt>固定 commit</dt><dd className="font-mono">{activeIntent.source_revision?.slice(0, 12)}…</dd></div><div><dt>包 checksum</dt><dd className="font-mono">{activeIntent.raw_checksum?.slice(0, 12)}…</dd></div></dl>
-            {activeIntent.candidates.map((candidate) => <div key={candidate.candidate_id} className="rounded-lg bg-white p-3"><div>{candidate.description}</div><div className="mt-2 text-[11px] text-[#b45b00]">风险：{candidate.risk_findings.join('、') || '未发现'}</div><div className="mt-1 text-[11px]">文件：{candidate.resources.length} 个</div></div>)}
-            <div role="status">状态：{activeIntent.status}</div>
+            <div><strong className="gg-type-control">{activeIntent.candidates.map((item) => item.name).join('、') || 'Skill 安装'}</strong><p className="mt-1 break-all font-mono gg-type-caption text-[#596078]">{activeIntent.source_reference_redacted}</p></div>
+            <dl className="grid grid-cols-2 gap-2 gg-type-meta"><div><dt>固定 commit</dt><dd className="font-mono gg-type-code">{activeIntent.source_revision?.slice(0, 12)}…</dd></div><div><dt>包 checksum</dt><dd className="font-mono gg-type-code">{activeIntent.raw_checksum?.slice(0, 12)}…</dd></div></dl>
+            {activeIntent.candidates.map((candidate) => <div key={candidate.candidate_id} className="rounded-lg bg-white p-3"><div className="gg-type-body">{candidate.description}</div><div className="mt-2 gg-type-caption text-[#b45b00]">风险：{candidate.risk_findings.join('、') || '未发现'}</div><div className="mt-1 gg-type-caption">文件：{candidate.resources.length} 个</div></div>)}
+            <div className="gg-type-control" role="status">状态：{activeIntent.status}</div>
             {activeIntent.status === 'awaiting_owner_confirmation' ? <div className="flex justify-end gap-2"><UIButton variant="outline" disabled={loading} onClick={() => void onResolve(activeIntent, 'cancel')}>取消安装</UIButton><UIButton disabled={loading} onClick={() => void onResolve(activeIntent, 'confirm')}>确认安装到当前分身</UIButton></div> : null}
             {activeIntent.status === 'installed' ? <UIButton onClick={onClose}>安装完成，开始使用</UIButton> : null}
           </section>

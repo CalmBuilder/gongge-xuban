@@ -44,8 +44,43 @@
   --gg-radius-control: 8px;
   --gg-radius-card: 12px;
   --gg-radius-panel: 16px;
+  --gg-radius-avatar-card: 10px;
+  --gg-radius-avatar-detail: 26px;
   --gg-shadow-card: 0 10px 26px rgba(24, 33, 61, 0.08);
   --gg-shadow-focus: 0 0 0 3px rgba(49, 87, 232, 0.22);
+  --gg-type-page-title-size: 24px;
+  --gg-type-page-title-line: 32px;
+  --gg-type-section-title-size: 18px;
+  --gg-type-section-title-line: 26px;
+  --gg-type-card-title-size: 16px;
+  --gg-type-card-title-line: 24px;
+  --gg-type-body-size: 14px;
+  --gg-type-body-line: 22px;
+  --gg-type-control-size: 13px;
+  --gg-type-control-line: 20px;
+  --gg-type-meta-size: 12px;
+  --gg-type-meta-line: 18px;
+  --gg-type-caption-size: 11px;
+  --gg-type-caption-line: 16px;
+  --gg-type-code-size: 12px;
+  --gg-type-code-line: 18px;
+  --gg-type-metric-size: 28px;
+  --gg-type-metric-line: 34px;
+  --gg-type-display-size: clamp(36px, 5.3vw, 76px);
+  --gg-type-display-line: 1.04;
+  --gg-type-icon-line: 1;
+  --gg-layout-gap: 16px;
+  --gg-resource-card-min-width: 264px;
+  --gg-resource-card-min-height: 288px;
+  --gg-metric-card-min-height: 136px;
+  --gg-info-card-min-height: 220px;
+  --gg-sidebar-primary-item-gap: 6px;
+  --gg-sidebar-secondary-item-gap: 2px;
+  --gg-sidebar-control-gap: 10px;
+  --gg-sidebar-secondary-control-gap: 8px;
+  --gg-sidebar-lower-top-gap: 36px;
+  --gg-sidebar-lower-bottom-gap: 24px;
+  --gg-sidebar-footer-slot: 64px;
 
   --background: var(--gg-cloud);
   --foreground: var(--gg-ink);
@@ -97,24 +132,24 @@
   --thinking-base: #8a918d;
   --thinking-focus: #2f3734;
   --thinking-flow-duration: 4.2s;
-  --card: #ffffff;
-  --card-foreground: #20201d;
-  --popover: #ffffff;
-  --popover-foreground: #20201d;
+  --card: var(--gg-surface);
+  --card-foreground: var(--gg-text-primary);
+  --popover: var(--gg-surface);
+  --popover-foreground: var(--gg-text-primary);
   --primary: var(--gg-interaction);
   --primary-foreground: #ffffff;
-  --secondary: #eeece4;
-  --secondary-foreground: #20201d;
-  --muted-foreground: #6d726e;
+  --secondary: var(--gg-state-neutral-soft);
+  --secondary-foreground: var(--gg-text-primary);
+  --muted-foreground: var(--gg-text-secondary);
   --destructive: var(--gg-state-danger);
-  --input: #ded7cc;
-  --ring: var(--gg-cobalt);
+  --input: var(--gg-border);
+  --ring: var(--gg-interaction);
   --chart-1: var(--gg-cobalt);
   --chart-2: #6f7b42;
   --chart-3: #a85d32;
   --chart-4: #138a55;
   --chart-5: #b45309;
-  --radius: 0.625rem;
+  --radius: 0.5rem;
   --sidebar: var(--gg-paper);
   --sidebar-foreground: var(--gg-text-muted);
   --sidebar-primary: var(--gg-interaction);
@@ -136,6 +171,8 @@ body {
   background: var(--gg-surface-page);
   color: var(--foreground);
   font-family: var(--font-body);
+  font-size: var(--gg-type-body-size);
+  line-height: var(--gg-type-body-line);
   -webkit-font-smoothing: antialiased;
   transition: background-color 260ms ease, color 260ms ease;
 }
@@ -183,61 +220,308 @@ select,
 }
 
 /* Shared type scale. Page families may compose these classes, but should not
-   invent another size for the same semantic role. */
+   invent another size for the same semantic role. These live in the
+   components layer so an explicit color utility (for example text-white or a
+   state color) can still win without changing the type scale. */
+@layer components {
 .gg-type-page-title {
-  font-size: 24px;
-  line-height: 32px;
+  font-size: var(--gg-type-page-title-size);
+  line-height: var(--gg-type-page-title-line);
   font-weight: 700;
   letter-spacing: -0.02em;
   color: var(--gg-text-primary);
+  text-wrap: balance;
 }
 
 .gg-type-section-title {
-  font-size: 18px;
-  line-height: 26px;
-  font-weight: 650;
+  font-size: var(--gg-type-section-title-size);
+  line-height: var(--gg-type-section-title-line);
+  font-weight: 700;
   letter-spacing: -0.01em;
   color: var(--gg-text-primary);
+  text-wrap: balance;
+}
+
+.gg-type-section-title--inverse {
+  color: #ffffff;
 }
 
 .gg-type-card-title {
-  font-size: 14px;
-  line-height: 20px;
+  font-size: var(--gg-type-card-title-size);
+  line-height: var(--gg-type-card-title-line);
   font-weight: 600;
   color: var(--gg-text-primary);
 }
 
 .gg-type-body {
-  font-size: 13px;
-  line-height: 20px;
+  font-size: var(--gg-type-body-size);
+  line-height: var(--gg-type-body-line);
   font-weight: 400;
   color: var(--gg-text-secondary);
 }
 
 .gg-type-control {
-  font-size: 12px;
-  line-height: 18px;
+  font-size: var(--gg-type-control-size);
+  line-height: var(--gg-type-control-line);
   font-weight: 500;
 }
 
 .gg-type-meta {
-  font-size: 12px;
-  line-height: 18px;
-  font-weight: 500;
+  font-size: var(--gg-type-meta-size);
+  line-height: var(--gg-type-meta-line);
+  font-weight: 400;
   color: var(--gg-text-muted);
 }
 
 .gg-type-caption {
-  font-size: 11px;
-  line-height: 16px;
-  font-weight: 500;
+  font-size: var(--gg-type-caption-size);
+  line-height: var(--gg-type-caption-line);
+  font-weight: 400;
   color: var(--gg-text-muted);
 }
 
 .gg-type-code {
   font-family: var(--font-mono);
-  font-size: 12px;
-  line-height: 20px;
+  font-size: var(--gg-type-code-size);
+  line-height: var(--gg-type-code-line);
+}
+
+.gg-type-display {
+  font-size: var(--gg-type-display-size);
+  line-height: var(--gg-type-display-line);
+  font-weight: 700;
+  letter-spacing: -0.055em;
+}
+
+.gg-type-metric {
+  font-size: var(--gg-type-metric-size);
+  line-height: var(--gg-type-metric-line);
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+}
+
+.gg-type-icon {
+  line-height: var(--gg-type-icon-line);
+}
+
+[data-slot="card"][data-size="sm"] [data-slot="card-title"] {
+  font-size: var(--gg-type-control-size);
+  line-height: var(--gg-type-control-line);
+}
+
+/*
+ * Rich text and compact workflow fields render children generated outside the
+ * React component tree. These named contracts keep their nested text on the
+ * same scale as native page controls instead of reintroducing one-off sizes.
+ */
+.gg-type-markdown :is(h1, h2, h3, h4) {
+  font-weight: 600;
+}
+
+.gg-type-markdown h1 {
+  font-size: var(--gg-type-section-title-size);
+  line-height: var(--gg-type-section-title-line);
+}
+
+.gg-type-markdown h2 {
+  font-size: var(--gg-type-card-title-size);
+  line-height: var(--gg-type-card-title-line);
+}
+
+.gg-type-markdown h3 {
+  font-size: var(--gg-type-body-size);
+  line-height: var(--gg-type-body-line);
+}
+
+.gg-type-markdown h4 {
+  font-size: var(--gg-type-control-size);
+  line-height: var(--gg-type-control-line);
+}
+
+.gg-type-markdown :is(code, pre) {
+  font-family: var(--font-mono);
+  font-size: var(--gg-type-code-size, 12px);
+  line-height: var(--gg-type-code-line);
+}
+
+.gg-type-children-caption :is(span, em) {
+  font-size: var(--gg-type-caption-size);
+  line-height: var(--gg-type-caption-line);
+}
+
+.gg-type-children-meta :is(span, em),
+.gg-type-children-meta label > span {
+  font-size: var(--gg-type-meta-size);
+  line-height: var(--gg-type-meta-line);
+}
+
+.gg-type-children-control :is(strong, p) {
+  font-size: var(--gg-type-control-size);
+  line-height: var(--gg-type-control-line);
+}
+
+.gg-type-children-body :is(strong, p) {
+  font-size: var(--gg-type-body-size);
+  line-height: var(--gg-type-body-line);
+}
+
+.gg-type-citation-markdown > div {
+  font-size: var(--gg-type-control-size);
+  line-height: var(--gg-type-control-line);
+}
+
+.gg-type-citation-markdown :is(h1, h2) {
+  font-size: var(--gg-type-card-title-size);
+  line-height: var(--gg-type-card-title-line);
+}
+
+.gg-type-citation-markdown h3 {
+  font-size: var(--gg-type-body-size);
+  line-height: var(--gg-type-body-line);
+}
+
+.gg-type-citation-markdown h4 {
+  font-size: var(--gg-type-control-size);
+  line-height: var(--gg-type-control-line);
+}
+
+.gg-type-children-meta-strong > strong {
+  font-size: var(--gg-type-control-size);
+  line-height: var(--gg-type-control-line);
+}
+
+.gg-type-children-meta-strong > span {
+  font-size: var(--gg-type-meta-size);
+  line-height: var(--gg-type-meta-line);
+}
+
+.gg-type-meta-first-child > span:first-child {
+  font-size: var(--gg-type-meta-size);
+  line-height: var(--gg-type-meta-line);
+}
+}
+
+.gg-page-shell {
+  width: 100%;
+  max-width: none;
+  min-height: 100%;
+  margin-inline: 0;
+  padding: 32px 24px 43px;
+}
+
+.gg-page-shell--compact {
+  padding-top: 24px;
+  padding-bottom: 32px;
+}
+
+.gg-page-header {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.gg-page-header__actions {
+  display: flex;
+  min-width: max-content;
+  align-items: center;
+  gap: 8px;
+}
+
+.gg-catalog-hero {
+  overflow: hidden;
+  border-bottom: 1px solid var(--gg-line);
+  background: linear-gradient(
+    110deg,
+    var(--gg-interaction-soft) 0%,
+    var(--gg-surface-subtle) 58%,
+    var(--gg-capability-soft) 100%
+  );
+}
+
+.gg-metric-grid {
+  display: grid;
+  grid-auto-rows: minmax(var(--gg-metric-card-min-height), auto);
+  grid-template-columns: repeat(auto-fit, minmax(max(220px, calc((100% - (var(--gg-layout-gap) * 3)) / 4)), 1fr));
+  gap: var(--gg-layout-gap);
+}
+
+.gg-info-grid {
+  display: grid;
+  grid-auto-rows: minmax(var(--gg-info-card-min-height), auto);
+  grid-template-columns: repeat(auto-fit, minmax(max(264px, calc((100% - var(--gg-layout-gap)) / 2)), 1fr));
+  gap: var(--gg-layout-gap);
+}
+
+.gg-resource-grid > *,
+.gg-metric-grid > *,
+.gg-info-grid > * {
+  min-width: 0;
+}
+
+.gg-detail-surface {
+  min-width: 0;
+}
+
+.gg-detail-surface--drawer {
+  overscroll-behavior: contain;
+}
+
+.gg-detail-section {
+  min-width: 0;
+  border: 1px solid var(--gg-line);
+  border-radius: var(--gg-radius-card);
+  background: var(--gg-surface);
+  padding: 16px;
+}
+
+.gg-detail-actions,
+.gg-editor-footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  border-top: 1px solid var(--gg-line);
+  background: var(--gg-surface);
+  padding: 12px 16px;
+}
+
+.gg-page-state {
+  display: flex;
+  min-height: 220px;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  border: 1px dashed var(--gg-line);
+  border-radius: var(--gg-radius-card);
+  background: var(--gg-surface);
+  padding: 28px 20px;
+  text-align: center;
+}
+
+.gg-page-state__icon {
+  display: grid;
+  width: 40px;
+  height: 40px;
+  place-items: center;
+  margin-bottom: 10px;
+  border-radius: 50%;
+  background: var(--gg-interaction-soft);
+  color: var(--gg-interaction);
+}
+
+.gg-page-state--error,
+.gg-page-state--forbidden {
+  border-color: var(--gg-state-danger);
+  background: var(--gg-state-danger-soft);
+}
+
+.gg-page-state--error .gg-page-state__icon,
+.gg-page-state--forbidden .gg-page-state__icon {
+  background: var(--gg-surface);
+  color: var(--gg-state-danger);
 }
 
 /* Resource cards use the available content width, not page-specific breakpoints.
@@ -245,9 +529,32 @@ select,
    wide screens from creating a fifth, overly dense column. */
 .gg-resource-grid {
   display: grid;
-  grid-auto-rows: minmax(288px, auto);
-  grid-template-columns: repeat(auto-fit, minmax(max(264px, calc((100% - 48px) / 4)), 1fr));
-  gap: 16px;
+  grid-auto-rows: minmax(var(--gg-resource-card-min-height), auto);
+  grid-template-columns: repeat(auto-fit, minmax(max(var(--gg-resource-card-min-width), calc((100% - (var(--gg-layout-gap) * 3)) / 4)), 1fr));
+  gap: var(--gg-layout-gap);
+}
+
+@media (max-width: 900px) {
+  .gg-page-shell {
+    padding: 24px 16px 32px;
+  }
+
+  .gg-page-header {
+    flex-direction: column;
+  }
+
+  .gg-page-header__actions {
+    width: 100%;
+    min-width: 0;
+    flex-wrap: wrap;
+  }
+}
+
+@media (max-width: 640px) {
+  .gg-metric-grid,
+  .gg-info-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 .product-icon-spin {
@@ -1250,10 +1557,6 @@ body.skill-distill-fixed .content {
   }
 }
 
-.tutorial-doc-page .ui-typography {
-  margin: 0;
-}
-
 .tutorial-doc-hero {
   position: relative;
   min-height: 520px;
@@ -1296,26 +1599,21 @@ body.skill-distill-fixed .content {
 
 .tutorial-doc-eyebrow {
   color: var(--accent) !important;
-  font-size: 12px;
   font-weight: 860;
   letter-spacing: 0.1em;
   text-transform: uppercase;
 }
 
-.tutorial-doc-hero h1.ui-typography {
+.tutorial-doc-hero h1.gg-type-display {
   max-width: 780px;
   color: var(--foreground);
-  font-size: clamp(38px, 4.6vw, 64px) !important;
-  line-height: 1.02 !important;
   font-weight: 860 !important;
   letter-spacing: 0 !important;
 }
 
-.tutorial-doc-hero p.ui-typography {
+.tutorial-doc-hero p.gg-type-body {
   max-width: 760px;
   color: var(--muted);
-  font-size: 16px;
-  line-height: 1.85;
 }
 
 .tutorial-doc-actions {
@@ -1376,13 +1674,13 @@ body.skill-distill-fixed .content {
   border-radius: 999px;
   background: color-mix(in srgb, var(--surface) 74%, var(--accent-soft));
   color: var(--muted);
-  font-size: 12px;
   font-weight: 760;
 }
 
 .tutorial-doc-proof-row strong {
   color: var(--foreground);
-  font-size: 20px;
+  font-size: var(--gg-type-section-title-size);
+  line-height: var(--gg-type-section-title-line);
 }
 
 .tutorial-doc-hero-map {
@@ -1407,7 +1705,6 @@ body.skill-distill-fixed .content {
   border-radius: 999px;
   background: color-mix(in srgb, var(--accent-soft) 72%, transparent);
   color: var(--accent);
-  font-size: 12px;
   font-weight: 840;
   letter-spacing: 0.08em;
   text-transform: uppercase;
@@ -1459,7 +1756,6 @@ body.skill-distill-fixed .content {
   gap: 9px;
   align-items: center;
   color: var(--muted);
-  font-size: 12px;
   font-weight: 760;
 }
 
@@ -1511,14 +1807,14 @@ body.skill-distill-fixed .content {
 
 .tutorial-doc-nav-title span {
   color: var(--accent);
-  font-size: 11px;
   font-weight: 860;
   letter-spacing: 0.12em;
 }
 
 .tutorial-doc-nav-title strong {
   color: var(--foreground);
-  font-size: 22px;
+  font-size: var(--gg-type-section-title-size);
+  line-height: var(--gg-type-section-title-line);
 }
 
 .tutorial-doc-nav nav {
@@ -1529,7 +1825,6 @@ body.skill-distill-fixed .content {
 .tutorial-doc-nav nav > span {
   margin-top: 4px;
   color: var(--foreground);
-  font-size: 13px;
   font-weight: 820;
 }
 
@@ -1539,7 +1834,6 @@ body.skill-distill-fixed .content {
   padding: 8px 10px 8px 14px;
   border-radius: 10px;
   color: var(--muted);
-  font-size: 13px;
   font-weight: 720;
   text-decoration: none;
   transition:
@@ -1601,19 +1895,14 @@ body.skill-distill-fixed .content {
   max-width: 860px;
 }
 
-.tutorial-doc-section-heading h2.ui-typography,
-.tutorial-doc-intro-panel h2.ui-typography {
+.tutorial-doc-section-heading h2.gg-type-section-title,
+.tutorial-doc-intro-panel h2.gg-type-page-title {
   color: var(--foreground);
-  font-size: 30px !important;
-  line-height: 1.14 !important;
-  font-weight: 840 !important;
 }
 
-.tutorial-doc-section-heading p.ui-typography,
-.tutorial-doc-intro-panel p.ui-typography {
+.tutorial-doc-section-heading p.gg-type-body,
+.tutorial-doc-intro-panel p.gg-type-body {
   color: var(--muted);
-  font-size: 14px;
-  line-height: 1.75;
 }
 
 .tutorial-doc-intro-panel {
@@ -1680,7 +1969,8 @@ body.skill-distill-fixed .content {
 .tutorial-doc-command-card span,
 .tutorial-doc-link-card strong {
   color: var(--foreground);
-  font-size: 15px;
+  font-size: var(--gg-type-card-title-size);
+  line-height: var(--gg-type-card-title-line);
   font-weight: 820;
 }
 
@@ -1702,14 +1992,15 @@ body.skill-distill-fixed .content {
   border: 1px solid var(--code-border);
   border-radius: 10px;
   background: var(--code-bg);
-  font-size: 12px;
+  font-size: var(--gg-type-code-size, 12px);
+  line-height: var(--gg-type-code-line);
 }
 
 .tutorial-doc-command-card p {
   margin: 0;
   color: var(--muted);
-  font-size: 13px;
-  line-height: 1.55;
+  font-size: var(--gg-type-body-size);
+  line-height: var(--gg-type-body-line);
 }
 
 .tutorial-doc-link-card .product-icon {
@@ -1756,17 +2047,14 @@ body.skill-distill-fixed .content {
   font-weight: 820;
 }
 
-.tutorial-doc-step h3.ui-typography,
-.tutorial-doc-showcase-grid h3.ui-typography {
+.tutorial-doc-step h3.gg-type-card-title,
+.tutorial-doc-showcase-grid h3.gg-type-card-title {
   color: var(--foreground);
-  font-size: 18px !important;
-  font-weight: 820 !important;
 }
 
-.tutorial-doc-step p.ui-typography,
-.tutorial-doc-showcase-grid p.ui-typography {
+.tutorial-doc-step p.gg-type-body,
+.tutorial-doc-showcase-grid p.gg-type-body {
   color: var(--muted);
-  line-height: 1.62;
 }
 
 .tutorial-doc-step > strong {
@@ -1778,8 +2066,8 @@ body.skill-distill-fixed .content {
   border-radius: 14px;
   background: color-mix(in srgb, var(--accent-soft) 42%, var(--surface));
   color: var(--foreground);
-  font-size: 13px;
-  line-height: 1.5;
+  font-size: var(--gg-type-control-size);
+  line-height: var(--gg-type-control-line);
   text-align: center;
 }
 
@@ -1836,22 +2124,24 @@ body.skill-distill-fixed .content {
 
 .tutorial-doc-feature em {
   color: var(--muted);
-  font-size: 12px;
+  font-size: var(--gg-type-meta-size);
+  line-height: var(--gg-type-meta-line);
   font-style: normal;
   font-weight: 780;
 }
 
 .tutorial-doc-feature strong {
   color: var(--foreground);
-  font-size: 20px;
+  font-size: var(--gg-type-card-title-size);
+  line-height: var(--gg-type-card-title-line);
   font-weight: 840;
 }
 
 .tutorial-doc-feature p {
   margin: 0;
   color: var(--muted);
-  font-size: 13px;
-  line-height: 1.65;
+  font-size: var(--gg-type-body-size);
+  line-height: var(--gg-type-body-line);
 }
 
 .tutorial-doc-feature small {
@@ -1883,7 +2173,8 @@ body.skill-distill-fixed .content {
   border-radius: 16px;
   background: color-mix(in srgb, var(--accent-soft) 38%, var(--surface));
   color: var(--foreground);
-  font-size: 13px;
+  font-size: var(--gg-type-control-size);
+  line-height: var(--gg-type-control-line);
   font-weight: 820;
   text-align: center;
 }
@@ -1930,7 +2221,8 @@ body.skill-distill-fixed .content {
 
 .tutorial-doc-architecture strong {
   color: var(--accent);
-  font-size: 14px;
+  font-size: var(--gg-type-body-size);
+  line-height: var(--gg-type-body-line);
   font-weight: 860;
   letter-spacing: 0.04em;
   text-transform: uppercase;
@@ -1939,7 +2231,8 @@ body.skill-distill-fixed .content {
 .tutorial-doc-architecture p {
   margin: 0;
   color: var(--muted);
-  line-height: 1.65;
+  font-size: var(--gg-type-body-size);
+  line-height: var(--gg-type-body-line);
 }
 
 .tutorial-doc-code {
@@ -1948,8 +2241,8 @@ body.skill-distill-fixed .content {
   border: 1px solid var(--code-border);
   border-radius: 16px;
   background: var(--code-bg);
-  font-size: 13px;
-  line-height: 1.8;
+  font-size: var(--gg-type-code-size, 12px);
+  line-height: var(--gg-type-code-line);
   overflow: auto;
 }
 
@@ -1963,7 +2256,8 @@ body.skill-distill-fixed .content {
   place-items: center;
   color: var(--foreground);
   font-weight: 820;
-  line-height: 1.55;
+  font-size: var(--gg-type-body-size);
+  line-height: var(--gg-type-body-line);
   text-align: center;
 }
 
@@ -1985,7 +2279,6 @@ body.skill-distill-fixed .content {
 
 .tutorial-doc-dev-grid span {
   color: var(--muted);
-  font-size: 13px;
   font-weight: 720;
 }
 
@@ -2030,7 +2323,8 @@ body.skill-distill-fixed .content {
 .tutorial-doc-faq p {
   margin: 10px 0 0;
   color: var(--muted);
-  line-height: 1.68;
+  font-size: var(--gg-type-body-size);
+  line-height: var(--gg-type-body-line);
 }
 
 @keyframes tutorial-doc-rise {
@@ -2127,10 +2421,6 @@ body.skill-distill-fixed .content {
     border-radius: 18px;
   }
 
-  .tutorial-doc-hero h1.ui-typography {
-    font-size: 32px !important;
-  }
-
   .tutorial-doc-hero-map {
     padding: 14px;
   }
@@ -2181,10 +2471,6 @@ body.skill-distill-fixed .content {
     grid-template-columns: 1fr;
   }
 
-  .tutorial-doc-section-heading h2.ui-typography,
-  .tutorial-doc-intro-panel h2.ui-typography {
-    font-size: 24px !important;
-  }
 }
 
 .open-platform-preview-media > span:not(.employee-avatar) {
@@ -2350,11 +2636,18 @@ body.skill-distill-fixed .content {
     linear-gradient(135deg, color-mix(in srgb, var(--surface) 92%, transparent), color-mix(in srgb, var(--surface-subtle) 78%, transparent));
 }
 
-.employee-profile-preview .employee-avatar {
+.employee-profile-preview .employee-avatar.employee-profile-preview-avatar {
   width: 92px !important;
   height: 92px !important;
-  border-radius: 26px;
+  overflow: hidden !important;
+  border-radius: var(--gg-radius-avatar-detail) !important;
+  clip-path: inset(0 round var(--gg-radius-avatar-detail));
   font-size: 26px;
+}
+
+.employee-profile-preview .employee-avatar.employee-profile-preview-avatar img {
+  border-radius: var(--gg-radius-avatar-detail) !important;
+  clip-path: inset(0 round var(--gg-radius-avatar-detail));
 }
 
 .employee-profile-preview .ui-typography {
@@ -4693,41 +4986,42 @@ pre {
   }
 }
 
-/* 共格 visual alignment */
+/* 共格 visual alignment: the screenshot-derived blue/cyan language remains the
+   compatibility layer for older page-specific selectors below. */
 :root {
-  --background: #f7f8fa;
-  --foreground: #111111;
-  --surface: #ffffff;
-  --surface-raised: #ffffff;
-  --surface-muted: #f3f4f6;
-  --surface-subtle: #fafafa;
-  --border: #e5e7eb;
-  --border-strong: #d4d4d8;
-  --line: #eceef1;
-  --muted: #6b7280;
-  --muted-soft: #9ca3af;
-  --accent: #111111;
-  --accent-soft: #f2f3f5;
+  --background: var(--gg-cloud);
+  --foreground: var(--gg-ink);
+  --surface: var(--gg-paper);
+  --surface-raised: var(--gg-paper);
+  --surface-muted: var(--gg-state-neutral-soft);
+  --surface-subtle: var(--gg-surface-subtle);
+  --border: var(--gg-border);
+  --border-strong: #c8d2e6;
+  --line: var(--gg-line);
+  --muted: var(--gg-text-secondary);
+  --muted-soft: var(--gg-slate);
+  --accent: var(--gg-interaction);
+  --accent-soft: var(--gg-interaction-soft);
   --accent-foreground: #ffffff;
-  --shadow-float: 0 18px 48px rgba(17, 17, 17, 0.10);
-  --shadow-soft: 0 8px 24px rgba(17, 17, 17, 0.045);
-  --font-body: "Inter", "IBM Plex Sans", "Noto Sans SC", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
+  --shadow-float: var(--gg-shadow-card);
+  --shadow-soft: var(--gg-shadow-card);
+  --font-body: var(--gg-font-ui);
   --font-display: var(--font-body);
   --font-mono: "JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
-  --page-gradient-a: transparent;
-  --page-gradient-top: #f7f8fa;
-  --page-gradient-bottom: #f7f8fa;
-  --panel-bg: rgba(255, 255, 255, 0.94);
+  --page-gradient-a: rgba(49, 87, 232, 0.055);
+  --page-gradient-top: var(--gg-cloud);
+  --page-gradient-bottom: var(--gg-cloud);
+  --panel-bg: color-mix(in srgb, var(--gg-paper) 94%, transparent);
 }
 
 body,
 .app-shell {
-  background: #f7f8fa;
+  background: var(--gg-surface-page);
   letter-spacing: 0;
 }
 
 .app-shell {
-  background: #f7f8fa;
+  background: var(--gg-surface-page);
 }
 
 .sidebar {
@@ -4749,7 +5043,7 @@ body,
 
 .content {
   padding: 18px;
-  background: #f7f8fa;
+  background: var(--gg-surface-page);
 }
 
 .page {
@@ -4857,6 +5151,29 @@ body,
   object-fit: contain;
   object-position: center bottom;
   filter: none;
+}
+
+/*
+ * Resource-card avatar contract: the slot, portrait frame and image must share
+ * one radius. The explicit clip keeps square source assets from exposing sharp
+ * corners when they are rendered inside a rounded card band.
+ */
+.employee-resource-avatar,
+.employee-resource-avatar img,
+.employee-resource-avatar-slot > .employee-avatar,
+.employee-resource-avatar-slot > .employee-avatar img {
+  border-radius: var(--gg-radius-avatar-card) !important;
+}
+
+.employee-resource-avatar,
+.employee-resource-avatar-slot > .employee-avatar {
+  overflow: hidden !important;
+  clip-path: inset(0 round var(--gg-radius-avatar-card));
+}
+
+.employee-resource-avatar img,
+.employee-resource-avatar-slot > .employee-avatar img {
+  clip-path: inset(0 round var(--gg-radius-avatar-card));
 }
 
 /* 共格 icon and layout finish */
@@ -5045,7 +5362,7 @@ body,
   width: 100vw;
   height: 100vh;
   min-height: 0;
-  background: #FCFCFC;
+  background: var(--gg-surface-page);
 }
 
 .gongge-sidebar.is-expanded {
@@ -5345,7 +5662,7 @@ body,
   min-height: 0;
   padding: 0 !important;
   overflow: auto;
-  background: #FCFCFC;
+  background: var(--gg-surface-page);
 }
 
 @media (min-width: 1181px) {
@@ -6621,4 +6938,196 @@ body,
   * {
     @apply border-border outline-ring/50;
   }
+}
+
+/*
+ * Typography contract enforcement.
+ *
+ * A few legacy page selectors still live in this stylesheet for layout
+ * compatibility. They must not silently change the size of an element that
+ * has opted into the shared type scale, so the semantic token wins at the
+ * final cascade boundary. Color utilities remain free to express state and
+ * theme contrast.
+ */
+body .gg-typography-scope {
+  font-size: var(--gg-type-body-size) !important;
+  line-height: var(--gg-type-body-line) !important;
+}
+
+/* Elements without an explicit semantic class inherit from their nearest
+ * typed parent first. Tag defaults below cover newly added markup. */
+body .gg-typography-scope :where(div, span, strong, em, b, i, a, p, li, dd) {
+  font-size: inherit !important;
+  line-height: inherit !important;
+}
+
+body .gg-typography-scope :where(h1) {
+  font-size: var(--gg-type-page-title-size) !important;
+  line-height: var(--gg-type-page-title-line) !important;
+}
+
+body .gg-typography-scope :where(h2) {
+  font-size: var(--gg-type-section-title-size) !important;
+  line-height: var(--gg-type-section-title-line) !important;
+}
+
+body .gg-typography-scope :where(h3) {
+  font-size: var(--gg-type-card-title-size) !important;
+  line-height: var(--gg-type-card-title-line) !important;
+}
+
+body .gg-typography-scope :where(h4) {
+  font-size: var(--gg-type-control-size) !important;
+  line-height: var(--gg-type-control-line) !important;
+}
+
+body .gg-typography-scope :where(h5) {
+  font-size: var(--gg-type-meta-size) !important;
+  line-height: var(--gg-type-meta-line) !important;
+}
+
+body .gg-typography-scope :where(h6) {
+  font-size: var(--gg-type-caption-size) !important;
+  line-height: var(--gg-type-caption-line) !important;
+}
+
+body .gg-typography-scope :where(p, li, dd, td) {
+  font-size: var(--gg-type-body-size) !important;
+  line-height: var(--gg-type-body-line) !important;
+}
+
+body .gg-typography-scope :where(button, input, textarea, select, label, legend, summary, [role="button"]) {
+  font-size: var(--gg-type-control-size) !important;
+  line-height: var(--gg-type-control-line) !important;
+}
+
+body .gg-typography-scope :where(small, dt, th, caption) {
+  font-size: var(--gg-type-meta-size) !important;
+  line-height: var(--gg-type-meta-line) !important;
+}
+
+body .gg-typography-scope :where(code, pre) {
+  font-size: var(--gg-type-code-size) !important;
+  line-height: var(--gg-type-code-line) !important;
+}
+
+body .gg-type-page-title {
+  font-size: var(--gg-type-page-title-size) !important;
+  line-height: var(--gg-type-page-title-line) !important;
+}
+
+body .gg-type-section-title {
+  font-size: var(--gg-type-section-title-size) !important;
+  line-height: var(--gg-type-section-title-line) !important;
+}
+
+body .gg-type-card-title {
+  font-size: var(--gg-type-card-title-size) !important;
+  line-height: var(--gg-type-card-title-line) !important;
+}
+
+body .gg-type-body {
+  font-size: var(--gg-type-body-size) !important;
+  line-height: var(--gg-type-body-line) !important;
+}
+
+body .gg-type-control {
+  font-size: var(--gg-type-control-size) !important;
+  line-height: var(--gg-type-control-line) !important;
+}
+
+body .gg-type-meta {
+  font-size: var(--gg-type-meta-size) !important;
+  line-height: var(--gg-type-meta-line) !important;
+}
+
+body .gg-type-caption {
+  font-size: var(--gg-type-caption-size) !important;
+  line-height: var(--gg-type-caption-line) !important;
+}
+
+body .gg-type-code {
+  font-size: var(--gg-type-code-size) !important;
+  line-height: var(--gg-type-code-line) !important;
+}
+
+body .gg-type-display {
+  font-size: var(--gg-type-display-size) !important;
+  line-height: var(--gg-type-display-line) !important;
+}
+
+body .gg-type-metric {
+  font-size: var(--gg-type-metric-size) !important;
+  line-height: var(--gg-type-metric-line) !important;
+}
+
+body .gg-type-markdown h1 {
+  font-size: var(--gg-type-section-title-size) !important;
+  line-height: var(--gg-type-section-title-line) !important;
+}
+
+body .gg-type-markdown h2 {
+  font-size: var(--gg-type-card-title-size) !important;
+  line-height: var(--gg-type-card-title-line) !important;
+}
+
+body .gg-type-markdown h3 {
+  font-size: var(--gg-type-body-size) !important;
+  line-height: var(--gg-type-body-line) !important;
+}
+
+body .gg-type-markdown h4 {
+  font-size: var(--gg-type-control-size) !important;
+  line-height: var(--gg-type-control-line) !important;
+}
+
+body .gg-type-markdown :is(code, pre) {
+  font-size: var(--gg-type-code-size) !important;
+  line-height: var(--gg-type-code-line) !important;
+}
+
+body .gg-type-citation-markdown > div {
+  font-size: var(--gg-type-control-size) !important;
+  line-height: var(--gg-type-control-line) !important;
+}
+
+body .gg-type-citation-markdown :is(h1, h2) {
+  font-size: var(--gg-type-card-title-size) !important;
+  line-height: var(--gg-type-card-title-line) !important;
+}
+
+body .gg-type-citation-markdown h3 {
+  font-size: var(--gg-type-body-size) !important;
+  line-height: var(--gg-type-body-line) !important;
+}
+
+body .gg-type-citation-markdown h4 {
+  font-size: var(--gg-type-control-size) !important;
+  line-height: var(--gg-type-control-line) !important;
+}
+
+body .gg-type-children-caption :is(span, em) {
+  font-size: var(--gg-type-caption-size) !important;
+  line-height: var(--gg-type-caption-line) !important;
+}
+
+body .gg-type-children-meta :is(span, em),
+body .gg-type-children-meta label > span {
+  font-size: var(--gg-type-meta-size) !important;
+  line-height: var(--gg-type-meta-line) !important;
+}
+
+body .gg-type-children-control :is(strong, p) {
+  font-size: var(--gg-type-control-size) !important;
+  line-height: var(--gg-type-control-line) !important;
+}
+
+body .gg-type-children-body :is(strong, p) {
+  font-size: var(--gg-type-body-size) !important;
+  line-height: var(--gg-type-body-line) !important;
+}
+
+body .gg-type-meta-first-child > span:first-child {
+  font-size: var(--gg-type-meta-size) !important;
+  line-height: var(--gg-type-meta-line) !important;
 }

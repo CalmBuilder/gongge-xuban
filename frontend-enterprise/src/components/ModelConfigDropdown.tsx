@@ -7,7 +7,7 @@ import { MENU_CONTENT_CLASS, MENU_ITEM_CLASS } from '@/lib/enterprise-ui';
 import { cn } from '@/lib/utils';
 
 const DEFAULT_MODEL_BUTTON_CLASS =
-  'h-8 max-w-[220px] gap-1 rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-4 text-[12px] font-normal text-[#757f9c] hover:border-[#cbd3e6]! hover:bg-white! hover:text-[#18181a]! aria-expanded:border-[#cbd3e6]! aria-expanded:bg-white! aria-expanded:text-[#18181a]!';
+  'h-8 max-w-[220px] gap-1 rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-4 gg-type-meta font-normal text-[#757f9c] hover:border-[#cbd3e6]! hover:bg-white! hover:text-[#18181a]! aria-expanded:border-[#cbd3e6]! aria-expanded:bg-white! aria-expanded:text-[#18181a]!';
 
 type ModelConfigDropdownProps = {
   models: ModelConfigRead[];
@@ -57,8 +57,8 @@ export function ModelConfigDropdown({
               onSelect={() => onChange(model.id)}
             >
               <span className="flex min-w-0 flex-1 flex-col">
-                <strong className="truncate text-[13px] text-foreground">{model.name || model.model}</strong>
-                <em className="truncate text-[11px] not-italic text-[#858b9c]">
+                <strong className="truncate gg-type-control text-foreground">{model.name || model.model}</strong>
+                <em className="truncate gg-type-caption not-italic text-[#858b9c]">
                   {model.is_default ? `${model.model} · 默认` : model.model}
                 </em>
               </span>

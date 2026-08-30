@@ -3,6 +3,7 @@ import { useNavigate, useSearchParams } from 'react-router-dom';
 import { Ban, CircleCheck, Copy, Eye, RotateCcw, Upload, Users } from 'lucide-react';
 
 import AppHeader from '@/components/AppHeader';
+import { PageShell } from '@/components/enterprise/PageShell';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { DataTable, type DataTableColumn } from '@/components/DataTable';
 import { Paginator } from '@/components/Paginator';
@@ -369,9 +370,9 @@ export default function SkillsPage({
       <article className={MOBILE_CARD_CLASS} key={row.id}>
         <div className="flex min-w-0 items-start justify-between gap-[10px]">
           <div className="min-w-0">
-            <strong className="block truncate text-[14px] font-semibold text-[#18181a]">{row.name}</strong>
-            <span className="mt-[2px] block truncate text-[12px] text-[#858b9c]">{row.skill_id}</span>
-            <span className="mt-[2px] block truncate text-[12px] text-[#858b9c]">创建者：{resourceCreatorName(row) || '-'}</span>
+            <strong className="block truncate gg-type-body font-semibold text-[#18181a]">{row.name}</strong>
+            <span className="mt-[2px] block truncate gg-type-meta text-[#858b9c]">{row.skill_id}</span>
+            <span className="mt-[2px] block truncate gg-type-meta text-[#858b9c]">创建者：{resourceCreatorName(row) || '-'}</span>
           </div>
           {renderActions(row)}
         </div>
@@ -380,7 +381,7 @@ export default function SkillsPage({
           {renderBranchBadge(row, isOverallAgent)}
           {row.business_domain && <StatusBadge tone="gray">{row.business_domain}</StatusBadge>}
         </div>
-        <div className="mt-[10px] flex items-center justify-between gap-[10px] text-[12px] text-[#858b9c]">
+        <div className="mt-[10px] flex items-center justify-between gap-[10px] gg-type-meta text-[#858b9c]">
           <span>调用 {row.call_count || 0} 次</span>
           <span>
             好评 {percent(row.positive_rate)} · 差评 {percent(row.negative_rate)}
@@ -607,7 +608,7 @@ export default function SkillsPage({
     : '当前员工暂无本地 SOP';
 
   return (
-    <div className="min-h-full box-border px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]" aria-busy={loading}>
+    <PageShell template="management" aria-busy={loading}>
       <AppHeader onLogout={onLogout} userName={currentUser?.username} title="SOP" />
 
       <div className="mt-[20px] mb-[16px] flex items-center justify-end gap-[12px]">
@@ -615,14 +616,14 @@ export default function SkillsPage({
           variant="outline"
           onClick={() => void load()}
           disabled={loading}
-          className="h-[34px] gap-[4px] rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[20px] text-[12px] font-normal text-[#757f9c] hover:border-[#cbd3e6] hover:bg-white hover:text-[#18181a]"
+          className="h-[34px] gap-[4px] rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[20px] gg-type-meta font-normal text-[#757f9c] hover:border-[#cbd3e6] hover:bg-white hover:text-[#18181a]"
         >
           <IconRefresh className={cn('size-[14px]', loading && 'animate-spin')} />
           刷新
         </UIButton>
         {canManageCurrentScope && (
           <DropdownMenu>
-            <DropdownMenuTrigger className="flex h-[34px] items-center gap-[4px] rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-[20px] text-[12px] font-semibold text-white outline-none transition-colors hover:bg-[#244bc7]">
+            <DropdownMenuTrigger className="flex h-[34px] items-center gap-[4px] rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-[20px] gg-type-meta font-semibold text-white outline-none transition-colors hover:bg-[#244bc7]">
               <IconAdd className="size-[14px]" />
               新增
               <IconChevronDown className="size-[12px]" />
@@ -653,7 +654,7 @@ export default function SkillsPage({
         <div className="flex flex-col gap-[18px]">
           <div className="flex items-center gap-[6px] px-[12px] text-[#757f9c]">
             <PlazaResourceIcon kind="skills" size="compact" />
-            <span className="text-[14px] font-normal leading-none">{isOverallAgent ? 'SOP 广场列表' : '本地 SOP'}</span>
+            <span className="gg-type-body font-normal">{isOverallAgent ? 'SOP 广场列表' : '本地 SOP'}</span>
           </div>
 
           <div className="flex flex-wrap items-center gap-[16px]">
@@ -663,7 +664,7 @@ export default function SkillsPage({
                 value={searchText}
                 placeholder="搜索 SOP 名称、ID、业务域"
                 onChange={(event) => setSearchText(event.target.value)}
-                className="h-full min-w-0 flex-1 bg-transparent text-[12px] text-[#17191f] outline-none placeholder:text-[#c0c6d4]"
+                className="h-full min-w-0 flex-1 bg-transparent gg-type-meta text-[#17191f] outline-none placeholder:text-[#c0c6d4]"
               />
               {searchText && (
                 <button
@@ -706,7 +707,7 @@ export default function SkillsPage({
             {filteredRows.length ? (
               pagination.pagedItems.map(renderMobileCard)
             ) : (
-              <div className="py-[40px] text-center text-[13px] text-[#858b9c]">{listEmptyText}</div>
+              <div className="py-[40px] text-center gg-type-control text-[#858b9c]">{listEmptyText}</div>
             )}
           </div>
 
@@ -777,7 +778,7 @@ export default function SkillsPage({
           label: (
             <>
               {item.name}
-              <span className="text-[#858b9c]"> · {item.skill_id}</span>
+              <span className="gg-type-caption text-[#858b9c]"> · {item.skill_id}</span>
             </>
           ),
         }))}
@@ -865,7 +866,7 @@ export default function SkillsPage({
         confirmText="发布"
         onConfirm={() => void confirmPromote()}
       />
-    </div>
+    </PageShell>
   );
 }
 
@@ -889,7 +890,7 @@ function ScopeToggle({ value, onChange }: { value: RankingScope; onChange: (scop
           type="button"
           onClick={() => onChange(scope)}
           className={cn(
-            'rounded-[6px] px-[10px] py-[3px] text-[11px] leading-none transition-colors',
+            'rounded-[6px] px-[10px] py-[3px] gg-type-caption transition-colors',
             value === scope
               ? 'bg-white text-[#18181a] shadow-sm'
               : 'text-[#858b9c] hover:text-[#18181a]',
@@ -922,20 +923,20 @@ function RankingCard({
   return (
     <section className="flex flex-col rounded-[14px] border border-[#eef0f4] bg-white p-[16px]">
       <header className="mb-[8px] flex items-center justify-between gap-[8px]">
-        <span className="text-[13px] font-medium text-[#18181a]">{title}</span>
+        <span className="gg-type-control font-medium text-[#18181a]">{title}</span>
         <div className="flex items-center gap-[8px]">
           {scope && onScopeChange && <ScopeToggle value={scope} onChange={onScopeChange} />}
           <button
             type="button"
             onClick={onMore}
-            className="text-[12px] text-[#1a71ff] transition-colors hover:text-[#4a8dff]"
+            className="gg-type-meta text-[#1a71ff] transition-colors hover:text-[#4a8dff]"
           >
             查看更多
           </button>
         </div>
       </header>
       {rows.length === 0 ? (
-        <div className="py-[28px] text-center text-[12px] text-[#858b9c]">暂无数据</div>
+        <div className="py-[28px] text-center gg-type-meta text-[#858b9c]">暂无数据</div>
       ) : (
         <div className="flex flex-col">
           {rows.map((row) => (
@@ -943,16 +944,16 @@ function RankingCard({
               key={`${title}_${row.skill_id}`}
               className="flex items-center gap-[10px] border-b border-[#f2f3f7] py-[9px] last:border-0"
             >
-              <span className="grid size-[20px] shrink-0 place-items-center rounded-[6px] bg-[#f6f6f6] text-[11px] leading-none text-[#464c5e]">
+              <span className="grid size-[20px] shrink-0 place-items-center rounded-[6px] bg-[#f6f6f6] gg-type-caption text-[#464c5e]">
                 {row.rank}
               </span>
               <div className="min-w-0 flex-1">
-                <div className="truncate text-[12px] text-[#18181a]" title={row.name}>
+                <div className="truncate gg-type-meta text-[#18181a]" title={row.name}>
                   {row.name}
                 </div>
-                {version && <div className="text-[11px] text-[#858b9c]">{version(row)}</div>}
+                {version && <div className="gg-type-caption text-[#858b9c]">{version(row)}</div>}
               </div>
-              <strong className="shrink-0 text-[12px] font-medium text-[#18181a]">{value(row)}</strong>
+              <strong className="shrink-0 gg-type-meta font-medium text-[#18181a]">{value(row)}</strong>
             </div>
           ))}
         </div>
@@ -1024,7 +1025,7 @@ function RankingDialog({
       >
         <div className="flex items-center gap-[6px] px-[12px] text-[#757f9c]">
           <PlazaResourceIcon kind="skills" size="compact" />
-          <DialogTitle className="text-[14px] font-normal leading-none text-[#757f9c]">
+          <DialogTitle className="gg-type-card-title font-normal text-[#757f9c]">
             {rankingTitle(mode, scope)}
           </DialogTitle>
         </div>
@@ -1129,7 +1130,7 @@ function VersionsDialog({
       >
         <div className="flex items-center gap-[6px] px-[12px] text-[#757f9c]">
           <IconHistory className="size-[14px] shrink-0" />
-          <DialogTitle className="min-w-0 truncate text-[14px] font-normal leading-none text-[#757f9c]">
+          <DialogTitle className="min-w-0 truncate gg-type-card-title font-normal text-[#757f9c]">
             版本管理{skill ? `：${skill.name}` : ''}
           </DialogTitle>
         </div>
@@ -1167,7 +1168,7 @@ function VersionDetailDialog({
       >
         <div className="flex items-center gap-[6px] px-[12px] text-[#757f9c]">
           <PlazaResourceIcon kind="skills" size="compact" />
-          <DialogTitle className="min-w-0 truncate text-[14px] font-normal leading-none text-[#757f9c]">
+          <DialogTitle className="min-w-0 truncate gg-type-card-title font-normal text-[#757f9c]">
             {detail ? `版本详情：${detail.name} / ${detail.version}` : '版本详情'}
           </DialogTitle>
         </div>
@@ -1184,7 +1185,7 @@ function VersionDetailDialog({
               <DetailField label="差评率">{percent(detail.negative_rate)}</DetailField>
               <DetailField label="更新时间">{detail.updated_at.slice(0, 10)}</DetailField>
             </div>
-            <pre className="overflow-x-auto rounded-[12px] bg-[#f6f6f6] p-[14px] text-[12px] leading-[1.7] text-[#464c5e] wrap-anywhere whitespace-pre-wrap">
+            <pre className="overflow-x-auto rounded-[12px] bg-[#f6f6f6] p-[14px] gg-type-meta  text-[#464c5e] wrap-anywhere whitespace-pre-wrap">
               {skillSourceText(detail)}
             </pre>
           </div>

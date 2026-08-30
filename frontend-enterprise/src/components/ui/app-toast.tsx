@@ -37,7 +37,7 @@ function ToastPill({ variant, message }: { variant: ToastVariant; message: React
       )}
     >
       <Icon className={cn('size-[16px] shrink-0', icon)} aria-hidden="true" />
-      <span className="text-[14px] leading-[normal] wrap-anywhere">{message}</span>
+      <span className="gg-type-body  wrap-anywhere">{message}</span>
     </div>
   );
 }

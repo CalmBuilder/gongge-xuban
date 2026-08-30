@@ -13,6 +13,7 @@ import IconProfileCalendar from '../../assets/icons/profile-calendar.svg?react';
 import { api, getRequestTenantId } from '../../api/client';
 import type { EnterpriseAuthUser } from '../../auth';
 import AppHeader from '../../components/AppHeader';
+import { PageShell } from '../../components/enterprise/PageShell';
 import EmployeeAvatar from '../../components/EmployeeAvatar';
 import EmployeeAvatarEditor from '../../components/EmployeeAvatarEditor';
 import EmployeeProfileEditor from '../../components/EmployeeProfileEditor';
@@ -235,8 +236,8 @@ export default function DashboardPage({
     return (
       <div className="page dashboard-page">
         <div className="empty-workspace-card p-[24px]">
-          <h3 className="m-0 text-[20px] font-semibold text-foreground">还没有数字员工</h3>
-          <p className="mt-[8px] text-[14px] text-muted-foreground">
+          <h3 className="m-0 gg-type-section-title font-semibold text-foreground">还没有数字员工</h3>
+          <p className="mt-[8px] gg-type-body text-muted-foreground">
             点击左下角「新建数字员工」开始创建，或前往员工广场选择已发布的员工。
           </p>
           <div className="mt-[16px] flex gap-[8px]">
@@ -252,13 +253,13 @@ export default function DashboardPage({
     return (
       <div className="page dashboard-page">
         <div className="page-title">
-          <h3>开放广场</h3>
+          <h3 className="gg-type-page-title">开放广场</h3>
         </div>
         <section className="employee-hero org-hero">
           <div>
-            <span className="section-kicker">开放广场</span>
-            <h2 className="ui-typography">开放广场</h2>
-            <p className="ui-typography">
+            <span className="section-kicker gg-type-caption">开放广场</span>
+            <h2 className="gg-type-section-title">开放广场</h2>
+            <p className="gg-type-body">
               汇集所有可共享的 SOP、知识库、技能和工具，新建数字员工时可以从这里复制配置作为起点。
             </p>
           </div>
@@ -279,8 +280,8 @@ export default function DashboardPage({
           <div className="org-dashboard-card">
             <div className="ui-card-body p-[24px]">
               <span className="org-dashboard-icon"><ProductIcon name="model" /></span>
-              <span className="text-[13px] text-muted-foreground">默认模型</span>
-              <span className="text-[15px] text-foreground">{defaultModel ? `${defaultModel.name} / ${defaultModel.model}` : '未配置'}</span>
+              <span className="gg-type-control text-muted-foreground">默认模型</span>
+              <span className="gg-type-body text-foreground">{defaultModel ? `${defaultModel.name} / ${defaultModel.model}` : '未配置'}</span>
             </div>
           </div>
         </div>
@@ -311,7 +312,7 @@ export default function DashboardPage({
     132,
   );
 
-  const heroActionButtonClass = 'inline-flex items-center justify-center gap-[4px] py-[8px] px-[12px] rounded-[14px] border-[0.5px] border-[#e3e7f1] bg-white text-[12px] font-normal text-[#858b9c] shadow-[0px_6px_6px_rgba(0,0,0,0.05)] hover:bg-[#f6f6f6] hover:text-[#858b9c]';
+  const heroActionButtonClass = 'inline-flex items-center justify-center gap-[4px] py-[8px] px-[12px] rounded-[14px] border-[0.5px] border-[#e3e7f1] bg-white gg-type-meta font-normal text-[#858b9c] shadow-[0px_6px_6px_rgba(0,0,0,0.05)] hover:bg-[#f6f6f6] hover:text-[#858b9c]';
   const heroAvatar = (
     <EmployeeAvatar
       agent={selectedAgent}
@@ -325,7 +326,7 @@ export default function DashboardPage({
   );
 
   return (
-    <div className="min-h-full w-full min-w-0 max-w-full box-border px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]">
+    <PageShell template="dashboard">
       <AppHeader
         onLogout={onLogout}
         userName={currentUser?.username}
@@ -340,7 +341,7 @@ export default function DashboardPage({
                   className="group relative block cursor-pointer border-0 bg-transparent p-0"
                 >
                   {heroAvatar}
-                  <span className="pointer-events-none absolute inset-x-0 bottom-0 flex items-center justify-center gap-1 bg-black/45 py-1 text-[11px] text-white opacity-0 transition-opacity group-hover:opacity-100">
+                  <span className="pointer-events-none absolute inset-x-0 bottom-0 flex items-center justify-center gap-1 bg-black/45 py-1 gg-type-caption text-white opacity-0 transition-opacity group-hover:opacity-100">
                     <IconAccount className="size-3" />
                     更换头像
                   </span>
@@ -372,10 +373,10 @@ export default function DashboardPage({
 
             <div className="flex min-w-[280px] flex-1 flex-col gap-2">
               <div className="flex items-end gap-2">
-                <h2 className="m-0 text-[22px] leading-none font-semibold text-[#18181a]">
+                <h2 className="m-0 gg-type-section-title font-semibold text-[#18181a]">
                   {employeeDisplayName(selectedAgent)}
                 </h2>
-                <span className="text-[13px] leading-none text-[#757f9c]">{employee.roleName || employeeDisplayName(selectedAgent)}</span>
+                <span className="gg-type-control text-[#757f9c]">{employee.roleName || employeeDisplayName(selectedAgent)}</span>
               </div>
 
               <div className="flex flex-wrap items-center gap-4">
@@ -384,18 +385,18 @@ export default function DashboardPage({
                     className="size-1.5 rounded-full ring-[1.5px] ring-white"
                     style={{ background: selectedAgent.status === 'active' ? '#22c55e' : '#c4c9d4' }}
                   />
-                  <span className="text-[12px] text-[#757f9c]">
+                  <span className="gg-type-meta text-[#757f9c]">
                     {selectedAgent.status === 'active' ? '在线' : '下线'}
                   </span>
                 </span>
-                <span className="text-[12px] text-[#757f9c]">创建者：{employeeCreator}</span>
-                <span className="text-[12px] text-[#757f9c]">入职时间：{employee.onboardedAt}</span>
+                <span className="gg-type-meta text-[#757f9c]">创建者：{employeeCreator}</span>
+                <span className="gg-type-meta text-[#757f9c]">入职时间：{employee.onboardedAt}</span>
                 <div className="flex flex-wrap items-center gap-3">
                   {employee.workStyles.slice(0, 3).map((item) => (
                     <Badge
                       key={item}
                       variant="outline"
-                      className="h-auto rounded-[10px] border-[0.5px] border-[#e3e7f1] px-4 py-1 text-[12px] font-normal text-[#757f9c]"
+                      className="h-auto rounded-[10px] border-[0.5px] border-[#e3e7f1] px-4 py-1 gg-type-meta font-normal text-[#757f9c]"
                     >
                       {item}
                     </Badge>
@@ -403,7 +404,7 @@ export default function DashboardPage({
                 </div>
               </div>
 
-              <p className="m-0 line-clamp-2 max-w-[720px] text-[14px] leading-[22px] text-[#757f9c]">
+              <p className="m-0 line-clamp-2 max-w-[720px] gg-type-body  text-[#757f9c]">
                 {systemSummary}
               </p>
 
@@ -450,7 +451,7 @@ export default function DashboardPage({
         onClose={() => setProfileEditorOpen(false)}
         onSaved={(saved) => setAgents((current) => current.map((item) => (item.id === saved.id ? saved : item)))}
       />
-    </div>
+    </PageShell>
   );
 }
 
@@ -459,8 +460,8 @@ function DashboardStat({ title, value, icon }: { title: string; value: number; i
     <div className="org-dashboard-card">
       <div className="ui-card-body p-[24px]">
         <span className="org-dashboard-icon">{icon}</span>
-        <span className="text-[13px] text-muted-foreground">{title}</span>
-        <strong>{value}</strong>
+        <span className="gg-type-control text-muted-foreground">{title}</span>
+        <strong className="gg-type-metric">{value}</strong>
       </div>
     </div>
   );
@@ -482,8 +483,8 @@ function isEmptyDefaultKnowledgeBase(item: KnowledgeBaseRead): boolean {
 function MetricTile({ label, value }: { label: string; value: number }) {
   return (
     <div className="employee-metric-tile">
-      <span>{label}</span>
-      <strong>{value}</strong>
+      <span className="gg-type-meta">{label}</span>
+      <strong className="gg-type-metric">{value}</strong>
     </div>
   );
 }
@@ -521,7 +522,7 @@ function EmployeeProfileTabs({ activeKey = 'work' }: { activeKey?: ProfileTabKey
           <TabsTrigger
             key={key}
             value={key}
-            className="h-[35px] flex-1 gap-[7px] rounded-t-lg rounded-b-none border-0 text-[14px] font-bold text-[#8b94aa] hover:text-[#202226] data-[state=active]:bg-white data-[state=active]:text-[#202226] data-[state=active]:shadow-[0_-12px_28px_rgba(21,26,38,0.04)] in-data-[theme=dark]:text-[#8f98aa] in-data-[theme=dark]:hover:text-[#f0f2f6] in-data-[theme=dark]:data-[state=active]:bg-[#202126] in-data-[theme=dark]:data-[state=active]:text-[#c5ccd8] in-data-[theme=dark]:data-[state=active]:shadow-none"
+            className="h-[35px] flex-1 gap-[7px] rounded-t-lg rounded-b-none border-0 gg-type-body font-bold text-[#8b94aa] hover:text-[#202226] data-[state=active]:bg-white data-[state=active]:text-[#202226] data-[state=active]:shadow-[0_-12px_28px_rgba(21,26,38,0.04)] in-data-[theme=dark]:text-[#8f98aa] in-data-[theme=dark]:hover:text-[#f0f2f6] in-data-[theme=dark]:data-[state=active]:bg-[#202126] in-data-[theme=dark]:data-[state=active]:text-[#c5ccd8] in-data-[theme=dark]:data-[state=active]:shadow-none"
           >
             <Icon />
             {label}
@@ -535,8 +536,8 @@ function EmployeeProfileTabs({ activeKey = 'work' }: { activeKey?: ProfileTabKey
 function HeroMetric({ label, value }: { label: string; value: number }) {
   return (
     <div className="flex flex-1 items-end gap-1 rounded-[10px] bg-[#f6f6f6] px-5 py-2">
-      <strong className="text-[14px] leading-none font-medium text-[#18181a]">{value}</strong>
-      <span className="text-[12px] leading-none text-[#464c5e]">{label}</span>
+      <strong className="gg-type-body font-medium text-[#18181a]">{value}</strong>
+      <span className="gg-type-meta text-[#464c5e]">{label}</span>
     </div>
   );
 }

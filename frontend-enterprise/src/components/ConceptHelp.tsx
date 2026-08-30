@@ -196,7 +196,7 @@ export function ConceptHelp({
           aria-label={`了解${concept.label}`}
           className={cn(
             triggerLabel
-              ? 'inline-flex min-h-[28px] shrink-0 items-center gap-[5px] rounded-full border border-[#dbe3f4] bg-white px-[9px] text-[10px] font-medium text-[#657394] outline-none transition-colors hover:border-[#bdcaec] hover:text-[var(--gg-cobalt)] focus-visible:ring-2 focus-visible:ring-[var(--gg-cobalt)] focus-visible:ring-offset-2'
+              ? 'inline-flex min-h-[28px] shrink-0 items-center gap-[5px] rounded-full border border-[#dbe3f4] bg-white px-[9px] gg-type-caption font-medium text-[#657394] outline-none transition-colors hover:border-[#bdcaec] hover:text-[var(--gg-cobalt)] focus-visible:ring-2 focus-visible:ring-[var(--gg-cobalt)] focus-visible:ring-offset-2'
               : 'inline-grid size-[20px] shrink-0 place-items-center rounded-full text-[#8190b1] outline-none transition-colors hover:bg-[#edf2ff] hover:text-[var(--gg-cobalt)] focus-visible:ring-2 focus-visible:ring-[var(--gg-cobalt)] focus-visible:ring-offset-2',
             className,
           )}
@@ -212,13 +212,13 @@ export function ConceptHelp({
         className="max-h-[min(78vh,760px)] w-[min(620px,calc(100vw-24px))] overflow-y-auto overscroll-contain rounded-[18px] border-[#dfe5f2] bg-white p-[20px] shadow-[0_18px_50px_rgba(35,55,100,0.18)]"
       >
         <PopoverHeader className="gap-[5px] text-left">
-          <span className="font-mono text-[9px] font-semibold uppercase tracking-[0.16em] text-[#6074a9]">
+          <span className="font-mono gg-type-caption font-semibold uppercase tracking-[0.16em] text-[#6074a9]">
             概念说明
           </span>
-          <PopoverTitle className="text-[18px] font-semibold leading-[26px] text-[#202637]">
+          <PopoverTitle className="gg-type-section-title font-semibold  text-[#202637]">
             {concept.title}
           </PopoverTitle>
-          <PopoverDescription className="max-w-[560px] text-[13px] leading-[21px] text-[#6f788d]">
+          <PopoverDescription className="max-w-[560px] gg-type-control  text-[#6f788d]">
             {concept.summary}
           </PopoverDescription>
         </PopoverHeader>
@@ -228,8 +228,8 @@ export function ConceptHelp({
               key={fact.term}
               className="rounded-[11px] bg-[#f7f9fd] px-[12px] py-[10px]"
             >
-              <dt className="text-[11px] font-semibold text-[#43547c]">{fact.term}</dt>
-              <dd className="mt-[3px] text-[11px] leading-[18px] text-[#6f788d]">{fact.description}</dd>
+              <dt className="gg-type-caption font-semibold text-[#43547c]">{fact.term}</dt>
+              <dd className="mt-[3px] gg-type-caption  text-[#6f788d]">{fact.description}</dd>
             </div>
           ))}
         </dl>
@@ -237,19 +237,19 @@ export function ConceptHelp({
           <div className="mt-[14px] grid gap-[8px] sm:grid-cols-2">
             {concept.details.map((detail) => (
               <section key={detail.title} className="rounded-[11px] border border-[#e4e9f3] px-[12px] py-[10px]">
-                <h3 className="text-[11px] font-semibold text-[#3d4b6b]">{detail.title}</h3>
-                <p className="mt-[3px] text-[11px] leading-[18px] text-[#6f788d]">{detail.description}</p>
+                <h3 className="gg-type-card-title font-semibold text-[#3d4b6b]">{detail.title}</h3>
+                <p className="mt-[3px] gg-type-caption  text-[#6f788d]">{detail.description}</p>
               </section>
             ))}
           </div>
         )}
         {concept.example && (
           <section className="mt-[14px] rounded-[12px] border border-[#dce5f7] bg-[#fbfcff] p-[13px]">
-            <h3 className="text-[11px] font-semibold text-[#3d4b6b]">{concept.example.title}</h3>
+            <h3 className="gg-type-card-title font-semibold text-[#3d4b6b]">{concept.example.title}</h3>
             <ol className="mt-[8px] grid gap-[6px]">
               {concept.example.steps.map((step, index) => (
-                <li key={step} className="flex gap-[8px] text-[11px] leading-[18px] text-[#657087]">
-                  <span className="grid size-[18px] shrink-0 place-items-center rounded-full bg-[#e9efff] font-mono text-[9px] font-semibold text-[#4e68b4]">
+                <li key={step} className="flex gap-[8px] gg-type-caption  text-[#657087]">
+                  <span className="grid size-[18px] shrink-0 place-items-center rounded-full bg-[#e9efff] font-mono gg-type-caption font-semibold text-[#4e68b4]">
                     {index + 1}
                   </span>
                   <span>{step}</span>
@@ -260,14 +260,14 @@ export function ConceptHelp({
         )}
         {concept.flow && (
           <section className="mt-[14px] rounded-[12px] border border-[#dce5f7] bg-[#fbfcff] p-[13px]">
-            <h3 className="text-[11px] font-semibold text-[#3d4b6b]">演进路径</h3>
+            <h3 className="gg-type-card-title font-semibold text-[#3d4b6b]">演进路径</h3>
             <ol className="mt-[9px] grid gap-[5px]">
               {concept.flow.map((step, index) => (
                 <li key={step} className="relative flex items-center gap-[9px] pb-[5px] last:pb-0">
-                  <span className="grid size-[20px] shrink-0 place-items-center rounded-full border border-[#b9c8ee] bg-white font-mono text-[9px] font-semibold text-[#4e68b4]">
+                  <span className="grid size-[20px] shrink-0 place-items-center rounded-full border border-[#b9c8ee] bg-white font-mono gg-type-caption font-semibold text-[#4e68b4]">
                     {index + 1}
                   </span>
-                  <span className="rounded-[8px] bg-[#eef3ff] px-[9px] py-[5px] text-[11px] font-medium text-[#506084]">
+                  <span className="rounded-[8px] bg-[#eef3ff] px-[9px] py-[5px] gg-type-caption font-medium text-[#506084]">
                     {step}
                   </span>
                 </li>
@@ -278,13 +278,13 @@ export function ConceptHelp({
         {concept.technicalFacts && (
           <ul className="mt-[12px] grid gap-[5px] rounded-[11px] bg-[#f4f6fa] px-[12px] py-[10px]">
             {concept.technicalFacts.map((fact) => (
-              <li key={fact} className="font-mono text-[10px] leading-[17px] text-[#64708a]">
+              <li key={fact} className="font-mono gg-type-caption  text-[#64708a]">
                 · {fact}
               </li>
             ))}
           </ul>
         )}
-        <p className="mt-[12px] border-l-2 border-[#9cb0ee] pl-[10px] text-[11px] leading-[18px] text-[#58647f]">
+        <p className="mt-[12px] border-l-2 border-[#9cb0ee] pl-[10px] gg-type-caption  text-[#58647f]">
           {concept.boundary}
         </p>
       </PopoverContent>
@@ -304,7 +304,7 @@ export function ConceptNote({
   return (
     <div
       className={cn(
-        'flex items-center gap-[7px] rounded-[11px] border border-[#e1e7f3] bg-[#f8faff] px-[11px] py-[8px] text-[11px] leading-[17px] text-[#64708a]',
+        'flex items-center gap-[7px] rounded-[11px] border border-[#e1e7f3] bg-[#f8faff] px-[11px] py-[8px] gg-type-caption  text-[#64708a]',
         className,
       )}
     >

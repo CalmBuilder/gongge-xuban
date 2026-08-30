@@ -18,7 +18,24 @@ describe('Gongge design tokens', () => {
   });
 
   it('defines the shared control radius and reduced-motion fallback', () => {
-    expect(styles).toContain('--gg-radius-control: 12px');
+    expect(styles).toContain('--gg-radius-control: 8px');
+    expect(styles).toContain('--gg-interaction: var(--gg-cobalt)');
+    expect(styles).toContain('--gg-text-secondary: #526B86');
     expect(styles).toContain('@media (prefers-reduced-motion: reduce)');
+  });
+
+  it('locks the shared type scale and page grid contracts', () => {
+    expect(styles).toContain('--gg-type-card-title-size: 16px');
+    expect(styles).toContain('--gg-type-body-line: 22px');
+    expect(styles).toContain('--gg-type-control-size: 13px');
+    expect(styles).toContain('--gg-resource-card-min-width: 264px');
+    expect(styles).toContain('--gg-resource-card-min-height: 288px');
+    expect(styles).toContain('--gg-layout-gap: 16px');
+    expect(styles).toContain('.gg-resource-grid');
+    expect(styles).toContain('.gg-metric-grid');
+    expect(styles).toContain('.gg-info-grid');
+    expect(styles).toContain('--gg-sidebar-lower-top-gap: 36px');
+    expect(styles).toContain('--gg-sidebar-lower-bottom-gap: 24px');
+    expect(styles).toContain('--gg-sidebar-primary-item-gap: 6px');
   });
 });

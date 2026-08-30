@@ -17,6 +17,7 @@ import {
 import { useNavigate } from 'react-router-dom';
 
 import AppHeader from '@/components/AppHeader';
+import { PageShell } from '@/components/enterprise/PageShell';
 import {
   Dialog,
   DialogContent,
@@ -166,7 +167,7 @@ function HorizontalRelation({
 }) {
   return (
     <div className="flex min-w-0 flex-col items-center justify-center gap-[4px] text-center">
-      <span className="text-[11px] font-medium leading-[16px] text-[#7b86a3]">{label}</span>
+      <span className="gg-type-caption font-medium text-[var(--gg-text-muted)]">{label}</span>
       <span className="flex w-full items-center text-[#8ba1da]">
         <i className={`h-px min-w-0 flex-1 ${conditional ? 'border-t border-dashed border-[#aebddd]' : 'bg-[#c9d4ed]'}`} aria-hidden="true" />
         <ArrowRight className={`size-[15px] shrink-0 ${reverse ? 'rotate-180' : ''}`} aria-hidden="true" />
@@ -178,7 +179,7 @@ function HorizontalRelation({
 function VerticalRelation({ label, conditional = false }: { label: string; conditional?: boolean }) {
   return (
     <div className="flex min-h-[58px] flex-col items-center justify-center gap-[4px] text-center">
-      <span className="text-[11px] font-medium leading-[16px] text-[#7b86a3]">{label}</span>
+      <span className="gg-type-caption font-medium text-[var(--gg-text-muted)]">{label}</span>
       <span className="flex flex-col items-center text-[#8ba1da]">
         <i className={`h-[20px] w-px ${conditional ? 'border-l border-dashed border-[#aebddd]' : 'bg-[#c9d4ed]'}`} aria-hidden="true" />
         <ArrowRight className="size-[15px] rotate-90" aria-hidden="true" />
@@ -264,11 +265,11 @@ function TopologyNode({
           {icon}
         </span>
         <div className="min-w-0">
-          <p className="text-[12px] font-medium opacity-75">{TOPOLOGY_NODE_LABEL[kind]}</p>
-          <h3 className="mt-[2px] line-clamp-2 text-[15px] font-semibold leading-[20px] text-[#202638]">{title}</h3>
+          <p className="gg-type-meta opacity-75">{TOPOLOGY_NODE_LABEL[kind]}</p>
+          <h3 className="gg-type-card-title mt-[2px] line-clamp-2">{title}</h3>
         </div>
       </div>
-      <p className="mt-[9px] line-clamp-2 text-[12px] leading-[19px] text-[#667087]">{subtitle}</p>
+      <p className="gg-type-meta mt-[9px] line-clamp-2">{subtitle}</p>
     </article>
   );
 }
@@ -314,11 +315,11 @@ function ResponsibilityTopology({
           <TopologyNode kind="sop" title={data.sop.title} subtitle={data.sop.subtitle} icon={<ClipboardCheck className="size-[18px]" />} />
         </div>
       </div>
-      <div className="mt-[9px] grid gap-[7px] text-[11px] leading-[17px] text-[#63708b] md:grid-cols-2 xl:grid-cols-4">
+      <div className="mt-[9px] grid gap-[7px] md:grid-cols-2 xl:grid-cols-4">
         {TOPOLOGY_RELATION_CONTRACTS.map((contract) => (
           <span
             key={contract}
-            className={`rounded-[9px] border px-[9px] py-[7px] font-mono ${relationVerified(contract) ? 'border-[#d8ebe4] bg-[#f4fbf8] text-[#347a66]' : 'border-[#e5e9f2] bg-[#fbfcff] text-[#7a8499]'}`}
+            className={`gg-type-control flex min-w-0 items-center break-words rounded-[var(--gg-radius-control)] border px-[10px] py-[7px] ${relationVerified(contract) ? 'border-[var(--gg-capability-line)] bg-[var(--gg-capability-soft)] text-[var(--gg-capability)]' : 'border-[var(--gg-line)] bg-[var(--gg-surface-subtle)] text-[var(--gg-text-secondary)]'}`}
             data-topology-relation={contract}
             data-relation-status={relationVerified(contract) ? 'verified' : 'missing'}
           >
@@ -360,11 +361,11 @@ function WorkflowStep({
         <span className="grid size-[32px] shrink-0 place-items-center rounded-[10px] bg-white shadow-[0_5px_14px_rgba(43,62,110,0.08)]">
           {icon}
         </span>
-        <span className="font-mono text-[11px] font-semibold opacity-55">0{index}</span>
+        <span className="gg-type-code font-semibold opacity-55">0{index}</span>
       </div>
-      <p className="mt-[10px] text-[11px] font-semibold uppercase tracking-[0.08em] opacity-70">{eyebrow}</p>
-      <h4 className="mt-[3px] line-clamp-2 text-[14px] font-semibold leading-[20px] text-[#252b3a]">{title}</h4>
-      <p className="mt-[5px] line-clamp-3 text-[11px] leading-[18px] text-[#697287]">{description}</p>
+      <p className="gg-type-caption mt-[10px] font-semibold uppercase tracking-[0.08em] opacity-70">{eyebrow}</p>
+      <h4 className="gg-type-card-title mt-[3px] line-clamp-2">{title}</h4>
+      <p className="gg-type-meta mt-[5px] line-clamp-3">{description}</p>
     </article>
   );
 }
@@ -388,9 +389,9 @@ function EnterpriseCollaborationMap({
       <div className="border-b border-[#e8edf7] bg-[linear-gradient(135deg,#f3f7ff_0%,#fbfdff_58%,#f6fbfa_100%)] px-[24px] py-[20px]">
         <div className="flex items-start justify-between gap-[18px]">
           <div>
-            <p className="font-mono text-[12px] font-semibold uppercase tracking-[0.14em] text-[#6074a9]">COLLABORATION MAP</p>
-            <h2 className="mt-[6px] text-[20px] font-semibold tracking-[-0.02em] text-[#18181a]">组织、真人与数字员工如何关联</h2>
-            <p className="mt-[5px] text-[14px] leading-[22px] text-[#70798e]">上半部分解释代码中的关系模型，下半部分只展示当前系统确实存在的数据。</p>
+            <p className="font-mono gg-type-meta font-semibold uppercase tracking-[0.14em] text-[#6074a9]">COLLABORATION MAP</p>
+            <h2 className="gg-type-section-title mt-[6px]">组织、真人与数字员工如何关联</h2>
+            <p className="gg-type-body mt-[5px]">上半部分解释代码中的关系模型，下半部分只展示当前系统确实存在的数据。</p>
           </div>
           <span className="grid size-[42px] shrink-0 place-items-center rounded-[14px] bg-white text-[#3157e8] shadow-[0_8px_20px_rgba(49,87,232,0.12)]">
             <Network className="size-[21px]" />
@@ -401,10 +402,10 @@ function EnterpriseCollaborationMap({
       <div className="p-[22px]">
         <div className="flex items-center justify-between gap-[12px]">
           <div>
-            <p className="font-mono text-[11px] font-semibold uppercase tracking-[0.13em] text-[#6074a9]">SYSTEM RELATION MODEL</p>
-            <h3 className="mt-[3px] text-[16px] font-semibold text-[#242a3a]">系统关系模型</h3>
+            <p className="font-mono gg-type-caption font-semibold uppercase tracking-[0.13em] text-[#6074a9]">SYSTEM RELATION MODEL</p>
+            <h3 className="gg-type-card-title mt-[3px]">系统关系模型</h3>
           </div>
-          <span className="rounded-full border border-[#dce4f3] bg-[#f8faff] px-[10px] py-[5px] text-[11px] text-[#677694]">结构说明，不代表当前已绑定</span>
+          <span className="gg-type-caption rounded-full border border-[#dce4f3] bg-[#f8faff] px-[10px] py-[5px]">结构说明，不代表当前已绑定</span>
         </div>
 
         <div className="mt-[11px] rounded-[18px] border border-[#e7ebf3] bg-[#fafbfe] p-[12px]" data-topology-model>
@@ -420,7 +421,7 @@ function EnterpriseCollaborationMap({
               sop: { title: 'SOP / 技能', subtitle: '通过 AgentResourceBinding 装载，定义人机协作节点' },
             }}
           />
-          <div className="mt-[9px] flex flex-wrap items-center gap-x-[18px] gap-y-[6px] rounded-[11px] border border-[#e5e9f2] bg-white px-[11px] py-[8px] text-[11px] text-[#68738a]">
+          <div className="gg-type-caption mt-[9px] flex flex-wrap items-center gap-x-[18px] gap-y-[6px] rounded-[11px] border border-[#e5e9f2] bg-white px-[11px] py-[8px]">
             <span className="flex items-center gap-[7px]"><i className="h-px w-[28px] bg-[#9fb0d5]" />实线：核心关系</span>
             <span className="flex items-center gap-[7px]"><i className="w-[28px] border-t border-dashed border-[#9fb0d5]" />虚线：能力分身等满足条件后成立</span>
             <span>上图与下图共用 8 条关系契约；下图只替换节点内容，不改变关系含义。</span>
@@ -429,10 +430,10 @@ function EnterpriseCollaborationMap({
 
         <div className="mt-[15px] flex items-end justify-between gap-[12px] border-t border-[#e8ecf4] pt-[14px]">
           <div>
-            <p className="font-mono text-[11px] font-semibold uppercase tracking-[0.13em] text-[#34846d]">LIVE DATA EXAMPLE</p>
-            <h3 className="mt-[3px] text-[16px] font-semibold text-[#242a3a]">当前系统真实示例</h3>
+            <p className="font-mono gg-type-caption font-semibold uppercase tracking-[0.13em] text-[#34846d]">LIVE DATA EXAMPLE</p>
+            <h3 className="gg-type-card-title mt-[3px]">当前系统真实示例</h3>
           </div>
-          <span className="rounded-full border border-[#d7ece5] bg-[#f4fbf8] px-[10px] py-[5px] text-[11px] text-[#34846d]">来自当前数据库</span>
+          <span className="gg-type-caption rounded-full border border-[#d7ece5] bg-[#f4fbf8] px-[10px] py-[5px] text-[#34846d]">来自当前数据库</span>
         </div>
 
         {selectedExample ? (
@@ -447,7 +448,7 @@ function EnterpriseCollaborationMap({
                   role="tab"
                   aria-selected={selected}
                   onClick={() => setSelectedScenario(item.scenarioName)}
-                  className={`shrink-0 rounded-full border px-[13px] py-[7px] text-[12px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#8da8f4] ${selected ? 'border-[#3157e8] bg-[#3157e8] text-white' : 'border-[#dfe5ef] bg-white text-[#667087] hover:border-[#b9c7e8] hover:text-[#3157e8]'}`}
+                  className={`gg-type-control shrink-0 rounded-full border px-[13px] py-[7px] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#8da8f4] ${selected ? 'border-[#3157e8] bg-[#3157e8] text-white' : 'border-[#dfe5ef] bg-white text-[#667087] hover:border-[#b9c7e8] hover:text-[#3157e8]'}`}
                 >
                   {item.scenarioName}
                 </button>
@@ -455,7 +456,7 @@ function EnterpriseCollaborationMap({
             })}
           </div>
           <div className="mt-[11px] rounded-[18px] border border-[#dce9e5] bg-[#f7fbf9] p-[14px]" data-topology-example="live">
-            <div className="mb-[9px] flex items-center gap-[7px] text-[11px] font-medium text-[#34846d]">
+            <div className="gg-type-caption mb-[9px] flex items-center gap-[7px] font-medium text-[#34846d]">
               <span className="rounded-full bg-[#e8f7f1] px-[7px] py-[3px]">{selectedExample.scenarioName}</span>
               <span>SOP 演示种子中的有效绑定</span>
             </div>
@@ -482,10 +483,10 @@ function EnterpriseCollaborationMap({
 
             <div className="mt-[10px] flex items-center justify-between gap-[12px]">
               <div>
-                <p className="font-mono text-[11px] font-semibold uppercase tracking-[0.12em] text-[#6074a9]">SOP COLLABORATION LOOP</p>
-                <h4 className="mt-[2px] text-[14px] font-semibold text-[#293044]">一次业务如何在人与数字员工之间闭环</h4>
+                <p className="font-mono gg-type-caption font-semibold uppercase tracking-[0.12em] text-[#6074a9]">SOP COLLABORATION LOOP</p>
+                <h4 className="gg-type-card-title mt-[2px]">一次业务如何在人与数字员工之间闭环</h4>
               </div>
-              <span className="rounded-full border border-[#e0e5ee] bg-white px-[9px] py-[5px] text-[11px] text-[#758097]">运行时协作</span>
+              <span className="gg-type-caption rounded-full border border-[#e0e5ee] bg-white px-[9px] py-[5px]">运行时协作</span>
             </div>
 
             <div className="mt-[8px] grid gap-[7px] md:grid-cols-4" data-sop-loop>
@@ -505,33 +506,33 @@ function EnterpriseCollaborationMap({
               />
               <WorkflowStep index={4} eyebrow="流程返回" title="SOP 继续并形成结果" description={selectedExample.outcome} tone="result" icon={<CheckCircle2 className="size-[17px]" />} />
             </div>
-            <div className="mt-[7px] flex items-center justify-center gap-[8px] rounded-[10px] border border-dashed border-[#cfd9ec] bg-white/70 px-[11px] py-[8px] text-[11px] font-medium text-[#6074a9]" data-loop-return>
+            <div className="gg-type-caption mt-[7px] flex items-center justify-center gap-[8px] rounded-[10px] border border-dashed border-[#cfd9ec] bg-white/70 px-[11px] py-[8px] font-medium text-[#6074a9]" data-loop-return>
               <RotateCcw className="size-[13px]" />
               处理结果与审计轨迹返回发起人，下一次业务仍从真人请求开始
             </div>
 
             <div className="mt-[9px] grid gap-[8px] md:grid-cols-2">
-              <div className="flex items-center gap-[9px] rounded-[12px] border border-[#e2e8f1] bg-white px-[12px] py-[10px] text-[12px] text-[#606a7e]">
+              <div className="gg-type-meta flex items-center gap-[9px] rounded-[12px] border border-[#e2e8f1] bg-white px-[12px] py-[10px]">
                 <UserRound className="size-[15px] shrink-0 text-[#6074a9]" />
                 {selectedExample.supervisorName ? `治理监督人：“${selectedExample.supervisorName}”` : '该数字员工未配置治理监督人'}
               </div>
-              <div className="flex items-center gap-[9px] rounded-[12px] border border-[#e2e8f1] bg-white px-[12px] py-[10px] text-[12px] text-[#606a7e]">
+              <div className="gg-type-meta flex items-center gap-[9px] rounded-[12px] border border-[#e2e8f1] bg-white px-[12px] py-[10px]">
                 <BriefcaseBusiness className="size-[15px] shrink-0 text-[#6074a9]" />
                 {selectedExample.positionName
                   ? `责任组织包含岗位：“${selectedExample.positionName}”；${selectedExample.positionAssignedToHuman ? '真人任职已验证' : '真人任职待配置'}`
                   : '责任组织没有与执行角色匹配的岗位；未强行连线'}
               </div>
             </div>
-            <p className="mt-[9px] text-[11px] leading-[18px] text-[#778198]">监督人负责数字员工治理，SOP 审批人或复核人来自员工角色任职；两者可能是同一人，也可能不是同一人。</p>
+            <p className="gg-type-meta mt-[9px]">监督人负责数字员工治理，SOP 审批人或复核人来自员工角色任职；两者可能是同一人，也可能不是同一人。</p>
           </div>
           </>
         ) : (
-          <div className="mt-[11px] rounded-[16px] border border-dashed border-[#dfe5ef] px-[16px] py-[22px] text-center text-[12px] text-[#7b8497]" data-topology-example="empty">
+          <div className="gg-type-meta mt-[11px] rounded-[16px] border border-dashed border-[#dfe5ef] px-[16px] py-[22px] text-center" data-topology-example="empty">
             当前权限范围内没有同时具备责任组织和角色绑定的数字员工，暂不生成示例。
           </div>
         )}
 
-        <div className="mt-[10px] flex items-start gap-[9px] rounded-[12px] border border-[#e5def3] bg-[#fbf8ff] px-[13px] py-[10px] text-[12px] leading-[19px] text-[#735895]">
+        <div className="gg-type-meta mt-[10px] flex items-start gap-[9px] rounded-[12px] border border-[#e5def3] bg-[#fbf8ff] px-[13px] py-[10px] text-[#735895]">
           <Sparkles className="mt-[1px] size-[14px] shrink-0" />
           能力分身说明：专家与数字员工都使用 AgentProfile。只有创建个人版本并形成 owner/source 关系后，才称为用户的能力分身；当前数据库没有可用于本图的来源绑定实例，因此这里只展示模型，不伪造名称。
         </div>
@@ -772,14 +773,14 @@ export default function EnterpriseInfoPage({
   }
 
   return (
-    <div data-enterprise-info-page className="min-h-full box-border px-[48px] pb-[43px] pt-[32px] max-[900px]:px-[16px]">
+    <PageShell template="management" data-enterprise-info-page>
       <AppHeader
         onLogout={onLogout}
         userName={currentUser?.username}
         left={(
           <div className="flex min-h-[44px] flex-col justify-center gap-[5px]">
-            <h1 className="text-[18px] font-semibold leading-[22px] text-[var(--gg-ink)]">企业与组织</h1>
-            <p className="text-[14px] leading-[20px] text-[var(--gg-slate)]">管理租户边界与企业组织节点，理解真人、数字员工和能力分身如何协作。</p>
+            <h1 className="gg-type-page-title">企业与组织</h1>
+            <p className="gg-type-body">管理租户边界与企业组织节点，理解真人、数字员工和能力分身如何协作。</p>
           </div>
         )}
       />
@@ -792,25 +793,25 @@ export default function EnterpriseInfoPage({
               <span className="grid size-[44px] place-items-center rounded-[14px] bg-white/14 shadow-[0_10px_24px_rgba(17,35,92,0.18)] ring-1 ring-white/20">
                 <Building2 className="size-[22px]" />
               </span>
-              <span className="rounded-full bg-white/12 px-[11px] py-[6px] font-mono text-[12px] tracking-[0.05em] text-white/85 ring-1 ring-white/20">TENANT BOUNDARY</span>
+              <span className="rounded-full bg-white/12 px-[11px] py-[6px] font-mono gg-type-meta tracking-[0.05em] text-white/85 ring-1 ring-white/20">TENANT BOUNDARY</span>
             </div>
-            <h2 className="mt-[18px] line-clamp-2 text-[22px] font-semibold tracking-[-0.02em]">{name}</h2>
-            <p className="mt-[6px] text-[13px] leading-[21px] text-white/76">租户是数据与认证边界；企业、事业部、部门和项目组统一建模为组织单元。</p>
+            <h2 className="gg-type-section-title gg-type-section-title--inverse mt-[18px] line-clamp-2">{name}</h2>
+            <p className="gg-type-control mt-[6px] text-white/76">租户是数据与认证边界；企业、事业部、部门和项目组统一建模为组织单元。</p>
           </div>
 
           <div className="grid gap-[16px] p-[22px]">
-            <label className="grid gap-[7px] text-[13px] font-medium text-[#646b7d]">
+            <label className="gg-type-control grid gap-[7px] text-[var(--gg-text-secondary)]">
               企业显示名称
               <Input value={name} disabled={!canEdit} onChange={(event) => setName(event.target.value)} />
             </label>
-            <label className="grid gap-[7px] text-[13px] font-medium text-[#646b7d]">
+            <label className="gg-type-control grid gap-[7px] text-[var(--gg-text-secondary)]">
               稳定租户编码
-              <span className="flex h-[42px] items-center gap-[8px] rounded-[10px] border border-[#e3e7f1] bg-[#f7f8fb] px-[12px] font-mono text-[14px] text-[#596174]">
+              <span className="gg-type-code flex h-[42px] items-center gap-[8px] rounded-[10px] border border-[#e3e7f1] bg-[#f7f8fb] px-[12px] text-[var(--gg-text-secondary)]">
                 <LockKeyhole className="size-[14px]" />
                 {tenant.id}
               </span>
             </label>
-            <div className="flex items-start gap-[9px] rounded-[12px] border border-[#dce5ff] bg-[#f5f8ff] px-[13px] py-[11px] text-[13px] leading-[21px] text-[#596b9d]">
+            <div className="gg-type-control flex items-start gap-[9px] rounded-[12px] border border-[#dce5ff] bg-[#f5f8ff] px-[13px] py-[11px] text-[#596b9d]">
               <ShieldCheck className="mt-[1px] size-[14px] shrink-0" />
               租户编码不可修改；新增企业会创建 company 类型组织单元，不会产生新的租户边界。
             </div>
@@ -821,7 +822,7 @@ export default function EnterpriseInfoPage({
                 </Button>
               </div>
             ) : (
-              <p className="text-[13px] text-[#858b9c]">普通成员可查看企业信息，仅管理员可以修改显示名称。</p>
+              <p className="gg-type-control text-[var(--gg-text-muted)]">普通成员可查看企业信息，仅管理员可以修改显示名称。</p>
             )}
           </div>
         </section>
@@ -829,9 +830,9 @@ export default function EnterpriseInfoPage({
         <section data-organization-panel className="min-w-0 overflow-hidden rounded-[22px] border border-[#e1e6f1] bg-white p-[18px] shadow-[0_14px_38px_rgba(30,48,91,0.05)]">
           <div className="flex items-start justify-between gap-[12px]">
             <div>
-              <p className="font-mono text-[11px] font-semibold uppercase tracking-[0.13em] text-[#6074a9]">ORGANIZATION UNITS</p>
-              <h2 className="mt-[4px] text-[18px] font-semibold tracking-[-0.02em] text-[#18181a]">企业组织单元</h2>
-              <p className="mt-[4px] text-[12px] leading-[19px] text-[#747d91]">企业和项目组都进入同一棵组织树。</p>
+              <p className="font-mono gg-type-caption font-semibold uppercase tracking-[0.13em] text-[#6074a9]">ORGANIZATION UNITS</p>
+              <h2 className="gg-type-section-title mt-[4px]">企业组织单元</h2>
+              <p className="gg-type-meta mt-[4px]">企业和项目组都进入同一棵组织树。</p>
             </div>
             {canEdit && (
               <Button
@@ -858,10 +859,10 @@ export default function EnterpriseInfoPage({
                     <Building2 className="size-[17px]" />
                   </span>
                   <div className="min-w-0 flex-1 basis-0">
-                    <p className="truncate text-[14px] font-semibold text-[#272d3e]">{unit.name}</p>
-                    <p className="mt-[2px] truncate font-mono text-[11px] text-[#8490aa]">{unit.code}</p>
+                    <p className="gg-type-control truncate font-semibold text-[var(--gg-text-primary)]">{unit.name}</p>
+                    <p className="gg-type-code mt-[2px] truncate text-[var(--gg-text-muted)]">{unit.code}</p>
                   </div>
-                  <span className="rounded-full bg-white px-[8px] py-[4px] text-[11px] text-[#778198] ring-1 ring-[#e0e6f2]">company</span>
+                  <span className="gg-type-caption rounded-full bg-white px-[8px] py-[4px] ring-1 ring-[#e0e6f2]">company</span>
                 </div>
               </article>
             ))}
@@ -869,10 +870,10 @@ export default function EnterpriseInfoPage({
               <div className="h-[58px] animate-pulse rounded-[14px] bg-[#f4f6fa]" aria-label="正在加载企业组织" />
             )}
             {!unitsLoading && canReadOrganization && !rootUnit && (
-              <div className="rounded-[14px] border border-dashed border-[#dfe5f0] px-[14px] py-[18px] text-center text-[12px] text-[#818ba0]">暂无可显示的企业组织单元</div>
+              <div className="gg-type-meta rounded-[14px] border border-dashed border-[#dfe5f0] px-[14px] py-[18px] text-center">暂无可显示的企业组织单元</div>
             )}
             {!canReadOrganization && (
-              <div className="rounded-[14px] border border-dashed border-[#dfe5f0] px-[14px] py-[18px] text-center text-[12px] text-[#818ba0]">需要组织读取权限才能查看企业组织节点</div>
+              <div className="gg-type-meta rounded-[14px] border border-dashed border-[#dfe5f0] px-[14px] py-[18px] text-center">需要组织读取权限才能查看企业组织节点</div>
             )}
           </div>
           <Button variant="outline" className="mt-[12px] w-full" onClick={() => navigate('/enterprise/organization')}>
@@ -891,9 +892,9 @@ export default function EnterpriseInfoPage({
       <Dialog open={companyDialogOpen} onOpenChange={setCompanyDialogOpen}>
         <DialogContent className="max-w-[460px]">
           <DialogTitle>新增企业组织</DialogTitle>
-          <p className="text-[14px] leading-[22px] text-[#737d92]">新企业会作为 company 类型组织单元创建在“{rootUnit?.name || tenant.name}”下。</p>
+          <p className="gg-type-body">新企业会作为 company 类型组织单元创建在“{rootUnit?.name || tenant.name}”下。</p>
           <div className="grid gap-[13px]">
-            <label className="grid gap-[6px] text-[13px] font-medium text-[#646b7d]">
+            <label className="gg-type-control grid gap-[6px] text-[var(--gg-text-secondary)]">
               稳定企业编码
               <Input
                 aria-label="稳定企业编码"
@@ -902,7 +903,7 @@ export default function EnterpriseInfoPage({
                 onChange={(event) => setCompanyDraft((current) => ({ ...current, code: event.target.value }))}
               />
             </label>
-            <label className="grid gap-[6px] text-[13px] font-medium text-[#646b7d]">
+            <label className="gg-type-control grid gap-[6px] text-[var(--gg-text-secondary)]">
               企业名称
               <Input
                 aria-label="新增企业名称"
@@ -923,6 +924,6 @@ export default function EnterpriseInfoPage({
           </div>
         </DialogContent>
       </Dialog>
-    </div>
+    </PageShell>
   );
 }

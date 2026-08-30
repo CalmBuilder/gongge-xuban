@@ -99,16 +99,16 @@ export default function PlatformKindDetailView({
   return (
     <div className="mt-[20px] flex flex-col gap-[16px]">
       <div className="flex flex-wrap items-center gap-[12px]">
-        <div className="min-w-0 text-[#464c5e]">
+        <div className="min-w-0 text-[var(--gg-text-secondary)]">
           <div className="flex items-center gap-[8px]">
           {kind === 'agents' || kind === 'experts'
             ? null
             : <PlazaResourceArtwork kind={kind} size="compact" />}
-            <h1 className="text-balance text-[14px] font-semibold leading-none text-[#252a3c]">{title}</h1>
-            <span className="text-[12px] text-[#8a93a6]">{items.length} {countLabel}</span>
+            <h1 className="gg-type-section-title text-balance">{title}</h1>
+            <span className="gg-type-meta">{items.length} {countLabel}</span>
           </div>
           {subtitle && (
-            <p className="mt-[7px] max-w-[680px] text-[12px] leading-[18px] text-[#7d879d]">
+            <p className="gg-type-body mt-[7px] max-w-[680px]">
               {subtitle}
             </p>
           )}
@@ -119,7 +119,7 @@ export default function PlatformKindDetailView({
             {signals.map((signal) => (
               <span
                 key={signal}
-                className="rounded-[20px] border border-[var(--gg-border)] bg-white px-[8px] py-[2px] text-[11px] leading-[normal] text-[#757f9c]"
+                className="gg-type-caption rounded-[var(--gg-radius-control)] border border-[var(--gg-border)] bg-[var(--gg-surface)] px-[8px] py-[2px]"
               >
                 {signal}
               </span>
@@ -128,8 +128,8 @@ export default function PlatformKindDetailView({
         )}
 
         <div className="ml-auto flex items-center gap-[10px]">
-          <label className="flex h-[36px] w-full max-w-[320px] items-center gap-[8px] overflow-hidden rounded-[10px] border border-[var(--gg-border)] bg-white px-[12px] transition-colors focus-within:border-[var(--gg-cobalt)]">
-            <IconSearch className="size-[14px] shrink-0 text-[#858b9c]" />
+          <label className="flex h-[36px] w-full max-w-[320px] items-center gap-[8px] overflow-hidden rounded-[var(--gg-radius-control)] border border-[var(--gg-border)] bg-[var(--gg-surface)] px-[12px] transition-colors focus-within:border-[var(--gg-interaction)]">
+            <IconSearch className="size-[14px] shrink-0 text-[var(--gg-text-muted)]" />
             <input
               value={searchText}
               name={`plaza-search-${kind}`}
@@ -140,7 +140,7 @@ export default function PlatformKindDetailView({
                 setSearchText(event.target.value);
                 setPage(1);
               }}
-              className="min-w-0 flex-1 border-0 bg-transparent text-[12px] text-[#18181a] outline-none placeholder:text-[#858b9c]"
+              className="gg-type-control min-w-0 flex-1 border-0 bg-transparent text-[var(--gg-text-primary)] outline-none placeholder:text-[var(--gg-text-muted)]"
             />
           </label>
           <UIButton
@@ -148,7 +148,7 @@ export default function PlatformKindDetailView({
             onClick={onRefresh}
             disabled={loading}
             aria-label="刷新"
-            className="h-[36px] gap-1 rounded-[10px] border-[var(--gg-border)] bg-white px-[12px] text-[12px] font-normal text-[#757f9c] hover:border-[#cbd3e6] hover:bg-white hover:text-[#18181a]"
+            className="gg-type-control h-[36px] gap-1 rounded-[var(--gg-radius-control)] border-[var(--gg-border)] bg-[var(--gg-surface)] px-[12px] text-[var(--gg-text-muted)] hover:border-[var(--gg-interaction)] hover:bg-[var(--gg-interaction-soft)] hover:text-[var(--gg-text-primary)]"
           >
             <IconRefresh className={cn('size-[14px]', loading && 'animate-spin')} />
             刷新
@@ -159,7 +159,7 @@ export default function PlatformKindDetailView({
       {loading ? (
         <DetailSkeleton />
       ) : filteredItems.length === 0 ? (
-        <div className="grid min-h-[180px] w-full place-items-center content-center gap-[10px] rounded-[18px] border border-dashed border-[#dfe4ec] bg-[#fbfcfd] px-[20px] py-[40px] text-center text-[13px] font-medium text-[#8b94aa]">
+        <div className="gg-type-body grid min-h-[180px] w-full place-items-center content-center gap-[10px] rounded-[var(--gg-radius-panel)] border border-dashed border-[var(--gg-line)] bg-[var(--gg-surface-subtle)] px-[20px] py-[40px] text-center font-medium">
           <IconSearch className="size-[20px] shrink-0" />
           <span>{items.length === 0 ? '暂无开放内容' : '没有匹配的广场内容'}</span>
         </div>

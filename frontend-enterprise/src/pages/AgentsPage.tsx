@@ -21,6 +21,9 @@ import EmployeeAvatarEditor from '../components/EmployeeAvatarEditor';
 import EmployeeCard from '../components/EmployeeCard';
 import EmployeeProfileEditor from '../components/EmployeeProfileEditor';
 import { EnterpriseCatalogHero, EnterpriseCatalogPageHeader } from '../components/EnterpriseCatalogHeader';
+import { CatalogGrid } from '../components/enterprise/CatalogGrid';
+import { PageShell } from '../components/enterprise/PageShell';
+import { PageState } from '../components/enterprise/PageState';
 import { Paginator } from '../components/Paginator';
 import ExpertBulkActionBar from '../components/ExpertBulkActionBar';
 import ExpertClassificationDialog from '../components/ExpertClassificationDialog';
@@ -58,6 +61,11 @@ const EMPTY_GOVERNANCE_COUNTS: NonNullable<AgentManagementPageRead['governance_c
   organization_pending: 0,
   organization_employee: 0,
   template: 0,
+};
+const EMPTY_AGENT_FACETS: NonNullable<AgentManagementPageRead['facets']> = {
+  sources: [],
+  departments: [],
+  directions: [],
 };
 type EmployeeFilter = 'all' | 'online' | 'offline' | 'pending' | 'expert' | 'governance' | 'capability' | 'organization';
 type AgentPublicationRelease = {
@@ -216,12 +224,19 @@ export default function AgentsPage({
         `/api/enterprise/agents/management-page?${params.toString()}`,
       );
       if (requestId !== requestIdRef.current) return;
-      setAgents(result.items);
-      setTotal(result.total);
-      setViewCounts(result.view_counts);
+      const items = Array.isArray(result.items) ? result.items : [];
+      const totalCount = Number.isFinite(result.total) ? result.total : 0;
+      const facets = result.facets || EMPTY_AGENT_FACETS;
+      setAgents(items);
+      setTotal(totalCount);
+      setViewCounts(result.view_counts || EMPTY_VIEW_COUNTS);
       setGovernanceCounts(result.governance_counts || EMPTY_GOVERNANCE_COUNTS);
-      setFacets(result.facets);
-      const lastPage = Math.max(1, Math.ceil(result.total / result.page_size));
+      setFacets({
+        sources: Array.isArray(facets.sources) ? facets.sources : [],
+        departments: Array.isArray(facets.departments) ? facets.departments : [],
+        directions: Array.isArray(facets.directions) ? facets.directions : [],
+      });
+      const lastPage = Math.max(1, Math.ceil(totalCount / (result.page_size || AGENT_PAGE_SIZE)));
       if (page > lastPage) setPage(lastPage);
     } catch (error) {
       if (requestId === requestIdRef.current) {
@@ -253,6 +268,7 @@ export default function AgentsPage({
     void api.get<ExpertTaxonomyRead>(
       `/api/enterprise/expert-taxonomy?tenant_id=${getRequestTenantId()}`,
     ).then((result) => {
+      if (!Array.isArray(result?.categories)) throw new Error('Invalid expert taxonomy response');
       setTaxonomy(result);
       setTaxonomyUnavailable(false);
     }).catch(() => {
@@ -696,7 +712,7 @@ export default function AgentsPage({
   ];
 
   const summaryCardClass =
-    'flex h-[100px] flex-1 basis-[220px] items-center gap-[16px] rounded-[20px] bg-[#f6f6f6] px-[32px] py-[20px] text-left transition-shadow';
+    'flex h-full min-h-[136px] w-full items-center gap-[16px] rounded-[var(--gg-radius-card)] border border-[var(--gg-line)] bg-[var(--gg-surface)] px-[24px] py-[20px] text-left transition-shadow hover:border-[var(--gg-interaction)] hover:shadow-[var(--gg-shadow-card)]';
   const summaryStats: { key: EmployeeFilter; value: number; label: string; sub: string }[] = isExpertTemplateManagement
     ? [{
         key: 'expert',
@@ -786,10 +802,13 @@ export default function AgentsPage({
   })();
 
   const employeeGrid = (
-    <div className={cn(
-      RESOURCE_GRID_CLASS,
-      selectedExpertIds.size > 0 && 'pb-[92px]',
-    )}>
+    <CatalogGrid
+      family="resource"
+      className={cn(
+        RESOURCE_GRID_CLASS,
+        selectedExpertIds.size > 0 && 'pb-[92px]',
+      )}
+    >
       {filteredEmployees.map((employee) => {
         const isExpertTemplateRow = isExpertTemplateManagement && employee.governance_form === 'template';
         const templateAvailable = employee.status === 'active' && isGalleryEmployee(employee);
@@ -851,7 +870,7 @@ export default function AgentsPage({
           onAction={emptyState.onAction}
         />
       )}
-    </div>
+    </CatalogGrid>
   );
 
   const viewMeta = activeViewMeta;
@@ -860,7 +879,7 @@ export default function AgentsPage({
     : `${total} 位员工`;
 
   return (
-    <div className="min-h-full box-border px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]" aria-busy={loading}>
+    <PageShell template={isExpertTemplateManagement ? 'catalog' : 'management'} aria-busy={loading}>
       {isExpertTemplateManagement ? (
         <>
           <EnterpriseCatalogPageHeader
@@ -871,7 +890,7 @@ export default function AgentsPage({
             onLogout={onLogout}
             userName={currentUser?.username}
           />
-          <section className="mt-[20px] overflow-hidden rounded-[20px] border border-[#e8ebf3] bg-white shadow-[0_16px_44px_rgba(24,39,75,0.07)]">
+          <section className="mt-[20px] overflow-hidden rounded-[var(--gg-radius-panel)] border border-[var(--gg-line)] bg-[var(--gg-surface)] shadow-[var(--gg-shadow-card)]">
             <EnterpriseCatalogHero
               icon={Star}
               title="专家模板目录"
@@ -903,7 +922,7 @@ export default function AgentsPage({
                   onChange={(event) => setSearchTerm(event.target.value)}
                   placeholder="搜索"
                   aria-label="搜索员工"
-                  className="min-w-0 flex-1 border-0 bg-transparent text-[14px] text-[#18181A] outline-none placeholder:text-[#757F9C]"
+                  className="min-w-0 flex-1 border-0 bg-transparent gg-type-body text-[#18181A] outline-none placeholder:text-[#757F9C]"
                 />
               </div>
             )}
@@ -918,7 +937,7 @@ export default function AgentsPage({
             <ConceptHelp topic="forms" triggerLabel="个人专家与组织数字员工" />
           </div>
 
-          <div className="my-[36px] flex flex-wrap items-stretch gap-[20px]" aria-label="数字员工统计">
+          <CatalogGrid family="metric" className="my-[36px]" aria-label="数字员工统计">
             {summaryStats.map((stat) => (
               <button
                 key={stat.key}
@@ -927,23 +946,23 @@ export default function AgentsPage({
                 onClick={() => navigate(viewLink(stat.key))}
                 className={cn(summaryCardClass)}
               >
-                <span className="shrink-0 text-[34px] font-semibold leading-none text-[#18181A]">{stat.value}</span>
+                <span className="gg-type-metric shrink-0 text-[var(--gg-text-primary)]">{stat.value}</span>
                 <span className="flex min-w-0 flex-col gap-[4px]">
-                  <span className="whitespace-nowrap text-[14px] text-[#464C5E]">{stat.label}</span>
-                  <span className="whitespace-nowrap text-[12px] text-[#757F9C]">{stat.sub}</span>
+                  <span className="gg-type-control whitespace-nowrap text-[var(--gg-text-secondary)]">{stat.label}</span>
+                  <span className="gg-type-meta whitespace-nowrap">{stat.sub}</span>
                 </span>
               </button>
             ))}
-            <button type="button" onClick={onCreateAgent} className={cn(summaryCardClass, 'hover:shadow-[0_16px_30px_0_rgba(0,0,0,0.10)]')}>
-              <span className="grid size-[38px] shrink-0 place-items-center text-[#18181A]">
+            <button type="button" onClick={onCreateAgent} className={cn(summaryCardClass)}>
+              <span className="grid size-[38px] shrink-0 place-items-center text-[var(--gg-interaction)]">
                 <IconPlus className="size-[38px]" />
               </span>
               <span className="flex min-w-0 flex-col gap-[4px]">
-                <span className="whitespace-nowrap text-[14px] text-[#464C5E]">创建新员工</span>
-                <span className="whitespace-nowrap text-[12px] text-[#757F9C]">几步搭好你的数字员工</span>
+                <span className="gg-type-control whitespace-nowrap text-[var(--gg-text-secondary)]">创建新员工</span>
+                <span className="gg-type-meta whitespace-nowrap">几步搭好你的数字员工</span>
               </span>
             </button>
-          </div>
+          </CatalogGrid>
         </>
       )}
 
@@ -962,8 +981,8 @@ export default function AgentsPage({
           linkFor={viewLink}
           footer={(
             <>
-              <strong className="text-[#464c5e]">视图说明</strong>
-              <p className="mt-[3px]">视图仅筛选本页列表，不会改变员工的运行状态。</p>
+              <strong className="gg-type-control text-[#464c5e]">视图说明</strong>
+              <p className="mt-[3px] gg-type-body">视图仅筛选本页列表，不会改变员工的运行状态。</p>
             </>
           )}
         />}
@@ -972,12 +991,12 @@ export default function AgentsPage({
           {!isExpertTemplateManagement && (
             <div className="flex items-start justify-between gap-[20px] px-[22px] py-[21px] max-[620px]:flex-col">
               <div className="min-w-0">
-                <p className="font-mono text-[10px] font-semibold uppercase tracking-[0.13em] text-[#6074a9]">{workspaceEyebrow}</p>
-                <h2 className="mt-[5px] flex items-center gap-[6px] text-[20px] font-semibold tracking-[-0.02em] text-[#18181a]">
+                <p className="font-mono gg-type-caption font-semibold uppercase tracking-[0.13em] text-[#6074a9]">{workspaceEyebrow}</p>
+                <h2 className="mt-[5px] flex items-center gap-[6px] gg-type-section-title font-semibold tracking-[-0.02em] text-[#18181a]">
                   {viewMeta.title}
                   <ConceptHelp topic={employeeFilter === 'expert' ? 'expert' : 'digital-employee'} />
                 </h2>
-                <p className="mt-[5px] max-w-[680px] text-[12px] leading-[19px] text-[#68718b]">{viewMeta.description}</p>
+                <p className="mt-[5px] max-w-[680px] gg-type-meta  text-[#68718b]">{viewMeta.description}</p>
               </div>
               <div className="flex flex-wrap items-center justify-end gap-[8px]">
                 <Button variant="outline" onClick={() => void openAgentReleases()}>
@@ -999,12 +1018,12 @@ export default function AgentsPage({
                   placeholder="搜索专家模板"
                   aria-label="搜索专家模板"
                   autoComplete="off"
-                  className="h-[34px] w-full rounded-[var(--gg-radius-control)] border border-[var(--gg-border)] bg-white pl-[32px] pr-[12px] text-[12px] text-[var(--gg-ink)] outline-none transition-colors placeholder:text-[var(--gg-slate)] focus:border-[var(--gg-cobalt)] focus:ring-2 focus:ring-[color-mix(in_srgb,var(--gg-cobalt)_16%,transparent)]"
+                  className="h-[34px] w-full rounded-[var(--gg-radius-control)] border border-[var(--gg-border)] bg-white pl-[32px] pr-[12px] gg-type-meta text-[var(--gg-ink)] outline-none transition-colors placeholder:text-[var(--gg-slate)] focus:border-[var(--gg-cobalt)] focus:ring-2 focus:ring-[color-mix(in_srgb,var(--gg-cobalt)_16%,transparent)]"
                 />
               </label>
             )}
             {employeeFilter === 'expert' && taxonomyUnavailable && isAdmin && (
-              <p className="mb-[12px] rounded-[10px] bg-[#fff8e8] px-[12px] py-[9px] text-[11px] text-[#8a6118]">
+              <p className="mb-[12px] rounded-[10px] bg-[#fff8e8] px-[12px] py-[9px] gg-type-caption text-[#8a6118]">
                 分类规则加载失败，请刷新后重试；当前仍可浏览专家。
               </p>
             )}
@@ -1085,16 +1104,16 @@ export default function AgentsPage({
       />
       <Dialog open={publicationOpen} onOpenChange={(open) => !publicationBusy && setPublicationOpen(open)}>
         <DialogContent aria-describedby={undefined} className="max-h-[86vh] overflow-y-auto sm:max-w-[720px]">
-          <DialogTitle className="flex items-center gap-2 text-[17px] font-semibold">
+          <DialogTitle className="flex items-center gap-2 gg-type-section-title font-semibold">
             <ShieldCheck className="size-5 text-[var(--gg-cobalt)]" />
             组织数字员工发布库
           </DialogTitle>
-          <p className="text-[12px] leading-5 text-[#68718b]">
+          <p className="gg-type-meta text-[#68718b]">
             这里只展示经职责分离审核的冻结快照。采用会创建归你所有的新数字员工，并固定已审 Persona 与组件版本；记忆、会话、连接账号、凭据和定时任务不会传播。
           </p>
           {publicationBusy && !agentReleases.length ? <p role="status">正在读取已审发布物…</p> : null}
           {!publicationBusy && !agentReleases.length ? (
-            <div className="rounded-xl border border-dashed border-[#dfe5f2] px-5 py-10 text-center text-[12px] text-[#7b8498]">
+            <div className="rounded-xl border border-dashed border-[#dfe5f2] px-5 py-10 text-center gg-type-meta text-[#7b8498]">
               当前没有可采用的组织数字员工发布物。
             </div>
           ) : null}
@@ -1106,8 +1125,8 @@ export default function AgentsPage({
               <article key={release.id} className="rounded-[14px] border border-[#dce5f6] bg-[#fbfcff] p-4">
                 <div className="flex items-start justify-between gap-4">
                   <div>
-                    <h3 className="text-[14px] font-semibold text-[#202536]">{release.name}</h3>
-                    <p className="mt-1 text-[12px] leading-5 text-[#68718b]">{release.description || '暂无说明'}</p>
+                    <h3 className="gg-type-card-title font-semibold text-[#202536]">{release.name}</h3>
+                    <p className="mt-1 gg-type-meta text-[#68718b]">{release.description || '暂无说明'}</p>
                   </div>
                   <div className="flex shrink-0 flex-wrap justify-end gap-2">
                     {release.status === 'active' ? (
@@ -1157,9 +1176,9 @@ export default function AgentsPage({
                     ) : null}
                   </div>
                 </div>
-                <div className="mt-3 flex flex-wrap gap-2 text-[11px] text-[#53617d]">
+                <div className="mt-3 flex flex-wrap gap-2 gg-type-caption text-[#53617d]">
                   <span className="rounded-full bg-white px-2.5 py-1 ring-1 ring-[#dfe6f5]">冻结组件 {release.components.length}</span>
-                  <span className="rounded-full bg-white px-2.5 py-1 font-mono ring-1 ring-[#dfe6f5]">{release.snapshot_checksum.slice(0, 12)}…</span>
+                  <span className="rounded-full bg-white px-2.5 py-1 font-mono gg-type-caption ring-1 ring-[#dfe6f5]">{release.snapshot_checksum.slice(0, 12)}…</span>
                   <span className={`rounded-full px-2.5 py-1 ${release.status === 'active' ? 'bg-[#eef8f2] text-[#237a48]' : release.status === 'security_revoked' ? 'bg-[#fce7e7] text-[#b40a0a]' : 'bg-[#fff5df] text-[#936000]'}`}>
                     {release.status === 'active' ? '已审 Release' : release.status === 'security_revoked' ? '安全撤销' : '历史已下架'}
                   </span>
@@ -1181,16 +1200,16 @@ export default function AgentsPage({
       >
         <DialogContent aria-describedby={undefined} className="sm:max-w-[520px]">
           <DialogTitle>回滚组织数字员工版本</DialogTitle>
-          <p className="text-[12px] leading-5 text-[#68718b]">
+          <p className="gg-type-meta text-[#68718b]">
             只允许恢复同一 Agent 的普通下架历史 Release；安全撤销版本不可恢复。提交时会校验当前版本和历史版本的行修订，避免覆盖并发变更。
           </p>
           {rollbackTarget ? (
             <div className="grid gap-[12px]">
-              <div className="rounded-[11px] border border-[#dce5ff] bg-[#f7f9ff] px-[12px] py-[10px] text-[12px] text-[#53617d]">
-                目标：<strong className="text-[#202536]">{rollbackTarget.name}</strong>
-                <span className="ml-2 font-mono text-[11px]">{rollbackTarget.snapshot_checksum.slice(0, 16)}…</span>
+              <div className="rounded-[11px] border border-[#dce5ff] bg-[#f7f9ff] px-[12px] py-[10px] gg-type-meta text-[#53617d]">
+                目标：<strong className="gg-type-control text-[#202536]">{rollbackTarget.name}</strong>
+                <span className="ml-2 font-mono gg-type-caption">{rollbackTarget.snapshot_checksum.slice(0, 16)}…</span>
               </div>
-              <label className="grid gap-[6px] text-[12px] font-medium text-[#464c5e]">
+              <label className="grid gap-[6px] gg-type-meta font-medium text-[#464c5e]">
                 回滚原因
                 <Textarea
                   aria-label="回滚原因"
@@ -1221,18 +1240,18 @@ export default function AgentsPage({
       >
         <DialogContent aria-describedby={undefined} className="sm:max-w-[520px]">
           <DialogTitle>{transitionCommand === 'security_revoke' ? '安全撤销组织数字员工 Release' : '普通下架组织数字员工 Release'}</DialogTitle>
-          <p className="text-[12px] leading-5 text-[#68718b]">
+          <p className="gg-type-meta text-[#68718b]">
             {transitionCommand === 'security_revoke'
               ? '安全撤销会停止组织广场发现、停用既有采用副本及其资源绑定，并提升租户授权修订；该版本不可回滚。'
               : '普通下架只停止组织广场发现和新的采用，既有采用副本继续按原授权运行。'}
           </p>
           {transitionTarget ? (
             <div className="grid gap-[12px]">
-              <div className="rounded-[11px] border border-[#dce5ff] bg-[#f7f9ff] px-[12px] py-[10px] text-[12px] text-[#53617d]">
-                目标：<strong className="text-[#202536]">{transitionTarget.name}</strong>
-                <span className="ml-2 font-mono text-[11px]">Release {transitionTarget.id}</span>
+              <div className="rounded-[11px] border border-[#dce5ff] bg-[#f7f9ff] px-[12px] py-[10px] gg-type-meta text-[#53617d]">
+                目标：<strong className="gg-type-control text-[#202536]">{transitionTarget.name}</strong>
+                <span className="ml-2 font-mono gg-type-caption">Release {transitionTarget.id}</span>
               </div>
-              <label className="grid gap-[6px] text-[12px] font-medium text-[#464c5e]">
+              <label className="grid gap-[6px] gg-type-meta font-medium text-[#464c5e]">
                 变更原因
                 <Textarea
                   aria-label="发布状态变更原因"
@@ -1263,15 +1282,15 @@ export default function AgentsPage({
         }}
       >
         <DialogContent aria-describedby={undefined} className="max-h-[86vh] overflow-y-auto sm:max-w-[620px]">
-          <DialogTitle className="text-[17px] font-semibold">{t('组织化检查：')}{organizationPreview?.agent_name}</DialogTitle>
-          <p className="text-[12px] leading-5 text-[#68718b]">
+          <DialogTitle className="gg-type-section-title font-semibold">{t('组织化检查：')}{organizationPreview?.agent_name}</DialogTitle>
+          <p className="gg-type-meta text-[#68718b]">
             组织化只改变治理关系和发布状态，不复制真人身份、私人凭据或会话记忆。所有事实以服务端回查为准。
           </p>
-          {organizationPreviewBusy ? <p role="status">{t('正在读取组织化条件…')}</p> : null}
+          {organizationPreviewBusy ? <p className="gg-type-body" role="status">{t('正在读取组织化条件…')}</p> : null}
           {organizationPreview && (
             <div className="grid gap-[10px]">
-              <div className="rounded-[12px] border border-[#dfe5f2] bg-[#f8faff] px-[14px] py-[11px] text-[12px] text-[#53617d]">
-                  {t('当前形态：')}<strong className="text-[#202536]">
+              <div className="rounded-[12px] border border-[#dfe5f2] bg-[#f8faff] px-[14px] py-[11px] gg-type-meta text-[#53617d]">
+                {t('当前形态：')}<strong className="gg-type-control text-[#202536]">
                   {organizationPreview.governance_form === 'organization_employee'
                   ? t('组织数字员工')
                     : organizationPreview.governance_form === 'organization_pending'
@@ -1290,12 +1309,12 @@ export default function AgentsPage({
                   className="grid gap-[10px] rounded-[12px] border border-[#d8e2fb] bg-[#f7f9ff] px-[14px] py-[13px]"
                 >
                   <div>
-                    <h3 className="text-[12px] font-semibold text-[#303a52]">{t('配置组织关系')}</h3>
-                    <p className="mt-[3px] text-[11px] leading-[17px] text-[#737d92]">
+                    <h3 className="gg-type-card-title font-semibold text-[#303a52]">{t('配置组织关系')}</h3>
+                    <p className="mt-[3px] gg-type-caption  text-[#737d92]">
                       {t('选择后的责任组织、业务角色和监督者会在同一事务中保存；保存后仍需提交组织审核。')}
                     </p>
                   </div>
-                  <label className="grid gap-[5px] text-[11px] font-medium text-[#53617d]">
+                  <label className="grid gap-[5px] gg-type-caption font-medium text-[#53617d]">
                     {t('责任组织')}
                     <select
                       aria-label={t('选择责任组织')}
@@ -1304,7 +1323,7 @@ export default function AgentsPage({
                         ...current,
                         responsibleOrgUnitId: event.target.value,
                       }))}
-                      className="h-9 rounded-[9px] border border-[#d8e0f0] bg-white px-3 text-[12px] font-normal text-[#303a52] outline-none focus:border-[var(--gg-cobalt)] focus:ring-2 focus:ring-[color-mix(in_srgb,var(--gg-cobalt)_16%,transparent)]"
+                      className="h-9 rounded-[9px] border border-[#d8e0f0] bg-white px-3 gg-type-meta font-normal text-[#303a52] outline-none focus:border-[var(--gg-cobalt)] focus:ring-2 focus:ring-[color-mix(in_srgb,var(--gg-cobalt)_16%,transparent)]"
                     >
                       <option value="">{t('请选择责任组织')}</option>
                       {(organizationOptions?.organizations || []).map((option) => (
@@ -1312,7 +1331,7 @@ export default function AgentsPage({
                       ))}
                     </select>
                   </label>
-                  <label className="grid gap-[5px] text-[11px] font-medium text-[#53617d]">
+                  <label className="grid gap-[5px] gg-type-caption font-medium text-[#53617d]">
                     {t('业务角色')}
                     <select
                       aria-label={t('选择业务角色')}
@@ -1321,7 +1340,7 @@ export default function AgentsPage({
                         ...current,
                         roleCode: event.target.value,
                       }))}
-                      className="h-9 rounded-[9px] border border-[#d8e0f0] bg-white px-3 text-[12px] font-normal text-[#303a52] outline-none focus:border-[var(--gg-cobalt)] focus:ring-2 focus:ring-[color-mix(in_srgb,var(--gg-cobalt)_16%,transparent)]"
+                      className="h-9 rounded-[9px] border border-[#d8e0f0] bg-white px-3 gg-type-meta font-normal text-[#303a52] outline-none focus:border-[var(--gg-cobalt)] focus:ring-2 focus:ring-[color-mix(in_srgb,var(--gg-cobalt)_16%,transparent)]"
                     >
                       <option value="">{t('请选择业务角色')}</option>
                       {(organizationOptions?.roles || []).map((option) => (
@@ -1329,7 +1348,7 @@ export default function AgentsPage({
                       ))}
                     </select>
                   </label>
-                  <label className="grid gap-[5px] text-[11px] font-medium text-[#53617d]">
+                  <label className="grid gap-[5px] gg-type-caption font-medium text-[#53617d]">
                     {t('监督者')}
                     <select
                       aria-label={t('选择监督者')}
@@ -1338,7 +1357,7 @@ export default function AgentsPage({
                         ...current,
                         supervisorProfileId: event.target.value,
                       }))}
-                      className="h-9 rounded-[9px] border border-[#d8e0f0] bg-white px-3 text-[12px] font-normal text-[#303a52] outline-none focus:border-[var(--gg-cobalt)] focus:ring-2 focus:ring-[color-mix(in_srgb,var(--gg-cobalt)_16%,transparent)]"
+                      className="h-9 rounded-[9px] border border-[#d8e0f0] bg-white px-3 gg-type-meta font-normal text-[#303a52] outline-none focus:border-[var(--gg-cobalt)] focus:ring-2 focus:ring-[color-mix(in_srgb,var(--gg-cobalt)_16%,transparent)]"
                     >
                       <option value="">{t('请选择监督者')}</option>
                       {(organizationOptions?.supervisors || []).map((option) => (
@@ -1347,7 +1366,7 @@ export default function AgentsPage({
                     </select>
                   </label>
                   <div className="flex items-center justify-between gap-3">
-                    <span className="text-[11px] text-[#7b8498]">
+                    <span className="gg-type-caption text-[#7b8498]">
                       {organizationOptions ? t('选项来自当前 agent.manage 授权范围') : t('正在读取可用组织化选项…')}
                     </span>
                     <Button
@@ -1364,11 +1383,11 @@ export default function AgentsPage({
                 {organizationPreview.requirements.map((requirement) => (
                   <div
                     key={requirement.code}
-                    className={`flex items-start justify-between gap-[12px] rounded-[10px] border px-[12px] py-[9px] text-[11px] ${requirement.satisfied ? 'border-[#ccebd8] bg-[#f2fbf5]' : 'border-[#f0d6a7] bg-[#fff8e8]'}`}
+                    className={`flex items-start justify-between gap-[12px] rounded-[10px] border px-[12px] py-[9px] gg-type-caption ${requirement.satisfied ? 'border-[#ccebd8] bg-[#f2fbf5]' : 'border-[#f0d6a7] bg-[#fff8e8]'}`}
                   >
                     <span className="min-w-0">
                       <strong className="block text-[#3f485d]">{requirement.label}</strong>
-                      <span className="mt-[2px] block leading-[17px] text-[#737d92]">
+                      <span className="mt-[2px] block  text-[#737d92]">
                         {requirement.satisfied ? '当前事实已验证' : requirement.detail}
                       </span>
                     </span>
@@ -1416,7 +1435,7 @@ export default function AgentsPage({
           )}
         </DialogContent>
       </Dialog>
-    </div>
+    </PageShell>
   );
 }
 
@@ -1432,23 +1451,16 @@ function AgentsEmptyState({
   onAction?: () => void;
 }) {
   return (
-    <div className="flex h-[262px] w-full items-center justify-center rounded-[20px] border border-dashed border-[#e4e9f2] bg-[#fbfcfe] px-[24px] text-center">
-      <div className="flex max-w-[260px] flex-col items-center">
-        <span className="grid size-[34px] place-items-center rounded-[12px] bg-white text-[#98a2b3] shadow-[0_1px_8px_rgba(70,76,94,0.06)] ring-1 ring-[#edf1f6]">
-          <IconSearch className="size-[16px] shrink-0" />
-        </span>
-        <p className="mt-[12px] text-[14px] font-medium leading-[20px] text-[#7f879a]">
-          {title}
-        </p>
-        <p className="mt-[4px] text-[11px] leading-[17px] text-[#a7adbb]">
-          {description}
-        </p>
-        {actionLabel && onAction ? (
-          <button type="button" onClick={onAction} className="mt-[10px] text-[11px] font-medium text-[var(--gg-cobalt)] hover:underline">
-            {actionLabel}
-          </button>
-        ) : null}
-      </div>
-    </div>
+    <PageState
+      kind="empty"
+      title={title}
+      description={description}
+      icon={<IconSearch className="size-[16px]" />}
+      action={actionLabel && onAction ? (
+        <button type="button" onClick={onAction} className="gg-type-control text-[var(--gg-interaction)] hover:underline">
+          {actionLabel}
+        </button>
+      ) : undefined}
+    />
   );
 }

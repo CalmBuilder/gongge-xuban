@@ -70,7 +70,7 @@ const DialogContent = React.forwardRef<
           onEscapeKeyDown?.(event)
         }}
         className={cn(
-          "fixed top-1/2 left-1/2 z-50 grid w-full max-w-[calc(100%-2rem)] -translate-x-1/2 -translate-y-1/2 gap-4 rounded-[var(--gg-radius-card)] border border-[var(--gg-border)] bg-[var(--gg-paper)] p-4 text-sm text-[var(--gg-ink)] shadow-[var(--gg-shadow-panel)] duration-100 outline-none sm:max-w-sm data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95",
+          "fixed top-1/2 left-1/2 z-50 grid w-full max-w-[calc(100%-2rem)] -translate-x-1/2 -translate-y-1/2 gap-4 rounded-[var(--gg-radius-card)] border border-[var(--gg-border)] bg-[var(--gg-paper)] p-4 gg-typography-scope gg-type-body text-[var(--gg-ink)] shadow-[var(--gg-shadow-panel)] duration-100 outline-none sm:max-w-sm data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95",
           className
         )}
         {...props}
@@ -140,7 +140,7 @@ const DialogTitle = React.forwardRef<
       ref={ref}
       data-slot="dialog-title"
       className={cn(
-        "font-heading text-base leading-none font-medium",
+        "font-heading gg-type-card-title font-medium",
         className
       )}
       {...props}
@@ -157,7 +157,7 @@ const DialogDescription = React.forwardRef<
       ref={ref}
       data-slot="dialog-description"
       className={cn(
-        "text-sm text-muted-foreground *:[a]:underline *:[a]:underline-offset-3 *:[a]:hover:text-foreground",
+        "gg-type-body text-muted-foreground *:[a]:underline *:[a]:underline-offset-3 *:[a]:hover:text-foreground",
         className
       )}
       {...props}

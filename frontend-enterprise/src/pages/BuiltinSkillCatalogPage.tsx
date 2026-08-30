@@ -7,11 +7,15 @@
  */
 
 import { useCallback, useEffect, useMemo, useState, type FormEvent, type ReactNode } from 'react';
-import { ArrowLeft, ExternalLink, RefreshCw, Search, ShieldAlert, Sparkles } from 'lucide-react';
+import { ExternalLink, RefreshCw, Search, ShieldAlert, Sparkles } from 'lucide-react';
 import { Link, useParams, useSearchParams } from 'react-router-dom';
 
 import AppHeader from '@/components/AppHeader';
 import { EnterpriseCatalogHero, EnterpriseCatalogPageHeader } from '@/components/EnterpriseCatalogHeader';
+import { CatalogGrid } from '@/components/enterprise/CatalogGrid';
+import { DetailSurface } from '@/components/enterprise/DetailSurface';
+import { PageHeader } from '@/components/enterprise/PageHeader';
+import { PageShell } from '@/components/enterprise/PageShell';
 import { Paginator } from '@/components/Paginator';
 import {
   Dialog,
@@ -37,8 +41,11 @@ import {
   DIALOG_PRIMARY_BUTTON_CLASS,
   DETAIL_FACT_CARD_CLASS,
   DETAIL_PANEL_CLASS,
+  RESOURCE_CARD_ICON_SLOT_CLASS,
   RESOURCE_CARD_CLASS,
-  RESOURCE_GRID_CLASS,
+  RESOURCE_CARD_DESCRIPTION_CLASS,
+  RESOURCE_CARD_FOOTER_CLASS,
+  RESOURCE_CARD_IDENTITY_CLASS,
   SELECT_TRIGGER_CLASS,
 } from '@/lib/enterprise-ui';
 import { cn } from '@/lib/utils';
@@ -348,7 +355,7 @@ function BuiltinSkillCatalogListPage({
   const facets = result?.facets;
 
   return (
-    <div className="min-h-full box-border px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]">
+    <PageShell template="catalog" aria-busy={loading}>
       <EnterpriseCatalogPageHeader
         backTo="/enterprise/general-skills"
         backLabel="返回 Skill 管理"
@@ -358,7 +365,7 @@ function BuiltinSkillCatalogListPage({
         userName={currentUser?.username}
       />
 
-      <section className="mt-[20px] overflow-hidden rounded-[20px] border border-[#e8ebf3] bg-white shadow-[0_16px_44px_rgba(24,39,75,0.07)]">
+      <section className="mt-[20px] overflow-hidden rounded-[var(--gg-radius-panel)] border border-[var(--gg-line)] bg-[var(--gg-surface)] shadow-[var(--gg-shadow-card)]">
         <EnterpriseCatalogHero
           icon={Sparkles}
           title="内置能力目录"
@@ -406,24 +413,24 @@ function BuiltinSkillCatalogListPage({
           <CatalogSelect label="调用方式" value={draftFilters.invocationPolicy} onChange={(value) => setDraftFilters((current) => ({ ...current, invocationPolicy: value }))} options={[{ value: 'model_allowed', label: '模型可选' }, { value: 'user_only', label: '仅用户触发' }]} />
           <CatalogSelect label="状态" value={draftFilters.status} onChange={(value) => setDraftFilters((current) => ({ ...current, status: value }))} options={Object.entries(STATUS_LABELS).map(([value, label]) => ({ value, label }))} />
           <div className="flex items-center justify-end gap-[8px] md:col-span-6">
-            <Button variant="outline" className="h-[32px] rounded-[9px] text-[12px]" onClick={resetFilters}>重置</Button>
-            <Button className="h-[32px] rounded-[9px] bg-[var(--gg-cobalt)] text-[12px]" onClick={submitFilters}>查询</Button>
+            <Button variant="outline" className="h-[32px] rounded-[9px] gg-type-meta" onClick={resetFilters}>重置</Button>
+            <Button className="h-[32px] rounded-[9px] bg-[var(--gg-cobalt)] gg-type-meta" onClick={submitFilters}>查询</Button>
           </div>
         </div>
 
         {isAdmin && (selectedSkillIds.size > 0 || result?.items.some((item) => item.status === 'draft')) && (
           <div className="flex flex-wrap items-center justify-between gap-[10px] border-b border-[#eef1f6] bg-[#fbfcff] px-[22px] py-[10px]" role="region" aria-label="批量审核工具">
-            <div className="flex items-center gap-[10px] text-[11px] text-[var(--gg-slate)]" role="status">
+            <div className="flex items-center gap-[10px] gg-type-caption text-[var(--gg-slate)]" role="status">
               <span>已选 {selectedSkillIds.size} 个待审核 Skill</span>
-              <Button variant="ghost" className="h-[28px] rounded-[8px] px-[8px] text-[11px] text-[var(--gg-cobalt)]" onClick={selectPageCandidates}>
+              <Button variant="ghost" className="h-[28px] rounded-[8px] px-[8px] gg-type-caption text-[var(--gg-cobalt)]" onClick={selectPageCandidates}>
                 全选当前页待审
               </Button>
             </div>
             <div className="flex items-center gap-[8px]">
-              <Button variant="outline" className="h-[30px] rounded-[9px] text-[11px]" onClick={() => openReview('reject')} disabled={!selectedSkillIds.size || reviewing}>
+              <Button variant="outline" className="h-[30px] rounded-[9px] gg-type-caption" onClick={() => openReview('reject')} disabled={!selectedSkillIds.size || reviewing}>
                 批量拒绝
               </Button>
-              <Button className="h-[30px] rounded-[9px] bg-[var(--gg-cobalt)] text-[11px]" onClick={() => openReview('approve')} disabled={!selectedSkillIds.size || reviewing}>
+              <Button className="h-[30px] rounded-[9px] bg-[var(--gg-cobalt)] gg-type-caption" onClick={() => openReview('approve')} disabled={!selectedSkillIds.size || reviewing}>
                 批量通过
               </Button>
             </div>
@@ -431,7 +438,7 @@ function BuiltinSkillCatalogListPage({
         )}
 
         <div className="flex flex-wrap items-center justify-between gap-[10px] px-[22px] py-[15px]">
-          <p className="text-[12px] text-[var(--gg-slate)]" role="status">
+          <p className="gg-type-meta text-[var(--gg-slate)]" role="status">
             {loading ? '正在读取目录…' : `共 ${result?.total || 0} 个 Skill`}
           </p>
               <div className="gg-type-caption flex flex-wrap gap-[6px]">
@@ -442,7 +449,7 @@ function BuiltinSkillCatalogListPage({
         </div>
 
         {result?.items.length ? (
-          <div className={cn(RESOURCE_GRID_CLASS, 'px-[22px] pb-[22px]')}>
+          <CatalogGrid family="resource" className="px-[22px] pb-[22px]">
             {result.items.map((item) => (
               <CatalogCard
                 key={item.id}
@@ -452,9 +459,9 @@ function BuiltinSkillCatalogListPage({
                 onSelect={(checked) => toggleSkillSelection(item.id, checked)}
               />
             ))}
-          </div>
+          </CatalogGrid>
         ) : (
-          <div className="mx-[22px] mb-[22px] rounded-[14px] border border-dashed border-[#dfe4ef] bg-[#fbfcff] px-[18px] py-[32px] text-center text-[13px] text-[var(--gg-slate)]">
+          <div className="mx-[22px] mb-[22px] rounded-[14px] border border-dashed border-[#dfe4ef] bg-[#fbfcff] px-[18px] py-[32px] text-center gg-type-control text-[var(--gg-slate)]">
             {loading ? '正在加载…' : isAdmin ? '暂无候选。可点击“核对内置快照”导入固定项目资产。' : '当前没有已发布的内置 Skill。'}
           </div>
         )}
@@ -481,7 +488,7 @@ function BuiltinSkillCatalogListPage({
           onSubmit={() => void submitReview()}
         />
       )}
-    </div>
+    </PageShell>
   );
 }
 
@@ -531,17 +538,17 @@ function ExternalSkillImportDialog({
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent className="max-w-[640px] gap-0 overflow-hidden p-0">
         <DialogHeader className="border-b border-[#eef1f6] bg-[linear-gradient(110deg,#f2f6ff_0%,#fbfcff_64%,#f4fbf8_100%)] px-[24px] py-[20px]">
-          <DialogTitle className="text-[16px] text-[var(--gg-ink)]">导入外部 Skill</DialogTitle>
-          <DialogDescription className="max-w-[540px] text-[12px] leading-[19px] text-[var(--gg-slate)]">
+          <DialogTitle className="gg-type-card-title text-[var(--gg-ink)]">导入外部 Skill</DialogTitle>
+          <DialogDescription className="max-w-[540px] gg-type-meta  text-[var(--gg-slate)]">
             只接收固定来源并生成待审核候选，不会自动发布、绑定或运行。导入后的内容进入项目 Skill 库；当前租户仅作为操作者和审计上下文。
           </DialogDescription>
         </DialogHeader>
         <form onSubmit={(event) => void submit(event)}>
           <div className="grid max-h-[min(68vh,560px)] gap-[16px] overflow-y-auto px-[24px] py-[20px]">
             <div className="grid gap-[7px]">
-              <Label htmlFor="external-skill-source-kind" className="text-[12px] text-[var(--gg-ink)]">来源类型</Label>
+              <Label htmlFor="external-skill-source-kind" className="gg-type-meta text-[var(--gg-ink)]">来源类型</Label>
               <Select value={form.source_kind} onValueChange={(value) => update('source_kind', value as ExternalSkillCatalogSourceKind)}>
-                <SelectTrigger id="external-skill-source-kind" aria-label="来源类型" className={cn(SELECT_TRIGGER_CLASS, 'w-full text-[12px]')}>
+                <SelectTrigger id="external-skill-source-kind" aria-label="来源类型" className={cn(SELECT_TRIGGER_CLASS, 'w-full gg-type-meta')}>
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -552,7 +559,7 @@ function ExternalSkillImportDialog({
               </Select>
             </div>
             <div className="grid gap-[7px]">
-              <Label htmlFor="external-skill-source-url" className="text-[12px] text-[var(--gg-ink)]">仓库、Skill 标识或压缩包地址</Label>
+              <Label htmlFor="external-skill-source-url" className="gg-type-meta text-[var(--gg-ink)]">仓库、Skill 标识或压缩包地址</Label>
               <Input
                 id="external-skill-source-url"
                 name="source_url"
@@ -565,7 +572,7 @@ function ExternalSkillImportDialog({
                   : form.source_kind === 'skillhub' ? 'skill-slug 或 SkillHub 页面地址' : 'https://…'}
                 aria-required="true"
               />
-              <p className="text-[11px] leading-[17px] text-[#858b9c]">
+              <p className="gg-type-caption  text-[#858b9c]">
                 {form.source_kind === 'github'
                   ? '只接受 github.com 仓库地址，并按完整 commit 固定归档。'
                   : form.source_kind === 'skillhub'
@@ -576,34 +583,34 @@ function ExternalSkillImportDialog({
             {githubSource && (
               <div className="grid gap-[16px] md:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)]">
                 <div className="grid gap-[7px]">
-                  <Label htmlFor="external-skill-revision" className="text-[12px] text-[var(--gg-ink)]">完整 commit SHA</Label>
+                  <Label htmlFor="external-skill-revision" className="gg-type-meta text-[var(--gg-ink)]">完整 commit SHA</Label>
                   <Input
                     id="external-skill-revision"
                     name="revision"
                     value={form.revision}
                     onChange={(event) => update('revision', event.target.value)}
                     placeholder="40 位 commit SHA…"
-                    className="font-mono text-[11px]"
+                    className="font-mono gg-type-caption"
                     pattern="[a-fA-F0-9]{40}"
                     aria-required="true"
                   />
                 </div>
                 <div className="grid gap-[7px]">
-                  <Label htmlFor="external-skill-subpath" className="text-[12px] text-[var(--gg-ink)]">Skill 子路径</Label>
+                  <Label htmlFor="external-skill-subpath" className="gg-type-meta text-[var(--gg-ink)]">Skill 子路径</Label>
                   <Input
                     id="external-skill-subpath"
                     name="source_subpath"
                     value={form.source_subpath}
                     onChange={(event) => update('source_subpath', event.target.value)}
                     placeholder="skills/productivity/example"
-                    className="font-mono text-[11px]"
+                    className="font-mono gg-type-caption"
                     aria-required="true"
                   />
                 </div>
               </div>
             )}
             <div className="grid gap-[7px]">
-              <Label htmlFor="external-skill-license" className="text-[12px] text-[var(--gg-ink)]">许可证证据</Label>
+              <Label htmlFor="external-skill-license" className="gg-type-meta text-[var(--gg-ink)]">许可证证据</Label>
               <Input
                 id="external-skill-license"
                 name="source_license"
@@ -613,7 +620,7 @@ function ExternalSkillImportDialog({
                 aria-required="true"
               />
             </div>
-            <div className="rounded-[12px] border border-[#dbe5ff] bg-[#f6f8ff] px-[13px] py-[11px] text-[11px] leading-[18px] text-[#5d6880]" role="note">
+            <div className="rounded-[12px] border border-[#dbe5ff] bg-[#f6f8ff] px-[13px] py-[11px] gg-type-caption  text-[#5d6880]" role="note">
               导入会保存来源、版本、许可证和内容 checksum；外部包中的脚本仍按 Skill 资源处理，不会因此获得进程、网络或任意工具执行权限。
             </div>
           </div>
@@ -665,20 +672,20 @@ function CatalogReviewDialog({
     <Dialog open={open} onOpenChange={(nextOpen) => { if (!submitting) onOpenChange(nextOpen); }}>
       <DialogContent className="max-w-[520px] gap-0 overflow-hidden p-0">
         <DialogHeader className="border-b border-[#eef1f6] bg-[#fbfcff] px-[24px] py-[20px]">
-          <DialogTitle className="text-[16px] text-[var(--gg-ink)]">批量审核 Skill</DialogTitle>
-          <DialogDescription className="text-[12px] leading-[19px] text-[var(--gg-slate)]">
+          <DialogTitle className="gg-type-card-title text-[var(--gg-ink)]">批量审核 Skill</DialogTitle>
+          <DialogDescription className="gg-type-meta  text-[var(--gg-slate)]">
             将对 {selectedCount} 个候选执行原子审核。只有通过审核的版本才会出现在开放广场的 Skill 分类。
           </DialogDescription>
         </DialogHeader>
         <div className="grid gap-[16px] px-[24px] py-[20px]">
           <div className="grid gap-[8px]">
-            <span className="text-[12px] font-medium text-[var(--gg-ink)]">审核决定</span>
+            <span className="gg-type-meta font-medium text-[var(--gg-ink)]">审核决定</span>
             <div className="grid grid-cols-2 gap-[8px]" role="radiogroup" aria-label="审核决定">
               <Button
                 type="button"
                 variant={approving ? 'default' : 'outline'}
                 aria-pressed={approving}
-                className={cn('h-[34px] rounded-[9px] text-[12px]', approving && 'bg-[var(--gg-cobalt)]')}
+                className={cn('h-[34px] rounded-[9px] gg-type-meta', approving && 'bg-[var(--gg-cobalt)]')}
                 onClick={() => onDecisionChange('approve')}
                 disabled={submitting}
               >
@@ -688,7 +695,7 @@ function CatalogReviewDialog({
                 type="button"
                 variant={!approving ? 'destructive' : 'outline'}
                 aria-pressed={!approving}
-                className="h-[34px] rounded-[9px] text-[12px]"
+                className="h-[34px] rounded-[9px] gg-type-meta"
                 onClick={() => onDecisionChange('reject')}
                 disabled={submitting}
               >
@@ -697,19 +704,19 @@ function CatalogReviewDialog({
             </div>
           </div>
           <div className="grid gap-[7px]">
-            <Label htmlFor="catalog-review-note" className="text-[12px] text-[var(--gg-ink)]">审核说明（可选）</Label>
+            <Label htmlFor="catalog-review-note" className="gg-type-meta text-[var(--gg-ink)]">审核说明（可选）</Label>
             <Textarea
               id="catalog-review-note"
               name="review_note"
               value={note}
               onChange={(event) => onNoteChange(event.target.value)}
               placeholder="记录来源、风险或版本判断依据…"
-              className="min-h-[92px] text-[12px]"
+              className="min-h-[92px] gg-type-meta"
               maxLength={2000}
               disabled={submitting}
             />
           </div>
-          <div className="rounded-[12px] border border-[#f2dfbd] bg-[#fffaf0] px-[13px] py-[11px] text-[11px] leading-[18px] text-[#7b551b]" role="note">
+          <div className="rounded-[12px] border border-[#f2dfbd] bg-[#fffaf0] px-[13px] py-[11px] gg-type-caption  text-[#7b551b]" role="note">
             批次使用候选和修订两级版本校验；若期间有变化，服务端会拒绝整批并要求重新加载。
           </div>
         </div>
@@ -775,28 +782,28 @@ function CatalogBindingDialog({
     <Dialog open={open} onOpenChange={(nextOpen) => { if (!submitting) onOpenChange(nextOpen); }}>
       <DialogContent className="max-w-[520px] gap-0 overflow-hidden p-0">
         <DialogHeader className="border-b border-[#eef1f6] bg-[#fbfcff] px-[24px] py-[20px]">
-          <DialogTitle className="text-[16px] text-[var(--gg-ink)]">
+          <DialogTitle className="gg-type-card-title text-[var(--gg-ink)]">
             {installing ? '安装到我的能力分身' : '绑定到组织数字员工'}
           </DialogTitle>
-          <DialogDescription className="text-[12px] leading-[19px] text-[var(--gg-slate)]">
+          <DialogDescription className="gg-type-meta  text-[var(--gg-slate)]">
             {installing
               ? '选择一个本人拥有的能力分身，系统会按当前已审核修订创建显式 Skill 绑定。'
               : '选择一个已完成组织化发布的数字员工，系统会按当前已审核修订创建组织 Skill 绑定。'}
           </DialogDescription>
         </DialogHeader>
         <div className="grid gap-[16px] px-[24px] py-[20px]">
-          <div className="rounded-[12px] border border-[#e4e9f4] bg-[#f8faff] px-[13px] py-[11px] text-[11px] leading-[18px] text-[#5d6880]">
-            <span className="font-medium text-[var(--gg-ink)]">{detail.name}</span>
+          <div className="rounded-[12px] border border-[#e4e9f4] bg-[#f8faff] px-[13px] py-[11px] gg-type-caption  text-[#5d6880]">
+            <span className="gg-type-caption font-medium text-[var(--gg-ink)]">{detail.name}</span>
             <span className="mx-[5px] text-[#a0a7b6]">·</span>
             固定修订 v{detail.revision_number || 1} · {detail.invocation_policy === 'user_only' ? '仅用户触发' : '模型可选'}
           </div>
           <div className="grid gap-[7px]">
-            <Label htmlFor="catalog-binding-agent" className="text-[12px] text-[var(--gg-ink)]">目标 Agent</Label>
+            <Label htmlFor="catalog-binding-agent" className="gg-type-meta text-[var(--gg-ink)]">目标 Agent</Label>
             {loading ? (
-              <p className="text-[12px] text-[var(--gg-slate)]" role="status">正在加载目标…</p>
+              <p className="gg-type-meta text-[var(--gg-slate)]" role="status">正在加载目标…</p>
             ) : agents.length ? (
               <Select value={selectedAgentId} onValueChange={onAgentChange}>
-                <SelectTrigger id="catalog-binding-agent" aria-label="目标 Agent" className={cn(SELECT_TRIGGER_CLASS, 'w-full text-[12px]')}>
+                <SelectTrigger id="catalog-binding-agent" aria-label="目标 Agent" className={cn(SELECT_TRIGGER_CLASS, 'w-full gg-type-meta')}>
                   <SelectValue placeholder="选择目标 Agent" />
                 </SelectTrigger>
                 <SelectContent>
@@ -804,15 +811,15 @@ function CatalogBindingDialog({
                 </SelectContent>
               </Select>
             ) : (
-              <p className="rounded-[10px] border border-dashed border-[#dfe4ef] px-[12px] py-[13px] text-[12px] text-[var(--gg-slate)]">
+              <p className="rounded-[10px] border border-dashed border-[#dfe4ef] px-[12px] py-[13px] gg-type-meta text-[var(--gg-slate)]">
                 {installing ? '当前账号还没有可安装的能力分身。' : '当前没有满足组织化绑定条件的数字员工。'}
               </p>
             )}
           </div>
           <div className="grid gap-[7px]">
-            <Label htmlFor="catalog-binding-invocation" className="text-[12px] text-[var(--gg-ink)]">调用方式</Label>
+            <Label htmlFor="catalog-binding-invocation" className="gg-type-meta text-[var(--gg-ink)]">调用方式</Label>
             <Select value={invocationPolicy} onValueChange={(value) => onInvocationPolicyChange(value as 'model_allowed' | 'user_only')}>
-              <SelectTrigger id="catalog-binding-invocation" aria-label="调用方式" className={cn(SELECT_TRIGGER_CLASS, 'w-full text-[12px]')}>
+              <SelectTrigger id="catalog-binding-invocation" aria-label="调用方式" className={cn(SELECT_TRIGGER_CLASS, 'w-full gg-type-meta')}>
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -822,7 +829,7 @@ function CatalogBindingDialog({
             </Select>
           </div>
           {!installing && (
-            <p className="rounded-[12px] border border-[#f2dfbd] bg-[#fffaf0] px-[13px] py-[11px] text-[11px] leading-[18px] text-[#7b551b]" role="note">
+            <p className="rounded-[12px] border border-[#f2dfbd] bg-[#fffaf0] px-[13px] py-[11px] gg-type-caption  text-[#7b551b]" role="note">
               组织绑定要求数字员工已有责任组织、有效主管角色绑定和 active 发布版本；不满足时服务端会拒绝整次操作。
             </p>
           )}
@@ -860,17 +867,17 @@ function CatalogLifecycleDialog({
     <Dialog open={open} onOpenChange={(nextOpen) => { if (!submitting) onOpenChange(nextOpen); }}>
       <DialogContent className="max-w-[520px] gap-0 overflow-hidden p-0">
         <DialogHeader className="border-b border-[#eef1f6] bg-[#fbfcff] px-[24px] py-[20px]">
-          <DialogTitle className="text-[16px] text-[var(--gg-ink)]">
+          <DialogTitle className="gg-type-card-title text-[var(--gg-ink)]">
             {archiving ? '下架 Skill' : '安全撤销 Skill'}
           </DialogTitle>
-          <DialogDescription className="text-[12px] leading-[19px] text-[var(--gg-slate)]">
+          <DialogDescription className="gg-type-meta  text-[var(--gg-slate)]">
             {archiving
               ? '下架会停止广场发现和新的安装/绑定；当前已存在的有效绑定仍按原固定版本继续使用。'
               : '安全撤销会停止广场发现和新的安装/绑定，并停用当前租户及其他租户的活动绑定。'}
           </DialogDescription>
         </DialogHeader>
         <div className="grid gap-[7px] px-[24px] py-[20px]">
-          <Label htmlFor="catalog-lifecycle-reason" className="text-[12px] text-[var(--gg-ink)]">
+          <Label htmlFor="catalog-lifecycle-reason" className="gg-type-meta text-[var(--gg-ink)]">
             状态变更原因
           </Label>
           <Textarea
@@ -879,12 +886,12 @@ function CatalogLifecycleDialog({
             value={reason}
             onChange={(event) => onReasonChange(event.target.value)}
             placeholder={archiving ? '例如：上游版本待复核，暂时停止新安装…' : '例如：发现高风险行为，需要立即停止所有活动绑定…'}
-            className="min-h-[104px] text-[12px]"
+            className="min-h-[104px] gg-type-meta"
             maxLength={2000}
             disabled={submitting}
             aria-required="true"
           />
-          <p className="text-[11px] leading-[17px] text-[#858b9c]">
+          <p className="gg-type-caption  text-[#858b9c]">
             服务端会校验 Skill 和当前修订版本；若期间发生变化，整次操作会拒绝并要求重新确认。
           </p>
         </div>
@@ -1067,30 +1074,24 @@ function BuiltinSkillDetailPage({
   }
 
   return (
-    <div className="min-h-full box-border px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]">
+    <PageShell template="detail" aria-busy={loading}>
       <AppHeader
         onLogout={onLogout}
         userName={currentUser?.username}
         left={(
-          <div className="flex items-center gap-[12px]">
-            <Link
-              to="/enterprise/general-skills/catalog"
-              aria-label="返回 Skill 管理"
-              className="grid size-[32px] place-items-center rounded-[10px] text-[var(--gg-slate)] transition-colors hover:bg-[var(--gg-cloud)] hover:text-[var(--gg-ink)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--gg-cobalt)]"
-            >
-              <ArrowLeft className="size-[16px]" />
-            </Link>
-            <div>
-              <h1 className="gg-type-section-title">Skill 详情</h1>
-              <p className="gg-type-meta mt-[4px]">查看来源、风险和固定修订</p>
-            </div>
-          </div>
+          <PageHeader
+            size="section"
+            backTo="/enterprise/general-skills/catalog"
+            backLabel="返回 Skill 管理"
+            title="Skill 详情"
+            description="查看来源、风险和固定修订"
+          />
         )}
       />
       {loading ? (
         <p className="gg-type-body mt-[24px]" role="status">正在读取 Skill 详情…</p>
       ) : detail ? (
-        <section className="mt-[20px] grid gap-[16px] lg:grid-cols-[minmax(0,1.5fr)_minmax(280px,0.7fr)]">
+        <DetailSurface container="page" className="mt-[20px] grid gap-[16px] lg:grid-cols-[minmax(0,1.5fr)_minmax(280px,0.7fr)]">
           <article className="min-w-0 overflow-hidden rounded-[var(--gg-radius-panel)] border border-[var(--gg-line)] bg-[var(--gg-surface)] shadow-[var(--gg-shadow-card)]">
             <div className="border-b border-[var(--gg-line)] px-[22px] py-[22px]">
               <div className="flex flex-wrap items-start justify-between gap-[12px]">
@@ -1190,7 +1191,7 @@ function BuiltinSkillDetailPage({
             </DetailPanel>
             {detail.risk_findings.length > 0 && (
               <div className="gg-type-body rounded-[var(--gg-radius-card)] border border-[var(--gg-state-warning)] bg-[var(--gg-state-warning-soft)] p-[14px] text-[var(--gg-state-warning)]">
-                <div className="flex items-center gap-[7px] font-semibold"><ShieldAlert className="size-[15px]" />风险证据</div>
+                <div className="flex items-center gap-[7px] gg-type-control font-semibold"><ShieldAlert className="size-[15px]" />风险证据</div>
                 <ul className="mt-[8px] grid gap-[5px] pl-[20px] list-disc">
                   {detail.risk_findings.map((finding) => <li key={finding} className="break-all">{finding}</li>)}
                 </ul>
@@ -1214,7 +1215,7 @@ function BuiltinSkillDetailPage({
               )}
             </DetailPanel>
           </aside>
-        </section>
+        </DetailSurface>
       ) : (
         <div className="gg-type-body mt-[24px] rounded-[var(--gg-radius-card)] border border-dashed border-[var(--gg-line)] bg-[var(--gg-surface)] p-[28px] text-center">
           <p>{detailError || 'Skill 不存在或当前账号无权查看。'}</p>
@@ -1252,7 +1253,7 @@ function BuiltinSkillDetailPage({
           onSubmit={() => void submitLifecycle()}
         />
       )}
-    </div>
+    </PageShell>
   );
 }
 
@@ -1273,34 +1274,41 @@ function CatalogCard({
       RESOURCE_CARD_CLASS,
       'border-[var(--gg-line)] hover:border-[var(--gg-interaction)] focus-within:ring-2 focus-within:ring-[var(--gg-interaction)]',
     )}>
-      <div className="flex items-start gap-[9px]">
-        {selectable && (
+      {selectable && (
+        <div className="absolute left-[12px] top-[12px] z-20 rounded-[var(--gg-radius-control)] bg-[var(--gg-surface)] p-[5px] shadow-[0_3px_10px_rgba(49,87,232,0.12)]">
           <Checkbox
             checked={selected}
             aria-label={`选择 ${item.name_zh || item.name}`}
             onClick={(event) => event.stopPropagation()}
             onCheckedChange={(checked) => onSelect?.(checked === true)}
-            className="mt-[2px]"
           />
-        )}
-        <Link to={detailHref} className="flex min-w-0 flex-1 items-start justify-between gap-[10px] text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--gg-cobalt)]">
-          <div className="min-w-0">
-            <h2 className="gg-type-card-title truncate">{item.name_zh || item.name}</h2>
-            {item.name_zh && <p className="gg-type-caption mt-[2px] truncate">英文：<span translate="no">{item.name}</span></p>}
-            <p className="gg-type-code mt-[4px] truncate text-[var(--gg-text-muted)]">{item.source_path}</p>
-          </div>
-          <CatalogBadge tone={item.risk_level === 'high' ? 'red' : item.risk_level === 'medium' ? 'amber' : 'green'}>{RISK_LABELS[item.risk_level]}</CatalogBadge>
+        </div>
+      )}
+
+      <div data-resource-identity className={cn(RESOURCE_CARD_IDENTITY_CLASS, 'bg-[var(--gg-interaction-soft)]')}>
+        <div className={RESOURCE_CARD_ICON_SLOT_CLASS} aria-hidden="true">
+          <Sparkles className="size-[22px]" strokeWidth={1.8} />
+        </div>
+        <Link to={detailHref} className="min-w-0 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--gg-cobalt)]">
+          <h2 className="gg-type-card-title truncate">{item.name_zh || item.name}</h2>
+          {item.name_zh && <p className="gg-type-caption mt-[2px] truncate">英文：<span translate="no">{item.name}</span></p>}
+          <p className="gg-type-code mt-[4px] truncate text-[var(--gg-text-muted)]" translate="no">{item.source_path}</p>
+        </Link>
+        <CatalogBadge tone={item.risk_level === 'high' ? 'red' : item.risk_level === 'medium' ? 'amber' : 'green'}>{RISK_LABELS[item.risk_level]}</CatalogBadge>
+      </div>
+
+      <p className={RESOURCE_CARD_DESCRIPTION_CLASS}>{item.description_zh || item.description || '暂无描述'}</p>
+
+      <div className={cn(RESOURCE_CARD_FOOTER_CLASS, 'justify-between gap-[10px]')}>
+        <div className="flex min-w-0 flex-wrap items-center gap-[6px]">
+          <CatalogBadge tone="blue">{item.category}</CatalogBadge>
+          <CatalogBadge tone="gray">{STABILITY_LABELS[item.stability]}</CatalogBadge>
+          <CatalogBadge tone={item.status === 'published' ? 'green' : 'blue'}>{STATUS_LABELS[item.status]}</CatalogBadge>
+        </div>
+        <Link to={detailHref} className="gg-type-control flex shrink-0 items-center gap-[4px] text-[var(--gg-interaction)] hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--gg-interaction)]">
+          查看详情 <ExternalLink className="size-[12px]" />
         </Link>
       </div>
-      <p className="gg-type-body mt-[12px] line-clamp-3 min-h-[60px]">{item.description_zh || item.description || '暂无描述'}</p>
-      <div className="mt-auto flex flex-wrap items-center gap-[6px] pt-[14px]">
-        <CatalogBadge tone="blue">{item.category}</CatalogBadge>
-        <CatalogBadge tone="gray">{STABILITY_LABELS[item.stability]}</CatalogBadge>
-        <CatalogBadge tone={item.status === 'published' ? 'green' : 'blue'}>{STATUS_LABELS[item.status]}</CatalogBadge>
-      </div>
-      <Link to={detailHref} className="gg-type-control mt-[13px] flex items-center gap-[4px] self-start text-[var(--gg-interaction)] hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--gg-interaction)]">
-        查看详情 <ExternalLink className="size-[12px]" />
-      </Link>
     </article>
   );
 }
@@ -1318,7 +1326,7 @@ function CatalogSelect({
 }) {
   return (
     <Select value={value || 'all'} onValueChange={(next) => onChange(next === 'all' ? '' : next)}>
-      <SelectTrigger aria-label={label} className={cn(SELECT_TRIGGER_CLASS, 'w-full text-[12px]')}>
+      <SelectTrigger aria-label={label} className={cn(SELECT_TRIGGER_CLASS, 'w-full gg-type-meta')}>
         <SelectValue placeholder={label} />
       </SelectTrigger>
       <SelectContent>
@@ -1337,7 +1345,7 @@ function CatalogBadge({
   children: ReactNode;
 }) {
   return <span className={cn(
-    'gg-type-caption inline-flex max-w-full items-center rounded-[var(--gg-radius-control)] px-[8px] py-[4px]',
+    'gg-type-caption inline-flex max-w-full shrink-0 items-center whitespace-nowrap rounded-[var(--gg-radius-control)] px-[8px] py-[4px]',
     tone === 'blue' && 'bg-[var(--gg-interaction-soft)] text-[var(--gg-interaction)]',
     tone === 'green' && 'bg-[var(--gg-state-success-soft)] text-[var(--gg-state-success)]',
     tone === 'amber' && 'bg-[var(--gg-state-warning-soft)] text-[var(--gg-state-warning)]',

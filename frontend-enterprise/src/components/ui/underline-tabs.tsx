@@ -61,7 +61,7 @@ export function UnderlineTabs<T extends string = string>({
             disabled={item.disabled}
             onClick={() => onChange(item.value)}
             className={cn(
-              'relative flex w-[120px] items-start justify-center px-[16px] text-[14px] capitalize transition-colors outline-none',
+              'relative flex w-[120px] items-start justify-center px-[16px] gg-type-control capitalize transition-colors outline-none',
               isLine ? 'pt-[6px] pb-[8px] mb-[-0.5px] border-b-2' : 'py-[6px]',
               isLine
                 ? active

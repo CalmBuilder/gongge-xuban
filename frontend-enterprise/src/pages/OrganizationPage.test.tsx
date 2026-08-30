@@ -237,7 +237,10 @@ it('shows the organization ledger, position history and position-derived role so
   expect(screen.getAllByText('成员一').length).toBeGreaterThan(0);
   expect(screen.getAllByText('财务审批人')).toHaveLength(2);
   expect(screen.getAllByText('主要负责人').length).toBeGreaterThan(0);
-  expect(screen.getByText(/责任关系，不自动授予角色或权限/)).toBeVisible();
+  expect(screen.getByText(/责任关系，不自动授予角色或权限/)).toHaveClass('gg-type-meta');
+  expect(screen.getByText('岗位目录')).toHaveClass('gg-type-card-title');
+  expect(screen.getByText('选择岗位查看任职与默认角色')).toHaveClass('gg-type-meta');
+  expect(screen.getAllByText('成员一', { exact: true }).some((element) => element.classList.contains('gg-type-control'))).toBe(true);
   expect(screen.getByText('岗位带入')).toBeVisible();
   expect(screen.getByText(/决定流程候选资格/)).toBeVisible();
   expect(screen.getByRole('region', { name: '岗位流程责任影响' })).toBeVisible();

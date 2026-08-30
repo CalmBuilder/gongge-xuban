@@ -202,7 +202,7 @@ export default function ModelSetupDialog({
             </div>
           </div>
         ) : (
-          <div className="flex items-start gap-[10px] rounded-[8px] border border-[#f0d9a8] bg-[#fffaf0] p-[12px] text-[13px] text-[#7b5c16]">
+          <div className="flex items-start gap-[10px] rounded-[8px] border border-[#f0d9a8] bg-[#fffaf0] p-[12px] gg-type-control text-[#7b5c16]">
             <AlertCircle className="mt-[1px] size-[16px] shrink-0" />
             <span>当前账号没有模型管理权限，请联系管理员完成模型配置和连通性测试。</span>
           </div>
@@ -211,8 +211,8 @@ export default function ModelSetupDialog({
         {testResult && (
           <div
             className={testResult.success
-              ? 'flex items-start gap-[10px] rounded-[8px] border border-[#b7e4c7] bg-[#f0fbf4] p-[12px] text-[13px] text-[#247447]'
-              : 'flex items-start gap-[10px] rounded-[8px] border border-[#f2c4c4] bg-[#fff5f5] p-[12px] text-[13px] text-[#b42318]'}
+              ? 'flex items-start gap-[10px] rounded-[8px] border border-[#b7e4c7] bg-[#f0fbf4] p-[12px] gg-type-control text-[#247447]'
+              : 'flex items-start gap-[10px] rounded-[8px] border border-[#f2c4c4] bg-[#fff5f5] p-[12px] gg-type-control text-[#b42318]'}
           >
             {testResult.success
               ? <CheckCircle2 className="mt-[1px] size-[16px] shrink-0" />
@@ -252,7 +252,7 @@ export default function ModelSetupDialog({
 function LabeledField({ label, children }: { label: string; children: ReactNode }) {
   return (
     <label className="flex min-w-0 flex-col gap-[6px]">
-      <span className="text-[12px] font-medium text-[#464c5e]">{label}</span>
+      <span className="gg-type-meta font-medium text-[#464c5e]">{label}</span>
       {children}
     </label>
   );

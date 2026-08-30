@@ -329,8 +329,8 @@ export default function AttentionCenter() {
             {activeCount > 0 ? <span className="absolute -right-[4px] -top-[4px] size-[9px] rounded-full border-2 border-white bg-[#ef8b2c]" /> : null}
           </span>
           <span className="min-w-0">
-            <strong className="block text-[15px] font-semibold tracking-[-0.01em] text-[#18181a]">待我处理</strong>
-            <span className="mt-[2px] block text-[12px] leading-[1.5] text-[#6f7892]">任务缺少信息或需要决定时，会在这里暂停；处理后从原执行记录继续。</span>
+            <strong className="block gg-type-body font-semibold tracking-[-0.01em] text-[#18181a]">待我处理</strong>
+            <span className="mt-[2px] block gg-type-meta  text-[#6f7892]">任务缺少信息或需要决定时，会在这里暂停；处理后从原执行记录继续。</span>
           </span>
         </div>
         <Button variant="ghost" size="sm" disabled={loading} onClick={() => void loadItems(view)} aria-label="刷新待处理事项">
@@ -350,7 +350,7 @@ export default function AttentionCenter() {
               aria-selected={view === option.value}
               onClick={() => setView(option.value)}
               className={cn(
-                'inline-flex h-[32px] items-center gap-[6px] rounded-[9px] px-[11px] text-[12px] transition-colors',
+                'inline-flex h-[32px] items-center gap-[6px] rounded-[9px] px-[11px] gg-type-meta transition-colors',
                 view === option.value ? 'bg-[#eef1fb] font-semibold text-[#244bc7]' : 'text-[#757f9c] hover:bg-[#f6f7fa]',
               )}
             >
@@ -363,7 +363,7 @@ export default function AttentionCenter() {
 
       <div className="grid gap-[8px] px-[18px] py-[14px]" aria-live="polite">
         {items.length === 0 ? (
-          <div className="flex min-h-[76px] items-center justify-center rounded-[12px] border border-dashed border-[#dfe4ef] bg-[#fafbfc] px-[16px] text-[12px] text-[#858b9c]">
+          <div className="flex min-h-[76px] items-center justify-center rounded-[12px] border border-dashed border-[#dfe4ef] bg-[#fafbfc] px-[16px] gg-type-meta text-[#858b9c]">
             {loading ? '正在加载待处理事项' : view === 'active' ? '当前没有需要你处理的事项' : '暂无最近处理记录'}
           </div>
         ) : items.map((item) => (
@@ -377,10 +377,10 @@ export default function AttentionCenter() {
               {item.kind === 'reauth' ? <KeyRound className="size-[17px]" /> : ['tool_approval', 'publication'].includes(item.kind) ? <ShieldCheck className="size-[17px]" /> : <CircleHelp className="size-[17px]" />}
             </span>
             <span className="min-w-0">
-              <strong className="block truncate text-[13px] font-semibold text-[#252936]">{item.title || attentionKindLabel(item.kind)}</strong>
-              <span className="mt-[2px] block truncate text-[12px] text-[#737c95]">{attentionQuestion(item)}</span>
+              <strong className="block truncate gg-type-control font-semibold text-[#252936]">{item.title || attentionKindLabel(item.kind)}</strong>
+              <span className="mt-[2px] block truncate gg-type-meta text-[#737c95]">{attentionQuestion(item)}</span>
             </span>
-            <span className="grid justify-items-end gap-[3px] text-[11px] text-[#8a91a4]">
+            <span className="grid justify-items-end gap-[3px] gg-type-caption text-[#8a91a4]">
               <span className={cn('rounded-full px-[8px] py-[2px]', item.status === 'completed' ? 'bg-[#eaf8ef] text-[#018434]' : 'bg-[#fff5df] text-[#936000]')}>
                 {item.status === 'completed' ? '已处理' : '等待处理'}
               </span>
@@ -401,17 +401,17 @@ export default function AttentionCenter() {
           {selected ? (
             <>
               <div>
-                <DialogTitle className="text-[15px] font-semibold text-[#18181a]">{selected.title || attentionKindLabel(selected.kind)}</DialogTitle>
-                <div className="mt-[5px] flex flex-wrap items-center gap-[7px] text-[11px] text-[#858b9c]">
+                <DialogTitle className="gg-type-card-title font-semibold text-[#18181a]">{selected.title || attentionKindLabel(selected.kind)}</DialogTitle>
+                <div className="mt-[5px] flex flex-wrap items-center gap-[7px] gg-type-caption text-[#858b9c]">
                   <span className="inline-flex items-center gap-[4px]"><Route className="size-[12px]" />执行 {selected.execution_id}</span>
                   {execution ? <span>状态 {execution.status} · 修订 {execution.revision}</span> : null}
                 </div>
               </div>
-              <div className="rounded-[12px] border border-[#e5e9f3] bg-[#f8faff] px-[13px] py-[12px] text-[13px] leading-[1.65] text-[#313747]">
+              <div className="rounded-[12px] border border-[#e5e9f3] bg-[#f8faff] px-[13px] py-[12px] gg-type-control  text-[#313747]">
                 {attentionQuestion(selected)}
               </div>
               {selected.kind === 'clarification' ? (
-                <p className="rounded-[11px] border border-[#dce5ff] bg-[#f7f9ff] px-[12px] py-[10px] text-[11px] leading-[1.6] text-[#52617f]">
+                <p className="rounded-[11px] border border-[#dce5ff] bg-[#f7f9ff] px-[12px] py-[10px] gg-type-caption  text-[#52617f]">
                   安全边界：这里只提交补充信息，按只读方式继续；不会执行附件或文本中的命令，也不会改动系统或外部数据。
                 </p>
               ) : null}
@@ -419,21 +419,21 @@ export default function AttentionCenter() {
                 <div className="grid gap-[9px] rounded-[12px] border border-[#dce5ff] bg-[#fbfcff] px-[13px] py-[12px]" aria-label={isWorkspaceApproval(selected) ? '待批准受管代码操作' : '待批准外部写'}>
                   {isWorkspaceApproval(selected) ? (
                     <>
-                      <div className="flex flex-wrap items-center justify-between gap-[10px] text-[11px] text-[#68738d]">
+                      <div className="flex flex-wrap items-center justify-between gap-[10px] gg-type-caption text-[#68738d]">
                         <span>受管工作区：{workspaceField(selected, 'workspace_id') || '未标识'} · 基线 {workspaceField(selected, 'base_ref') || '未标识'}</span>
-                        <code className="font-mono">{workspaceField(selected, 'handler')}</code>
+                        <code className="font-mono gg-type-code">{workspaceField(selected, 'handler')}</code>
                       </div>
-                      <pre className="max-h-[260px] overflow-auto whitespace-pre-wrap break-words rounded-[9px] bg-white p-[10px] text-[12px] leading-[1.65] text-[#283044]">{JSON.stringify(selected.payload.arguments || {}, null, 2)}</pre>
-                      <p className="text-[11px] leading-[1.6] text-[#6a7388]">批准只绑定本次 Execution、Operation、参数、工作区与能力修订；路径、内容或工具授权变化后不会沿用。</p>
+                      <pre className="max-h-[260px] overflow-auto whitespace-pre-wrap break-words rounded-[9px] bg-white p-[10px] gg-type-meta  text-[#283044]">{JSON.stringify(selected.payload.arguments || {}, null, 2)}</pre>
+                      <p className="gg-type-caption  text-[#6a7388]">批准只绑定本次 Execution、Operation、参数、工作区与能力修订；路径、内容或工具授权变化后不会沿用。</p>
                     </>
                   ) : (
                     <>
-                      <div className="flex items-center justify-between gap-[10px] text-[11px] text-[#68738d]">
+                      <div className="flex items-center justify-between gap-[10px] gg-type-caption text-[#68738d]">
                         <span>目标：当前企业微信会话</span>
-                        <code className="font-mono">{stringPayload(selected, 'content_checksum').slice(0, 12)}</code>
+                        <code className="font-mono gg-type-code">{stringPayload(selected, 'content_checksum').slice(0, 12)}</code>
                       </div>
-                      <pre className="max-h-[220px] overflow-auto whitespace-pre-wrap break-words rounded-[9px] bg-white p-[10px] text-[12px] leading-[1.65] text-[#283044]">{stringPayload(selected, 'content')}</pre>
-                      <p className="text-[11px] leading-[1.6] text-[#6a7388]">批准只绑定本次 Operation、正文、目标、能力与连接修订；任何变化都会重新进入待处理。</p>
+                      <pre className="max-h-[220px] overflow-auto whitespace-pre-wrap break-words rounded-[9px] bg-white p-[10px] gg-type-meta  text-[#283044]">{stringPayload(selected, 'content')}</pre>
+                      <p className="gg-type-caption  text-[#6a7388]">批准只绑定本次 Operation、正文、目标、能力与连接修订；任何变化都会重新进入待处理。</p>
                     </>
                   )}
                 </div>
@@ -441,50 +441,50 @@ export default function AttentionCenter() {
               {selected.kind === 'publication' && stringPayload(selected, 'publication_request_id') ? (
                 <div className="grid gap-[10px] rounded-[12px] border border-[#dce5ff] bg-[#fbfcff] px-[13px] py-[12px]" aria-label="组织发布审核">
                   <strong>{stringPayload(selected, 'publication_request_kind') === 'agent' ? '整 Agent 发布申请' : 'Skill 发布申请'}</strong>
-                  <span className="text-[12px]">资源：{stringPayload(selected, 'resource_name')}</span>
-                  <span className="break-all text-[12px]">冻结快照：<code>{stringPayload(selected, 'snapshot_checksum')}</code></span>
-                  <p className="text-[11px] leading-[1.6] text-[#6a7388]">提交人与审核人分离；批准生成独立 Release，之后私有修改不会改写该已审快照。</p>
+                  <span className="gg-type-meta">资源：{stringPayload(selected, 'resource_name')}</span>
+                  <span className="break-all gg-type-meta">冻结快照：<code>{stringPayload(selected, 'snapshot_checksum')}</code></span>
+                  <p className="gg-type-caption  text-[#6a7388]">提交人与审核人分离；批准生成独立 Release，之后私有修改不会改写该已审快照。</p>
                 </div>
               ) : selected.kind === 'publication' ? (
                 <div className="grid gap-[10px] rounded-[12px] border border-[#dce5ff] bg-[#fbfcff] px-[13px] py-[12px]" aria-label="待审核 Skill 提案">
                   {stringPayload(selected, 'proposal_kind') === 'remote_import' ? (
-                    <div className="grid gap-[5px] text-[12px] text-[#4f5870]">
-                      <span>类型：<strong className="text-[#252b3b]">固定 GitHub Skill 导入建议</strong></span>
+                    <div className="grid gap-[5px] gg-type-meta text-[#4f5870]">
+                      <span>类型：<strong className="gg-type-control text-[#252b3b]">固定 GitHub Skill 导入建议</strong></span>
                       <span className="break-all">来源：<code>{stringPayload(selected, 'source_reference_redacted')}</code></span>
                       <span>预览校验：<code>{stringPayload(selected, 'preview_checksum').slice(0, 16)}</code></span>
                       <span>候选内容和风险：见下方冻结审核摘要；批准前不会创建 Skill 或绑定。</span>
                     </div>
                   ) : (
-                    <div className="grid gap-[5px] text-[12px] text-[#4f5870] sm:grid-cols-2">
-                      <span>Skill：<strong className="text-[#252b3b]">{stringPayload(selected, 'name')}</strong></span>
+                    <div className="grid gap-[5px] gg-type-meta text-[#4f5870] sm:grid-cols-2">
+                      <span>Skill：<strong className="gg-type-control text-[#252b3b]">{stringPayload(selected, 'name')}</strong></span>
                       <span>调用策略：<code>user_only</code></span>
                       <span className="sm:col-span-2">说明：{stringPayload(selected, 'description')}</span>
                       <span className="sm:col-span-2">请求工具：{stringArrayPayload(selected, 'requested_tools').join('、') || '无（不会获得新工具授权）'}</span>
                     </div>
                   )}
                   <div className="rounded-[9px] border border-[#e5e9f3] bg-white p-[10px]">
-                    <div className="mb-[7px] flex items-center justify-between text-[11px] text-[#70798f]">
+                    <div className="mb-[7px] flex items-center justify-between gg-type-caption text-[#70798f]">
                       <span>{stringPayload(selected, 'proposal_kind') === 'remote_import' ? '固定来源、checksum、候选与风险摘要' : '完整 diff、权限与 Artifact 来源'}</span>
                       <code>{(stringPayload(selected, 'preview_checksum') || stringPayload(selected, 'content_checksum')).slice(0, 12)}</code>
                     </div>
-                    <pre className="max-h-[360px] overflow-auto whitespace-pre-wrap break-words text-[12px] leading-[1.65] text-[#283044]">{proposalReview?.content || '正在加载审核 Artifact…'}</pre>
+                    <pre className="max-h-[360px] overflow-auto whitespace-pre-wrap break-words gg-type-meta  text-[#283044]">{proposalReview?.content || '正在加载审核 Artifact…'}</pre>
                   </div>
-                  <p className="text-[11px] leading-[1.6] text-[#6a7388]">批准后才会消费冻结预览、发布不可变修订并绑定当前分身；拒绝、过期、来源或校验值变化都不会进入 Skill 目录。</p>
+                  <p className="gg-type-caption  text-[#6a7388]">批准后才会消费冻结预览、发布不可变修订并绑定当前分身；拒绝、过期、来源或校验值变化都不会进入 Skill 目录。</p>
                 </div>
               ) : null}
               {execution?.goal ? (
                 <div className="grid gap-[8px] rounded-[12px] border border-[#e7eaf2] bg-white px-[13px] py-[11px]" aria-label="执行计划">
                   <div className="flex items-center justify-between gap-[12px]">
-                    <span className="min-w-0 truncate text-[12px] font-medium text-[#343949]">{execution.goal}</span>
-                    <span className="shrink-0 text-[11px] text-[#7b849c]">{budgetSummary(execution)}</span>
+                    <span className="min-w-0 truncate gg-type-meta font-medium text-[#343949]">{execution.goal}</span>
+                    <span className="shrink-0 gg-type-caption text-[#7b849c]">{budgetSummary(execution)}</span>
                   </div>
                   {Array.isArray(execution.steps) && execution.steps.length > 0 ? (
                     <ol className="grid gap-[5px]">
                       {execution.steps.map((step, index) => (
-                        <li key={step.step_key} className="grid grid-cols-[18px_minmax(0,1fr)_auto] items-center gap-[7px] text-[11px]">
+                        <li key={step.step_key} className="grid grid-cols-[18px_minmax(0,1fr)_auto] items-center gap-[7px] gg-type-caption">
                           <span className={cn('grid size-[18px] place-items-center rounded-full font-semibold', ['completed', 'succeeded'].includes(step.status) ? 'bg-[#e6f6ec] text-[#087a38]' : step.status === 'waiting' || step.status === 'running' ? 'bg-[#fff0d8] text-[#996000]' : 'bg-[#eef1f6] text-[#778097]')}>{index + 1}</span>
                           <span className="truncate text-[#4f576d]">{step.title}</span>
-                          <span className="text-[#8991a5]">{stepStatusLabel(step.status)}</span>
+                          <span className="gg-type-caption text-[#8991a5]">{stepStatusLabel(step.status)}</span>
                         </li>
                       ))}
                     </ol>
@@ -494,14 +494,14 @@ export default function AttentionCenter() {
               {attentionOptions(selected).length > 0 && selected.status !== 'completed' && selected.kind !== 'reauth' ? (
                 <div className="flex flex-wrap gap-[7px]" aria-label="可选答案">
                   {attentionOptions(selected).map((option) => (
-                    <button key={option} type="button" onClick={() => setAnswer(option)} className={cn('rounded-full border px-[10px] py-[5px] text-[12px]', answer === option ? 'border-[#3157e8] bg-[#eef1fb] text-[#244bc7]' : 'border-[#dfe4ef] text-[#5f6880] hover:border-[#aebcf0]')}>
+                    <button key={option} type="button" onClick={() => setAnswer(option)} className={cn('rounded-full border px-[10px] py-[5px] gg-type-meta', answer === option ? 'border-[#3157e8] bg-[#eef1fb] text-[#244bc7]' : 'border-[#dfe4ef] text-[#5f6880] hover:border-[#aebcf0]')}>
                       {option}
                     </button>
                   ))}
                 </div>
               ) : null}
               {selected.status === 'completed' ? (
-                <div className="rounded-[11px] bg-[#f2f8f4] px-[12px] py-[10px] text-[12px] text-[#25623c]">处理结果：{String(selected.resolution.comment || selected.resolution.command || '已完成')}</div>
+                <div className="rounded-[11px] bg-[#f2f8f4] px-[12px] py-[10px] gg-type-meta text-[#25623c]">处理结果：{String(selected.resolution.comment || selected.resolution.command || '已完成')}</div>
               ) : selected.kind === 'reauth' ? (
                 <div className="grid gap-[10px]">
                   {selectedReauthProvider === 'wecom' ? (
@@ -513,13 +513,13 @@ export default function AttentionCenter() {
                   ) : (
                     <ReauthField label="新的 Slack Bot Token" value={reauthToken} onChange={setReauthToken} secret autoFocus placeholder="xoxb-…" />
                   )}
-                  <div className="rounded-[11px] border border-[#dce5ff] bg-[#f7f9ff] px-[12px] py-[10px] text-[11px] leading-[1.6] text-[#52617f]">
+                  <div className="rounded-[11px] border border-[#dce5ff] bg-[#f7f9ff] px-[12px] py-[10px] gg-type-caption  text-[#52617f]">
                     {selectedReauthProvider === 'wecom' ? '新凭据必须属于同一企业微信自建应用。验证成功后，系统通过持久信号恢复原 Operation。' : '新凭据必须属于同一 Slack 工作区并包含 channels:read。验证成功后，系统通过持久信号恢复原 Operation。'}
                   </div>
                 </div>
               ) : ['tool_approval', 'publication'].includes(selected.kind) ? null : (
                 <label className="grid gap-[6px]">
-                  <span className="text-[12px] font-medium text-[#464c5e]">{selected.kind === 'exception' ? '外部对账证据（必填）' : '补充信息'}</span>
+                  <span className="gg-type-meta font-medium text-[#464c5e]">{selected.kind === 'exception' ? '外部对账证据（必填）' : '补充信息'}</span>
                   <Textarea value={answer} onChange={(event) => setAnswer(event.target.value)} rows={4} placeholder={selected.kind === 'exception' ? '填写后台记录、客户端核对结果或工单证据；系统不会自动重发' : '填写任务继续执行所需的准确信息'} />
                 </label>
               )}
@@ -563,7 +563,7 @@ function ReauthField({
 
   return (
     <label className="grid gap-[6px]">
-      <span className="text-[12px] font-medium text-[#464c5e]">{label}</span>
+      <span className="gg-type-meta font-medium text-[#464c5e]">{label}</span>
       <input
         autoFocus={autoFocus}
         type={secret ? 'password' : 'text'}
@@ -571,7 +571,7 @@ function ReauthField({
         value={value}
         onChange={(event) => onChange(event.target.value)}
         placeholder={placeholder}
-        className="h-[38px] rounded-[10px] border border-[#dfe4ef] bg-white px-[11px] text-[13px] outline-none transition focus:border-[#3157e8] focus:ring-2 focus:ring-[#3157e8]/15"
+        className="h-[38px] rounded-[10px] border border-[#dfe4ef] bg-white px-[11px] gg-type-control outline-none transition focus:border-[#3157e8] focus:ring-2 focus:ring-[#3157e8]/15"
       />
     </label>
   );

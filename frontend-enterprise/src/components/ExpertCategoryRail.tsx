@@ -31,8 +31,8 @@ function CategoryButton({
       className={cn(
         'shrink-0 rounded-[10px] text-left outline-none transition-[background-color,color,box-shadow] focus-visible:ring-2 focus-visible:ring-[var(--gg-cobalt)] focus-visible:ring-offset-2',
         compact
-          ? 'inline-flex h-[36px] items-center gap-[6px] border border-[var(--gg-border)] bg-white px-[12px] text-[12px]'
-          : 'flex w-full items-center justify-between px-[10px] py-[8px] text-[13px]',
+          ? 'inline-flex h-[36px] items-center gap-[6px] border border-[var(--gg-border)] bg-white px-[12px] gg-type-meta'
+          : 'flex w-full items-center justify-between px-[10px] py-[8px] gg-type-control',
         selected
           ? 'bg-[var(--gg-cobalt)] font-semibold text-white shadow-[0_6px_16px_rgba(49,87,232,0.18)]'
           : 'text-[#46516a] hover:bg-[#f4f6fc]',
@@ -42,7 +42,7 @@ function CategoryButton({
       <span>{label}</span>
       <span
         className={cn(
-          'rounded-full px-[6px] py-[1px] text-[11px] leading-[16px]',
+          'rounded-full px-[6px] py-[1px] gg-type-caption ',
           selected ? 'bg-white/20 text-white/90' : 'bg-[#eff1f7] text-[#757f9c]',
         )}
       >
@@ -66,7 +66,7 @@ export default function ExpertCategoryRail({
         aria-label="专家专业部门"
         className="sticky top-[20px] hidden self-start rounded-[16px] border border-[var(--gg-border)] bg-white p-[12px] shadow-[0_1px_4px_rgba(15,23,42,0.04)] lg:block"
       >
-        <p className="px-[10px] pb-[8px] pt-[2px] text-[12px] font-semibold text-[#30394e]">
+        <p className="px-[10px] pb-[8px] pt-[2px] gg-type-meta font-semibold text-[#30394e]">
           专业部门
         </p>
         <nav className="flex max-h-[calc(100vh-180px)] flex-col gap-[2px] overflow-y-auto" aria-label="专家部门列表">

@@ -197,11 +197,11 @@ export default function DynamicExecutionControl({ executionId }: { executionId: 
     <div className="mt-[10px] rounded-[12px] border border-[#dfe5f2] bg-[linear-gradient(105deg,#f8faff,#f5fbf8)] px-[12px] py-[10px]" aria-label={dynamicExecution ? '动态任务控制' : 'SOP执行结果'}>
       <div className="flex flex-wrap items-center justify-between gap-[8px]">
         <span className="min-w-0">
-          <span className="flex items-center gap-[6px] text-[12px] font-semibold text-[#343949]">
+          <span className="flex items-center gap-[6px] gg-type-meta font-semibold text-[#343949]">
             <Route className="size-[13px] text-[#3157e8]" />
             <span className="truncate">{execution.goal || (dynamicExecution ? '动态任务' : 'SOP 执行')}</span>
           </span>
-          <span className="mt-[2px] block text-[11px] text-[#7b849c]">
+          <span className="mt-[2px] block gg-type-caption text-[#7b849c]">
             {executionStatusLabel(execution.status)}{execution.current_step_key ? ` · ${execution.current_step_key}` : ''}
             {execution.plan_revision_number ? ` · 计划 v${execution.plan_revision_number}` : ''}
           </span>
@@ -224,9 +224,9 @@ export default function DynamicExecutionControl({ executionId }: { executionId: 
       {execution.parallel_waves?.length ? (
         <div className="mt-[8px] grid gap-[5px]" aria-label="并行读取记录">
           {execution.parallel_waves.map((wave) => (
-            <div key={wave.id} className="rounded-[8px] border border-[#dfe5f2] bg-white px-[9px] py-[7px] text-[11px] text-[#4f576d]">
-              <span className="font-medium text-[#3157e8]">并行读取 · {wave.parallelism} 路 · {parallelStatusLabel(wave.status)}</span>
-              <span className="mt-[2px] block break-all text-[#7b849c]">{wave.ordered_step_keys.join(' → ')}</span>
+            <div key={wave.id} className="rounded-[8px] border border-[#dfe5f2] bg-white px-[9px] py-[7px] gg-type-caption text-[#4f576d]">
+              <span className="gg-type-meta font-medium text-[#3157e8]">并行读取 · {wave.parallelism} 路 · {parallelStatusLabel(wave.status)}</span>
+              <span className="mt-[2px] block break-all gg-type-caption text-[#7b849c]">{wave.ordered_step_keys.join(' → ')}</span>
             </div>
           ))}
         </div>
@@ -237,19 +237,19 @@ export default function DynamicExecutionControl({ executionId }: { executionId: 
             <button
               key={artifact.id}
               type="button"
-              className="flex items-center justify-between gap-[8px] rounded-[8px] border border-[#dfe5f2] bg-white px-[9px] py-[7px] text-left text-[11px] text-[#4f576d] hover:border-[#b9c5ee] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#3157e8]"
+              className="flex items-center justify-between gap-[8px] rounded-[8px] border border-[#dfe5f2] bg-white px-[9px] py-[7px] text-left gg-type-caption text-[#4f576d] hover:border-[#b9c5ee] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#3157e8]"
               onClick={() => void downloadArtifact(artifact.id, artifact.filename)}
             >
               <span className="truncate">{artifact.filename}</span>
-              <span className="flex shrink-0 items-center gap-[4px] text-[#3157e8]"><Download className="size-[12px]" />下载</span>
+              <span className="flex shrink-0 items-center gap-[4px] gg-type-caption text-[#3157e8]"><Download className="size-[12px]" />下载</span>
             </button>
           ))}
         </div>
       ) : null}
       <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
         <DialogContent aria-describedby={undefined} className="gap-[14px] rounded-[14px] sm:max-w-[500px]">
-          <DialogTitle className="text-[15px]">追加当前任务约束</DialogTitle>
-          <p className="text-[12px] leading-[1.6] text-[#69728a]">已完成步骤和证据会保留；新约束只在当前外部动作安全结束后应用。若要开始无关目标，请直接发送一条新消息。</p>
+          <DialogTitle className="gg-type-card-title">追加当前任务约束</DialogTitle>
+          <p className="gg-type-meta  text-[#69728a]">已完成步骤和证据会保留；新约束只在当前外部动作安全结束后应用。若要开始无关目标，请直接发送一条新消息。</p>
           <Textarea value={instruction} onChange={(event) => setInstruction(event.target.value)} maxLength={4000} rows={4} placeholder="例如：只分析 2026 年内到期合同，并排除已终止记录" />
           <div className="flex justify-end gap-[8px]">
             <Button variant="outline" disabled={submitting} onClick={() => setDialogOpen(false)}>关闭</Button>
@@ -259,24 +259,24 @@ export default function DynamicExecutionControl({ executionId }: { executionId: 
       </Dialog>
       <Dialog open={skillDialogOpen} onOpenChange={setSkillDialogOpen}>
         <DialogContent aria-describedby={undefined} className="gap-[14px] rounded-[14px] sm:max-w-[560px]">
-          <DialogTitle className="text-[15px]">给当前任务增加 Skill</DialogTitle>
-          <p className="text-[12px] leading-[1.6] text-[#69728a]">系统会重新校验当前用户、数字员工和会话权限，固定不可变修订后生成新计划；已完成步骤不会被伪装成重做。</p>
+          <DialogTitle className="gg-type-card-title">给当前任务增加 Skill</DialogTitle>
+          <p className="gg-type-meta  text-[#69728a]">系统会重新校验当前用户、数字员工和会话权限，固定不可变修订后生成新计划；已完成步骤不会被伪装成重做。</p>
           {skillCatalogLoading ? (
-            <div className="flex items-center gap-[6px] py-[18px] text-[12px] text-[#69728a]"><LoaderCircle className="size-[14px] animate-spin" />正在读取当前会话可用 Skill</div>
+            <div className="flex items-center gap-[6px] py-[18px] gg-type-meta text-[#69728a]"><LoaderCircle className="size-[14px] animate-spin" />正在读取当前会话可用 Skill</div>
           ) : availableSkills.length ? (
             <RadioGroup value={selectedSkillId} onValueChange={setSelectedSkillId} aria-label="可追加 Skill">
               {availableSkills.map((skill) => (
                 <label key={skill.skill_id} className="flex cursor-pointer items-start gap-[10px] rounded-[10px] border border-[#dfe5f2] bg-white px-[11px] py-[10px] hover:border-[#b9c5ee]">
                   <RadioGroupItem value={skill.skill_id} aria-label={`${skill.name} 修订 ${skill.revision_number}`} className="mt-[2px]" />
                   <span className="min-w-0">
-                    <span className="block text-[12px] font-medium text-[#343949]">{skill.name}</span>
-                    <span className="mt-[2px] block text-[11px] leading-[1.5] text-[#7b849c]">固定修订 v{skill.revision_number} · {skill.description}</span>
+                    <span className="block gg-type-meta font-medium text-[#343949]">{skill.name}</span>
+                    <span className="mt-[2px] block gg-type-caption  text-[#7b849c]">固定修订 v{skill.revision_number} · {skill.description}</span>
                   </span>
                 </label>
               ))}
             </RadioGroup>
           ) : (
-            <div className="rounded-[10px] bg-[#f6f7fb] px-[12px] py-[16px] text-center text-[12px] text-[#69728a]">当前会话没有可追加的 Skill</div>
+            <div className="rounded-[10px] bg-[#f6f7fb] px-[12px] py-[16px] text-center gg-type-meta text-[#69728a]">当前会话没有可追加的 Skill</div>
           )}
           <div className="flex justify-end gap-[8px]">
             <Button variant="outline" disabled={submitting} onClick={() => setSkillDialogOpen(false)}>关闭</Button>
@@ -293,7 +293,7 @@ function CommandStatus({ command }: { command: CommandState }) {
   const applied = command.status === 'applied';
   const Icon = pending ? LoaderCircle : applied ? CircleCheck : CircleX;
   return (
-    <div className={cn('mt-[8px] flex items-center gap-[6px] rounded-[8px] px-[8px] py-[6px] text-[11px]', pending ? 'bg-[#fff5df] text-[#8a5b00]' : applied ? 'bg-[#eaf8ef] text-[#16723c]' : 'bg-[#fff0f0] text-[#9b3434]')} role="status">
+    <div className={cn('mt-[8px] flex items-center gap-[6px] rounded-[8px] px-[8px] py-[6px] gg-type-caption', pending ? 'bg-[#fff5df] text-[#8a5b00]' : applied ? 'bg-[#eaf8ef] text-[#16723c]' : 'bg-[#fff0f0] text-[#9b3434]')} role="status">
       <Icon className={cn('size-[13px]', pending && 'animate-spin')} />
       {commandStatusLabel(command)}
     </div>

@@ -5,19 +5,19 @@ import { cn } from '@/lib/utils';
 export type StatCardTone = 'default' | 'green' | 'red';
 
 const SURFACE_CLASS: Record<StatCardTone, string> = {
-  default: 'bg-[#f6f6f6]',
-  green: 'bg-[#e9f7ef]',
-  red: 'bg-[#fce7e7]',
+  default: 'border-[var(--gg-line)] bg-[var(--gg-surface)]',
+  green: 'border-[var(--gg-capability-line)] bg-[var(--gg-state-success-soft)]',
+  red: 'border-[var(--gg-state-danger)] bg-[var(--gg-state-danger-soft)]',
 };
 const VALUE_CLASS: Record<StatCardTone, string> = {
-  default: 'text-[#18181a]',
-  green: 'text-[#2cb360]',
-  red: 'text-[#d20b0b]',
+  default: 'text-[var(--gg-text-primary)]',
+  green: 'text-[var(--gg-state-success)]',
+  red: 'text-[var(--gg-state-danger)]',
 };
 const LABEL_CLASS: Record<StatCardTone, string> = {
-  default: 'text-[#464c5e]',
-  green: 'text-[#2cb360]',
-  red: 'text-[#d20b0b]',
+  default: 'text-[var(--gg-text-secondary)]',
+  green: 'text-[var(--gg-state-success)]',
+  red: 'text-[var(--gg-state-danger)]',
 };
 
 export type StatCardProps = {
@@ -38,17 +38,18 @@ export type StatCardProps = {
 export function StatCard({ value, label, tone = 'default', valueClassName, className }: StatCardProps) {
   return (
     <div
+      data-card-family="metric"
       className={cn(
-        'flex h-[70px] flex-1 basis-[180px] items-center rounded-[14px] px-[24px] py-[8px]',
+        'gg-stat-card flex min-h-[136px] flex-1 basis-[220px] items-center rounded-[var(--gg-radius-card)] border px-[24px] py-[20px]',
         SURFACE_CLASS[tone],
         className,
       )}
     >
       <div className="flex min-w-0 items-end gap-[6px]">
-        <span className={cn('shrink-0 text-[26px] font-semibold leading-none', VALUE_CLASS[tone], valueClassName)}>
+        <span className={cn('gg-type-metric shrink-0', VALUE_CLASS[tone], valueClassName)}>
           {value}
         </span>
-        <span className={cn('truncate text-[14px] leading-none', LABEL_CLASS[tone])}>{label}</span>
+        <span className={cn('gg-type-meta truncate', LABEL_CLASS[tone])}>{label}</span>
       </div>
     </div>
   );

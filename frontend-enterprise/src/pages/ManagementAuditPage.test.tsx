@@ -51,6 +51,14 @@ const operationsSnapshot = {
   observed_at: '2026-08-10T23:30:00Z',
   thresholds_configured: true,
   quota_limits_configured: true,
+  runtime_capacity_limits_configured: true,
+  runtime_capacity_available: true,
+  base_execution_available: true,
+  base_execution_reason: 'available',
+  high_risk_external_write_available: false,
+  high_risk_external_write_reason: 'external_write_gray_not_ready',
+  high_risk_destructive_available: false,
+  high_risk_destructive_reason: 'destructive_gray_not_ready',
   quota_limits: { tenant: 16, agent: 8, user: 4, tool: 4 },
   quota_leases: { tenant: 2, agent: 2, user: 2, tool: 1 },
   executions: { running: 2, waiting: 1 },
@@ -112,7 +120,7 @@ it('uses server pagination and opens sanitized details on demand without export'
   expect(await screen.findByText('organization.update')).toBeVisible();
   expect(screen.getByText('平台管理员')).toBeVisible();
   expect(screen.queryByRole('button', { name: /导出/ })).not.toBeInTheDocument();
-  expect(await screen.findByText('停止扩大灰度')).toBeVisible();
+  expect(await screen.findByText('普通动态已开放')).toBeVisible();
   expect(screen.getByText('1时1分')).toBeVisible();
   expect(api.get).toHaveBeenCalledTimes(2);
 
@@ -126,14 +134,16 @@ it('uses server pagination and opens sanitized details on demand without export'
   );
 });
 
-it('shows threshold readiness and refreshes the operational snapshot explicitly', async () => {
+it('shows ordinary dynamic as open and keeps high-risk gray states independent', async () => {
   const user = userEvent.setup();
   renderPage();
 
   expect(await screen.findByRole('region', { name: '动态任务运行门禁' })).toBeVisible();
   expect(screen.getByText('待对账动作')).toBeVisible();
   expect(screen.getAllByText('停止阈值 1')).toHaveLength(2);
-  expect(screen.getByText(/配额租约 7/)).toBeVisible();
+  expect(screen.getByText(/运行容量租约 7/)).toBeVisible();
+  expect(screen.getByText('普通动态已开放')).toBeVisible();
+  expect(screen.getAllByText('默认关闭')).toHaveLength(2);
 
   await user.click(screen.getByRole('button', { name: '刷新动态任务运行状态' }));
 

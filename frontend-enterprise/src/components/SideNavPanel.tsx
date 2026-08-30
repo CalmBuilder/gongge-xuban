@@ -2,6 +2,7 @@ import type { ComponentType, ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 
 import { cn } from '@/lib/utils';
+import { DETAIL_PANEL_CLASS } from '@/lib/enterprise-ui';
 
 export type SideNavPanelChild = {
   key: string;
@@ -46,15 +47,15 @@ export default function SideNavPanel({
   'aria-label': ariaLabel = title,
 }: SideNavPanelProps) {
   return (
-    <aside className="overflow-hidden rounded-[18px] border border-[#dfe5f2] bg-white max-[920px]:overflow-x-auto">
-      <div className="border-b border-[#e8ebf2] px-[18px] py-[17px] max-[920px]:min-w-[680px]">
+    <aside className={cn(DETAIL_PANEL_CLASS, 'overflow-hidden p-0 max-[920px]:overflow-x-auto')}>
+      <div className="border-b border-[var(--gg-line)] px-[18px] py-[17px] max-[920px]:min-w-[680px]">
         <div className="flex items-center gap-[9px]">
-          <span className="grid size-[32px] place-items-center rounded-[9px] bg-[#edf2ff] text-[#3157e8]">
+          <span className="grid size-[32px] place-items-center rounded-[var(--gg-radius-control)] bg-[var(--gg-interaction-soft)] text-[var(--gg-interaction)]">
             <HeaderIcon aria-hidden="true" className="size-[16px]" />
           </span>
           <div className="min-w-0">
-            <h2 className="text-[13px] font-semibold text-[#18181a]">{title}</h2>
-            {subtitle ? <p className="mt-[1px] text-[11px] text-[#858b9c]">{subtitle}</p> : null}
+            <h2 className="gg-type-card-title">{title}</h2>
+            {subtitle ? <p className="gg-type-caption mt-[1px]">{subtitle}</p> : null}
           </div>
         </div>
       </div>
@@ -67,28 +68,28 @@ export default function SideNavPanel({
               <Link
                 aria-current={selected ? 'page' : undefined}
                 className={cn(
-                  'group flex min-w-0 items-center gap-[10px] rounded-[11px] px-[11px] py-[10px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#3157e8] max-[920px]:min-w-[158px]',
+                  'group gg-type-control flex min-w-0 items-center gap-[10px] rounded-[var(--gg-radius-control)] px-[11px] py-[10px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--gg-interaction)] max-[920px]:min-w-[158px]',
                   selected
-                    ? 'bg-[#edf2ff] text-[#244bc7]'
-                    : 'text-[#526183] hover:bg-[#f6f8fc] hover:text-[#24262d]',
+                    ? 'bg-[var(--gg-interaction-soft)] text-[var(--gg-interaction-hover)]'
+                    : 'text-[var(--gg-text-secondary)] hover:bg-[var(--gg-surface-subtle)] hover:text-[var(--gg-text-primary)]',
                 )}
                 to={linkFor(item.key)}
               >
                 <Icon aria-hidden="true" className="size-[16px] shrink-0" />
                 <span className="min-w-0 flex-1">
-                  <strong className="block truncate text-[12px] font-semibold">{item.label}</strong>
+                    <strong className="block truncate gg-type-meta font-semibold">{item.label}</strong>
                   {item.description ? (
-                    <small className="block truncate text-[10px] font-normal opacity-70">{item.description}</small>
+                    <small className="gg-type-caption block truncate font-normal opacity-70">{item.description}</small>
                   ) : null}
                 </span>
                 {item.count != null ? (
-                  <span className="font-mono text-[11px] tabular-nums opacity-60">{item.count}</span>
+                  <span className="font-mono gg-type-caption tabular-nums opacity-60">{item.count}</span>
                 ) : null}
               </Link>
               {selected && item.children?.length ? (
                 <div
                   aria-label={`${item.label}子分类`}
-                  className="ml-[37px] mt-[2px] grid gap-[1px] border-l border-[#e8ebf2] pl-[8px] max-[920px]:hidden"
+                    className="ml-[37px] mt-[2px] grid gap-[1px] border-l border-[var(--gg-line)] pl-[8px] max-[920px]:hidden"
                 >
                   {item.children.map((child) => {
                     const childSelected = activeChildKey === child.key;
@@ -97,16 +98,16 @@ export default function SideNavPanel({
                         key={child.key || '__all__'}
                         aria-current={childSelected ? 'page' : undefined}
                         className={cn(
-                          'flex min-w-0 items-center justify-between gap-[8px] rounded-[8px] px-[9px] py-[6px] text-[11px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#3157e8]',
+                          'gg-type-caption flex min-w-0 items-center justify-between gap-[8px] rounded-[var(--gg-radius-control)] px-[9px] py-[6px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--gg-interaction)]',
                           childSelected
-                            ? 'bg-[#edf2ff] font-semibold text-[#244bc7]'
-                            : 'text-[#526183] hover:bg-[#f6f8fc] hover:text-[#24262d]',
+                            ? 'bg-[var(--gg-interaction-soft)] font-semibold text-[var(--gg-interaction-hover)]'
+                            : 'text-[var(--gg-text-secondary)] hover:bg-[var(--gg-surface-subtle)] hover:text-[var(--gg-text-primary)]',
                         )}
                         to={linkFor(item.key, child.key)}
                       >
                         <span className="truncate">{child.label}</span>
                         {child.count != null ? (
-                          <span className="font-mono text-[10px] tabular-nums opacity-60">{child.count}</span>
+                          <span className="font-mono gg-type-caption tabular-nums opacity-60">{child.count}</span>
                         ) : null}
                       </Link>
                     );
@@ -118,7 +119,7 @@ export default function SideNavPanel({
         })}
       </nav>
       {footer ? (
-        <div className="border-t border-[#e8ebf2] bg-[#fafbfe] px-[16px] py-[13px] text-[11px] leading-[18px] text-[#68718b] max-[920px]:hidden">
+        <div className="gg-type-caption border-t border-[var(--gg-line)] bg-[var(--gg-surface-subtle)] px-[16px] py-[13px] max-[920px]:hidden">
           {footer}
         </div>
       ) : null}

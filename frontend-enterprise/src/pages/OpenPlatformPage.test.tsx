@@ -131,8 +131,8 @@ it('开放广场数字员工复用会话端和管理端的统一卡片与四列�
   const cardName = await screen.findByText('广场财务专家');
   const card = cardName.closest('.gongge-employee-card');
   expect(card).not.toBeNull();
-  expect(card?.parentElement).toHaveClass('2xl:grid-cols-4');
-  expect(card?.parentElement).toHaveClass('auto-rows-[292px]');
+  expect(card?.parentElement).toHaveClass('gg-resource-grid');
+  expect(card).toHaveClass('min-h-[var(--gg-resource-card-min-height)]');
 });
 
 it('开放平台专家分类与数字员工分类隔离，并保留使用与复制入口', async () => {
@@ -154,8 +154,8 @@ it('资源分类与数字员工采用相同的固定卡片尺寸契约', async (
   const card = resourceName.closest('.gongge-platform-resource-card');
   expect(card).not.toBeNull();
   expect(card).toHaveClass('h-full');
-  expect(card?.parentElement).toHaveClass('auto-rows-[292px]');
-  expect(card?.parentElement).toHaveClass('2xl:grid-cols-4');
+  expect(card?.parentElement).toHaveClass('gg-resource-grid');
+  expect(card).toHaveClass('min-h-[var(--gg-resource-card-min-height)]');
 });
 
 it('已发布平台 Skill 出现在开放广场的 Skill 分类而不是管理入口', async () => {

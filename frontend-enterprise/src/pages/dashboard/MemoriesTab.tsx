@@ -182,7 +182,7 @@ export default function MemoriesTab() {
         <UIButton
           variant="link"
           onClick={() => setDetail(row)}
-          className="h-auto p-0 text-[12px] font-normal text-[#1a71ff] hover:text-[#4a8dff] hover:no-underline"
+          className="h-auto p-0 gg-type-meta font-normal text-[#1a71ff] hover:text-[#4a8dff] hover:no-underline"
         >
           查看
         </UIButton>
@@ -193,13 +193,13 @@ export default function MemoriesTab() {
   const renderMobileCard = (row: MemoryUserGroup) => (
     <article className={MOBILE_CARD_CLASS} key={row.key}>
       <div className="flex min-w-0 items-start justify-between gap-[10px]">
-        <strong className="min-w-0 truncate text-[14px] font-semibold text-[#18181a]">
+        <strong className="min-w-0 truncate gg-type-body font-semibold text-[#18181a]">
           {row.username || row.user_id}
         </strong>
         <UIButton
           variant="link"
           onClick={() => setDetail(row)}
-          className="h-auto shrink-0 p-0 text-[12px] font-normal text-[#1a71ff] hover:text-[#4a8dff] hover:no-underline"
+          className="h-auto shrink-0 p-0 gg-type-meta font-normal text-[#1a71ff] hover:text-[#4a8dff] hover:no-underline"
         >
           查看
         </UIButton>
@@ -209,8 +209,8 @@ export default function MemoriesTab() {
           <MemoryKindBadge key={kind} kind={kind} />
         ))}
       </div>
-      <p className="mt-[8px] line-clamp-2 text-[12px] leading-[1.55] text-[#858b9c]">{row.preview || '-'}</p>
-      <div className="mt-[10px] flex items-center justify-between text-[12px] text-[#858b9c]">
+      <p className="mt-[8px] line-clamp-2 gg-type-meta  text-[#858b9c]">{row.preview || '-'}</p>
+      <div className="mt-[10px] flex items-center justify-between gg-type-meta text-[#858b9c]">
         <span>{row.memories.length} 条记忆</span>
         <span>{formatDateTime(row.latest_at)}</span>
       </div>
@@ -226,7 +226,7 @@ export default function MemoriesTab() {
         <div className="flex flex-col gap-[18px]">
           <div className="flex items-center gap-[6px] px-[12px] text-[#757f9c]">
             <IconHistory className="size-[14px] shrink-0" />
-            <span className="text-[14px] font-normal leading-none">记忆查询</span>
+            <span className="gg-type-body font-normal">记忆查询</span>
           </div>
 
           <form
@@ -259,7 +259,7 @@ export default function MemoriesTab() {
             <UIButton
               type="submit"
               disabled={loading}
-              className="h-[34px] w-[80px] gap-[4px] rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-[20px] text-[12px] font-semibold text-white hover:bg-[#244bc7]"
+              className="h-[34px] w-[80px] gap-[4px] rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-[20px] gg-type-meta font-semibold text-white hover:bg-[#244bc7]"
             >
               <IconSearch className="size-[14px]" />
               查询
@@ -269,7 +269,7 @@ export default function MemoriesTab() {
               variant="outline"
               onClick={resetFilter}
               disabled={loading}
-              className="h-[34px] w-[80px] gap-[4px] rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[20px] text-[12px] font-normal text-[#757f9c] hover:border-[#cbd3e6] hover:bg-white hover:text-[#18181a]"
+              className="h-[34px] w-[80px] gap-[4px] rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[20px] gg-type-meta font-normal text-[#757f9c] hover:border-[#cbd3e6] hover:bg-white hover:text-[#18181a]"
             >
               <IconRefresh className={cn('size-[14px]', loading && 'animate-spin')} />
               重置
@@ -279,7 +279,7 @@ export default function MemoriesTab() {
               variant="outline"
               onClick={clearOwnMemories}
               disabled={loading || clearing}
-              className="h-[34px] w-[112px] rounded-[10px] border-[0.5px] border-[#f0d3d3] bg-white px-[16px] text-[12px] font-normal text-[#c43d3d] hover:border-[#e1a8a8] hover:bg-[#fff7f7] hover:text-[#a92d2d]"
+              className="h-[34px] w-[112px] rounded-[10px] border-[0.5px] border-[#f0d3d3] bg-white px-[16px] gg-type-meta font-normal text-[#c43d3d] hover:border-[#e1a8a8] hover:bg-[#fff7f7] hover:text-[#a92d2d]"
             >
               {clearing ? '清空中' : '清空我的记忆'}
             </UIButton>
@@ -289,7 +289,7 @@ export default function MemoriesTab() {
             {groups.length ? (
               groups.map(renderMobileCard)
             ) : (
-              <div className="py-[40px] text-center text-[13px] text-[#858b9c]">{emptyText}</div>
+              <div className="py-[40px] text-center gg-type-control text-[#858b9c]">{emptyText}</div>
             )}
           </div>
 
@@ -334,14 +334,14 @@ function PrefixInput({
 }) {
   return (
     <label className="flex h-[34px] w-[260px] items-center overflow-hidden rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white transition-colors focus-within:border-[var(--gg-cobalt)] max-[900px]:w-full">
-      <span className="flex h-full w-[58px] shrink-0 items-center justify-center border-r-[0.5px] border-[#e3e7f1] bg-[#f6f6f6] text-[12px] text-[#858b9c]">
+      <span className="flex h-full w-[58px] shrink-0 items-center justify-center border-r-[0.5px] border-[#e3e7f1] bg-[#f6f6f6] gg-type-meta text-[#858b9c]">
         {label}
       </span>
       <input
         value={value}
         placeholder={placeholder}
         onChange={(event) => onChange(event.target.value)}
-        className="h-full min-w-0 flex-1 bg-transparent px-[12px] text-[12px] text-[#17191f] outline-none placeholder:text-[#c0c6d4]"
+        className="h-full min-w-0 flex-1 bg-transparent px-[12px] gg-type-meta text-[#17191f] outline-none placeholder:text-[#c0c6d4]"
       />
     </label>
   );
@@ -352,7 +352,7 @@ function MemoryKindBadge({ kind }: { kind: string }) {
   return (
     <span
       className={cn(
-        'inline-flex items-center rounded-full px-[12px] py-[4px] text-[12px] leading-none capitalize whitespace-nowrap',
+        'inline-flex items-center rounded-full px-[12px] py-[4px] gg-type-meta capitalize whitespace-nowrap',
         MEMORY_KIND_TONE_CLASS[tone],
       )}
     >
@@ -376,7 +376,7 @@ function MemoryDetailDialog({
       >
         <div className="flex items-center gap-[6px] px-[12px] text-[#757f9c]">
           <IconListBulleted className="size-[14px] shrink-0" />
-          <DialogTitle className="text-[14px] font-normal leading-none text-[#757f9c]">
+          <DialogTitle className="gg-type-card-title font-normal text-[#757f9c]">
             员工记忆详情
           </DialogTitle>
         </div>
@@ -404,19 +404,19 @@ function MemoryDetailDialog({
                 >
                   <div className="flex items-center justify-between gap-[10px]">
                     <MemoryKindBadge kind={item.kind} />
-                    <span className="text-[12px] text-[#858b9c]">{formatDateTime(item.updated_at)}</span>
+                    <span className="gg-type-meta text-[#858b9c]">{formatDateTime(item.updated_at)}</span>
                   </div>
-                  <div className="mt-[10px] flex flex-wrap gap-x-[16px] gap-y-[4px] text-[12px] text-[#858b9c]">
+                  <div className="mt-[10px] flex flex-wrap gap-x-[16px] gap-y-[4px] gg-type-meta text-[#858b9c]">
                     <span>importance: {item.importance}</span>
                     <span>session: {item.session_id || '-'}</span>
                   </div>
-                  <p className="mt-[8px] text-[13px] leading-[1.6] text-[#18181a] wrap-break-word">
+                  <p className="mt-[8px] gg-type-control  text-[#18181a] wrap-break-word">
                     {item.content}
                   </p>
                   {Object.keys(item.metadata || {}).length > 0 && (
-                    <details className="mt-[10px] text-[12px] text-[#858b9c]">
+                    <details className="mt-[10px] gg-type-meta text-[#858b9c]">
                       <summary className="cursor-pointer select-none">metadata</summary>
-                      <pre className="mt-[6px] overflow-x-auto rounded-[8px] bg-[#f6f6f6] p-[10px] text-[11px] leading-normal text-[#464c5e]">
+                      <pre className="mt-[6px] overflow-x-auto rounded-[8px] bg-[#f6f6f6] p-[10px] gg-type-caption  text-[#464c5e]">
                         {JSON.stringify(item.metadata, null, 2)}
                       </pre>
                     </details>

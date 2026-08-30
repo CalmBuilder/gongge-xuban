@@ -48,7 +48,7 @@ export default function ChatHeader({ chat }: { chat: UseChatSession }) {
             aria-label="账户菜单"
             className="flex shrink-0 items-center gap-[10px] rounded-[10px] py-[4px] pl-[6px] pr-[10px] outline-none transition-colors"
           >
-            <span className="grid size-[32px] shrink-0 place-items-center overflow-hidden rounded-full bg-[#eef1fb] text-[14px] font-medium text-[#7e96dc]">
+            <span className="grid size-[32px] shrink-0 place-items-center overflow-hidden rounded-full bg-[#eef1fb] gg-type-body font-medium text-[#7e96dc]">
               {initial}
             </span>
             <IconChevronDown className="size-[14px] shrink-0 text-[#757F9C]" />
@@ -59,7 +59,7 @@ export default function ChatHeader({ chat }: { chat: UseChatSession }) {
           >
             <DropdownMenuItem
               onSelect={logout}
-              className="h-[36px] cursor-pointer gap-2 rounded-[10px] px-[12px] text-[14px] text-[#464C5E]"
+              className="h-[36px] cursor-pointer gap-2 rounded-[10px] px-[12px] gg-type-body text-[#464C5E]"
             >
               <IconLogout className="size-[16px]" />
               退出登录

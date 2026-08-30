@@ -24,7 +24,7 @@ const Toaster = ({ ...props }: ToasterProps) => {
       }
       toastOptions={{
         classNames: {
-          toast: 'cn-toast',
+          toast: 'cn-toast gg-type-body gg-typography-scope',
         },
       }}
       {...props}

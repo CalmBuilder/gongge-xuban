@@ -67,6 +67,14 @@ const agent: AgentProfileRead = {
   updated_at: '',
 };
 
+const expertTemplate: AgentProfileRead = {
+  ...agent,
+  id: 'expert-template',
+  name: '数据可视化工程师',
+  governance_form: 'template',
+  metadata: { employee_type: 'expert', role_name: '工程研发' },
+};
+
 beforeEach(() => {
   vi.mocked(api.put).mockReset();
 });
@@ -105,4 +113,29 @@ it('lets an agent governor set responsibility without editing the private profil
     },
   ));
   expect(onSaved).toHaveBeenCalledWith(saved);
+});
+
+it('keeps the expert template dialog at the original width and uses one avatar radius', () => {
+  render(
+    <I18nProvider>
+      <EmployeeProfileEditor
+        agent={expertTemplate}
+        currentUser={admin}
+        mode="expert-template"
+        onClose={vi.fn()}
+        open
+      />
+    </I18nProvider>,
+  );
+
+  const dialog = screen.getByRole('dialog');
+  expect(dialog).toHaveClass('sm:max-w-[860px]');
+  expect(dialog).not.toHaveClass('sm:max-w-[520px]');
+  const avatar = dialog.querySelector('.employee-profile-preview-avatar');
+  expect(avatar).toHaveStyle({
+    borderRadius: 'var(--gg-radius-avatar-detail)',
+  });
+  expect(avatar?.querySelector('img')).toHaveStyle({
+    borderRadius: 'var(--gg-radius-avatar-detail)',
+  });
 });

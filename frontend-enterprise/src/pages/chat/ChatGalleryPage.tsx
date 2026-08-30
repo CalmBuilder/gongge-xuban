@@ -40,7 +40,8 @@ export default function ChatGalleryPage() {
           '--sidebar-width-icon': '72px',
         } as CSSProperties
       }
-      className="h-screen min-h-0 bg-[#fcfcfc] text-[#18181a]"
+      className="h-screen min-h-0 bg-[#fcfcfc] text-[#18181a] gg-typography-scope"
+      data-typography-contract="v1"
     >
       <AppSidebar
         variant="chat"

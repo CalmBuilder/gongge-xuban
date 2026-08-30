@@ -184,7 +184,7 @@ export function OrganizationTreeNavigator({
         <Search className="pointer-events-none absolute left-[10px] top-1/2 size-[14px] -translate-y-1/2 text-[#858b9c]" />
         <input
           aria-label="搜索组织"
-          className="h-[34px] w-full rounded-[10px] border border-[#e3e7f1] bg-white pl-[31px] pr-[30px] text-[12px] outline-none focus:border-[#3157e8]"
+          className="gg-type-control h-[34px] w-full rounded-[10px] border border-[#e3e7f1] bg-white pl-[31px] pr-[30px] text-[var(--gg-text-primary)] placeholder:text-[var(--gg-text-muted)] outline-none focus:border-[#3157e8]"
           onChange={(event) => setSearchText(event.target.value)}
           placeholder="按名称或编码定位"
           value={searchText}
@@ -204,7 +204,7 @@ export function OrganizationTreeNavigator({
       {searchText ? (
         <div className="mt-[8px] max-h-[390px] overflow-y-auto rounded-[10px] border border-[#e5e9f2] bg-white p-[4px]">
           {searching ? (
-            <p className="flex items-center gap-[6px] px-[9px] py-[12px] text-[12px] text-[#858b9c]">
+            <p className="gg-type-meta flex items-center gap-[6px] px-[9px] py-[12px]">
               <LoaderCircle className="size-[14px] animate-spin" />正在定位组织…
             </p>
           ) : searchResults.length ? searchResults.map((result) => (
@@ -214,13 +214,13 @@ export function OrganizationTreeNavigator({
               onClick={() => void selectSearchResult(result)}
               type="button"
             >
-              <strong className="block text-[12px] font-medium text-[#303748]">{result.name}</strong>
-              <span className="mt-[2px] block truncate text-[10px] text-[#8a93a8]">
+              <strong className="gg-type-control block text-[#303748]">{result.name}</strong>
+              <span className="gg-type-caption mt-[2px] block truncate">
                 {result.path.map((item) => item.name).join(' / ')}
               </span>
             </button>
           )) : (
-            <p className="px-[9px] py-[12px] text-[12px] text-[#858b9c]">没有匹配的组织</p>
+            <p className="gg-type-meta px-[9px] py-[12px]">没有匹配的组织</p>
           )}
         </div>
       ) : (
@@ -264,7 +264,7 @@ export function OrganizationTreeNavigator({
                 )}
               </Button>
               <button
-                className="min-w-0 flex-1 truncate py-[8px] text-left text-[12px]"
+                className="gg-type-control min-w-0 flex-1 truncate py-[8px] text-left"
                 onClick={(event) => {
                   event.stopPropagation();
                   onSelect(node);
@@ -278,7 +278,7 @@ export function OrganizationTreeNavigator({
         </div>
       )}
       {treeError ? (
-        <p className="mt-[8px] rounded-[8px] bg-[#fff4f2] px-[9px] py-[7px] text-[10px] leading-[16px] text-[#b94a3d]">
+        <p className="gg-type-control mt-[8px] rounded-[8px] bg-[#fff4f2] px-[9px] py-[7px] text-[#b94a3d]">
           {treeError}
         </p>
       ) : null}

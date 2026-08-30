@@ -188,6 +188,7 @@ it('shows the authenticated tenant id as immutable to ordinary members', () => {
   expect(within(topology).getByText(/共用 8 条关系契约/)).toBeInTheDocument();
   expect(within(topology).getAllByText('SOP / 技能')).toHaveLength(2);
   expect(within(topology).getByText(/当前数据库没有可用于本图的来源绑定实例/)).toBeInTheDocument();
+  expect(screen.getByRole('heading', { name: '企业与组织', level: 1 })).toHaveClass('gg-type-page-title');
 });
 
 it('creates another enterprise as a company organization unit under the tenant root', async () => {
@@ -229,6 +230,9 @@ it('creates another enterprise as a company organization unit under the tenant r
   expect(within(topology).getByText('一次业务如何在人与数字员工之间闭环')).toBeInTheDocument();
   expect(within(topology).getByText(/当前任职：财务报销专员：演示管理员/)).toBeInTheDocument();
   expect(within(topology).getByText(/处理结果与审计轨迹返回发起人/)).toBeInTheDocument();
+  const verifiedRelation = liveContract?.querySelector('[data-topology-relation="PositionAssignment.assigns.Human"]');
+  expect(verifiedRelation).toHaveClass('gg-type-control', 'break-words');
+  expect(verifiedRelation).not.toHaveClass('font-mono');
   await userEvent.click(within(topology).getByRole('tab', { name: 'IT 权限开通' }));
   expect(within(topology).getByText('IT 权限开通操作员')).toBeInTheDocument();
   expect(within(topology).getByText('IT 高权限审批人')).toBeInTheDocument();

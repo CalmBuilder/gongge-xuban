@@ -53,8 +53,8 @@ export default function ChatEmptyState({ chat }: { chat: UseChatSession }) {
         <div className="flex min-w-0 items-stretch">
           {emptyStats.map((item) => (
             <div key={item.label} className={CHAT_EMPTY_STAT_CELL_CLASS}>
-              <span className="text-[18px] font-medium leading-none">{item.value}</span>
-              <span className="text-[10px] leading-none">{item.label}</span>
+              <span className="gg-type-section-title font-medium">{item.value}</span>
+              <span className="gg-type-caption">{item.label}</span>
             </div>
           ))}
         </div>

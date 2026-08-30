@@ -55,13 +55,13 @@ export default function ExpertClassificationDialog({
     <Dialog open={open} onOpenChange={(next) => { if (!next && !saving) onClose(); }}>
       <DialogContent className="w-[calc(100%-2rem)] max-w-[480px] gap-[18px] rounded-[16px] p-[22px]" aria-describedby="expert-classification-description">
         <div>
-          <DialogTitle className="text-[16px] font-semibold text-[#18181a]">编辑专家分类</DialogTitle>
-          <DialogDescription id="expert-classification-description" className="mt-[6px] text-[12px] text-[#757f9c]">
+          <DialogTitle className="gg-type-card-title font-semibold text-[#18181a]">编辑专家分类</DialogTitle>
+          <DialogDescription id="expert-classification-description" className="mt-[6px] gg-type-meta text-[#757f9c]">
             将修改 {expertCount} 位专家
           </DialogDescription>
         </div>
         <div className="grid gap-[14px] sm:grid-cols-2">
-          <label className="grid gap-[6px] text-[12px] text-[#464c5e]">
+          <label className="grid gap-[6px] gg-type-meta text-[#464c5e]">
             一级分类
             <Select value={category} onValueChange={(value) => { setCategory(value); setSubcategory(''); }}>
               <SelectTrigger aria-label="一级分类" className="w-full">
@@ -72,7 +72,7 @@ export default function ExpertClassificationDialog({
               </SelectContent>
             </Select>
           </label>
-          <label className="grid gap-[6px] text-[12px] text-[#464c5e]">
+          <label className="grid gap-[6px] gg-type-meta text-[#464c5e]">
             二级分类
             <Select value={subcategory} onValueChange={setSubcategory} disabled={!category}>
               <SelectTrigger aria-label="二级分类" className="w-full">

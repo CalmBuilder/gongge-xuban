@@ -116,7 +116,7 @@ export default function EmployeeAvatarEditor({
         className="flex max-h-[calc(100dvh-4rem)] w-[calc(100%-2rem)] flex-col gap-4 overflow-hidden rounded-[14px] px-5 py-4 sm:max-w-[680px]"
       >
         <DialogHeader className="px-3">
-          <DialogTitle className="text-sm font-normal leading-none text-[#757f9c]">
+          <DialogTitle className="gg-type-card-title font-normal text-[#757f9c]">
             {agent ? `设置头像：${employeeDisplayName(agent)}` : '设置头像'}
           </DialogTitle>
         </DialogHeader>
@@ -125,8 +125,8 @@ export default function EmployeeAvatarEditor({
           <div className="grid grid-cols-[auto_minmax(0,1fr)] items-center gap-[18px] rounded-2xl border border-border bg-[linear-gradient(135deg,color-mix(in_srgb,var(--accent-soft)_34%,transparent),transparent_58%),var(--surface-subtle)] p-[18px]">
             <EmployeeAvatar profile={profile} width={104} height={122} />
             <div>
-              <strong className="block text-sm text-foreground">{mode === 'upload' ? '自定义头像' : selected.label}</strong>
-              <p className="mt-1 text-xs text-muted-foreground">
+              <strong className="block gg-type-body text-foreground">{mode === 'upload' ? '自定义头像' : selected.label}</strong>
+              <p className="mt-1 gg-type-caption text-muted-foreground">
                 头像会显示在我创建的数字员工、数字员工档案页和对话端的员工选择中。
               </p>
             </div>
@@ -134,8 +134,8 @@ export default function EmployeeAvatarEditor({
 
           <section className="space-y-3">
             <div className="flex items-baseline justify-between gap-3">
-              <strong className="text-[13px] text-foreground">默认头像</strong>
-              <span className="text-xs text-muted-foreground">选择一个适合岗位的默认头像。</span>
+              <strong className="gg-type-control text-foreground">默认头像</strong>
+              <span className="gg-type-caption text-muted-foreground">选择一个适合岗位的默认头像。</span>
             </div>
             <div className="grid grid-cols-3 gap-2.5">
               {EMPLOYEE_AVATAR_PRESETS.map((preset) => {
@@ -161,7 +161,7 @@ export default function EmployeeAvatarEditor({
                       }}
                       size={52}
                     />
-                    <span className="min-w-0 truncate text-left font-[760]">{preset.label}</span>
+                    <span className="min-w-0 truncate gg-type-control text-left font-[760]">{preset.label}</span>
                     {active && <CheckOutlined className="text-accent" />}
                   </button>
                 );
@@ -181,12 +181,12 @@ export default function EmployeeAvatarEditor({
               className="hidden"
               onChange={(event) => void handleUpload(event.target.files?.[0])}
             />
-            <span className="inline-flex size-10 shrink-0 items-center justify-center rounded-xl bg-[color-mix(in_srgb,var(--accent)_12%,var(--surface))] text-lg text-accent">
+            <span className="inline-flex size-10 shrink-0 items-center justify-center rounded-xl bg-[color-mix(in_srgb,var(--accent)_12%,var(--surface))] gg-type-section-title text-accent">
               <UploadOutlined />
             </span>
             <span className="grid min-w-0 gap-0.5">
-              <span className="text-sm font-semibold text-foreground">上传自定义头像</span>
-              <span className="text-xs text-muted-foreground">支持常见图片格式，会自动裁剪为方形头像。</span>
+              <span className="gg-type-body font-semibold text-foreground">上传自定义头像</span>
+              <span className="gg-type-caption text-muted-foreground">支持常见图片格式，会自动裁剪为方形头像。</span>
             </span>
           </button>
         </div>
@@ -196,14 +196,14 @@ export default function EmployeeAvatarEditor({
             variant="outline"
             disabled={saving}
             onClick={onClose}
-            className="h-8 w-[92px] rounded-[10px] border-[#e3e7f1] bg-white px-3 text-sm font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-[#18181a]"
+            className="h-8 w-[92px] rounded-[10px] border-[#e3e7f1] bg-white px-3 gg-type-body font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-[#18181a]"
           >
             取消
           </Button>
           <Button
             disabled={saving}
             onClick={() => void save()}
-            className="h-8 w-[92px] rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-3 text-sm font-semibold text-white hover:bg-[#244bc7]"
+            className="h-8 w-[92px] rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-3 gg-type-body font-semibold text-white hover:bg-[#244bc7]"
           >
             保存头像
           </Button>

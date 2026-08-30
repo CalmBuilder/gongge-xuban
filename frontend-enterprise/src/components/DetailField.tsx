@@ -20,8 +20,8 @@ export function DetailField({ label, children, className }: DetailFieldProps) {
         className,
       )}
     >
-      <span className="text-[11px] font-semibold text-[#858b9c]">{label}</span>
-      <div className="min-w-0 wrap-break-word text-[12px] text-[#18181a]">{children}</div>
+      <span className="gg-type-caption font-semibold text-[#858b9c]">{label}</span>
+      <div className="min-w-0 wrap-break-word gg-type-meta text-[#18181a]">{children}</div>
     </div>
   );
 }

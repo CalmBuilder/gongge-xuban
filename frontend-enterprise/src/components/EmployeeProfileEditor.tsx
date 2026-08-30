@@ -41,6 +41,7 @@ import type { OrganizationUnit } from '../types/organization';
 import EmployeeAvatar from './EmployeeAvatar';
 import { ConceptHelp } from './ConceptHelp';
 import { OrganizationTreeNavigator } from './OrganizationTreeNavigator';
+import { DetailSurface } from './enterprise/DetailSurface';
 
 type EmployeeProfileFormValues = {
   name: string;
@@ -222,20 +223,29 @@ export default function EmployeeProfileEditor({
     <Dialog open={open} onOpenChange={(next) => { if (!next && !saving) onClose(); }}>
       <DialogContent
         aria-describedby={undefined}
-        className="employee-profile-modal flex max-h-[calc(100dvh-4rem)] w-[calc(100%-2rem)] flex-col gap-[16px] overflow-hidden rounded-[var(--gg-radius-panel)] border border-[var(--gg-line)] bg-[var(--gg-surface)] px-[20px] py-[16px] shadow-[var(--gg-shadow-card)] sm:max-w-[860px]"
+        className={cn(
+          'employee-profile-modal flex max-h-[calc(100dvh-4rem)] w-[calc(100%-2rem)] flex-col overflow-hidden rounded-[var(--gg-radius-panel)] border border-[var(--gg-line)] bg-[var(--gg-surface)] px-[20px] py-[16px] shadow-[var(--gg-shadow-card)]',
+          'sm:max-w-[860px]',
+        )}
       >
-        <DialogTitle className="gg-type-section-title px-[12px]">
+        <DetailSurface container="dialog" className="flex min-h-0 flex-1 flex-col gap-[16px]">
+          <DialogTitle className="gg-type-section-title px-[12px]">
           {agent
             ? isExpertTemplateMode
               ? `查看专家模板：${employeeDisplayName(agent)}`
               : `${canEdit ? '编辑' : '查看'}数字员工档案：${employeeDisplayName(agent)}`
             : '编辑数字员工档案'}
-        </DialogTitle>
+          </DialogTitle>
 
         <div className="min-h-0 flex-1 overflow-y-auto px-[12px]">
           <div className="employee-profile-editor">
             <div className="employee-profile-preview">
-              <EmployeeAvatar agent={agent} size={92} />
+              <EmployeeAvatar
+                agent={agent}
+                size={92}
+                radius="var(--gg-radius-avatar-detail)"
+                className="employee-profile-preview-avatar"
+              />
               <div>
                 <span className="gg-type-meta m-0 block">
                   {isExpertTemplateMode ? '专家模板（平台内置）' : '数字员工档案'}
@@ -267,7 +277,7 @@ export default function EmployeeProfileEditor({
                       责任组织
                       <ConceptHelp topic="governance" />
                     </strong>
-                    <span className="gg-type-caption leading-[1.6]">
+                    <span className="gg-type-caption ">
                       只表示谁负责治理该数字员工，不自动改变服务范围、执行授权或知识权限。
                     </span>
                   </div>
@@ -375,7 +385,7 @@ export default function EmployeeProfileEditor({
           </div>
         </div>
 
-        <div className={cn(DETAIL_ACTIONS_CLASS, 'px-[12px]')}>
+          <div className={cn(DETAIL_ACTIONS_CLASS, 'px-[12px]')}>
           <UIButton
             variant="outline"
             disabled={saving}
@@ -393,7 +403,8 @@ export default function EmployeeProfileEditor({
               保存
             </UIButton>
           )}
-        </div>
+          </div>
+        </DetailSurface>
       </DialogContent>
     </Dialog>
   );

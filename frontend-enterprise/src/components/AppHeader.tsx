@@ -57,10 +57,10 @@ export default function AppHeader({
     (title !== undefined || description !== undefined) ? (
       <div className="flex min-h-[40px] flex-col justify-center gap-[4px]">
         {title !== undefined && (
-          <p className="text-[16px] font-semibold leading-[normal] text-[var(--gg-ink)]">{title}</p>
+          <p className="gg-type-section-title">{title}</p>
         )}
         {description !== undefined && (
-          <p className="text-[13px] leading-[normal] text-[var(--gg-slate)]">{description}</p>
+          <p className="gg-type-meta">{description}</p>
         )}
       </div>
     ) : null
@@ -77,18 +77,18 @@ export default function AppHeader({
               aria-label="账户菜单"
               className="flex h-[32px] shrink-0 items-center gap-[8px] rounded-[10px] pl-[4px] pr-[8px] outline-none"
             >
-              <span className="grid size-[32px] shrink-0 place-items-center overflow-hidden rounded-full bg-[#eef1fb] text-[14px] font-medium leading-none text-[#7e96dc]">
+              <span className="grid size-[32px] shrink-0 place-items-center overflow-hidden rounded-full bg-[var(--gg-interaction-soft)] gg-type-body font-medium text-[var(--gg-interaction)]">
                 {initial ?? '--'}
               </span>
-              <IconChevronDown className="size-[14px] shrink-0 text-[#757F9C]" />
+              <IconChevronDown className="size-[14px] shrink-0 text-[var(--gg-text-muted)]" />
             </DropdownMenuTrigger>
             <DropdownMenuContent
               align="end"
-              className="w-fit min-w-0 rounded-[14px] border-0 bg-white p-[6px] shadow-[0px_16px_15px_rgba(0,0,0,0.1)] ring-0 [--accent:#F6F6F6] [--accent-foreground:#18181A]"
+              className="w-fit min-w-0 rounded-[var(--gg-radius-card)] border border-[var(--gg-line)] bg-[var(--gg-surface)] p-[6px] shadow-[var(--gg-shadow-card)] ring-0 [--accent:var(--gg-interaction-soft)] [--accent-foreground:var(--gg-text-primary)]"
             >
               <DropdownMenuItem
                 onSelect={() => onLogout?.()}
-                className="h-[36px] cursor-pointer gap-2 rounded-[10px] px-[12px] text-[14px] text-[#464C5E]"
+                className="gg-type-control h-[36px] cursor-pointer gap-2 rounded-[var(--gg-radius-control)] px-[12px] text-[var(--gg-text-secondary)]"
               >
                 <IconLogout className="size-[16px]" />
                 退出登录

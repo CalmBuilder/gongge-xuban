@@ -40,8 +40,8 @@ export default function BrandLogo({
         style={{ width: markSize, height: markSize }}
       />
       {!markOnly && (
-        <span className={cn('flex flex-col gap-[2px] leading-none', wordmarkClassName)}>
-          <strong className="whitespace-nowrap text-[17px] font-semibold leading-none tracking-[0.02em] text-[#0b1f47]">
+        <span className={cn('flex flex-col gap-[2px]', wordmarkClassName)}>
+          <strong className="whitespace-nowrap gg-type-section-title font-semibold tracking-[0.02em] text-[#0b1f47]">
             {wordmark}
           </strong>
         </span>

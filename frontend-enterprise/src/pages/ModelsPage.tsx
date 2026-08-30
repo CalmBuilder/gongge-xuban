@@ -4,6 +4,7 @@ import { Check, FlaskConical } from 'lucide-react';
 import { api, ApiError, getRequestTenantId } from '../api/client';
 import type { EnterpriseAuthUser } from '../auth';
 import AppHeader from '@/components/AppHeader';
+import { PageShell } from '@/components/enterprise/PageShell';
 import { DataTable, type DataTableColumn } from '@/components/DataTable';
 import { Paginator } from '@/components/Paginator';
 import { StatCard } from '@/components/StatCard';
@@ -258,7 +259,7 @@ export default function ModelsPage({
           aria-label={`连接测试 ${row.name}`}
           disabled={testingId === row.id}
           onClick={() => void testConnection(row)}
-          className="inline-flex h-7 items-center gap-1 rounded-[8px] px-2 text-[11px] font-medium text-[#1a71ff] transition-colors hover:bg-[#edf2ff] disabled:cursor-wait disabled:opacity-60"
+          className="inline-flex h-7 items-center gap-1 rounded-[8px] px-2 gg-type-caption font-medium text-[#1a71ff] transition-colors hover:bg-[#edf2ff] disabled:cursor-wait disabled:opacity-60"
         >
           <FlaskConical className={cn('size-3.5', testingId === row.id && 'animate-pulse')} />
           {testingId === row.id ? '测试中' : '连接测试'}
@@ -294,27 +295,27 @@ export default function ModelsPage({
       render: (row) => (
         <div className="flex min-w-0 flex-col gap-[2px]">
           <span className="flex min-w-0 items-center gap-[6px]">
-            <span className="truncate font-medium leading-[18px] text-[#18181a]">{row.name}</span>
+            <span className="truncate gg-type-meta font-medium text-[#18181a]">{row.name}</span>
             {row.is_default && <StatusBadge tone="green">默认</StatusBadge>}
           </span>
-          <span className="truncate text-[#858b9c]">
+          <span className="truncate gg-type-caption text-[#858b9c]">
             {row.enabled ? '已启用' : '已停用'} · {row.provider}
           </span>
         </div>
       ),
     },
-    { key: 'model', title: '模型', width: 180, render: (row) => <span className="block truncate">{row.model}</span> },
+    { key: 'model', title: '模型', width: 180, render: (row) => <span className="block truncate gg-type-meta">{row.model}</span> },
     {
       key: 'base_url',
       title: 'Base URL',
       className: 'whitespace-normal',
-      render: (row) => <span className="line-clamp-1 wrap-break-word text-[#858b9c]">{row.base_url || '-'}</span>,
+      render: (row) => <span className="line-clamp-1 wrap-break-word gg-type-meta text-[#858b9c]">{row.base_url || '-'}</span>,
     },
     {
       key: 'api_key',
       title: 'API Key',
       width: 180,
-      render: (row) => <span className="block truncate font-mono text-[#858b9c]">{row.api_key_masked || '-'}</span>,
+      render: (row) => <span className="block truncate font-mono gg-type-caption text-[#858b9c]">{row.api_key_masked || '-'}</span>,
     },
     {
       key: 'actions',
@@ -333,24 +334,24 @@ export default function ModelsPage({
       <div className="flex min-w-0 items-start justify-between gap-[10px]">
         <div className="min-w-0">
           <span className="flex min-w-0 items-center gap-[6px]">
-            <strong className="truncate text-[14px] font-semibold text-[#18181a]">{row.name}</strong>
+            <strong className="truncate gg-type-body font-semibold text-[#18181a]">{row.name}</strong>
             {row.is_default && <StatusBadge tone="green">默认</StatusBadge>}
           </span>
-          <span className="mt-[2px] block truncate text-[12px] text-[#858b9c]">
+          <span className="mt-[2px] block truncate gg-type-meta text-[#858b9c]">
             {row.enabled ? '已启用' : '已停用'} · {row.provider}
           </span>
         </div>
         {renderActions(row)}
       </div>
-      <p className="mt-[8px] line-clamp-1 wrap-break-word text-[12px] text-[#858b9c]">{row.model}</p>
-      <p className="mt-[4px] line-clamp-1 wrap-break-word font-mono text-[12px] text-[#858b9c]">
+      <p className="mt-[8px] line-clamp-1 wrap-break-word gg-type-meta text-[#858b9c]">{row.model}</p>
+      <p className="mt-[4px] line-clamp-1 wrap-break-word font-mono gg-type-meta text-[#858b9c]">
         {row.api_key_masked || '-'}
       </p>
     </article>
   );
 
   return (
-    <div className="min-h-full box-border px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]">
+    <PageShell template="management">
       <AppHeader onLogout={onLogout} userName={currentUser?.username} title="模型" />
 
       <div className="mt-[20px] mb-[16px] flex items-center justify-end gap-[12px]">
@@ -358,7 +359,7 @@ export default function ModelsPage({
           variant="outline"
           onClick={() => void load()}
           disabled={loading}
-          className="h-[34px] gap-[4px] rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[20px] text-[12px] font-normal text-[#757f9c] hover:border-[#cbd3e6] hover:bg-white hover:text-[#18181a]"
+          className="h-[34px] gap-[4px] rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[20px] gg-type-meta font-normal text-[#757f9c] hover:border-[#cbd3e6] hover:bg-white hover:text-[#18181a]"
         >
           <IconRefresh className={cn('size-[14px]', loading && 'animate-spin')} />
           刷新
@@ -366,7 +367,7 @@ export default function ModelsPage({
         <UIButton
           data-guide-target="models-create"
           onClick={createBlank}
-          className="h-[34px] gap-[4px] rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-[20px] text-[12px] font-semibold text-white hover:bg-[#244bc7]"
+          className="h-[34px] gap-[4px] rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-[20px] gg-type-meta font-semibold text-white hover:bg-[#244bc7]"
         >
           <IconAdd className="size-[14px]" />
           新建模型
@@ -377,14 +378,14 @@ export default function ModelsPage({
         <div className="flex flex-wrap items-stretch gap-[20px]" aria-label="模型统计">
           <StatCard label="模型" value={rows.length} />
           <StatCard label="已启用" value={enabledCount} tone="green" />
-          <StatCard label="默认模型" value={defaultRow?.name || '-'} valueClassName="text-[18px]" />
+          <StatCard label="默认模型" value={defaultRow?.name || '-'} valueClassName="gg-type-section-title" />
           <StatCard label="Provider" value={providerCount} />
         </div>
 
         <div className="flex flex-col gap-[18px]">
           <div className="flex items-center gap-[6px] px-[12px] text-[#757f9c]">
             <IconModels className="size-[14px] shrink-0" />
-            <span className="text-[14px] font-normal leading-none">模型列表</span>
+            <span className="gg-type-body font-normal">模型列表</span>
           </div>
 
           <label className="flex h-[34px] w-[300px] items-center gap-[8px] overflow-hidden rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[12px] transition-colors focus-within:border-[var(--gg-cobalt)] max-[900px]:w-full">
@@ -393,7 +394,7 @@ export default function ModelsPage({
               value={searchText}
               placeholder="搜索名称、模型、Provider 或 Base URL"
               onChange={(event) => setSearchText(event.target.value)}
-              className="h-full min-w-0 flex-1 bg-transparent text-[12px] text-[#17191f] outline-none placeholder:text-[#c0c6d4]"
+              className="h-full min-w-0 flex-1 bg-transparent gg-type-meta text-[#17191f] outline-none placeholder:text-[#c0c6d4]"
             />
             {searchText && (
               <button
@@ -411,7 +412,7 @@ export default function ModelsPage({
             {filteredRows.length ? (
               pagination.pagedItems.map(renderMobileCard)
             ) : (
-              <div className="py-[40px] text-center text-[13px] text-[#858b9c]">暂无模型</div>
+              <div className="py-[40px] text-center gg-type-control text-[#858b9c]">暂无模型</div>
             )}
           </div>
 
@@ -445,7 +446,7 @@ export default function ModelsPage({
         >
           <div className="flex items-center gap-[6px] px-[12px] text-[#757f9c]">
             <IconModels className="size-[14px] shrink-0" />
-            <DialogTitle className="min-w-0 truncate text-[14px] font-normal leading-none text-[#757f9c]">
+            <DialogTitle className="min-w-0 truncate gg-type-card-title font-normal text-[#757f9c]">
               {selected ? `编辑模型：${selected.name}` : '新建模型'}
             </DialogTitle>
           </div>
@@ -499,7 +500,7 @@ export default function ModelsPage({
                     rows={5}
                     value={form.extra_body}
                     placeholder={'{\n  "thinking": {\n    "type": "disabled"\n  }\n}'}
-                    className="min-h-[116px] resize-y font-mono text-[12px]"
+                    className="min-h-[116px] resize-y font-mono gg-type-meta"
                     onChange={(event) => updateForm('extra_body', event.target.value)}
                   />
                 </LabeledField>
@@ -508,11 +509,11 @@ export default function ModelsPage({
             <div className="mt-[16px] flex flex-wrap items-center gap-[24px]">
               <label className="flex cursor-pointer items-center gap-[8px]">
                 <Switch checked={form.is_default} onCheckedChange={(next) => updateForm('is_default', next)} />
-                <span className="text-[12px] font-medium text-[#464c5e]">设为默认</span>
+                <span className="gg-type-meta font-medium text-[#464c5e]">设为默认</span>
               </label>
               <label className="flex cursor-pointer items-center gap-[8px]">
                 <Switch checked={form.enabled} onCheckedChange={(next) => updateForm('enabled', next)} />
-                <span className="text-[12px] font-medium text-[#464c5e]">启用</span>
+                <span className="gg-type-meta font-medium text-[#464c5e]">启用</span>
               </label>
             </div>
           </div>
@@ -522,14 +523,14 @@ export default function ModelsPage({
               variant="outline"
               disabled={saving}
               onClick={closeEditor}
-              className="h-[32px] w-[80px] rounded-[10px] border-[#e3e7f1] bg-white px-[12px] text-[14px] font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-[#18181a]"
+              className="h-[32px] w-[80px] rounded-[10px] border-[#e3e7f1] bg-white px-[12px] gg-type-body font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-[#18181a]"
             >
               取消
             </UIButton>
             <UIButton
               disabled={saving}
               onClick={() => void save()}
-              className="h-[36px] w-[80px] rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-[12px] text-[14px] font-semibold text-white hover:bg-[#244bc7]"
+              className="h-[36px] w-[80px] rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-[12px] gg-type-body font-semibold text-white hover:bg-[#244bc7]"
             >
               保存
             </UIButton>
@@ -542,45 +543,45 @@ export default function ModelsPage({
           aria-describedby={undefined}
           className="max-h-[calc(100dvh-4rem)] w-[calc(100%-2rem)] overflow-y-auto rounded-[14px] px-5 py-4 sm:max-w-[620px]"
         >
-          <DialogTitle className="text-[15px] font-semibold text-[#18181a]">模型连接诊断</DialogTitle>
+          <DialogTitle className="gg-type-card-title font-semibold text-[#18181a]">模型连接诊断</DialogTitle>
           {connectionResult && (
             <div className="mt-3 grid gap-3">
               <div className={cn(
-                'rounded-[10px] border px-3 py-2 text-[12px]',
+                'rounded-[10px] border px-3 py-2 gg-type-meta',
                 connectionResult.success
                   ? 'border-[#b7e4c7] bg-[#f2fbf5] text-[#237a42]'
                   : 'border-[#ffd0d0] bg-[#fff6f6] text-[#b42318]',
               )}>
-                <p className="font-semibold">{connectionResult.success ? '连接可用' : '连接不可用'}</p>
-                <p className="mt-1 break-words">{connectionResult.message}</p>
+                <p className="gg-type-control font-semibold">{connectionResult.success ? '连接可用' : '连接不可用'}</p>
+                <p className="mt-1 break-words gg-type-body">{connectionResult.message}</p>
               </div>
-              <dl className="grid grid-cols-[88px_minmax(0,1fr)] gap-x-3 gap-y-1 text-[12px]">
-                <dt className="text-[#858b9c]">Endpoint</dt>
-                <dd className="break-all text-[#303746]">{connectionResult.endpoint || '-'}</dd>
-                <dt className="text-[#858b9c]">Model</dt>
-                <dd className="break-all text-[#303746]">{connectionResult.model || '-'}</dd>
-                <dt className="text-[#858b9c]">错误分类</dt>
-                <dd className="text-[#303746]">{connectionResult.error_code || '-'}</dd>
-                <dt className="text-[#858b9c]">HTTP / Request</dt>
-                <dd className="break-all text-[#303746]">
+              <dl className="grid grid-cols-[88px_minmax(0,1fr)] gap-x-3 gap-y-1 gg-type-meta">
+                <dt className="gg-type-caption text-[#858b9c]">Endpoint</dt>
+                <dd className="break-all gg-type-meta text-[#303746]">{connectionResult.endpoint || '-'}</dd>
+                <dt className="gg-type-caption text-[#858b9c]">Model</dt>
+                <dd className="break-all gg-type-meta text-[#303746]">{connectionResult.model || '-'}</dd>
+                <dt className="gg-type-caption text-[#858b9c]">错误分类</dt>
+                <dd className="gg-type-meta text-[#303746]">{connectionResult.error_code || '-'}</dd>
+                <dt className="gg-type-caption text-[#858b9c]">HTTP / Request</dt>
+                <dd className="break-all gg-type-meta text-[#303746]">
                   {connectionResult.http_status || '-'} / {connectionResult.request_id || '-'}
                 </dd>
               </dl>
               <div className="grid gap-2">
                 {connectionResult.checks.map((check) => (
-                  <div key={check.name} className="rounded-[10px] border border-[#e8ebf2] px-3 py-2 text-[12px]">
+                  <div key={check.name} className="rounded-[10px] border border-[#e8ebf2] px-3 py-2 gg-type-meta">
                     <div className="flex items-center justify-between gap-3">
-                      <span className="font-medium text-[#303746]">{check.name}</span>
+                      <span className="gg-type-meta font-medium text-[#303746]">{check.name}</span>
                       <StatusBadge tone={check.status === 'passed' ? 'green' : check.status === 'failed' ? 'red' : 'gray'}>
                         {check.status === 'passed' ? '通过' : check.status === 'failed' ? '失败' : '跳过'}
                       </StatusBadge>
                     </div>
-                    <p className="mt-1 break-words text-[#757f9c]">{check.message}</p>
+                    <p className="mt-1 break-words gg-type-body text-[#757f9c]">{check.message}</p>
                   </div>
                 ))}
               </div>
               {connectionResult.suggestion && (
-                <p className="rounded-[10px] bg-[#f6f8fc] px-3 py-2 text-[12px] text-[#464c5e]">
+                <p className="rounded-[10px] bg-[#f6f8fc] px-3 py-2 gg-type-meta text-[#464c5e]">
                   建议：{connectionResult.suggestion}
                 </p>
               )}
@@ -588,14 +589,14 @@ export default function ModelsPage({
           )}
         </DialogContent>
       </Dialog>
-    </div>
+    </PageShell>
   );
 }
 
 function LabeledField({ label, children }: { label: string; children: ReactNode }) {
   return (
     <label className="flex flex-col gap-[6px]">
-      <span className="text-[12px] font-medium text-[#464c5e]">{label}</span>
+      <span className="gg-type-meta font-medium text-[#464c5e]">{label}</span>
       {children}
     </label>
   );

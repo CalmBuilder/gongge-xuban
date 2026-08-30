@@ -3,11 +3,11 @@ import { cn } from '@/lib/utils';
 // Enterprise button + card patterns (match GeneralSkillsPage)
 export const SECTION_CARD_CLASS =
   'flex flex-col gap-[24px] rounded-[20px_20px_0_0] bg-[#FFF] p-[18px] shadow-[0_-4px_16px_0_rgba(0,0,0,0.05)]';
-export const SECTION_CARD_TITLE_CLASS = 'text-[14px] font-medium text-[#18181a]';
+export const SECTION_CARD_TITLE_CLASS = 'gg-type-body font-medium text-[#18181a]';
 export const RETURN_BUTTON_CLASS =
-  'h-8 gap-1 rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-5 text-[12px] font-normal text-[#757f9c] hover:border-[#cbd3e6]! hover:bg-white! hover:text-[#18181a]! focus-visible:border-[#cbd3e6]! focus-visible:ring-0 aria-expanded:border-[#cbd3e6]! aria-expanded:bg-white! aria-expanded:text-[#18181a]! data-[state=open]:border-[#cbd3e6]! data-[state=open]:bg-white! data-[state=open]:text-[#18181a]!';
+  'h-8 gap-1 rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-5 gg-type-meta font-normal text-[#757f9c] hover:border-[#cbd3e6]! hover:bg-white! hover:text-[#18181a]! focus-visible:border-[#cbd3e6]! focus-visible:ring-0 aria-expanded:border-[#cbd3e6]! aria-expanded:bg-white! aria-expanded:text-[#18181a]! data-[state=open]:border-[#cbd3e6]! data-[state=open]:bg-white! data-[state=open]:text-[#18181a]!';
 export const PRIMARY_BUTTON_CLASS =
-  'h-8 gap-1 rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-5 text-[12px] font-semibold text-white hover:bg-[#244bc7]';
+  'h-8 gap-1 rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-5 gg-type-meta font-semibold text-white hover:bg-[#244bc7]';
 
 // Page layout — flex column so header + actions stay auto-sized and workbench fills the rest
 export const DISTILL_PAGE_CLASS =
@@ -32,14 +32,14 @@ export const SOURCE_CARD_CLASS = DISTILL_CARD_CLASS;
 // Chat panel
 export const CHAT_PANEL_CLASS = 'relative flex h-full min-w-0 flex-col';
 export const CHAT_UPLOAD_DROP_HINT_CLASS =
-  'pointer-events-none absolute inset-0 z-[2] grid place-items-center rounded-[12px] border border-dashed border-[#d1d5db] bg-white/88 text-[14px] font-medium text-[#18181a] backdrop-blur-sm';
+  'pointer-events-none absolute inset-0 z-[2] grid place-items-center rounded-[12px] border border-dashed border-[#d1d5db] bg-white/88 gg-type-body font-medium text-[#18181a] backdrop-blur-sm';
 export const CHAT_MESSAGES_CLASS =
   'min-h-0 min-w-0 flex-1 overflow-auto bg-[#fbfcfd] px-[20px] py-[18px]';
 export const CHAT_COMPOSER_SHELL_CLASS =
   'shrink-0 border-t border-[#eceef1] pt-[16px]';
 export const CHAT_COMPOSER_CLASS = 'grid gap-[12px]';
 export const CHAT_TEXTAREA_CLASS =
-  'h-[112px] min-h-[96px] max-h-[160px] resize-none overflow-y-auto field-sizing-fixed rounded-[var(--gg-radius-control)] border border-[var(--gg-border)] bg-[var(--gg-cloud)] px-[14px] py-[12px] text-[13px] leading-[1.65] text-[var(--gg-ink)] shadow-none placeholder:text-[var(--gg-slate)] focus-visible:border-[var(--gg-cobalt)] focus-visible:ring-2 focus-visible:ring-[color-mix(in_srgb,var(--gg-cobalt)_16%,transparent)]';
+  'h-[112px] min-h-[96px] max-h-[160px] resize-none overflow-y-auto field-sizing-fixed rounded-[var(--gg-radius-control)] border border-[var(--gg-border)] bg-[var(--gg-cloud)] px-[14px] py-[12px] gg-type-control  text-[var(--gg-ink)] shadow-none placeholder:text-[var(--gg-slate)] focus-visible:border-[var(--gg-cobalt)] focus-visible:ring-2 focus-visible:ring-[color-mix(in_srgb,var(--gg-cobalt)_16%,transparent)]';
 export const CHAT_ACTIONS_CLASS = 'flex flex-wrap items-center justify-between gap-[10px]';
 export const CHAT_ACTIONS_GROUP_CLASS = 'flex flex-wrap items-center justify-end gap-[8px]';
 
@@ -48,7 +48,7 @@ export const CHAT_ROW_USER_CLASS = 'justify-end mb-[30px]';
 export const CHAT_ROW_ASSISTANT_CLASS = '';
 
 export const CHAT_BUBBLE_BASE_CLASS =
-  'relative box-border max-w-[min(720px,92%)] min-w-0 rounded-[12px] border border-[#eceef1] bg-white px-[14px] py-[12px] text-[13px] leading-[1.65] whitespace-pre-wrap wrap-anywhere text-[#18181a]';
+  'relative box-border max-w-[min(720px,92%)] min-w-0 rounded-[12px] border border-[#eceef1] bg-white px-[14px] py-[12px] gg-type-control  whitespace-pre-wrap wrap-anywhere text-[#18181a]';
 export const CHAT_BUBBLE_ASSISTANT_CLASS = 'border-transparent bg-white shadow-none';
 export const CHAT_BUBBLE_USER_CLASS =
   'max-w-[min(620px,80%)] rounded-[16px] border-transparent bg-[#f0eee9] shadow-none';
@@ -65,9 +65,9 @@ export const CHAT_CONTENT_USER_ATTACHMENTS_CLASS =
 
 export const CHAT_THINKING_BLOCK_CLASS = 'mb-[10px] min-w-0 max-w-full';
 export const CHAT_THINKING_BUTTON_CLASS =
-  'inline-flex cursor-pointer items-center gap-[7px] border-0 bg-transparent p-0 text-[13px] font-semibold leading-[1.5] text-[#62625e] hover:text-[#18181a]';
+  'inline-flex cursor-pointer items-center gap-[7px] border-0 bg-transparent p-0 gg-type-control font-semibold  text-[#62625e] hover:text-[#18181a]';
 export const CHAT_THINKING_DETAILS_CLASS =
-  'mb-[4px] mt-[10px] box-border grid max-w-full min-w-0 gap-[6px] rounded-[10px] border border-[#eceef1] bg-[#fafafa] p-[10px_12px] text-[12px] leading-[1.55] text-[#858b9c]';
+  'mb-[4px] mt-[10px] box-border grid max-w-full min-w-0 gap-[6px] rounded-[10px] border border-[#eceef1] bg-[#fafafa] p-[10px_12px] gg-type-meta  text-[#858b9c]';
 export const CHAT_THINKING_DETAIL_CLASS =
   'relative min-w-0 pl-[14px] wrap-anywhere before:absolute before:left-0 before:top-[0.72em] before:size-[5px] before:rounded-full before:bg-[#d1d5db] before:content-[""]';
 
@@ -77,40 +77,40 @@ export const CHAT_ATTACHMENT_CLASS =
   'grid min-h-[46px] w-[min(260px,100%)] grid-cols-[32px_minmax(0,1fr)] items-center gap-[9px] rounded-[8px] border border-[#eceef1] bg-[#fbfaf8] px-[7px_10px_7px_7px] text-[#18181a] shadow-[0_5px_14px_rgba(45,39,30,0.035)]';
 export const CHAT_ATTACHMENT_USER_CLASS = 'ml-auto bg-[#f8f7f3]';
 export const CHAT_ATTACHMENT_ICON_CLASS =
-  'inline-flex size-[32px] items-center justify-center rounded-[8px] bg-[#ef4444] text-[15px] text-white';
+  'inline-flex size-[32px] items-center justify-center rounded-[8px] bg-[#ef4444] gg-type-body text-white';
 export const CHAT_ATTACHMENT_MAIN_CLASS = 'grid min-w-0 gap-px';
 export const CHAT_ATTACHMENT_NAME_CLASS =
-  'min-w-0 truncate text-[12px] font-semibold leading-[1.35]';
-export const CHAT_ATTACHMENT_TYPE_CLASS = 'text-[11px] leading-[1.2] text-[#858b9c]';
+  'min-w-0 truncate gg-type-meta font-semibold ';
+export const CHAT_ATTACHMENT_TYPE_CLASS = 'gg-type-caption  text-[#858b9c]';
 
 export const CHAT_EDIT_PANEL_CLASS = 'grid gap-[10px]';
 export const CHAT_EDIT_PANEL_USER_ATTACHMENTS_CLASS =
   'w-[min(520px,100%)] rounded-[16px] bg-[#f0eee9] px-[14px] py-[12px]';
 export const CHAT_EDIT_TEXTAREA_CLASS =
-  'min-h-[34px] resize-none border-0 bg-transparent p-0 text-[16px] leading-[1.65] text-[#18181a] shadow-none focus-visible:ring-0';
+  'min-h-[34px] resize-none border-0 bg-transparent p-0 gg-type-card-title  text-[#18181a] shadow-none focus-visible:ring-0';
 export const CHAT_EDIT_ACTIONS_CLASS = 'flex justify-end gap-[7px]';
 
 export const CHAT_HOVER_ACTIONS_CLASS =
   'absolute right-[10px] bottom-[-26px] inline-flex items-center gap-[9px] text-[#858b9c] opacity-0 transition-opacity duration-150 group-hover/bubble:opacity-100 group-focus-within/bubble:opacity-100';
-export const CHAT_TIME_CLASS = 'text-[12px] leading-none text-[#858b9c]';
+export const CHAT_TIME_CLASS = 'gg-type-meta text-[#858b9c]';
 export const CHAT_HOVER_BUTTON_CLASS =
   'inline-flex size-[17px] items-center justify-center border-0 bg-transparent p-0 text-[#858b9c] hover:text-[#18181a] disabled:cursor-not-allowed disabled:opacity-45';
 
 export const CHAT_WARNING_CLASS =
-  'mt-[12px] grid gap-[6px] rounded-[8px] border border-[#fed7aa] bg-[#fff7ed] p-[10px_12px] text-[12px] leading-[1.55] text-[#7c2d12]';
+  'mt-[12px] grid gap-[6px] rounded-[8px] border border-[#fed7aa] bg-[#fff7ed] p-[10px_12px] gg-type-meta  text-[#7c2d12]';
 export const CHAT_WARNING_TITLE_CLASS =
   'inline-flex items-center gap-[6px] font-semibold text-[#9a3412]';
 export const CHAT_WARNING_ITEM_CLASS =
   'relative whitespace-normal wrap-anywhere pl-[18px] before:absolute before:left-[6px] before:top-[0.72em] before:size-[4px] before:rounded-full before:bg-[#fb923c] before:content-[""]';
 
 export const CHAT_CONFIRM_CLASS = 'mt-[12px] flex gap-[8px]';
-export const CHAT_DECISION_CLASS = 'mt-[10px] text-[12px] text-[#858b9c]';
+export const CHAT_DECISION_CLASS = 'mt-[10px] gg-type-meta text-[#858b9c]';
 
 // Upload list
 export const UPLOAD_LIST_CLASS =
   'grid max-h-[min(168px,30vh)] gap-[8px] overflow-y-auto overscroll-contain pr-[2px] [scrollbar-gutter:stable]';
 export const UPLOAD_ITEM_BASE_CLASS =
-  'grid min-h-[34px] min-w-0 grid-cols-[auto_minmax(0,1fr)_auto_auto] items-center gap-[8px] rounded-[10px] border border-[#eceef1] bg-[#fafafa] p-[6px_8px] text-[12px] text-[#18181a]';
+  'grid min-h-[34px] min-w-0 grid-cols-[auto_minmax(0,1fr)_auto_auto] items-center gap-[8px] rounded-[10px] border border-[#eceef1] bg-[#fafafa] p-[6px_8px] gg-type-meta text-[#18181a]';
 export const UPLOAD_ITEM_ERROR_CLASS = 'border-[#fecaca] bg-[#fef2f2] text-[#d20b0b]';
 export const UPLOAD_NAME_CLASS = 'min-w-0 truncate';
 export const UPLOAD_STATUS_CLASS = 'max-w-[160px] truncate whitespace-nowrap text-[#858b9c]';
@@ -122,13 +122,13 @@ export const TOOL_SUGGESTION_CLASS =
 export const TOOL_SUGGESTION_MAIN_CLASS = 'min-w-0 max-w-full pr-[118px]';
 export const TOOL_SUGGESTION_HEAD_CLASS = 'mb-[4px] flex min-w-0 items-center gap-[7px]';
 export const TOOL_SUGGESTION_TITLE_CLASS =
-  'min-w-0 truncate text-[13px] font-semibold text-[#18181a]';
+  'min-w-0 truncate gg-type-control font-semibold text-[#18181a]';
 export const TOOL_SUGGESTION_DESC_CLASS =
-  'min-w-0 text-[12px] leading-[1.55] wrap-anywhere text-[#858b9c]';
+  'min-w-0 gg-type-meta  wrap-anywhere text-[#858b9c]';
 export const TOOL_SUGGESTION_META_CLASS =
-  'mt-[7px] flex min-w-0 max-w-full items-center gap-[6px] text-[11px] text-[#858b9c]';
+  'mt-[7px] flex min-w-0 max-w-full items-center gap-[6px] gg-type-caption text-[#858b9c]';
 export const TOOL_METHOD_CLASS =
-  'min-w-[44px] shrink-0 rounded-full border border-[#eceef1] bg-white px-[7px] py-px text-center text-[11px] font-semibold text-[#18181a]';
+  'min-w-[44px] shrink-0 rounded-full border border-[#eceef1] bg-white px-[7px] py-px text-center gg-type-caption font-semibold text-[#18181a]';
 export const TOOL_SUGGESTION_ACTIONS_CLASS = 'absolute right-[12px] top-[10px] inline-flex items-center justify-end gap-[8px]';
 export const TOOL_ACTION_GROUP_CLASS =
   'inline-flex items-center justify-center gap-[4px] rounded-full border border-[#e2dacd]/90 bg-white/78 p-[2px] shadow-[inset_0_1px_0_rgba(255,255,255,0.9)]';
@@ -149,7 +149,7 @@ const TOOL_STATUS_BADGE_VARIANTS: Record<ToolStatusBadgeVariant, string> = {
 };
 
 export const TOOL_STATUS_BADGE_BASE_CLASS =
-  'inline-flex shrink-0 items-center rounded-full border px-[7px] py-px text-[11px] font-semibold leading-[1.45]';
+  'inline-flex shrink-0 items-center rounded-full border px-[7px] py-px gg-type-caption font-semibold ';
 
 export function toolStatusBadgeClass(status: ToolStatusBadgeVariant): string {
   return cn(TOOL_STATUS_BADGE_BASE_CLASS, TOOL_STATUS_BADGE_VARIANTS[status]);
@@ -157,18 +157,18 @@ export function toolStatusBadgeClass(status: ToolStatusBadgeVariant): string {
 
 // Rewrite model button (DropdownMenuTrigger — override outline variant ring/expanded state)
 export const REWRITE_MODEL_BUTTON_CLASS =
-  'inline-flex h-8 max-w-[220px] min-w-0 items-center gap-2 rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[12px] text-[12px] font-normal text-[#757f9c] shadow-none hover:border-[#cbd3e6]! hover:bg-white! hover:text-[#18181a]! focus-visible:border-[#cbd3e6]! focus-visible:ring-0 aria-expanded:border-[#cbd3e6]! aria-expanded:bg-white! aria-expanded:text-[#18181a]! data-[state=open]:border-[#cbd3e6]! data-[state=open]:bg-white! data-[state=open]:text-[#18181a]! [&>span:first-child]:min-w-0 [&>span:first-child]:truncate';
+  'inline-flex h-8 max-w-[220px] min-w-0 items-center gap-2 rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[12px] gg-type-meta font-normal text-[#757f9c] shadow-none hover:border-[#cbd3e6]! hover:bg-white! hover:text-[#18181a]! focus-visible:border-[#cbd3e6]! focus-visible:ring-0 aria-expanded:border-[#cbd3e6]! aria-expanded:bg-white! aria-expanded:text-[#18181a]! data-[state=open]:border-[#cbd3e6]! data-[state=open]:bg-white! data-[state=open]:text-[#18181a]! [&>span:first-child]:min-w-0 [&>span:first-child]:truncate';
 
 // Source toolbar + editor
 export const SOURCE_TOOLBAR_CLASS =
   'mb-[12px] flex shrink-0 flex-wrap items-center gap-[8px] rounded-[10px] bg-[#fafafa] p-[8px]';
 export const SOURCE_EMPTY_STATE_CLASS =
   'flex min-h-[240px] flex-1 flex-col items-center justify-center gap-[10px] rounded-[12px] border border-dashed border-[#e3e7f1] bg-[#fbfcfd] px-[24px] py-[32px] text-center';
-export const SOURCE_EMPTY_TEXT_CLASS = 'text-[13px] leading-[20px] text-[#858b9c]';
+export const SOURCE_EMPTY_TEXT_CLASS = 'gg-type-control  text-[#858b9c]';
 export const SOURCE_MD_CLASS =
   'box-border grid min-h-0 min-w-0 w-full max-w-full flex-1 content-start gap-[14px] self-stretch overflow-x-hidden overflow-y-auto overscroll-contain [scrollbar-gutter:stable] pr-[clamp(6px,1vw,14px)]';
 export const SOURCE_GROUP_TITLE_CLASS =
-  'my-[2px_-2px] text-[13px] font-semibold text-[#18181a]';
+  'my-[2px_-2px] gg-type-control font-semibold text-[#18181a]';
 export const SOURCE_STEPS_CLASS = 'grid gap-[12px]';
 export const SOURCE_STEP_BLOCK_CLASS = 'grid gap-[10px]';
 
@@ -180,7 +180,7 @@ export const SOURCE_SECTION_CHANGED_CLASS =
 export const SOURCE_SECTION_DIRTY_CLASS = 'bg-[#fffdf8] shadow-[inset_3px_0_0_#d8c7a4]';
 export const SOURCE_SECTION_UPDATING_CLASS = 'animate-pulse';
 
-export const SOURCE_RENDERED_CLASS = 'grid gap-[12px] text-[13px] leading-[1.7] text-[#18181a]';
+export const SOURCE_RENDERED_CLASS = 'grid gap-[12px] gg-type-control  text-[#18181a]';
 export const SOURCE_META_LIST_CLASS = 'grid gap-[7px]';
 export const SOURCE_STEP_HEADER_CLASS =
   'flex min-w-0 items-start justify-between gap-[12px] pr-[6px]';
@@ -188,7 +188,7 @@ export const SOURCE_LINE_CLASS =
   'grid min-h-[1.7em] min-w-0 max-w-full grid-cols-[132px_minmax(0,1fr)] items-start gap-[10px] max-[760px]:grid-cols-1';
 export const SOURCE_LINE_COLLAPSIBLE_CLASS = '[&_.source-edit-field]:w-full';
 export const SOURCE_LINE_READONLY_CLASS = '';
-export const SOURCE_KEY_CLASS = 'text-[12px] font-semibold text-[#858b9c]';
+export const SOURCE_KEY_CLASS = 'gg-type-meta font-semibold text-[#858b9c]';
 export const SOURCE_VALUE_CLASS = 'min-w-0 w-full max-w-full whitespace-pre-wrap text-[#18181a]';
 export const SOURCE_READONLY_VALUE_CLASS = 'block';
 export const SOURCE_JSON_INLINE_CLASS =
@@ -196,7 +196,7 @@ export const SOURCE_JSON_INLINE_CLASS =
 export const SOURCE_EDIT_FIELD_CLASS = 'flex min-w-0 w-full max-w-full items-start';
 
 const PILL_OUTLINE_BUTTON_BASE =
-  'inline-flex cursor-pointer items-center justify-center gap-1 rounded-full border-[0.5px] border-[#e3e7f1] bg-white text-[12px] font-normal leading-none text-[#858b9c] shadow-none transition-colors hover:border-[#04756f]! hover:bg-white! hover:text-[#18181a]! focus-visible:border-[#04756f]! focus-visible:ring-0 focus-visible:outline-none focus-visible:text-[#18181a]! [&_.anticon]:inline-flex [&_.anticon]:shrink-0 [&_.anticon]:items-center [&_.anticon]:justify-center [&_.anticon_svg]:block';
+  'inline-flex cursor-pointer items-center justify-center gap-1 rounded-full border-[0.5px] border-[#e3e7f1] bg-white gg-type-meta font-normal text-[#858b9c] shadow-none transition-colors hover:border-[#04756f]! hover:bg-white! hover:text-[#18181a]! focus-visible:border-[#04756f]! focus-visible:ring-0 focus-visible:outline-none focus-visible:text-[#18181a]! [&_.anticon]:inline-flex [&_.anticon]:shrink-0 [&_.anticon]:items-center [&_.anticon]:justify-center [&_.anticon_svg]:block';
 
 export const NODE_INSERT_ROW_CLASS = 'flex justify-center';
 export const NODE_INSERT_ROW_EDGE_CLASS = 'my-[2px]';
@@ -205,19 +205,19 @@ export const PILL_OUTLINE_BUTTON_SM_CLASS = cn(PILL_OUTLINE_BUTTON_BASE, 'h-6 px
 export const NODE_INSERT_BUTTON_CLASS = PILL_OUTLINE_BUTTON_CLASS;
 
 export const SOURCE_TITLE_INPUT_CLASS =
-  'max-w-full rounded-[6px] border-transparent bg-transparent px-[6px] py-0 text-[18px] font-semibold leading-[1.5] shadow-none hover:border-[#eceef1] hover:bg-white focus-visible:border-[#eceef1] focus-visible:bg-white focus-visible:ring-0';
+  'max-w-full rounded-[6px] border-transparent bg-transparent px-[6px] py-0 gg-type-section-title font-semibold  shadow-none hover:border-[#eceef1] hover:bg-white focus-visible:border-[#eceef1] focus-visible:bg-white focus-visible:ring-0';
 export const SOURCE_STEP_TITLE_EDIT_CLASS =
-  'inline-grid w-full max-w-full min-w-0 grid-cols-[auto_minmax(0,1fr)] items-center gap-[6px] text-[15px] font-semibold [&>span:first-child]:whitespace-nowrap [&>span:first-child]:text-[#18181a]';
+  'inline-grid w-full max-w-full min-w-0 grid-cols-[auto_minmax(0,1fr)] items-center gap-[6px] gg-type-body font-semibold [&>span:first-child]:whitespace-nowrap [&>span:first-child]:text-[#18181a]';
 export const SOURCE_EDIT_INPUT_CLASS =
-  'box-border min-w-0 max-w-full resize-none overflow-x-hidden overflow-y-hidden! rounded-[6px] border-transparent bg-transparent px-[6px] py-[2px] leading-[1.65] wrap-anywhere shadow-none field-sizing-fixed hover:border-[#eceef1] hover:bg-white focus-visible:border-[#eceef1] focus-visible:bg-white focus-visible:ring-0';
+  'box-border min-w-0 max-w-full resize-none overflow-x-hidden overflow-y-hidden! rounded-[6px] border-transparent bg-transparent px-[6px] py-[2px]  wrap-anywhere shadow-none field-sizing-fixed hover:border-[#eceef1] hover:bg-white focus-visible:border-[#eceef1] focus-visible:bg-white focus-visible:ring-0';
 
 export const SOURCE_COLLAPSIBLE_EDITOR_CLASS = 'grid min-w-0 w-full max-w-full gap-[8px]';
 export const SOURCE_COLLAPSIBLE_HEAD_CLASS =
   'grid min-h-[38px] w-full cursor-pointer grid-cols-[minmax(0,1fr)_auto] items-center gap-[10px] rounded-[10px] border border-[#eceef1] bg-linear-to-b from-[#f8f7f4]/96 to-[#f4f2ed]/78 px-[12px] py-[6px] text-left text-[#858b9c] shadow-[inset_0_1px_0_rgba(255,255,255,0.74)] hover:border-[#d1d5db] hover:bg-white hover:text-[#18181a] focus-visible:outline-none';
-export const SOURCE_COLLAPSIBLE_PREVIEW_CLASS = 'min-w-0 truncate text-[12px] leading-[1.5]';
+export const SOURCE_COLLAPSIBLE_PREVIEW_CLASS = 'min-w-0 truncate gg-type-meta ';
 export const SOURCE_COLLAPSIBLE_PREVIEW_MUTED_CLASS = 'text-[#858b9c]';
 export const SOURCE_COLLAPSIBLE_TOGGLE_CLASS =
-  'inline-flex h-[26px] shrink-0 items-center gap-[5px] rounded-full border border-[#eceef1] bg-white px-[9px] text-[12px] font-semibold leading-none text-[#858b9c]';
+  'inline-flex h-[26px] shrink-0 items-center gap-[5px] rounded-full border border-[#eceef1] bg-white px-[9px] gg-type-meta font-semibold text-[#858b9c]';
 
 export const SOURCE_ACTION_EDITOR_CLASS = 'grid w-[min(820px,100%)] gap-[6px]';
 export const SOURCE_ACTION_LIST_CLASS = 'flex max-h-[84px] flex-wrap gap-[6px] overflow-auto';
@@ -230,32 +230,32 @@ export const SOURCE_ACTION_REMOVE_CLASS =
 export const SOURCE_ACTION_ADD_CLASS = PILL_OUTLINE_BUTTON_SM_CLASS;
 export const SOURCE_ACTION_PICKER_CLASS = 'inline-flex min-w-[min(280px,100%)] max-w-full';
 export const SOURCE_ACTION_SELECT_CLASS =
-  'h-[26px] min-w-0 w-full max-w-full rounded-full border border-[#eceef1] bg-white px-2 text-[12px] leading-[1.4] shadow-none';
+  'h-[26px] min-w-0 w-full max-w-full rounded-full border border-[#eceef1] bg-white px-2 gg-type-meta  shadow-none';
 export const SOURCE_EDIT_HINT_CLASS =
-  'shrink-0 text-[11px] text-[#858b9c] opacity-0 group/action-editor:opacity-100';
+  'shrink-0 gg-type-caption text-[#858b9c] opacity-0 group/action-editor:opacity-100';
 
 export const SOURCE_SELECT_CLASS = 'min-w-[168px]';
 export const CONDITION_EDITOR_CLASS =
   'grid min-w-0 w-full max-w-full grid-cols-1 items-start gap-x-[10px] gap-y-[8px] min-[1500px]:grid-cols-[minmax(160px,220px)_minmax(0,1fr)]';
 export const CONDITION_READABLE_CLASS =
-  'col-span-full text-[12px] leading-[1.55] text-[#858b9c]';
+  'col-span-full gg-type-meta  text-[#858b9c]';
 export const CONDITION_PRESET_CLASS = 'min-w-[168px]';
 export const CONDITION_INPUT_CLASS = 'w-full! min-w-0';
 
 export const RETRY_POLICY_EDITOR_CLASS =
   'grid min-w-0 w-full max-w-full grid-cols-1 items-start gap-x-[10px] gap-y-[8px] min-[1500px]:grid-cols-[120px_minmax(180px,240px)_minmax(0,1fr)]';
-export const RETRY_POLICY_FIELD_CLASS = 'grid min-w-0 gap-[4px] [&>span]:text-[11px] [&>span]:font-semibold [&>span]:leading-[1.3] [&>span]:text-[#858b9c]';
+export const RETRY_POLICY_FIELD_CLASS = 'grid min-w-0 gap-[4px] gg-type-children-caption [&>span]:font-semibold [&>span]:text-[#858b9c]';
 
 export const FLOW_RULE_EDITOR_CLASS = 'grid w-[min(1120px,100%)] gap-[10px]';
 export const FLOW_RULE_HEAD_CLASS =
-  'flex flex-wrap items-center justify-between gap-2 text-[12px] font-semibold text-[#858b9c]';
+  'flex flex-wrap items-center justify-between gap-2 gg-type-meta font-semibold text-[#858b9c]';
 export const FLOW_RULE_LIST_CLASS = 'grid gap-[10px]';
 export const FLOW_RULE_ITEM_CLASS =
   'grid min-w-0 max-w-full gap-x-[12px] gap-y-[10px] rounded-[12px] border border-[#eceef1] bg-[#fafafa] p-[12px] [grid-template-areas:"target"_"label"_"priority"_"condition"_"delete"] [grid-template-columns:minmax(0,1fr)] min-[1500px]:[grid-template-areas:"target_label_priority_delete"_"condition_condition_condition_condition"] min-[1500px]:[grid-template-columns:minmax(220px,1.05fr)_minmax(220px,1fr)_112px_32px]';
-export const FLOW_RULE_FIELD_CLASS = 'grid min-w-0 gap-[4px] [&>span]:text-[11px] [&>span]:font-semibold [&>span]:leading-[1.3] [&>span]:text-[#858b9c]';
+export const FLOW_RULE_FIELD_CLASS = 'grid min-w-0 gap-[4px] gg-type-children-caption [&>span]:font-semibold [&>span]:text-[#858b9c]';
 export const FLOW_RULE_FIELD_TARGET_CLASS = '[grid-area:target]';
 export const FLOW_RULE_FIELD_LABEL_CLASS = '[grid-area:label]';
-export const FLOW_RULE_FIELD_CONDITION_CLASS = '[grid-area:condition] [&_em]:text-[11px] [&_em]:not-italic [&_em]:leading-[1.45] [&_em]:text-[#858b9c]';
+export const FLOW_RULE_FIELD_CONDITION_CLASS = '[grid-area:condition] gg-type-children-caption [&_em]:not-italic [&_em]:text-[#858b9c]';
 export const FLOW_RULE_FIELD_PRIORITY_CLASS = '[grid-area:priority]';
 export const FLOW_RULE_CONDITION_CONTROLS_CLASS =
   'grid min-w-0 max-w-full grid-cols-1 items-start gap-[8px] min-[1500px]:grid-cols-[minmax(180px,240px)_minmax(0,1fr)]';
@@ -265,16 +265,16 @@ export const FLOW_RULE_CONDITION_INPUT_CLASS = 'w-full min-w-0 resize-none';
 export const FLOW_RULE_PRIORITY_CLASS = 'w-full min-w-0';
 export const FLOW_RULE_DELETE_CLASS = '[grid-area:delete] mt-[19px]';
 export const FLOW_RULE_EMPTY_CLASS =
-  'rounded-[12px] border border-dashed border-[#eceef1] bg-[#fafafa] p-[10px_12px] text-[12px] text-[#858b9c]';
+  'rounded-[12px] border border-dashed border-[#eceef1] bg-[#fafafa] p-[10px_12px] gg-type-meta text-[#858b9c]';
 
 export const NODE_DELETE_CONFIRM_CLASS = 'grid gap-[8px] [&_p]:m-0 [&_ul]:m-0 [&_ul]:pl-[18px]';
 
 // Flow diagram
 export const FLOW_ZOOM_TOOLBAR_CLASS =
-  '-mt-[2px] mb-[12px] flex min-h-[40px] items-center gap-[8px] text-[12px] text-[#858b9c]';
+  '-mt-[2px] mb-[12px] flex min-h-[40px] items-center gap-[8px] gg-type-meta text-[#858b9c]';
 
 const FLOW_ZOOM_BUTTON_BASE =
-  'inline-flex shrink-0 items-center justify-center rounded-[9px] border-[0.5px] border-[#e3e7f1] bg-white text-[12px] font-normal leading-none text-[#757f9c] shadow-none transition-colors hover:border-[#cbd3e6]! hover:bg-white! hover:text-[#18181a]! focus-visible:border-[#cbd3e6]! focus-visible:ring-0 focus-visible:outline-none aria-pressed:border-[#04756f]! aria-pressed:bg-[#f3fbf8]! aria-pressed:font-medium aria-pressed:text-[#18181a]!';
+  'inline-flex shrink-0 items-center justify-center rounded-[9px] border-[0.5px] border-[#e3e7f1] bg-white gg-type-meta font-normal text-[#757f9c] shadow-none transition-colors hover:border-[#cbd3e6]! hover:bg-white! hover:text-[#18181a]! focus-visible:border-[#cbd3e6]! focus-visible:ring-0 focus-visible:outline-none aria-pressed:border-[#04756f]! aria-pressed:bg-[#f3fbf8]! aria-pressed:font-medium aria-pressed:text-[#18181a]!';
 
 export const FLOW_ZOOM_STEP_BUTTON_CLASS = cn(FLOW_ZOOM_BUTTON_BASE, 'size-7 min-w-[34px] px-0');
 export const FLOW_ZOOM_PRESET_BUTTON_CLASS = cn(FLOW_ZOOM_BUTTON_BASE, 'h-7 min-w-[34px] px-2.5');
@@ -287,7 +287,7 @@ export function flowZoomPresetButtonClass(active: boolean): string {
 }
 
 export const FLOW_ZOOM_VALUE_CLASS =
-  'inline-flex h-7 min-w-[42px] items-center justify-center rounded-[9px] bg-[#fafafa] px-2 text-center font-mono text-[12px] leading-none text-[#18181a]';
+  'inline-flex h-7 min-w-[42px] items-center justify-center rounded-[9px] bg-[#fafafa] px-2 text-center font-mono gg-type-meta text-[#18181a]';
 export const FLOW_CLASS =
   'block min-h-0 flex-1 overflow-auto px-[clamp(18px,3vw,40px)] py-[clamp(18px,2.8vw,34px)] pb-16';
 export const FLOW_ZOOM_SHELL_CLASS = 'relative mx-0 min-w-full';
@@ -297,7 +297,7 @@ export const FLOW_EDGES_CLASS = 'pointer-events-none absolute top-0 left-0 z-[2]
 export const FLOW_EDGE_PATH_CLASS =
   'fill-none stroke-[#bfb09a] [stroke-width:1.3] [stroke-dasharray:6_14] [vector-effect:non-scaling-stroke] [stroke-linecap:round] [stroke-linejoin:round] opacity-50';
 export const FLOW_EDGE_LABEL_BASE_CLASS =
-  'pointer-events-none absolute z-[4] max-w-[176px] -translate-x-1/2 -translate-y-1/2 overflow-hidden rounded-full border border-[#d7cbbb] bg-[#fffdf8]/98 px-[9px] py-[4px] text-[11px] leading-[1.35] text-ellipsis whitespace-nowrap text-[#5f574b] shadow-[0_8px_18px_rgba(38,32,23,0.1)]';
+  'pointer-events-none absolute z-[4] max-w-[176px] -translate-x-1/2 -translate-y-1/2 overflow-hidden rounded-full border border-[#d7cbbb] bg-[#fffdf8]/98 px-[9px] py-[4px] gg-type-caption  text-ellipsis whitespace-nowrap text-[#5f574b] shadow-[0_8px_18px_rgba(38,32,23,0.1)]';
 export const FLOW_ROOT_POSITION_CLASS = 'absolute z-[6]';
 export const FLOW_NODE_POSITION_CLASS = 'absolute z-[7]';
 export const FLOW_NODE_SHELL_CLASS =
@@ -315,18 +315,18 @@ export const FLOW_NODE_UPDATING_CLASS = 'animate-pulse';
 
 export const FLOW_NODE_BADGES_CLASS = 'flex max-h-[28px] flex-wrap gap-[6px] overflow-hidden';
 export const FLOW_NODE_SUMMARY_CLASS =
-  'm-[2px_0_0] line-clamp-3 text-[13px] leading-[1.5] wrap-anywhere text-[#858b9c]!';
+  'm-[2px_0_0] line-clamp-3 gg-type-control  wrap-anywhere text-[#858b9c]!';
 export const FLOW_COMPACT_META_CLASS = 'grid min-h-0 content-start gap-[6px] overflow-hidden';
 export const FLOW_COMPACT_ROW_CLASS =
-  'grid min-w-0 grid-cols-[34px_minmax(0,1fr)] items-start gap-[8px] [&>span:first-child]:text-[12px] [&>span:first-child]:font-semibold [&>span:first-child]:leading-[24px] [&>span:first-child]:text-[#858b9c]';
+  'grid min-w-0 grid-cols-[34px_minmax(0,1fr)] items-start gap-[8px] gg-type-meta-first-child [&>span:first-child]:font-semibold [&>span:first-child]:text-[#858b9c]';
 export const FLOW_ROUTE_COUNT_CLASS =
-  'w-fit rounded-full border border-dashed border-[#eceef1] bg-[#fafafa] px-2 py-[3px] text-[11px] leading-[1.3] text-[#858b9c]';
+  'w-fit rounded-full border border-dashed border-[#eceef1] bg-[#fafafa] px-2 py-[3px] gg-type-caption  text-[#858b9c]';
 export const FLOW_META_CLASS = 'mt-[6px] grid gap-[8px]';
 export const FLOW_META_ROW_CLASS = 'grid gap-[5px]';
-export const FLOW_META_LABEL_CLASS = 'text-[11px] font-semibold text-[#858b9c]';
+export const FLOW_META_LABEL_CLASS = 'gg-type-caption font-semibold text-[#858b9c]';
 export const FLOW_CHIP_LIST_CLASS = 'flex max-h-[54px] flex-wrap gap-[6px] overflow-hidden';
 export const FLOW_CHIP_CLASS =
-  'max-w-full overflow-hidden rounded-full border border-[#eceef1] bg-[#fafafa] px-2 py-[4px] text-[11px] leading-[1.4] wrap-anywhere text-[#858b9c]';
+  'max-w-full overflow-hidden rounded-full border border-[#eceef1] bg-[#fafafa] px-2 py-[4px] gg-type-caption  wrap-anywhere text-[#858b9c]';
 export const FLOW_CHIP_MUTED_CLASS = 'text-[#858b9c]';
 export const FLOW_CHIP_TERMINAL_CLASS = '';
 
@@ -334,7 +334,7 @@ export const FLOW_CHIP_TERMINAL_CLASS = '';
 export const ACTION_LIST_CLASS = 'flex max-h-[84px] flex-wrap gap-[6px] overflow-auto';
 export const ACTION_EMPTY_CLASS = 'text-[#858b9c]';
 export const ACTION_CHIP_BASE_CLASS =
-  'max-w-full overflow-hidden rounded-full border border-[#eceef1] bg-[#fafafa] px-2 py-[4px] text-[11px] leading-[1.4] wrap-anywhere text-[#858b9c]';
+  'max-w-full overflow-hidden rounded-full border border-[#eceef1] bg-[#fafafa] px-2 py-[4px] gg-type-caption  wrap-anywhere text-[#858b9c]';
 export const ACTION_CHIP_TOOL_CLASS = 'cursor-help border-[#b9ded5] bg-[#e9f6f2] text-[#075f59]';
 export const ACTION_CHIP_TOOL_EXISTING_CLASS = 'border-[#bbf7d0] bg-[#f0fdf4] text-[#166534]';
 export const ACTION_CHIP_TOOL_PENDING_CLASS = 'border-[#fed7aa] bg-[#fffbeb] text-[#92400e]';
@@ -351,35 +351,35 @@ export const INLINE_ADD_CLASS = 'rounded-[4px] bg-[#dcfce7] px-[2px] py-px font-
 export const INLINE_ADD_SETTLED_CLASS = 'bg-[#dcfce7]';
 
 export const SELECTION_MARK_CLASS =
-  'absolute right-[10px] bottom-[10px] inline-grid size-[22px] place-items-center rounded-full bg-[#04756f] text-[12px] text-white';
+  'absolute right-[10px] bottom-[10px] inline-grid size-[22px] place-items-center rounded-full bg-[#04756f] gg-type-meta text-white';
 
 // Save review + tool detail dialogs
 export const SAVE_REVIEW_FORM_CLASS =
   'mb-[16px] grid grid-cols-3 gap-[12px] min-[0px]:max-[640px]:grid-cols-1';
 export const SAVE_REVIEW_FORM_LABEL_CLASS =
-  'grid gap-[6px] text-[12px] text-[#858b9c]';
+  'grid gap-[6px] gg-type-meta text-[#858b9c]';
 export const SAVE_REVIEW_DIFF_CLASS = 'grid max-h-[420px] gap-[10px] overflow-auto';
 export const SAVE_REVIEW_DIFF_ROW_CLASS =
   'rounded-[10px] border border-[#eceef1] bg-[#fafafa] p-[10px_12px]';
 export const SAVE_REVIEW_DIFF_PATH_CLASS =
-  'mb-[6px] text-[12px] font-semibold text-[#858b9c]';
+  'mb-[6px] gg-type-meta font-semibold text-[#858b9c]';
 export const SAVE_REVIEW_ACTION_DIFF_CLASS = 'mt-[4px] flex items-start gap-[8px]';
 export const SAVE_REVIEW_ACTION_DIFF_OLD_CLASS = '';
 export const SAVE_REVIEW_ACTION_DIFF_NEW_CLASS = '';
-export const SAVE_REVIEW_DIFF_SIGN_CLASS = 'w-3 shrink-0 font-mono text-[13px] font-semibold leading-[24px]';
+export const SAVE_REVIEW_DIFF_SIGN_CLASS = 'w-3 shrink-0 font-mono gg-type-control font-semibold ';
 export const SAVE_REVIEW_DIFF_SIGN_OLD_CLASS = 'text-[#991b1b]';
 export const SAVE_REVIEW_DIFF_SIGN_NEW_CLASS = 'text-[#166534]';
-export const DIFF_OLD_CLASS = 'font-mono text-[12px] leading-[1.6] whitespace-pre-wrap text-[#991b1b]';
-export const DIFF_NEW_CLASS = 'font-mono text-[12px] leading-[1.6] whitespace-pre-wrap text-[#166534]';
+export const DIFF_OLD_CLASS = 'font-mono gg-type-meta  whitespace-pre-wrap text-[#991b1b]';
+export const DIFF_NEW_CLASS = 'font-mono gg-type-meta  whitespace-pre-wrap text-[#166534]';
 
 export const TOOL_SUGGESTION_DETAIL_CLASS = 'grid gap-[10px]';
 export const TOOL_SUGGESTION_DETAIL_FOOTER_CLASS = 'flex w-full flex-wrap justify-end gap-[8px]';
 export const TOOL_SUGGESTION_DETAIL_PRE_CLASS =
-  'm-0 max-h-[220px] overflow-auto rounded-[10px] border border-[#eceef1] bg-[#fafafa] p-[12px] text-[12px]';
+  'm-0 max-h-[220px] overflow-auto rounded-[10px] border border-[#eceef1] bg-[#fafafa] p-[12px] gg-type-meta';
 
 // Inline editable source inputs (replaces ant-input)
 export const SOURCE_INPUT_CLASS =
-  'box-border h-auto min-h-0 min-w-0 w-full max-w-full rounded-[6px] border border-transparent bg-transparent px-[6px] py-[2px] text-[13px] leading-[1.65] text-[#18181a] shadow-none transition-colors field-sizing-fixed hover:border-[#eceef1] hover:bg-white focus-visible:border-[#eceef1] focus-visible:bg-white focus-visible:ring-0';
+  'box-border h-auto min-h-0 min-w-0 w-full max-w-full rounded-[6px] border border-transparent bg-transparent px-[6px] py-[2px] gg-type-control  text-[#18181a] shadow-none transition-colors field-sizing-fixed hover:border-[#eceef1] hover:bg-white focus-visible:border-[#eceef1] focus-visible:bg-white focus-visible:ring-0';
 
 // Helper functions
 export function chatRowClass(role: 'user' | 'assistant'): string {

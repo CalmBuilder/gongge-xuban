@@ -55,17 +55,17 @@ const ALIGN_CLASS = {
 } as const;
 
 const HEAD_CELL_CLASS =
-  'h-[36px] bg-[#f2f3f7] px-[16px] py-[12px] align-middle text-[12px] font-normal text-[#464c5e]';
-const BODY_CELL_CLASS = 'px-[16px] py-[12px] align-middle text-[12px] text-[#858b9c]';
+  'h-[36px] bg-[var(--gg-surface-subtle)] px-[16px] py-[12px] align-middle gg-type-meta  font-medium text-[var(--gg-text-secondary)]';
+const BODY_CELL_CLASS = 'px-[16px] py-[12px] align-middle gg-type-meta  text-[var(--gg-text-secondary)]';
 const BODY_HEIGHT = {
   default: 'min-h-[64px]',
   compact: 'min-h-[46px]',
 } as const;
-const CELL_BORDER = 'border border-[#f2f3f7]';
+const CELL_BORDER = 'border border-[var(--gg-line)]';
 
 /**
  * Business data table (共格 designs: node 281:1942 default, 281:2040 compact grid).
- * Rounded `#f2f3f7` frame, gray header row, white body rows with hairline dividers.
+ * Rounded semantic frame, subtle header row, white body rows with hairline dividers.
  * Built on top of the shadcn `Table` primitives but owns the product-specific styling.
  */
 export function DataTable<T>({
@@ -86,11 +86,11 @@ export function DataTable<T>({
   return (
     <div
       className={cn(
-        'overflow-hidden rounded-[14px] border border-[#f2f3f7]',
+        'overflow-hidden rounded-[var(--gg-radius-card)] border border-[var(--gg-line)] bg-[var(--gg-surface)]',
         className,
       )}
     >
-      <Table className="w-full table-fixed text-[12px]" aria-label={ariaLabel}>
+      <Table className="w-full table-fixed gg-type-meta" aria-label={ariaLabel}>
         <TableHeader>
           <TableRow className="border-0 hover:bg-transparent">
             {columns.map((column) => (
@@ -119,12 +119,12 @@ export function DataTable<T>({
                   'has-aria-expanded:bg-transparent',
                   bordered
                     ? 'border-0'
-                    : 'border-b border-[#f2f3f7] last:border-0',
+                    : 'border-b border-[var(--gg-line)] last:border-0',
                   striped
                     ? index % 2 === 1
-                      ? 'bg-[#fbfbfb] hover:bg-[#f2f3f7]'
-                      : 'bg-white hover:bg-[#f2f3f7]'
-                    : 'hover:bg-[#fafbfc]',
+                      ? 'bg-[var(--gg-surface-subtle)] hover:bg-[var(--gg-interaction-soft)]'
+                      : 'bg-[var(--gg-surface)] hover:bg-[var(--gg-interaction-soft)]'
+                    : 'hover:bg-[var(--gg-surface-subtle)]',
                   onRowClick && 'cursor-pointer',
                 )}
               >
@@ -150,7 +150,7 @@ export function DataTable<T>({
             ))
           ) : (
             <TableRow className="hover:bg-transparent">
-              <TableCell colSpan={columns.length} className="h-[160px] text-center align-middle text-[13px] text-[#858b9c]">
+              <TableCell colSpan={columns.length} className="h-[160px] text-center align-middle gg-type-control  text-[var(--gg-text-muted)]">
                 {loading ? loadingText : emptyText}
               </TableCell>
             </TableRow>

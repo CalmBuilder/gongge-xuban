@@ -26,7 +26,7 @@ export default function LanguageSwitcher({ className }: { className?: string }) 
         data-i18n-ignore
         aria-label={locale === 'zh-CN' ? '切换语言' : 'Switch language'}
         className={cn(
-          'flex h-[32px] w-[74px] shrink-0 items-center justify-center gap-[6px] rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[8px] text-[12px] font-medium text-[#757f9c] outline-none transition-colors hover:border-[#cbd3e6] hover:text-[#18181a]',
+          'flex h-[32px] w-[74px] shrink-0 items-center justify-center gap-[6px] rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[8px] gg-type-meta font-medium text-[#757f9c] outline-none transition-colors hover:border-[#cbd3e6] hover:text-[#18181a]',
           className,
         )}
       >
@@ -43,7 +43,7 @@ export default function LanguageSwitcher({ className }: { className?: string }) 
           <DropdownMenuItem
             key={option.locale}
             onSelect={() => setLocale(option.locale)}
-            className="h-[34px] cursor-pointer justify-between rounded-[8px] px-[10px] text-[13px] text-[#464c5e]"
+            className="h-[34px] cursor-pointer justify-between rounded-[8px] px-[10px] gg-type-control text-[#464c5e]"
           >
             <span>{option.label}</span>
             <Check

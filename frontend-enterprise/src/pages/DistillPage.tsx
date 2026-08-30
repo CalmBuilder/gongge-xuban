@@ -2057,7 +2057,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
   const pageTitle = mode === 'create' && !skillId ? '新建 SOP' : '编辑 SOP';
 
   return (
-    <div className={DISTILL_PAGE_CLASS}>
+    <div className={cn(DISTILL_PAGE_CLASS, 'gg-typography-scope')} data-typography-contract="v1">
       <AppHeader className="shrink-0" onLogout={onLogout} userName={currentUser?.username} title={pageTitle} />
       <div className={DISTILL_ACTIONS_CLASS}>
         <UIButton variant="outline" className={RETURN_BUTTON_CLASS} onClick={() => navigate('/enterprise/skills')}>
@@ -2332,7 +2332,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
                 }
               />
               <div className={CHAT_ACTIONS_CLASS}>
-                <span id="distill-composer-status" role="status" aria-live="polite" className="min-w-0 truncate text-[12px] text-[#858b9c]">{streamStatus}</span>
+                <span id="distill-composer-status" role="status" aria-live="polite" className="min-w-0 truncate gg-type-meta text-[#858b9c]">{streamStatus}</span>
                 <div className={CHAT_ACTIONS_GROUP_CLASS}>
                   <label>
                     <input
@@ -2423,9 +2423,9 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
           </div>
           {!draft ? (
             <div className={SOURCE_EMPTY_STATE_CLASS}>
-              <FileTextOutlined className="text-[28px] text-[#c0c6d4]" />
+              <FileTextOutlined className="gg-type-metric text-[#c0c6d4]" />
               <p className={SOURCE_EMPTY_TEXT_CLASS}>暂无 SOP 草稿</p>
-              <p className="text-[12px] leading-[18px] text-[#c0c6d4]">在左侧输入说明或上传文档后开始生成</p>
+              <p className="gg-type-meta  text-[#c0c6d4]">在左侧输入说明或上传文档后开始生成</p>
             </div>
           ) : viewMode === 'source' ? (
             <SkillSource
@@ -2490,7 +2490,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
           </div>
         }
       >
-        <p className="m-0 text-[14px] leading-[22px] text-foreground">
+        <p className="m-0 gg-type-body  text-foreground">
           检测到当前 SOP 有未保存变更。你可以先保存当前内容；清空后会进入新的 SOP 草稿工作台，不会把原 SOP 替换为空。
         </p>
       </KDialog>
@@ -2521,7 +2521,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
           </label>
         </div>
         <div className={SAVE_REVIEW_DIFF_CLASS}>
-          <strong className="text-[13px] font-semibold text-foreground">本轮修改 diff</strong>
+          <strong className="gg-type-control font-semibold text-foreground">本轮修改 diff</strong>
           {saveReviewDiffs.length === 0 ? (
             <EmptyState description="暂无结构差异" />
           ) : (
@@ -2571,19 +2571,19 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
             {toolDetail.missing_reason && <div><strong>缺失原因：</strong>{toolDetail.missing_reason}</div>}
             <div><strong>原因：</strong>{toolDetail.reason || '-'}</div>
             <div><strong>来源：</strong>{toolDetail.source_excerpt || '-'}</div>
-            <strong className="text-[13px] font-semibold text-foreground">样例参数</strong>
+            <strong className="gg-type-control font-semibold text-foreground">样例参数</strong>
             <Textarea
               value={probeArgsText}
               rows={5}
               onChange={(event) => setProbeArgsText(event.target.value)}
             />
-            <strong className="text-[13px] font-semibold text-foreground">输入 Schema</strong>
+            <strong className="gg-type-control font-semibold text-foreground">输入 Schema</strong>
             <pre className={TOOL_SUGGESTION_DETAIL_PRE_CLASS}>{JSON.stringify(toolDetail.input_schema || {}, null, 2)}</pre>
-            <strong className="text-[13px] font-semibold text-foreground">输出 Schema</strong>
+            <strong className="gg-type-control font-semibold text-foreground">输出 Schema</strong>
             <pre className={TOOL_SUGGESTION_DETAIL_PRE_CLASS}>{JSON.stringify(toolDetail.output_schema || {}, null, 2)}</pre>
             {toolDetail.probe_result && (
               <>
-                <strong className="text-[13px] font-semibold text-foreground">测试结果</strong>
+                <strong className="gg-type-control font-semibold text-foreground">测试结果</strong>
                 <pre className={TOOL_SUGGESTION_DETAIL_PRE_CLASS}>{JSON.stringify(toolDetail.probe_result, null, 2)}</pre>
               </>
             )}
@@ -2687,7 +2687,7 @@ function KDialog({
         style={{ width: `min(${width}px, calc(100vw - 32px))`, maxWidth: 'calc(100vw - 32px)' }}
       >
         {title != null && (
-          <DialogTitle className="border-b border-border px-[24px] py-[16px] text-[16px] font-semibold text-foreground">
+          <DialogTitle className="border-b border-border px-[24px] py-[16px] gg-type-card-title font-semibold text-foreground">
             {title}
           </DialogTitle>
         )}
@@ -2714,7 +2714,7 @@ function SimpleTooltip({ title, children }: { title?: ReactNode; children: React
 
 function EmptyState({ description }: { description: ReactNode }) {
   return (
-    <div className="flex flex-col items-center justify-center gap-[8px] py-[32px] text-center text-[13px] text-[#858b9c]">
+    <div className="flex flex-col items-center justify-center gap-[8px] py-[32px] text-center gg-type-control text-[#858b9c]">
       {description}
     </div>
   );
@@ -2722,7 +2722,7 @@ function EmptyState({ description }: { description: ReactNode }) {
 
 function DistillTag({ children }: { children: ReactNode }) {
   return (
-    <span className="inline-flex items-center rounded-[6px] bg-[#f2f3f5] px-[8px] py-px text-[12px] font-medium leading-[18px] text-[#5b6273]">
+    <span className="inline-flex items-center rounded-[6px] bg-[#f2f3f5] px-[8px] py-px gg-type-meta font-medium  text-[#5b6273]">
       {children}
     </span>
   );
@@ -2870,14 +2870,14 @@ function ActionCombobox({
         className="max-h-[280px] w-[320px] overflow-y-auto p-[4px]"
       >
         {filtered.length === 0 ? (
-          <div className="px-[10px] py-[12px] text-center text-[13px] text-[#858b9c]">无匹配动作</div>
+          <div className="px-[10px] py-[12px] text-center gg-type-control text-[#858b9c]">无匹配动作</div>
         ) : (
           filtered.map((option) => (
             <button
               key={String(option.value)}
               type="button"
               className={cn(
-                'flex w-full items-center rounded-[8px] px-[10px] py-[6px] text-left text-[13px] text-foreground hover:bg-muted',
+                'flex w-full items-center rounded-[8px] px-[10px] py-[6px] text-left gg-type-control text-foreground hover:bg-muted',
                 option.value === value && 'bg-muted',
               )}
               onClick={() => onSelect(String(option.value))}
@@ -4662,7 +4662,7 @@ function EditableParticipantPolicyLine({
       <span className={SOURCE_VALUE_CLASS}>
         <EditableSourceField>
           <div className="grid min-w-[320px] gap-[10px] rounded-[10px] border border-[#dfe5f2] bg-[#fbfcff] p-[10px]">
-            <label className="flex items-center gap-[8px] text-[12px] font-medium text-[#24262d]">
+            <label className="flex items-center gap-[8px] gg-type-meta font-medium text-[#24262d]">
               <Checkbox
                 checked={Boolean(policy)}
                 onCheckedChange={(checked) => {
@@ -4679,10 +4679,10 @@ function EditableParticipantPolicyLine({
             {policy ? (
               <>
                 <div>
-                  <span className="mb-[5px] block text-[11px] text-[#69718a]">候选公司业务角色</span>
+                  <span className="mb-[5px] block gg-type-caption text-[#69718a]">候选公司业务角色</span>
                   <div className="grid max-h-[150px] gap-[5px] overflow-y-auto rounded-[8px] border border-[#e8ebf2] bg-white p-[7px]">
                     {businessRoles.length > 0 ? businessRoles.map((role) => (
-                      <label key={role.id} className="flex items-center gap-[7px] text-[12px]">
+                      <label key={role.id} className="flex items-center gap-[7px] gg-type-meta">
                         <Checkbox
                           aria-label={`候选角色 ${role.name}`}
                           checked={selectedRoleCodes.includes(role.role_code)}
@@ -4692,22 +4692,22 @@ function EditableParticipantPolicyLine({
                               : selectedRoleCodes.filter((code) => code !== role.role_code),
                           })}
                         />
-                        <span>{role.name} <small className="font-mono text-[#75809c]">{role.role_code}</small></span>
+                        <span className="gg-type-meta">{role.name} <small className="font-mono gg-type-caption text-[#75809c]">{role.role_code}</small></span>
                       </label>
-                    )) : <span className="text-[11px] text-[#a06a00]">请先在“组织角色”中创建有效业务角色。</span>}
+                    )) : <span className="gg-type-caption text-[#a06a00]">请先在“组织角色”中创建有效业务角色。</span>}
                   </div>
                 </div>
-                <label className="flex items-center gap-[8px] text-[12px]">
+                <label className="flex items-center gap-[8px] gg-type-meta">
                   <Checkbox checked={Boolean(policy.claim_required)} onCheckedChange={(checked) => updatePolicy({ claim_required: checked === true })} />
                   办理前必须认领
                 </label>
-                <label className="flex items-center gap-[8px] text-[12px]">
+                <label className="flex items-center gap-[8px] gg-type-meta">
                   <Checkbox checked={policy.exclude_initiator !== false} onCheckedChange={(checked) => updatePolicy({ exclude_initiator: checked === true })} />
                   禁止申请人办理自己的任务
                 </label>
                 {[['claim', '认领'], ...effectiveOutcomes.map((outcome) => [`outcome:${outcome}`, `提交结果：${outcome}`])].map(([actionKey, label]) => (
                   <div className="grid grid-cols-[110px_minmax(0,1fr)] items-center gap-[8px]" key={actionKey}>
-                    <span className="text-[11px] text-[#69718a]">{label}</span>
+                    <span className="gg-type-caption text-[#69718a]">{label}</span>
                     <SourceSelect
                       className={cn(SOURCE_SELECT_CLASS, 'w-full')}
                       value={actionPermissions[actionKey] || '__none__'}
@@ -4716,9 +4716,9 @@ function EditableParticipantPolicyLine({
                     />
                   </div>
                 ))}
-                <span className="text-[11px] leading-[17px] text-[#858b9c]">候选角色决定谁可见；动作权限在认领和提交时由服务端再次校验。</span>
+                <span className="gg-type-caption  text-[#858b9c]">候选角色决定谁可见；动作权限在认领和提交时由服务端再次校验。</span>
               </>
-            ) : <span className="text-[11px] text-[#858b9c]">未启用时保留旧对话接管语义，不会进入任务箱。</span>}
+            ) : <span className="gg-type-caption text-[#858b9c]">未启用时保留旧对话接管语义，不会进入任务箱。</span>}
           </div>
         </EditableSourceField>
       </span>

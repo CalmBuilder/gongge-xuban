@@ -120,14 +120,14 @@ const EMPTY_SKILL_MARKDOWN = `# 技能说明
 
 const SECTION_CARD_CLASS =
   'flex flex-col gap-[24px] rounded-[20px_20px_0_0] bg-[#FFF] p-[18px] shadow-[0_-4px_16px_0_rgba(0,0,0,0.05)]';
-const SECTION_CARD_TITLE_CLASS = 'text-[14px] font-medium text-[#18181a]';
-const FIELD_LABEL_CLASS = 'text-[13px] font-medium text-[#18181a]';
+const SECTION_CARD_TITLE_CLASS = 'gg-type-body font-medium text-[#18181a]';
+const FIELD_LABEL_CLASS = 'gg-type-control font-medium text-[#18181a]';
 const RETURN_BUTTON_CLASS =
-  'h-8 gap-1 rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-5 text-[12px] font-normal text-[#757f9c] hover:border-[#cbd3e6]! hover:bg-white! hover:text-[#18181a]! aria-expanded:border-[#cbd3e6]! aria-expanded:bg-white! aria-expanded:text-[#18181a]!';
+  'h-8 gap-1 rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-5 gg-type-meta font-normal text-[#757f9c] hover:border-[#cbd3e6]! hover:bg-white! hover:text-[#18181a]! aria-expanded:border-[#cbd3e6]! aria-expanded:bg-white! aria-expanded:text-[#18181a]!';
 const PRIMARY_BUTTON_CLASS =
-  'h-8 gap-1 rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-5 text-[12px] font-semibold text-white hover:bg-[#244bc7]';
+  'h-8 gap-1 rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-5 gg-type-meta font-semibold text-white hover:bg-[#244bc7]';
 const DELETE_BUTTON_CLASS =
-  'h-8 gap-1 rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-5 text-[12px] font-normal text-[#d20b0b] hover:border-[#f3b6b6]! hover:bg-[#fce7e7]! hover:text-[#d20b0b]! aria-expanded:border-[#f3b6b6]! aria-expanded:bg-[#fce7e7]! aria-expanded:text-[#d20b0b]!';
+  'h-8 gap-1 rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-5 gg-type-meta font-normal text-[#d20b0b] hover:border-[#f3b6b6]! hover:bg-[#fce7e7]! hover:text-[#d20b0b]! aria-expanded:border-[#f3b6b6]! aria-expanded:bg-[#fce7e7]! aria-expanded:text-[#d20b0b]!';
 const EDITOR_ACTION_OUTLINE_CLASS = RETURN_BUTTON_CLASS;
 const EDITOR_ACTION_PRIMARY_CLASS = PRIMARY_BUTTON_CLASS;
 const HIDDEN_FILE_INPUT_CLASS =
@@ -135,13 +135,13 @@ const HIDDEN_FILE_INPUT_CLASS =
 const SKILL_EDITOR_DRAG_ACTIVE_CLASS =
   'ring-1 ring-[color-mix(in_srgb,var(--gg-cobalt)_24%,transparent)] shadow-[0_-4px_16px_0_rgba(49,87,232,0.08)]';
 const SKILL_DROP_HINT_CLASS =
-  'pointer-events-none absolute inset-x-[18px] bottom-[18px] top-[46px] z-[6] flex items-center justify-center gap-3 rounded-[14px] border border-dashed border-[var(--gg-cobalt)] bg-white/90 text-[15px] font-semibold text-[var(--gg-cobalt)] shadow-sm backdrop-blur-sm';
+  'pointer-events-none absolute inset-x-[18px] bottom-[18px] top-[46px] z-[6] flex items-center justify-center gap-3 rounded-[14px] border border-dashed border-[var(--gg-cobalt)] bg-white/90 gg-type-body font-semibold text-[var(--gg-cobalt)] shadow-sm backdrop-blur-sm';
 const SKILL_FILE_EDITOR_CLASS =
   'grid min-h-[560px] flex-1 grid-cols-[minmax(180px,240px)_minmax(0,1fr)] overflow-hidden border-t border-[#e3e7f1] bg-[#fafafa]';
 const SKILL_FILE_TREE_CLASS =
   'grid min-w-0 grid-rows-[auto_minmax(0,1fr)_auto] border-r border-[#e3e7f1] bg-white';
 const SKILL_FILE_TREE_HEADER_CLASS =
-  'flex min-h-[44px] items-center gap-2 border-b border-[#e3e7f1] bg-[#f6f6f6] px-[14px] text-[12px] font-medium text-[#757f9c]';
+  'flex min-h-[44px] items-center gap-2 border-b border-[#e3e7f1] bg-[#f6f6f6] px-[14px] gg-type-meta font-medium text-[#757f9c]';
 const SKILL_FILE_TREE_LIST_CLASS =
   'min-h-0 overflow-auto bg-white p-2';
 const SKILL_FILE_TREE_ACTIONS_CLASS =
@@ -149,22 +149,22 @@ const SKILL_FILE_TREE_ACTIONS_CLASS =
 const SKILL_FILE_PANE_CLASS =
   'grid min-w-0 grid-rows-[auto_minmax(0,1fr)]';
 const SKILL_FILE_TAB_CLASS =
-  'flex min-h-[44px] items-center gap-2 border-b border-[#e3e7f1] bg-[#f6f6f6] px-[14px] text-[12px] font-medium text-[#757f9c]';
+  'flex min-h-[44px] items-center gap-2 border-b border-[#e3e7f1] bg-[#f6f6f6] px-[14px] gg-type-meta font-medium text-[#757f9c]';
 const SKILL_CODE_EDITOR_CLASS =
-  'relative min-h-0 overflow-hidden bg-[#fafafa] font-mono text-[13px] leading-[1.7] tab-[2] shadow-[inset_0_1px_0_#e3e7f1]';
+  'relative min-h-0 overflow-hidden bg-[#fafafa] font-mono gg-type-control  tab-[2] shadow-[inset_0_1px_0_#e3e7f1]';
 const SKILL_CODE_HIGHLIGHT_CLASS =
   'pointer-events-none absolute inset-0 z-[1] m-0 overflow-hidden whitespace-pre p-[18px_20px] text-[#18181a] tab-[2]';
 const SKILL_CODE_HIGHLIGHT_CODE_CLASS =
   'block w-max min-w-full font-[inherit] will-change-transform';
 const SKILL_CODE_INPUT_CLASS =
-  'absolute inset-0 z-[2] m-0 size-full min-h-0 resize-none overflow-auto rounded-none border-0 bg-transparent! p-[18px_20px] font-[inherit] leading-[inherit] tracking-normal whitespace-pre text-transparent caret-[#18181a] outline-none tab-[2] [scrollbar-gutter:stable] selection:bg-[rgba(0,120,215,0.24)] [-webkit-text-fill-color:transparent]';
+  'absolute inset-0 z-[2] m-0 size-full min-h-0 resize-none overflow-auto rounded-none border-0 bg-transparent! p-[18px_20px] font-[inherit]  tracking-normal whitespace-pre text-transparent caret-[#18181a] outline-none tab-[2] [scrollbar-gutter:stable] selection:bg-[rgba(0,120,215,0.24)] [-webkit-text-fill-color:transparent]';
 const SKILL_RESULT_LAYOUT_CLASS = 'grid gap-5';
 const SKILL_SECTION_LABEL_CLASS =
-  'mb-2 text-[12px] font-semibold text-[#757f9c]';
+  'mb-2 gg-type-meta font-semibold text-[#757f9c]';
 const SKILL_REPLY_PANEL_CLASS =
   'rounded-xl border border-[#eceef1] bg-white p-[16px_18px]';
 const SKILL_REPLY_TEXT_CLASS =
-  'mb-0! text-[15px] leading-[1.8] text-[#18181a]';
+  'mb-0! gg-type-body  text-[#18181a]';
 const SKILL_TRACE_LIST_CLASS =
   'grid gap-[10px] rounded-xl border border-[#eceef1] bg-[#fbfcfd] p-[12px_14px]';
 const SKILL_TRACE_ITEM_CLASS =
@@ -173,20 +173,20 @@ const SKILL_TRACE_ITEM_BODY_CLASS = 'min-w-0 max-w-full';
 const SKILL_TRACE_DOT_CLASS =
   'mt-[9px] size-[7px] shrink-0 rounded-full bg-[#18181a]';
 const SKILL_TRACE_TITLE_CLASS =
-  'text-[13px] font-semibold text-[#18181a]';
+  'gg-type-control font-semibold text-[#18181a]';
 const SKILL_TRACE_MESSAGE_CLASS =
-  'mt-[2px] break-words text-[12px] leading-[1.55] text-[#757f9c]';
+  'mt-[2px] break-words gg-type-meta  text-[#757f9c]';
 const SKILL_TRACE_CODE_DETAILS_CLASS =
   'group/gs-trace box-border w-full min-w-0 max-w-full overflow-hidden rounded-xl border border-[#eceef1] bg-white';
 const SKILL_TRACE_CODE_SUMMARY_CLASS =
-  'flex min-h-[38px] cursor-pointer list-none items-center gap-2 px-3 py-[9px] text-[12px] font-semibold text-[#18181a] select-none group-open/gs-trace:border-b group-open/gs-trace:border-[#eceef1] [&::-webkit-details-marker]:hidden';
+  'flex min-h-[38px] cursor-pointer list-none items-center gap-2 px-3 py-[9px] gg-type-meta font-semibold text-[#18181a] select-none group-open/gs-trace:border-b group-open/gs-trace:border-[#eceef1] [&::-webkit-details-marker]:hidden';
 const SKILL_CODE_BLOCK_CLASS =
-  'm-0 max-h-[520px] max-w-full overflow-auto whitespace-pre border-0 p-[16px_18px] font-mono text-[12px] leading-[1.65]';
+  'm-0 max-h-[520px] max-w-full overflow-auto whitespace-pre border-0 p-[16px_18px] font-mono gg-type-meta ';
 const SKILL_OUTPUT_STACK_CLASS = 'grid gap-[10px]';
 
 function skillFileNodeClass(active: boolean) {
   return cn(
-    'flex w-full min-w-0 cursor-pointer items-center gap-2 rounded-lg border-0 bg-transparent px-[10px] py-2 text-left text-[12px] text-[#757f9c] transition-[background,color,box-shadow] duration-150',
+    'flex w-full min-w-0 cursor-pointer items-center gap-2 rounded-lg border-0 bg-transparent px-[10px] py-2 text-left gg-type-meta text-[#757f9c] transition-[background,color,box-shadow] duration-150',
     'hover:bg-[#f6f6f6] hover:text-[#18181a]',
     active && 'bg-[#f6f6f6] text-[#18181a]',
   );
@@ -194,7 +194,7 @@ function skillFileNodeClass(active: boolean) {
 
 function TraceDisclosureLabel() {
   return (
-    <span className="ml-auto text-[12px] font-medium text-[#757f9c]">
+    <span className="ml-auto gg-type-meta font-medium text-[#757f9c]">
       <span className="group-open/gs-trace:hidden">展开</span>
       <span className="hidden group-open/gs-trace:inline">收起</span>
     </span>
@@ -1070,10 +1070,10 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
       className: 'text-[#18181a]',
       render: (row) => (
         <div className="flex min-w-0 flex-col gap-[2px]">
-          <span className="truncate font-medium leading-[18px] text-[#18181a]" title={skillDisplayName(row)}>
+          <span className="truncate gg-type-control font-medium text-[#18181a]" title={skillDisplayName(row)}>
             {skillDisplayName(row)}
           </span>
-          <span className="truncate text-[#858b9c]" title={row.slug}>
+          <span className="truncate gg-type-meta text-[#858b9c]" title={row.slug}>
             {row.slug}
           </span>
         </div>
@@ -1083,7 +1083,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
       key: 'description',
       title: '描述',
       className: 'whitespace-normal',
-      render: (row) => <span className="line-clamp-2 wrap-break-word">{skillDisplayDescription(row)}</span>,
+      render: (row) => <span className="line-clamp-2 wrap-break-word gg-type-body">{skillDisplayDescription(row)}</span>,
     },
     {
       key: 'files',
@@ -1096,7 +1096,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
       title: '创建者',
       width: 120,
       render: (row) => (
-        <span className="block truncate text-[#858b9c]" title={resourceCreatorName(row)}>
+        <span className="block truncate gg-type-meta text-[#858b9c]" title={resourceCreatorName(row)}>
           {resourceCreatorName(row) || '-'}
         </span>
       ),
@@ -1131,16 +1131,16 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
       <article className={MOBILE_CARD_CLASS} key={row.id}>
         <div className="flex min-w-0 items-start justify-between gap-[10px]">
           <div className="min-w-0">
-            <strong className="block truncate text-[14px] font-semibold text-[#18181a]">{skillDisplayName(row)}</strong>
-            <span className="mt-[2px] block truncate text-[12px] text-[#858b9c]">{row.slug}</span>
-            <span className="mt-[2px] block truncate text-[12px] text-[#858b9c]">创建者：{resourceCreatorName(row) || '-'}</span>
+            <strong className="block truncate gg-type-body font-semibold text-[#18181a]">{skillDisplayName(row)}</strong>
+            <span className="mt-[2px] block truncate gg-type-meta text-[#858b9c]">{row.slug}</span>
+            <span className="mt-[2px] block truncate gg-type-meta text-[#858b9c]">创建者：{resourceCreatorName(row) || '-'}</span>
           </div>
           {renderActions(row)}
         </div>
         {skillDisplayDescription(row) && (
-          <p className="mt-[8px] line-clamp-2 text-[12px] leading-[1.55] text-[#858b9c]">{skillDisplayDescription(row)}</p>
+          <p className="mt-[8px] line-clamp-2 gg-type-meta  text-[#858b9c]">{skillDisplayDescription(row)}</p>
         )}
-        <div className="mt-[10px] flex items-center justify-between gap-[10px] text-[12px] text-[#858b9c]">
+        <div className="mt-[10px] flex items-center justify-between gap-[10px] gg-type-meta text-[#858b9c]">
           <StatusBadge tone={preset.tone}>{preset.text}</StatusBadge>
           <span>{row.skill_files?.length || 1} 个文件 · {formatDateTime(row.updated_at)}</span>
         </div>
@@ -1153,7 +1153,11 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
     : '当前员工暂无技能';
 
   return (
-    <div className={embedded ? undefined : 'min-h-full box-border px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]'}>
+    <div
+      className={cn(embedded ? undefined : 'gg-page-shell', 'gg-typography-scope')}
+      data-page-template={embedded ? undefined : 'management'}
+      data-typography-contract="v1"
+    >
       {!embedded && (
         <>
           <AppHeader onLogout={onLogout} userName={currentUser?.username} title={pageTitle} />
@@ -1161,14 +1165,14 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
             <UIButton
               variant="outline"
               onClick={() => navigate('/enterprise/general-skills/catalog')}
-              className="h-[34px] rounded-[10px] border-[0.5px] border-[#d7def5] bg-[#f7f9ff] px-[20px] text-[12px] font-medium text-[var(--gg-cobalt)] hover:border-[#b9c7f2] hover:bg-[#f1f5ff]"
+              className="h-[34px] rounded-[10px] border-[0.5px] border-[#d7def5] bg-[#f7f9ff] px-[20px] gg-type-meta font-medium text-[var(--gg-cobalt)] hover:border-[#b9c7f2] hover:bg-[#f1f5ff]"
             >
               Skill 管理
             </UIButton>
             <UIButton
               variant="outline"
               onClick={() => setMyLibraryOpen(true)}
-              className="h-[34px] rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[20px] text-[12px] font-normal text-[#464c5e] hover:border-[#cbd3e6] hover:bg-white hover:text-[#18181a]"
+              className="h-[34px] rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[20px] gg-type-meta font-normal text-[#464c5e] hover:border-[#cbd3e6] hover:bg-white hover:text-[#18181a]"
             >
               我的 Skill 库
             </UIButton>
@@ -1176,14 +1180,14 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
               variant="outline"
               onClick={() => void load()}
               disabled={loading}
-              className="h-[34px] gap-[4px] rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[20px] text-[12px] font-normal text-[#757f9c] hover:border-[#cbd3e6] hover:bg-white hover:text-[#18181a]"
+              className="h-[34px] gap-[4px] rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[20px] gg-type-meta font-normal text-[#757f9c] hover:border-[#cbd3e6] hover:bg-white hover:text-[#18181a]"
             >
               <IconRefresh className={cn('size-[14px]', loading && 'animate-spin')} />
               刷新
             </UIButton>
             {canManageCurrentScope && (
               <DropdownMenu>
-                <DropdownMenuTrigger className="flex h-[34px] items-center gap-[4px] rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-[20px] text-[12px] font-semibold text-white outline-none transition-colors hover:bg-[#244bc7]">
+                <DropdownMenuTrigger className="flex h-[34px] items-center gap-[4px] rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-[20px] gg-type-meta font-semibold text-white outline-none transition-colors hover:bg-[#244bc7]">
                   <IconAdd className="size-[14px]" />
                   新增
                   <IconChevronDown className="size-[12px]" />
@@ -1229,7 +1233,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
         <div className="flex flex-col gap-[18px]">
           <div className="flex items-center gap-[6px] px-[12px] text-[#757f9c]">
             <PlazaResourceIcon kind="general-skills" size="compact" />
-            <span className="text-[14px] font-normal leading-none">{listLabel}</span>
+            <span className="gg-type-body font-normal">{listLabel}</span>
           </div>
 
           <div className="flex flex-wrap items-center gap-[16px]">
@@ -1239,7 +1243,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
                 value={searchText}
                 placeholder="搜索技能名称、Slug、描述或主页"
                 onChange={(event) => setSearchText(event.target.value)}
-                className="h-full min-w-0 flex-1 bg-transparent text-[12px] text-[#17191f] outline-none placeholder:text-[#c0c6d4]"
+                className="h-full min-w-0 flex-1 bg-transparent gg-type-meta text-[#17191f] outline-none placeholder:text-[#c0c6d4]"
               />
               {searchText && (
                 <button
@@ -1269,7 +1273,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
             {filteredRows.length ? (
               pagination.pagedItems.map(renderMobileCard)
             ) : (
-              <div className="py-[40px] text-center text-[13px] text-[#858b9c]">{listEmptyText}</div>
+              <div className="py-[40px] text-center gg-type-control text-[#858b9c]">{listEmptyText}</div>
             )}
           </div>
 
@@ -1396,7 +1400,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
           label: (
             <>
               {skillDisplayName(item)}
-              <span className="text-[#858b9c]"> · {item.slug}</span>
+              <span className="gg-type-caption text-[#858b9c]"> · {item.slug}</span>
             </>
           ),
         }))}
@@ -1603,19 +1607,19 @@ function MyGeneralSkillLibraryDialog({
   return (
     <Dialog open={open} onOpenChange={(next) => !next && !loading && onClose()}>
       <DialogContent aria-describedby={undefined} className="max-h-[88vh] overflow-y-auto sm:max-w-[760px]">
-        <DialogTitle className="text-[17px] font-semibold">我的 Skill 库</DialogTitle>
-        <p className="text-[12px] leading-5 text-[#757f9c]">
+        <DialogTitle className="gg-type-section-title font-semibold">我的 Skill 库</DialogTitle>
+        <p className="gg-type-meta text-[#757f9c]">
           每个 Skill 只保存一份不可变修订；勾选要装配的本人数字员工，预检通过后整批生效。
         </p>
-        {loading && !skills.length ? <p role="status">正在加载 Skill 库…</p> : null}
+        {loading && !skills.length ? <p className="gg-type-body" role="status">正在加载 Skill 库…</p> : null}
         {!loading && !skills.length ? (
-          <div className="rounded-xl border border-dashed border-[#dfe5f2] p-8 text-center text-[#757f9c]">
+          <div className="rounded-xl border border-dashed border-[#dfe5f2] p-8 text-center gg-type-body text-[#757f9c]">
             暂无本人私有 Skill，请先在某个数字员工中完成安全导入。
           </div>
         ) : null}
         {skills.length ? (
           <div className="grid gap-4">
-            <label className="grid gap-2 text-[13px] font-medium">
+            <label className="grid gap-2 gg-type-control font-medium">
               选择 Skill
               <select
                 aria-label="选择我的 Skill"
@@ -1630,15 +1634,15 @@ function MyGeneralSkillLibraryDialog({
               </select>
             </label>
             {selectedSkill ? (
-              <div className="rounded-xl bg-[#f7f9ff] p-4 text-[12px] text-[#596078]">
-                <strong className="text-[#252936]">{selectedSkill.name}</strong>
-                <div className="mt-1 font-mono">{selectedSkill.content_checksum.slice(0, 16)}… · {selectedSkill.source_kind || '受管来源'}</div>
+              <div className="rounded-xl bg-[#f7f9ff] p-4 gg-type-meta text-[#596078]">
+                <strong className="gg-type-control text-[#252936]">{selectedSkill.name}</strong>
+                <div className="mt-1 font-mono gg-type-caption">{selectedSkill.content_checksum.slice(0, 16)}… · {selectedSkill.source_kind || '受管来源'}</div>
               </div>
             ) : null}
             {selectedSkill ? (
               <section className="rounded-xl border border-[#e3e7f1] p-4" aria-label="Skill 对外发布">
-                <h3 className="font-medium">发布给组织其他用户</h3>
-                <p className="mt-1 text-[12px] leading-5 text-[#757f9c]">这与私有安装不同：提交后由另一位管理员审核冻结 Revision，批准后才生成组织广场 Release。</p>
+                <h3 className="gg-type-card-title font-medium">发布给组织其他用户</h3>
+                <p className="mt-1 gg-type-meta text-[#757f9c]">这与私有安装不同：提交后由另一位管理员审核冻结 Revision，批准后才生成组织广场 Release。</p>
                 <UIButton className="mt-3" variant="outline" disabled={loading} onClick={() => void submitPublication()}>
                   提交组织审核
                 </UIButton>
@@ -1646,11 +1650,11 @@ function MyGeneralSkillLibraryDialog({
             ) : null}
             {releases.length ? (
               <section className="rounded-xl border border-[#dce5ff] bg-[#fbfcff] p-4" aria-label="已发布 Skill">
-                <h3 className="font-medium">已发布 Skill</h3>
+                <h3 className="gg-type-card-title font-medium">已发布 Skill</h3>
                 <div className="mt-2 grid gap-2">
                   {releases.map((release) => (
                     <div key={release.id} className="flex items-center justify-between gap-3 rounded-lg bg-white px-3 py-2">
-                      <div><strong>{release.name}</strong><div className="text-[11px] text-[#757f9c]">已审 Revision {release.approved_revision_id?.slice(-12)}</div></div>
+                      <div><strong className="gg-type-control">{release.name}</strong><div className="gg-type-caption text-[#757f9c]">已审 Revision {release.approved_revision_id?.slice(-12)}</div></div>
                       <UIButton size="sm" disabled={loading || !ownedAgents.length} onClick={() => void adoptRelease(release)}>采用到首个本人分身</UIButton>
                     </div>
                   ))}
@@ -1658,10 +1662,10 @@ function MyGeneralSkillLibraryDialog({
               </section>
             ) : null}
             <fieldset className="grid gap-2">
-              <legend className="mb-2 text-[13px] font-medium">装配到我的数字员工</legend>
+              <legend className="mb-2 gg-type-control font-medium">装配到我的数字员工</legend>
               {ownedAgents.map((agent) => (
-                <label key={agent.id} className="flex items-center justify-between rounded-xl border border-[#e3e7f1] px-4 py-3">
-                  <span>{agent.name}</span>
+                <label key={agent.id} className="flex items-center justify-between rounded-xl border border-[#e3e7f1] px-4 py-3 gg-type-control">
+                  <span className="gg-type-control">{agent.name}</span>
                   <input
                     type="checkbox"
                     checked={selectedAgentIds.includes(agent.id)}
@@ -1678,8 +1682,8 @@ function MyGeneralSkillLibraryDialog({
             </fieldset>
             {preview ? (
               <section aria-label="装配预检结果" className="rounded-xl border border-[#cbd8ff] bg-[#f7f9ff] p-4">
-                <h3 className="font-medium">预检通过，尚未写入</h3>
-                <ul className="mt-2 grid gap-1 text-[12px] text-[#596078]">
+                <h3 className="gg-type-card-title font-medium">预检通过，尚未写入</h3>
+                <ul className="mt-2 grid gap-1 gg-type-meta text-[#596078]">
                   {preview.targets.map((row) => (
                     <li key={row.agent_id}>{row.agent_name}：{row.action === 'create' ? '新建绑定' : row.action === 'update' ? '更新绑定' : '保持不变'}</li>
                   ))}
@@ -1724,20 +1728,20 @@ function ClawHubDialog({
       >
         <div className="flex items-center gap-[6px] px-[12px] text-[#757f9c]">
           <PlazaResourceIcon kind="general-skills" size="compact" />
-          <DialogTitle className="text-[14px] font-normal leading-none text-[#757f9c]">
+          <DialogTitle className="gg-type-card-title font-normal text-[#757f9c]">
             从开源平台导入技能
           </DialogTitle>
         </div>
 
         <div className="flex flex-col gap-[12px] px-[12px]">
-          <p className="text-[12px] leading-[1.6] text-[#858b9c]">
+          <p className="gg-type-meta  text-[#858b9c]">
             支持开源平台地址、GitHub repo/tree/raw SKILL.md 或 owner/repo 形式。本地 zip 或 Markdown 文件请在编辑页使用「导入 &gt; 选择文件」。
           </p>
           <input
             value={source}
             onChange={(event) => onSourceChange(event.target.value)}
             placeholder="例如 alchaincyf/nuwa-skill 或 https://github.com/owner/repo/tree/main/skill"
-            className="h-[34px] w-full rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[12px] text-[12px] text-[#17191f] outline-none transition-colors placeholder:text-[#c0c6d4] focus:border-[var(--gg-cobalt)]"
+            className="h-[34px] w-full rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[12px] gg-type-meta text-[#17191f] outline-none transition-colors placeholder:text-[#c0c6d4] focus:border-[var(--gg-cobalt)]"
           />
         </div>
 
@@ -1746,14 +1750,14 @@ function ClawHubDialog({
             variant="outline"
             disabled={loading}
             onClick={onClose}
-            className="h-[32px] w-[80px] rounded-[10px] border-[#e3e7f1] bg-white px-[12px] text-[14px] font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-[#18181a]"
+            className="h-[32px] w-[80px] rounded-[10px] border-[#e3e7f1] bg-white px-[12px] gg-type-body font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-[#18181a]"
           >
             取消
           </UIButton>
           <UIButton
             disabled={loading}
             onClick={onSubmit}
-            className="h-[36px] w-[80px] rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-[12px] text-[14px] font-semibold text-white hover:bg-[#244bc7]"
+            className="h-[36px] w-[80px] rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-[12px] gg-type-body font-semibold text-white hover:bg-[#244bc7]"
           >
             新增
           </UIButton>
@@ -1852,10 +1856,10 @@ export function SecureSkillImportDialog({
               <ShieldCheck className="size-5" />
             </span>
             <div>
-              <DialogTitle className="text-[17px] font-semibold text-[#18181a]">
+              <DialogTitle className="gg-type-section-title font-semibold text-[#18181a]">
                 安全导入 Skill 包
               </DialogTitle>
-              <p className="mt-1 text-[12px] leading-[1.5] text-[#757f9c]">
+              <p className="mt-1 gg-type-meta  text-[#757f9c]">
                 先检查完整文件树和申请能力，确认后才会固定版本并绑定当前数字员工。
               </p>
             </div>
@@ -1871,14 +1875,14 @@ export function SecureSkillImportDialog({
                 <li
                   key={step}
                   className={cn(
-                    'flex items-center gap-2 rounded-lg border px-3 py-2 text-[12px]',
+                    'flex items-center gap-2 rounded-lg border px-3 py-2 gg-type-meta',
                     active
                       ? 'border-[#cbd8ff] bg-white text-[#3157e8]'
                       : 'border-transparent bg-[#f1f3f8] text-[#9aa1b4]',
                   )}
                 >
-                  <span className="font-mono font-semibold">{step}</span>
-                  <span>{label}</span>
+                  <span className="font-mono gg-type-meta font-semibold">{step}</span>
+                  <span className="gg-type-meta">{label}</span>
                 </li>
               );
             })}
@@ -1906,7 +1910,7 @@ export function SecureSkillImportDialog({
                     disabled={loading}
                     onClick={() => onSourceKindChange(kind)}
                     className={cn(
-                      'h-9 rounded-[8px] text-[12px] font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[var(--gg-cobalt)]',
+                      'h-9 rounded-[8px] gg-type-meta font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[var(--gg-cobalt)]',
                       sourceKind === kind
                         ? 'bg-white text-[#3157e8] shadow-sm'
                         : 'text-[#757f9c] hover:text-[#343a4a]',
@@ -1920,14 +1924,14 @@ export function SecureSkillImportDialog({
               {sourceKind === 'upload' ? (
                 <label className="flex min-h-[190px] cursor-pointer flex-col items-center justify-center rounded-[14px] border border-dashed border-[#bfc9dc] bg-[#fbfcff] px-6 text-center transition-colors hover:border-[var(--gg-cobalt)] hover:bg-[#f7f9ff] focus-within:ring-2 focus-within:ring-[#b9c8ff]">
                   <FileArchive className="mb-3 size-8 text-[#5574dc]" />
-                  <strong className="text-[14px] font-semibold text-[#252936]">
+                  <strong className="gg-type-body font-semibold text-[#252936]">
                     {file ? file.name : '选择 SKILL.md 或 ZIP Skill 包'}
                   </strong>
-                  <span className="mt-2 text-[12px] leading-[1.6] text-[#858b9c]">
+                  <span className="mt-2 gg-type-meta  text-[#858b9c]">
                     不会直接运行包内内容；路径、编码、压缩比、文件预算和所有 SKILL.md 会先接受完整检查。
                   </span>
                   {file ? (
-                    <span className="mt-3 rounded-full bg-[#edf2ff] px-3 py-1 font-mono text-[11px] text-[#3157e8]">
+                    <span className="mt-3 rounded-full bg-[#edf2ff] px-3 py-1 font-mono gg-type-caption text-[#3157e8]">
                       {formatBytes(file.size)}
                     </span>
                   ) : null}
@@ -1942,10 +1946,10 @@ export function SecureSkillImportDialog({
               ) : sourceKind === 'folder' ? (
                 <label className="flex min-h-[190px] cursor-pointer flex-col items-center justify-center rounded-[14px] border border-dashed border-[#bfc9dc] bg-[#fbfcff] px-6 text-center transition-colors hover:border-[var(--gg-cobalt)] hover:bg-[#f7f9ff] focus-within:ring-2 focus-within:ring-[#b9c8ff]">
                   <IconFolder className="mb-3 size-8 text-[#5574dc]" />
-                  <strong className="text-[14px] font-semibold text-[#252936]">
+                  <strong className="gg-type-body font-semibold text-[#252936]">
                     {folderFiles.length ? `已选择 ${folderFiles.length} 个文件` : '选择完整 Skill 文件夹'}
                   </strong>
-                  <span className="mt-2 text-[12px] leading-[1.6] text-[#858b9c]">
+                  <span className="mt-2 gg-type-meta  text-[#858b9c]">
                     相对路径和全部文件会送入与 ZIP 相同的 fail-closed 检查；不会读取所选目录之外的内容。
                   </span>
                   <input
@@ -1959,7 +1963,7 @@ export function SecureSkillImportDialog({
                 </label>
               ) : (
                 <section className="grid gap-4 rounded-[14px] border border-[#dfe5f2] bg-[#fbfcff] p-5">
-                  <label className="grid gap-2 text-[12px] font-medium text-[#303747]">
+                  <label className="grid gap-2 gg-type-meta font-medium text-[#303747]">
                     {sourceKind === 'github'
                       ? 'GitHub 仓库地址'
                       : sourceKind === 'skillhub'
@@ -1973,27 +1977,27 @@ export function SecureSkillImportDialog({
                         : sourceKind === 'skillhub'
                           ? '例如 customer-support 或 https://skillhub.ai/owner/customer-support'
                           : 'https://example.com/skills.zip'}
-                      className="h-10 rounded-[9px] border-[#cfd7e6] bg-white font-mono text-[12px]"
+                      className="h-10 rounded-[9px] border-[#cfd7e6] bg-white font-mono gg-type-meta"
                     />
                   </label>
                   {sourceKind === 'github' ? (
                     <div className="grid gap-4 sm:grid-cols-[minmax(0,1fr)_180px]">
-                      <label className="grid gap-2 text-[12px] font-medium text-[#303747]">
+                      <label className="grid gap-2 gg-type-meta font-medium text-[#303747]">
                         完整 commit SHA
                         <Input
                           value={revision}
                           onChange={(event) => onRevisionChange(event.target.value)}
                           placeholder="40 位十六进制 commit，不接受 main 或 tag"
-                          className="h-10 rounded-[9px] border-[#cfd7e6] bg-white font-mono text-[12px]"
+                          className="h-10 rounded-[9px] border-[#cfd7e6] bg-white font-mono gg-type-meta"
                         />
                       </label>
-                      <label className="grid gap-2 text-[12px] font-medium text-[#303747]">
+                      <label className="grid gap-2 gg-type-meta font-medium text-[#303747]">
                         仓库内 Skill 目录
                         <Input
                           value={sourceSubpath}
                           onChange={(event) => onSourceSubpathChange(event.target.value)}
                           placeholder="skills"
-                          className="h-10 rounded-[9px] border-[#cfd7e6] bg-white font-mono text-[12px]"
+                          className="h-10 rounded-[9px] border-[#cfd7e6] bg-white font-mono gg-type-meta"
                         />
                       </label>
                     </div>
@@ -2001,21 +2005,21 @@ export function SecureSkillImportDialog({
                   {['github', 'https'].includes(sourceKind) ? (
                     <section className="grid gap-3 rounded-[11px] border border-[#dfe5f2] bg-white p-4">
                       <div>
-                        <strong className="text-[12px] font-semibold text-[#303747]">
+                        <strong className="gg-type-meta font-semibold text-[#303747]">
                           私有来源凭据（可选）
                         </strong>
-                        <p className="mt-1 text-[11px] leading-[1.6] text-[#858b9c]">
+                        <p className="mt-1 gg-type-caption  text-[#858b9c]">
                           Token 加密保存且只属于你；导入作业仅保存不透明引用，跨主机重定向不会携带授权头。
                         </p>
                       </div>
-                      <label className="grid gap-1.5 text-[11px] font-medium text-[#4e5668]">
+                      <label className="grid gap-1.5 gg-type-caption font-medium text-[#4e5668]">
                         本次导入使用
                         <select
                           aria-label="本次导入使用的私有来源凭据"
                           value={credentialId}
                           disabled={credentialLoading}
                           onChange={(event) => onCredentialIdChange?.(event.target.value)}
-                          className="h-9 rounded-[8px] border border-[#cfd7e6] bg-white px-3 text-[12px] text-[#303747] outline-none focus:border-[var(--gg-cobalt)]"
+                          className="h-9 rounded-[8px] border border-[#cfd7e6] bg-white px-3 gg-type-meta text-[#303747] outline-none focus:border-[var(--gg-cobalt)]"
                         >
                           <option value="">公开来源（不发送 Token）</option>
                           {credentials
@@ -2036,7 +2040,7 @@ export function SecureSkillImportDialog({
                           disabled={credentialLoading}
                           onChange={(event) => onCredentialNameChange?.(event.target.value)}
                           placeholder="例如：我的 GitHub 只读 Token"
-                          className="h-9 rounded-[8px] border-[#cfd7e6] text-[12px]"
+                          className="h-9 rounded-[8px] border-[#cfd7e6] gg-type-meta"
                         />
                         <Input
                           aria-label="私有来源 Token"
@@ -2046,7 +2050,7 @@ export function SecureSkillImportDialog({
                           disabled={credentialLoading}
                           onChange={(event) => onCredentialTokenChange?.(event.target.value)}
                           placeholder={credentialId ? '输入新 Token 可轮换当前凭据' : 'Token 不会回显'}
-                          className="h-9 rounded-[8px] border-[#cfd7e6] font-mono text-[12px]"
+                          className="h-9 rounded-[8px] border-[#cfd7e6] font-mono gg-type-meta"
                         />
                       </div>
                       <div className="flex flex-wrap justify-end gap-2">
@@ -2057,7 +2061,7 @@ export function SecureSkillImportDialog({
                               variant="outline"
                               disabled={credentialLoading || !credentialToken}
                               onClick={onCredentialRotate}
-                              className="h-8 text-[11px]"
+                              className="h-8 gg-type-caption"
                             >
                               轮换 Token
                             </UIButton>
@@ -2066,7 +2070,7 @@ export function SecureSkillImportDialog({
                               variant="outline"
                               disabled={credentialLoading}
                               onClick={onCredentialRevoke}
-                              className="h-8 border-[#efcaca] text-[11px] text-[#a62626]"
+                              className="h-8 border-[#efcaca] gg-type-caption text-[#a62626]"
                             >
                               撤销凭据
                             </UIButton>
@@ -2077,7 +2081,7 @@ export function SecureSkillImportDialog({
                             variant="outline"
                             disabled={credentialLoading || !credentialName.trim() || !credentialToken}
                             onClick={onCredentialCreate}
-                            className="h-8 text-[11px]"
+                            className="h-8 gg-type-caption"
                           >
                             加密保存并用于本次导入
                           </UIButton>
@@ -2085,7 +2089,7 @@ export function SecureSkillImportDialog({
                       </div>
                     </section>
                   ) : null}
-                  <p className="text-[11px] leading-[1.6] text-[#858b9c]">
+                  <p className="gg-type-caption  text-[#858b9c]">
                     每次重定向都会重新检查 HTTPS 主机与 DNS；私网、loopback、metadata 地址和漂移版本会在下载前拒绝。
                   </p>
                 </section>
@@ -2095,8 +2099,8 @@ export function SecureSkillImportDialog({
 
           {job?.status === 'failed' ? (
             <section role="alert" className="rounded-[14px] border border-[#f2c7c7] bg-[#fff8f8] p-4">
-              <strong className="text-[13px] font-semibold text-[#a62626]">Skill 包未通过安全检查</strong>
-              <p className="mt-2 text-[12px] leading-[1.6] text-[#7c4a4a]">
+              <strong className="gg-type-control font-semibold text-[#a62626]">Skill 包未通过安全检查</strong>
+              <p className="mt-2 gg-type-meta  text-[#7c4a4a]">
                 {job.error_detail_redacted || job.error_code || '请修正文件后重新选择。'}
               </p>
             </section>
@@ -2109,13 +2113,13 @@ export function SecureSkillImportDialog({
               className="flex min-h-[190px] flex-col items-center justify-center rounded-[14px] border border-[#d9e2f5] bg-[#f8faff] px-6 text-center"
             >
               <IconRefresh className="size-8 animate-spin text-[#5574dc]" />
-              <strong className="mt-4 text-[14px] font-semibold text-[#252936]">
+              <strong className="mt-4 gg-type-body font-semibold text-[#252936]">
                 后台正在安全检查 Skill 包
               </strong>
-              <span className="mt-2 max-w-[520px] text-[12px] leading-[1.7] text-[#757f9c]">
+              <span className="mt-2 max-w-[520px] gg-type-meta  text-[#757f9c]">
                 作业已持久保存，可关闭页面后稍后恢复。系统正在完成来源抓取、完整文件树校验、风险分析和候选预览。
               </span>
-              <code className="mt-3 rounded-full bg-white px-3 py-1 font-mono text-[10px] text-[#6f7789]">
+              <code className="mt-3 rounded-full bg-white px-3 py-1 font-mono gg-type-caption text-[#6f7789]">
                 {job?.status}
               </code>
             </section>
@@ -2123,21 +2127,21 @@ export function SecureSkillImportDialog({
 
           {hasPreview ? (
             <div className="grid gap-4">
-              <section className="grid gap-2 rounded-[12px] border border-[#e2e7f2] bg-[#fafbfe] p-4 text-[12px] text-[#60687b] sm:grid-cols-2">
+              <section className="grid gap-2 rounded-[12px] border border-[#e2e7f2] bg-[#fafbfe] p-4 gg-type-meta text-[#60687b] sm:grid-cols-2">
                 <div>
-                  <span className="block text-[11px] text-[#969daf]">规范包 checksum</span>
-                  <code className="mt-1 block truncate font-mono text-[#303747]" title={job.normalized_checksum}>
+                  <span className="block gg-type-caption text-[#969daf]">规范包 checksum</span>
+                  <code className="mt-1 block truncate font-mono gg-type-caption text-[#303747]" title={job.normalized_checksum}>
                     {job.normalized_checksum}
                   </code>
                 </div>
                 <div>
-                  <span className="block text-[11px] text-[#969daf]">暂存占用</span>
-                  <span className="mt-1 block font-medium text-[#303747]">{formatBytes(job.quota_bytes)}</span>
+                  <span className="block gg-type-caption text-[#969daf]">暂存占用</span>
+                  <span className="mt-1 block gg-type-meta font-medium text-[#303747]">{formatBytes(job.quota_bytes)}</span>
                 </div>
               </section>
 
               <fieldset className="grid gap-3">
-                <legend className="mb-1 text-[13px] font-semibold text-[#252936]">
+                <legend className="mb-1 gg-type-control font-semibold text-[#252936]">
                   选择要固定到当前数字员工的 Skill
                 </legend>
                 {job.candidates.map((candidate) => {
@@ -2166,23 +2170,23 @@ export function SecureSkillImportDialog({
                       />
                       <span className="min-w-0">
                         <span className="flex flex-wrap items-center gap-2">
-                          <strong className="text-[14px] font-semibold text-[#252936]">{candidate.name}</strong>
-                          <span className="rounded-full bg-[#edf2ff] px-2 py-0.5 text-[10px] text-[#3157e8]">
+                          <strong className="gg-type-body font-semibold text-[#252936]">{candidate.name}</strong>
+                          <span className="rounded-full bg-[#edf2ff] px-2 py-0.5 gg-type-caption text-[#3157e8]">
                             {candidate.resources.length} 个文件
                           </span>
                         </span>
-                        <span className="mt-1 block text-[12px] leading-[1.6] text-[#6f7789]">
+                        <span className="mt-1 block gg-type-meta  text-[#6f7789]">
                           {candidate.description}
                         </span>
-                        <span className="mt-3 block text-[11px] text-[#969daf]">申请工具（不代表已授权）</span>
+                        <span className="mt-3 block gg-type-caption text-[#969daf]">申请工具（不代表已授权）</span>
                         <span className="mt-1 flex flex-wrap gap-1.5">
                           {candidate.allowed_tools.length ? candidate.allowed_tools.map((tool) => (
-                            <code key={tool} className="rounded bg-[#f0f2f6] px-2 py-1 text-[10px] text-[#4e5668]">
+                            <code key={tool} className="rounded bg-[#f0f2f6] px-2 py-1 gg-type-caption text-[#4e5668]">
                               {tool}
                             </code>
-                          )) : <span className="text-[11px] text-[#858b9c]">未声明额外工具范围</span>}
+                          )) : <span className="gg-type-caption text-[#858b9c]">未声明额外工具范围</span>}
                         </span>
-                        <span className="mt-3 flex flex-wrap items-center gap-2 text-[11px]">
+                        <span className="mt-3 flex flex-wrap items-center gap-2 gg-type-caption">
                           <span className={cn(
                             'rounded-full px-2 py-1 font-medium',
                             candidate.invocation_policy === 'user_only'
@@ -2192,21 +2196,21 @@ export function SecureSkillImportDialog({
                             {candidate.invocation_policy === 'user_only' ? '仅显式调用' : '允许模型选择'}
                           </span>
                           {candidate.argument_hint ? (
-                            <span className="text-[#6f7789]">调用提示：{candidate.argument_hint}</span>
+                            <span className="gg-type-caption text-[#6f7789]">调用提示：{candidate.argument_hint}</span>
                           ) : null}
                         </span>
                         {Object.keys(candidate.instruction_contracts).length ? (
-                          <span className="mt-3 block rounded-lg border border-[#e4e8f1] bg-[#f8f9fc] p-2.5 text-[11px] text-[#626b7d]">
-                            <strong className="font-semibold text-[#303747]">已声明运行契约：</strong>{' '}
+                          <span className="mt-3 block rounded-lg border border-[#e4e8f1] bg-[#f8f9fc] p-2.5 gg-type-caption text-[#626b7d]">
+                            <strong className="gg-type-caption font-semibold text-[#303747]">已声明运行契约：</strong>{' '}
                             {Object.entries(candidate.instruction_contracts)
                               .map(([key, value]) => `${key}=${value}`)
                               .join(' · ')}
                           </span>
                         ) : null}
-                        <span className="mt-3 block text-[11px] text-[#969daf]">许可证与静态风险</span>
+                        <span className="mt-3 block gg-type-caption text-[#969daf]">许可证与静态风险</span>
                         <span className="mt-1 flex flex-wrap gap-1.5">
                           <span className={cn(
-                            'rounded px-2 py-1 text-[10px]',
+                            'rounded px-2 py-1 gg-type-caption',
                             candidate.license_hint
                               ? 'bg-[#edf7ef] text-[#23733b]'
                               : 'bg-[#fff4df] text-[#946200]',
@@ -2216,14 +2220,14 @@ export function SecureSkillImportDialog({
                           {candidate.risk_findings
                             .filter((finding) => finding !== 'license_not_declared')
                             .map((finding) => (
-                              <span key={finding} className="rounded bg-[#fff4df] px-2 py-1 text-[10px] text-[#946200]">
+                              <span key={finding} className="rounded bg-[#fff4df] px-2 py-1 gg-type-caption text-[#946200]">
                                 {skillRiskFindingLabel(finding)}
                               </span>
                             ))}
                         </span>
                         {candidate.dependency_candidates.length ? (
-                          <span className="mt-3 block rounded-lg border border-[#e4e8f1] bg-white p-2.5 text-[11px] text-[#626b7d]">
-                            <strong className="font-semibold text-[#303747]">待确认的同包 Skill 引用：</strong>{' '}
+                          <span className="mt-3 block rounded-lg border border-[#e4e8f1] bg-white p-2.5 gg-type-caption text-[#626b7d]">
+                            <strong className="gg-type-caption font-semibold text-[#303747]">待确认的同包 Skill 引用：</strong>{' '}
                             <span className="mt-2 grid gap-2">
                               {candidate.dependency_candidates.map((dependency) => (
                                 <label
@@ -2231,7 +2235,7 @@ export function SecureSkillImportDialog({
                                   className="grid gap-1.5 rounded-md bg-[#f8f9fc] p-2 sm:grid-cols-[minmax(0,1fr)_150px] sm:items-center"
                                 >
                                   <span>
-                                    <code className="font-mono text-[#3157e8]">/{dependency.referenced_name}</code>
+                                    <code className="font-mono gg-type-caption text-[#3157e8]">/{dependency.referenced_name}</code>
                                     <span className="ml-1 text-[#969daf]">引用 {dependency.reference_count} 次</span>
                                   </span>
                                   <select
@@ -2241,7 +2245,7 @@ export function SecureSkillImportDialog({
                                       dependency.dependency_candidate_id,
                                       event.target.value as SkillDependencyDecision,
                                     )}
-                                    className="h-8 rounded-md border border-[#cfd7e6] bg-white px-2 text-[11px] text-[#303747] outline-none focus:border-[var(--gg-cobalt)]"
+                                    className="h-8 rounded-md border border-[#cfd7e6] bg-white px-2 gg-type-caption text-[#303747] outline-none focus:border-[var(--gg-cobalt)]"
                                   >
                                     <option value="ignored">仅正文引用</option>
                                     <option value="required">建立必需依赖</option>
@@ -2254,11 +2258,11 @@ export function SecureSkillImportDialog({
                           </span>
                         ) : null}
                         {candidate.platform_commands.length ? (
-                          <span className="mt-2 block text-[11px] text-[#858b9c]">
+                          <span className="mt-2 block gg-type-caption text-[#858b9c]">
                             平台命令引用：{candidate.platform_commands.map((command) => `/${command}`).join('、')}
                           </span>
                         ) : null}
-                        <code className="mt-3 block truncate font-mono text-[10px] text-[#9aa1b4]" title={candidate.content_checksum}>
+                        <code className="mt-3 block truncate font-mono gg-type-caption text-[#9aa1b4]" title={candidate.content_checksum}>
                           内容：{candidate.content_checksum}
                         </code>
                       </span>
@@ -2271,7 +2275,7 @@ export function SecureSkillImportDialog({
         </div>
 
         <footer className="flex items-center justify-between gap-3 border-t border-[#e8ebf2] bg-white px-[24px] py-[16px]">
-          <span className="text-[11px] text-[#858b9c]">
+          <span className="gg-type-caption text-[#858b9c]">
             {hasPreview
               ? '默认固定本次修订；后续升级需再次审核。'
               : isProcessing
@@ -2525,7 +2529,7 @@ function SectionCard({
       )}
       <div className={cn('min-h-0 flex-1', bodyClassName)}>
         {loading ? (
-          <div className="py-[24px] text-center text-[13px] text-[#858b9c]">加载中…</div>
+          <div className="py-[24px] text-center gg-type-control text-[#858b9c]">加载中…</div>
         ) : (
           children
         )}
@@ -3379,7 +3383,8 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
 
   return (
     <div
-      className="min-h-full box-border px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]"
+      className="gg-page-shell"
+      data-page-template="detail"
       aria-busy={loading || saving}
     >
       <AppHeader
@@ -3627,10 +3632,10 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
                 <span>运行结果</span>
                 {activeResult && (
                   isLiveRunning
-                    ? <span className="inline-flex items-center gap-[4px] rounded-full bg-[#e6f4ff] px-[8px] py-px text-[12px] font-bold text-[#0958d9]">运行中</span>
+                    ? <span className="inline-flex items-center gap-[4px] rounded-full bg-[#e6f4ff] px-[8px] py-px gg-type-meta font-bold text-[#0958d9]">运行中</span>
                     : resultSucceeded(activeResult)
-                    ? <span className="inline-flex items-center gap-[4px] rounded-full bg-[#eafbf0] px-[8px] py-px text-[12px] font-bold text-[#018434]"><CheckCircleOutlined />成功</span>
-                    : <span className="inline-flex items-center gap-[4px] rounded-full bg-[#fce7e7] px-[8px] py-px text-[12px] font-bold text-[#d20b0b]"><CloseCircleOutlined />失败</span>
+                    ? <span className="inline-flex items-center gap-[4px] rounded-full bg-[#eafbf0] px-[8px] py-px gg-type-meta font-bold text-[#018434]"><CheckCircleOutlined />成功</span>
+                    : <span className="inline-flex items-center gap-[4px] rounded-full bg-[#fce7e7] px-[8px] py-px gg-type-meta font-bold text-[#d20b0b]"><CloseCircleOutlined />失败</span>
                 )}
               </span>
             )}
@@ -3719,7 +3724,7 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
                 })()}
               </div>
             ) : (
-              <div className="flex min-h-[560px] flex-1 flex-col items-center justify-center gap-[8px] text-center text-[13px] text-muted-foreground xl:min-h-0">
+              <div className="flex min-h-[560px] flex-1 flex-col items-center justify-center gap-[8px] text-center gg-type-control text-muted-foreground xl:min-h-0">
                 运行后将在这里显示回复、执行流程、代码和输出
               </div>
             )}
@@ -3750,7 +3755,7 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
           label: (
             <>
               {skillDisplayName(item)}
-              <span className="text-[#858b9c]"> · {item.slug}</span>
+              <span className="gg-type-caption text-[#858b9c]"> · {item.slug}</span>
             </>
           ),
         }))}
@@ -3793,30 +3798,30 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
         onOpenChange={(open) => { if (!open) { setImportPrepareOpen(false); importPrepareActionRef.current = null; } }}
       >
         <DialogContent aria-describedby={undefined} className="flex w-[calc(100%-2rem)] flex-col gap-0 overflow-hidden rounded-[16px] p-0 sm:max-w-[460px]">
-          <DialogTitle className="border-b border-border px-[24px] py-[16px] text-[16px] font-semibold text-foreground">
+          <DialogTitle className="border-b border-border px-[24px] py-[16px] gg-type-card-title font-semibold text-foreground">
             导入新技能前是否保存当前技能？
           </DialogTitle>
-          <p className="px-[24px] py-[16px] text-[13px] leading-[20px] text-[#4f5669]">
+          <p className="px-[24px] py-[16px] gg-type-control  text-[#4f5669]">
             你正在编辑现有技能。导入会进入新建状态，不会覆盖当前技能。
           </p>
           <div className="flex items-center justify-end gap-[8px] bg-background px-[24px] py-[12px]">
             <UIButton
               variant="outline"
               onClick={() => { setImportPrepareOpen(false); importPrepareActionRef.current = null; }}
-              className="h-[32px] rounded-[10px] border-[#e3e7f1] bg-white px-[14px] text-[14px] font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-[#18181a]"
+              className="h-[32px] rounded-[10px] border-[#e3e7f1] bg-white px-[14px] gg-type-body font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-[#18181a]"
             >
               取消
             </UIButton>
             <UIButton
               variant="outline"
               onClick={() => void confirmImportPrepareSkip()}
-              className="h-[32px] rounded-[10px] border-[#e3e7f1] bg-white px-[14px] text-[14px] font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-[#18181a]"
+              className="h-[32px] rounded-[10px] border-[#e3e7f1] bg-white px-[14px] gg-type-body font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-[#18181a]"
             >
               不保存，继续导入
             </UIButton>
             <UIButton
               onClick={() => void confirmImportPrepareSave()}
-              className="h-[36px] rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-[14px] text-[14px] font-semibold text-white hover:bg-[#244bc7]"
+              className="h-[36px] rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-[14px] gg-type-body font-semibold text-white hover:bg-[#244bc7]"
             >
               保存并发布
             </UIButton>
@@ -3826,7 +3831,7 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
 
       <Dialog open={Boolean(renameTarget)} onOpenChange={(open) => { if (!open) setRenameTarget(null); }}>
         <DialogContent aria-describedby={undefined} className="flex w-[calc(100%-2rem)] flex-col gap-0 overflow-hidden rounded-[16px] p-0 sm:max-w-[420px]">
-          <DialogTitle className="border-b border-border px-[24px] py-[16px] text-[16px] font-semibold text-foreground">
+          <DialogTitle className="border-b border-border px-[24px] py-[16px] gg-type-card-title font-semibold text-foreground">
             重命名文件
           </DialogTitle>
           <div className="px-[24px] py-[16px]">
@@ -3846,13 +3851,13 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
             <UIButton
               variant="outline"
               onClick={() => setRenameTarget(null)}
-              className="h-[32px] w-[80px] rounded-[10px] border-[#e3e7f1] bg-white px-[12px] text-[14px] font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-[#18181a]"
+              className="h-[32px] w-[80px] rounded-[10px] border-[#e3e7f1] bg-white px-[12px] gg-type-body font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-[#18181a]"
             >
               取消
             </UIButton>
             <UIButton
               onClick={runRenameFile}
-              className="h-[36px] w-[80px] rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-[12px] text-[14px] font-semibold text-white hover:bg-[#244bc7]"
+              className="h-[36px] w-[80px] rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-[12px] gg-type-body font-semibold text-white hover:bg-[#244bc7]"
             >
               重命名
             </UIButton>

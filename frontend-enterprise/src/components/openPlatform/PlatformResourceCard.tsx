@@ -89,7 +89,7 @@ export default function PlatformResourceCard({
         className,
       )}
     >
-      <div className={cn(
+      <div data-resource-identity className={cn(
         RESOURCE_CARD_IDENTITY_CLASS,
         accentStyles.identity,
       )}>

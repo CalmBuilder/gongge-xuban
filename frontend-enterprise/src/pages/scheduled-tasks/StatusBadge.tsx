@@ -8,7 +8,7 @@ export function StatusBadge({ tone, children }: { tone: BadgeTone; children: Rea
   return (
     <span
       className={cn(
-        'inline-flex items-center rounded-full px-[12px] py-[4px] text-[10px] leading-none whitespace-nowrap capitalize',
+        'inline-flex items-center rounded-full px-[12px] py-[4px] gg-type-caption whitespace-nowrap capitalize',
         BADGE_TONE_CLASS[tone],
       )}
     >

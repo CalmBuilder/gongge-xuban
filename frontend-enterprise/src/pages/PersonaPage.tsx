@@ -235,7 +235,7 @@ export default function PersonaPage() {
     <>
       <div className="page-title">
         <div>
-          <h3>岗位人设</h3>
+          <h3 className="gg-type-page-title">岗位人设</h3>
         </div>
         <UIButton disabled={loading} onClick={() => void save()}>
           <SaveOutlined />
@@ -262,7 +262,7 @@ export default function PersonaPage() {
               onChange={(event) => updatePersona({ system_prompt: event.target.value })}
             />
           </LabeledField>
-          {updatedAt && <span className="text-[12px] text-muted-foreground">最后更新：{formatDateOnly(updatedAt)}</span>}
+          {updatedAt && <span className="gg-type-meta text-muted-foreground">最后更新：{formatDateOnly(updatedAt)}</span>}
         </CardContent>
       </Card>
       <Card className="editor-card settings-card">
@@ -339,7 +339,7 @@ export default function PersonaPage() {
             <SaveOutlined />
             保存设置
           </UIButton>
-          {uiUpdatedAt && <span className="text-[12px] text-muted-foreground">最后更新：{formatDateOnly(uiUpdatedAt)}</span>}
+          {uiUpdatedAt && <span className="gg-type-meta text-muted-foreground">最后更新：{formatDateOnly(uiUpdatedAt)}</span>}
         </CardContent>
       </Card>
     </>
@@ -349,8 +349,8 @@ export default function PersonaPage() {
 function LabeledField({ label, hint, hintId, children }: { label: string; hint?: string; hintId?: string; children: ReactNode }) {
   return (
     <label className="flex flex-col gap-[6px]">
-      <span className="text-[12px] font-medium text-[#464c5e]">{label}</span>
-      {hint && <span id={hintId} className="text-[11px] leading-[16px] text-muted-foreground">{hint}</span>}
+      <span className="gg-type-meta font-medium text-[#464c5e]">{label}</span>
+      {hint && <span id={hintId} className="gg-type-caption  text-muted-foreground">{hint}</span>}
       {children}
     </label>
   );
@@ -359,7 +359,7 @@ function LabeledField({ label, hint, hintId, children }: { label: string; hint?:
 function SwitchRow({ label, checked, onChange }: { label: string; checked: boolean; onChange: (next: boolean) => void }) {
   return (
     <label className="flex items-center justify-between gap-[16px]">
-      <span className="text-[12px] font-medium text-[#464c5e]">{label}</span>
+      <span className="gg-type-meta font-medium text-[#464c5e]">{label}</span>
       <Switch checked={checked} onCheckedChange={onChange} />
     </label>
   );

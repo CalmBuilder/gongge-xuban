@@ -138,6 +138,14 @@ it('loads the first server-managed page instead of downloading the full employee
   ));
 });
 
+it('renders an empty management state when an isolated API mock has no page envelope', async () => {
+  vi.mocked(api.get).mockResolvedValue([] as never);
+  renderPage({ ...admin, role: 'member' }, false);
+
+  expect(await screen.findByText('还没有数字员工')).toBeInTheDocument();
+  expect(screen.queryByText('Cannot read properties of undefined')).not.toBeInTheDocument();
+});
+
 it('separates my capability avatars from organization employee readiness', async () => {
   const capability = {
     ...row('capability-1', '我的报销分身', {}),
@@ -225,7 +233,9 @@ it('uses the shared catalog header pattern for expert template management', asyn
     '/enterprise/platform/experts',
   );
   expect(screen.getByRole('textbox', { name: '搜索专家模板' })).toBeInTheDocument();
-  expect(screen.getByText('开放广场的专家分类展示已发布模板；本页只维护平台内置模板，用户复制后才进入“我的能力分身”。')).toBeInTheDocument();
+  const description = screen.getByText('开放广场的专家分类展示已发布模板；本页只维护平台内置模板，用户复制后才进入“我的能力分身”。');
+  expect(description).toHaveClass('gg-type-body', 'max-w-none');
+  expect(description.parentElement).toHaveClass('min-w-0', 'flex-1');
 });
 
 it('keeps expert management controls hidden from members', async () => {

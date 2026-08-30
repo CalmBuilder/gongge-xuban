@@ -180,6 +180,34 @@ describe('EmployeeCard', () => {
     expect(onOpen).not.toHaveBeenCalled();
   });
 
+  it('keeps the portrait inside a fixed identity slot when expert selection is enabled', () => {
+    render(
+      <EmployeeCard
+        employee={expertEmployee()} canManage showMenu={false} selectable checked={false}
+        onCheckedChange={vi.fn()} onOpen={vi.fn()} onChat={vi.fn()}
+        onStatus={vi.fn()} onGallery={vi.fn()} onDelete={vi.fn()} onAvatar={vi.fn()}
+        onEdit={vi.fn()}
+      />,
+    );
+
+    const identity = document.querySelector('.gongge-employee-identity');
+    expect(identity).toHaveClass('grid-cols-[56px_minmax(0,1fr)_auto]', 'overflow-hidden');
+    expect(identity).not.toHaveClass('pl-[42px]');
+    const avatarSlot = document.querySelector('[data-avatar-slot]');
+    expect(avatarSlot).toHaveClass('employee-resource-avatar-slot', 'overflow-hidden');
+    const avatar = avatarSlot?.querySelector('.employee-avatar');
+    expect(avatar).toHaveClass('employee-resource-avatar');
+    expect(avatar).toHaveStyle({
+      width: '56px',
+      height: '56px',
+      borderRadius: 'var(--gg-radius-avatar-card)',
+    });
+    expect(avatar?.querySelector('img')).toHaveStyle({
+      borderRadius: 'var(--gg-radius-avatar-card)',
+      objectFit: 'cover',
+    });
+  });
+
   it('exposes expert classification editing from the card menu', () => {
     const onEditClassification = vi.fn();
     render(

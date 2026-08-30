@@ -3,6 +3,7 @@ import type { ReactNode } from 'react';
 import { User } from 'lucide-react';
 
 import AppHeader from '@/components/AppHeader';
+import { PageShell } from '@/components/enterprise/PageShell';
 import { ConceptHelp } from '@/components/ConceptHelp';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { DataTable, type DataTableColumn } from '@/components/DataTable';
@@ -402,7 +403,7 @@ export default function AccountsPage({
           <span className="grid size-[24px] shrink-0 place-items-center rounded-full bg-[#eef1fb] text-[#7e96dc]">
             <User className="size-[14px]" />
           </span>
-          <span className="truncate font-medium">{row.username}</span>
+          <span className="truncate gg-type-meta font-medium">{row.username}</span>
         </span>
       ),
     },
@@ -486,16 +487,16 @@ export default function AccountsPage({
             <User className="size-[15px]" />
           </span>
           <span className="min-w-0">
-            <strong className="block truncate text-[14px] font-semibold text-[#18181a]">{row.username}</strong>
-            <span className="mt-[2px] block truncate text-[12px] text-[#858b9c]">{row.display_name || row.username}</span>
-            <span className="mt-[2px] block truncate text-[12px] text-[#858b9c]">工号：{row.employee_id || '未绑定'}</span>
-            <span className="mt-[2px] block truncate text-[12px] text-[#858b9c]">
+            <strong className="block truncate gg-type-body font-semibold text-[#18181a]">{row.username}</strong>
+            <span className="mt-[2px] block truncate gg-type-meta text-[#858b9c]">{row.display_name || row.username}</span>
+            <span className="mt-[2px] block truncate gg-type-meta text-[#858b9c]">工号：{row.employee_id || '未绑定'}</span>
+            <span className="mt-[2px] block truncate gg-type-meta text-[#858b9c]">
               {MEMBERSHIP_STATUS_LABELS[row.membership_status]} · {memberCategories.find((item) => item.code === row.member_category_code)?.name || row.member_category_code}
             </span>
-            <span className="mt-[2px] block truncate text-[12px] text-[#858b9c]">
+            <span className="mt-[2px] block truncate gg-type-meta text-[#858b9c]">
               任职：{currentAssignmentSummary(row)}
             </span>
-            <span className="mt-[2px] block truncate text-[12px] text-[#858b9c]">
+            <span className="mt-[2px] block truncate gg-type-meta text-[#858b9c]">
               业务角色：{(row.business_role_codes || []).map((code) => (
                 businessRoles.find((role) => role.role_code === code)?.name || code
               )).join('、') || '未分配'}
@@ -504,7 +505,7 @@ export default function AccountsPage({
         </span>
         {renderActions(row)}
       </div>
-      <div className="mt-[10px] flex items-center justify-between gap-[10px] text-[12px] text-[#858b9c]">
+      <div className="mt-[10px] flex items-center justify-between gap-[10px] gg-type-meta text-[#858b9c]">
         <span>加入 {formatDateTime(row.joined_at)}</span>
         <span>更新 {formatDateTime(row.updated_at)}</span>
       </div>
@@ -512,7 +513,7 @@ export default function AccountsPage({
   );
 
   return (
-    <div className="min-h-full box-border px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]" aria-busy={loading}>
+    <PageShell template="management" aria-busy={loading}>
       <AppHeader
         onLogout={onLogout}
         userName={currentUser?.username}
@@ -530,7 +531,7 @@ export default function AccountsPage({
           variant="outline"
           onClick={() => void load()}
           disabled={loading}
-          className="h-[34px] gap-[4px] rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[20px] text-[12px] font-normal text-[#757f9c] hover:border-[#cbd3e6] hover:bg-white hover:text-[#18181a]"
+          className="h-[34px] gap-[4px] rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[20px] gg-type-meta font-normal text-[#757f9c] hover:border-[#cbd3e6] hover:bg-white hover:text-[#18181a]"
         >
           <IconRefresh className={cn('size-[14px]', loading && 'animate-spin')} />
           刷新
@@ -538,7 +539,7 @@ export default function AccountsPage({
         {canManageMembers ? (
           <UIButton
             onClick={openCreate}
-            className="h-[34px] gap-[4px] rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-[20px] text-[12px] font-semibold text-white hover:bg-[#244bc7]"
+            className="h-[34px] gap-[4px] rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-[20px] gg-type-meta font-semibold text-white hover:bg-[#244bc7]"
           >
             <IconAdd className="size-[14px]" />
             新增成员
@@ -549,8 +550,8 @@ export default function AccountsPage({
       <div className="grid grid-cols-[250px_minmax(0,1fr)] overflow-hidden rounded-[20px_20px_0_0] bg-white shadow-[0_-4px_16px_0_rgba(0,0,0,0.05)] max-[980px]:grid-cols-1">
         <aside className="border-r border-[#edf0f6] bg-[#fbfcff] p-[14px] max-[980px]:border-r-0 max-[980px]:border-b">
           <div className="mb-[10px] px-[3px]">
-            <strong className="text-[12px] font-semibold text-[#424b61]">按组织查看成员</strong>
-            <p className="mt-[3px] text-[10px] leading-[16px] text-[#8a93a8]">组织逐层加载，不下载整棵人员树。</p>
+            <strong className="gg-type-meta font-semibold text-[#424b61]">按组织查看成员</strong>
+            <p className="mt-[3px] gg-type-caption  text-[#8a93a8]">组织逐层加载，不下载整棵人员树。</p>
           </div>
           <OrganizationTreeNavigator
             onSelect={selectOrganization}
@@ -558,7 +559,7 @@ export default function AccountsPage({
             selectRootOnInitialize={false}
             tenantId={getRequestTenantId()}
           />
-          <label className="mt-[12px] flex cursor-pointer items-center gap-[7px] rounded-[9px] border border-[#e5e9f2] bg-white px-[9px] py-[8px] text-[11px] text-[#596174]">
+          <label className="mt-[12px] flex cursor-pointer items-center gap-[7px] rounded-[9px] border border-[#e5e9f2] bg-white px-[9px] py-[8px] gg-type-caption text-[#596174]">
             <Checkbox
               aria-label="包含下级组织成员"
               checked={includeDescendants}
@@ -570,7 +571,7 @@ export default function AccountsPage({
         <div className="flex min-w-0 flex-col gap-[18px] p-[18px_18px_24px_18px]">
           <div className="flex items-center gap-[6px] px-[12px] text-[#757f9c]">
             <IconAccounts className="size-[14px] shrink-0" />
-            <span className="text-[14px] font-normal leading-none">企业成员</span>
+            <span className="gg-type-body font-normal">企业成员</span>
           </div>
 
           <label className="flex h-[34px] w-[300px] items-center gap-[8px] overflow-hidden rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[12px] transition-colors focus-within:border-[var(--gg-cobalt)] max-[900px]:w-full">
@@ -579,7 +580,7 @@ export default function AccountsPage({
               value={searchText}
               placeholder="搜索成员、账号、工号、状态或类别"
               onChange={(event) => setSearchText(event.target.value)}
-              className="h-full min-w-0 flex-1 bg-transparent text-[12px] text-[#17191f] outline-none placeholder:text-[#c0c6d4]"
+              className="h-full min-w-0 flex-1 bg-transparent gg-type-meta text-[#17191f] outline-none placeholder:text-[#c0c6d4]"
             />
             {searchText && (
               <button
@@ -597,7 +598,7 @@ export default function AccountsPage({
             {rows.length ? (
               rows.map(renderMobileCard)
             ) : (
-              <div className="py-[40px] text-center text-[13px] text-[#858b9c]">暂无成员</div>
+              <div className="py-[40px] text-center gg-type-control text-[#858b9c]">暂无成员</div>
             )}
           </div>
 
@@ -698,7 +699,7 @@ export default function AccountsPage({
         description="离职后该成员无法登录和领取新任务；账号、历史会话、流程记录与数字员工所有权不会被删除。"
         onConfirm={() => void confirmDelete()}
       />
-    </div>
+    </PageShell>
   );
 }
 
@@ -792,7 +793,7 @@ function AccountDialog({
       >
         <div className="flex shrink-0 items-center gap-[6px] px-[12px] text-[#757f9c]">
           <IconAccounts className="size-[14px] shrink-0" />
-          <DialogTitle className="text-[14px] font-normal leading-none text-[#757f9c]">
+          <DialogTitle className="gg-type-card-title font-normal text-[#757f9c]">
             {title}
           </DialogTitle>
         </div>
@@ -908,7 +909,7 @@ function AccountDialog({
               <span className="flex items-center justify-between gap-[8px]">
                 <span>公司业务角色</span>
                 {businessRoleCodes.length > 0 && (
-                  <span className="rounded-full bg-[#eef3ff] px-[8px] py-[1px] text-[10px] font-medium leading-[16px] text-[var(--gg-cobalt)]">
+                  <span className="rounded-full bg-[#eef3ff] px-[8px] py-[1px] gg-type-caption font-medium  text-[var(--gg-cobalt)]">
                     已选 {businessRoleCodes.length} 项
                   </span>
                 )}
@@ -919,7 +920,7 @@ function AccountDialog({
               <div className="flex max-h-[220px] flex-col gap-[10px] overflow-y-auto rounded-[10px] border border-[#e3e7f1] bg-[#fafbfd] p-[8px]">
                 {groupedBusinessRoles.map((group) => (
                   <div key={group.category} className="flex flex-col gap-[6px]">
-                    <div className="sticky top-[-8px] z-[1] mx-[-8px] bg-[#fafbfd] px-[8px] py-[4px] text-[10px] font-semibold tracking-[0.04em] text-[#858b9c]">
+                    <div className="sticky top-[-8px] z-[1] mx-[-8px] bg-[#fafbfd] px-[8px] py-[4px] gg-type-caption font-semibold tracking-[0.04em] text-[#858b9c]">
                       {group.label}
                     </div>
                     <div className="grid grid-cols-2 gap-[6px] max-[560px]:grid-cols-1">
@@ -948,10 +949,10 @@ function AccountDialog({
                               )}
                             />
                             <span className="min-w-0 flex-1">
-                              <span className="block truncate text-[12px] font-medium leading-[16px] text-[#464c5e]">
+                              <span className="block truncate gg-type-meta font-medium  text-[#464c5e]">
                                 {businessRole.name}
                               </span>
-                              <span className="block truncate text-[10px] leading-[14px] text-[#9aa1b5]">
+                              <span className="block truncate gg-type-caption  text-[#9aa1b5]">
                                 {businessRole.role_code}
                               </span>
                             </span>
@@ -963,7 +964,7 @@ function AccountDialog({
                 ))}
               </div>
             ) : (
-              <span className="text-[12px] text-[#858b9c]">当前尚无可分配业务角色</span>
+              <span className="gg-type-meta text-[#858b9c]">当前尚无可分配业务角色</span>
             )}
           </LabeledField>
         </div>
@@ -973,14 +974,14 @@ function AccountDialog({
             variant="outline"
             disabled={loading}
             onClick={onClose}
-            className="h-[32px] w-[80px] rounded-[10px] border-[#e3e7f1] bg-white px-[12px] text-[14px] font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-[#18181a]"
+            className="h-[32px] w-[80px] rounded-[10px] border-[#e3e7f1] bg-white px-[12px] gg-type-body font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-[#18181a]"
           >
             取消
           </UIButton>
           <UIButton
             disabled={loading}
             onClick={onSubmit}
-            className="h-[36px] w-[80px] rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-[12px] text-[14px] font-semibold text-white hover:bg-[#244bc7]"
+            className="h-[36px] w-[80px] rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-[12px] gg-type-body font-semibold text-white hover:bg-[#244bc7]"
           >
             {submitText}
           </UIButton>
@@ -993,7 +994,7 @@ function AccountDialog({
 function LabeledField({ label, children }: { label: ReactNode; children: ReactNode }) {
   return (
     <label className="flex flex-col gap-[6px]">
-      <span className="text-[12px] font-medium text-[#464c5e]">{label}</span>
+      <span className="gg-type-meta font-medium text-[#464c5e]">{label}</span>
       {children}
     </label>
   );

@@ -58,7 +58,7 @@ export default function TracesPage() {
         <UIButton
           variant="outline"
           size="sm"
-          className="h-[28px] rounded-[8px] px-[12px] text-[12px]"
+          className="h-[28px] rounded-[8px] px-[12px] gg-type-meta"
           onClick={() => void openDetail(row)}
         >
           查看
@@ -70,7 +70,7 @@ export default function TracesPage() {
   return (
     <>
       <div className="page-title">
-        <h3>Trace</h3>
+        <h3 className="gg-type-page-title">Trace</h3>
         <UIButton variant="outline" onClick={() => void load()}>
           <ReloadOutlined />
           刷新
@@ -108,7 +108,7 @@ export default function TracesPage() {
             <SheetTitle>Trace Detail</SheetTitle>
           </SheetHeader>
           <div className="min-h-0 flex-1 overflow-auto px-[16px] pb-[16px]">
-            <pre className="text-[12px] whitespace-pre-wrap">{JSON.stringify(detail, null, 2)}</pre>
+            <pre className="gg-type-meta whitespace-pre-wrap">{JSON.stringify(detail, null, 2)}</pre>
           </div>
         </SheetContent>
       </Sheet>

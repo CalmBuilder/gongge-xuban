@@ -13,6 +13,7 @@ import {
 import { useSearchParams } from 'react-router-dom';
 
 import AppHeader from '@/components/AppHeader';
+import { PageShell } from '@/components/enterprise/PageShell';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { DataTable, type DataTableColumn } from '@/components/DataTable';
 import { OrganizationTreeNavigator } from '@/components/OrganizationTreeNavigator';
@@ -792,8 +793,8 @@ export default function OrganizationRolesPage({
       width: 230,
       render: (role) => (
         <span className="grid min-w-0 gap-[2px]">
-          <strong className="truncate text-[13px] font-semibold text-[#18181a]">{role.name}</strong>
-          <span className="truncate font-mono text-[11px] text-[#858b9c]">{role.role_code}</span>
+          <strong className="truncate gg-type-control font-semibold text-[#18181a]">{role.name}</strong>
+          <span className="truncate font-mono gg-type-caption text-[#858b9c]">{role.role_code}</span>
         </span>
       ),
     },
@@ -812,7 +813,7 @@ export default function OrganizationRolesPage({
       title: '权限点',
       width: 280,
       render: (role) => (
-        <span className="block truncate text-[12px] text-[#464c5e]">
+        <span className="block truncate gg-type-meta text-[#464c5e]">
           {role.permissions.join('、') || '未配置'}
         </span>
       ),
@@ -868,8 +869,8 @@ export default function OrganizationRolesPage({
       width: 180,
       render: (assignment) => (
         <span className="grid">
-          <strong className="text-[12px]">{assignment.employee_name || assignment.employee_id}</strong>
-          <small className="font-mono text-[#858b9c]">{assignment.employee_id}</small>
+          <strong className="gg-type-meta">{assignment.employee_name || assignment.employee_id}</strong>
+          <small className="font-mono gg-type-caption text-[#858b9c]">{assignment.employee_id}</small>
         </span>
       ),
     },
@@ -879,8 +880,8 @@ export default function OrganizationRolesPage({
       width: 230,
       render: (assignment) => (
         <span className="grid">
-          <strong className="text-[12px]">{assignment.role_name}</strong>
-          <small className="font-mono text-[#526183]">{assignment.role_code}</small>
+          <strong className="gg-type-meta">{assignment.role_name}</strong>
+          <small className="font-mono gg-type-caption text-[#526183]">{assignment.role_code}</small>
         </span>
       ),
     },
@@ -905,7 +906,7 @@ export default function OrganizationRolesPage({
       render: (assignment) => (
         <span className="grid gap-[2px]">
           <span>{assignment.grant_reason || '历史兼容授权'}</span>
-          <small className="text-[#858b9c]">授予人：{assignment.granted_by_user_id || '历史数据'}</small>
+          <small className="gg-type-caption text-[#858b9c]">授予人：{assignment.granted_by_user_id || '历史数据'}</small>
         </span>
       ),
     },
@@ -941,7 +942,7 @@ export default function OrganizationRolesPage({
       key: 'permission',
       title: '有效权限',
       width: 230,
-      render: (grant) => <span className="font-mono text-[11px] text-[#3157e8]">{grant.permission_code}</span>,
+      render: (grant) => <span className="font-mono gg-type-caption text-[#3157e8]">{grant.permission_code}</span>,
     },
     {
       key: 'role',
@@ -984,7 +985,7 @@ export default function OrganizationRolesPage({
       key: 'role',
       title: '公司业务角色',
       width: 230,
-      render: (binding) => <span>{binding.role_name}<small className="ml-[7px] font-mono text-[#858b9c]">{binding.role_code}</small></span>,
+      render: (binding) => <span className="gg-type-meta">{binding.role_name}<small className="ml-[7px] font-mono gg-type-caption text-[#858b9c]">{binding.role_code}</small></span>,
     },
     {
       key: 'mode',
@@ -1026,7 +1027,7 @@ export default function OrganizationRolesPage({
   const permissionColumns: DataTableColumn<PermissionDefinition>[] = [
     {
       key: 'permission', title: '权限点', width: 280,
-      render: (permission) => <span className="grid"><strong className="text-[12px]">{permission.name}</strong><small className="font-mono text-[#526183]">{permission.permission_code}</small></span>,
+      render: (permission) => <span className="grid"><strong className="gg-type-meta">{permission.name}</strong><small className="font-mono gg-type-caption text-[#526183]">{permission.permission_code}</small></span>,
     },
     { key: 'category', title: '业务域', width: 150, render: (permission) => permission.category },
     { key: 'semantics', title: '资源 / 动作', width: 190, render: (permission) => `${permission.resource} / ${permission.action}` },
@@ -1039,7 +1040,7 @@ export default function OrganizationRolesPage({
   const categoryColumns: DataTableColumn<RoleCategoryDefinition>[] = [
     {
       key: 'category', title: '角色分类', width: 220,
-      render: (category) => <span className="grid"><strong className="text-[12px]">{category.name}</strong><small className="font-mono text-[#526183]">{category.code}</small></span>,
+      render: (category) => <span className="grid"><strong className="gg-type-meta">{category.name}</strong><small className="font-mono gg-type-caption text-[#526183]">{category.code}</small></span>,
     },
     { key: 'prefix', title: '角色编码前缀', width: 150, render: (category) => `${category.role_code_prefix}_` },
     { key: 'description', title: '说明', width: 280, render: (category) => category.description },
@@ -1050,7 +1051,7 @@ export default function OrganizationRolesPage({
   ];
 
   return (
-    <div className="min-h-full box-border px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]" aria-busy={loading}>
+    <PageShell template="management" aria-busy={loading}>
       <AppHeader onLogout={onLogout} userName={currentUser?.username} title="组织角色" />
 
       <div className="mt-[20px] grid grid-cols-[248px_minmax(0,1fr)] items-start gap-[16px] max-[920px]:grid-cols-1">
@@ -1080,15 +1081,15 @@ export default function OrganizationRolesPage({
           linkFor={(key) => `?section=${key}`}
           footer={(
             <>
-              <strong className="text-[#464c5e]">权限边界</strong>
-              <p className="mt-[3px]">平台 admin 只负责配置，不会自动获得业务办理权。</p>
+              <strong className="gg-type-control text-[#464c5e]">权限边界</strong>
+              <p className="mt-[3px] gg-type-body">平台 admin 只负责配置，不会自动获得业务办理权。</p>
             </>
           )}
         />
 
         <main className="min-w-0 overflow-hidden rounded-[20px] border border-[#dfe5f2] bg-white shadow-[0_12px_32px_rgba(35,55,100,0.06)]">
-          <div aria-label="授权关系" className="flex items-center gap-[7px] overflow-x-auto border-b border-[#e8ebf2] bg-[#f8faff] px-[20px] py-[10px] text-[11px] text-[#68718b]">
-            <span className="shrink-0 font-semibold text-[#464c5e]">治理链路</span>
+          <div aria-label="授权关系" className="flex items-center gap-[7px] overflow-x-auto border-b border-[#e8ebf2] bg-[#f8faff] px-[20px] py-[10px] gg-type-caption text-[#68718b]">
+            <span className="shrink-0 gg-type-caption font-semibold text-[#464c5e]">治理链路</span>
             {['权限目录', '业务 / 治理角色', '成员 / 岗位来源', '组织范围', '实际判断'].map((label, index) => (
               <span className="flex shrink-0 items-center gap-[7px]" key={label}>
                 {index ? <ChevronRight aria-hidden="true" className="size-[12px] text-[#aab2c5]" /> : null}
@@ -1222,7 +1223,7 @@ export default function OrganizationRolesPage({
 
       <Dialog open={dialogOpen} onOpenChange={(open) => !open && setDialogOpen(false)}>
         <DialogContent aria-describedby={undefined} className="gap-[16px] rounded-[14px] sm:max-w-[620px]">
-          <DialogTitle className="text-[15px] font-semibold text-[#18181a]">
+          <DialogTitle className="gg-type-card-title font-semibold text-[#18181a]">
             {editingRole ? `编辑角色：${editingRole.name}` : '新建公司角色'}
           </DialogTitle>
           <div className="grid gap-[12px]">
@@ -1231,7 +1232,7 @@ export default function OrganizationRolesPage({
             </RoleField>
             <RoleField label="角色编码">
               <Input value={draft.roleCode} disabled={Boolean(editingRole)} onChange={(event) => setDraft((current) => ({ ...current, roleCode: event.target.value }))} placeholder={`例如 ${selectedCategory?.role_code_prefix || 'cross'}_process_owner`} />
-              <span className="text-[11px] leading-[18px] text-[#858b9c]">小写英文“业务域_职责”，建议以 {selectedCategory?.role_code_prefix || 'cross'}_ 开头；创建后不可修改。</span>
+              <span className="gg-type-caption  text-[#858b9c]">小写英文“业务域_职责”，建议以 {selectedCategory?.role_code_prefix || 'cross'}_ 开头；创建后不可修改。</span>
             </RoleField>
             <RoleField label="角色类型">
               <Select
@@ -1253,7 +1254,7 @@ export default function OrganizationRolesPage({
                   <SelectItem value="governance">治理角色 · 管理平台范围</SelectItem>
                 </SelectContent>
               </Select>
-              <span className="text-[11px] leading-[18px] text-[#858b9c]">治理角色不会进入人工任务候选池，平台管理员也不会因此获得业务办理权。</span>
+              <span className="gg-type-caption  text-[#858b9c]">治理角色不会进入人工任务候选池，平台管理员也不会因此获得业务办理权。</span>
             </RoleField>
             <RoleField label="角色分类">
               <Select disabled={draft.roleKind === 'governance'} value={draft.category} onValueChange={(category) => setDraft((current) => ({ ...current, category }))}>
@@ -1266,16 +1267,16 @@ export default function OrganizationRolesPage({
                   ))}
                 </SelectContent>
               </Select>
-              {selectedCategory ? <span className="text-[11px] leading-[18px] text-[#858b9c]">{selectedCategory.description}</span> : null}
+              {selectedCategory ? <span className="gg-type-caption  text-[#858b9c]">{selectedCategory.description}</span> : null}
             </RoleField>
             <RoleField label="权限点">
               <div className="rounded-[10px] border border-[#dfe5f2] bg-[#fbfcff]">
                 <div className="flex min-h-[42px] flex-wrap items-center gap-[6px] border-b border-[#e8ebf2] px-[10px] py-[7px]">
                   {draft.permissions.length ? draft.permissions.map((permissionCode) => (
-                    <button key={permissionCode} type="button" onClick={() => togglePermission(permissionCode, false)} className="flex items-center gap-[4px] rounded-full bg-[#e9efff] px-[8px] py-[4px] font-mono text-[11px] text-[#244bc7] hover:bg-[#dce6ff]" aria-label={`移除权限 ${permissionCode}`}>
+                    <button key={permissionCode} type="button" onClick={() => togglePermission(permissionCode, false)} className="flex items-center gap-[4px] rounded-full bg-[#e9efff] px-[8px] py-[4px] font-mono gg-type-caption text-[#244bc7] hover:bg-[#dce6ff]" aria-label={`移除权限 ${permissionCode}`}>
                       {permissionCode}<X aria-hidden="true" className="size-[11px]" />
                     </button>
-                  )) : <span className="text-[12px] text-[#858b9c]">尚未选择权限</span>}
+                  )) : <span className="gg-type-meta text-[#858b9c]">尚未选择权限</span>}
                 </div>
                 <div className="relative m-[8px]">
                   <Search aria-hidden="true" className="pointer-events-none absolute left-[9px] top-1/2 size-[14px] -translate-y-1/2 text-[#858b9c]" />
@@ -1288,13 +1289,13 @@ export default function OrganizationRolesPage({
                       <label key={permission.id} className="flex cursor-pointer items-start gap-[9px] rounded-[8px] px-[8px] py-[7px] hover:bg-white">
                         <Checkbox checked={selected} onCheckedChange={(checked) => togglePermission(permission.permission_code, checked === true)} aria-label={`选择权限 ${permission.name}`} className="mt-[2px]" />
                         <span className="min-w-0">
-                          <strong className="block text-[12px] font-medium text-[#24262d]">{permission.name}</strong>
-                          <span className="block truncate font-mono text-[11px] text-[#526183]">{permission.permission_code}</span>
-                          {permission.description ? <span className="mt-[2px] block text-[11px] leading-[17px] text-[#858b9c]">{permission.description}</span> : null}
+                          <strong className="block gg-type-meta font-medium text-[#24262d]">{permission.name}</strong>
+                          <span className="block truncate font-mono gg-type-caption text-[#526183]">{permission.permission_code}</span>
+                          {permission.description ? <span className="mt-[2px] block gg-type-caption  text-[#858b9c]">{permission.description}</span> : null}
                         </span>
                       </label>
                     );
-                  }) : <p className="px-[8px] py-[16px] text-center text-[12px] text-[#858b9c]">没有匹配的权限点</p>}
+                  }) : <p className="px-[8px] py-[16px] text-center gg-type-meta text-[#858b9c]">没有匹配的权限点</p>}
                 </div>
               </div>
             </RoleField>
@@ -1310,8 +1311,8 @@ export default function OrganizationRolesPage({
 
       <Dialog open={assignmentDialogOpen} onOpenChange={(open) => !open && setAssignmentDialogOpen(false)}>
         <DialogContent aria-describedby="assignment-dialog-description" className="max-h-[92vh] gap-[16px] overflow-y-auto rounded-[16px] sm:max-w-[760px]">
-          <DialogTitle className="text-[16px] font-semibold text-[#18181a]">授予成员角色</DialogTitle>
-          <p className="text-[12px] leading-[19px] text-[#68718b]" id="assignment-dialog-description">
+          <DialogTitle className="gg-type-card-title font-semibold text-[#18181a]">授予成员角色</DialogTitle>
+          <p className="gg-type-meta  text-[#68718b]" id="assignment-dialog-description">
             先选择职责，再明确它在哪个组织范围内生效。负责人称谓本身不会自动产生这里的授权。
           </p>
           <div className="grid gap-[14px]">
@@ -1358,7 +1359,7 @@ export default function OrganizationRolesPage({
                     tenantId={getRequestTenantId()}
                   />
                 </div>
-                <label className="flex items-center gap-[8px] text-[12px] text-[#464c5e]">
+                <label className="flex items-center gap-[8px] gg-type-meta text-[#464c5e]">
                   <Checkbox
                     aria-label="授权包含下级组织"
                     checked={assignmentIncludesDescendants}
@@ -1368,7 +1369,7 @@ export default function OrganizationRolesPage({
                 </label>
               </RoleField>
             ) : (
-              <p className="rounded-[10px] bg-[#fff8e8] px-[11px] py-[9px] text-[12px] text-[#795300]">
+              <p className="rounded-[10px] bg-[#fff8e8] px-[11px] py-[9px] gg-type-meta text-[#795300]">
                 全企业授权只能由拥有租户级授权管理权限的成员保存。
               </p>
             )}
@@ -1411,10 +1412,10 @@ export default function OrganizationRolesPage({
       <Dialog open={permissionDialogOpen} onOpenChange={(open) => !open && setPermissionDialogOpen(false)}>
         <DialogContent aria-describedby="permission-dialog-description" className="max-h-[92vh] gap-0 overflow-y-auto overscroll-contain rounded-[18px] p-0 sm:max-w-[700px]">
           <div className="border-b border-[#e8ebf2] px-[24px] py-[20px]">
-            <DialogTitle className="text-[17px] font-semibold text-[#18181a]">
+            <DialogTitle className="gg-type-section-title font-semibold text-[#18181a]">
               {editingPermission ? `编辑权限：${editingPermission.name}` : '新增权限点'}
             </DialogTitle>
-            <p className="mt-[5px] text-[12px] leading-[19px] text-[#68718b]" id="permission-dialog-description">
+            <p className="mt-[5px] gg-type-meta  text-[#68718b]" id="permission-dialog-description">
               {editingPermission
                 ? '稳定编码和业务语义已冻结，只能修正名称与用途说明。'
                 : '先描述“对什么资源执行什么动作”，系统会生成可被角色和 SOP 引用的稳定编码。'}
@@ -1424,8 +1425,8 @@ export default function OrganizationRolesPage({
           <form onSubmit={(event) => { event.preventDefault(); void savePermission(); }}>
             <div className="grid gap-[18px] px-[24px] py-[20px]">
               <fieldset className="grid gap-[12px] border-0 p-0">
-                <legend className="mb-[1px] flex items-center gap-[8px] text-[12px] font-semibold text-[#24262d]">
-                  <span className="grid size-[22px] place-items-center rounded-full bg-[#3157e8] font-mono text-[10px] text-white">1</span>
+                <legend className="mb-[1px] flex items-center gap-[8px] gg-type-meta font-semibold text-[#24262d]">
+                  <span className="grid size-[22px] place-items-center rounded-full bg-[#3157e8] font-mono gg-type-caption text-white">1</span>
                   说明这项权限属于哪里
                 </legend>
                 <div className="grid grid-cols-2 gap-[12px] max-[620px]:grid-cols-1">
@@ -1450,8 +1451,8 @@ export default function OrganizationRolesPage({
               </fieldset>
 
               <fieldset className="grid gap-[12px] border-0 p-0">
-                <legend className="mb-[1px] flex items-center gap-[8px] text-[12px] font-semibold text-[#24262d]">
-                  <span className="grid size-[22px] place-items-center rounded-full bg-[#3157e8] font-mono text-[10px] text-white">2</span>
+                <legend className="mb-[1px] flex items-center gap-[8px] gg-type-meta font-semibold text-[#24262d]">
+                  <span className="grid size-[22px] place-items-center rounded-full bg-[#3157e8] font-mono gg-type-caption text-white">2</span>
                   定义原子操作
                 </legend>
                 <div className="grid grid-cols-2 gap-[12px] max-[620px]:grid-cols-1">
@@ -1498,16 +1499,16 @@ export default function OrganizationRolesPage({
               </fieldset>
 
               <fieldset className="grid gap-[12px] border-0 p-0">
-                <legend className="mb-[1px] flex items-center gap-[8px] text-[12px] font-semibold text-[#24262d]">
-                  <span className="grid size-[22px] place-items-center rounded-full bg-[#3157e8] font-mono text-[10px] text-white">3</span>
+                <legend className="mb-[1px] flex items-center gap-[8px] gg-type-meta font-semibold text-[#24262d]">
+                  <span className="grid size-[22px] place-items-center rounded-full bg-[#3157e8] font-mono gg-type-caption text-white">3</span>
                   确认生成的契约
                 </legend>
                 <div className="rounded-[12px] border border-[#cfd9f4] bg-[#f5f8ff] px-[14px] py-[12px]">
-                  <span className="block text-[10px] font-semibold uppercase tracking-[0.13em] text-[#68718b]">稳定权限编码</span>
-                  <code aria-label="权限稳定编码" className="mt-[5px] block break-words text-[14px] font-semibold text-[#244bc7]" translate="no">
+                  <span className="block gg-type-caption font-semibold uppercase tracking-[0.13em] text-[#68718b]">稳定权限编码</span>
+                  <code aria-label="权限稳定编码" className="mt-[5px] block break-words gg-type-body font-semibold text-[#244bc7]" translate="no">
                     {permissionCode || '填写资源和动作后自动生成'}
                   </code>
-                  <p className="mt-[6px] text-[11px] leading-[17px] text-[#68718b]">创建后不可改名；语义变化时应创建新权限并迁移引用，避免历史 SOP 含义漂移。</p>
+                  <p className="mt-[6px] gg-type-caption  text-[#68718b]">创建后不可改名；语义变化时应创建新权限并迁移引用，避免历史 SOP 含义漂移。</p>
                 </div>
                 <RoleField hint="写清谁会使用、在哪个流程动作中消费，方便后续授权审核。" label="用途说明">
                   <Input
@@ -1522,7 +1523,7 @@ export default function OrganizationRolesPage({
               </fieldset>
 
               {permissionServerError ? (
-                <div aria-live="polite" className="rounded-[10px] border border-[#f2c6c3] bg-[#fff4f3] px-[12px] py-[10px] text-[12px] leading-[18px] text-[#a12a21]" role="alert">
+                <div aria-live="polite" className="rounded-[10px] border border-[#f2c6c3] bg-[#fff4f3] px-[12px] py-[10px] gg-type-meta  text-[#a12a21]" role="alert">
                   <strong className="block">权限点没有保存</strong>
                   {permissionServerError}
                 </div>
@@ -1530,7 +1531,7 @@ export default function OrganizationRolesPage({
             </div>
 
             <div className="flex items-center justify-between gap-[12px] border-t border-[#e8ebf2] bg-[#fafbfe] px-[24px] py-[14px] max-[620px]:items-end">
-              <p className="max-w-[390px] text-[11px] leading-[17px] text-[#858b9c]">保存后会立即出现在“新建业务角色”的权限选择器中。</p>
+              <p className="max-w-[390px] gg-type-caption  text-[#858b9c]">保存后会立即出现在“新建业务角色”的权限选择器中。</p>
               <div className="flex shrink-0 gap-[8px]">
                 <Button type="button" variant="outline" disabled={permissionSaving} onClick={() => setPermissionDialogOpen(false)}>取消</Button>
                 <Button type="submit" disabled={permissionSaving}>{permissionSaving ? '保存中…' : editingPermission ? '保存说明' : '创建权限点'}</Button>
@@ -1549,14 +1550,14 @@ export default function OrganizationRolesPage({
             <RoleField label="角色编码前缀"><Input value={categoryDraft.roleCodePrefix} onChange={(event) => setCategoryDraft((current) => ({ ...current, roleCodePrefix: event.target.value }))} placeholder="purchase" /></RoleField>
             <RoleField label="说明"><Input value={categoryDraft.description} onChange={(event) => setCategoryDraft((current) => ({ ...current, description: event.target.value }))} placeholder="该业务域覆盖的职责边界" /></RoleField>
           </div>
-          <p className="text-[11px] leading-[18px] text-[#858b9c]">分类编码创建后不可修改；存在有效角色或权限引用时不能停用。</p>
+          <p className="gg-type-caption  text-[#858b9c]">分类编码创建后不可修改；存在有效角色或权限引用时不能停用。</p>
           <div className="flex justify-end gap-[8px]"><Button variant="outline" onClick={() => setCategoryDialogOpen(false)}>取消</Button><Button disabled={categorySaving} onClick={() => void saveCategory()}>{categorySaving ? '保存中…' : '保存分类'}</Button></div>
         </DialogContent>
       </Dialog>
 
       <Dialog open={bindingDialogOpen} onOpenChange={(open) => !open && setBindingDialogOpen(false)}>
         <DialogContent aria-describedby={undefined} className="gap-[16px] rounded-[14px] sm:max-w-[480px]">
-          <DialogTitle className="text-[15px] font-semibold text-[#18181a]">{editingBinding ? '编辑数字员工业务角色' : '绑定数字员工业务角色'}</DialogTitle>
+          <DialogTitle className="gg-type-card-title font-semibold text-[#18181a]">{editingBinding ? '编辑数字员工业务角色' : '绑定数字员工业务角色'}</DialogTitle>
           <div className="grid gap-[12px]">
             <RoleField label="数字员工">
               <Select disabled={Boolean(editingBinding)} value={bindingAgentId} onValueChange={setBindingAgentId}>
@@ -1589,7 +1590,7 @@ export default function OrganizationRolesPage({
               />
             </RoleField>
             {editingBinding ? (
-              <p className="rounded-[10px] border border-[#e1e6f0] bg-[#f8f9fc] px-[11px] py-[9px] text-[12px] text-[#616a7d]">
+              <p className="rounded-[10px] border border-[#e1e6f0] bg-[#f8f9fc] px-[11px] py-[9px] gg-type-meta text-[#616a7d]">
                 作用范围：{editingBinding.scope_type === 'tenant'
                   ? '全企业'
                   : `${editingBinding.scope_id}${editingBinding.include_descendants ? '（含下级）' : '（仅本组织）'}`}。如需变更范围，请停用后重新绑定，避免改写历史授权语义。
@@ -1615,7 +1616,7 @@ export default function OrganizationRolesPage({
                         tenantId={getRequestTenantId()}
                       />
                     </div>
-                    <label className="flex items-center gap-[8px] text-[12px] text-[#464c5e]">
+                    <label className="flex items-center gap-[8px] gg-type-meta text-[#464c5e]">
                       <Checkbox
                         aria-label="数字员工范围包含下级组织"
                         checked={bindingIncludesDescendants}
@@ -1637,7 +1638,7 @@ export default function OrganizationRolesPage({
               />
             </RoleField>
           </div>
-          <p className="rounded-[10px] bg-[#fff8e8] px-[11px] py-[9px] text-[12px] text-[#795300]">该绑定不授予人工审批权；人工任务仍只解析真实员工任职快照。</p>
+          <p className="rounded-[10px] bg-[#fff8e8] px-[11px] py-[9px] gg-type-meta text-[#795300]">该绑定不授予人工审批权；人工任务仍只解析真实员工任职快照。</p>
           <div className="flex justify-end gap-[8px]">
             <Button variant="outline" disabled={bindingSaving} onClick={() => setBindingDialogOpen(false)}>取消</Button>
             <Button disabled={bindingSaving} onClick={() => void saveAgentBinding()} className="bg-[var(--gg-cobalt)] text-white hover:bg-[#244bc7]">保存绑定</Button>
@@ -1661,7 +1662,7 @@ export default function OrganizationRolesPage({
         description="系统会先检查活动角色、权限和已发布 SOP 引用；存在引用时不会停用。"
         onConfirm={() => void confirmCatalogDeactivate()}
       />
-    </div>
+    </PageShell>
   );
 }
 
@@ -1681,9 +1682,9 @@ function WorkspaceHeader({
   return (
     <div className="flex items-start justify-between gap-[20px] px-[22px] py-[21px] max-[620px]:flex-col">
       <div className="min-w-0">
-        <p className="font-mono text-[10px] font-semibold uppercase tracking-[0.13em] text-[#6074a9]">{eyebrow}</p>
-        <h2 className="mt-[5px] text-[20px] font-semibold tracking-[-0.02em] text-[#18181a] text-balance" id={id}>{title}</h2>
-        <p className="mt-[5px] max-w-[680px] text-[12px] leading-[19px] text-[#68718b] text-pretty">{description}</p>
+        <p className="font-mono gg-type-caption font-semibold uppercase tracking-[0.13em] text-[#6074a9]">{eyebrow}</p>
+        <h2 className="mt-[5px] gg-type-section-title font-semibold tracking-[-0.02em] text-[#18181a] text-balance" id={id}>{title}</h2>
+        <p className="mt-[5px] max-w-[680px] gg-type-meta  text-[#68718b] text-pretty">{description}</p>
       </div>
       <div className="shrink-0">{action}</div>
     </div>
@@ -1705,12 +1706,12 @@ function RoleField({
 }) {
   return (
     <label className="grid gap-[5px]">
-      <span className="text-[12px] font-medium text-[#464c5e]">
+      <span className="gg-type-meta font-medium text-[#464c5e]">
         {label}{required ? <span aria-hidden="true" className="ml-[3px] text-[#c33b30]">*</span> : null}
       </span>
       {children}
-      {error ? <span className="text-[11px] leading-[17px] text-[#b52e25]" role="alert">{error}</span> : null}
-      {!error && hint ? <span className="text-[11px] leading-[17px] text-[#858b9c]">{hint}</span> : null}
+      {error ? <span className="gg-type-caption  text-[#b52e25]" role="alert">{error}</span> : null}
+      {!error && hint ? <span className="gg-type-caption  text-[#858b9c]">{hint}</span> : null}
     </label>
   );
 }

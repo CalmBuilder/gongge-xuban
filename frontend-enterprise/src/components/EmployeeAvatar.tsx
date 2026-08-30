@@ -66,7 +66,8 @@ export default function EmployeeAvatar({
     maxWidth: 'none',
     objectFit: fit,
     objectPosition,
-    transform: 'none'
+    transform: 'none',
+    ...(radius != null ? { borderRadius: radius } : null),
   };
 
   return (
