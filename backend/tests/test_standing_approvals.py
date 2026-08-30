@@ -241,6 +241,7 @@ def test_schedule_drift_expiry_revoke_and_disabled_switch_fail_closed(monkeypatc
         "app.dynamic_tasks.standing_approvals.get_settings",
         lambda: SimpleNamespace(
             dynamic_task_external_write_enabled=True,
+            dynamic_task_high_risk_external_write_allows=lambda _tenant, _agent: True,
             dynamic_task_standing_approval_enabled=False,
         ),
     )
@@ -412,6 +413,7 @@ def _runtime(monkeypatch) -> tuple[Session, SimpleNamespace]:
         "app.dynamic_tasks.standing_approvals.get_settings",
         lambda: SimpleNamespace(
             dynamic_task_external_write_enabled=True,
+            dynamic_task_high_risk_external_write_allows=lambda _tenant, _agent: True,
             dynamic_task_standing_approval_enabled=True,
         ),
     )

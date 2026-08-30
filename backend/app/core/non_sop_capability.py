@@ -2,8 +2,8 @@
 @Time       : 2026/08/28 13:20
 @Author     : zhanglp8181
 @File       : non_sop_capability.py
-@CallChain  : AgentLoop 非 SOP 分支 → NonSopCapabilityRouter → GeneralSkill/动态任务 shadow
-@Description: 统一普通回答、通用技能和动态任务 shadow 的兼容决策，确保 A 批不改变执行行为。
+@CallChain  : AgentLoop 非 SOP 分支 → NonSopCapabilityRouter → GeneralSkill/动态任务主路由与 shadow
+@Description: 统一普通回答、通用技能、动态任务主路由和可选 shadow 观测决策。
 """
 
 from __future__ import annotations
@@ -56,8 +56,8 @@ class GeneralCapabilitySelector(Protocol):
         """返回旧链路仍然权威的通用能力选择。"""
 
 
-class DynamicTaskShadowSelector(Protocol):
-    """约束 A 批动态任务 shadow 选择器的最小调用契约。"""
+class DynamicTaskSelector(Protocol):
+    """约束动态任务主路由和 shadow 选择器的最小调用契约。"""
 
     def decide(
         self,
@@ -69,11 +69,15 @@ class DynamicTaskShadowSelector(Protocol):
         knowledge_capability: dict[str, object],
         is_cancelled: Callable[[], bool] | None = None,
     ) -> NonSopCapabilityDecision:
-        """提出不具备执行权限的动态任务 shadow 决策。"""
+        """提出结构化动态任务决策；调用方负责执行前的能力与风险校验。"""
+
+
+class DynamicTaskShadowSelector(DynamicTaskSelector, Protocol):
+    """保留旧类型名，供只读 shadow 适配器和外部测试兼容使用。"""
 
 
 class NonSopCapabilityDecision(BaseModel):
-    """表达非 SOP 能力模式；A 批中的 dynamic_task 只能用于 shadow 审计。"""
+    """表达非 SOP 能力模式，dynamic_task 可作为主路由或 shadow 观测结果。"""
 
     mode: Literal["answer", "general_skill", "dynamic_task", "clarify"] = "answer"
     selected_general_skill_slug: str | None = None
@@ -94,7 +98,7 @@ class NonSopCapabilityDecision(BaseModel):
 
 @dataclass(frozen=True)
 class NonSopCapabilityRouteResult:
-    """同时携带旧链路权威决策和不可执行的 shadow 观测结果。"""
+    """同时携带普通 Skill 选择、动态主路由和可选 shadow 观测结果。"""
 
     selected_general_skill: GeneralSkill | None
     general_selection: GeneralSkillSelection
@@ -103,43 +107,65 @@ class NonSopCapabilityRouteResult:
     shadow_attempted: bool
     shadow_duration_ms: float
     execution_created: bool = False
+    primary_decision: NonSopCapabilityDecision | None = None
+    primary_attempted: bool = False
+    primary_duration_ms: float = 0.0
 
     def audit_payload(self) -> dict[str, object]:
         """生成固定白名单审计字段，禁止输出用户输入、目标、理由或上下文正文。"""
 
         shadow = self.shadow_decision
-        confidence = shadow.confidence if shadow is not None else 0.0
+        primary = self.primary_decision
+        observed = primary or shadow
+        confidence = observed.confidence if observed is not None else 0.0
         if confidence >= 0.8:
             confidence_bucket = "high"
         elif confidence >= 0.5:
             confidence_bucket = "medium"
         else:
             confidence_bucket = "low"
-        return {
+        payload = {
             "effective_mode": self.effective_decision.mode,
             "shadow_mode": shadow.mode if shadow is not None else None,
-            "execution_intent": shadow.execution_intent if shadow is not None else "none",
+            "execution_intent": observed.execution_intent if observed is not None else "none",
             "knowledge_mode": self.general_selection.knowledge_mode,
             "confidence_bucket": confidence_bucket,
             "requires_durable_execution": bool(
-                shadow and shadow.requires_durable_execution
+                observed and observed.requires_durable_execution
             ),
-            "requires_artifact": bool(shadow and shadow.requires_artifact),
-            "degraded": bool(shadow and shadow.degraded),
-            "failure_code": shadow.failure_code if shadow is not None else None,
+            "requires_artifact": bool(observed and observed.requires_artifact),
+            "degraded": bool(observed and observed.degraded),
+            "failure_code": observed.failure_code if observed is not None else None,
             "shadow_attempted": self.shadow_attempted,
             "shadow_duration_ms": round(max(0.0, self.shadow_duration_ms), 3),
             "execution_created": self.execution_created,
         }
+        if primary is not None or self.primary_attempted:
+            payload.update(
+                {
+                    "primary_mode": primary.mode if primary is not None else None,
+                    "primary_attempted": self.primary_attempted,
+                    "primary_duration_ms": round(max(0.0, self.primary_duration_ms), 3),
+                }
+            )
+        return payload
 
 
-class LlmDynamicTaskShadowSelector:
-    """调用受限超时的模型，仅判断动态任务候选，不执行任何能力。"""
+class LlmDynamicTaskSelector:
+    """调用模型生成结构化动态任务决策，不在路由阶段执行任何能力。"""
 
-    def __init__(self, timeout_seconds: float) -> None:
-        """保存 shadow 专用超时，避免观测调用长期阻塞旧链路。"""
+    def __init__(
+        self,
+        timeout_seconds: float,
+        *,
+        phase: str,
+        operation: str,
+    ) -> None:
+        """保存阶段和超时，避免主路由或观测调用长期阻塞聊天链路。"""
 
         self.timeout_seconds = max(0.1, float(timeout_seconds))
+        self.phase = phase
+        self.operation = operation
 
     def decide(
         self,
@@ -151,7 +177,7 @@ class LlmDynamicTaskShadowSelector:
         knowledge_capability: dict[str, object],
         is_cancelled: Callable[[], bool] | None = None,
     ) -> NonSopCapabilityDecision:
-        """基于能力元数据提出 answer/dynamic_task/clarify shadow 决策。"""
+        """基于能力元数据提出 answer/dynamic_task/clarify 决策。"""
 
         raise_if_cancelled(is_cancelled)
         selector_context = copy.deepcopy(
@@ -159,7 +185,7 @@ class LlmDynamicTaskShadowSelector:
         )
         selector_context.pop(TURN_STAGE_MESSAGES_KEY, None)
         payload = stage_payload(
-            phase="Router / Dynamic Task Shadow",
+            phase=self.phase,
             user_message=query,
             conversation_context=selector_context,
             memory_context=memory_context,
@@ -183,7 +209,7 @@ class LlmDynamicTaskShadowSelector:
             },
             output_contract=NON_SOP_CAPABILITY_OUTPUT,
         )
-        with llm_operation("dynamic_task.route_shadow"):
+        with llm_operation(self.operation):
             raw = LLMClient(
                 model_config,
                 timeout_seconds=self.timeout_seconds,
@@ -200,22 +226,61 @@ class LlmDynamicTaskShadowSelector:
         return NonSopCapabilityDecision.model_validate(raw)
 
 
+class LlmDynamicTaskPrimarySelector(LlmDynamicTaskSelector):
+    """DynamicTaskAgent 的正式主路由模型选择器。"""
+
+    def __init__(self, timeout_seconds: float) -> None:
+        """使用主路由阶段名和独立的阶段观测操作名。"""
+
+        super().__init__(
+            timeout_seconds,
+            phase="Router / Dynamic Task",
+            operation="dynamic_task.route_primary",
+        )
+
+
+class LlmDynamicTaskShadowSelector(LlmDynamicTaskSelector):
+    """可选的只读比较路由选择器，永远不直接改变主执行语义。"""
+
+    def __init__(self, timeout_seconds: float) -> None:
+        """使用 shadow 专用阶段名和超时。"""
+
+        super().__init__(
+            timeout_seconds,
+            phase="Router / Dynamic Task Shadow",
+            operation="dynamic_task.route_shadow",
+        )
+
+
 class NonSopCapabilityRouter:
-    """在不改变旧行为的前提下，统一计算非 SOP 权威选择和动态任务 shadow。"""
+    """统一计算非 SOP 权威选择、动态主路由和可选 shadow。"""
 
     def __init__(
         self,
         *,
         shadow_enabled: bool,
         execution_enabled: bool = False,
-        shadow_selector: DynamicTaskShadowSelector,
+        primary_selector: DynamicTaskSelector | None = None,
+        shadow_selector: DynamicTaskShadowSelector | None = None,
         minimum_confidence: float = 0.7,
     ) -> None:
-        """冻结 shadow/执行 kill switch、选择器和最低采信置信度。"""
+        """冻结主路由、shadow 观测开关、兼容选择器和最低采信置信度。"""
 
         self.shadow_enabled = bool(shadow_enabled)
         self.execution_enabled = bool(execution_enabled)
-        self.shadow_selector = shadow_selector
+        legacy_selector_fallback = primary_selector is None and shadow_selector is not None
+        self.primary_selector = primary_selector or (
+            shadow_selector if self.execution_enabled else None
+        )
+        self.shadow_selector = (
+            shadow_selector
+            if (not legacy_selector_fallback or not self.execution_enabled)
+            else None
+        )
+        if self.shadow_enabled and not self.execution_enabled and self.shadow_selector is None:
+            self.shadow_selector = primary_selector
+        if self.execution_enabled and self.primary_selector is None:
+            raise ValueError("execution_enabled=True 时必须提供 primary_selector")
         self.minimum_confidence = min(1.0, max(0.0, float(minimum_confidence)))
 
     def decide(
@@ -317,10 +382,78 @@ class NonSopCapabilityRouter:
                 shadow_duration_ms=0.0,
             )
 
+        primary: NonSopCapabilityDecision | None = None
+        primary_attempted = False
+        primary_duration_ms = 0.0
+        if self.execution_enabled:
+            primary, primary_attempted, primary_duration_ms = self._run_selector(
+                self.primary_selector,
+                failure_code="dynamic_primary_failed",
+                message=message,
+                general_skills=general_skills,
+                model_config=model_config,
+                selector_context=selector_context,
+                memory_context=memory_context,
+                knowledge_capability=knowledge_capability,
+                selection=selection,
+                is_cancelled=is_cancelled,
+            )
+            if primary is not None:
+                if primary.mode in {"dynamic_task", "clarify"}:
+                    effective = primary
+                elif selected_skill is None and effective.mode != "dynamic_task":
+                    effective = primary
+
+        shadow: NonSopCapabilityDecision | None = None
+        shadow_attempted = False
+        shadow_duration_ms = 0.0
+        if self.shadow_enabled and self.shadow_selector is not None:
+            shadow, shadow_attempted, shadow_duration_ms = self._run_selector(
+                self.shadow_selector,
+                failure_code="dynamic_shadow_failed",
+                message=message,
+                general_skills=general_skills,
+                model_config=model_config,
+                selector_context=selector_context,
+                memory_context=memory_context,
+                knowledge_capability=knowledge_capability,
+                selection=selection,
+                is_cancelled=is_cancelled,
+            )
+        return NonSopCapabilityRouteResult(
+            selected_general_skill=selected_skill,
+            general_selection=selection,
+            effective_decision=effective,
+            shadow_decision=shadow,
+            shadow_attempted=shadow_attempted,
+            shadow_duration_ms=shadow_duration_ms,
+            primary_decision=primary,
+            primary_attempted=primary_attempted,
+            primary_duration_ms=primary_duration_ms,
+        )
+
+    def _run_selector(
+        self,
+        selector: DynamicTaskSelector | None,
+        *,
+        failure_code: str,
+        message: str,
+        general_skills: list[GeneralSkill],
+        model_config: ModelConfig,
+        selector_context: dict[str, object],
+        memory_context: list[dict[str, object]] | None,
+        knowledge_capability: dict[str, object],
+        selection: GeneralSkillSelection,
+        is_cancelled: Callable[[], bool] | None,
+    ) -> tuple[NonSopCapabilityDecision | None, bool, float]:
+        """执行一次主路由或 shadow 调用并统一记录失败降级事实。"""
+
+        if selector is None:
+            return None, False, 0.0
         started = perf_counter()
         try:
             raise_if_cancelled(is_cancelled)
-            shadow = self.shadow_selector.decide(
+            decision = selector.decide(
                 message,
                 general_skills,
                 model_config,
@@ -333,29 +466,20 @@ class NonSopCapabilityRouter:
                     else {}
                 ),
             )
-            shadow = self._validate_shadow(shadow, selection)
+            decision = self._validate_decision(decision, selection, failure_code)
         except TurnCancellationRequested:
             raise
         except Exception:
-            shadow = NonSopCapabilityDecision(
+            decision = NonSopCapabilityDecision(
                 mode="answer",
                 knowledge_mode=selection.knowledge_mode,
                 knowledge_query=selection.knowledge_query,
                 degraded=True,
-                failure_code="dynamic_shadow_failed",
+                failure_code=failure_code,
             )
         duration_ms = (perf_counter() - started) * 1000
         raise_if_cancelled(is_cancelled)
-        if self.execution_enabled and shadow.mode == "dynamic_task":
-            effective = shadow
-        return NonSopCapabilityRouteResult(
-            selected_general_skill=selected_skill,
-            general_selection=selection,
-            effective_decision=effective,
-            shadow_decision=shadow,
-            shadow_attempted=True,
-            shadow_duration_ms=duration_ms,
-        )
+        return decision, True, duration_ms
 
     @staticmethod
     def _resolve_selected_general_skill(
@@ -393,12 +517,13 @@ class NonSopCapabilityRouter:
             failure_code=selection.failure_code,
         )
 
-    def _validate_shadow(
+    def _validate_decision(
         self,
         shadow: NonSopCapabilityDecision,
         selection: GeneralSkillSelection,
+        failure_code: str,
     ) -> NonSopCapabilityDecision:
-        """应用置信度和字段完整性门禁，并以服务端知识选择覆盖模型声明。"""
+        """应用主路由和 shadow 共用的结构化完整性、置信度和知识范围校验。"""
 
         normalized = shadow.model_copy(
             update={
@@ -412,7 +537,7 @@ class NonSopCapabilityRouter:
                 update={
                     "mode": "answer",
                     "degraded": True,
-                    "failure_code": "dynamic_shadow_invalid_mode",
+                    "failure_code": failure_code.replace("_failed", "_invalid_mode"),
                 }
             )
         if normalized.mode == "dynamic_task" and normalized.confidence < self.minimum_confidence:
@@ -420,7 +545,7 @@ class NonSopCapabilityRouter:
                 update={
                     "mode": "answer",
                     "degraded": True,
-                    "failure_code": "dynamic_shadow_low_confidence",
+                    "failure_code": failure_code.replace("_failed", "_low_confidence"),
                 }
             )
         if normalized.mode == "dynamic_task" and (
@@ -430,7 +555,7 @@ class NonSopCapabilityRouter:
                 update={
                     "mode": "answer",
                     "degraded": True,
-                    "failure_code": "dynamic_shadow_incomplete",
+                    "failure_code": failure_code.replace("_failed", "_incomplete"),
                 }
             )
         if normalized.mode == "clarify" and not str(normalized.clarification or "").strip():
@@ -438,7 +563,7 @@ class NonSopCapabilityRouter:
                 update={
                     "mode": "answer",
                     "degraded": True,
-                    "failure_code": "dynamic_shadow_incomplete",
+                    "failure_code": failure_code.replace("_failed", "_incomplete"),
                 }
             )
         return normalized

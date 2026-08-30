@@ -267,17 +267,29 @@ def configure_environment(database_path: Path) -> None:
         "APP_SECRET": E2E_SECRET,
         "AUTO_RESTART": "false",
         "DATABASE_URL": database_url,
+        # provider 自调用必须命中本进程监听的 IPv4 地址；localhost 在部分环境会先解析到
+        # 未监听的 ::1，导致正向 disposable 回归被误判为 unknown。
+        "TOOL_BASE_URL": f"http://127.0.0.1:{E2E_PORT}",
         "PUBLIC_MOCK_API_KEY": "fullstack-e2e-public-mock-key",
-        "DYNAMIC_TASK_EXECUTION_ENABLED": (
-            "false" if os.environ.get("SKILL_AB_E2E") == "1" else "true"
-        ),
-        "DYNAMIC_TASK_TENANT_ALLOWLIST": "*",
-        "DYNAMIC_TASK_AGENT_ALLOWLIST": "*",
-        "DYNAMIC_TASK_ALERT_SIGNAL_BACKLOG_THRESHOLD": "100",
-        "DYNAMIC_TASK_ALERT_DEAD_LETTER_THRESHOLD": "1",
-        "DYNAMIC_TASK_ALERT_UNKNOWN_OPERATION_THRESHOLD": "1",
-        "DYNAMIC_TASK_ALERT_PUBLICATION_BACKLOG_THRESHOLD": "10",
-        "DYNAMIC_TASK_ALERT_WAITING_AGE_SECONDS": "3600",
+        # Skill A/B 只替换供应商响应，不应借测试变量把普通动态执行重新关掉。
+        # 这样同一套隔离服务仍能验证 Skill、附件和 DynamicTask 的组合契约。
+        "DYNAMIC_TASK_EXECUTION_ENABLED": "true",
+        "DYNAMIC_TASK_TENANT_ALLOWLIST": "",
+        "DYNAMIC_TASK_AGENT_ALLOWLIST": "",
+        "DYNAMIC_TASK_STEERING_ENABLED": "true",
+        "DYNAMIC_TASK_EXPLORE_ENABLED": "true",
+        "DYNAMIC_TASK_MAX_PARALLEL_READS": "2",
+        "DYNAMIC_TASK_EXTERNAL_WRITE_ENABLED": "false",
+        "DYNAMIC_TASK_DESTRUCTIVE_ENABLED": "false",
+        "DYNAMIC_TASK_DESTRUCTIVE_TENANT_ALLOWLIST": "",
+        "DYNAMIC_TASK_DESTRUCTIVE_AGENT_ALLOWLIST": "",
+        "DYNAMIC_TASK_STANDING_APPROVAL_ENABLED": "false",
+        # 普通能力不依赖告警阈值；高风险 profile 在下方显式补齐阈值。
+        "DYNAMIC_TASK_ALERT_SIGNAL_BACKLOG_THRESHOLD": "0",
+        "DYNAMIC_TASK_ALERT_DEAD_LETTER_THRESHOLD": "0",
+        "DYNAMIC_TASK_ALERT_UNKNOWN_OPERATION_THRESHOLD": "0",
+        "DYNAMIC_TASK_ALERT_PUBLICATION_BACKLOG_THRESHOLD": "0",
+        "DYNAMIC_TASK_ALERT_WAITING_AGE_SECONDS": "0",
         "DYNAMIC_TASK_MAX_ACTIVE_PER_TENANT": "16",
         "DYNAMIC_TASK_MAX_ACTIVE_PER_AGENT": "8",
         "DYNAMIC_TASK_MAX_ACTIVE_PER_USER": "4",
@@ -297,6 +309,7 @@ def configure_environment(database_path: Path) -> None:
         "ATTACHMENT_PARSER_WORKER_ENABLED": "true",
         "GONGGE_XUBAN_DATA_DIR": str(E2E_RUNTIME_DIR / "user-data"),
     }
+    apply_dynamic_e2e_profile(environment)
     if live_attachment_e2e_enabled():
         live_values = {
             "DEMO_MODEL_API_KEY": os.environ.get("LIVE_ATTACHMENT_MODEL_API_KEY", "").strip(),
@@ -324,6 +337,64 @@ def configure_environment(database_path: Path) -> None:
     os.environ.update(environment)
     os.chdir(BACKEND_DIR)
     sys.path.insert(0, str(BACKEND_DIR))
+
+
+def apply_dynamic_e2e_profile(environment: dict[str, str]) -> None:
+    """把真实浏览器 profile 映射为隔离环境变量，不改变生产默认配置。"""
+
+    profile = os.environ.get("FULLSTACK_E2E_PROFILE", "base-open").strip() or "base-open"
+    supported_profiles = {
+        "base-open",
+        "high-risk-gray",
+        "destructive-gray",
+        "kill-switch",
+        "runtime-capacity-saturated",
+        "model-error",
+        "unsafe-input",
+        "mysql-isolated",
+    }
+    if profile not in supported_profiles:
+        raise RuntimeError(
+            "FULLSTACK_E2E_PROFILE must be one of: " + ", ".join(sorted(supported_profiles))
+        )
+    environment["FULLSTACK_E2E_PROFILE"] = profile
+    if profile == "high-risk-gray":
+        environment.update(
+            {
+                "DYNAMIC_TASK_EXTERNAL_WRITE_ENABLED": "true",
+                "DYNAMIC_TASK_TENANT_ALLOWLIST": "tenant_demo",
+                "DYNAMIC_TASK_AGENT_ALLOWLIST": "agent_e2e_employee",
+                "DYNAMIC_TASK_ALERT_SIGNAL_BACKLOG_THRESHOLD": "100",
+                "DYNAMIC_TASK_ALERT_DEAD_LETTER_THRESHOLD": "1",
+                "DYNAMIC_TASK_ALERT_UNKNOWN_OPERATION_THRESHOLD": "1",
+                "DYNAMIC_TASK_ALERT_PUBLICATION_BACKLOG_THRESHOLD": "10",
+                "DYNAMIC_TASK_ALERT_WAITING_AGE_SECONDS": "3600",
+            }
+        )
+    elif profile == "destructive-gray":
+        environment.update(
+            {
+                "DYNAMIC_TASK_DESTRUCTIVE_ENABLED": "true",
+                "DYNAMIC_TASK_DESTRUCTIVE_TENANT_ALLOWLIST": "tenant_demo",
+                "DYNAMIC_TASK_DESTRUCTIVE_AGENT_ALLOWLIST": "agent_e2e_employee",
+                "DYNAMIC_TASK_ALERT_SIGNAL_BACKLOG_THRESHOLD": "100",
+                "DYNAMIC_TASK_ALERT_DEAD_LETTER_THRESHOLD": "1",
+                "DYNAMIC_TASK_ALERT_UNKNOWN_OPERATION_THRESHOLD": "1",
+                "DYNAMIC_TASK_ALERT_PUBLICATION_BACKLOG_THRESHOLD": "10",
+                "DYNAMIC_TASK_ALERT_WAITING_AGE_SECONDS": "3600",
+            }
+        )
+    elif profile == "kill-switch":
+        environment["DYNAMIC_TASK_EXECUTION_ENABLED"] = "false"
+    elif profile == "runtime-capacity-saturated":
+        environment.update(
+            {
+                "DYNAMIC_TASK_MAX_ACTIVE_PER_TENANT": "0",
+                "DYNAMIC_TASK_MAX_ACTIVE_PER_AGENT": "0",
+                "DYNAMIC_TASK_MAX_ACTIVE_PER_USER": "0",
+                "DYNAMIC_TASK_MAX_ACTIVE_PER_TOOL": "0",
+            }
+        )
 
 
 def live_attachment_e2e_enabled() -> bool:
@@ -436,6 +507,7 @@ def seed_e2e_fixtures() -> None:
         Skill,
         SkillVersion,
         Tenant,
+        Tool,
         User,
     )
     from app.approvals import ApprovalRequestService
@@ -445,6 +517,10 @@ def seed_e2e_fixtures() -> None:
         EXPENSE_SPECIAL_APPROVAL_ORG_SCOPE_VERSION,
     )
     from app.db.seed import seed_demo_data
+    from app.dynamic_tasks.capability_catalog import (
+        ToolReliabilityContract,
+        publish_tool_contract,
+    )
     from app.organization.assignments import assign_member_to_organization
     from app.organization.units import (
         create_organization_unit,
@@ -474,6 +550,62 @@ def seed_e2e_fixtures() -> None:
         )
         db.commit()
         seed_demo_data(db)
+        destructive_target = "disposable://fixture/object-1"
+        # 目标摘要是 provider 契约的一部分，必须与 disposable endpoint 的原始
+        # UTF-8 SHA-256 口径一致；不能误用能力快照 checksum 的规范 JSON 口径。
+        destructive_target_checksum = hashlib.sha256(destructive_target.encode("utf-8")).hexdigest()
+        destructive_tool = Tool(
+            id="tool_e2e_disposable_delete",
+            tenant_id="tenant_demo",
+            name="disposable.fixture_delete",
+            display_name="隔离 Fixture 删除",
+            description="仅用于 destructive-gray 浏览器正向验证的进程内 disposable provider。",
+            method="POST",
+            url="/api/mock/destructive/fixture-delete",
+            headers_json={"X-API-Key": "${secret.PUBLIC_MOCK_API_KEY}"},
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string"},
+                    "target_checksum": {"type": "string"},
+                },
+                "required": ["target", "target_checksum"],
+                "additionalProperties": False,
+            },
+            output_schema={"type": "object"},
+            enabled=True,
+        )
+        publish_tool_contract(
+            destructive_tool,
+            ToolReliabilityContract.model_validate(
+                {
+                    "risk_class": "destructive",
+                    "side_effect": "external",
+                    "confirmation_policy": "always",
+                    "timeout_policy": "unknown",
+                    "dynamic_task_enabled": False,
+                    "destructive_dynamic_task_enabled": True,
+                    "idempotency": {
+                        "mode": "request_key",
+                        "remote_scope": "e2e-disposable-fixture",
+                    },
+                    "reconcile": {
+                        "supported": True,
+                        "tool_name": "disposable.fixture_delete",
+                        "reference_source": "output.operation_id",
+                        "terminal_status_mapping": {
+                            "deleted": "complete",
+                            "already_deleted": "complete",
+                            "pending": "unknown",
+                        },
+                    },
+                    "canonical_target": destructive_target,
+                    "target_checksum": destructive_target_checksum,
+                    "destructive_provider": "disposable",
+                }
+            ),
+        )
+        db.add(destructive_tool)
 
         sales_sop_content = {
             "skill_id": "attachment_sales_reconcile_sop",
@@ -686,6 +818,72 @@ def seed_e2e_fixtures() -> None:
         )
         db.add(
             AgentProfile(
+                id="agent_e2e_expert_security",
+                tenant_id="tenant_demo",
+                name="E2E 安全架构专家",
+                description="来自项目内置专家快照，用于验证安全边界和威胁建模上下文。",
+                persona_prompt="以安全架构专家身份分析信任边界、威胁模型、最小权限和可验证缓解措施。",
+                status="active",
+                owner_user_id="admin",
+                published_to_gallery=True,
+                gallery_published_by="admin",
+                agent_category_code="professional",
+                visibility_scope="tenant",
+                metadata_json={
+                    "owner_user_id": "admin",
+                    "owner_username": "admin",
+                    "employee_type": "expert",
+                    "expert_source_code": "agency-agents",
+                    "expert_source_label": "项目内置专家快照",
+                    "expert_category": "安全",
+                    "expert_subcategory": "安全架构",
+                    "expert_tags": ["威胁建模", "安全架构"],
+                    "expert_name_original": "Security Architect",
+                    "upstream_path": "security/security-architect.md",
+                    "upstream_commit": "459dce837db3bdfdc4763d3fefd1fd854e73c8f1",
+                    "upstream_license": "MIT",
+                    "import_batch_id": "e2e-expert-snapshot",
+                    "owner_semantics": "technical_import_admin",
+                    "governance_template": True,
+                    "published_to_gallery": True,
+                },
+            )
+        )
+        db.add(
+            AgentProfile(
+                id="agent_e2e_expert_dbre",
+                tenant_id="tenant_demo",
+                name="E2E 数据库可靠性专家",
+                description="来自项目内置专家快照，用于验证 SQLite/MySQL 双数据库可靠性上下文。",
+                persona_prompt="以数据库可靠性专家身份分析可用性、备份恢复、幂等、迁移和 SQLite/MySQL 差异。",
+                status="active",
+                owner_user_id="admin",
+                published_to_gallery=True,
+                gallery_published_by="admin",
+                agent_category_code="professional",
+                visibility_scope="tenant",
+                metadata_json={
+                    "owner_user_id": "admin",
+                    "owner_username": "admin",
+                    "employee_type": "expert",
+                    "expert_source_code": "agency-agents",
+                    "expert_source_label": "项目内置专家快照",
+                    "expert_category": "工程",
+                    "expert_subcategory": "数据库可靠性",
+                    "expert_tags": ["数据库", "高可用", "迁移"],
+                    "expert_name_original": "Database Reliability Engineer",
+                    "upstream_path": "engineering/engineering-database-reliability-engineer.md",
+                    "upstream_commit": "459dce837db3bdfdc4763d3fefd1fd854e73c8f1",
+                    "upstream_license": "MIT",
+                    "import_batch_id": "e2e-expert-snapshot",
+                    "owner_semantics": "technical_import_admin",
+                    "governance_template": True,
+                    "published_to_gallery": True,
+                },
+            )
+        )
+        db.add(
+            AgentProfile(
                 id="agent_e2e_diagnosis",
                 tenant_id="tenant_demo",
                 name="E2E 疑难故障诊断分身",
@@ -865,6 +1063,14 @@ def seed_e2e_fixtures() -> None:
             )
         )
         db.flush()
+        ensure_private_resource_binding(
+            db,
+            "tenant_demo",
+            "agent_e2e_employee",
+            "tool",
+            destructive_tool.id,
+            "active",
+        )
         sales_skill = db.exec(
             select(Skill).where(
                 Skill.tenant_id == "tenant_demo",
@@ -3011,6 +3217,14 @@ def install_schedule_llm_override() -> None:
 
     model_config_api._deepseek_balance_failure = deterministic_account_probe
 
+    def raise_if_model_error_profile() -> None:
+        """在专用 profile 中模拟 Provider 失败，验证模型错误不被误归类为产品门禁。"""
+
+        if os.environ.get("FULLSTACK_E2E_PROFILE") == "model-error":
+            from app.llm import LLMError
+
+            raise LLMError("MODEL_PROVIDER_QUOTA_EXCEEDED")
+
     def deterministic_json(
         client: LLMClient,
         system_prompt: str,
@@ -3023,6 +3237,7 @@ def install_schedule_llm_override() -> None:
         from app.cancellation import raise_if_cancelled
 
         raise_if_cancelled(is_cancelled)
+        raise_if_model_error_profile()
 
         if "附件视觉证据复核器" in system_prompt:
             resources = user_payload.get("reviewed_structural_evidence")
@@ -3077,6 +3292,41 @@ def install_schedule_llm_override() -> None:
                 "gaps": [],
             }
 
+        if "Guidance 要求修复器" in system_prompt:
+            contract = user_payload.get("loaded_skill_contract", [])
+            candidates = user_payload.get("candidate_options", [])
+            if not isinstance(contract, list) or not isinstance(candidates, list):
+                raise RuntimeError("Guidance repair missed its frozen contract")
+            requirements: list[dict[str, object]] = []
+            for item in contract:
+                if not isinstance(item, dict):
+                    continue
+                skill_ref = str(item.get("skill_ref") or "").strip()
+                candidate = next(
+                    (
+                        option
+                        for option in candidates
+                        if isinstance(option, dict)
+                        and str(option.get("skill_ref") or "").strip() == skill_ref
+                        and str(option.get("principle_candidate_id") or "").strip()
+                    ),
+                    None,
+                )
+                if candidate is None:
+                    raise RuntimeError(f"Guidance repair missed candidate for {skill_ref}")
+                requirements.append(
+                    {
+                        "skill_ref": skill_ref,
+                        "source_kind": candidate["source_kind"],
+                        "source_ref": candidate["source_ref"],
+                        "principle_candidate_id": candidate["principle_candidate_id"],
+                        "task_mapping": "将冻结 Guidance 原则映射到当前交付任务",
+                        "observable_acceptance": "最终交付物逐项体现该原则，并由结果验证",
+                        "disposition": "apply",
+                    }
+                )
+            return {"guidance_requirements": requirements}
+
         stage = user_payload.get(STAGE_PROTOCOL_KEY, {})
         phase = str(stage.get("phase") or "") if isinstance(stage, dict) else ""
         if phase == "Router":
@@ -3116,10 +3366,12 @@ def install_schedule_llm_override() -> None:
                 "confidence": 0.99,
                 "reason": "该任务需要持久执行而非原子技能",
             }
-        if phase == "Router / Dynamic Task Shadow":
+        if phase in {"Router / Dynamic Task", "Router / Dynamic Task Shadow"}:
             goal = str(user_payload.get("user_message") or "生成合同巡检结果")
             if (
                 "S3" in goal
+                or "SKILL-AB-" in goal
+                or "EXPERT-SKILL-" in goal
                 or "本轮选定的指南" in goal
                 or "请读取本轮CSV" in goal
                 or "只核对两份材料中的当前版本号" in goal
@@ -3236,6 +3488,93 @@ def install_schedule_llm_override() -> None:
 
                 return [loaded_ref_by_base[name] for name in names]
             goal = str(user_payload.get("goal") or "")
+            if "EXTERNAL-WRITE-GRAY" in goal:
+                capability_ref = next(
+                    (
+                        str(item.get("name") or "")
+                        for item in user_payload.get("capabilities", [])
+                        if isinstance(item, dict)
+                        and str(item.get("name") or "").startswith("wecom.message_send@")
+                    ),
+                    "",
+                )
+                if not capability_ref:
+                    raise RuntimeError("external-write planner missed gray capability")
+                return {
+                    "goal": goal,
+                    "success_criteria": user_payload.get("success_criteria", []),
+                    "constraints": [
+                        "只向当前绑定的企业微信会话发送一条固定消息；发送前必须逐次审批，"
+                        "回执必须包含 delivery_status 和 message_id",
+                    ],
+                    "assumptions": [],
+                    "steps": [
+                        {
+                            "draft_id": "send",
+                            "title": "发送企业微信 external_write 消息",
+                            "kind": "tool.write",
+                            "required": True,
+                            "depends_on": [],
+                            "capability_refs": [capability_ref],
+                            "guidance_skill_refs": [],
+                            "expected_output_schema": {
+                                "delivery_status_required": True,
+                                "message_id_required": True,
+                            },
+                        },
+                        {
+                            "draft_id": "answer",
+                            "title": "确认企业微信 external_write 回执",
+                            "kind": "answer",
+                            "required": True,
+                            "depends_on": ["send"],
+                            "capability_refs": [],
+                            "guidance_skill_refs": [],
+                            "expected_output_schema": {},
+                        },
+                    ],
+                    "expected_artifacts": [],
+                }
+            if "DESTRUCTIVE-GRAY" in goal:
+                capability_names = {
+                    str(item.get("name") or "")
+                    for item in user_payload.get("capabilities", [])
+                    if isinstance(item, dict)
+                }
+                if "disposable.fixture_delete" not in capability_names:
+                    raise RuntimeError("destructive-gray planner missed disposable fixture capability")
+                return {
+                    "goal": goal,
+                    "success_criteria": user_payload.get("success_criteria", []),
+                    "constraints": [
+                        "只能调用固定 disposable://fixture/object-1，必须使用目标摘要和远端幂等键",
+                        "destructive 仅在每次确认后执行，回执必须包含 effect_status 和 operation_id",
+                    ],
+                    "assumptions": [],
+                    "steps": [
+                        {
+                            "draft_id": "destroy",
+                            "title": "执行隔离 destructive fixture 单次操作",
+                            "kind": "tool.destructive",
+                            "required": True,
+                            "depends_on": [],
+                            "capability_refs": ["disposable.fixture_delete"],
+                            "guidance_skill_refs": [],
+                            "expected_output_schema": {"effect_status_required": True},
+                        },
+                        {
+                            "draft_id": "answer",
+                            "title": "确认隔离 destructive 回执",
+                            "kind": "answer",
+                            "required": True,
+                            "depends_on": ["destroy"],
+                            "capability_refs": [],
+                            "guidance_skill_refs": [],
+                            "expected_output_schema": {},
+                        },
+                    ],
+                    "expected_artifacts": [],
+                }
             if (
                 "ATTACHMENT-FORMULA-MATCH-DYNAMIC" in goal
                 or "ATTACHMENT-FORMULA-CONFLICT-DYNAMIC" in goal
@@ -3457,19 +3796,6 @@ def install_schedule_llm_override() -> None:
                     ],
                 }
             if all(loaded_ref_by_base.values()):
-                capability_names = {
-                    str(item.get("name") or "")
-                    for item in user_payload.get("capabilities", [])
-                    if isinstance(item, dict)
-                }
-                required = {
-                    "workspace.refund.read",
-                    "workspace.refund.apply-set",
-                    "workspace.refund.check",
-                    "workspace.refund.commit",
-                }
-                if not required <= capability_names:
-                    raise RuntimeError("S4 full delivery missed governed workspace tools")
                 return {
                     "goal": str(user_payload.get("goal") or "完成退款审批研发交付"),
                     "success_criteria": user_payload.get("success_criteria", []),
@@ -4056,6 +4382,15 @@ def install_schedule_llm_override() -> None:
                 or "# Test-Driven Development" in str(user_payload)
                 or "CODE-REVIEW-FIXED-COMMIT" in str(user_payload)
                 or any(
+                    capability in str(user_payload)
+                    for capability in (
+                        "workspace.refund.read",
+                        "workspace.refund.apply-set",
+                        "workspace.refund.check",
+                        "workspace.refund.commit",
+                    )
+                )
+                or any(
                     marker in step_title
                     for marker in (
                         "工程 Skill 仓库约定",
@@ -4400,6 +4735,152 @@ def install_schedule_llm_override() -> None:
                 }
             is_s4_diagnosis = "agent_e2e_diagnosis" in str(user_payload)
             is_s4 = "S4-DYNAMIC-FULL-GUIDANCE" in str(user_payload)
+            if "EXTERNAL-WRITE-GRAY" in str(user_payload):
+                client._last_completed_response_metadata = {
+                    "response_id": (
+                        "e2e-external-write-gray-"
+                        f"{step_kind}-{hashlib.sha256(step_title.encode()).hexdigest()[:12]}"
+                    ),
+                    "finish_reason": "stop",
+                    "usage": {"input_tokens": 14, "output_tokens": 12},
+                }
+                if step_kind == "tool.write":
+                    capability_refs = (
+                        current_step.get("capability_refs", [])
+                        if isinstance(current_step, dict)
+                        else []
+                    )
+                    capability_ref = (
+                        str(capability_refs[0])
+                        if isinstance(capability_refs, list) and capability_refs
+                        else ""
+                    )
+                    if not capability_ref.startswith("wecom.message_send@"):
+                        raise RuntimeError("external-write action missed frozen connector capability")
+                    return {
+                        "action_kind": "call_tool",
+                        "arguments": {
+                            "content": (
+                                "EXTERNAL-WRITE-GRAY：已通过独立审批，发送一条固定的"
+                                " DynamicTaskAgent 外部写回归消息。"
+                            ),
+                        },
+                        "capability_ref": capability_ref,
+                        "expected_output_schema": {
+                            "delivery_status_required": True,
+                            "message_id_required": True,
+                        },
+                        "rationale": "只对当前冻结企业微信会话发起一次已审批外部写入",
+                    }
+                if step_kind == "answer":
+                    execution_view = user_payload.get("provider_execution_view", {})
+                    execution_context = (
+                        execution_view.get("execution_context", {})
+                        if isinstance(execution_view, dict)
+                        else {}
+                    )
+                    completed_steps = execution_context.get("completed_steps", [])
+                    completed_step_keys = [
+                        str(item.get("step_key") or "")
+                        for item in completed_steps
+                        if isinstance(item, dict) and item.get("step_key")
+                    ]
+                    send_step_key = next(
+                        (
+                            key
+                            for key in completed_step_keys
+                            if key != str(current_step.get("step_key") or "")
+                        ),
+                        completed_step_keys[-1] if completed_step_keys else "",
+                    )
+                    message_ids = [
+                        str(
+                            item.get("model_output", {}).get("message_id")
+                            or ""
+                        )
+                        for item in completed_steps
+                        if isinstance(item, dict)
+                        and isinstance(item.get("model_output"), dict)
+                        and item.get("model_output", {}).get("message_id")
+                    ]
+                    criteria = [
+                        str(item.get("id") or "")
+                        for item in execution_context.get("success_criteria", [])
+                        if isinstance(item, dict) and item.get("id")
+                    ]
+                    receipt = message_ids[-1] if message_ids else ""
+                    return {
+                        "action_kind": "answer",
+                        "arguments": {
+                            "markdown": (
+                                "EXTERNAL-WRITE-GRAY-SUCCESS：外部写入已在当前企业微信会话"
+                                f"完成一次，delivery_status=sent，provider 回执 message_id={receipt or '已记录'}，"
+                                "未授予长期自动放行。"
+                            ),
+                            "criterion_evidence": {
+                                criterion: [send_step_key] for criterion in criteria
+                            },
+                            "pending_questions": [],
+                        },
+                        "capability_ref": None,
+                        "expected_output_schema": {},
+                        "rationale": "依据外部 provider 的结构化 delivery_status 与 message_id 回执形成终态",
+                    }
+            if "DESTRUCTIVE-GRAY" in str(user_payload):
+                client._last_completed_response_metadata = {
+                    "response_id": (
+                        "e2e-destructive-gray-"
+                        f"{step_kind}-{hashlib.sha256(step_title.encode()).hexdigest()[:12]}"
+                    ),
+                    "finish_reason": "stop",
+                    "usage": {"input_tokens": 14, "output_tokens": 12},
+                }
+                if step_kind == "tool.destructive":
+                    return {
+                        "action_kind": "call_tool",
+                        "arguments": {
+                            "target": "disposable://fixture/object-1",
+                            "target_checksum": hashlib.sha256(
+                                "disposable://fixture/object-1".encode("utf-8")
+                            ).hexdigest(),
+                        },
+                        "capability_ref": "disposable.fixture_delete",
+                        "expected_output_schema": {"effect_status_required": True},
+                        "rationale": "只对固定 disposable fixture 发起一次可对账 destructive 操作",
+                    }
+                if step_kind == "answer":
+                    execution_view = user_payload.get("provider_execution_view", {})
+                    execution_context = (
+                        execution_view.get("execution_context", {})
+                        if isinstance(execution_view, dict)
+                        else {}
+                    )
+                    completed = [
+                        str(item.get("step_key") or "")
+                        for item in execution_context.get("completed_steps", [])
+                        if isinstance(item, dict) and item.get("step_key")
+                    ]
+                    criteria = [
+                        str(item.get("id") or "")
+                        for item in execution_context.get("success_criteria", [])
+                        if isinstance(item, dict) and item.get("id")
+                    ]
+                    return {
+                        "action_kind": "answer",
+                        "arguments": {
+                            "markdown": (
+                                "DESTRUCTIVE-GRAY-SUCCESS：已在 disposable 隔离 provider 上完成一次"
+                                " destructive 操作，回执包含 effect_status 与 operation_id；生产数据未被触达。"
+                            ),
+                            "criterion_evidence": {
+                                criterion: completed for criterion in criteria
+                            },
+                            "pending_questions": [],
+                        },
+                        "capability_ref": None,
+                        "expected_output_schema": {},
+                        "rationale": "依据冻结目标和 provider 回执形成终态确认",
+                    }
             if step_title == "提交 C1 远程 Skill 导入提案":
                 client._last_completed_response_metadata = {
                     "response_id": "e2e-c1-remote-proposal-response",
@@ -4777,6 +5258,22 @@ def install_schedule_llm_override() -> None:
                         if isinstance(execution_view, dict)
                         else {}
                     )
+                    guidance_requirements = []
+                    for message in (
+                        execution_view.get("messages", [])
+                        if isinstance(execution_view, dict)
+                        else []
+                    ):
+                        content = message.get("content") if isinstance(message, dict) else None
+                        requirements = (
+                            content.get("guidance_requirements")
+                            if isinstance(content, dict)
+                            else None
+                        )
+                        if isinstance(requirements, list):
+                            guidance_requirements.extend(
+                                item for item in requirements if isinstance(item, dict)
+                            )
                     completed = [
                         str(item.get("step_key") or "")
                         for item in execution_context.get("completed_steps", [])
@@ -4793,12 +5290,36 @@ def install_schedule_llm_override() -> None:
                             "markdown": (
                                 "S4-CODE-DELIVERY-SUCCESS：补丁已审批写入，固定容器回归通过，"
                                 "Standards 与 Spec 两轴审查均通过，未解决风险为空，"
-                                "并在一次性任务分支形成提交。"
+                                "并在一次性任务分支形成提交。\n\n"
+                                "已按冻结 Guidance 原则完成受管交付，并以各步骤 Operation 回执完成结果验证。"
                             ),
                             "criterion_evidence": {
                                 criterion: completed for criterion in criteria
                             },
                             "pending_questions": [],
+                            "guidance_applications": [
+                                {
+                                    "skill_use_id": str(item.get("skill_use_id") or ""),
+                                    "items": [
+                                        {
+                                            "requirement_id": str(
+                                                item.get("requirement_id") or ""
+                                            ),
+                                            "principle": str(item.get("principle") or ""),
+                                            "application": (
+                                                "将该冻结原则映射到本次受管交付，并以对应"
+                                                "步骤的 Operation 回执核验。"
+                                            ),
+                                            "evidence_excerpt": (
+                                                "已按冻结 Guidance 原则完成受管交付，并以各步骤"
+                                                "Operation 回执完成结果验证。"
+                                            ),
+                                        }
+                                    ],
+                                }
+                                for item in guidance_requirements
+                                if str(item.get("disposition") or "") == "apply"
+                            ],
                         },
                         "capability_ref": None,
                         "expected_output_schema": {},
@@ -4857,6 +5378,42 @@ def install_schedule_llm_override() -> None:
                     "expected_output_schema": {},
                     "rationale": "按固定 Skill 和真实检索证据完成任务",
                 }
+            if step_kind == "answer" and step_title == "生成巡检结果":
+                execution_view = user_payload.get("provider_execution_view", {})
+                execution_context = (
+                    execution_view.get("execution_context", {})
+                    if isinstance(execution_view, dict)
+                    else {}
+                )
+                completed = [
+                    str(item.get("step_key") or "")
+                    for item in execution_context.get("completed_steps", [])
+                    if isinstance(item, dict) and item.get("step_key")
+                ]
+                criteria = [
+                    str(item.get("id") or "")
+                    for item in execution_context.get("success_criteria", [])
+                    if isinstance(item, dict) and item.get("id")
+                ]
+                client._last_completed_response_metadata = {
+                    "response_id": "e2e-dynamic-clarification-answer-response",
+                    "finish_reason": "stop",
+                    "usage": {"input_tokens": 12, "output_tokens": 12},
+                }
+                return {
+                    "action_kind": "answer",
+                    "arguments": {
+                        "markdown": (
+                            "合同巡检结果：已按用户确认的未来30天到期范围完成核验，"
+                            "结果和范围均可追溯。"
+                        ),
+                        "criterion_evidence": {criterion: completed for criterion in criteria},
+                        "pending_questions": [],
+                    },
+                    "capability_ref": None,
+                    "expected_output_schema": {},
+                    "rationale": "依据已完成 clarification 事实形成普通动态终态",
+                }
             client._last_completed_response_metadata = {
                 "response_id": "e2e-schedule-clarification-response",
                 "finish_reason": "stop",
@@ -4884,6 +5441,7 @@ def install_schedule_llm_override() -> None:
     ) -> str:
         """只在 Skill A/B 隔离回归中固定四象限供应商输出，其余场景保持原链路。"""
 
+        raise_if_model_error_profile()
         if isinstance(user_payload, dict):
             if os.environ.get("SKILL_AB_E2E") == "1":
                 return skill_ab_response(user_payload)
@@ -4949,9 +5507,24 @@ def install_schedule_llm_override() -> None:
         context = user_payload.get("conversation_context")
         context_dict = context if isinstance(context, dict) else {}
         raw_inputs = context_dict.get("current_turn_inputs")
-        attachment_text = json.dumps(raw_inputs, ensure_ascii=False)
-        has_attachment = isinstance(raw_inputs, list) and bool(raw_inputs)
-        if has_attachment and "SKILL-AB-ATTACHMENT-FACT" not in attachment_text:
+        authoritative_inputs = user_payload.get("authoritative_attachment_evidence")
+        attachment_text = json.dumps(
+            [raw_inputs, authoritative_inputs], ensure_ascii=False
+        )
+        has_attachment = (
+            isinstance(raw_inputs, list)
+            and bool(raw_inputs)
+        ) or (
+            isinstance(authoritative_inputs, list)
+            and bool(authoritative_inputs)
+        )
+        user_message = str(user_payload.get("user_message") or "")
+        is_expert_closed_loop = "EXPERT-SKILL-CLOSED-LOOP" in user_message
+        if (
+            has_attachment
+            and "SKILL-AB-ATTACHMENT-FACT" not in attachment_text
+            and not is_expert_closed_loop
+        ):
             raise RuntimeError("Skill A/B response did not receive the uploaded attachment")
         raw_loaded = user_payload.get("loaded_general_skills")
         if not isinstance(raw_loaded, list):
@@ -4968,6 +5541,21 @@ def install_schedule_llm_override() -> None:
             "验收：高额请求进入待审批，重复请求只产生一个结果，失败路径可回滚。\n"
             f"{evidence}"
         )
+        if "EXPERT-SKILL-CLOSED-LOOP" in user_message:
+            history = json.dumps(context_dict, ensure_ascii=False)
+            if "EXPERT-SKILL-FIRST-TURN" not in history:
+                raise RuntimeError("expert Skill closed-loop prior turn was absent from context")
+            attachment_evidence = (
+                "SKILL-AB-ATTACHMENT-FACT：第二轮附件事实已在当前 Skill 上下文中核对。"
+                if has_attachment
+                else ""
+            )
+            return (
+                "SKILL-AB-TREATMENT expert-closed-loop：\n"
+                f"{baseline}\n"
+                "EXPERT-SKILL-CLOSED-LOOP-SUCCESS：已沿用第一轮结论，并在同一会话中完成第二轮复核。\n"
+                f"{attachment_evidence}"
+            )
         if not loaded:
             return baseline
         if name == "code-review" or "Standards" in instructions and "Spec" in instructions:
@@ -5007,6 +5595,7 @@ def install_schedule_llm_override() -> None:
     ):
         """让隔离 Skill 场景走真实流式/SSE边界，同时禁止占位密钥访问外部供应商。"""
 
+        raise_if_model_error_profile()
         context = user_payload.get("conversation_context") if isinstance(user_payload, dict) else None
         loaded = user_payload.get("loaded_general_skills") if isinstance(user_payload, dict) else None
         if not isinstance(loaded, list):
@@ -5041,19 +5630,30 @@ def install_schedule_llm_override() -> None:
 
     LLMClient.generate_text_stream = deterministic_text_stream
 
-
 def seed_connection_browser_fixtures() -> None:
     """准备 Slack 控制面、企业微信消息接入，以及浏览器可办理的 reauth Attention。"""
 
     import json
 
-    from sqlmodel import Session
+    from sqlmodel import Session, select
 
     from app.connectors.service import ConnectionService
     from app.connectors.slack import SlackCallResult
     from app.connectors.wecom import WeComCallResult
     from app.db import engine
-    from app.db.models import ConnectorInboundEvent
+    from app.db.models import (
+        AgentConnectionBinding,
+        BusinessRole,
+        ChatSession,
+        ConnectorInboundEvent,
+        ConnectorThreadBinding,
+        EmployeeProfile,
+        EmployeeRoleAssignment,
+    )
+    from app.organization.permissions import (
+        ensure_builtin_permission_catalog,
+        sync_role_permissions,
+    )
     from app.security.encryption import encrypt_secret
     from app.dynamic_tasks.planning import NormalizedPlan, PlanStep, SuccessCriterion
     from app.sop_runtime.execution_control import ExecutionControlService
@@ -5136,6 +5736,118 @@ def seed_connection_browser_fixtures() -> None:
             allowed_scopes={"application:read"},
             expected_profile_revision=wecom_profile.revision,
             actor_user_id="admin",
+        )
+        wecom_binding = service.db.exec(
+            select(AgentConnectionBinding).where(
+                AgentConnectionBinding.tenant_id == "tenant_demo",
+                AgentConnectionBinding.profile_id == wecom_profile.id,
+                AgentConnectionBinding.agent_id == "agent_e2e_employee",
+            )
+        ).one()
+        wecom_profile, wecom_binding = service.set_binding_actions(
+            tenant_id="tenant_demo",
+            profile_id=wecom_profile.id,
+            binding_id=wecom_binding.id,
+            allowed_actions={"wecom.message_send"},
+            expected_profile_revision=wecom_profile.revision,
+            expected_binding_revision=wecom_binding.revision,
+            actor_user_id="admin",
+        )
+        # 外部写的连接权限是独立业务权限，不因平台 admin 身份自动旁路；为浏览器
+        # 正向回归准备两个真实员工身份，分别承担发起和审批，保持生产鉴权路径不变。
+        publication_profile = db.exec(
+            select(EmployeeProfile).where(
+                EmployeeProfile.tenant_id == "tenant_demo",
+                EmployeeProfile.user_id == "publication_admin_e2e",
+            )
+        ).first()
+        if publication_profile is None:
+            publication_profile = EmployeeProfile(
+                id="profile_e2e_publication_admin",
+                tenant_id="tenant_demo",
+                user_id="publication_admin_e2e",
+                employee_id="E2E-PUBLICATION-ADMIN",
+                employee_name="E2E Publication Administrator",
+            )
+            db.add(publication_profile)
+            db.flush()
+        ensure_builtin_permission_catalog(db, "tenant_demo")
+        external_role = db.exec(
+            select(BusinessRole).where(
+                BusinessRole.tenant_id == "tenant_demo",
+                BusinessRole.role_code == "e2e.external_connection_writer",
+            )
+        ).first()
+        if external_role is None:
+            external_role = BusinessRole(
+                id="role_e2e_external_connection_writer",
+                tenant_id="tenant_demo",
+                role_code="e2e.external_connection_writer",
+                name="E2E 外部连接写入办理人",
+                category="cross_functional",
+            )
+            db.add(external_role)
+            db.flush()
+        sync_role_permissions(
+            db,
+            role=external_role,
+            permission_codes=["external_connection.write"],
+        )
+        for employee_profile in (
+            db.exec(
+                select(EmployeeProfile).where(
+                    EmployeeProfile.tenant_id == "tenant_demo",
+                    EmployeeProfile.user_id == "admin",
+                )
+            ).one(),
+            publication_profile,
+        ):
+            assignment = db.exec(
+                select(EmployeeRoleAssignment).where(
+                    EmployeeRoleAssignment.tenant_id == "tenant_demo",
+                    EmployeeRoleAssignment.employee_profile_id == employee_profile.id,
+                    EmployeeRoleAssignment.business_role_id == external_role.id,
+                    EmployeeRoleAssignment.scope_type == "tenant",
+                    EmployeeRoleAssignment.scope_id == "*",
+                )
+            ).first()
+            if assignment is None:
+                db.add(
+                    EmployeeRoleAssignment(
+                        tenant_id="tenant_demo",
+                        employee_profile_id=employee_profile.id,
+                        business_role_id=external_role.id,
+                        scope_type="tenant",
+                        scope_id="*",
+                        include_descendants=True,
+                        granted_by_user_id="admin",
+                    )
+                )
+        db.add(
+            ChatSession(
+                id="session_e2e_dynamic_external_write",
+                tenant_id="tenant_demo",
+                user_id="admin",
+                agent_id="agent_e2e_employee",
+                origin="connector",
+                title="Dynamic 外部写浏览器回归",
+                status="active",
+            )
+        )
+        db.add(
+            ConnectorThreadBinding(
+                id="connthread_e2e_dynamic_external_write",
+                tenant_id="tenant_demo",
+                provider="wecom",
+                profile_id=wecom_profile.id,
+                sender_ref_hash=hashlib.sha256(
+                    "ww-e2e-corp\0e2e-external-user".encode()
+                ).hexdigest(),
+                encrypted_recipient_ref=encrypt_secret("e2e-external-user"),
+                user_id="admin",
+                agent_id="agent_e2e_employee",
+                session_id="session_e2e_dynamic_external_write",
+            )
         )
         plaintext = (
             "<xml><ToUserName>ww-e2e-corp</ToUserName>"
@@ -5243,8 +5955,10 @@ def install_connection_service_override() -> None:
     from sqlmodel import Session
 
     from app.api.connection_profiles import get_connection_service
+    from app.connectors import service as connection_service_module
     from app.connectors.service import ConnectionService
     from app.connectors.slack import SlackCallResult
+    from app.connectors.wecom import WeComCallResult
     from app.db import get_session
     from app.main import app
 
@@ -5273,6 +5987,49 @@ def install_connection_service_override() -> None:
                 True,
                 {"ok": True, "channel": {"id": channel_id, "name": "contracts"}},
             )
+
+    class BrowserWeCom:
+        """模拟固定企业微信账号，记录的回执仍经 ConnectionService 的真实授权链。"""
+
+        def application_info(self, **_credentials: str) -> WeComCallResult:
+            """返回与种子账号一致的应用身份，禁止全栈回归访问公网。"""
+
+            return WeComCallResult(
+                True,
+                {
+                    "agent_id": "1000002",
+                    "name": "E2E 企业微信消息",
+                    "description": "动态 external_write 浏览器回归",
+                    "enabled": True,
+                },
+                granted_scopes=frozenset({"application:read"}),
+            )
+
+        def send_text(
+            self,
+            *,
+            recipient_ref: str,
+            content: str,
+            **_credentials: str,
+        ) -> WeComCallResult:
+            """返回可审计固定 message_id，证明一次且仅一次到达 provider 边界。"""
+
+            if not recipient_ref or not content:
+                return WeComCallResult(False, {}, error_code="WECOM_MESSAGE_INVALID")
+            message_id = "e2e-wecom-message-" + hashlib.sha256(
+                content.encode("utf-8")
+            ).hexdigest()[:16]
+            return WeComCallResult(
+                True,
+                {"message_id": message_id, "invalid_user_count": 0},
+            )
+
+        def invalidate_credentials(self, **_credentials: str) -> None:
+            """隔离 provider 不维护进程级凭据缓存。"""
+
+    # DynamicTaskAgent 通过默认 ConnectionService 创建实例；只在本隔离进程替换
+    # 默认 adapter，HTTP 管理面仍使用下方 dependency override 的真实服务对象。
+    connection_service_module._DEFAULT_WECOM_ADAPTER = BrowserWeCom()
 
     def override_service(db: Session = Depends(get_session)) -> ConnectionService:
         """让每个 HTTP 请求继续使用真实事务，只替换 provider adapter。"""

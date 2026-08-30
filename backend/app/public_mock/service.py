@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from hashlib import sha256
+from threading import Lock
 from typing import Any
 from uuid import uuid4
 
@@ -18,6 +19,49 @@ from pydantic import BaseModel
 
 from app.public_mock.copywriter import TextGenerator, polish_text
 from app.public_mock import schemas
+
+
+DISPOSABLE_DESTRUCTIVE_TARGET = "disposable://fixture/object-1"
+DISPOSABLE_DESTRUCTIVE_TARGET_CHECKSUM = sha256(
+    DISPOSABLE_DESTRUCTIVE_TARGET.encode("utf-8")
+).hexdigest()
+_DISPOSABLE_DESTRUCTIVE_LOCK = Lock()
+_DISPOSABLE_DESTRUCTIVE_DELETED = False
+_DISPOSABLE_DESTRUCTIVE_IDEMPOTENCY_RESULTS: dict[
+    str, schemas.DisposableDestructiveFixtureResponse
+] = {}
+
+
+def execute_disposable_destructive_fixture(
+    request: schemas.DisposableDestructiveFixtureRequest,
+    *,
+    idempotency_key: str,
+) -> schemas.DisposableDestructiveFixtureResponse:
+    """在进程隔离的 disposable fixture 上执行一次可重复、不可触达生产数据的删除。"""
+
+    if (
+        request.target != DISPOSABLE_DESTRUCTIVE_TARGET
+        or request.target_checksum != DISPOSABLE_DESTRUCTIVE_TARGET_CHECKSUM
+    ):
+        raise ValueError("disposable fixture target mismatch")
+    if not idempotency_key.strip():
+        raise ValueError("disposable fixture idempotency key required")
+    global _DISPOSABLE_DESTRUCTIVE_DELETED
+    with _DISPOSABLE_DESTRUCTIVE_LOCK:
+        cached = _DISPOSABLE_DESTRUCTIVE_IDEMPOTENCY_RESULTS.get(idempotency_key)
+        if cached is not None:
+            return cached
+        effect_status = "already_deleted" if _DISPOSABLE_DESTRUCTIVE_DELETED else "deleted"
+        _DISPOSABLE_DESTRUCTIVE_DELETED = True
+        result = schemas.DisposableDestructiveFixtureResponse(
+            target=request.target,
+            target_checksum=request.target_checksum,
+            effect_status=effect_status,
+            destructive_provider="disposable",
+            operation_id=f"disposable-{sha256(idempotency_key.encode('utf-8')).hexdigest()[:16]}",
+        )
+        _DISPOSABLE_DESTRUCTIVE_IDEMPOTENCY_RESULTS[idempotency_key] = result
+        return result
 
 
 def _now() -> str:

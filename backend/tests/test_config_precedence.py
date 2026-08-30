@@ -104,12 +104,22 @@ def test_dynamic_task_router_shadow_is_safe_by_default(monkeypatch) -> None:
     settings = Settings(_env_file=None, public_mock_api_key="test-key")
 
     assert settings.dynamic_task_router_shadow_enabled is False
-    assert settings.dynamic_task_execution_enabled is False
-    assert settings.dynamic_task_steering_enabled is False
+    assert settings.dynamic_task_execution_enabled is True
+    assert settings.dynamic_task_steering_enabled is True
+    assert settings.dynamic_task_skill_loading_enabled is True
+    assert settings.dynamic_task_explore_enabled is True
+    assert settings.dynamic_task_managed_workspace_enabled is True
+    assert settings.general_skill_agent_proposal_enabled is True
+    assert settings.general_skill_resolver_v2_enabled is True
+    assert settings.general_skill_dynamic_guidance_enabled is True
+    assert settings.attachment_analysis_enabled is True
+    assert settings.attachment_parser_worker_enabled is True
+    assert settings.dynamic_task_max_parallel_reads == 2
     assert settings.dynamic_task_external_write_enabled is False
+    assert settings.dynamic_task_destructive_enabled is False
     assert settings.dynamic_task_tenant_allowlist == ""
     assert settings.dynamic_task_agent_allowlist == ""
-    assert settings.dynamic_task_rollout_allows("tenant_demo", "agent_demo") is False
+    assert settings.dynamic_task_rollout_allows("tenant_demo", "agent_demo") is True
     assert settings.dynamic_task_signal_dispatch_workers == 4
     assert settings.dynamic_task_signal_dispatch_capacity == 16
     assert settings.dynamic_task_alert_signal_backlog_threshold == 0
@@ -118,11 +128,12 @@ def test_dynamic_task_router_shadow_is_safe_by_default(monkeypatch) -> None:
     assert settings.dynamic_task_alert_publication_backlog_threshold == 0
     assert settings.dynamic_task_alert_waiting_age_seconds == 0
     assert settings.dynamic_task_alert_thresholds_configured is False
-    assert settings.dynamic_task_max_active_per_tenant == 0
-    assert settings.dynamic_task_max_active_per_agent == 0
-    assert settings.dynamic_task_max_active_per_user == 0
-    assert settings.dynamic_task_max_active_per_tool == 0
-    assert settings.dynamic_task_quota_limits_configured is False
+    assert settings.dynamic_task_max_active_per_tenant == 16
+    assert settings.dynamic_task_max_active_per_agent == 8
+    assert settings.dynamic_task_max_active_per_user == 4
+    assert settings.dynamic_task_max_active_per_tool == 4
+    assert settings.dynamic_task_quota_limits_configured is True
+    assert settings.dynamic_task_runtime_capacity_limits_configured is True
     assert settings.dynamic_task_router_shadow_timeout_seconds == 2.0
     assert settings.dynamic_task_router_shadow_min_confidence == 0.7
 
@@ -135,17 +146,17 @@ def test_dynamic_task_router_shadow_is_safe_by_default(monkeypatch) -> None:
         ("tenant_a", "agent_a", "tenant_a", "agent_b", False),
         ("*", "agent_a", "tenant_b", "agent_a", True),
         ("tenant_a", "*", "tenant_a", "agent_b", True),
-        ("", "", "tenant_a", "agent_a", False),
+        ("", "", "tenant_a", "agent_a", True),
     ],
 )
-def test_dynamic_task_rollout_requires_tenant_and_agent_allowlists(
+def test_dynamic_task_rollout_allows_empty_or_matching_optional_allowlists(
     tenant_allowlist: str,
     agent_allowlist: str,
     tenant_id: str,
     agent_id: str,
     allowed: bool,
 ) -> None:
-    """验证打开总开关后仍须同时命中 tenant 与 Agent 灰度边界。"""
+    """验证普通动态空名单默认开放，非空名单只按部署方主动收窄范围。"""
 
     settings = Settings(
         _env_file=None,
@@ -153,11 +164,6 @@ def test_dynamic_task_rollout_requires_tenant_and_agent_allowlists(
         dynamic_task_execution_enabled=True,
         dynamic_task_tenant_allowlist=tenant_allowlist,
         dynamic_task_agent_allowlist=agent_allowlist,
-        dynamic_task_alert_signal_backlog_threshold=10,
-        dynamic_task_alert_dead_letter_threshold=1,
-        dynamic_task_alert_unknown_operation_threshold=1,
-        dynamic_task_alert_publication_backlog_threshold=5,
-        dynamic_task_alert_waiting_age_seconds=3600,
         dynamic_task_max_active_per_tenant=16,
         dynamic_task_max_active_per_agent=8,
         dynamic_task_max_active_per_user=4,
@@ -181,8 +187,8 @@ def test_dynamic_task_rollout_global_kill_switch_overrides_wildcards() -> None:
     assert settings.dynamic_task_rollout_allows("tenant_a", "agent_a") is False
 
 
-def test_dynamic_task_rollout_rejects_allowlists_without_alert_thresholds() -> None:
-    """验证 tenant/Agent 即使命中，也不能在停止阈值未配置时开放生产执行。"""
+def test_dynamic_task_base_allows_without_alert_thresholds() -> None:
+    """验证普通动态不需要告警阈值，高风险 external write 仍需要告警配置。"""
 
     settings = Settings(
         _env_file=None,
@@ -193,11 +199,13 @@ def test_dynamic_task_rollout_rejects_allowlists_without_alert_thresholds() -> N
     )
 
     assert settings.dynamic_task_alert_thresholds_configured is False
-    assert settings.dynamic_task_rollout_allows("tenant_a", "agent_a") is False
+    assert settings.dynamic_task_base_execution_allows("tenant_a", "agent_a") is True
+    assert settings.dynamic_task_rollout_allows("tenant_a", "agent_a") is True
+    assert settings.dynamic_task_high_risk_external_write_allows("tenant_a", "agent_a") is False
 
 
-def test_dynamic_task_rollout_rejects_allowlists_without_quota_limits() -> None:
-    """验证停止阈值已配置但四级配额为空时仍不能开放动态执行。"""
+def test_dynamic_task_base_rejects_zero_runtime_capacity() -> None:
+    """验证运行时并发容量为零时只拒绝入场，不把原因解释成模型配额。"""
 
     settings = Settings(
         _env_file=None,
@@ -205,16 +213,82 @@ def test_dynamic_task_rollout_rejects_allowlists_without_quota_limits() -> None:
         dynamic_task_execution_enabled=True,
         dynamic_task_tenant_allowlist="tenant_a",
         dynamic_task_agent_allowlist="agent_a",
+        dynamic_task_max_active_per_tenant=0,
+        dynamic_task_max_active_per_agent=8,
+        dynamic_task_max_active_per_user=4,
+        dynamic_task_max_active_per_tool=4,
+    )
+
+    assert settings.dynamic_task_alert_thresholds_configured is False
+    assert settings.dynamic_task_quota_limits_configured is False
+    assert settings.dynamic_task_base_execution_allows("tenant_a", "agent_a") is False
+    assert settings.dynamic_task_rollout_allows("tenant_a", "agent_a") is False
+
+
+def test_dynamic_task_external_write_requires_explicit_high_risk_configuration() -> None:
+    """验证 external write 必须独立打开、命中双名单并配置告警阈值。"""
+
+    base = dict(
+        _env_file=None,
+        public_mock_api_key="test-key",
+        dynamic_task_execution_enabled=True,
+        dynamic_task_external_write_enabled=True,
+        dynamic_task_tenant_allowlist="tenant_a",
+        dynamic_task_agent_allowlist="agent_a",
+        dynamic_task_max_active_per_tenant=16,
+        dynamic_task_max_active_per_agent=8,
+        dynamic_task_max_active_per_user=4,
+        dynamic_task_max_active_per_tool=4,
+    )
+    without_thresholds = Settings(**base)
+    assert without_thresholds.dynamic_task_base_execution_allows("tenant_a", "agent_a") is True
+    assert without_thresholds.dynamic_task_high_risk_external_write_allows(
+        "tenant_a", "agent_a"
+    ) is False
+
+    configured = Settings(
+        **base,
         dynamic_task_alert_signal_backlog_threshold=10,
         dynamic_task_alert_dead_letter_threshold=1,
         dynamic_task_alert_unknown_operation_threshold=1,
         dynamic_task_alert_publication_backlog_threshold=5,
         dynamic_task_alert_waiting_age_seconds=3600,
     )
+    assert configured.dynamic_task_high_risk_external_write_allows("tenant_a", "agent_a") is True
+    assert configured.dynamic_task_high_risk_external_write_allows(
+        "tenant_a", "agent_a", blocking_critical_alert=True
+    ) is False
 
-    assert settings.dynamic_task_alert_thresholds_configured is True
-    assert settings.dynamic_task_quota_limits_configured is False
-    assert settings.dynamic_task_rollout_allows("tenant_a", "agent_a") is False
+
+def test_dynamic_task_destructive_gate_uses_independent_allowlists() -> None:
+    """验证 destructive 不继承 external write 名单，必须使用自己的独立配置。"""
+
+    settings = Settings(
+        _env_file=None,
+        public_mock_api_key="test-key",
+        dynamic_task_execution_enabled=True,
+        dynamic_task_destructive_enabled=True,
+        dynamic_task_tenant_allowlist="tenant_a",
+        dynamic_task_agent_allowlist="agent_a",
+        dynamic_task_destructive_tenant_allowlist="tenant_d",
+        dynamic_task_destructive_agent_allowlist="agent_d",
+        dynamic_task_alert_signal_backlog_threshold=10,
+        dynamic_task_alert_dead_letter_threshold=1,
+        dynamic_task_alert_unknown_operation_threshold=1,
+        dynamic_task_alert_publication_backlog_threshold=5,
+        dynamic_task_alert_waiting_age_seconds=3600,
+        dynamic_task_max_active_per_tenant=16,
+        dynamic_task_max_active_per_agent=8,
+        dynamic_task_max_active_per_user=4,
+        dynamic_task_max_active_per_tool=4,
+    )
+
+    assert settings.dynamic_task_high_risk_destructive_allows("tenant_d", "agent_d") is False
+    assert settings.dynamic_task_high_risk_destructive_allows("tenant_a", "agent_a") is False
+
+    settings.dynamic_task_tenant_allowlist = "tenant_d"
+    settings.dynamic_task_agent_allowlist = "agent_d"
+    assert settings.dynamic_task_high_risk_destructive_allows("tenant_d", "agent_d") is True
 
 
 def test_dynamic_task_signal_capacity_must_cover_all_workers() -> None:

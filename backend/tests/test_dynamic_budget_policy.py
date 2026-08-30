@@ -82,6 +82,19 @@ def test_complex_goal_without_resources_gets_long_runtime_budget() -> None:
     assert recovery_wording.tier == DynamicBudgetTier.EXTENDED
 
 
+def test_multi_skill_goal_gets_runtime_budget_for_guidance_replay() -> None:
+    """确认多 Skill 组合只提升运行时容量，不改变普通动态能力的开放语义。"""
+
+    selected = select_dynamic_budget(
+        goal="按多个 Skill 完成可审计交付",
+        resources=(),
+        guidance_count=3,
+    )
+
+    assert selected.tier == DynamicBudgetTier.EXTENDED
+    assert selected.max_model_calls == 20
+
+
 def test_simple_plain_goal_keeps_interactive_budget() -> None:
     """确认复杂题放宽等待不会把普通短问答一并升级。"""
 

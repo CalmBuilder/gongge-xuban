@@ -14,6 +14,7 @@ from sqlmodel import Session, SQLModel, create_engine, select
 
 from app.agents.branching import ensure_private_resource_binding
 from app.api.general_skills import import_general_skill, publish_general_skill
+from app.config import Settings
 from app.db.models import AgentProfile, AgentResourceBinding, ModelConfig, Tenant, Tool, User
 from app.dynamic_tasks.capability_catalog import (
     CapabilityAccessDenied,
@@ -60,6 +61,37 @@ def _admin() -> User:
         username="admin",
         role="admin",
         password_hash="test",
+    )
+
+
+def _destructive_contract() -> ToolReliabilityContract:
+    """构造满足 destructive 隔离 provider 要求的最小可靠性契约。"""
+
+    return _contract(
+        risk_class="destructive",
+        side_effect="external",
+        confirmation_policy="always",
+        timeout_policy="unknown",
+        dynamic_task_enabled=False,
+        destructive_dynamic_task_enabled=True,
+        idempotency={
+            "mode": "request_key",
+            "argument": None,
+            "remote_scope": "disposable-provider",
+        },
+        reconcile={
+            "supported": True,
+            "tool_name": "isolated.delete.status",
+            "reference_source": "output.operation_id",
+            "terminal_status_mapping": {
+                "deleted": "complete",
+                "missing": "complete",
+                "pending": "unknown",
+            },
+        },
+        canonical_target="disposable://tenant_a/fixture/object-1",
+        target_checksum="a" * 64,
+        destructive_provider="disposable",
     )
 
 
@@ -240,6 +272,75 @@ def test_catalog_defaults_legacy_tools_out_and_rechecks_live_access() -> None:
         db.commit()
         with pytest.raises(CapabilityAccessDenied, match="DISABLED"):
             catalog.reauthorize_tool(snapshot, actor_user_id=None, organization_unit_id=None)
+
+
+def test_destructive_tool_is_hidden_by_default_and_visible_only_in_its_own_gray_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证 destructive 默认关闭，打开后也只受 destructive 独立名单控制。"""
+
+    engine = create_engine("sqlite://")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as db:
+        db.add(Tenant(id="tenant_a", name="Tenant A"))
+        db.add(AgentProfile(id="agent_a", tenant_id="tenant_a", name="A", is_overall=False))
+        contract = _destructive_contract()
+        tool = Tool(
+            id="tool_destructive",
+            tenant_id="tenant_a",
+            name="fixture.delete",
+            method="POST",
+            url="http://fixture.invalid/delete",
+            input_schema={"type": "object", "properties": {"object_id": {"type": "string"}}},
+            reliability_contract_json=contract.model_dump(mode="json"),
+        )
+        db.add(tool)
+        db.commit()
+        ensure_private_resource_binding(
+            db, "tenant_a", "agent_a", "tool", tool.id, "active"
+        )
+        db.commit()
+        catalog = DynamicCapabilityCatalog(db)
+
+        monkeypatch.setattr(
+            "app.dynamic_tasks.capability_catalog.get_settings",
+            lambda: Settings(_env_file=None, public_mock_api_key="test-key"),
+        )
+        assert catalog.list_tools("tenant_a", "agent_a") == []
+
+        enabled = Settings(
+            _env_file=None,
+            public_mock_api_key="test-key",
+            dynamic_task_destructive_enabled=True,
+            dynamic_task_destructive_tenant_allowlist="tenant_a",
+            dynamic_task_destructive_agent_allowlist="agent_a",
+            dynamic_task_alert_signal_backlog_threshold=10,
+            dynamic_task_alert_dead_letter_threshold=1,
+            dynamic_task_alert_unknown_operation_threshold=1,
+            dynamic_task_alert_publication_backlog_threshold=5,
+            dynamic_task_alert_waiting_age_seconds=3600,
+        )
+        monkeypatch.setattr(
+            "app.dynamic_tasks.capability_catalog.get_settings",
+            lambda: enabled,
+        )
+        snapshots = catalog.list_tools("tenant_a", "agent_a")
+        assert [item.name for item in snapshots] == [tool.name]
+
+        enabled.dynamic_task_destructive_agent_allowlist = "another-agent"
+        assert catalog.list_tools("tenant_a", "agent_a") == []
+
+
+def test_destructive_contract_target_checksum_is_required_for_published_gray() -> None:
+    """验证 destructive 发布契约必须固定目标与校验指纹，不能只声明风险类别。"""
+
+    with pytest.raises(ValidationError):
+        ToolReliabilityContract.model_validate(
+            {
+                **_destructive_contract().model_dump(mode="json"),
+                "target_checksum": None,
+            }
+        )
 
 
 def test_dynamic_model_requires_successful_capability_preflight() -> None:

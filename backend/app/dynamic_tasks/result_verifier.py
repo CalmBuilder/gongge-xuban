@@ -257,7 +257,7 @@ def _guidance_delivery_errors(
     """把冻结的可观察验收收敛为正文门禁，避免只在审计尾注中声称已应用。"""
 
     has_runtime_prerequisite = any(
-        step.kind in {"tool.read", "tool.execute", "knowledge", "explore"}
+        step.kind in {"tool.read", "tool.execute", "tool.destructive", "knowledge", "explore"}
         for step in plan.steps
     )
     body = str(result.markdown or "").split("\nSkill应用记录", 1)[0]
@@ -360,7 +360,7 @@ def _guidance_phase_gate_errors(
     """当冻结原则明确禁止跳过前置证据时，拒绝在无运行步骤的结果中伪造假设阶段。"""
 
     has_runtime_prerequisite = any(
-        step.kind in {"tool.read", "tool.execute", "knowledge", "explore"}
+        step.kind in {"tool.read", "tool.execute", "tool.destructive", "knowledge", "explore"}
         for step in plan.steps
     )
     if has_runtime_prerequisite:

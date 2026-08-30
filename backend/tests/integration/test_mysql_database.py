@@ -443,6 +443,63 @@ def test_alembic_upgrades_empty_mysql_database(mysql_database_url: str) -> None:
         )
 
 
+def test_mysql_operation_effect_constraint_accepts_destructive_and_rejects_unknown(
+    mysql_database_url: str,
+) -> None:
+    """验证 MySQL 8.4 的 Operation 约束与 SQLite 一致支持 destructive 且拒绝未知类别。"""
+
+    upgrade(mysql_database_url)
+    engine = create_engine(mysql_database_url, pool_pre_ping=True)
+    try:
+        constraints = inspect(engine).get_check_constraints("sop_operations")
+        effect_constraints = [
+            item
+            for item in constraints
+            if "effect_kind" in str(item.get("sqltext") or "")
+        ]
+        assert effect_constraints
+        assert any("destructive" in str(item.get("sqltext") or "") for item in effect_constraints)
+
+        with Session(engine) as db:
+            db.add(
+                SopOperation(
+                    id="mysql-destructive-operation",
+                    tenant_id="tenant_mysql_destructive",
+                    instance_id="instance_mysql_destructive",
+                    node_execution_id="node_mysql_destructive",
+                    operation_name="disposable.fixture_delete",
+                    idempotency_key="mysql-destructive-local-key",
+                    logical_action_id="mysql-destructive-action",
+                    request_fingerprint="a" * 64,
+                    effect_kind="destructive",
+                    effect_state="unknown",
+                    status="unknown",
+                )
+            )
+            db.commit()
+
+        with Session(engine) as db:
+            db.add(
+                SopOperation(
+                    id="mysql-invalid-operation",
+                    tenant_id="tenant_mysql_destructive",
+                    instance_id="instance_mysql_destructive",
+                    node_execution_id="node_mysql_destructive",
+                    operation_name="invalid.effect",
+                    idempotency_key="mysql-invalid-local-key",
+                    logical_action_id="mysql-invalid-action",
+                    request_fingerprint="b" * 64,
+                    effect_kind="arbitrary_shell",
+                    effect_state="none",
+                    status="prepared",
+                )
+            )
+            with pytest.raises((IntegrityError, OperationalError)):
+                db.commit()
+    finally:
+        engine.dispose()
+
+
 def test_mysql_context_compaction_config_round_trips_into_runtime(
     mysql_database_url: str,
 ) -> None:

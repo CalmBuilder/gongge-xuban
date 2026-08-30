@@ -98,6 +98,28 @@ const workspaceApproval = {
   revision: 7,
 };
 
+const destructiveApproval = {
+  ...toolApproval,
+  id: 'attention_destructive',
+  title: '批准 destructive 隔离 provider 单次操作',
+  payload: {
+    operation_id: 'operation_destructive_1',
+    operation_name: 'disposable.fixture_delete',
+    risk_class: 'destructive',
+    canonical_target: 'disposable://fixture/object-1',
+    target_checksum: 'b'.repeat(64),
+    destructive_provider: 'disposable',
+    remote_idempotency_key: 'remote-destructive-1',
+    workspace: {},
+    arguments: {
+      target: 'disposable://fixture/object-1',
+      target_checksum: 'b'.repeat(64),
+    },
+  },
+  available_commands: ['allow_once', 'deny'],
+  revision: 9,
+};
+
 const skillPublication = {
   ...toolApproval,
   id: 'attention_skill_publication',
@@ -354,6 +376,40 @@ it('受管代码审批展示工作区与精确参数并使用通用操作文案'
     }),
   ]);
   expect(vi.mocked(api.post).mock.calls[0][1]).not.toHaveProperty('arguments');
+});
+
+it('destructive 审批展示固定目标与隔离 provider，不误判为工作区操作', async () => {
+  /** 验证 destructive 与 external_write、managed workspace 在真实审批语义和文案上分开。 */
+
+  vi.mocked(api.get).mockImplementation(async (path: string) => {
+    if (path.startsWith('/api/executions/')) {
+      return { id: 'execution_1', status: 'waiting', revision: 14, effect_state: 'unknown' };
+    }
+    return { items: [destructiveApproval], total: 1 };
+  });
+  const user = userEvent.setup();
+  renderCenter();
+  await user.click(await screen.findByRole('button', { name: /批准 destructive 隔离 provider 单次操作/ }));
+
+  const review = screen.getByLabelText('待批准 destructive 操作');
+  expect(review).toHaveTextContent('disposable://fixture/object-1');
+  expect(review).toHaveTextContent('disposable');
+  expect(review).toHaveTextContent('b'.repeat(64));
+  expect(review).toHaveTextContent('remote-destructive-1');
+  expect(screen.queryByLabelText('待批准受管代码操作')).not.toBeInTheDocument();
+  expect(screen.getAllByText(/固定目标、目标摘要、隔离 provider/)).toHaveLength(2);
+
+  await user.click(screen.getByRole('button', { name: '仅批准本次 destructive 操作' }));
+  await waitFor(() => expect(api.post).toHaveBeenCalledTimes(1));
+  expect(vi.mocked(api.post).mock.calls[0]).toEqual([
+    '/api/attention-items/attention_destructive/resolve',
+    expect.objectContaining({
+      tenant_id: 'tenant_demo',
+      command: 'allow_once',
+      expected_revision: 9,
+    }),
+  ]);
+  expect(vi.mocked(api.post).mock.calls[0][1]).not.toHaveProperty('target');
 });
 
 it('Skill 发布审批展示完整审阅 Artifact 且只提交一次性发布决定', async () => {

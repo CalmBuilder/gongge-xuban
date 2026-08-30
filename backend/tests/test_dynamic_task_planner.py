@@ -18,6 +18,8 @@ from app.dynamic_tasks.planner_service import (
     DynamicTaskPlanner,
     DynamicTaskPlannerError,
     _force_guidance_phase_gate,
+    _guidance_source_contract,
+    _goal_has_workspace_intent,
     _planner_guidance_candidate_catalog,
     _repair_covers_loaded_skills,
     _repair_guidance_phase_continuity,
@@ -2398,6 +2400,28 @@ def test_guidance_not_applicable_is_unique_and_forced_only() -> None:
     assert forced.guidance_requirements[0].disposition == "not_applicable"
 
 
+def test_guidance_source_contract_preserves_dependency_selection_mode() -> None:
+    """多 Skill 组合中的依赖 Skill 应保留 dependency 身份并进入同一规划契约。"""
+
+    sources, modes = _guidance_source_contract(
+        [
+            {
+                "name": "setup-matt-pocock-skills",
+                "selection_mode": "forced",
+                "skills": [{"instructions": "先确认交付范围。", "reviewed_resources": []}],
+            },
+            {
+                "name": "tdd",
+                "selection_mode": "dependency",
+                "skills": [{"instructions": "先写测试。", "reviewed_resources": []}],
+            },
+        ]
+    )
+
+    assert set(sources) == {"setup-matt-pocock-skills", "tdd"}
+    assert modes == {"setup-matt-pocock-skills": "forced", "tdd": "dependency"}
+
+
 def test_guidance_repair_does_not_accept_mixed_not_applicable_and_apply() -> None:
     """Guidance 修复不能把同一 Skill 的不适用和适用要求混在一起提前放行。"""
 
@@ -2994,6 +3018,12 @@ def test_planner_retains_generic_agent_workspace_for_code_change_without_path() 
     )
 
     assert [step.kind for step in plan.steps] == ["tool.read", "answer"]
+
+
+def test_workspace_execute_intent_accepts_completion_of_real_tests() -> None:
+    """用户要求完成真实测试时，规划器应投影已授权的工作区执行能力。"""
+
+    assert _goal_has_workspace_intent("完成真实测试和提交", "code_execute")
 
 
 class _RequiredKnowledgeRepairClient:

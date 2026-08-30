@@ -43,6 +43,7 @@ from app.core.cancellation import (
 from app.core.conversation_context import ConversationContextSettings, build_conversation_context
 from app.core.non_sop_capability import (
     LlmDynamicTaskShadowSelector,
+    LlmDynamicTaskPrimarySelector,
     NonSopCapabilityDecision,
     NonSopCapabilityRouteResult,
     NonSopCapabilityRouter,
@@ -304,7 +305,7 @@ class QueuedTaskContinuation:
 
 class AgentLoop:
     def __init__(self, db: Session):
-        """组装聊天、SOP、通用能力及默认关闭的动态任务 shadow 编排依赖。"""
+        """组装聊天、SOP、通用能力及默认开放的动态任务编排依赖。"""
 
         settings = get_settings()
         self.db = db
@@ -318,12 +319,20 @@ class AgentLoop:
         self.non_sop_capability_router = NonSopCapabilityRouter(
             shadow_enabled=settings.dynamic_task_router_shadow_enabled,
             execution_enabled=settings.dynamic_task_execution_enabled,
+            primary_selector=LlmDynamicTaskPrimarySelector(
+                settings.dynamic_task_router_shadow_timeout_seconds
+            ),
             shadow_selector=LlmDynamicTaskShadowSelector(
                 settings.dynamic_task_router_shadow_timeout_seconds
             ),
             minimum_confidence=settings.dynamic_task_router_shadow_min_confidence,
         )
-        self._dynamic_task_rollout_allows = settings.dynamic_task_rollout_allows
+        self._dynamic_task_rollout_allows = settings.dynamic_task_base_execution_allows
+        self._dynamic_task_rollout_denial_code = (
+            "DYNAMIC_TASK_QUOTA_NOT_CONFIGURED"
+            if not settings.dynamic_task_runtime_capacity_limits_configured
+            else "DYNAMIC_TASK_ROLLOUT_DENIED"
+        )
         self._dynamic_task_quota_limits = quota_limits_from_settings(settings)
         self.general_skill_runner = GeneralSkillRunner()
         self.tool_executor = ToolExecutor(db)
@@ -7806,7 +7815,7 @@ class AgentLoop:
         user_message_id: str | None = None,
         is_cancelled: Callable[[], bool] | None = None,
     ) -> tuple[GeneralSkill | None, GeneralSkillSelection]:
-        """统一非 SOP 权威选择与脱敏 shadow；A 批只返回旧 GeneralSkill 行为。"""
+        """统一非 SOP 权威选择与可选 shadow，并返回当前有效 Skill 选择。"""
 
         route = self._decide_non_sop_capability(
             message,
@@ -7913,7 +7922,14 @@ class AgentLoop:
             is_cancelled=is_cancelled,
         )
         raise_if_cancelled(is_cancelled)
-        if route.shadow_decision is not None:
+        if route.primary_decision is not None:
+            self.events.record(
+                model_config.tenant_id,
+                chat_session.id,
+                "non_sop_capability_primary_decided",
+                self._turn_payload(route.audit_payload(), user_message_id),
+            )
+        if route.shadow_decision is not None and route.shadow_attempted:
             self.events.record(
                 model_config.tenant_id,
                 chat_session.id,
@@ -8038,13 +8054,18 @@ class AgentLoop:
             else True
         )
         if not rollout_allowed:
+            denial_code = getattr(
+                self,
+                "_dynamic_task_rollout_denial_code",
+                "DYNAMIC_TASK_ROLLOUT_DENIED",
+            )
             self.events.record(
                 request.tenant_id,
                 chat_session.id,
                 "dynamic_task_rollout_denied",
                 self._turn_payload(
                     {
-                        "reason_code": "DYNAMIC_TASK_ROLLOUT_DENIED",
+                        "reason_code": denial_code,
                         "agent_id": chat_session.agent_id,
                         "source_kind": request.interaction_mode,
                     },
@@ -8061,7 +8082,7 @@ class AgentLoop:
                 )
             )
             if requires_dynamic_contract:
-                raise DynamicTaskAgentError("DYNAMIC_TASK_ROLLOUT_DENIED")
+                raise DynamicTaskAgentError(denial_code)
             return None
         dynamic_agent = DynamicTaskAgent(self.db)
         quota_limits = getattr(self, "_dynamic_task_quota_limits", None)

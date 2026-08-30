@@ -3,7 +3,7 @@
 @Author     : zhanglp8181
 @File       : test_dynamic_external_write.py
 @CallChain  : pytest → DynamicTaskAgent → tool Approval/Operation/企业微信 adapter stub
-@Description: 验证一次性审批外部写的零调用、唯一派发、拒绝和 unknown 人工对账闭环。
+@Description: 验证外部写和 destructive-gray 的独立审批、隔离派发、零重发与 unknown 对账闭环。
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ from app.db.models import (
     User,
     utc_now,
 )
-from app.dynamic_tasks.agent import DynamicTaskAgent
+from app.dynamic_tasks.agent import DynamicTaskAgent, DynamicTaskAgentError
 from app.dynamic_tasks.capability_catalog import CapabilitySnapshot, capability_checksum
 from app.dynamic_tasks.standing_approvals import StandingApprovalMatch
 from app.dynamic_tasks.worker import due_dynamic_task_signals
@@ -43,6 +43,7 @@ from app.dynamic_tasks.planning import (
 )
 from app.sop_runtime.execution_control import ExecutionControlService
 from app.sop_runtime.execution_store import SopExecutionStore
+from app.tools.tool_schema import ToolError, ToolResult
 
 
 class _WriteCatalog:
@@ -107,6 +108,113 @@ class _WriteProposer:
                 arguments={"content": "审批后发送的精确消息"},
                 rationale="向当前企业微信线程发送已核对内容",
             ),
+        )
+
+
+class _DestructiveCatalog:
+    """为 destructive 单测提供已预检模型和实时快照再授权。"""
+
+    def __init__(self, model: ModelConfig) -> None:
+        """保存本次隔离运行使用的模型并初始化再授权计数。"""
+
+        self.model = model
+        self.reauthorize_calls = 0
+
+    def require_dynamic_model(self, tenant_id: str, model_config_id: str) -> ModelConfig:
+        """返回同租户已预检模型，模拟生产目录的模型门禁。"""
+
+        assert tenant_id == self.model.tenant_id
+        assert model_config_id == self.model.id
+        return self.model
+
+    def reauthorize_tool(self, snapshot, **_kwargs) -> object:
+        """记录 dispatch 前的实时再授权并保留当前快照。"""
+
+        self.reauthorize_calls += 1
+        return snapshot
+
+
+class _DestructiveProposer:
+    """为 destructive 操作和最终答复返回固定、可校验的 provider 提案。"""
+
+    def __init__(self, capability_name: str, target: str, target_checksum: str) -> None:
+        """冻结能力名、目标及其校验指纹，避免测试提案漂移。"""
+
+        self.capability_name = capability_name
+        self.target = target
+        self.target_checksum = target_checksum
+        self.steps: list[str] = []
+
+    def propose(self, *, view, step) -> CompletedProviderProposal:
+        """按步骤返回唯一 destructive 调用或带真实证据引用的最终答复。"""
+
+        del view
+        self.steps.append(step.step_key)
+        if step.kind == "tool.destructive":
+            return CompletedProviderProposal(
+                response_id="destructive-proposal-1",
+                finish_reason="stop",
+                proposal=RuntimeActionProposal(
+                    action_kind=ActionKind.CALL_TOOL,
+                    capability_ref=self.capability_name,
+                    arguments={
+                        "target": self.target,
+                        "target_checksum": self.target_checksum,
+                    },
+                    rationale="在隔离 disposable fixture 上执行已确认动作",
+                ),
+            )
+        assert step.kind == "answer"
+        return CompletedProviderProposal(
+            response_id=f"destructive-answer-{len(self.steps)}",
+            finish_reason="stop",
+            proposal=RuntimeActionProposal(
+                action_kind=ActionKind.ANSWER,
+                arguments={
+                    "markdown": "隔离 disposable fixture 已按批准目标完成处理。",
+                    "criterion_evidence": {"effect_applied": ["destroy_fixture"]},
+                    "pending_questions": [],
+                },
+                rationale="依据 destructive Operation 的真实回执形成结果",
+            ),
+        )
+
+
+class _DestructiveExecutor:
+    """记录 destructive adapter 的单次调用、幂等键和固定目标。"""
+
+    def __init__(self, *, timeout: bool = False) -> None:
+        """配置是否返回效果不确定的超时回执。"""
+
+        self.timeout = timeout
+        self.calls: list[dict[str, object]] = []
+
+    def execute(self, tenant_id, tool_call, **kwargs):
+        """返回成功或 timeout，并保留所有到达 provider 边界的关键事实。"""
+
+        self.calls.append(
+            {
+                "tenant_id": tenant_id,
+                "name": tool_call.name,
+                "arguments": dict(tool_call.arguments),
+                "remote_idempotency_key": kwargs.get("remote_idempotency_key"),
+            }
+        )
+        if self.timeout:
+            return ToolResult(
+                tool_name=tool_call.name,
+                success=False,
+                error=ToolError(code="TIMEOUT", message="disposable provider timeout"),
+            )
+        return ToolResult(
+            tool_name=tool_call.name,
+            success=True,
+            data={
+                "effect_status": "deleted",
+                "target": tool_call.arguments["target"],
+                "target_checksum": tool_call.arguments["target_checksum"],
+                "destructive_provider": "disposable",
+            },
         )
 
 
@@ -413,6 +521,47 @@ def test_allow_once_dispatches_exactly_once_and_replay_does_not_send(
     db.close()
 
 
+def test_external_write_gray_revocation_blocks_prepared_resume(monkeypatch) -> None:
+    """外部写已生成待审批后撤回灰度时，恢复也必须拒绝且不触达连接器。"""
+
+    db, instance, model, snapshot = _write_runtime(monkeypatch)
+    service = _WriteConnectionService(
+        WeComCallResult(True, {"message_id": "must-not-send"})
+    )
+    agent = DynamicTaskAgent(
+        db,
+        catalog=_WriteCatalog(model),
+        action_proposer=_WriteProposer(snapshot.name),
+        connection_service=service,
+    )
+    attention = agent.advance_next_write_step(
+        execution_id=instance.id,
+        model_config=model,
+        worker_id="prepare-revocation",
+        actor_user_id="requester",
+    )
+    signal = _resolve(db, instance, attention, command="allow_once")
+    monkeypatch.setattr(
+        "app.dynamic_tasks.agent.get_settings",
+        lambda: SimpleNamespace(
+            dynamic_task_high_risk_external_write_allows=lambda _tenant, _agent: False,
+        ),
+    )
+
+    with pytest.raises(DynamicTaskAgentError, match="DYNAMIC_EXTERNAL_WRITE_DISABLED"):
+        agent.resume_tool_approval_signal(
+            signal_id=signal.id,
+            model_config=model,
+            worker_id="resume-after-revocation",
+            actor_user_id="approver",
+        )
+
+    operation = db.exec(select(SopOperation)).one()
+    assert operation.status == "prepared"
+    assert service.validate_calls == service.send_calls == 0
+    db.close()
+
+
 def test_legacy_write_only_plan_fails_closed_after_effect_without_orphan(
     monkeypatch,
 ) -> None:
@@ -657,6 +806,7 @@ def test_crash_after_dispatch_recovers_to_unknown_without_resend(monkeypatch) ->
     assert operation.status == "running"
     assert signal.status == "claimed"
     assert service.send_calls == 1
+
     signal.lease_expires_at = utc_now() - timedelta(seconds=1)
     db.add(signal)
     db.commit()
@@ -681,6 +831,325 @@ def test_crash_after_dispatch_recovers_to_unknown_without_resend(monkeypatch) ->
     db.close()
 
 
+def test_destructive_default_off_has_zero_operation_or_provider_calls(monkeypatch) -> None:
+    """默认 destructive 关闭时在动作入场处稳定拒绝，不能创建 Operation 或调用 provider。"""
+
+    db, instance, model, snapshot, settings = _destructive_runtime(monkeypatch, allowed=False)
+    executor = _DestructiveExecutor()
+    agent = DynamicTaskAgent(
+        db,
+        catalog=_DestructiveCatalog(model),
+        action_proposer=_DestructiveProposer(
+            snapshot.name,
+            snapshot.contract["canonical_target"],
+            snapshot.contract["target_checksum"],
+        ),
+        tool_executor=executor,
+    )
+
+    assert settings.dynamic_task_high_risk_destructive_allows("tenant_destructive", "agent-destructive") is False
+    with pytest.raises(DynamicTaskAgentError, match="DYNAMIC_DESTRUCTIVE_DISABLED"):
+        agent.advance_next_local_step(
+            execution_id=instance.id,
+            model_config=model,
+            worker_id="destructive-default-off",
+            actor_user_id="requester",
+            step_kind="tool.destructive",
+        )
+
+    assert executor.calls == []
+    assert db.exec(select(SopOperation)).all() == []
+
+
+def test_destructive_gray_requires_exact_target_and_dispatches_once_with_remote_idempotency(
+    monkeypatch,
+) -> None:
+    """destructive-gray 命中后仍需逐次批准，且 provider 只收到固定目标和稳定幂等键。"""
+
+    db, instance, model, snapshot, _settings = _destructive_runtime(monkeypatch, allowed=True)
+    executor = _DestructiveExecutor()
+    catalog = _DestructiveCatalog(model)
+    agent = DynamicTaskAgent(
+        db,
+        catalog=catalog,
+        action_proposer=_DestructiveProposer(
+            snapshot.name,
+            snapshot.contract["canonical_target"],
+            snapshot.contract["target_checksum"],
+        ),
+        tool_executor=executor,
+    )
+
+    attention = agent.advance_next_local_step(
+        execution_id=instance.id,
+        model_config=model,
+        worker_id="destructive-prepare",
+        actor_user_id="requester",
+        step_kind="tool.destructive",
+    )
+    operation = db.exec(select(SopOperation)).one()
+    assert attention.attention_kind == "tool_approval"
+    assert operation.effect_kind == "destructive"
+    assert operation.status == "prepared"
+    assert operation.idempotency_scope == "instance"
+    assert operation.remote_idempotency_key
+    assert attention.payload_json["canonical_target"] == snapshot.contract["canonical_target"]
+    assert executor.calls == []
+
+    signal = _resolve(db, instance, attention, command="allow_once")
+    first = agent.resume_tool_approval_signal(
+        signal_id=signal.id,
+        model_config=model,
+        worker_id="destructive-dispatch",
+        actor_user_id="approver",
+    )
+    replay = agent.resume_tool_approval_signal(
+        signal_id=signal.id,
+        model_config=model,
+        worker_id="destructive-replay",
+        actor_user_id="approver",
+    )
+
+    db.refresh(operation)
+    assert first.status == replay.status == "succeeded"
+    assert operation.status == "succeeded"
+    assert operation.effect_state == "complete"
+    assert len(executor.calls) == 1
+    assert executor.calls[0]["remote_idempotency_key"] == operation.remote_idempotency_key
+    assert executor.calls[0]["arguments"] == {
+        "target": snapshot.contract["canonical_target"],
+        "target_checksum": snapshot.contract["target_checksum"],
+    }
+    assert catalog.reauthorize_calls == 1
+
+
+def test_destructive_timeout_parks_unknown_and_reconcile_never_resends(monkeypatch) -> None:
+    """destructive provider 超时必须进入人工对账，确认后继续且绝不二次派发。"""
+
+    db, instance, model, snapshot, _settings = _destructive_runtime(monkeypatch, allowed=True)
+    executor = _DestructiveExecutor(timeout=True)
+    proposer = _DestructiveProposer(
+        snapshot.name,
+        snapshot.contract["canonical_target"],
+        snapshot.contract["target_checksum"],
+    )
+    agent = DynamicTaskAgent(
+        db,
+        catalog=_DestructiveCatalog(model),
+        action_proposer=proposer,
+        tool_executor=executor,
+    )
+    approval = agent.advance_next_local_step(
+        execution_id=instance.id,
+        model_config=model,
+        worker_id="destructive-unknown-prepare",
+        actor_user_id="requester",
+        step_kind="tool.destructive",
+    )
+    approval_signal = _resolve(db, instance, approval, command="allow_once")
+    blocked = agent.resume_tool_approval_signal(
+        signal_id=approval_signal.id,
+        model_config=model,
+        worker_id="destructive-unknown-dispatch",
+        actor_user_id="approver",
+    )
+
+    operation = db.exec(select(SopOperation)).one()
+    exception = db.exec(
+        select(SopWorkItem).where(SopWorkItem.attention_kind == "exception")
+    ).one()
+    assert blocked.status == "waiting"
+    assert operation.status == "unknown"
+    assert exception.payload_json["effect_kind"] == "destructive"
+    assert len(executor.calls) == 1
+
+    reconcile_signal = _resolve(
+        db,
+        instance,
+        exception,
+        command="confirm_applied",
+        comment="隔离 provider 状态已核对",
+    )
+    outcome = agent.resume_write_reconciliation_signal(
+        signal_id=reconcile_signal.id,
+        model_config=model,
+        worker_id="destructive-reconcile",
+        actor_user_id="approver",
+    )
+
+    db.refresh(operation)
+    assert outcome.status == "succeeded"
+    assert operation.status == "succeeded"
+    assert operation.effect_state == "complete"
+    assert operation.cancellation_disposition == "reconciled"
+    assert len(executor.calls) == 1
+
+
+def _destructive_runtime(
+    monkeypatch,
+    *,
+    allowed: bool,
+) -> tuple[Session, SopInstance, ModelConfig, CapabilitySnapshot, SimpleNamespace]:
+    """创建带独立 destructive gate、逐次审批人和隔离目标的内存动态运行时。"""
+
+    settings = SimpleNamespace(
+        dynamic_task_explore_enabled=False,
+        dynamic_task_managed_workspace_enabled=True,
+        general_skill_agent_proposal_enabled=True,
+        dynamic_task_high_risk_destructive_allows=lambda _tenant, _agent: allowed,
+    )
+    monkeypatch.setattr("app.dynamic_tasks.agent.get_settings", lambda: settings)
+    engine = create_engine("sqlite://", poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    db = Session(engine, expire_on_commit=False)
+    model_facts = {
+        "protocol_version": "dynamic-v1",
+        "sdk_available": True,
+        "credentials_verified": True,
+        "tool_calling": True,
+        "structured_output": True,
+    }
+    model = ModelConfig(
+        id="model-destructive",
+        tenant_id="tenant_destructive",
+        name="Destructive isolation model",
+        api_key_encrypted="encrypted",
+        model="model-demo",
+        capability_snapshot_json=model_facts,
+        capability_checksum=capability_checksum(model_facts),
+        preflight_status="ready",
+    )
+    target = "disposable://fixture/object-1"
+    target_checksum = capability_checksum(target)
+    snapshot_payload = {
+        "capability_type": "tool",
+        "capability_id": "tool-disposable-delete",
+        "tenant_id": "tenant_destructive",
+        "name": "disposable.fixture_delete",
+        "contract": {
+            "risk_class": "destructive",
+            "side_effect": "external",
+            "confirmation_policy": "always",
+            "timeout_policy": "unknown",
+            "dynamic_task_enabled": False,
+            "destructive_dynamic_task_enabled": True,
+            "idempotency": {
+                "mode": "request_key",
+                "argument": None,
+                "remote_scope": "disposable-fixture",
+            },
+            "reconcile": {
+                "supported": True,
+                "tool_name": "disposable.fixture_status",
+                "reference_source": "output.operation_id",
+                "terminal_status_mapping": {
+                    "deleted": "complete",
+                    "already_deleted": "complete",
+                    "pending": "unknown",
+                },
+            },
+            "canonical_target": target,
+            "target_checksum": target_checksum,
+            "destructive_provider": "disposable",
+        },
+        "model_view": {
+            "name": "disposable.fixture_delete",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string"},
+                    "target_checksum": {"type": "string"},
+                },
+                "required": ["target", "target_checksum"],
+                "additionalProperties": False,
+            },
+            "output_schema": {"type": "object"},
+        },
+        "user_view": {"target": "隔离 disposable fixture"},
+        "audit_view": {"provider": "disposable", "fixture": True},
+    }
+    snapshot = CapabilitySnapshot(
+        **snapshot_payload,
+        agent_id="agent-destructive",
+        checksum=capability_checksum(snapshot_payload),
+    )
+    plan = NormalizedPlan(
+        goal="在隔离 provider 上处理 fixture",
+        success_criteria=(
+            SuccessCriterion(id="effect_applied", type="assertion", spec={"required": True}),
+        ),
+        steps=(
+            PlanStep(
+                step_key="destroy_fixture",
+                title="处理隔离 fixture",
+                kind="tool.destructive",
+                capability_refs=(snapshot.name,),
+            ),
+            PlanStep(
+                step_key="answer_result",
+                title="确认隔离处理结果",
+                kind="answer",
+                depends_on=("destroy_fixture",),
+            ),
+        ),
+        budget={"max_steps": 3, "max_tool_calls": 1, "max_model_calls": 4},
+    )
+    db.add_all(
+        [
+            Tenant(id="tenant_destructive", name="Destructive tenant"),
+            User(
+                id="requester",
+                tenant_id="tenant_destructive",
+                username="requester",
+                role="member",
+                password_hash="x",
+                membership_status="active",
+            ),
+            User(
+                id="approver",
+                tenant_id="tenant_destructive",
+                username="approver",
+                role="admin",
+                password_hash="x",
+                membership_status="active",
+            ),
+            AgentProfile(
+                id="agent-destructive",
+                tenant_id="tenant_destructive",
+                name="Destructive isolation Agent",
+                status="active",
+                owner_user_id="requester",
+            ),
+            model,
+        ]
+    )
+    db.flush()
+    instance = SopExecutionStore(db).start_dynamic_instance(
+        tenant_id="tenant_destructive",
+        session_id="session-destructive",
+        agent_id="agent-destructive",
+        initiator_user_id="requester",
+        plan=plan,
+        capability_snapshot={
+            "tools": [snapshot.model_dump(mode="json")],
+            "connectors": [],
+            "general_skills": [],
+            "knowledge": [],
+            "model": {
+                "model_config_id": model.id,
+                "capabilities": model_facts,
+                "checksum": model.capability_checksum,
+            },
+        },
+    )[0]
+    instance.context_json = {
+        "dynamic_budget_usage": {"model_calls": 0, "tool_calls": 0},
+    }
+    db.add(instance)
+    db.commit()
+    return db, instance, model, snapshot, settings
+
+
 def _write_runtime(
     monkeypatch,
     *,
@@ -690,7 +1159,10 @@ def _write_runtime(
 
     monkeypatch.setattr(
         "app.dynamic_tasks.agent.get_settings",
-        lambda: SimpleNamespace(dynamic_task_external_write_enabled=True),
+        lambda: SimpleNamespace(
+            dynamic_task_external_write_enabled=True,
+            dynamic_task_high_risk_external_write_allows=lambda _tenant, _agent: True,
+        ),
     )
     engine = create_engine("sqlite://", poolclass=StaticPool)
     SQLModel.metadata.create_all(engine)

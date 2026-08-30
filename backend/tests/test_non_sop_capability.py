@@ -63,8 +63,8 @@ class _ShadowSelector:
         return self.decision
 
 
-def test_empty_skill_and_knowledge_catalog_skips_remote_selector() -> None:
-    """无 Skill 且无知识候选时直接进入 shadow，避免空目录浪费长模型阶段预算。"""
+def test_empty_skill_and_knowledge_catalog_enters_primary_selector() -> None:
+    """无 Skill 且无知识候选时跳过旧 Skill 选择器，但仍进入动态主路由。"""
 
     general_selector = _GeneralSelector(GeneralSkillSelection())
     router = NonSopCapabilityRouter(
@@ -91,7 +91,10 @@ def test_empty_skill_and_knowledge_catalog_skips_remote_selector() -> None:
     )
 
     assert general_selector.calls == 0
-    assert result.shadow_attempted is True
+    assert result.primary_attempted is True
+    assert result.shadow_attempted is False
+    assert result.primary_decision is not None
+    assert result.primary_decision.mode == "dynamic_task"
     assert result.effective_decision.mode == "dynamic_task"
 
 
@@ -244,8 +247,10 @@ def test_selected_general_skill_and_dynamic_execution_are_orthogonal() -> None:
     assert result.selected_general_skill is not None
     assert result.selected_general_skill.slug == "weather-zh"
     assert result.effective_decision.mode == "dynamic_task"
-    assert result.shadow_decision is not None
-    assert result.shadow_decision.mode == "dynamic_task"
+    assert result.primary_decision is not None
+    assert result.primary_decision.mode == "dynamic_task"
+    assert result.shadow_decision is None
+    assert result.primary_attempted is True
     assert dynamic.calls == 1
 
 
@@ -279,8 +284,10 @@ def test_selected_general_skill_keeps_lightweight_answer_for_simple_request() ->
 
     assert result.selected_general_skill is not None
     assert result.effective_decision.mode == "general_skill"
-    assert result.shadow_decision is not None
-    assert result.shadow_decision.mode == "answer"
+    assert result.primary_decision is not None
+    assert result.primary_decision.mode == "answer"
+    assert result.shadow_decision is None
+    assert result.primary_attempted is True
     assert answer.calls == 1
 
 
@@ -374,8 +381,8 @@ def test_dynamic_task_is_shadow_only_in_batch_a() -> None:
     assert result.execution_created is False
 
 
-def test_dynamic_task_becomes_effective_only_with_separate_execution_kill_switch() -> None:
-    """验证 B1 执行开关与 shadow 开关分离，只有高置信完整任务可成为权威选择。"""
+def test_dynamic_task_becomes_effective_with_primary_execution_switch() -> None:
+    """验证执行主路由开关与 shadow 开关分离，高置信完整任务成为权威选择。"""
 
     result = _route(
         NonSopCapabilityRouter(
@@ -396,8 +403,49 @@ def test_dynamic_task_becomes_effective_only_with_separate_execution_kill_switch
     )
 
     assert result.effective_decision.mode == "dynamic_task"
-    assert result.shadow_decision is not None
+    assert result.primary_decision is not None
+    assert result.primary_decision.mode == "dynamic_task"
+    assert result.primary_attempted is True
+    assert result.shadow_decision is None
     assert result.execution_created is False
+
+
+def test_primary_and_shadow_are_independent_when_both_are_explicit() -> None:
+    """显式同时配置时主路由负责执行语义，shadow 只负责比较观测。"""
+
+    primary = _ShadowSelector(
+        NonSopCapabilityDecision(
+            mode="dynamic_task",
+            goal="主路由任务",
+            success_criteria=["主路由标准"],
+            confidence=0.95,
+        )
+    )
+    shadow = _ShadowSelector(
+        NonSopCapabilityDecision(
+            mode="answer",
+            confidence=0.95,
+            reason="shadow 仅供比较",
+        )
+    )
+
+    result = _route(
+        NonSopCapabilityRouter(
+            shadow_enabled=True,
+            execution_enabled=True,
+            primary_selector=primary,
+            shadow_selector=shadow,
+        ),
+        _GeneralSelector(GeneralSkillSelection()),
+    )
+
+    assert result.effective_decision.mode == "dynamic_task"
+    assert result.primary_decision is not None
+    assert result.primary_decision.mode == "dynamic_task"
+    assert result.shadow_decision is not None
+    assert result.shadow_decision.mode == "answer"
+    assert primary.calls == 1
+    assert shadow.calls == 1
 
 
 def test_agent_loop_delegates_effective_dynamic_route_without_copying_loop(monkeypatch) -> None:
@@ -853,6 +901,53 @@ def test_agent_loop_optional_dynamic_rollout_denial_can_fall_back(monkeypatch) -
     assert recorded[0][2] == "dynamic_task_rollout_denied"
     assert recorded[0][3]["reason_code"] == "DYNAMIC_TASK_ROLLOUT_DENIED"
     assert "生成风险简报" not in str(recorded)
+
+
+def test_runtime_capacity_denial_has_stable_capacity_code_without_model_quota_gate() -> None:
+    """运行容量为零时只返回容量错误，不把模型账户配额伪装成产品灰度门禁。"""
+
+    route = _route(
+        NonSopCapabilityRouter(
+            shadow_enabled=False,
+            execution_enabled=True,
+            shadow_selector=_ShadowSelector(
+                NonSopCapabilityDecision(
+                    mode="dynamic_task",
+                    goal="生成风险简报",
+                    success_criteria=["覆盖合同证据"],
+                    requires_durable_execution=True,
+                    confidence=0.95,
+                )
+            ),
+        ),
+        _GeneralSelector(GeneralSkillSelection()),
+    )
+    recorded: list[tuple] = []
+    loop = object.__new__(AgentLoop)
+    loop.db = SimpleNamespace()
+    loop.events = SimpleNamespace(record=lambda *args, **_kwargs: recorded.append(args))
+    loop._dynamic_task_rollout_allows = lambda _tenant, _agent: False
+    loop._dynamic_task_rollout_denial_code = "DYNAMIC_TASK_QUOTA_NOT_CONFIGURED"
+
+    with pytest.raises(DynamicTaskAgentError, match="DYNAMIC_TASK_QUOTA_NOT_CONFIGURED"):
+        loop._try_handle_dynamic_task(
+            ChatTurnRequest(
+                tenant_id="tenant_demo",
+                user_id="user_demo",
+                agent_id="agent_demo",
+                message="生成风险简报",
+            ),
+            ChatSession(
+                id="session_capacity_not_configured",
+                tenant_id="tenant_demo",
+                agent_id="agent_demo",
+            ),
+            SimpleNamespace(id="model_1"),
+            route,
+            "message_capacity_not_configured",
+        )
+
+    assert recorded[0][3]["reason_code"] == "DYNAMIC_TASK_QUOTA_NOT_CONFIGURED"
 
 
 def test_durable_dynamic_rollout_denial_fails_instead_of_fake_answer(monkeypatch) -> None:

@@ -17,6 +17,23 @@ class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class DisposableDestructiveFixtureRequest(StrictModel):
+    """描述一次只指向隔离 disposable fixture 的破坏性动作。"""
+
+    target: str = Field(min_length=1, max_length=512)
+    target_checksum: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class DisposableDestructiveFixtureResponse(StrictModel):
+    """返回 disposable fixture 的确定性效果状态与幂等操作身份。"""
+
+    target: str
+    target_checksum: str
+    effect_status: Literal["deleted", "already_deleted"]
+    destructive_provider: Literal["disposable"]
+    operation_id: str
+
+
 class RoomBookRequest(StrictModel):
     employee_id: str
     employee_name: str | None = None

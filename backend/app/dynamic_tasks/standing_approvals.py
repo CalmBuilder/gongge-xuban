@@ -405,9 +405,10 @@ def scheduled_write_snapshots(
 ) -> list[CapabilitySnapshot]:
     """仅为来源和规则仍完全匹配的调度运行投影精确企业微信写能力。"""
 
+    settings = get_settings()
     if not (
-        get_settings().dynamic_task_external_write_enabled
-        and get_settings().dynamic_task_standing_approval_enabled
+        settings.dynamic_task_high_risk_external_write_allows(tenant_id, agent_id)
+        and settings.dynamic_task_standing_approval_enabled
     ):
         return []
     run = db.get(ScheduledTaskRun, run_id)
@@ -454,7 +455,10 @@ def match_standing_approval_rule(
 
     settings = get_settings()
     if not (
-        settings.dynamic_task_external_write_enabled
+        settings.dynamic_task_high_risk_external_write_allows(
+            instance.tenant_id,
+            instance.agent_id,
+        )
         and settings.dynamic_task_standing_approval_enabled
         and instance.source_kind == "schedule"
     ):

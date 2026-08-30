@@ -192,6 +192,10 @@ def select_dynamic_budget(
         or total_sheets >= 3
         or total_slides >= 10
         or (resource_count > 0 and guidance_count > 0)
+        # 多 Skill 组合会为每个冻结原则产生结果回证，并可能在 answer 前触发
+        # 一次运行时 Skill 发现；它仍是普通 DynamicTask，只需要更大的运行时
+        # 预算，不能因为没有附件而被交互级/标准级预算截断。
+        or guidance_count >= 3
         or (resource_count > 0 and extended_goal)
         # 纯对话也可能是需要持久计划、恢复和结果核验的复杂任务。不能因为
         # 没有附件就把它压回 300 秒交互预算；用户目标本身是服务端可重放的

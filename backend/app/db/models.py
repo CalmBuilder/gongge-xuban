@@ -1769,7 +1769,7 @@ class SopOperation(SQLModel, table=True):
             name="ck_sop_operation_status",
         ),
         CheckConstraint(
-            "effect_kind IN ('read', 'local_write', 'execute', 'external_write', "
+            "effect_kind IN ('read', 'local_write', 'execute', 'external_write', 'destructive', "
             "'legacy_unknown')",
             name="ck_sop_operation_effect_kind",
         ),

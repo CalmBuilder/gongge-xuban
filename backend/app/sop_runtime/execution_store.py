@@ -77,6 +77,7 @@ ACTIVE_INSTANCE_STATUSES = (
     SopInstanceStatus.RUNNING.value,
     SopInstanceStatus.WAITING.value,
 )
+_EFFECTS_WITH_UNKNOWN_RECONCILIATION = frozenset({"external_write", "destructive"})
 
 
 class SopExecutionConflictError(ValueError):
@@ -179,7 +180,7 @@ class SopExecutionStore:
         worker_id: str,
         ttl_seconds: int = 30,
     ) -> Iterator[ExecutionLease]:
-        """仅为已进入外部效果对账流程的 Execution 开放一次受限恢复租约。"""
+        """仅为已进入 external_write 或 destructive 对账流程的 Execution 开放受限恢复租约。"""
 
         with self._owned(
             instance,
@@ -287,16 +288,18 @@ class SopExecutionStore:
         if _allow_archived_agent and not _allow_cancellation:
             raise SopExecutionConflictError("仅外部效果对账允许使用归档 Agent 的恢复租约。")
         if _allow_archived_agent:
-            unknown_external_write = self.db.exec(
+            unknown_effect = self.db.exec(
                 select(SopOperation.id).where(
                     SopOperation.tenant_id == instance.tenant_id,
                     SopOperation.instance_id == instance.id,
                     SopOperation.status == OperationStatus.UNKNOWN.value,
-                    SopOperation.effect_kind == "external_write",
+                    SopOperation.effect_kind.in_(_EFFECTS_WITH_UNKNOWN_RECONCILIATION),
                 )
             ).first()
-            if unknown_external_write is None:
-                raise SopExecutionConflictError("只有 unknown 外部写才允许使用对账恢复租约。")
+            if unknown_effect is None:
+                raise SopExecutionConflictError(
+                    "只有 unknown external_write 或 destructive 才允许使用对账恢复租约。"
+                )
         if not _allow_archived_agent and not self.lock_agent_for_runtime(instance):
             raise SopExecutionConflictError("SOP 实例所属 Agent 当前不可用。")
         database_now = self._database_now()
@@ -1324,8 +1327,16 @@ class SopExecutionStore:
 
         self._assert_execution_owner(instance, execution)
         self._guard_mutation(instance, "operation.prepare")
-        if effect_kind not in {"read", "local_write", "execute", "external_write"}:
-            raise ValueError("effect_kind 必须是 read、local_write、execute 或 external_write。")
+        if effect_kind not in {
+            "read",
+            "local_write",
+            "execute",
+            "external_write",
+            "destructive",
+        }:
+            raise ValueError(
+                "effect_kind 必须是 read、local_write、execute、external_write 或 destructive。"
+            )
         policy = idempotency_policy or IdempotencyPolicy()
         frozen_capability = dict(capability_snapshot or {})
         frozen_checksum = capability_checksum(frozen_capability) if frozen_capability else None
@@ -1398,7 +1409,7 @@ class SopExecutionStore:
                 request=request,
                 policy=policy,
             )
-            if effect_kind == "external_write"
+            if effect_kind in {"external_write", "destructive"}
             else None
         )
         operation = SopOperation(
@@ -1638,8 +1649,13 @@ class SopExecutionStore:
     ) -> None:
         """冻结一次性本地写/执行批准并进入 running；中断后可按幂等动作安全重派。"""
 
-        if operation.effect_kind not in {"local_write", "execute"} or operation.status != "prepared":
-            raise SopExecutionConflictError("只有 prepared 本地写或执行可以绑定批准并派发。")
+        if (
+            operation.effect_kind not in {"local_write", "execute", "destructive"}
+            or operation.status != "prepared"
+        ):
+            raise SopExecutionConflictError(
+                "只有 prepared 本地写、执行或 destructive 可以绑定批准并派发。"
+            )
         self.authorize_operation_skill_causes(operation)
         if (
             not approval_work_item_id.strip()
@@ -1704,7 +1720,7 @@ class SopExecutionStore:
             attempt.completed_at = operation.completed_at
             attempt.updated_at = operation.completed_at
             self.db.add(attempt)
-        if operation.effect_kind in {"local_write", "external_write"}:
+        if operation.effect_kind in {"local_write", "external_write", "destructive"}:
             operation.effect_state = "complete" if succeeded else "none"
             self._append_operation_effect(
                 operation,
@@ -1751,8 +1767,8 @@ class SopExecutionStore:
     ) -> None:
         """将已 dispatch 外部写标为效果未知，强制后续进入对账而非盲目重试。"""
 
-        if operation.effect_kind != "external_write":
-            raise SopExecutionConflictError("只有外部写操作可以进入 unknown 效果状态。")
+        if operation.effect_kind not in _EFFECTS_WITH_UNKNOWN_RECONCILIATION:
+            raise SopExecutionConflictError("只有可能产生外部效果的操作可以进入 unknown 效果状态。")
         self._guard_operation_mutation(operation, "operation.mark_unknown")
         transition = transition_operation(
             OperationStatus(operation.status),
@@ -1789,7 +1805,7 @@ class SopExecutionStore:
 
         if (
             operation.status != OperationStatus.RUNNING.value
-            or operation.effect_kind != "external_write"
+            or operation.effect_kind not in _EFFECTS_WITH_UNKNOWN_RECONCILIATION
             or operation.started_at is None
         ):
             return False
@@ -1879,7 +1895,7 @@ class SopExecutionStore:
             if operation.status == OperationStatus.PREPARED.value:
                 self.cancel_prepared_operation(operation)
             elif operation.status == OperationStatus.RUNNING.value:
-                if operation.effect_kind == "external_write":
+                if operation.effect_kind in _EFFECTS_WITH_UNKNOWN_RECONCILIATION:
                     self.mark_operation_unknown(
                         operation,
                         error={"code": "CANCELLED_WHILE_IN_FLIGHT"},
@@ -1891,11 +1907,11 @@ class SopExecutionStore:
             for operation in operations
             if (
                 operation.status == OperationStatus.UNKNOWN.value
-                and operation.effect_kind == "external_write"
+                and operation.effect_kind in _EFFECTS_WITH_UNKNOWN_RECONCILIATION
             )
         ]
         for operation in unknown_operations:
-            self._ensure_external_effect_reconciliation_attention(
+            self._ensure_effect_reconciliation_attention(
                 instance,
                 operation,
                 actor_user_id=actor_user_id,
@@ -1928,7 +1944,7 @@ class SopExecutionStore:
             )
         ).all()
         for signal in active_signals:
-            if self._is_external_reconciliation_signal(signal, instance):
+            if self._is_effect_reconciliation_signal(signal, instance):
                 continue
             signal.status = "discarded"
             signal.lease_owner = None
@@ -1962,13 +1978,30 @@ class SopExecutionStore:
         *,
         actor_user_id: str,
     ) -> SopWorkItem | None:
-        """为取消时新发现的 unknown 外部写补齐可办理的异常对账工作项。"""
+        """保持旧内部调用名，生成 external_write 的 unknown 对账工作项。"""
+
+        if operation.effect_kind != "external_write":
+            return None
+        return self._ensure_effect_reconciliation_attention(
+            instance,
+            operation,
+            actor_user_id=actor_user_id,
+        )
+
+    def _ensure_effect_reconciliation_attention(
+        self,
+        instance: SopInstance,
+        operation: SopOperation,
+        *,
+        actor_user_id: str,
+    ) -> SopWorkItem | None:
+        """为 unknown external/destructive 效果补齐可办理的异常对账工作项。"""
 
         if (
             operation.instance_id != instance.id
             or operation.tenant_id != instance.tenant_id
             or operation.status != OperationStatus.UNKNOWN.value
-            or operation.effect_kind != "external_write"
+            or operation.effect_kind not in _EFFECTS_WITH_UNKNOWN_RECONCILIATION
         ):
             return None
         existing = self.db.exec(
@@ -2002,48 +2035,72 @@ class SopExecutionStore:
         from app.sop_runtime.execution_control import ExecutionControlService
 
         control = ExecutionControlService(self.db, self)
+        is_destructive = operation.effect_kind == "destructive"
+        reconciliation_context_key = (
+            "destructive_effect_reconciliation"
+            if is_destructive
+            else "external_effect_reconciliation"
+        )
+        blocked_event_type = (
+            "destructive_reconciliation_blocked"
+            if is_destructive
+            else "external_write_reconciliation_blocked"
+        )
+        required_permission = "admin" if is_destructive else "connection_profile.manage"
 
-        candidate_user_ids = [
-            user.id
-            for user in self.db.exec(
-                select(User).where(
-                    User.tenant_id == instance.tenant_id,
-                    User.membership_status == "active",
+        if is_destructive:
+            candidate_user_ids = [
+                user.id
+                for user in self.db.exec(
+                    select(User).where(
+                        User.tenant_id == instance.tenant_id,
+                        User.membership_status == "active",
+                        User.role == "admin",
+                    )
+                ).all()
+            ]
+        else:
+            candidate_user_ids = [
+                user.id
+                for user in self.db.exec(
+                    select(User).where(
+                        User.tenant_id == instance.tenant_id,
+                        User.membership_status == "active",
+                    )
+                ).all()
+                if has_governance_permission(
+                    self.db,
+                    tenant_id=instance.tenant_id,
+                    user_id=user.id,
+                    permission_code="connection_profile.manage",
                 )
-            ).all()
-            if has_governance_permission(
-                self.db,
-                tenant_id=instance.tenant_id,
-                user_id=user.id,
-                permission_code="connection_profile.manage",
-            )
-        ]
+            ]
         if not candidate_user_ids:
             blocked = {
                 "status": "blocked_no_candidate",
                 "code": "RECONCILIATION_CANDIDATE_REQUIRED",
                 "operation_id": operation.id,
-                "required_permission": "connection_profile.manage",
+                "required_permission": required_permission,
                 "last_checked_at": now.isoformat(),
             }
             reconciliation = dict(
-                (instance.context_json or {}).get("external_effect_reconciliation") or {}
+                (instance.context_json or {}).get(reconciliation_context_key) or {}
             )
             if reconciliation.get(operation.id) != blocked:
                 reconciliation[operation.id] = blocked
                 instance.context_json = {
                     **(instance.context_json or {}),
-                    "external_effect_reconciliation": reconciliation,
+                    reconciliation_context_key: reconciliation,
                 }
                 self.db.add(instance)
                 control.append_execution_event(
                     instance,
-                    event_type="external_write_reconciliation_blocked",
+                    event_type=blocked_event_type,
                     causation_id=f"reconciliation-candidate:{operation.id}",
                     payload={
                         "operation_id": operation.id,
                         "code": blocked["code"],
-                        "required_permission": blocked["required_permission"],
+                        "required_permission": required_permission,
                     },
                 )
                 self.db.flush()
@@ -2052,11 +2109,25 @@ class SopExecutionStore:
         step_key = step.step_key if step is not None else operation.node_execution_id
         error_json = operation.error_json if isinstance(operation.error_json, dict) else {}
         error_code = str(error_json.get("code") or "CANCELLED_WHILE_IN_FLIGHT")
+        title = (
+            "核对 destructive 隔离 provider 是否已经生效"
+            if is_destructive
+            else "核对外部写入是否已经生效"
+        )
+        instruction = (
+            "请依据隔离 provider 的目标状态确认是否已生效；系统不会自动重发。"
+            if is_destructive
+            else "请依据外部系统证据确认是否已生效；系统不会自动重发。"
+        )
         attention, _ = control.offer_attention(
             instance,
             attention_kind="exception",
-            attention_key=f"{step_key}:write_unknown:{operation.id}",
-            title="核对外部写入是否已经生效",
+            attention_key=(
+                f"{step_key}:destructive_unknown:{operation.id}"
+                if is_destructive
+                else f"{step_key}:write_unknown:{operation.id}"
+            ),
+            title=title,
             payload={
                 "operation_id": operation.id,
                 "operation_name": operation.operation_name,
@@ -2064,7 +2135,8 @@ class SopExecutionStore:
                 "error_code": error_code,
                 "request_fingerprint": operation.request_fingerprint,
                 "cancellation_requested_by": actor_user_id,
-                "instruction": "请依据外部系统证据确认是否已生效；系统不会自动重发。",
+                "effect_kind": operation.effect_kind,
+                "instruction": instruction,
             },
             allowed_commands=["confirm_applied", "confirm_not_applied"],
             candidate_user_ids=candidate_user_ids,
@@ -2082,17 +2154,17 @@ class SopExecutionStore:
         ):
             self.wait_for_work_item(instance, step, work_item_id=attention.id)
         reconciliation = dict(
-            (instance.context_json or {}).get("external_effect_reconciliation") or {}
+            (instance.context_json or {}).get(reconciliation_context_key) or {}
         )
         reconciliation[operation.id] = {
             "status": "offered",
             "operation_id": operation.id,
             "attention_id": attention.id,
-            "required_permission": "connection_profile.manage",
+            "required_permission": required_permission,
         }
         instance.context_json = {
             **(instance.context_json or {}),
-            "external_effect_reconciliation": reconciliation,
+            reconciliation_context_key: reconciliation,
         }
         self.db.add(instance)
         self.db.flush()
@@ -2103,7 +2175,22 @@ class SopExecutionStore:
         signal: ExecutionSignal,
         instance: SopInstance,
     ) -> bool:
-        """判断 signal 是否精确指向当前实例的 unknown 外部写对账工作项。"""
+        """保持旧内部调用名，判断 external_write 对账 signal。"""
+
+        return self._is_effect_reconciliation_signal(
+            signal,
+            instance,
+            effect_kinds={"external_write"},
+        )
+
+    def _is_effect_reconciliation_signal(
+        self,
+        signal: ExecutionSignal,
+        instance: SopInstance,
+        *,
+        effect_kinds: set[str] | frozenset[str] = _EFFECTS_WITH_UNKNOWN_RECONCILIATION,
+    ) -> bool:
+        """判断 signal 是否精确指向当前实例的 unknown 效果对账工作项。"""
 
         if signal.signal_type != "attention_decided":
             return False
@@ -2120,7 +2207,7 @@ class SopExecutionStore:
             and operation.tenant_id == instance.tenant_id
             and operation.instance_id == instance.id
             and operation.status == OperationStatus.UNKNOWN.value
-            and operation.effect_kind == "external_write"
+            and operation.effect_kind in effect_kinds
         )
 
     def aggregate_effect_state(self, instance: SopInstance) -> str:
@@ -2130,7 +2217,7 @@ class SopExecutionStore:
             select(SopOperation).where(
                 SopOperation.tenant_id == instance.tenant_id,
                 SopOperation.instance_id == instance.id,
-                SopOperation.effect_kind == "external_write",
+                SopOperation.effect_kind.in_(tuple(_EFFECTS_WITH_UNKNOWN_RECONCILIATION)),
             )
         ).all()
         states = [operation.effect_state for operation in operations]

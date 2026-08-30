@@ -1,5 +1,5 @@
 """
-@Time       : 2026/08/28 13:20
+@Time       : 2026/08/30 13:20
 @Author     : zhanglp8181
 @File       : config.py
 @CallChain  : Environment/.env → Settings/get_settings → app/main/db/api
@@ -45,18 +45,21 @@ class Settings(BaseSettings):
     model_thinking_mode: str = ""
     model_thinking_models: str = ""
     dynamic_task_router_shadow_enabled: bool = False
-    dynamic_task_execution_enabled: bool = False
-    dynamic_task_steering_enabled: bool = False
-    dynamic_task_skill_loading_enabled: bool = False
-    dynamic_task_max_parallel_reads: int = Field(default=1, ge=1, le=8)
+    dynamic_task_execution_enabled: bool = True
+    dynamic_task_steering_enabled: bool = True
+    dynamic_task_skill_loading_enabled: bool = True
+    dynamic_task_max_parallel_reads: int = Field(default=2, ge=1, le=8)
     dynamic_task_parallel_dispatch_workers: int = Field(default=8, ge=1, le=64)
     dynamic_task_parallel_read_timeout_seconds: int = Field(default=120, ge=5, le=3600)
     dynamic_task_external_write_enabled: bool = False
+    dynamic_task_destructive_enabled: bool = False
+    dynamic_task_destructive_tenant_allowlist: str = ""
+    dynamic_task_destructive_agent_allowlist: str = ""
     dynamic_task_standing_approval_enabled: bool = False
-    dynamic_task_explore_enabled: bool = False
-    dynamic_task_managed_workspace_enabled: bool = False
+    dynamic_task_explore_enabled: bool = True
+    dynamic_task_managed_workspace_enabled: bool = True
     dynamic_task_managed_workspace_root: str = "./data/managed-code-workspaces"
-    general_skill_agent_proposal_enabled: bool = False
+    general_skill_agent_proposal_enabled: bool = True
     general_skill_agent_proposal_approval_ttl_seconds: int = Field(
         default=900, ge=30, le=86_400
     )
@@ -69,12 +72,12 @@ class Settings(BaseSettings):
     dynamic_task_alert_unknown_operation_threshold: int = Field(default=0, ge=0)
     dynamic_task_alert_publication_backlog_threshold: int = Field(default=0, ge=0)
     dynamic_task_alert_waiting_age_seconds: int = Field(default=0, ge=0)
-    dynamic_task_max_active_per_tenant: int = Field(default=0, ge=0, le=4096)
-    dynamic_task_max_active_per_agent: int = Field(default=0, ge=0, le=1024)
-    dynamic_task_max_active_per_user: int = Field(default=0, ge=0, le=256)
-    dynamic_task_max_active_per_tool: int = Field(default=0, ge=0, le=1024)
-    attachment_analysis_enabled: bool = False
-    attachment_parser_worker_enabled: bool = False
+    dynamic_task_max_active_per_tenant: int = Field(default=16, ge=0, le=4096)
+    dynamic_task_max_active_per_agent: int = Field(default=8, ge=0, le=1024)
+    dynamic_task_max_active_per_user: int = Field(default=4, ge=0, le=256)
+    dynamic_task_max_active_per_tool: int = Field(default=4, ge=0, le=1024)
+    attachment_analysis_enabled: bool = True
+    attachment_parser_worker_enabled: bool = True
     attachment_upload_chunk_bytes: int = Field(default=256 * 1024, ge=64 * 1024, le=1024 * 1024)
     attachment_max_file_bytes: int = Field(default=12 * 1024 * 1024, ge=1024, le=64 * 1024 * 1024)
     attachment_max_request_bytes: int = Field(default=48 * 1024 * 1024, ge=1024, le=128 * 1024 * 1024)
@@ -138,8 +141,8 @@ class Settings(BaseSettings):
     )
     general_skill_import_async_enabled: bool = True
     general_skill_resolver_v2_shadow: bool = False
-    general_skill_resolver_v2_enabled: bool = False
-    general_skill_dynamic_guidance_enabled: bool = False
+    general_skill_resolver_v2_enabled: bool = True
+    general_skill_dynamic_guidance_enabled: bool = True
     general_skill_catalog_top_k: int = Field(default=12, ge=1, le=24)
     general_skill_instruction_char_limit: int = Field(default=48_000, ge=1_000, le=96_000)
     general_skill_total_instruction_char_limit: int = Field(
@@ -172,20 +175,93 @@ class Settings(BaseSettings):
 
         return frozenset(item.strip() for item in value.split(",") if item.strip())
 
-    def dynamic_task_rollout_allows(self, tenant_id: str, agent_id: str) -> bool:
-        """要求总开关、双灰度名单和生产告警阈值同时就绪，任一缺失均默认拒绝。"""
+    @classmethod
+    def _allowlist_matches(cls, value: str, identifier: str, *, require_non_empty: bool) -> bool:
+        """判断标识是否命中指定名单，并区分普通空名单与高风险必填名单语义。"""
 
-        if (
-            not self.dynamic_task_execution_enabled
-            or not self.dynamic_task_alert_thresholds_configured
-            or not self.dynamic_task_quota_limits_configured
-        ):
-            return False
-        tenants = self._identifier_allowlist(self.dynamic_task_tenant_allowlist)
-        agents = self._identifier_allowlist(self.dynamic_task_agent_allowlist)
-        return ("*" in tenants or tenant_id in tenants) and (
-            "*" in agents or agent_id in agents
+        identifiers = cls._identifier_allowlist(value)
+        if not identifiers:
+            return not require_non_empty
+        return "*" in identifiers or identifier in identifiers
+
+    def dynamic_task_base_execution_allows(self, tenant_id: str, agent_id: str) -> bool:
+        """判断普通 DynamicTaskAgent 是否具备基础入场条件，不读取模型或告警额度。"""
+
+        return (
+            self.dynamic_task_execution_enabled
+            and self.dynamic_task_runtime_capacity_limits_configured
+            and self._allowlist_matches(
+                self.dynamic_task_tenant_allowlist,
+                tenant_id,
+                require_non_empty=False,
+            )
+            and self._allowlist_matches(
+                self.dynamic_task_agent_allowlist,
+                agent_id,
+                require_non_empty=False,
+            )
         )
+
+    def dynamic_task_high_risk_external_write_allows(
+        self,
+        tenant_id: str,
+        agent_id: str,
+        *,
+        blocking_critical_alert: bool = False,
+        permission_and_connection_checks_pass: bool = True,
+    ) -> bool:
+        """判断 external write 是否满足配置级高风险条件，实际 dispatch 仍需再次授权。"""
+
+        return (
+            self.dynamic_task_base_execution_allows(tenant_id, agent_id)
+            and self.dynamic_task_external_write_enabled
+            and self._allowlist_matches(
+                self.dynamic_task_tenant_allowlist,
+                tenant_id,
+                require_non_empty=True,
+            )
+            and self._allowlist_matches(
+                self.dynamic_task_agent_allowlist,
+                agent_id,
+                require_non_empty=True,
+            )
+            and self.dynamic_task_alert_thresholds_configured
+            and not blocking_critical_alert
+            and permission_and_connection_checks_pass
+        )
+
+    def dynamic_task_high_risk_destructive_allows(
+        self,
+        tenant_id: str,
+        agent_id: str,
+        *,
+        blocking_critical_alert: bool = False,
+        permission_and_connection_checks_pass: bool = True,
+    ) -> bool:
+        """判断 destructive 是否满足独立配置级高风险条件，禁止复用 external write 名单。"""
+
+        return (
+            self.dynamic_task_base_execution_allows(tenant_id, agent_id)
+            and self.dynamic_task_destructive_enabled
+            and self._allowlist_matches(
+                self.dynamic_task_destructive_tenant_allowlist,
+                tenant_id,
+                require_non_empty=True,
+            )
+            and self._allowlist_matches(
+                self.dynamic_task_destructive_agent_allowlist,
+                agent_id,
+                require_non_empty=True,
+            )
+            and self.dynamic_task_alert_thresholds_configured
+            and not blocking_critical_alert
+            and permission_and_connection_checks_pass
+        )
+
+    def dynamic_task_rollout_allows(self, tenant_id: str, agent_id: str) -> bool:
+        """兼容旧调用方，转发到普通动态基础 gate；不再承担高风险发布门禁。"""
+
+        return self.dynamic_task_base_execution_allows(tenant_id, agent_id)
 
     @property
     def dynamic_task_alert_thresholds_configured(self) -> bool:
@@ -204,7 +280,13 @@ class Settings(BaseSettings):
 
     @property
     def dynamic_task_quota_limits_configured(self) -> bool:
-        """要求 tenant、Agent、用户和工具四级上限均为正数，零表示发布门禁未就绪。"""
+        """兼容旧字段名，表示四级运行时容量槽位均为有限正数，不表示模型配额。"""
+
+        return self.dynamic_task_runtime_capacity_limits_configured
+
+    @property
+    def dynamic_task_runtime_capacity_limits_configured(self) -> bool:
+        """判断 tenant、Agent、用户和工具四级运行时容量是否均为有限正数。"""
 
         return all(
             value > 0

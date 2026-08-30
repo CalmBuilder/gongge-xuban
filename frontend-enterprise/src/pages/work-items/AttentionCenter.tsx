@@ -416,8 +416,21 @@ export default function AttentionCenter() {
                 </p>
               ) : null}
               {selected.kind === 'tool_approval' ? (
-                <div className="grid gap-[9px] rounded-[12px] border border-[#dce5ff] bg-[#fbfcff] px-[13px] py-[12px]" aria-label={isWorkspaceApproval(selected) ? '待批准受管代码操作' : '待批准外部写'}>
-                  {isWorkspaceApproval(selected) ? (
+                <div className="grid gap-[9px] rounded-[12px] border border-[#dce5ff] bg-[#fbfcff] px-[13px] py-[12px]" aria-label={isDestructiveApproval(selected) ? '待批准 destructive 操作' : isWorkspaceApproval(selected) ? '待批准受管代码操作' : '待批准外部写'}>
+                  {isDestructiveApproval(selected) ? (
+                    <>
+                      <div className="flex flex-wrap items-center justify-between gap-[10px] gg-type-caption text-[#68738d]">
+                        <span>固定目标：{stringPayload(selected, 'canonical_target') || '未标识'}</span>
+                        <code className="font-mono gg-type-code">{stringPayload(selected, 'destructive_provider') || '未标识'}</code>
+                      </div>
+                      <div className="grid gap-[6px] rounded-[9px] bg-white p-[10px] gg-type-meta text-[#283044]">
+                        <span>目标摘要：<code className="break-all font-mono">{stringPayload(selected, 'target_checksum') || '未提供'}</code></span>
+                        <span>远端幂等键：<code className="break-all font-mono">{stringPayload(selected, 'remote_idempotency_key') || '由 Execution 冻结'}</code></span>
+                        <pre className="max-h-[220px] overflow-auto whitespace-pre-wrap break-words border-t border-[#edf0f5] pt-[8px]">{JSON.stringify(selected.payload.arguments || {}, null, 2)}</pre>
+                      </div>
+                      <p className="gg-type-caption text-[#6a7388]">只允许在固定目标和隔离 provider 上批准本次 destructive 操作；批准不会转成长期授权，目标或摘要变化后必须重新确认。</p>
+                    </>
+                  ) : isWorkspaceApproval(selected) ? (
                     <>
                       <div className="flex flex-wrap items-center justify-between gap-[10px] gg-type-caption text-[#68738d]">
                         <span>受管工作区：{workspaceField(selected, 'workspace_id') || '未标识'} · 基线 {workspaceField(selected, 'base_ref') || '未标识'}</span>
@@ -527,8 +540,8 @@ export default function AttentionCenter() {
                 <Button variant="outline" disabled={acting} onClick={() => setSelected(null)}>关闭</Button>
                 {selected.available_commands.includes('cancel') ? <Button variant="outline" disabled={acting} onClick={() => void resolve('cancel')}>取消任务</Button> : null}
                 {selected.available_commands.includes('answer') ? <Button disabled={acting} onClick={() => void resolve('answer')} className="bg-[#3157e8] text-white hover:bg-[#244bc7]">补充并继续</Button> : null}
-                {selected.available_commands.includes('deny') ? <Button variant="outline" disabled={acting} onClick={() => void resolve('deny')}>{selected.kind === 'publication' ? '拒绝提案' : isWorkspaceApproval(selected) ? '拒绝操作' : '拒绝发送'}</Button> : null}
-                {selected.available_commands.includes('allow_once') ? <Button disabled={acting} onClick={() => void resolve('allow_once')} className="bg-[#3157e8] text-white hover:bg-[#244bc7]">{selected.kind === 'publication' ? '批准并发布' : isWorkspaceApproval(selected) ? '仅批准本次操作' : '仅批准本次发送'}</Button> : null}
+                {selected.available_commands.includes('deny') ? <Button variant="outline" disabled={acting} onClick={() => void resolve('deny')}>{selected.kind === 'publication' ? '拒绝提案' : isDestructiveApproval(selected) ? '拒绝 destructive 操作' : isWorkspaceApproval(selected) ? '拒绝操作' : '拒绝发送'}</Button> : null}
+                {selected.available_commands.includes('allow_once') ? <Button disabled={acting} onClick={() => void resolve('allow_once')} className="bg-[#3157e8] text-white hover:bg-[#244bc7]">{selected.kind === 'publication' ? '批准并发布' : isDestructiveApproval(selected) ? '仅批准本次 destructive 操作' : isWorkspaceApproval(selected) ? '仅批准本次操作' : '仅批准本次发送'}</Button> : null}
                 {selected.available_commands.includes('reject') ? <Button variant="outline" disabled={acting} onClick={() => void resolve('reject')}>拒绝组织发布</Button> : null}
                 {selected.available_commands.includes('approve') ? <Button disabled={acting} onClick={() => void resolve('approve')} className="bg-[#3157e8] text-white hover:bg-[#244bc7]">批准发布到组织广场</Button> : null}
                 {selected.available_commands.includes('confirm_not_applied') ? <Button variant="outline" disabled={acting} onClick={() => void resolve('confirm_not_applied')}>确认未送达</Button> : null}
@@ -584,7 +597,9 @@ function attentionQuestion(item: AttentionItem): string {
     const provider = stringPayload(item, 'provider') === 'wecom' ? '企业微信应用' : 'Slack 账号';
     return `${provider} ${accountId || '未知'} 需要重新授权${reasonCode ? `（${reasonCode}）` : ''}`;
   }
-  if (item.kind === 'tool_approval') return isWorkspaceApproval(item)
+  if (item.kind === 'tool_approval') return isDestructiveApproval(item)
+    ? '请核对固定目标、目标摘要、隔离 provider 与远端幂等边界，再决定是否批准本次 destructive 操作。'
+    : isWorkspaceApproval(item)
     ? '请核对受管工作区、固定动作和精确参数，再决定是否批准本次代码操作。'
     : '请核对下方精确正文，并决定是否仅批准本次企业微信发送。';
   if (item.kind === 'publication') return '请核对完整 Skill diff、请求权限和受管 Artifact 来源，再决定是否发布到当前分身。';
@@ -623,7 +638,18 @@ function stringArrayPayload(item: AttentionItem, key: string): string[] {
 function isWorkspaceApproval(item: AttentionItem): boolean {
   /** 只根据服务端冻结的 workspace 对象切换展示，不从标题或操作名猜测风险类别。 */
 
-  return Boolean(item.payload.workspace && typeof item.payload.workspace === 'object' && !Array.isArray(item.payload.workspace));
+  return !isDestructiveApproval(item) && Boolean(
+    item.payload.workspace
+    && typeof item.payload.workspace === 'object'
+    && !Array.isArray(item.payload.workspace)
+    && (workspaceField(item, 'workspace_id') || workspaceField(item, 'handler')),
+  );
+}
+
+function isDestructiveApproval(item: AttentionItem): boolean {
+  /** 以服务端冻结的 risk_class 区分 destructive，避免空 workspace 被误判为代码审批。 */
+
+  return item.kind === 'tool_approval' && stringPayload(item, 'risk_class') === 'destructive';
 }
 
 function workspaceField(item: AttentionItem, key: string): string {

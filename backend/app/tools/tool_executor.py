@@ -37,6 +37,7 @@ from app.security.outbound import (
     allowed_hosts_from_settings,
     prepare_outbound_request,
 )
+from app.dynamic_tasks.capability_catalog import ToolReliabilityContract
 from app.tools.http_request import prepare_get_request
 from app.tools.builtin_tools import execute_builtin_tool
 from app.tools.mcp_client import MCPClientError, execute_mcp_tool
@@ -89,6 +90,13 @@ class ToolExecutor:
             return self._error(tool_call.name, "NOT_FOUND", "工具不存在或未配置。")
         if not tool.enabled:
             return self._error(tool.name, "DISABLED", "工具当前未启用。")
+        destructive_error = self._validate_destructive_dispatch(
+            tool,
+            tool_call.arguments,
+            remote_idempotency_key=remote_idempotency_key,
+        )
+        if destructive_error is not None:
+            return destructive_error
         if agent_id and tool.id not in {
             row.id
             for row in visible_tool_rows(self.db, tenant_id, agent_id, include_inactive=False)
@@ -416,6 +424,69 @@ class ToolExecutor:
         if decision is None:
             return result
         return result.model_copy(update={"authorization_context": decision.as_dict()})
+
+    def _validate_destructive_dispatch(
+        self,
+        tool: Tool,
+        arguments: dict[str, Any],
+        *,
+        remote_idempotency_key: str | None,
+    ) -> ToolResult | None:
+        """把 destructive 真实派发限制在固定目标、幂等键和隔离 provider 内。"""
+
+        raw_contract = tool.reliability_contract_json
+        if not isinstance(raw_contract, dict) or not raw_contract:
+            return None
+        try:
+            contract = ToolReliabilityContract.model_validate(raw_contract)
+        except (TypeError, ValueError):
+            return self._error(tool.name, "DESTRUCTIVE_CONTRACT_INVALID", "破坏性工具契约无效。")
+        if contract.risk_class != "destructive":
+            return None
+        if not contract.destructive_dynamic_task_enabled:
+            return self._error(tool.name, "DESTRUCTIVE_NOT_PUBLISHED", "破坏性工具未发布。")
+        if not remote_idempotency_key:
+            return self._error(
+                tool.name,
+                "DESTRUCTIVE_IDEMPOTENCY_KEY_MISSING",
+                "破坏性操作缺少远端幂等键。",
+            )
+        if (
+            arguments.get("target") != contract.canonical_target
+            or arguments.get("target_checksum") != contract.target_checksum
+        ):
+            return self._error(
+                tool.name,
+                "DESTRUCTIVE_TARGET_MISMATCH",
+                "破坏性操作目标与冻结目标不一致。",
+            )
+        normalized_url = self._normalize_tool_url(tool.url)
+        if contract.destructive_provider == "disposable":
+            target = urlsplit(normalized_url)
+            if (
+                (tool.tool_type or "http") != "http"
+                or not self._is_internal_mock_url(normalized_url)
+                or not target.path.startswith("/api/mock/destructive/")
+            ):
+                return self._error(
+                    tool.name,
+                    "DESTRUCTIVE_PROVIDER_NOT_ISOLATED",
+                    "disposable provider 必须是同源隔离测试资源。",
+                )
+        elif contract.destructive_provider == "isolated":
+            if (tool.config_json or {}).get("isolated_provider") is not True:
+                return self._error(
+                    tool.name,
+                    "DESTRUCTIVE_PROVIDER_NOT_ISOLATED",
+                    "isolated provider 缺少隔离声明。",
+                )
+        else:
+            return self._error(
+                tool.name,
+                "DESTRUCTIVE_PROVIDER_NOT_ISOLATED",
+                "破坏性 provider 不在隔离白名单内。",
+            )
+        return None
 
     def _execute_mcp_tool(
         self,

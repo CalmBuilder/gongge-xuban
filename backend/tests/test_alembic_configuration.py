@@ -21,7 +21,7 @@ def test_alembic_has_single_expected_head_and_baseline() -> None:
     config = Config(str(BACKEND_DIR / "alembic.ini"))
     script = ScriptDirectory.from_config(config)
 
-    assert script.get_heads() == ["20260830_0076"]
+    assert script.get_heads() == ["20260830_0077"]
     member_lifecycle = script.get_revision("20260728_0016")
     assert member_lifecycle.down_revision == "20260727_0015"
     organization_units = script.get_revision("20260728_0017")
@@ -116,6 +116,8 @@ def test_alembic_has_single_expected_head_and_baseline() -> None:
     assert platform_general_skill_catalog.down_revision == "20260829_0074"
     skill_revision_localization = script.get_revision("20260830_0076")
     assert skill_revision_localization.down_revision == "20260830_0075"
+    destructive_operation_kind = script.get_revision("20260830_0077")
+    assert destructive_operation_kind.down_revision == "20260830_0076"
     approval_requests = script.get_revision("20260727_0015")
     assert approval_requests.down_revision == "20260727_0014"
     unique_default_model = script.get_revision("20260727_0014")

@@ -202,6 +202,10 @@ class ToolReliabilityContract(BaseModel):
     applicability: CapabilityApplicabilityContract | None = None
     timeout_policy: Literal["failed", "unknown"]
     dynamic_task_enabled: bool = False
+    destructive_dynamic_task_enabled: bool = False
+    canonical_target: str | None = Field(default=None, max_length=512)
+    target_checksum: str | None = Field(default=None, max_length=128)
+    destructive_provider: Literal["disposable", "isolated"] | None = None
     explore_safe: bool = False
     parallel_safe: bool = False
     concurrency_key: str | None = Field(default=None, max_length=128)
@@ -232,10 +236,27 @@ class ToolReliabilityContract(BaseModel):
             raise ValueError("外部副作用超时必须进入 unknown")
         if self.risk_class == "external_write" and self.confirmation_policy == "none":
             raise ValueError("外部写不得无确认策略")
-        if self.risk_class == "destructive" and self.confirmation_policy != "forbidden":
-            raise ValueError("首期破坏性能力必须禁止")
-        if self.dynamic_task_enabled and self.risk_class == "destructive":
-            raise ValueError("破坏性能力不得进入首期动态目录")
+        if self.risk_class == "destructive":
+            if self.dynamic_task_enabled:
+                raise ValueError("破坏性能力不得复用普通动态目录开关")
+            if self.destructive_dynamic_task_enabled and (
+                self.confirmation_policy != "always"
+                or self.idempotency.mode == "none"
+                or not self.reconcile.supported
+                or not (self.canonical_target or "").strip()
+                or not (self.target_checksum or "").strip()
+                or self.destructive_provider is None
+            ):
+                raise ValueError(
+                    "destructive 灰度能力必须具备每次人工确认、幂等、对账、固定目标和隔离 provider"
+                )
+        elif self.destructive_dynamic_task_enabled:
+            raise ValueError("只有 risk_class=destructive 才能启用 destructive 动态能力")
+        if self.risk_class != "destructive" and any(
+            value is not None
+            for value in (self.canonical_target, self.target_checksum, self.destructive_provider)
+        ):
+            raise ValueError("非 destructive 能力不得声明 destructive 目标或 provider")
         if self.explore_safe and (
             not self.dynamic_task_enabled
             or self.risk_class != "read"
@@ -309,6 +330,14 @@ def _tool_contract_payload(contract: ToolReliabilityContract) -> dict[str, Any]:
         payload.pop("parallel_safe", None)
         payload.pop("concurrency_key", None)
         payload.pop("max_in_flight", None)
+    if payload.get("destructive_dynamic_task_enabled") is False:
+        payload.pop("destructive_dynamic_task_enabled", None)
+    if payload.get("canonical_target") is None:
+        payload.pop("canonical_target", None)
+    if payload.get("target_checksum") is None:
+        payload.pop("target_checksum", None)
+    if payload.get("destructive_provider") is None:
+        payload.pop("destructive_provider", None)
     return payload
 
 
@@ -408,11 +437,20 @@ class DynamicCapabilityCatalog:
         snapshots: list[CapabilitySnapshot] = []
         for tool in visible_tool_rows(self.db, tenant_id, agent_id, include_inactive=False):
             contract = self._published_tool_contract(tool)
-            if contract is None or contract.risk_class not in {
+            ordinary_tool = contract is not None and contract.risk_class in {
                 "read",
                 "local_write",
                 "execute",
-            }:
+            }
+            destructive_tool = contract is not None and (
+                contract.risk_class == "destructive"
+                and contract.destructive_dynamic_task_enabled
+                and get_settings().dynamic_task_high_risk_destructive_allows(
+                    tenant_id,
+                    agent_id,
+                )
+            )
+            if not ordinary_tool and not destructive_tool:
                 continue
             snapshots.append(self._tool_snapshot(tool, agent_id, contract))
         return snapshots
@@ -1148,7 +1186,7 @@ class DynamicCapabilityCatalog:
             contract = ToolReliabilityContract.model_validate(raw)
         except (TypeError, ValueError):
             return None
-        return contract if contract.dynamic_task_enabled else None
+        return contract if contract.dynamic_task_enabled or contract.destructive_dynamic_task_enabled else None
 
     @staticmethod
     def _tool_snapshot(

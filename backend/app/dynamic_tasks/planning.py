@@ -228,7 +228,7 @@ class DynamicPlanDraftStep(PlanningContract):
     title: str = Field(min_length=1, max_length=256)
     kind: str = Field(
         pattern=(
-            r"^(tool\.read|tool\.write|tool\.execute|knowledge|explore|answer|clarification)$"
+            r"^(tool\.read|tool\.write|tool\.execute|tool\.destructive|knowledge|explore|answer|clarification)$"
         )
     )
     required: bool = True
@@ -299,7 +299,15 @@ def normalize_plan_draft(
     if len(draft.steps) > max_steps:
         raise ValueError("动态计划步骤超过服务端预算")
     capability_steps = sum(
-        step.kind in {"tool.read", "tool.write", "tool.execute", "knowledge", "explore"}
+        step.kind
+        in {
+            "tool.read",
+            "tool.write",
+            "tool.execute",
+            "tool.destructive",
+            "knowledge",
+            "explore",
+        }
         for step in draft.steps
     )
     if capability_steps > max_tool_calls:
@@ -350,6 +358,7 @@ def normalize_plan_draft(
                     "tool.read",
                     "tool.write",
                     "tool.execute",
+                    "tool.destructive",
                     "knowledge",
                     "explore",
                     "answer",

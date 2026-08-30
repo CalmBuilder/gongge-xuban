@@ -140,7 +140,7 @@ from app.sop_runtime.execution_store import (
     SopExecutionSkillAuthorizationError,
     SopExecutionStore,
 )
-from app.sop_runtime.contracts import IdempotencyPolicy
+from app.sop_runtime.contracts import IdempotencyPolicy, IdempotencyScope
 from app.tools.tool_executor import ToolExecutor
 from app.tools.tool_schema import ToolCall, ToolError, ToolResult
 
@@ -247,7 +247,7 @@ class DynamicToolExecutor(Protocol):
 
 
 class DynamicTaskAgent:
-    """首期仅串行执行已冻结、实时再授权的 read tool proposal。"""
+    """推进已冻结并实时再授权的动态步骤，含普通能力与独立高风险动作。"""
 
     def __init__(
         self,
@@ -956,6 +956,26 @@ class DynamicTaskAgent:
                     worker_id=worker_id,
                     actor_user_id=actor_user_id,
                     step_kind="tool.execute",
+                )
+                if resume_signal_id is not None:
+                    self._consume_resume_signal(
+                        instance,
+                        signal_id=resume_signal_id,
+                        worker_id=signal_worker_id or worker_id,
+                    )
+                self.db.commit()
+                return DynamicRunOutcome(
+                    "waiting",
+                    instance.id,
+                    blocking_step_key=step.step_key if attention is not None else None,
+                )
+            if step.kind == "tool.destructive":
+                attention = self.advance_next_local_step(
+                    execution_id=instance.id,
+                    model_config=model_config,
+                    worker_id=worker_id,
+                    actor_user_id=actor_user_id,
+                    step_kind="tool.destructive",
                 )
                 if resume_signal_id is not None:
                     self._consume_resume_signal(
@@ -1811,11 +1831,14 @@ class DynamicTaskAgent:
     ) -> SopWorkItem | None:
         """冻结 external-write；精确长期规则命中时派发，否则创建一次性审批。"""
 
-        if not get_settings().dynamic_task_external_write_enabled:
-            raise DynamicTaskAgentError("DYNAMIC_EXTERNAL_WRITE_DISABLED")
         instance = self.db.get(SopInstance, execution_id)
         if instance is None or instance.kind != "dynamic_task":
             raise DynamicTaskAgentError("DYNAMIC_EXECUTION_NOT_FOUND")
+        if not get_settings().dynamic_task_high_risk_external_write_allows(
+            instance.tenant_id,
+            instance.agent_id,
+        ):
+            raise DynamicTaskAgentError("DYNAMIC_EXTERNAL_WRITE_DISABLED")
         dispatch: tuple[
             StandingApprovalMatch,
             SopNodeExecution,
@@ -2028,17 +2051,30 @@ class DynamicTaskAgent:
     ) -> SopWorkItem:
         """冻结受管工作区本地写或隔离检查，并始终创建一次性人工批准。"""
 
-        if not (
-            get_settings().dynamic_task_managed_workspace_enabled
-            or get_settings().general_skill_agent_proposal_enabled
-        ):
-            raise DynamicTaskAgentError("DYNAMIC_MANAGED_WORKSPACE_DISABLED")
-        if step_kind not in {"tool.write", "tool.execute"}:
+        if step_kind not in {"tool.write", "tool.execute", "tool.destructive"}:
             raise DynamicTaskAgentError("DYNAMIC_LOCAL_STEP_KIND_INVALID")
         instance = self.db.get(SopInstance, execution_id)
         if instance is None or instance.kind != "dynamic_task":
             raise DynamicTaskAgentError("DYNAMIC_EXECUTION_NOT_FOUND")
-        expected_effect = "local_write" if step_kind == "tool.write" else "execute"
+        settings = get_settings()
+        if step_kind == "tool.destructive":
+            if not settings.dynamic_task_high_risk_destructive_allows(
+                instance.tenant_id,
+                instance.agent_id,
+            ):
+                raise DynamicTaskAgentError("DYNAMIC_DESTRUCTIVE_DISABLED")
+        elif not (
+            settings.dynamic_task_managed_workspace_enabled
+            or settings.general_skill_agent_proposal_enabled
+        ):
+            raise DynamicTaskAgentError("DYNAMIC_MANAGED_WORKSPACE_DISABLED")
+        expected_effect = (
+            "local_write"
+            if step_kind == "tool.write"
+            else "execute"
+            if step_kind == "tool.execute"
+            else "destructive"
+        )
         with self.store.owned(instance, worker_id=worker_id):
             plan = self._current_plan(instance)
             completed_keys = self._completed_step_keys(instance)
@@ -2129,20 +2165,29 @@ class DynamicTaskAgent:
             if proposal.action_kind.value != "call_tool":
                 raise DynamicTaskAgentError("DYNAMIC_LOCAL_ACTION_REQUIRED")
             capability_ref = str(proposal.capability_ref or "")
-            snapshot = self._frozen_local_snapshot(
-                instance,
-                capability_ref,
-                expected_risk=expected_effect,
+            snapshot = (
+                self._frozen_destructive_snapshot(instance, capability_ref)
+                if expected_effect == "destructive"
+                else self._frozen_local_snapshot(
+                    instance,
+                    capability_ref,
+                    expected_risk=expected_effect,
+                )
             )
             arguments = dict(proposal.arguments)
             self._validate_workspace_arguments(snapshot, arguments)
+            idempotency_policy = (
+                self._destructive_idempotency_policy(snapshot)
+                if expected_effect == "destructive"
+                else IdempotencyPolicy()
+            )
             operation, _ = self.store.prepare_operation_from_proposal(
                 instance,
                 step,
                 action_record,
                 operation_name=capability_ref,
                 request=arguments,
-                idempotency_policy=IdempotencyPolicy(),
+                idempotency_policy=idempotency_policy,
                 effect_kind=expected_effect,
                 caused_by_skill_use_ids=definition.guidance_skill_use_ids,
                 capability_snapshot=snapshot.model_dump(
@@ -2196,6 +2241,10 @@ class DynamicTaskAgent:
             "arguments": dict(arguments),
             "request_fingerprint": operation.request_fingerprint,
             "capability_checksum": snapshot.checksum,
+            "risk_class": operation.effect_kind,
+            "canonical_target": snapshot.contract.get("canonical_target"),
+            "target_checksum": snapshot.contract.get("target_checksum"),
+            "destructive_provider": snapshot.contract.get("destructive_provider"),
             "workspace": dict(snapshot.audit_view.get("managed_workspace") or {}),
             "execution_id": instance.id,
             "plan_revision_id": instance.current_plan_revision_id,
@@ -2228,7 +2277,9 @@ class DynamicTaskAgent:
                 "审核并发布当前分身提出的 Skill"
                 if is_skill_proposal
                 else (
-                    "批准受管代码工作区执行检查"
+                    "批准 destructive 隔离 provider 单次操作"
+                    if operation.effect_kind == "destructive"
+                    else "批准受管代码工作区执行检查"
                     if operation.effect_kind == "execute"
                     else "批准受管代码工作区变更"
                 )
@@ -2554,6 +2605,7 @@ class DynamicTaskAgent:
         if operation_probe is not None and operation_probe.effect_kind in {
             "local_write",
             "execute",
+            "destructive",
         }:
             return self._resume_local_tool_approval_signal(
                 signal=signal,
@@ -2651,7 +2703,10 @@ class DynamicTaskAgent:
                 return DynamicRunOutcome("failed", instance.id)
             if command != "allow_once":
                 raise DynamicTaskAgentError("DYNAMIC_TOOL_APPROVAL_COMMAND_INVALID")
-            if not get_settings().dynamic_task_external_write_enabled:
+            if not get_settings().dynamic_task_high_risk_external_write_allows(
+                instance.tenant_id,
+                instance.agent_id,
+            ):
                 raise DynamicTaskAgentError("DYNAMIC_EXTERNAL_WRITE_DISABLED")
             payload = dict(attention.payload_json or {})
             frozen_fingerprint = str(payload.pop("approval_fingerprint", ""))
@@ -2807,11 +2862,7 @@ class DynamicTaskAgent:
     ) -> DynamicRunOutcome:
         """办理或恢复本地一次性审批；running 中断按内容幂等契约安全重派。"""
 
-        if not (
-            get_settings().dynamic_task_managed_workspace_enabled
-            or get_settings().general_skill_agent_proposal_enabled
-        ):
-            raise DynamicTaskAgentError("DYNAMIC_MANAGED_WORKSPACE_DISABLED")
+        settings = get_settings()
         if signal.status == "consumed":
             if instance.status in {"failed", "cancelled", "timed_out"}:
                 return DynamicRunOutcome(instance.status, instance.id)
@@ -2852,9 +2903,20 @@ class DynamicTaskAgent:
                 or step is None
                 or operation.instance_id != instance.id
                 or operation.node_execution_id != step.id
-                or operation.effect_kind not in {"local_write", "execute"}
+                or operation.effect_kind not in {"local_write", "execute", "destructive"}
             ):
                 raise DynamicTaskAgentError("DYNAMIC_TOOL_APPROVAL_OPERATION_INVALID")
+            if operation.effect_kind == "destructive":
+                if not settings.dynamic_task_high_risk_destructive_allows(
+                    instance.tenant_id,
+                    instance.agent_id,
+                ):
+                    raise DynamicTaskAgentError("DYNAMIC_DESTRUCTIVE_DISABLED")
+            elif not (
+                settings.dynamic_task_managed_workspace_enabled
+                or settings.general_skill_agent_proposal_enabled
+            ):
+                raise DynamicTaskAgentError("DYNAMIC_MANAGED_WORKSPACE_DISABLED")
             if operation.status == "succeeded" and step.status == "succeeded":
                 self.db.commit()
                 return self.run_until_blocked_or_complete(
@@ -2904,10 +2966,14 @@ class DynamicTaskAgent:
                 ):
                     raise DynamicTaskAgentError("DYNAMIC_TOOL_APPROVAL_FINGERPRINT_INVALID")
                 expected_risk = operation.effect_kind
-                snapshot = self._frozen_local_snapshot(
-                    instance,
-                    operation.operation_name,
-                    expected_risk=expected_risk,
+                snapshot = (
+                    self._frozen_destructive_snapshot(instance, operation.operation_name)
+                    if expected_risk == "destructive"
+                    else self._frozen_local_snapshot(
+                        instance,
+                        operation.operation_name,
+                        expected_risk=expected_risk,
+                    )
                 )
                 if payload.get("capability_checksum") != snapshot.checksum:
                     raise DynamicTaskAgentError("DYNAMIC_TOOL_APPROVAL_CAPABILITY_CHANGED")
@@ -2964,10 +3030,14 @@ class DynamicTaskAgent:
                     )
                 self._consume_call_budget(instance, "tool_calls")
             elif operation.status == "running" and step.status == "running":
-                snapshot = self._frozen_local_snapshot(
-                    instance,
-                    operation.operation_name,
-                    expected_risk=operation.effect_kind,
+                snapshot = (
+                    self._frozen_destructive_snapshot(instance, operation.operation_name)
+                    if operation.effect_kind == "destructive"
+                    else self._frozen_local_snapshot(
+                        instance,
+                        operation.operation_name,
+                        expected_risk=operation.effect_kind,
+                    )
                 )
                 self.catalog.reauthorize_tool(
                     snapshot,
@@ -2977,13 +3047,48 @@ class DynamicTaskAgent:
             else:
                 raise DynamicTaskAgentError("DYNAMIC_TOOL_APPROVAL_OPERATION_INVALID")
         self.db.commit()
-        result = self.tool_executor.execute(
-            instance.tenant_id,
-            ToolCall(name=operation.operation_name, arguments=dict(operation.request_json or {})),
-            agent_id=instance.agent_id,
-            actor_user_id=instance.initiator_user_id,
-            execution_id=instance.id,
-        )
+        try:
+            result = self.tool_executor.execute(
+                instance.tenant_id,
+                ToolCall(
+                    name=operation.operation_name,
+                    arguments=dict(operation.request_json or {}),
+                ),
+                agent_id=instance.agent_id,
+                actor_user_id=instance.initiator_user_id,
+                remote_idempotency_key=operation.remote_idempotency_key,
+                execution_id=instance.id,
+            )
+        except Exception:
+            if operation.effect_kind == "destructive":
+                return self._park_unknown_effect(
+                    instance=instance,
+                    step=step,
+                    operation=operation,
+                    worker_id=worker_id,
+                    error_code="DYNAMIC_DESTRUCTIVE_DISPATCH_UNKNOWN",
+                    signal=signal,
+                    control=control,
+                )
+            raise
+        if (
+            operation.effect_kind == "destructive"
+            and not result.success
+            and result.error is not None
+            and self._is_ambiguous_tool_failure(
+                result.error.code,
+                result.error.message,
+            )
+        ):
+            return self._park_unknown_effect(
+                instance=instance,
+                step=step,
+                operation=operation,
+                worker_id=worker_id,
+                error_code=result.error.code,
+                signal=signal,
+                control=control,
+            )
         with self.store.owned(instance, worker_id=worker_id):
             self.store.finish_operation(
                 operation,
@@ -3282,10 +3387,20 @@ class DynamicTaskAgent:
                 "attention_id": attention.id,
                 "comment_present": bool(attention.comment),
             }
-            data = {
-                "delivery_status": "manually_confirmed",
-                "message_id": operation.external_reference or "",
-            }
+            if operation.effect_kind == "destructive":
+                contract = operation.capability_snapshot_json.get("contract")
+                contract = contract if isinstance(contract, Mapping) else {}
+                data = {
+                    "effect_status": "manually_confirmed",
+                    "canonical_target": contract.get("canonical_target"),
+                    "target_checksum": contract.get("target_checksum"),
+                    "destructive_provider": contract.get("destructive_provider"),
+                }
+            else:
+                data = {
+                    "delivery_status": "manually_confirmed",
+                    "message_id": operation.external_reference or "",
+                }
             control.consume_signal(instance, signal, worker_id=worker_id)
             settled = self.store.reconcile_operation(
                 instance,
@@ -3340,39 +3455,91 @@ class DynamicTaskAgent:
         signal: ExecutionSignal | None = None,
         control: ExecutionControlService | None = None,
     ) -> DynamicRunOutcome:
-        """把不确定外部效果冻结为 exception Attention，禁止普通恢复重新派发。"""
+        """保持旧调用名，将 external_write 的不确定效果转入人工对账。"""
+
+        return self._park_unknown_effect(
+            instance=instance,
+            step=step,
+            operation=operation,
+            worker_id=worker_id,
+            error_code=error_code,
+            signal=signal,
+            control=control,
+        )
+
+    def _park_unknown_effect(
+        self,
+        *,
+        instance: SopInstance,
+        step: SopNodeExecution,
+        operation: SopOperation,
+        worker_id: str,
+        error_code: str,
+        signal: ExecutionSignal | None = None,
+        control: ExecutionControlService | None = None,
+    ) -> DynamicRunOutcome:
+        """把不确定 external/destructive 效果冻结为 exception Attention，禁止重派发。"""
 
         with self.store.owned(instance, worker_id=worker_id):
             self.store.mark_operation_unknown(operation, error={"code": error_code})
-            manager_ids = [
-                user.id
-                for user in self.db.exec(
-                    select(User).where(
-                        User.tenant_id == instance.tenant_id,
-                        User.membership_status == "active",
-                    )
-                ).all()
-                if has_governance_permission(
-                    self.db,
-                    tenant_id=instance.tenant_id,
-                    user_id=user.id,
-                    permission_code="connection_profile.manage",
+            is_destructive = operation.effect_kind == "destructive"
+            if is_destructive:
+                manager_ids = self._workspace_approver_ids(
+                    instance.tenant_id,
+                    exclude_user_id=instance.initiator_user_id,
                 )
-            ]
+            else:
+                manager_ids = [
+                    user.id
+                    for user in self.db.exec(
+                        select(User).where(
+                            User.tenant_id == instance.tenant_id,
+                            User.membership_status == "active",
+                        )
+                    ).all()
+                    if has_governance_permission(
+                        self.db,
+                        tenant_id=instance.tenant_id,
+                        user_id=user.id,
+                        permission_code="connection_profile.manage",
+                    )
+                ]
             active_control = control or ExecutionControlService(self.db, self.store)
+            title = (
+                "核对 destructive 隔离 provider 是否已经生效"
+                if is_destructive
+                else "核对企业微信消息是否送达"
+            )
+            instruction = (
+                "请依据隔离 provider 的目标状态确认是否已生效；系统不会自动重发。"
+                if is_destructive
+                else "请依据企业微信后台或客户端证据确认是否已送达；系统不会自动重发。"
+            )
+            payload: dict[str, object] = {
+                "operation_id": operation.id,
+                "operation_name": operation.operation_name,
+                "node_execution_id": step.id,
+                "error_code": error_code,
+                "request_fingerprint": operation.request_fingerprint,
+                "effect_kind": operation.effect_kind,
+                "instruction": instruction,
+            }
+            if is_destructive:
+                raw_contract = operation.capability_snapshot_json.get("contract")
+                contract = raw_contract if isinstance(raw_contract, Mapping) else {}
+                payload.update(
+                    {
+                        "canonical_target": contract.get("canonical_target"),
+                        "target_checksum": contract.get("target_checksum"),
+                        "destructive_provider": contract.get("destructive_provider"),
+                    }
+                )
             attention, _ = active_control.offer_attention(
                 instance,
                 attention_kind="exception",
                 attention_key=f"{step.step_key}:write_unknown:{operation.id}",
-                title="核对企业微信消息是否送达",
-                payload={
-                    "operation_id": operation.id,
-                    "operation_name": operation.operation_name,
-                    "node_execution_id": step.id,
-                    "error_code": error_code,
-                    "request_fingerprint": operation.request_fingerprint,
-                    "instruction": "请依据企业微信后台或客户端证据确认是否已送达；系统不会自动重发。",
-                },
+                title=title,
+                payload=payload,
                 allowed_commands=["confirm_applied", "confirm_not_applied"],
                 candidate_user_ids=manager_ids,
                 source_type="dynamic_task",
@@ -3390,6 +3557,16 @@ class DynamicTaskAgent:
                 )
         self.db.commit()
         return DynamicRunOutcome("waiting", instance.id, blocking_step_key=step.step_key)
+
+    @staticmethod
+    def _is_ambiguous_tool_failure(code: str, message: str) -> bool:
+        """保守识别 destructive provider 可能已执行但回执不确定的错误。"""
+
+        if code in {"TIMEOUT", "EXECUTION_ERROR", "MCP_ERROR", "MCP_EXECUTION_ERROR"}:
+            return True
+        if code != "HTTP_ERROR":
+            return False
+        return any(str(status) in message for status in range(500, 600))
 
     def _fail_started_write(
         self,
@@ -4459,7 +4636,10 @@ class DynamicTaskAgent:
             *self.catalog.list_connector_reads(tenant_id, agent_id, initiator_user_id),
             *self.catalog.list_general_skills(tenant_id, agent_id, initiator_user_id),
         ]
-        if get_settings().dynamic_task_external_write_enabled:
+        if get_settings().dynamic_task_high_risk_external_write_allows(
+            tenant_id,
+            agent_id,
+        ):
             capabilities.extend(
                 self.catalog.list_connector_writes(
                     tenant_id,
@@ -4673,6 +4853,7 @@ class DynamicTaskAgent:
                 "tool.read",
                 "tool.write",
                 "tool.execute",
+                "tool.destructive",
                 "knowledge",
                 "explore",
                 "clarification",
@@ -6265,6 +6446,76 @@ class DynamicTaskAgent:
             return snapshot
         raise DynamicTaskAgentError("DYNAMIC_LOCAL_CAPABILITY_NOT_FROZEN")
 
+    def _frozen_destructive_snapshot(
+        self,
+        instance: SopInstance,
+        capability_ref: str,
+    ) -> CapabilitySnapshot:
+        """从冻结目录解析 destructive 工具，并要求固定目标、幂等、对账和隔离 provider。"""
+
+        if not get_settings().dynamic_task_high_risk_destructive_allows(
+            instance.tenant_id,
+            instance.agent_id,
+        ):
+            raise DynamicTaskAgentError("DYNAMIC_DESTRUCTIVE_DISABLED")
+        catalog = instance.capability_snapshot_json or {}
+        values = catalog.get("tools")
+        if not isinstance(values, list):
+            raise DynamicTaskAgentError("DYNAMIC_CAPABILITY_SNAPSHOT_INVALID")
+        for value in values:
+            if not isinstance(value, dict) or value.get("name") != capability_ref:
+                continue
+            try:
+                snapshot = CapabilitySnapshot.model_validate(value)
+            except ValueError as exc:
+                raise DynamicTaskAgentError("DYNAMIC_CAPABILITY_SNAPSHOT_INVALID") from exc
+            contract = snapshot.contract
+            idempotency = contract.get("idempotency")
+            reconcile = contract.get("reconcile")
+            if (
+                snapshot.capability_type != "tool"
+                or snapshot.agent_id != instance.agent_id
+                or snapshot.tenant_id != instance.tenant_id
+                or contract.get("risk_class") != "destructive"
+                or contract.get("destructive_dynamic_task_enabled") is not True
+                or contract.get("confirmation_policy") != "always"
+                or not str(contract.get("canonical_target") or "").strip()
+                or not str(contract.get("target_checksum") or "").strip()
+                or not isinstance(idempotency, Mapping)
+                or idempotency.get("mode") == "none"
+                or not isinstance(reconcile, Mapping)
+                or reconcile.get("supported") is not True
+                or contract.get("destructive_provider") not in {"disposable", "isolated"}
+                or capability_checksum(
+                    snapshot.model_dump(mode="json", exclude={"checksum", "agent_id"})
+                )
+                != snapshot.checksum
+            ):
+                raise DynamicTaskAgentError("DYNAMIC_DESTRUCTIVE_CAPABILITY_INVALID")
+            return snapshot
+        raise DynamicTaskAgentError("DYNAMIC_DESTRUCTIVE_CAPABILITY_NOT_FROZEN")
+
+    @staticmethod
+    def _destructive_idempotency_policy(snapshot: CapabilitySnapshot) -> IdempotencyPolicy:
+        """把 destructive 发布契约映射为统一 Operation 的本地/远端幂等策略。"""
+
+        raw_idempotency = snapshot.contract.get("idempotency")
+        if not isinstance(raw_idempotency, Mapping):
+            raise DynamicTaskAgentError("DYNAMIC_DESTRUCTIVE_IDEMPOTENCY_INVALID")
+        mode = str(raw_idempotency.get("mode") or "")
+        if mode == "request_key":
+            return IdempotencyPolicy(required=True, scope=IdempotencyScope.INSTANCE)
+        if mode == "business_key":
+            argument = str(raw_idempotency.get("argument") or "").strip()
+            if not argument:
+                raise DynamicTaskAgentError("DYNAMIC_DESTRUCTIVE_IDEMPOTENCY_INVALID")
+            return IdempotencyPolicy(
+                required=True,
+                scope=IdempotencyScope.BUSINESS,
+                key_fields=(argument,),
+            )
+        raise DynamicTaskAgentError("DYNAMIC_DESTRUCTIVE_IDEMPOTENCY_INVALID")
+
     def _planned_step_risk(self, instance: SopInstance, step: PlanStep) -> str:
         """解析计划步骤唯一能力的冻结风险类别，用于区分本地写和外部写。"""
 
@@ -6290,6 +6541,18 @@ class DynamicTaskAgent:
     ) -> None:
         """在创建审批前按固定 handler 校验精确参数集合和关键大小边界。"""
 
+        if snapshot.contract.get("risk_class") == "destructive":
+            if not arguments or len(json.dumps(dict(arguments), ensure_ascii=False)) > 128_000:
+                raise DynamicTaskAgentError("DYNAMIC_DESTRUCTIVE_ARGUMENTS_INVALID")
+            forbidden = {"tenant_id", "agent_id", "authorized", "permission", "risk_class"}
+            if any(key in forbidden for key in arguments):
+                raise DynamicTaskAgentError("DYNAMIC_DESTRUCTIVE_ARGUMENTS_INVALID")
+            if (
+                arguments.get("target") != snapshot.contract.get("canonical_target")
+                or arguments.get("target_checksum") != snapshot.contract.get("target_checksum")
+            ):
+                raise DynamicTaskAgentError("DYNAMIC_DESTRUCTIVE_TARGET_MISMATCH")
+            return
         if snapshot.audit_view.get("platform_capability") == "general_skill_proposal":
             try:
                 GeneralSkillProposalArguments.model_validate(arguments)
@@ -6421,7 +6684,7 @@ class DynamicTaskAgent:
         required: dict[str, dict[str, object]] = {}
         for step in plan.steps:
             if (
-                step.kind not in {"tool.read", "tool.write", "tool.execute"}
+                step.kind not in {"tool.read", "tool.write", "tool.execute", "tool.destructive"}
                 or len(step.capability_refs) != 1
             ):
                 continue
@@ -6931,7 +7194,11 @@ class DynamicTaskAgent:
                         else (
                             "dynamic_task.action.write"
                             if step.kind == "tool.write"
-                            else "dynamic_task.action"
+                            else (
+                                "dynamic_task.action.destructive"
+                                if step.kind == "tool.destructive"
+                                else "dynamic_task.action"
+                            )
                         )
                     )
                     with llm_operation(operation_name):

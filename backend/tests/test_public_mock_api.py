@@ -400,6 +400,62 @@ def test_public_mock_health_is_anonymous_and_reports_capability_count(monkeypatc
     assert client.get("/health").json() == {"status": "ok", "tools": 18}
 
 
+def test_disposable_destructive_fixture_requires_auth_and_is_idempotent(monkeypatch) -> None:
+    """验证隔离 destructive provider 只接受认证和远端幂等键，并对重复请求返回同一回执。"""
+
+    from app.public_mock.service import (
+        DISPOSABLE_DESTRUCTIVE_TARGET,
+        DISPOSABLE_DESTRUCTIVE_TARGET_CHECKSUM,
+    )
+
+    client = _public_mock_client(monkeypatch)
+    payload = {
+        "target": DISPOSABLE_DESTRUCTIVE_TARGET,
+        "target_checksum": DISPOSABLE_DESTRUCTIVE_TARGET_CHECKSUM,
+    }
+    assert client.post("/api/mock/destructive/fixture-delete", json=payload).status_code == 401
+    assert (
+        client.post(
+            "/api/mock/destructive/fixture-delete",
+            headers={"X-API-Key": "expected-key"},
+            json=payload,
+        ).status_code
+        == 400
+    )
+    assert (
+        client.post(
+            "/api/mock/destructive/fixture-delete",
+            headers={
+                "X-API-Key": "expected-key",
+                "Idempotency-Key": "browser-disposable-fixture-1",
+            },
+            json={**payload, "target": "disposable://fixture/other"},
+        ).status_code
+        == 409
+    )
+    first = client.post(
+        "/api/mock/destructive/fixture-delete",
+        headers={
+            "X-API-Key": "expected-key",
+            "Idempotency-Key": "browser-disposable-fixture-1",
+        },
+        json=payload,
+    )
+    repeated = client.post(
+        "/api/mock/destructive/fixture-delete",
+        headers={
+            "X-API-Key": "expected-key",
+            "Idempotency-Key": "browser-disposable-fixture-1",
+        },
+        json=payload,
+    )
+
+    assert first.status_code == repeated.status_code == 200
+    assert first.json() == repeated.json()
+    assert first.json()["destructive_provider"] == "disposable"
+    assert first.json()["effect_status"] in {"deleted", "already_deleted"}
+
+
 @pytest.mark.parametrize(
     ("customer_code", "circuit_no", "expected_status"),
     [

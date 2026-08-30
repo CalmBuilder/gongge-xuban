@@ -162,7 +162,7 @@ class DynamicTaskPlanner:
             snapshot
             for snapshot in capabilities
             if snapshot.contract.get("risk_class")
-            in {"read", "local_write", "execute", "external_write"}
+            in {"read", "local_write", "execute", "external_write", "destructive"}
             and snapshot.capability_type in {"tool", "connector", "knowledge"}
             and _goal_authorizes_capability(goal, snapshot)
         ]
@@ -196,6 +196,11 @@ class DynamicTaskPlanner:
             for snapshot in executable_capabilities
         ):
             allowed_step_kinds.insert(-2, "tool.execute")
+        if any(
+            snapshot.contract.get("risk_class") == "destructive"
+            for snapshot in executable_capabilities
+        ):
+            allowed_step_kinds.insert(-2, "tool.destructive")
         payload = {
             "goal": goal,
             "success_criteria": [item.model_dump(mode="json") for item in success_criteria],
@@ -217,7 +222,7 @@ class DynamicTaskPlanner:
                 "max_steps": self.max_steps,
                 "max_tool_calls": self.max_tool_calls,
                 "max_tool_calls_semantics": (
-                    "tool.read、tool.write、tool.execute、knowledge 与 explore 内部实际能力调用总和"
+                    "tool.read、tool.write、tool.execute、tool.destructive、knowledge 与 explore 内部实际能力调用总和"
                 ),
                 "max_model_calls": self.max_model_calls,
                 "max_input_tokens": self.max_input_tokens,
@@ -503,7 +508,7 @@ class DynamicTaskPlanner:
 
 _PLANNER_SYSTEM_PROMPT = """你是共格·序伴的受控动态任务规划器。只输出一个完整 JSON object。
 你只能使用输入中列出的能力；local_write/external_write 只能规划为 tool.write，execute 只能规划为
-tool.execute，运行时会冻结参数并等待一次性人工批准。
+tool.execute，destructive 只能规划为 tool.destructive，运行时会冻结参数并等待一次性人工批准。
 不得提出执行、删除、权限变更或输入中不存在的能力。步骤种类必须来自 limits.allowed_step_kinds。
 每项能力只能用于它声明的 allowed_step_kind；“写文档/写方案”是 answer，不是 tool.write。
 每个能力步骤必须且只能在 capability_refs 中逐字复制一个 capabilities[].name；禁止使用显示名、
@@ -810,7 +815,7 @@ _PLANNER_OUTPUT_CONTRACT = {
             "draft_id": "字母开头的本次草案步骤标识",
             "title": "简短展示标题，最多 256 个字符；不得把步骤说明或 Skill 正文塞入标题",
             "kind": (
-                "tool.read | tool.write | tool.execute | knowledge | explore | answer | "
+                "tool.read | tool.write | tool.execute | tool.destructive | knowledge | explore | answer | "
                 "clarification"
             ),
             "required": True,
@@ -1052,7 +1057,10 @@ def _guidance_source_contract(
         selection_mode = str(
             loaded.get("selection_mode") or block.get("selection_mode") or "forced"
         )
-        if selection_mode not in {"auto", "forced"}:
+        # GeneralSkillRuntime 会把由父 Skill 带入的依赖标记为 dependency。
+        # 依赖仍然是服务端已经加载并冻结的 Guidance，只是它不能被模型当作
+        # 独立的 auto 选择；规划层需要保留这个事实，不能因多 Skill 组合而报错。
+        if selection_mode not in {"auto", "forced", "dependency"}:
             raise ValueError("loaded_guidance selection_mode 无效")
         modes_by_name[name] = selection_mode
     return sources_by_name, modes_by_name
@@ -1323,6 +1331,7 @@ def _planner_capability_view(snapshot: CapabilitySnapshot) -> dict[str, object]:
         "local_write": "tool.write",
         "external_write": "tool.write",
         "execute": "tool.execute",
+        "destructive": "tool.destructive",
     }.get(risk_class, "")
     return {
         **snapshot.model_view,
@@ -1798,7 +1807,7 @@ def _goal_authorizes_capability(goal: str, snapshot: CapabilitySnapshot) -> bool
     if (
         not intent
         and isinstance(managed_workspace, Mapping)
-        and snapshot.contract.get("risk_class") in {"local_write", "execute"}
+        and snapshot.contract.get("risk_class") in {"local_write", "execute", "destructive"}
     ):
         normalized = " ".join(goal.casefold().split())
         write_intent = re.search(
@@ -1813,6 +1822,7 @@ def _goal_authorizes_capability(goal: str, snapshot: CapabilitySnapshot) -> bool
         )
         execute_intent = re.search(
             r"(?:运行|执行|跑).{0,16}(?:测试|检查|命令|脚本|构建)"
+            r"|(?:完成|通过|验证|确保).{0,16}(?:测试|检查|命令|脚本|构建)"
             r"|(?:run|execute).{0,16}(?:test|check|command|script|build)"
             r"|(?:修改|重构|修复|实现).{0,8}(?:并)?(?:验证|测试)",
             normalized,
@@ -1905,7 +1915,8 @@ def _goal_has_workspace_intent(goal: str, intent: str) -> bool:
     if intent == "code_execute":
         return bool(
             re.search(
-                rf"{execute_action}.{{0,16}}(?:测试|检查|命令|脚本|构建|test|check|command|script|build)",
+                rf"{execute_action}.{{0,16}}(?:测试|检查|命令|脚本|构建|test|check|command|script|build)"
+                rf"|(?:完成|通过|验证|确保).{{0,16}}(?:测试|检查|命令|脚本|构建|test|check|command|script|build)",
                 goal,
             )
         )
@@ -1934,6 +1945,12 @@ def _validate_plan_capabilities(
         item.name
         for item in capabilities
         if item.capability_type == "tool" and item.contract.get("risk_class") == "execute"
+    }
+    destructive_names = {
+        item.name
+        for item in capabilities
+        if item.capability_type in {"tool", "connector"}
+        and item.contract.get("risk_class") == "destructive"
     }
     knowledge_names = {
         item.name for item in capabilities if item.capability_type == "knowledge"
@@ -1964,6 +1981,10 @@ def _validate_plan_capabilities(
         if step.kind == "tool.execute":
             if not refs or not refs <= execute_names:
                 raise ValueError("动态计划引用了未冻结的执行能力")
+            continue
+        if step.kind == "tool.destructive":
+            if not refs or not refs <= destructive_names:
+                raise ValueError("动态计划引用了未冻结的 destructive 能力")
             continue
         if step.kind == "knowledge":
             if refs != {"knowledge.search"} or not refs <= knowledge_names:

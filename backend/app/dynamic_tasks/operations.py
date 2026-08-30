@@ -14,6 +14,7 @@ from datetime import datetime
 from sqlalchemy import func
 from sqlmodel import Session, select
 
+from app.config import get_settings
 from app.db.models import (
     ExecutionPublication,
     ExecutionSignal,
@@ -76,6 +77,28 @@ class DynamicTaskOperationsService:
         publication_statuses = self._publication_statuses(tenant_id)
         attention_statuses = self._attention_statuses(tenant_id)
         quota_leases = self._quota_leases(tenant_id)
+        settings = get_settings()
+        runtime_capacity_limits_configured = quota_limits.configured
+        runtime_capacity_available = runtime_capacity_limits_configured and (
+            quota_leases.get("tenant", 0) < quota_limits.tenant
+        )
+        base_execution_available = bool(
+            settings.dynamic_task_execution_enabled and runtime_capacity_available
+        )
+        high_risk_external_write_available = bool(
+            base_execution_available
+            and settings.dynamic_task_external_write_enabled
+            and settings.dynamic_task_alert_thresholds_configured
+            and settings._identifier_allowlist(settings.dynamic_task_tenant_allowlist)
+            and settings._identifier_allowlist(settings.dynamic_task_agent_allowlist)
+        )
+        high_risk_destructive_available = bool(
+            base_execution_available
+            and settings.dynamic_task_destructive_enabled
+            and settings.dynamic_task_alert_thresholds_configured
+            and settings._identifier_allowlist(settings.dynamic_task_destructive_tenant_allowlist)
+            and settings._identifier_allowlist(settings.dynamic_task_destructive_agent_allowlist)
+        )
         oldest_waiting = self.db.exec(
             select(func.min(SopInstance.updated_at)).where(
                 SopInstance.tenant_id == tenant_id,
@@ -122,6 +145,28 @@ class DynamicTaskOperationsService:
             "observed_at": now,
             "thresholds_configured": thresholds.configured,
             "quota_limits_configured": quota_limits.configured,
+            "runtime_capacity_limits_configured": runtime_capacity_limits_configured,
+            "runtime_capacity_available": runtime_capacity_available,
+            "base_execution_available": base_execution_available,
+            "base_execution_reason": (
+                "available"
+                if base_execution_available
+                else "execution_switch_off"
+                if not settings.dynamic_task_execution_enabled
+                else "runtime_capacity_unavailable"
+            ),
+            "high_risk_external_write_available": high_risk_external_write_available,
+            "high_risk_external_write_reason": (
+                "available"
+                if high_risk_external_write_available
+                else "external_write_gray_not_ready"
+            ),
+            "high_risk_destructive_available": high_risk_destructive_available,
+            "high_risk_destructive_reason": (
+                "available"
+                if high_risk_destructive_available
+                else "destructive_gray_not_ready"
+            ),
             "quota_limits": {
                 "tenant": quota_limits.tenant,
                 "agent": quota_limits.agent,

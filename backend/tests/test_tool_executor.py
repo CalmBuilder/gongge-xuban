@@ -13,6 +13,12 @@ import httpx
 import pytest
 
 from app.agents.branching import ensure_private_resource_binding
+from app.config import get_settings
+from app.dynamic_tasks.capability_catalog import (
+    ToolReliabilityContract,
+    capability_checksum,
+    publish_tool_contract,
+)
 from app.tools.tool_executor import ToolExecutor
 from app.tools.tool_schema import ToolCall
 from app.tools.managed_workspace import ManagedCodeWorkspaceService
@@ -473,6 +479,133 @@ def test_execute_http_write_sends_authoritative_remote_idempotency_header(monkey
     assert requested["json"] == {"amount": 100}
 
 
+def test_execute_destructive_dispatch_requires_isolated_contract_target_and_remote_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证 destructive 执行器拒绝缺键/漂移/非隔离目标，并把正确幂等键传给 provider。"""
+
+    monkeypatch.setenv("PUBLIC_MOCK_API_KEY", "expected-key")
+    monkeypatch.setenv("TOOL_BASE_URL", "http://localhost:5137")
+    get_settings.cache_clear()
+    requested: dict[str, object] = {}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            """接收生产客户端参数，但只记录请求，不触达网络。"""
+
+        def __enter__(self):
+            """返回假客户端。"""
+
+            return self
+
+        def __exit__(self, *args):
+            """结束假客户端上下文。"""
+
+            return None
+
+        def request(self, method, url, headers=None, json=None, **kwargs):
+            """记录 destructive provider 请求并返回结构化隔离回执。"""
+
+            requested.update({"method": method, "url": url, "headers": dict(headers or {}), "json": json})
+            return httpx.Response(
+                200,
+                json={
+                    "target": json["target"],
+                    "target_checksum": json["target_checksum"],
+                    "effect_status": "deleted",
+                    "destructive_provider": "disposable",
+                    "operation_id": "disposable-test-1",
+                },
+                request=httpx.Request(method, url),
+            )
+
+    monkeypatch.setattr(httpx, "Client", FakeClient)
+    target = "disposable://fixture/object-1"
+    contract = _destructive_contract(target)
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_destructive", name="Destructive"))
+        tool = Tool(
+            tenant_id="tenant_destructive",
+            name="disposable.fixture_delete",
+            method="POST",
+            url="/api/mock/destructive/fixture-delete",
+            enabled=True,
+        )
+        publish_tool_contract(tool, contract)
+        db.add(tool)
+        db.commit()
+        executor = ToolExecutor(db)
+        valid_arguments = {
+            "target": target,
+            "target_checksum": capability_checksum(target),
+        }
+
+        missing_key = executor.execute(
+            "tenant_destructive",
+            ToolCall(name=tool.name, arguments=valid_arguments),
+        )
+        mismatched_target = executor.execute(
+            "tenant_destructive",
+            ToolCall(
+                name=tool.name,
+                arguments={**valid_arguments, "target": "disposable://fixture/other"},
+            ),
+            remote_idempotency_key="destructive-test-key",
+        )
+        dispatched = executor.execute(
+            "tenant_destructive",
+            ToolCall(name=tool.name, arguments=valid_arguments),
+            remote_idempotency_key="destructive-test-key",
+        )
+
+    get_settings.cache_clear()
+    assert missing_key.error is not None
+    assert missing_key.error.code == "DESTRUCTIVE_IDEMPOTENCY_KEY_MISSING"
+    assert mismatched_target.error is not None
+    assert mismatched_target.error.code == "DESTRUCTIVE_TARGET_MISMATCH"
+    assert dispatched.success is True
+    assert requested["method"] == "POST"
+    assert requested["headers"]["Idempotency-Key"] == "destructive-test-key"
+    assert requested["json"] == valid_arguments
+
+
+def test_execute_destructive_disposable_provider_rejects_external_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证 disposable 契约即使参数正确，也不能指向外部 URL。"""
+
+    monkeypatch.setenv("PUBLIC_MOCK_API_KEY", "expected-key")
+    get_settings.cache_clear()
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_destructive", name="Destructive"))
+        tool = Tool(
+            tenant_id="tenant_destructive",
+            name="disposable.external_url",
+            method="POST",
+            url="https://example.test/delete",
+            enabled=True,
+        )
+        publish_tool_contract(tool, _destructive_contract("disposable://fixture/object-1"))
+        db.add(tool)
+        db.commit()
+        result = ToolExecutor(db).execute(
+            "tenant_destructive",
+            ToolCall(
+                name=tool.name,
+                arguments={
+                    "target": "disposable://fixture/object-1",
+                    "target_checksum": capability_checksum("disposable://fixture/object-1"),
+                },
+            ),
+            remote_idempotency_key="destructive-external-url",
+        )
+    get_settings.cache_clear()
+
+    assert result.success is False
+    assert result.error is not None
+    assert result.error.code == "DESTRUCTIVE_PROVIDER_NOT_ISOLATED"
+
+
 def test_execute_http_tool_rejects_private_target_before_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -536,6 +669,38 @@ def _fake_public_dns(monkeypatch: pytest.MonkeyPatch) -> None:
                 ("93.184.216.34", port),
             )
         ],
+    )
+
+
+def _destructive_contract(target: str) -> ToolReliabilityContract:
+    """构造指向 disposable fixture 的最小 destructive 发布契约。"""
+
+    return ToolReliabilityContract.model_validate(
+        {
+            "risk_class": "destructive",
+            "side_effect": "external",
+            "confirmation_policy": "always",
+            "timeout_policy": "unknown",
+            "dynamic_task_enabled": False,
+            "destructive_dynamic_task_enabled": True,
+            "idempotency": {
+                "mode": "request_key",
+                "remote_scope": "disposable-fixture",
+            },
+            "reconcile": {
+                "supported": True,
+                "tool_name": "disposable.fixture_status",
+                "reference_source": "output.operation_id",
+                "terminal_status_mapping": {
+                    "deleted": "complete",
+                    "already_deleted": "complete",
+                    "pending": "unknown",
+                },
+            },
+            "canonical_target": target,
+            "target_checksum": capability_checksum(target),
+            "destructive_provider": "disposable",
+        }
     )
 
 

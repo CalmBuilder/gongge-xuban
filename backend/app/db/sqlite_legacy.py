@@ -102,6 +102,7 @@ def migrate_sqlite_skill_schema(engine: Engine) -> None:
 
         _migrate_agent_identity_fields(conn, tables)
         _migrate_execution_reliability_fields(conn, tables)
+        _ensure_sqlite_operation_effect_kind_constraint(conn)
         _migrate_dynamic_capability_fields(conn, tables)
         _migrate_sqlite_platform_general_skill_catalog(conn, tables)
         _migrate_execution_plan_fields(conn, tables)
@@ -1540,6 +1541,97 @@ def _migrate_execution_reliability_fields(conn, tables: set[str]) -> None:
         _backfill_sqlite_instance_effects(conn, instance_rows)
 
 
+def _ensure_sqlite_operation_effect_kind_constraint(conn) -> None:
+    """为已完成历史迁移的 SQLite Operation 表补齐 destructive 检查约束。
+
+    SQLite 的 ``CREATE TABLE`` 不会把新模型约束应用到既有表；如果旧库已经具备
+    B0.2 全部字段，常规字段迁移会提前返回，因而必须单独检查并在安全条件下重建表。
+    重建前校验历史值和未知列，保留可反射的旧索引，避免静默丢失数据或结构。
+    """
+
+    from app.db.models import SopOperation
+
+    inspector = inspect(conn)
+    if not inspector.has_table("sop_operations"):
+        return
+    checks = inspector.get_check_constraints("sop_operations")
+    effect_checks = [
+        item
+        for item in checks
+        if "effect_kind" in str(item.get("sqltext") or "")
+    ]
+    if effect_checks and all(
+        "destructive" in str(item.get("sqltext") or "") for item in effect_checks
+    ):
+        return
+
+    model_columns = {column.name for column in SopOperation.__table__.columns}
+    reflected = Table("sop_operations", MetaData(), autoload_with=conn)
+    existing_columns = {column.name for column in reflected.columns}
+    unknown_columns = existing_columns - model_columns
+    if unknown_columns:
+        raise RuntimeError(
+            "legacy SQLite sop_operations has columns unsupported by the current model: "
+            + ",".join(sorted(unknown_columns))
+        )
+    invalid_rows = conn.execute(
+        text(
+            "SELECT id, effect_kind FROM sop_operations "
+            "WHERE effect_kind NOT IN "
+            "('read', 'local_write', 'execute', 'external_write', 'destructive', 'legacy_unknown')"
+        )
+    ).mappings().all()
+    if invalid_rows:
+        raise RuntimeError(
+            "legacy SQLite sop_operations contains unsupported effect_kind values: "
+            + ",".join(
+                f"{row['id']}={row['effect_kind']}" for row in invalid_rows
+            )
+        )
+
+    rows = conn.execute(reflected.select()).mappings().all()
+    indexes = [
+        item
+        for item in inspector.get_indexes("sop_operations")
+        if item.get("name")
+    ]
+    preparer = conn.dialect.identifier_preparer
+    for index in indexes:
+        conn.execute(text(f"DROP INDEX {preparer.quote(str(index['name']))}"))
+    backup_name = "_legacy_b077_sop_operations"
+    if inspector.has_table(backup_name):
+        raise RuntimeError("legacy SQLite Operation constraint rebuild was interrupted")
+    conn.execute(text(f"ALTER TABLE sop_operations RENAME TO {backup_name}"))
+    SopOperation.__table__.create(conn)
+    for row in rows:
+        values = {
+            column.name: row[column.name]
+            for column in SopOperation.__table__.columns
+            if column.name in row
+        }
+        conn.execute(SopOperation.__table__.insert().values(**values))
+    conn.execute(text(f"DROP TABLE {backup_name}"))
+
+    current_indexes = {
+        str(item.get("name"))
+        for item in inspect(conn).get_indexes("sop_operations")
+        if item.get("name")
+    }
+    for index in indexes:
+        index_name = str(index["name"])
+        columns = [str(column) for column in (index.get("column_names") or [])]
+        if index_name in current_indexes or not columns:
+            continue
+        unique = "UNIQUE " if index.get("unique") else ""
+        quoted_columns = ", ".join(preparer.quote(column) for column in columns)
+        conn.execute(
+            text(
+                f"CREATE {unique}INDEX {preparer.quote(index_name)} "
+                f"ON sop_operations ({quoted_columns})"
+            )
+        )
+
+
 def _backfill_sqlite_operation_ledgers(
     conn,
     row,
@@ -1612,7 +1704,8 @@ def _backfill_sqlite_instance_effects(conn, instance_rows) -> None:
         states = conn.execute(
             text(
                 "SELECT effect_state FROM sop_operations "
-                "WHERE instance_id=:instance_id AND effect_kind='external_write'"
+                "WHERE instance_id=:instance_id "
+                "AND effect_kind IN ('external_write', 'destructive')"
             ),
             {"instance_id": instance["id"]},
         ).scalars().all()

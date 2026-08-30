@@ -98,7 +98,11 @@ class ExecutionControlService:
         instance: SopInstance,
         attention: SopWorkItem | None,
     ) -> bool:
-        """确认 Attention 是否精确关联当前实例的 unknown 外部写对账。"""
+        """确认 Attention 是否精确关联当前实例的 unknown 外部副作用对账。
+
+        保留旧方法名供既有 API/worker 调用；destructive 与 external_write 共用
+        unknown 对账信号的租约和归档 Agent 安全边界，但两者的业务门禁仍独立。
+        """
 
         if (
             attention is None
@@ -114,7 +118,7 @@ class ExecutionControlService:
             and operation.tenant_id == instance.tenant_id
             and operation.instance_id == instance.id
             and operation.status == "unknown"
-            and operation.effect_kind == "external_write"
+            and operation.effect_kind in {"external_write", "destructive"}
         )
 
     def offer_attention(
@@ -507,7 +511,7 @@ class ExecutionControlService:
         available_at: datetime | None = None,
         allow_archived_agent: bool = False,
     ) -> ExecutionSignal:
-        """按因果事实去重写入恢复信号；归档例外仅限已验证的外部效果对账。"""
+        """按因果事实去重写入恢复信号；归档例外仅限已验证的副作用对账。"""
 
         self._assert_instance(instance)
         body = dict(payload or {})
@@ -524,7 +528,7 @@ class ExecutionControlService:
             ):
                 raise ExecutionControlError(
                     "SIGNAL_RECONCILIATION_REQUIRED",
-                    "归档 Agent 仅允许为当前 unknown 外部写创建对账 signal。",
+                    "归档 Agent 仅允许为当前 unknown 外部副作用创建对账 signal。",
                 )
         elif not self.store.agent_is_available(instance):
             raise ExecutionControlError(
@@ -581,7 +585,7 @@ class ExecutionControlService:
         ttl_seconds: int = 30,
         allow_archived_agent: bool = False,
     ) -> ExecutionSignal:
-        """以数据库时间 CAS 认领信号；归档 Agent 只允许外部效果对账专用调用方使用。"""
+        """以数据库时间 CAS 认领信号；归档 Agent 只允许副作用对账专用调用方使用。"""
 
         if ttl_seconds < 1 or not worker_id.strip():
             raise ExecutionControlError("SIGNAL_LEASE_INVALID", "signal worker 和 TTL 必须有效。")
@@ -596,7 +600,7 @@ class ExecutionControlService:
             if not self.is_external_reconciliation_attention(instance, attention):
                 raise ExecutionControlError(
                     "SIGNAL_RECONCILIATION_REQUIRED",
-                    "归档 Agent 仅允许认领当前 unknown 外部写的对账 signal。",
+                    "归档 Agent 仅允许认领当前 unknown 外部副作用的对账 signal。",
                 )
         if not allow_archived_agent and not self.store.agent_is_available(instance):
             raise ExecutionControlError(

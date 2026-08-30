@@ -17,7 +17,11 @@ from fastapi.responses import Response
 from app.config import get_settings
 from app.public_mock import schemas
 from app.public_mock.copywriter import TextGenerator, build_copywriter
-from app.public_mock.service import PUBLIC_MOCK_CAPABILITIES, execute_public_mock
+from app.public_mock.service import (
+    PUBLIC_MOCK_CAPABILITIES,
+    execute_disposable_destructive_fixture,
+    execute_public_mock,
+)
 
 
 PUBLIC_MOCK_API_KEY_HEADER = "X-API-Key"
@@ -42,6 +46,28 @@ def public_mock_health() -> dict[str, int | str]:
     """返回公共 Mock 服务健康状态和能力数量。"""
 
     return {"status": "ok", "tools": len(PUBLIC_MOCK_CAPABILITIES)}
+
+
+@router.post(
+    "/api/mock/destructive/fixture-delete",
+    response_model=schemas.DisposableDestructiveFixtureResponse,
+    dependencies=_AUTH,
+)
+def disposable_destructive_fixture_delete(
+    request: schemas.DisposableDestructiveFixtureRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> schemas.DisposableDestructiveFixtureResponse:
+    """执行仅存在于当前隔离进程的 disposable fixture 删除并强制远端幂等键。"""
+
+    if not idempotency_key or not idempotency_key.strip():
+        raise HTTPException(status_code=400, detail="Idempotency-Key is required")
+    try:
+        return execute_disposable_destructive_fixture(
+            request,
+            idempotency_key=idempotency_key,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.get("/api/tools", response_model=schemas.PublicMockCatalog, dependencies=_AUTH)

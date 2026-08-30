@@ -53,6 +53,14 @@ class DynamicTaskOperationalSnapshotRead(BaseModel):
     observed_at: datetime
     thresholds_configured: bool
     quota_limits_configured: bool
+    runtime_capacity_limits_configured: bool
+    runtime_capacity_available: bool
+    base_execution_available: bool
+    base_execution_reason: str
+    high_risk_external_write_available: bool
+    high_risk_external_write_reason: str
+    high_risk_destructive_available: bool
+    high_risk_destructive_reason: str
     quota_limits: dict[str, int]
     quota_leases: dict[str, int]
     executions: dict[str, int]
