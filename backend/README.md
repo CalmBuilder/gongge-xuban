@@ -20,7 +20,7 @@ cp .env.example .env
 .venv/bin/uvicorn single_port_app:app --host 0.0.0.0 --port 5137
 ```
 
-Swagger UI: `http://localhost:5137/docs`
+Health endpoint: `http://localhost:5137/api/health`
 
 `CORS_ORIGINS` controls the allowed frontend origins. Application settings use
 operating-system environment variables first, then `backend/.env`, then defaults
