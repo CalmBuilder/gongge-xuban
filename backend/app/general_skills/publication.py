@@ -17,15 +17,20 @@ from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
-from app.agents.identity import agent_owner_user_id
+from app.audit.service import append_management_audit
+from app.agents.identity import agent_owner_user_id, project_agent_governance
 from app.db.models import (
     AgentProfile,
+    AgentRoleBinding,
     AgentPublicationRevision,
     AgentResourceBinding,
+    BusinessRole,
+    EmployeeProfile,
     GeneralSkill,
     GeneralSkillPublicationRevision,
     GeneralSkillRevision,
     KnowledgeBase,
+    OrganizationUnit,
     PublicationAdoptionCommand,
     PublicationRelease,
     ResourcePublicationRequest,
@@ -87,6 +92,7 @@ class PublicationService:
         if resource_type == "general_skill":
             snapshot, resource_name = self._snapshot_skill(resource_id, expected_revision, owner)
         elif resource_type == "agent":
+            self._assert_agent_organization_ready(resource_id, owner)
             snapshot, resource_name = self._snapshot_agent(resource_id, expected_revision, owner)
         else:
             raise PublicationError("PUBLICATION_TYPE_INVALID", "unsupported resource type", 400)
@@ -193,7 +199,15 @@ class PublicationService:
         self.db.add(attention)
         self.db.add(request)
         if command == "approve":
-            self._create_release(request)
+            release = self._create_release(request)
+            if request.resource_type == "agent":
+                self._sync_agent_release_projection(
+                    request.resource_id,
+                    published=True,
+                    release_id=release.id,
+                    published_by_user_id=reviewer.id,
+                    now=now,
+                )
             if request.resource_type == "general_skill":
                 skill = self.db.get(GeneralSkill, request.resource_id)
                 if skill is not None:
@@ -212,16 +226,43 @@ class PublicationService:
         self.db.refresh(request)
         return self.read_request(request)
 
-    def list_releases(self, tenant_id: str, resource_type: str | None = None) -> list[PublicationReleaseRead]:
-        """列出租户内 active Release，并从类型化快照投影展示信息。"""
+    def _assert_agent_organization_ready(self, agent_id: str, owner: User) -> None:
+        """提交整 Agent 发布前校验组织化事实，避免产生没有治理边界的 Release。"""
 
-        statement = select(PublicationRelease).where(
-            PublicationRelease.tenant_id == tenant_id,
-            PublicationRelease.status == "active",
-        )
+        agent = self.db.get(AgentProfile, agent_id)
+        if agent is None or agent.tenant_id != owner.tenant_id:
+            raise PublicationError("PUBLICATION_RESOURCE_NOT_FOUND", "agent unavailable", 404)
+        governance = project_agent_governance(self.db, agent)
+        missing = {
+            "owner_required",
+            "responsible_organization_required",
+            "active_role_and_supervisor_required",
+            "agent_must_be_active",
+        }.intersection(governance.reasons)
+        if missing or governance.form not in {"organization_pending", "organization_employee"}:
+            raise PublicationError(
+                "ORGANIZATIONIZATION_INCOMPLETE",
+                "Agent must complete owner, responsibility organization, business role, supervisor and active state before publication",
+            )
+
+    def list_releases(
+        self,
+        tenant_id: str,
+        resource_type: str | None = None,
+        *,
+        include_history: bool = False,
+    ) -> list[PublicationReleaseRead]:
+        """列出租户内 Release；默认只返回 active，管理员历史视图可包含普通下架版本。"""
+
+        predicates = [PublicationRelease.tenant_id == tenant_id]
+        if not include_history:
+            predicates.append(PublicationRelease.status == "active")
+        statement = select(PublicationRelease).where(*predicates)
         if resource_type:
             statement = statement.where(PublicationRelease.resource_type == resource_type)
-        releases = self.db.exec(statement.order_by(PublicationRelease.created_at.desc())).all()
+        releases = self.db.exec(
+            statement.order_by(PublicationRelease.created_at.desc(), PublicationRelease.id.desc())
+        ).all()
         return [self._release_read(row) for row in releases]
 
     def transition_release(
@@ -293,9 +334,154 @@ class PublicationService:
                 resource_id=release.id,
                 payload={"resource_type": release.resource_type, "reason": reason},
             )
+        if release.resource_type == "agent":
+            self._sync_agent_release_projection(
+                release.resource_id,
+                published=False,
+                release_id=None,
+                published_by_user_id=actor.id,
+                now=now,
+            )
         self.db.commit()
         self.db.refresh(release)
         return self._release_read(release)
+
+    def rollback_agent_release(
+        self,
+        target_release_id: str,
+        *,
+        command_id: str,
+        expected_active_release_id: str,
+        expected_active_row_version: int,
+        expected_target_row_version: int,
+        actor: User,
+        reason: str,
+    ) -> PublicationReleaseRead:
+        """以双重 CAS 恢复同一 Agent 的历史普通下架 Release，并同步发现投影。"""
+
+        if actor.role != "admin":
+            raise PublicationError("PUBLICATION_ROLLBACK_DENIED", "administrator required", 403)
+        target = self.db.exec(
+            select(PublicationRelease)
+            .where(
+                PublicationRelease.id == target_release_id,
+                PublicationRelease.tenant_id == actor.tenant_id,
+            )
+            .with_for_update()
+        ).first()
+        if target is None or target.resource_type != "agent":
+            raise PublicationError("PUBLICATION_RELEASE_NOT_FOUND", "agent release unavailable", 404)
+        if target.status == "active" and target.terminal_command_id == command_id:
+            return self._release_read(target)
+        if target.status != "unpublished":
+            raise PublicationError(
+                "PUBLICATION_ROLLBACK_TARGET_INVALID",
+                "only a normally unpublished agent release can be restored",
+                409,
+            )
+        if target.row_version != expected_target_row_version:
+            raise PublicationError("PUBLICATION_RELEASE_STALE", "rollback target is stale")
+        active = self.db.exec(
+            select(PublicationRelease)
+            .where(
+                PublicationRelease.tenant_id == actor.tenant_id,
+                PublicationRelease.resource_type == "agent",
+                PublicationRelease.resource_id == target.resource_id,
+                PublicationRelease.status == "active",
+                PublicationRelease.active_slot_key == "active",
+            )
+            .with_for_update()
+        ).first()
+        if (
+            active is None
+            or active.id != expected_active_release_id
+            or active.row_version != expected_active_row_version
+        ):
+            raise PublicationError("PUBLICATION_RELEASE_STALE", "active release changed before rollback")
+        if self.db.get(AgentPublicationRevision, target.snapshot_id) is None:
+            raise PublicationError("PUBLICATION_RELEASE_CORRUPT", "rollback snapshot unavailable")
+        now = utc_now()
+        retired_command_id = f"{command_id}:superseded"
+        retired = self.db.exec(
+            update(PublicationRelease)
+            .where(
+                PublicationRelease.id == active.id,
+                PublicationRelease.tenant_id == actor.tenant_id,
+                PublicationRelease.status == "active",
+                PublicationRelease.row_version == expected_active_row_version,
+            )
+            .values(
+                status="unpublished",
+                active_slot_key=None,
+                row_version=PublicationRelease.row_version + 1,
+                terminal_command_id=retired_command_id,
+                terminal_by_user_id=actor.id,
+                terminal_reason=f"rollback: {reason}",
+                updated_at=now,
+                terminal_at=now,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if retired.rowcount != 1:
+            self.db.rollback()
+            raise PublicationError("PUBLICATION_RELEASE_STALE", "active release changed before rollback")
+        activated = self.db.exec(
+            update(PublicationRelease)
+            .where(
+                PublicationRelease.id == target.id,
+                PublicationRelease.tenant_id == actor.tenant_id,
+                PublicationRelease.status == "unpublished",
+                PublicationRelease.row_version == expected_target_row_version,
+            )
+            .values(
+                status="active",
+                active_slot_key="active",
+                row_version=PublicationRelease.row_version + 1,
+                terminal_command_id=command_id,
+                terminal_by_user_id=actor.id,
+                terminal_reason=reason,
+                updated_at=now,
+                terminal_at=now,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if activated.rowcount != 1:
+            self.db.rollback()
+            raise PublicationError("PUBLICATION_RELEASE_STALE", "rollback target changed before commit")
+        self.db.refresh(target)
+        self._sync_agent_release_projection(
+            target.resource_id,
+            published=True,
+            release_id=target.id,
+            published_by_user_id=actor.id,
+            now=now,
+        )
+        append_management_audit(
+            self.db,
+            tenant_id=actor.tenant_id,
+            actor_user_id=actor.id,
+            actor_display_name=actor.display_name or actor.username,
+            action="publication_release_rollback",
+            action_kind="update",
+            outcome="success",
+            resource_type="agent_publication_release",
+            resource_id=target.id,
+            before={
+                "active_release_id": active.id,
+                "target_status": "unpublished",
+                "target_row_version": expected_target_row_version,
+            },
+            after={
+                "active_release_id": target.id,
+                "retired_release_id": active.id,
+                "target_status": "active",
+                "target_row_version": expected_target_row_version + 1,
+            },
+            detail={"command_id": command_id, "reason": reason},
+        )
+        self.db.commit()
+        self.db.refresh(target)
+        return self._release_read(target)
 
     def _revoke_adopted_agents(self, release: PublicationRelease, *, now: datetime) -> None:
         """安全撤销整 Agent Release 时停用全部采用副本及其资源绑定。"""
@@ -586,13 +772,71 @@ class PublicationService:
             "persona_checksum": _checksum(persona),
             "persona_snapshot_json": persona,
             "component_snapshot_json": components,
-            "governance_snapshot_json": {
-                "excluded": ["memory", "conversation", "connection", "credential", "schedule"],
-                "owner_user_id": owner.id,
-            },
+            "governance_snapshot_json": self._agent_governance_snapshot(agent),
         }
         facts["snapshot_checksum"] = _checksum(facts)
         return facts, agent.name
+
+    def _agent_governance_snapshot(self, agent: AgentProfile) -> dict[str, Any]:
+        """冻结组织化发布所依赖的责任组织、角色、监督者和作用域事实。"""
+
+        organization = (
+            self.db.get(OrganizationUnit, agent.responsible_org_unit_id)
+            if agent.responsible_org_unit_id
+            else None
+        )
+        bindings = self.db.exec(
+            select(AgentRoleBinding).where(
+                AgentRoleBinding.tenant_id == agent.tenant_id,
+                AgentRoleBinding.agent_id == agent.id,
+            )
+        ).all()
+        binding_facts: list[dict[str, object]] = []
+        for binding in bindings:
+            role = self.db.get(BusinessRole, binding.business_role_id)
+            supervisor = (
+                self.db.get(EmployeeProfile, binding.supervisor_employee_profile_id)
+                if binding.supervisor_employee_profile_id
+                else None
+            )
+            binding_facts.append(
+                {
+                    "id": binding.id,
+                    "business_role_id": binding.business_role_id,
+                    "role_code": role.role_code if role else None,
+                    "role_kind": role.role_kind if role else None,
+                    "role_status": role.status if role else None,
+                    "assignment_mode": binding.assignment_mode,
+                    "supervisor_employee_profile_id": binding.supervisor_employee_profile_id,
+                    "supervisor_status": supervisor.status if supervisor else None,
+                    "scope_type": binding.scope_type,
+                    "scope_id": binding.scope_id,
+                    "include_descendants": binding.include_descendants,
+                    "status": binding.status,
+                    "effective_from": (
+                        binding.effective_from.isoformat() if binding.effective_from else None
+                    ),
+                    "effective_until": (
+                        binding.effective_until.isoformat() if binding.effective_until else None
+                    ),
+                }
+            )
+        binding_facts.sort(key=lambda item: str(item["id"]))
+        return {
+            "excluded": ["memory", "conversation", "connection", "credential", "schedule"],
+            "owner_user_id": agent_owner_user_id(agent),
+            "source_agent_id": agent.source_agent_id,
+            "agent_status": agent.status,
+            "responsible_org_unit": (
+                {
+                    "id": organization.id,
+                    "status": organization.status,
+                }
+                if organization is not None
+                else None
+            ),
+            "role_bindings": binding_facts,
+        }
 
     def _released_component_authorized(
         self,
@@ -793,6 +1037,40 @@ class PublicationService:
         self.db.add(release)
         self.db.flush()
         return release
+
+    def _sync_agent_release_projection(
+        self,
+        agent_id: str,
+        *,
+        published: bool,
+        release_id: str | None,
+        published_by_user_id: str,
+        now: datetime,
+    ) -> None:
+        """同步 Agent Release 到兼容发现投影，避免布尔列独立于 Release 漂移。"""
+
+        agent = self.db.get(AgentProfile, agent_id)
+        if agent is None:
+            raise PublicationError("PUBLICATION_RESOURCE_NOT_FOUND", "agent unavailable", 404)
+        metadata = dict(agent.metadata_json or {})
+        metadata["published_to_gallery"] = published
+        if published:
+            metadata["organization_release_id"] = release_id
+            metadata["organization_release_projection"] = True
+            agent.published_to_gallery = True
+            agent.visibility_scope = "tenant"
+            agent.gallery_published_at = now
+            agent.gallery_published_by = published_by_user_id
+        else:
+            metadata.pop("organization_release_id", None)
+            metadata.pop("organization_release_projection", None)
+            agent.published_to_gallery = False
+            agent.visibility_scope = "private"
+            agent.gallery_published_at = None
+            agent.gallery_published_by = None
+        agent.metadata_json = metadata
+        agent.updated_at = now
+        self.db.add(agent)
 
     def _release_read(self, release: PublicationRelease) -> PublicationReleaseRead:
         """从类型化冻结快照投影 Release 展示内容。"""

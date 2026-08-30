@@ -61,6 +61,10 @@ from app.db.demo_sop_versions import (
     ensure_participant_acceptance_skill,
     ensure_travel_reimbursement_deterministic_version,
 )
+from app.general_skills.builtin_catalog import (
+    BUILTIN_SKILL_INITIAL_IMPORT_COMMAND_ID,
+    BuiltinSkillCatalogService,
+)
 from app.organization.reference_data import (
     ensure_agent_category_catalog,
     ensure_member_category_catalog,
@@ -1108,6 +1112,20 @@ def seed_demo_data(session: Session) -> None:
         )
 
     session.commit()
+    catalog_admin = session.exec(
+        select(User).where(
+            User.tenant_id == "tenant_demo",
+            User.username == "admin",
+            User.role == "admin",
+        )
+    ).first()
+    if catalog_admin is None:
+        raise RuntimeError("Demo tenant administrator is required for the built-in Skill catalog")
+    BuiltinSkillCatalogService(session).import_snapshot(
+        tenant_id="tenant_demo",
+        command_id=BUILTIN_SKILL_INITIAL_IMPORT_COMMAND_ID,
+        actor_user_id=catalog_admin.id,
+    )
 
 
 def _publish_seeded_system_resources(session: Session) -> None:

@@ -21,7 +21,9 @@ from sqlmodel import Session, select
 
 from app.agents.branching import (
     get_agent,
+    is_archived_platform_catalog_binding_continuable,
     is_bound_resource_visible_for_agent,
+    is_platform_catalog_general_skill,
     is_open_gallery_resource,
     visible_tool_rows,
 )
@@ -799,9 +801,10 @@ class DynamicCapabilityCatalog:
         """仅返回当前数字员工可见、已发布且 checksum 与快照一致的通用技能。"""
 
         snapshots = [
-            self._general_skill_snapshot(row, agent_id)
+            self._general_skill_snapshot(row, agent_id, tenant_id)
             for row in self._visible_general_skills(tenant_id, agent_id)
-            if row.status == "published" and self._valid_general_skill_publication(row)
+            if self._general_skill_can_continue(row, tenant_id, agent_id)
+            and self._valid_general_skill_publication(row)
         ]
         if get_settings().general_skill_resolver_v2_enabled and actor_user_id:
             actor = self.db.get(User, actor_user_id)
@@ -811,7 +814,12 @@ class DynamicCapabilityCatalog:
             return [
                 snapshot
                 for item in catalog.items
-                if (snapshot := self._resolved_general_skill_snapshot(item, agent_id)) is not None
+                if (
+                    snapshot := self._resolved_general_skill_snapshot(
+                        item, agent_id, tenant_id
+                    )
+                )
+                is not None
             ]
         if get_settings().general_skill_resolver_v2_shadow and actor_user_id:
             actor = self.db.get(User, actor_user_id)
@@ -835,6 +843,7 @@ class DynamicCapabilityCatalog:
         self,
         item,
         agent_id: str,
+        tenant_id: str,
     ) -> CapabilitySnapshot | None:
         """从 resolver 固定 revision 构造动态目录快照，不信任可变根正文。"""
 
@@ -854,7 +863,7 @@ class DynamicCapabilityCatalog:
         payload = {
             "capability_type": "general_skill",
             "capability_id": root.id,
-            "tenant_id": root.tenant_id,
+            "tenant_id": tenant_id,
             "name": root.slug,
             "contract": {
                 "usage_mode": item.usage_mode,
@@ -1072,9 +1081,24 @@ class DynamicCapabilityCatalog:
         """在加载指南或执行原子技能前重查状态、绑定与发布修订。"""
 
         row = self.db.get(GeneralSkill, snapshot.capability_id)
-        if row is None or row.tenant_id != snapshot.tenant_id:
+        if row is None or (
+            row.tenant_id != snapshot.tenant_id
+            and not is_platform_catalog_general_skill(row)
+        ):
             raise CapabilityAccessDenied("GENERAL_SKILL_NOT_FOUND")
-        if row.status != "published":
+        binding = self.db.exec(
+            select(AgentResourceBinding).where(
+                AgentResourceBinding.tenant_id == snapshot.tenant_id,
+                AgentResourceBinding.agent_id == snapshot.agent_id,
+                AgentResourceBinding.resource_type == "general_skill",
+                AgentResourceBinding.resource_id == row.id,
+                AgentResourceBinding.status == "active",
+            )
+        ).first()
+        if row.status != "published" and not (
+            binding is not None
+            and is_archived_platform_catalog_binding_continuable(row, binding)
+        ):
             raise CapabilityAccessDenied("GENERAL_SKILL_DISABLED")
         visible_ids = {
             item.id
@@ -1084,10 +1108,34 @@ class DynamicCapabilityCatalog:
             raise CapabilityAccessDenied("GENERAL_SKILL_BINDING_REVOKED")
         if not self._valid_general_skill_publication(row):
             raise CapabilityAccessDenied("GENERAL_SKILL_PUBLICATION_INVALID")
-        current = self._general_skill_snapshot(row, snapshot.agent_id)
+        current = self._general_skill_snapshot(row, snapshot.agent_id, snapshot.tenant_id)
         if current.checksum != snapshot.checksum:
             raise CapabilityAccessDenied("GENERAL_SKILL_REVISION_CHANGED")
         return row
+
+    def _general_skill_can_continue(
+        self,
+        row: GeneralSkill,
+        tenant_id: str,
+        agent_id: str,
+    ) -> bool:
+        """允许普通下架的项目 Skill 沿既有活动绑定继续使用，拒绝其他非发布状态。"""
+
+        if row.status == "published":
+            return True
+        binding = self.db.exec(
+            select(AgentResourceBinding).where(
+                AgentResourceBinding.tenant_id == tenant_id,
+                AgentResourceBinding.agent_id == agent_id,
+                AgentResourceBinding.resource_type == "general_skill",
+                AgentResourceBinding.resource_id == row.id,
+                AgentResourceBinding.status == "active",
+            )
+        ).first()
+        return binding is not None and is_archived_platform_catalog_binding_continuable(
+            row,
+            binding,
+        )
 
     @staticmethod
     def _published_tool_contract(tool: Tool) -> ToolReliabilityContract | None:
@@ -1159,7 +1207,10 @@ class DynamicCapabilityCatalog:
             row = self.db.get(GeneralSkill, binding.resource_id)
             if (
                 row is not None
-                and row.tenant_id == tenant_id
+                and (
+                    row.tenant_id == tenant_id
+                    or is_platform_catalog_general_skill(row)
+                )
                 and is_bound_resource_visible_for_agent(
                     self.db, tenant_id, "general_skill", row, binding
                 )
@@ -1203,7 +1254,7 @@ class DynamicCapabilityCatalog:
 
     @staticmethod
     def _general_skill_snapshot(
-        row: GeneralSkill, agent_id: str
+        row: GeneralSkill, agent_id: str, tenant_id: str
     ) -> CapabilitySnapshot:
         """把已发布通用技能投影为规划可用但不承载持续授权的快照。"""
 
@@ -1230,7 +1281,7 @@ class DynamicCapabilityCatalog:
         payload = {
             "capability_type": "general_skill",
             "capability_id": row.id,
-            "tenant_id": row.tenant_id,
+            "tenant_id": tenant_id,
             "name": row.slug,
             "contract": {"usage_mode": usage_mode},
             "model_view": model_view,

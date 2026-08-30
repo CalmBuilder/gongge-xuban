@@ -8,6 +8,7 @@ import IconChevronDown from '../../assets/icons/chevron-down.svg?react';
 import IconTrash from '../../assets/icons/trash.svg?react';
 import EmployeeAvatar from '../EmployeeAvatar';
 import type { AgentProfileRead } from '../../types';
+import type { EmployeeStatusKind } from '../../employee';
 
 import type { PlatformStat } from './PlatformEmployeeCard';
 
@@ -22,6 +23,10 @@ export type PlatformEmployeeDrawerProps = {
   workStyles: string[];
   stats: PlatformStat[];
   online?: boolean;
+  /** Override the status text for a published template, which is not an online employee. */
+  statusLabel?: string;
+  /** Distinguishes a published template from a live employee in the detail drawer. */
+  statusKind?: EmployeeStatusKind;
   canManage?: boolean;
   deleting?: boolean;
   hasPrev?: boolean;
@@ -78,6 +83,8 @@ export default function PlatformEmployeeDrawer({
   workStyles,
   stats,
   online = true,
+  statusLabel,
+  statusKind,
   canManage = false,
   deleting = false,
   hasPrev = false,
@@ -89,6 +96,13 @@ export default function PlatformEmployeeDrawer({
   onUse,
   onCopy,
 }: PlatformEmployeeDrawerProps) {
+  const effectiveStatusKind: EmployeeStatusKind = statusKind
+    || (statusLabel ? 'available' : online ? 'online' : 'offline');
+  const statusPresentation = {
+    online: { badge: 'border-[#96d9b0] bg-[#e9f7ef] text-[#2cb360]', dot: 'bg-[#22c55e]' },
+    available: { badge: 'border-[#c7d4f5] bg-[#f0f4ff] text-[#526bc4]', dot: 'bg-[#5474dd]' },
+    offline: { badge: 'border-[#d1d5db] bg-[#f3f4f6] text-[#757f9c]', dot: 'bg-[#9ca3af]' },
+  }[effectiveStatusKind];
   return (
     <Sheet open={open} onOpenChange={(next) => { if (!next) onClose(); }}>
       <SheetContent
@@ -145,16 +159,14 @@ export default function PlatformEmployeeDrawer({
               <span
                 className={cn(
                   'inline-flex w-fit items-center gap-[4px] rounded-[90px] border-[0.5px] px-[10px] py-[4px]',
-                  online
-                    ? 'border-[#96d9b0] bg-[#e9f7ef] text-[#2cb360]'
-                    : 'border-[#d1d5db] bg-[#f3f4f6] text-[#757f9c]',
+                  statusPresentation.badge,
                 )}
               >
                 <i
-                  className={cn('size-[4px] shrink-0 rounded-full shadow-[inset_1px_1px_2px_0.5px_rgba(0,0,0,0.05)]', online ? 'bg-[#22c55e]' : 'bg-[#9ca3af]')}
+                  className={cn('size-[4px] shrink-0 rounded-full shadow-[inset_1px_1px_2px_0.5px_rgba(0,0,0,0.05)]', statusPresentation.dot)}
                   aria-hidden="true"
                 />
-                <span className="text-[10px] capitalize">{online ? '在线' : '下线'}</span>
+                <span className="text-[10px] capitalize">{statusLabel || (online ? '在线' : '下线')}</span>
               </span>
             </div>
           </div>

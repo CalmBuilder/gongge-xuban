@@ -12,7 +12,8 @@
 - `packaging/`：PyInstaller 及 Linux、macOS、Windows 桌面打包。
 - `docs/Module_Description/`：后端、前端和 Agent Loop 的详细模块手册；它适合导航，但依赖版本和文件数量可能滞后，最终以源码和清单文件为准。
 - `docs/superpowers/specs/`、`docs/superpowers/plans/`：历史设计和实施记录，不等同于当前待办。
-- `agency-agents-zh/`、`agency-agents-import/`：专家中文化与一次性导入工作树/产物。
+- `agency-agents-library/`：项目内置专家快照、中文化包和离线升级报告；产品运行时不连接
+  GitHub，不从该目录自动同步。
 - `otherpro/`：只读上游或参考源码，不参与主项目构建，不要修改，也不要让生产代码或测试依赖它。
 
 不要编辑生成目录或本地状态，例如 `node_modules/`、`dist/`、`build/`、`*.egg-info/`、`__pycache__/`、`.pytest_cache/`、`.ruff_cache/`、`.venv/`、`.runtime_venv/`、`packaging/out/` 和数据库文件。

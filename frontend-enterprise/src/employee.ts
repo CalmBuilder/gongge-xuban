@@ -28,6 +28,12 @@ export type EmployeeProfile = {
   workModes: string[];
 };
 
+/**
+ * 页面上对 Agent 可用性的三种表达：在线是运行状态，可使用是目录发布状态，下线是不可用状态。
+ * 它不改变后端 AgentProfile 的 status，只避免把专家模板误显示为真人式“在线员工”。
+ */
+export type EmployeeStatusKind = 'online' | 'available' | 'offline';
+
 export type EmployeeAvatarPreset = {
   key: string;
   label: string;
@@ -51,6 +57,7 @@ type EmployeeAgentLike = {
   id?: string;
   name?: string;
   is_overall?: boolean;
+  agent_category_code?: string;
   metadata?: Record<string, unknown>;
 };
 
@@ -197,6 +204,8 @@ export function canSelectCurrentEmployeeAgent(
   const includeOverall = options.includeOverall ?? false;
   if (isEnterpriseAdmin(user)) {
     if (agent.is_overall) return includeOverall;
+    // 平台内置专家模板的技术 owner 不是当前员工关系；只有建立 AgentUsage 后才能进入当前上下文。
+    if (isExpertTemplate(agent)) return isEmployeeUsedByCurrentUser(agent);
     if (isGalleryEmployee(agent) && !isEmployeeOwnedBy(agent, user)) {
       return isEmployeeUsedByCurrentUser(agent);
     }
@@ -276,7 +285,13 @@ const EXPERT_SOURCE_LABELS: Record<string, string> = {
 };
 
 export function isExpertEmployee(agent?: AgentProfileRead | null): boolean {
-  return stringFromMeta(agent?.metadata || {}, 'employee_type') === 'expert';
+  return agent?.agent_category_code === 'professional'
+    || stringFromMeta(agent?.metadata || {}, 'employee_type') === 'expert';
+}
+
+/** 判断服务端治理投影中的平台专家模板，模板未被当前用户使用前不能进入当前员工上下文。 */
+export function isExpertTemplate(agent?: AgentProfileRead | null): boolean {
+  return isExpertEmployee(agent) && agent?.governance_form === 'template';
 }
 
 export function expertSourceCode(agent?: AgentProfileRead | null): string {
@@ -438,6 +453,9 @@ export function employeeDisplayName(agent?: AgentProfileRead | null): string {
 }
 
 export function employeeCreatorName(agent?: AgentProfileRead | null): string {
+  if (isExpertTemplate(agent)) {
+    return '平台内置';
+  }
   return creatorNameFromMetadata(agent?.metadata);
 }
 

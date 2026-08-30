@@ -1010,7 +1010,7 @@ class GeneralSkillRuntimeService:
         remaining = get_settings().general_skill_resource_read_bytes
         blocks: list[dict[str, object]] = []
         for resource in revision.resource_manifest_json:
-            path = str(resource.get("path") or "").strip()
+            path = str(resource.get("path") or resource.get("relative_path") or "").strip()
             if not path or path == "SKILL.md" or remaining <= 0:
                 continue
             media_type = str(resource.get("media_type") or resource.get("mime_type") or "")
@@ -1206,11 +1206,11 @@ class GeneralSkillRuntimeService:
     ) -> bytes:
         """读取新对象或 legacy inline 内容，两种路径都复核 SHA-256。"""
 
-        if resource.get("legacy_inline"):
+        if resource.get("legacy_inline") or not resource.get("object_key"):
             skill = self.db.get(GeneralSkill, revision.skill_id)
             if skill is None:
                 raise SkillObjectStoreError("legacy skill is unavailable")
-            target_path = str(resource.get("path") or "")
+            target_path = str(resource.get("path") or resource.get("relative_path") or "")
             if target_path == "SKILL.md":
                 payload = revision.normalized_skill_markdown.encode()
             else:

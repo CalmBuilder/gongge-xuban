@@ -18,6 +18,7 @@ from app.general_skills.publication_schema import (
     PublicationAdoptRead,
     PublicationAdoptRequest,
     PublicationReleaseRead,
+    PublicationReleaseRollbackRequest,
     PublicationRequestRead,
     PublicationReviewRequest,
     PublicationReleaseTransitionRequest,
@@ -74,13 +75,24 @@ def review_publication(
 @router.get("/releases", response_model=list[PublicationReleaseRead])
 def list_publication_releases(
     resource_type: str | None = None,
+    include_history: bool = False,
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> list[PublicationReleaseRead]:
-    """列出租户内 active Skill/Agent Release。"""
+    """列出租户内 active Skill/Agent Release，管理员可显式读取历史版本。"""
 
     try:
-        return PublicationService(db).list_releases(current_user.tenant_id, resource_type)
+        if include_history and current_user.role != "admin":
+            raise PublicationError(
+                "PUBLICATION_HISTORY_DENIED",
+                "only administrator can inspect release history",
+                403,
+            )
+        return PublicationService(db).list_releases(
+            current_user.tenant_id,
+            resource_type,
+            include_history=include_history,
+        )
     except PublicationError as exc:
         raise _http_error(exc) from exc
 
@@ -120,6 +132,29 @@ def transition_publication_release(
             command=request.command,
             command_id=request.command_id,
             expected_row_version=request.expected_row_version,
+            actor=current_user,
+            reason=request.reason,
+        )
+    except PublicationError as exc:
+        raise _http_error(exc) from exc
+
+
+@router.post("/releases/{release_id}/rollback", response_model=PublicationReleaseRead)
+def rollback_publication_release(
+    release_id: str,
+    request: PublicationReleaseRollbackRequest,
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> PublicationReleaseRead:
+    """管理员以历史普通下架 Release 回滚整 Agent，并返回新的当前事实。"""
+
+    try:
+        return PublicationService(db).rollback_agent_release(
+            release_id,
+            command_id=request.command_id,
+            expected_active_release_id=request.expected_active_release_id,
+            expected_active_row_version=request.expected_active_row_version,
+            expected_target_row_version=request.expected_target_row_version,
             actor=current_user,
             reason=request.reason,
         )

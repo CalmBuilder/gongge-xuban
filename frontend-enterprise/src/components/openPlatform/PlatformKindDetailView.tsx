@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react';
 
 import { Button as UIButton } from '@/components/ui/button';
+import { RESOURCE_GRID_CLASS } from '@/lib/enterprise-ui';
 import { cn } from '@/lib/utils';
 
 import IconRefresh from '../../assets/icons/refresh.svg?react';
@@ -12,7 +13,7 @@ import type { AgentProfileRead } from '../../types';
 import PlazaResourceArtwork from './PlazaResourceArtwork';
 import PlatformResourceCard, { type PlatformResourceAccent } from './PlatformResourceCard';
 
-export type PlatformDetailKind = 'agents' | 'knowledge' | 'general-skills' | 'skills' | 'tools';
+export type PlatformDetailKind = 'agents' | 'experts' | 'knowledge' | 'general-skills' | 'skills' | 'tools';
 
 export type PlatformDetailItem = {
   id: string;
@@ -35,6 +36,7 @@ const PLATFORM_PAGE_SIZE = 12;
 export type PlatformKindDetailViewProps = {
   kind: PlatformDetailKind;
   title: string;
+  subtitle?: string;
   countLabel: string;
   signals: string[];
   items: PlatformDetailItem[];
@@ -46,11 +48,11 @@ export type PlatformKindDetailViewProps = {
 
 function DetailSkeleton() {
   return (
-    <div className="grid auto-rows-[292px] grid-cols-1 gap-[32px] sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 max-[900px]:gap-[18px]">
+    <div className={RESOURCE_GRID_CLASS}>
       {Array.from({ length: 8 }, (_, index) => (
         <div
           key={index}
-          className="h-full w-full animate-pulse rounded-[14px] border-[0.5px] border-[#f0f1f5] bg-[#f6f6f6]"
+          className="h-full w-full animate-pulse rounded-[var(--gg-radius-card)] border border-[var(--gg-line)] bg-[var(--gg-surface-subtle)]"
         />
       ))}
     </div>
@@ -65,6 +67,7 @@ function DetailSkeleton() {
 export default function PlatformKindDetailView({
   kind,
   title,
+  subtitle,
   countLabel,
   signals,
   items,
@@ -96,12 +99,19 @@ export default function PlatformKindDetailView({
   return (
     <div className="mt-[20px] flex flex-col gap-[16px]">
       <div className="flex flex-wrap items-center gap-[12px]">
-        <div className="flex items-center gap-[8px] text-[#464c5e]">
-          {kind === 'agents'
+        <div className="min-w-0 text-[#464c5e]">
+          <div className="flex items-center gap-[8px]">
+          {kind === 'agents' || kind === 'experts'
             ? null
             : <PlazaResourceArtwork kind={kind} size="compact" />}
-          <span className="text-[14px] font-semibold leading-none text-[#252a3c]">{title}</span>
-          <span className="text-[12px] text-[#8a93a6]">{items.length} {countLabel}</span>
+            <h1 className="text-balance text-[14px] font-semibold leading-none text-[#252a3c]">{title}</h1>
+            <span className="text-[12px] text-[#8a93a6]">{items.length} {countLabel}</span>
+          </div>
+          {subtitle && (
+            <p className="mt-[7px] max-w-[680px] text-[12px] leading-[18px] text-[#7d879d]">
+              {subtitle}
+            </p>
+          )}
         </div>
 
         {signals.length > 0 && (
@@ -122,7 +132,10 @@ export default function PlatformKindDetailView({
             <IconSearch className="size-[14px] shrink-0 text-[#858b9c]" />
             <input
               value={searchText}
-              placeholder={`搜索${countLabel}`}
+              name={`plaza-search-${kind}`}
+              aria-label={`搜索${countLabel}`}
+              autoComplete="off"
+              placeholder={`搜索${countLabel}…`}
               onChange={(event) => {
                 setSearchText(event.target.value);
                 setPage(1);
@@ -150,8 +163,8 @@ export default function PlatformKindDetailView({
           <IconSearch className="size-[20px] shrink-0" />
           <span>{items.length === 0 ? '暂无开放内容' : '没有匹配的广场内容'}</span>
         </div>
-      ) : kind === 'agents' ? (
-        <div className="grid auto-rows-[292px] grid-cols-1 content-start gap-[32px] sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 max-[900px]:gap-[18px]">
+      ) : kind === 'agents' || kind === 'experts' ? (
+        <div className={RESOURCE_GRID_CLASS}>
           {pageItems.map((item) => item.agent && (
             <EmployeeCard
               key={item.id}
@@ -159,7 +172,11 @@ export default function PlatformKindDetailView({
               canManage={false}
               canGovern={false}
               showMenu={false}
-              relationLabels={['企业发布']}
+              statusLabel={kind === 'experts' ? '可使用' : undefined}
+              statusKind={kind === 'experts'
+                ? 'available'
+                : item.agent.status === 'active' ? 'online' : 'offline'}
+              relationLabels={kind === 'experts' ? [] : ['企业发布']}
               onOpen={() => onOpenItem(item)}
               onChat={() => onUseItem(item)}
               onStatus={() => undefined}
@@ -171,7 +188,7 @@ export default function PlatformKindDetailView({
           ))}
         </div>
       ) : (
-        <div className="grid auto-rows-[292px] grid-cols-1 content-start gap-[32px] sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 max-[900px]:gap-[18px]">
+        <div className={RESOURCE_GRID_CLASS}>
           {pageItems.map((item) => (
             <PlatformResourceCard
               key={item.id}

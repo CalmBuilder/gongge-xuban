@@ -232,6 +232,10 @@ export type AgentProfileRead = {
   used_by_current_user?: boolean;
   manageable_by_current_user?: boolean;
   view_level?: 'manager' | 'user' | 'governance';
+  governance_form?: 'capability_avatar' | 'organization_pending' | 'organization_employee' | 'template' | string;
+  governance_reasons?: string[];
+  organization_release_id?: string;
+  active_role_binding_ids?: string[];
   copy_summary?: {
     copied?: Array<Record<string, string>>;
     skipped?: Array<Record<string, string>>;
@@ -273,9 +277,53 @@ export type AgentManagementPageRead = {
   items: AgentProfileRead[];
   total: number;
   view_counts: Record<'all' | 'online' | 'offline' | 'pending' | 'expert' | 'governance', number>;
+  governance_counts?: Record<'capability_avatar' | 'organization_pending' | 'organization_employee' | 'template', number>;
   facets: AgentGalleryPageRead['facets'];
   page: number;
   page_size: number;
+};
+
+export type AgentOrganizationRequirementRead = {
+  code: string;
+  label: string;
+  satisfied: boolean;
+  detail: string;
+};
+
+export type AgentOrganizationizationPreviewRead = {
+  tenant_id: string;
+  agent_id: string;
+  agent_name: string;
+  governance_form: 'capability_avatar' | 'organization_pending' | 'organization_employee' | 'template' | string;
+  governance_reasons: string[];
+  requirements: AgentOrganizationRequirementRead[];
+  can_submit: boolean;
+  active_release_id?: string;
+  profile_revision: number;
+  owner_user_id?: string;
+  source_agent_id?: string;
+  responsible_org_unit_id?: string;
+  responsible_org_unit_name?: string;
+  active_role_binding_ids: string[];
+  active_role_code?: string;
+  active_supervisor_employee_profile_id?: string;
+  relationship_checksum: string;
+};
+
+export type AgentOrganizationizationOptionsRead = {
+  organizations: Array<{ id: string; name: string }>;
+  roles: Array<{ role_code: string; name: string }>;
+  supervisors: Array<{ id: string; employee_id: string; employee_name: string }>;
+};
+
+export type AgentOrganizationizationResultRead = {
+  command_id: string;
+  result_status: 'configured' | 'unchanged';
+  agent_id: string;
+  profile_revision: number;
+  relationship_checksum: string;
+  active_role_binding_id: string;
+  preview: AgentOrganizationizationPreviewRead;
 };
 
 export type ToolSuggestion = {
@@ -353,12 +401,18 @@ export type SkillVersionRead = SkillRead & {
 
 export type GeneralSkillRead = {
   id: string;
-  tenant_id: string;
+  tenant_id: string | null;
   slug: string;
   name: string;
+  name_zh?: string | null;
   description?: string;
+  description_zh?: string | null;
   homepage?: string;
   skill_markdown: string;
+  explanation_markdown_zh?: string | null;
+  localization_status?: string | null;
+  localization_source_content_checksum?: string | null;
+  localization_checksum?: string | null;
   skill_files: Array<{
     path: string;
     content: string;
@@ -371,7 +425,7 @@ export type GeneralSkillRead = {
   runtime_config: Record<string, unknown>;
   usage_mode?: 'atomic_execution' | 'planning_guidance';
   owner_user_id?: string;
-  visibility_scope?: 'user_private' | 'agent_private' | 'tenant_gallery';
+  visibility_scope?: 'user_private' | 'agent_private' | 'tenant_gallery' | 'platform_gallery';
   current_published_revision_id?: string;
   row_version?: number;
   binding_id?: string;

@@ -83,10 +83,12 @@ def test_owned_gallery_page_paginates_before_card_projection_and_returns_scope_c
 
 
 def test_gallery_search_and_expert_facets_keep_visibility_and_filter_semantics() -> None:
-    """验证搜索覆盖标签，专家级联筛选返回完整计数且普通成员看不到私人专家。"""
+    """验证管理员和普通成员的专家搜索、级联筛选及未发布模板可见性边界。"""
 
     with _test_session() as db:
         owner, other = _seed_users(db)
+        owner.role = "admin"
+        db.add(owner)
         db.add_all(
             [
                 AgentProfile(
@@ -148,6 +150,7 @@ def test_gallery_search_and_expert_facets_keep_visibility_and_filter_semantics()
             expert_department="工程研发",
             expert_direction="前端与客户端",
         )
+        expert_ids = {item.id for item in _page(db, owner, "expert").items}
 
     assert [item.id for item in searched.items] == ["expert_data"]
     assert searched.scope_counts["expert"] == 2
@@ -162,6 +165,7 @@ def test_gallery_search_and_expert_facets_keep_visibility_and_filter_semantics()
         ("数据与数据库", 1),
     ]
     assert [item.id for item in filtered.items] == ["expert_frontend"]
+    assert "expert_private" not in expert_ids
 
 
 def test_management_page_uses_owner_scope_and_returns_cross_page_view_counts() -> None:

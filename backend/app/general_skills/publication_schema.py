@@ -83,3 +83,13 @@ class PublicationReleaseTransitionRequest(BaseModel):
     command: str = Field(pattern=r"^(unpublish|security_revoke)$")
     expected_row_version: int = Field(ge=1)
     reason: str = Field(min_length=1, max_length=2000)
+
+
+class PublicationReleaseRollbackRequest(BaseModel):
+    """管理员以双重 CAS 将同一 Agent 的历史普通下架 Release 恢复为当前版本。"""
+
+    command_id: str = Field(min_length=1, max_length=128)
+    expected_active_release_id: str = Field(min_length=1, max_length=512)
+    expected_active_row_version: int = Field(ge=1)
+    expected_target_row_version: int = Field(ge=1)
+    reason: str = Field(min_length=1, max_length=2000)

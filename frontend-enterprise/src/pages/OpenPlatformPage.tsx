@@ -1,7 +1,7 @@
-import { notify, UnderlineTabs, type UnderlineTabItem } from '@/components/ui';
+import { Button as UIButton, notify, UnderlineTabs, type UnderlineTabItem } from '@/components/ui';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { useNavigate, useParams } from 'react-router-dom';
+import { Link, useNavigate, useParams } from 'react-router-dom';
 import { api, getRequestTenantId } from '../api/client';
 import { isGalleryEmployee, type EnterpriseAuthUser } from '../auth';
 import type { PlazaResourceKind } from '../assets/plaza/plaza-resource-icons';
@@ -11,6 +11,7 @@ import {
   employeeDisplayNameWithCreator,
   employeeProfile,
   resourceDisplayNameWithCreator,
+  isExpertTemplate,
 } from '../employee';
 import type { AgentProfileRead, GeneralSkillRead, KnowledgeBaseRead, SkillRead, ToolRead } from '../types';
 
@@ -27,7 +28,7 @@ import {
 
 const ENTERPRISE_AGENT_STORAGE_KEY = 'gongge_enterprise_agent_scope';
 
-type PlatformKind = 'agents' | PlazaResourceKind;
+type PlatformKind = 'agents' | 'experts' | PlazaResourceKind;
 
 type PlatformConfig = {
   kind: PlatformKind;
@@ -42,6 +43,7 @@ type PlatformConfig = {
 type PlatformItem = {
   id: string;
   deleteKey?: string;
+  detailHref?: string;
   title: string;
   description: string;
   meta: string;
@@ -52,17 +54,26 @@ type PlatformItem = {
 const PLATFORM_CONFIGS: PlatformConfig[] = [
   {
     kind: 'agents',
-    title: '数字员工广场',
-    subtitle: '已发布到广场，可在对话端直接使用。',
+    title: '数字员工',
+    subtitle: '已发布到开放平台，可在对话端直接使用。',
     detail: '选择一个数字员工查看能力、岗位和服务范围。',
     useLabel: '使用此员工',
     metricLabel: '数字员工',
     signals: ['聊天可用', '支持对话', '查看能力'],
   },
   {
+    kind: 'experts',
+    title: '专家',
+    subtitle: '已审核并发布的专业型 Agent，可直接使用或复制为能力分身。',
+    detail: '专家模板与能力分身共用 AgentProfile；直接使用只建立使用关系，复制后才归当前用户所有。',
+    useLabel: '使用此专家',
+    metricLabel: '专家',
+    signals: ['专业分类', '来源可追溯', '可复制定制'],
+  },
+  {
     kind: 'knowledge',
-    title: '知识库广场',
-    subtitle: '发布到广场的知识库，可复制到你的数字员工。',
+    title: '知识库',
+    subtitle: '发布到开放平台的知识库，可复制到你的数字员工。',
     detail: '从广场复制到当前数字员工的知识库。',
     useLabel: '复制到知识库',
     metricLabel: '知识库',
@@ -70,8 +81,8 @@ const PLATFORM_CONFIGS: PlatformConfig[] = [
   },
   {
     kind: 'general-skills',
-    title: '技能广场',
-    subtitle: '浏览器、MCP、查询工具等可复用能力。',
+    title: 'Skill',
+    subtitle: '已审核发布的可复用工作能力。',
     detail: '从广场复制到当前数字员工的技能。',
     useLabel: '复制到技能',
     metricLabel: '技能',
@@ -79,7 +90,7 @@ const PLATFORM_CONFIGS: PlatformConfig[] = [
   },
   {
     kind: 'skills',
-    title: 'SOP 广场',
+    title: 'SOP',
     subtitle: '可复制和复用的业务流程与执行规范。',
     detail: '从广场复制到当前数字员工的 SOP。',
     useLabel: '复制到 SOP',
@@ -88,7 +99,7 @@ const PLATFORM_CONFIGS: PlatformConfig[] = [
   },
   {
     kind: 'tools',
-    title: '工具广场',
+    title: '工具',
     subtitle: '可开放给员工调用和测试的工具能力。',
     detail: '前往工具页按现有流程配置和测试工具。',
     useLabel: '前往工具页',
@@ -109,7 +120,11 @@ const PLATFORM_ACCENT: Partial<Record<PlatformKind, PlatformResourceAccent>> = {
 
 // Unit rendered after the header count, e.g. "12 员工" / "12 内容".
 function platformCountLabel(kind: PlatformKind): string {
-  return kind === 'agents' ? '员工' : '内容';
+  if (kind === 'experts') return '专家';
+  if (kind === 'agents') return '员工';
+  if (kind === 'general-skills') return 'Skill';
+  if (kind === 'skills') return 'SOP';
+  return kind === 'knowledge' ? '知识库' : '工具';
 }
 
 // Bottom metric segments for a 数字员工广场 card.
@@ -144,6 +159,8 @@ export default function OpenPlatformPage({
   const { kind } = useParams<{ kind?: PlatformKind }>();
   const selectedKind: PlatformKind = kind && PLATFORM_BY_KIND.has(kind) ? kind : 'agents';
   const [agents, setAgents] = useState<AgentProfileRead[]>([]);
+  const [galleryAgents, setGalleryAgents] = useState<AgentProfileRead[]>([]);
+  const [expertAgents, setExpertAgents] = useState<AgentProfileRead[]>([]);
   const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBaseRead[]>([]);
   const [generalSkills, setGeneralSkills] = useState<GeneralSkillRead[]>([]);
   const [skills, setSkills] = useState<SkillRead[]>([]);
@@ -168,19 +185,36 @@ export default function OpenPlatformPage({
   const loadPlatformData = useCallback(async () => {
     setLoading(true);
     try {
-      const agentRows = await api.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${getRequestTenantId()}`);
+      const tenantId = getRequestTenantId();
+      const [allAgentsResult, galleryAgentsResult, expertAgentsResult] = await Promise.allSettled([
+        api.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${tenantId}`),
+        api.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${tenantId}&scope=gallery`),
+        api.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${tenantId}&scope=expert`),
+      ]);
+      if (allAgentsResult.status === 'rejected') throw allAgentsResult.reason;
+      const agentRows = allAgentsResult.value;
       const overall = agentRows.find((item) => item.is_overall);
       const overallSuffix = overall ? `&agent_id=${encodeURIComponent(overall.id)}` : '';
       const [kbResult, generalResult, skillResult, toolResult] = await Promise.allSettled([
-        api.get<KnowledgeBaseRead[]>(`/api/enterprise/knowledge-bases?tenant_id=${getRequestTenantId()}${overallSuffix}`),
-        api.get<GeneralSkillRead[]>(`/api/enterprise/general-skills?tenant_id=${getRequestTenantId()}${overallSuffix}`),
+        api.get<KnowledgeBaseRead[]>(`/api/enterprise/knowledge-bases?tenant_id=${tenantId}${overallSuffix}`),
+        api.get<GeneralSkillRead[]>(`/api/enterprise/general-skills?tenant_id=${tenantId}${overallSuffix}`),
         overall
-          ? api.get<SkillRead[]>(`/api/enterprise/agents/${overall.id}/skills?tenant_id=${getRequestTenantId()}`)
+          ? api.get<SkillRead[]>(`/api/enterprise/agents/${overall.id}/skills?tenant_id=${tenantId}`)
           : Promise.resolve([]),
-        api.get<ToolRead[]>(`/api/enterprise/tools?tenant_id=${getRequestTenantId()}${overallSuffix}`),
+        api.get<ToolRead[]>(`/api/enterprise/tools?tenant_id=${tenantId}${overallSuffix}`),
       ]);
       setAgents(agentRows);
       const failures: string[] = [];
+      if (galleryAgentsResult.status === 'fulfilled') setGalleryAgents(galleryAgentsResult.value);
+      else {
+        setGalleryAgents([]);
+        failures.push('数字员工广场');
+      }
+      if (expertAgentsResult.status === 'fulfilled') setExpertAgents(expertAgentsResult.value);
+      else {
+        setExpertAgents([]);
+        failures.push('专家分类');
+      }
       if (kbResult.status === 'fulfilled') setKnowledgeBases(kbResult.value);
       else failures.push('知识库');
       if (generalResult.status === 'fulfilled') setGeneralSkills(generalResult.value);
@@ -204,11 +238,26 @@ export default function OpenPlatformPage({
   }, [loadPlatformData]);
 
   const visibleAgents = useMemo(
-    () => agents.filter((item) => !item.is_overall && item.status === 'active' && isGalleryEmployee(item)),
-    [agents],
+    () => galleryAgents.filter((item) => (
+      !item.is_overall
+      && item.status === 'active'
+      && item.agent_category_code !== 'professional'
+      && isGalleryEmployee(item)
+    )),
+    [galleryAgents],
+  );
+  const visibleExpertAgents = useMemo(
+    () => expertAgents.filter((item) => (
+      !item.is_overall
+      && item.status === 'active'
+      && item.agent_category_code === 'professional'
+      && isGalleryEmployee(item)
+    )),
+    [expertAgents],
   );
   const overallAgent = agents.find((item) => item.is_overall) || null;
-  const canManagePlatform = isAdmin;
+  // 开放平台是发现入口；发布、下架和删除分别在资源管理页完成。
+  const canManagePlatform = false;
   const currentAgent = agents.find((item) => item.id === agentId);
   const targetEmployee = currentAgent && canManageEmployeeAgent(currentAgent, currentUser)
     ? currentAgent
@@ -231,6 +280,25 @@ export default function OpenPlatformPage({
         agent: item,
       };
     }),
+    experts: visibleExpertAgents.map((item) => {
+      const profile = employeeProfile(item);
+      const template = isExpertTemplate(item);
+      return {
+        id: item.id,
+        deleteKey: item.id,
+        title: employeeDisplayNameWithCreator(item),
+        description: item.description || (template
+          ? '已发布的专家模板，可直接使用或复制为你的能力分身。'
+          : '已发布的专业型数字员工，可直接使用。'),
+        meta: profile.roleName,
+        tags: [
+          template ? '专家模板' : '专业型数字员工',
+          `来源 ${String(item.metadata?.expert_source_label || item.metadata?.expert_source_code || '项目内置')}`,
+          `技能 ${agentResourceCount(item, 'general_skill')}`,
+        ],
+        agent: item,
+      };
+    }),
     knowledge: knowledgeBases
       .filter((item) => item.status === 'active' && !isEmptyDefaultKnowledgeBase(item))
       .map((item) => ({
@@ -246,8 +314,9 @@ export default function OpenPlatformPage({
       .map((item) => ({
         id: item.id,
         deleteKey: item.slug,
-        title: resourceDisplayNameWithCreator(item.name, item),
-        description: item.description || '可复制到当前数字员工的技能。',
+        detailHref: `/enterprise/general-skills/catalog/${encodeURIComponent(item.slug)}`,
+        title: resourceDisplayNameWithCreator(item.name_zh || item.name, item),
+        description: item.description_zh || item.description || '可复制到当前数字员工的技能。',
         meta: item.slug,
         tags: [item.homepage ? '外部能力' : '内置能力', '已启用'],
       })),
@@ -271,7 +340,7 @@ export default function OpenPlatformPage({
         meta: `${item.bucket || '工具'} / ${item.tool_type.toUpperCase()}`,
         tags: [item.method, item.enabled ? '已启用' : '已停用'],
       })),
-  }), [generalSkills, knowledgeBases, skills, tools, visibleAgents]);
+  }), [generalSkills, knowledgeBases, skills, tools, visibleAgents, visibleExpertAgents]);
 
   const platformStats = PLATFORM_CONFIGS.map((config) => ({
     ...config,
@@ -296,7 +365,7 @@ export default function OpenPlatformPage({
     if (metadata.used_by_current_user !== true && metadata.chat_used_by_current_user !== true) {
       await api.post<AgentProfileRead>(`/api/chat/agents/${agent.id}/use?tenant_id=${getRequestTenantId()}`, {});
     }
-    setAgents((current) => current.map((item) => (
+    const markUsedInState = (current: AgentProfileRead[]) => current.map((item) => (
       item.id === agent.id
         ? {
           ...item,
@@ -307,7 +376,10 @@ export default function OpenPlatformPage({
           },
         }
         : item
-    )));
+    ));
+    setAgents(markUsedInState);
+    setGalleryAgents(markUsedInState);
+    setExpertAgents(markUsedInState);
     window.localStorage.setItem(ENTERPRISE_AGENT_STORAGE_KEY, agent.id);
     window.dispatchEvent(new Event('gongge-enterprise-agent-scope-refresh'));
     window.dispatchEvent(new CustomEvent('gongge-enterprise-agent-scope-change', { detail: { agentId: agent.id } }));
@@ -315,10 +387,11 @@ export default function OpenPlatformPage({
   }
 
   async function usePlatformItem(platformKind: PlatformKind, itemId?: string) {
-    if (platformKind === 'agents') {
-      const agent = visibleAgents.find((item) => item.id === itemId) || visibleAgents[0];
+    if (platformKind === 'agents' || platformKind === 'experts') {
+      const sourceAgents = platformKind === 'experts' ? visibleExpertAgents : visibleAgents;
+      const agent = sourceAgents.find((item) => item.id === itemId) || sourceAgents[0];
       if (!agent) {
-        notify.warning('广场暂无可用数字员工');
+        notify.warning(platformKind === 'experts' ? '开放平台暂无可用专家' : '开放平台暂无可用数字员工');
         return;
       }
       try {
@@ -344,7 +417,7 @@ export default function OpenPlatformPage({
   function platformDeleteUrl(platformKind: PlatformKind, item: PlatformItem): string {
     const resourceKey = encodeURIComponent(item.deleteKey || item.id);
     const overallSuffix = overallAgent ? `&agent_id=${encodeURIComponent(overallAgent.id)}` : '';
-    if (platformKind === 'agents') return `/api/enterprise/agents/${resourceKey}?tenant_id=${getRequestTenantId()}`;
+    if (platformKind === 'agents' || platformKind === 'experts') return `/api/enterprise/agents/${resourceKey}?tenant_id=${getRequestTenantId()}`;
     if (platformKind === 'knowledge') return `/api/enterprise/knowledge-bases/${resourceKey}?tenant_id=${getRequestTenantId()}${overallSuffix}`;
     if (platformKind === 'general-skills') return `/api/enterprise/general-skills/${resourceKey}?tenant_id=${getRequestTenantId()}${overallSuffix}`;
     if (platformKind === 'skills') return `/api/enterprise/skills/${resourceKey}?tenant_id=${getRequestTenantId()}${overallSuffix}`;
@@ -357,7 +430,7 @@ export default function OpenPlatformPage({
     const key = platformItemDeleteKey(platformKind, item);
     setDeletingItemKey(key);
     try {
-      if (platformKind === 'agents' && item.agent) {
+      if ((platformKind === 'agents' || platformKind === 'experts') && item.agent) {
         await api.put<AgentProfileRead>(
           `/api/enterprise/agents/${item.agent.id}/gallery-publication`,
           {
@@ -399,7 +472,7 @@ export default function OpenPlatformPage({
     const drawerItems = platformItems[detailItem.kind];
     const drawerIndex = drawerItems.findIndex((entry) => entry.id === item.id);
 
-    if (detailItem.kind === 'agents') {
+    if (detailItem.kind === 'agents' || detailItem.kind === 'experts') {
       if (!item.agent) return null;
       const profile = employeeProfile(item.agent);
       const detailText = item.agent.persona_prompt
@@ -417,6 +490,8 @@ export default function OpenPlatformPage({
           workStyles={profile.workStyles}
           stats={employeeStats(item.agent)}
           online={item.agent.status === 'active'}
+          statusLabel={detailItem.kind === 'experts' ? '可使用' : undefined}
+          statusKind={detailItem.kind === 'experts' ? 'available' : 'online'}
           canManage={canManagePlatform}
           deleting={deletingItemKey === deleteKey}
           hasPrev={drawerIndex > 0}
@@ -449,6 +524,7 @@ export default function OpenPlatformPage({
         categoryMeta={item.meta}
         detailText={config.detail}
         useLabel={config.useLabel}
+        detailsHref={item.detailHref}
         canManage={canManagePlatform}
         deleting={deletingItemKey === deleteKey}
         hasPrev={drawerIndex > 0}
@@ -472,12 +548,12 @@ export default function OpenPlatformPage({
         open={Boolean(confirmTarget)}
         onOpenChange={(next) => { if (!next) setConfirmTarget(null); }}
         title={confirmTarget && config
-          ? confirmTarget.kind === 'agents'
+          ? confirmTarget.kind === 'agents' || confirmTarget.kind === 'experts'
             ? `从广场下架「${confirmTarget.item.title}」？`
             : `删除${config.metricLabel}「${confirmTarget.item.title}」？`
           : ''}
-        description={confirmTarget?.kind === 'agents'
-          ? '下架后将停止向新用户开放；数字员工本身、已有使用关系和资源绑定不会被删除。'
+        description={confirmTarget?.kind === 'agents' || confirmTarget?.kind === 'experts'
+          ? '下架后将停止向新用户开放；模板本身、已有使用关系和资源绑定不会被删除。'
           : '删除后该广场内容会从开放平台移除，已复制到员工侧的引用可能不再可同步。'}
         loading={Boolean(confirmTarget) && deletingItemKey === (confirmTarget ? platformItemDeleteKey(confirmTarget.kind, confirmTarget.item) : '')}
         onConfirm={() => void runDelete()}
@@ -491,7 +567,7 @@ export default function OpenPlatformPage({
       value: platform.kind as string,
       label: (
         <span className="inline-flex items-center gap-[6px]">
-          {platform.title.replace('广场', '')}
+          {platform.title}
           {platform.count > 0 && (
             <span className="rounded-full bg-[#eff1f7] px-[6px] py-[1px] text-[11px] leading-[16px] text-[#757f9c]">
               {platform.count}
@@ -518,11 +594,26 @@ export default function OpenPlatformPage({
             <ConceptHelp topic="plaza" />
           </span>
         )}
-        description="发现已发布的数字员工与可复用资源；使用不等于拥有。"
+        description={selectedKind === 'experts'
+          ? '发现已审核并发布的专业型 Agent；模板可直接使用或复制。'
+          : selectedKind === 'agents'
+            ? '发现已发布的数字员工；直接使用不等于拥有。'
+            : '发现可复用资源；复制或安装后才进入目标员工的能力范围。'}
       />
-      <ConceptNote topic="plaza" className="mt-[14px] max-w-[760px]">
-        直接使用只建立使用关系；创建自己的版本后，才形成由你所有的专家（能力分身）。
-      </ConceptNote>
+      <div className="mt-[14px] flex flex-wrap items-center gap-[10px]">
+        <ConceptNote topic="plaza" className="max-w-[760px]">
+          {selectedKind === 'experts'
+            ? '直接使用只建立使用关系；复制并定制后，才形成由你拥有的专家能力分身。'
+            : selectedKind === 'agents'
+              ? '直接使用只建立使用关系；复制并定制后，才形成由你拥有的数字员工。'
+              : '广场资源只表示可发现；复制或安装后，才会绑定到目标数字员工。'}
+        </ConceptNote>
+        {selectedKind === 'experts' && isAdmin && (
+          <UIButton asChild variant="outline" className="h-[32px] rounded-[10px] px-[12px] text-[12px]">
+            <Link to="/enterprise/agents?view=expert">管理专家模板</Link>
+          </UIButton>
+        )}
+      </div>
 
       <UnderlineTabs
         variant="line"
@@ -538,6 +629,7 @@ export default function OpenPlatformPage({
         key={selectedKind}
         kind={selectedKind}
         title={selectedConfig.title}
+        subtitle={selectedConfig.subtitle}
         countLabel={platformCountLabel(selectedKind)}
         signals={selectedConfig.signals}
         items={platformItems[selectedKind]}

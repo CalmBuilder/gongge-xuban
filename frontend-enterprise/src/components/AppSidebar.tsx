@@ -22,7 +22,12 @@ import EmployeeAvatar from './EmployeeAvatar';
 import BrandLogo from './BrandLogo';
 import ProductIcon from './ProductIcon';
 import PlazaResourceArtwork from './openPlatform/PlazaResourceArtwork';
-import { employeeDisplayNameWithCreator, employeeProfile, normalizeProductDisplayText } from '../employee';
+import {
+  employeeDisplayNameWithCreator,
+  employeeProfile,
+  isExpertTemplate,
+  normalizeProductDisplayText,
+} from '../employee';
 import { EnterpriseRoute } from '../enums/routes';
 import type { AgentProfileRead, ChatSession } from '../types';
 import IconPlatform from '../assets/icons/nav-platform.svg?react';
@@ -40,6 +45,7 @@ import IconChevronDown from '../assets/icons/chevron-down.svg?react';
 import IconAdd from '../assets/icons/add.svg?react';
 import IconSort from '../assets/icons/sort.svg?react';
 import IconGlobe from '../assets/icons/globe.svg?react';
+import IconCapMagicwand from '../assets/icons/cap-magicwand.svg?react';
 import IconViewMasonry from '../assets/icons/view-masonry.svg?react';
 import IconChatBubble from '../assets/icons/chat.svg?react';
 import IconEdit from '../assets/icons/edit.svg?react';
@@ -52,10 +58,18 @@ type NavItem = {
   label: string;
   Icon: IconComponent;
   governancePermissions?: string[];
+  adminOnly?: boolean;
 };
 
 const PRIMARY_NAV: NavItem[] = [
   { route: EnterpriseRoute.Platform, label: '开放广场平台', Icon: IconPlatform },
+  {
+    route: EnterpriseRoute.ExpertTemplateManagement,
+    label: '专家模板管理',
+    Icon: IconAgents,
+    adminOnly: true,
+  },
+  { route: EnterpriseRoute.SkillManagement, label: 'Skill 管理', Icon: IconCapMagicwand },
   { route: EnterpriseRoute.Agents, label: '数字员工管理', Icon: IconAgents },
   { route: EnterpriseRoute.WorkItems, label: '待我处理中心', Icon: IconCalendar },
   { route: EnterpriseRoute.EnterpriseInfo, label: '企业信息', Icon: IconAccounts },
@@ -130,7 +144,10 @@ function primaryNavItems(
       ? item.governancePermissions.some((permission) => governancePermissions.includes(permission))
       : isAdmin
   ));
-  return [...PRIMARY_NAV, ...allowedSystemItems];
+  return [
+    ...PRIMARY_NAV.filter((item) => !item.adminOnly || isAdmin),
+    ...allowedSystemItems,
+  ];
 }
 
 export type AppSidebarManagementProps = {
@@ -198,15 +215,15 @@ function PrimaryNavButton({
         isActive={selected === item.route}
         onClick={() => onNavigate(item.route)}
         className={cn(
-          'gongge-primary-nav h-[40px] gap-[10px] rounded-[12px] px-[20px] py-[10px] text-[14px] text-sidebar-foreground',
+          'gongge-primary-nav h-[40px] gap-[8px] rounded-[var(--gg-radius-control)] px-[16px] py-[10px] text-[13px] leading-[20px] text-sidebar-foreground',
           'hover:bg-sidebar-accent hover:text-sidebar-accent-foreground',
           'data-active:bg-sidebar-accent data-active:text-sidebar-accent-foreground data-active:font-normal',
-          attention && selected !== item.route && 'bg-[#fff7e8] text-[#8a4b00] ring-1 ring-[#ffd58a]',
+          attention && selected !== item.route && 'bg-[var(--gg-state-warning-soft)] text-[var(--gg-state-warning)] ring-1 ring-[var(--gg-state-warning)]',
           'group-data-[collapsible=icon]:px-0!',
         )}
       >
         <item.Icon className="size-[16px]!" />
-        <span className="text-[14px]">{item.label}</span>
+        <span>{item.label}</span>
         {attention && (
           <span className="ml-auto size-[6px] rounded-full bg-[#f59e0b] group-data-[collapsible=icon]:hidden" />
         )}
@@ -247,10 +264,18 @@ function CardNavButton({
 
 function GroupLabel({ children }: { children: string }) {
   return (
-    <span className="px-[8px] pt-[6px] pb-[2px] text-[10px] leading-none text-[#464c5e] group-data-[collapsible=icon]:hidden">
+    <span className="gg-type-caption px-[8px] pt-[6px] pb-[2px] group-data-[collapsible=icon]:hidden">
       {children}
     </span>
   );
+}
+
+function agentContextLabel(agent: AgentProfileRead): string {
+  if (isExpertTemplate(agent)) return '专家模板 · 直接使用';
+  if (agent.governance_form === 'capability_avatar') return '能力分身';
+  if (agent.governance_form === 'organization_pending') return '待组织化';
+  if (agent.governance_form === 'organization_employee') return '组织数字员工';
+  return employeeProfile(agent).roleName;
 }
 
 function AgentSwitcher({
@@ -261,7 +286,9 @@ function AgentSwitcher({
 }: Pick<AppSidebarManagementProps, 'sidebarAgent' | 'scopeAgents' | 'selectedAgentId' | 'onSelectAgent'>) {
   const employeeAgents = scopeAgents.filter((agent) => !agent.is_overall);
   const currentAgent = sidebarAgent && !sidebarAgent.is_overall ? sidebarAgent : undefined;
-  const caption = currentAgent ? '当前员工' : '未选择';
+  const caption = currentAgent
+    ? isExpertTemplate(currentAgent) ? '当前专家模板（直接使用）' : '当前员工'
+    : '未选择';
   const nameLabel = currentAgent
     ? employeeDisplayNameWithCreator(currentAgent)
     : '-';
@@ -317,7 +344,7 @@ function AgentSwitcher({
                 {employeeDisplayNameWithCreator(agent)}
               </strong>
               <small className="truncate text-[10px] text-muted-foreground">
-                {employeeProfile(agent).roleName}
+                {agentContextLabel(agent)}
               </small>
             </span>
           </DropdownMenuItem>
@@ -397,7 +424,7 @@ function CollapsedNavButton({
             'relative flex size-[32px] shrink-0 items-center justify-center text-sidebar-foreground transition-colors',
             'hover:bg-sidebar-accent hover:text-sidebar-accent-foreground',
             active && 'bg-sidebar-accent text-sidebar-accent-foreground',
-            attention && !active && 'bg-[#fff7e8] text-[#8a4b00] ring-1 ring-[#ffd58a]',
+            attention && !active && 'bg-[var(--gg-state-warning-soft)] text-[var(--gg-state-warning)] ring-1 ring-[var(--gg-state-warning)]',
           )}
           style={{ borderRadius: radius }}
         >
@@ -459,7 +486,7 @@ function CollapsedAgentSwitcher({
                 {employeeDisplayNameWithCreator(agent)}
               </strong>
               <small className="truncate text-[10px] text-muted-foreground">
-                {employeeProfile(agent).roleName}
+                {agentContextLabel(agent)}
               </small>
             </span>
           </DropdownMenuItem>
@@ -634,7 +661,7 @@ function ManagementSidebar({
   return (
     <Sidebar collapsible="icon" className={SIDEBAR_SHELL_CLASS}>
       <div className="flex h-full w-(--sidebar-width) shrink-0 flex-col">
-      <SidebarHeader className="gap-[24px] px-[20px] pt-[10px] group-data-[collapsible=icon]:px-[20px]">
+      <SidebarHeader className="h-[min(54vh,680px)] min-h-[420px] shrink-0 gap-[24px] overflow-hidden px-[20px] pt-[10px] group-data-[collapsible=icon]:px-[20px]">
         <div className="flex items-center justify-between">
           <button type="button" title="开放广场">
             <BrandLogo context="management" wordmarkClassName="group-data-[collapsible=icon]:hidden" />
@@ -652,8 +679,8 @@ function ManagementSidebar({
           )}
         </div>
 
-        <div className="flex flex-col gap-[18px]">
-          <SidebarMenu className="gap-[10px]">
+        <div className="flex min-h-0 flex-1 flex-col gap-[18px]">
+          <SidebarMenu className="no-scrollbar min-h-0 flex-1 gap-[6px] overflow-y-auto overscroll-contain pr-[4px]">
             {primaryItems.map((item) => (
               <PrimaryNavButton
                 key={item.route}
@@ -668,10 +695,10 @@ function ManagementSidebar({
         </div>
       </SidebarHeader>
 
-      <SidebarContent className="px-[20px] group-data-[collapsible=icon]:px-[20px]">
+      <SidebarContent className="min-h-0 flex-1 overflow-y-auto px-[20px] group-data-[collapsible=icon]:px-[20px]">
         <div
           className={cn(
-            'mt-[36px] mb-[24px] flex flex-col gap-[8px] rounded-[20px] border-[0.5px] border-[#e3e7f1] bg-sidebar px-[4px] pt-[6px] pb-[8px]',
+            'mt-[36px] mb-[24px] flex flex-col gap-[8px] rounded-[var(--gg-radius-panel)] border border-[var(--gg-line)] bg-sidebar px-[4px] pt-[6px] pb-[8px]',
             'group-data-[collapsible=icon]:mt-[24px] group-data-[collapsible=icon]:border-transparent group-data-[collapsible=icon]:bg-transparent group-data-[collapsible=icon]:p-0 group-data-[collapsible=icon]:shadow-none',
           )}
         >
@@ -1201,7 +1228,7 @@ function ChatSidebarVariant({
   return (
     <Sidebar collapsible="icon" className={SIDEBAR_SHELL_CLASS}>
       <div className="flex h-full w-(--sidebar-width) shrink-0 flex-col">
-        <SidebarHeader className="gap-[24px] px-[20px] pt-[10px]">
+        <SidebarHeader className="h-[min(36vh,360px)] min-h-[240px] shrink-0 gap-[24px] overflow-hidden px-[20px] pt-[10px]">
           <div className="flex items-center justify-between">
             <button type="button" title="数字员工广场" onClick={onOpenGallery}>
               <BrandLogo context="workspace" />
@@ -1217,7 +1244,7 @@ function ChatSidebarVariant({
             </button>
           </div>
 
-          <div className="flex flex-col gap-[16px]">
+          <div className="flex min-h-0 flex-1 flex-col gap-[16px]">
             <button
               type="button"
               onClick={onOpenGallery}

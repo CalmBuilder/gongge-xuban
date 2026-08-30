@@ -13,7 +13,7 @@ from time import sleep
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import func, or_
+from sqlalchemy import and_, func, or_
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.sql.elements import ColumnElement
 from sqlmodel import Session, select
@@ -29,6 +29,14 @@ from app.agents.schema import (
     AgentListScope,
     AgentManagementPageRead,
     AgentManagementView,
+    AgentOrganizationizationRequest,
+    AgentOrganizationizationOptionsRead,
+    AgentOrganizationizationOrganizationOptionRead,
+    AgentOrganizationRequirementRead,
+    AgentOrganizationizationPreviewRead,
+    AgentOrganizationizationResultRead,
+    AgentOrganizationizationRoleOptionRead,
+    AgentOrganizationizationSupervisorOptionRead,
     AgentModelsUpdateRequest,
     AgentProfileCreateRequest,
     AgentProfileRead,
@@ -45,10 +53,13 @@ from app.agents.schema import (
     AgentWorkRecordReplyStatsRead,
 )
 from app.agents.identity import (
+    AgentGovernanceProjection,
     agent_category,
     agent_is_published,
+    agent_organization_relationship_checksum,
     agent_owner_user_id,
     agent_visibility_scope,
+    project_agent_governance,
 )
 from app.agents.branching import (
     agent_private_metadata,
@@ -58,6 +69,7 @@ from app.agents.branching import (
     ensure_knowledge_base_version,
     get_overall_agent,
     is_bound_resource_visible_for_agent,
+    is_platform_catalog_general_skill,
     is_open_gallery_resource,
     promote_branch_to_overall,
     promote_knowledge_branch_to_overall,
@@ -71,9 +83,11 @@ from app.db.models import (
     AgentKnowledgeBranch,
     AgentProfile,
     AgentResourceBinding,
+    AgentRoleBinding,
     AgentSkillBranch,
     AgentSkillBranchVersion,
     AgentUsage,
+    BusinessRole,
     ChatSession,
     GeneralSkill,
     KnowledgeBase,
@@ -81,6 +95,7 @@ from app.db.models import (
     KnowledgeChunk,
     KnowledgeDocument,
     Message,
+    EmployeeProfile,
     OrganizationUnit,
     ScheduledTask,
     Skill,
@@ -88,7 +103,16 @@ from app.db.models import (
     utc_now,
     User,
 )
-from app.organization.governance import ensure_governance_permission, has_governance_permission
+from app.agents.organizationization import (
+    OrganizationizationError,
+    apply_agent_organizationization,
+)
+from app.organization.governance import (
+    authorized_organization_ids,
+    ensure_governance_permission,
+    has_governance_permission,
+    resolve_permission_grants,
+)
 from app.organization.reference_data import (
     ReferenceDataError,
     require_active_agent_category,
@@ -148,12 +172,14 @@ def list_agents(
             AgentProfile.published_to_gallery == True,  # noqa: E712
             AgentProfile.status == "active",
             AgentProfile.is_overall == False,  # noqa: E712
+            _agent_nonprofessional_condition(),
         )
     elif scope == "expert":
         statement = statement.where(
-            AgentProfile.agent_category_code == "professional",
+            _agent_professional_condition(),
             AgentProfile.status == "active",
             AgentProfile.is_overall == False,  # noqa: E712
+            AgentProfile.published_to_gallery == True,  # noqa: E712
         )
     elif scope == "manageable":
         can_govern_agents = _is_admin_user(user) or has_governance_permission(
@@ -192,6 +218,7 @@ def list_agents(
             row,
             bindings.get(row.id, []),
             row.id in used_agent_ids,
+            db=db,
             viewer=user,
             governance_summary=scope == "manageable" and can_govern_agents,
             responsible_org_unit_name=responsible_org_names.get(
@@ -281,6 +308,7 @@ def page_agent_gallery(
                 row,
                 bindings.get(row.id, []),
                 row.id in used_agent_ids,
+                db=db,
                 viewer=current_user,
                 responsible_org_unit_name=responsible_org_names.get(
                     row.responsible_org_unit_id or ""
@@ -326,34 +354,70 @@ def page_managed_agents(
     can_govern = _is_admin_user(current_user) or has_governance_permission(
         db, tenant_id=tenant_id, user_id=current_user.id, permission_code="agent.manage"
     )
-    view_counts = {
-        item_view: _agent_management_count(db, tenant_id, current_user, item_view, can_govern)
+    governance_rows = _agent_management_identity_rows(db, tenant_id, current_user, can_govern)
+    governance_projections = {
+        row.id: project_agent_governance(db, row) for row in governance_rows
+    }
+    view_rows = {
+        item_view: _agent_management_view_rows(
+            governance_rows,
+            governance_projections,
+            current_user,
+            item_view,
+            can_govern,
+        )
         for item_view in ("all", "online", "offline", "pending", "expert", "governance")
     }
-    conditions = _agent_management_conditions(tenant_id, current_user, view, can_govern)
-    if view == "expert":
-        for key, value in (
-            ("expert_source_code", expert_source),
-            ("expert_category", expert_department),
-            ("expert_subcategory", expert_direction),
-        ):
-            if value:
-                conditions.append(AgentProfile.metadata_json[key].as_string() == value)
-    ordered = select(AgentProfile).where(*conditions).order_by(
-        AgentProfile.updated_at.desc(), AgentProfile.id.desc()
-    )
-    keyword = (q or "").strip().lower()
-    if keyword:
+    view_counts = {item_view: len(rows) for item_view, rows in view_rows.items()}
+    governance_counts = {
+        form: sum(projection.form == form for projection in governance_projections.values())
+        for form in (
+            "capability_avatar",
+            "organization_pending",
+            "organization_employee",
+            "template",
+        )
+    }
+    if view in {"capability", "organization"}:
+        desired_forms = (
+            {"capability_avatar", "organization_pending"}
+            if view == "capability"
+            else {"organization_pending", "organization_employee"}
+        )
         matched = [
-            row for row in db.exec(ordered).all() if _agent_matches_gallery_search(row, keyword)
+            row
+            for row in governance_rows
+            if governance_projections[row.id].form in desired_forms
+            and (
+                view != "capability"
+                or agent_owner_user_id(row) == current_user.id
+            )
         ]
+        keyword = (q or "").strip().lower()
+        if keyword:
+            matched = [row for row in matched if _agent_matches_gallery_search(row, keyword)]
         total = len(matched)
         rows = matched[(page - 1) * page_size : page * page_size]
     else:
-        total = int(
-            db.exec(select(func.count()).select_from(AgentProfile).where(*conditions)).one()
-        )
-        rows = db.exec(ordered.offset((page - 1) * page_size).limit(page_size)).all()
+        matched = list(view_rows[view])
+        if view == "expert":
+            for key, value in (
+                ("expert_source_code", expert_source),
+                ("expert_category", expert_department),
+                ("expert_subcategory", expert_direction),
+            ):
+                if value:
+                    matched = [
+                        row
+                        for row in matched
+                        if str((row.metadata_json or {}).get(key) or "").strip() == value
+                    ]
+        keyword = (q or "").strip().lower()
+        if keyword:
+            matched = [row for row in matched if _agent_matches_gallery_search(row, keyword)]
+        matched.sort(key=lambda row: (row.updated_at, row.id), reverse=True)
+        total = len(matched)
+        rows = matched[(page - 1) * page_size : page * page_size]
     used_agent_ids = _used_agent_ids_for_user(db, tenant_id, current_user)
     bindings = _bindings_by_agent(db, tenant_id, {row.id for row in rows})
     responsible_org_names = _responsible_org_names(db, rows)
@@ -363,8 +427,9 @@ def page_managed_agents(
                 row,
                 bindings.get(row.id, []),
                 row.id in used_agent_ids,
+                db=db,
                 viewer=current_user,
-                governance_summary=view == "governance",
+                governance_summary=view in {"governance", "organization"},
                 responsible_org_unit_name=responsible_org_names.get(
                     row.responsible_org_unit_id or ""
                 ),
@@ -373,9 +438,10 @@ def page_managed_agents(
         ],
         total=total,
         view_counts=view_counts,
+        governance_counts=governance_counts,
         facets=(
             _agent_management_facets(
-                db, tenant_id, current_user, expert_source or "", expert_department or ""
+                view_rows["expert"], expert_source or "", expert_department or ""
             )
             if view == "expert"
             else AgentGalleryFacetsRead()
@@ -477,11 +543,94 @@ def create_agent(
     return agent_read(
         row,
         _bindings_by_agent(db, request.tenant_id).get(row.id, []),
+        db=db,
         viewer=current_user,
         copy_summary=copy_summary,
         responsible_org_unit_name=_responsible_org_names(db, [row]).get(
             row.responsible_org_unit_id or ""
         ),
+    )
+
+
+@enterprise_router.get(
+    "/organizationization-options",
+    response_model=AgentOrganizationizationOptionsRead,
+)
+def list_agent_organizationization_options(
+    tenant_id: str = Query(...),
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> AgentOrganizationizationOptionsRead:
+    """按 agent.manage 的组织范围返回组织化向导选择项，不暴露凭据或私人资料。"""
+
+    ensure_tenant(db, tenant_id)
+    _ensure_request_tenant(tenant_id, current_user)
+    ensure_governance_permission(
+        db,
+        tenant_id=tenant_id,
+        current_user=current_user,
+        permission_code="agent.manage",
+    )
+    grants = resolve_permission_grants(db, tenant_id=tenant_id, user_id=current_user.id)
+    allowed_org_ids = authorized_organization_ids(grants, permission_code="agent.manage")
+    organizations = db.exec(
+        select(OrganizationUnit).where(
+            OrganizationUnit.tenant_id == tenant_id,
+            OrganizationUnit.status == "active",
+        ).order_by(
+            OrganizationUnit.depth,
+            OrganizationUnit.sort_order,
+            OrganizationUnit.name,
+        )
+    ).all()
+    if allowed_org_ids is not None:
+        organizations = [
+            organization for organization in organizations if organization.id in allowed_org_ids
+        ]
+    roles = db.exec(
+        select(BusinessRole).where(
+            BusinessRole.tenant_id == tenant_id,
+            BusinessRole.role_kind == "business",
+            BusinessRole.status == "active",
+        ).order_by(BusinessRole.role_code)
+    ).all()
+    profiles = db.exec(
+        select(EmployeeProfile, User)
+        .join(
+            User,
+            (User.tenant_id == EmployeeProfile.tenant_id)
+            & (User.id == EmployeeProfile.user_id),
+        )
+        .where(
+            EmployeeProfile.tenant_id == tenant_id,
+            EmployeeProfile.status == "active",
+            User.membership_status == "active",
+        )
+        .order_by(EmployeeProfile.employee_name, EmployeeProfile.employee_id)
+    ).all()
+    return AgentOrganizationizationOptionsRead(
+        organizations=[
+            AgentOrganizationizationOrganizationOptionRead(
+                id=organization.id,
+                name=organization.name,
+            )
+            for organization in organizations
+        ],
+        roles=[
+            AgentOrganizationizationRoleOptionRead(
+                role_code=role.role_code,
+                name=role.name,
+            )
+            for role in roles
+        ],
+        supervisors=[
+            AgentOrganizationizationSupervisorOptionRead(
+                id=profile.id,
+                employee_id=profile.employee_id,
+                employee_name=profile.employee_name or user.display_name or user.username,
+            )
+            for profile, user in profiles
+        ],
     )
 
 
@@ -498,10 +647,71 @@ def get_agent(
         row,
         _bindings_by_agent(db, tenant_id).get(row.id, []),
         row.id in _used_agent_ids_for_user(db, tenant_id, current_user),
+        db=db,
         viewer=current_user,
         responsible_org_unit_name=_responsible_org_names(db, [row]).get(
             row.responsible_org_unit_id or ""
         ),
+    )
+
+
+@enterprise_router.get(
+    "/{agent_id}/organizationization-preview",
+    response_model=AgentOrganizationizationPreviewRead,
+)
+def preview_agent_organizationization(
+    agent_id: str,
+    tenant_id: str = Query(...),
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> AgentOrganizationizationPreviewRead:
+    """返回能力分身转为组织数字员工前的正式关系清单和缺项。"""
+
+    row = _get_agent(db, tenant_id, agent_id)
+    can_govern = _is_admin_user(current_user) or has_governance_permission(
+        db,
+        tenant_id=tenant_id,
+        user_id=current_user.id,
+        permission_code="agent.manage",
+    )
+    if not can_govern and agent_owner_user_id(row) != current_user.id:
+        raise HTTPException(status_code=403, detail="Only the owner or agent governor can preview organizationization")
+    return _organizationization_preview_read(db, row)
+
+
+@enterprise_router.post(
+    "/{agent_id}/organizationization",
+    response_model=AgentOrganizationizationResultRead,
+)
+def configure_agent_organizationization(
+    agent_id: str,
+    request: AgentOrganizationizationRequest,
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> AgentOrganizationizationResultRead:
+    """以关系 checksum 和 Agent 版本 CAS 原子配置组织化前置事实。"""
+
+    try:
+        result = apply_agent_organizationization(
+            db,
+            agent_id=agent_id,
+            request=request,
+            actor=current_user,
+        )
+    except OrganizationizationError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"code": exc.code, "message": str(exc)},
+        ) from exc
+    row = _get_agent(db, request.tenant_id, agent_id)
+    return AgentOrganizationizationResultRead(
+        command_id=result.command_id,
+        result_status=result.result_status,  # type: ignore[arg-type]
+        agent_id=result.agent_id,
+        profile_revision=result.profile_revision,
+        relationship_checksum=result.relationship_checksum,
+        active_role_binding_id=result.active_role_binding_id,
+        preview=_organizationization_preview_read(db, row),
     )
 
 
@@ -612,6 +822,7 @@ def update_agent(
     return agent_read(
         row,
         _bindings_by_agent(db, request.tenant_id).get(row.id, []),
+        db=db,
         viewer=current_user,
         responsible_org_unit_name=_responsible_org_names(db, [row]).get(
             row.responsible_org_unit_id or ""
@@ -692,6 +903,7 @@ def set_agent_responsibility(
     return agent_read(
         row,
         _bindings_by_agent(db, request.tenant_id).get(row.id, []),
+        db=db,
         viewer=current_user,
         responsible_org_unit_name=organization.name if organization else None,
     )
@@ -715,6 +927,17 @@ def set_agent_gallery_publication(
     _ensure_agent_not_tombstoned(row)
     if row.is_overall:
         raise HTTPException(status_code=400, detail="Overall agent cannot be published to gallery")
+    governance = project_agent_governance(db, row)
+    if governance.form == "organization_employee" or (
+        governance.form == "organization_pending" and request.published
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "ORGANIZATION_RELEASE_REQUIRED",
+                "message": "组织数字员工的广场状态必须通过 Publication Release 管理。",
+            },
+        )
     before = {
         "published_to_gallery": agent_is_published(row),
         "visibility_scope": row.visibility_scope,
@@ -762,6 +985,7 @@ def set_agent_gallery_publication(
     return agent_read(
         row,
         _bindings_by_agent(db, request.tenant_id).get(row.id, []),
+        db=db,
         viewer=current_user,
         responsible_org_unit_name=_responsible_org_names(db, [row]).get(
             row.responsible_org_unit_id or ""
@@ -1152,6 +1376,7 @@ def list_chat_agents(
             row,
             bindings.get(row.id, []),
             row.id in used_agent_ids,
+            db=db,
             viewer=current_user,
             responsible_org_unit_name=responsible_org_names.get(
                 row.responsible_org_unit_id or ""
@@ -1184,6 +1409,7 @@ def use_chat_agent(
         row,
         bindings.get(row.id, []),
         True,
+        db=db,
         viewer=current_user,
         responsible_org_unit_name=_responsible_org_names(db, [row]).get(
             row.responsible_org_unit_id or ""
@@ -1247,8 +1473,14 @@ def _agent_resource_timeline_events(
         row.id: row
         for row in db.exec(
             select(GeneralSkill).where(
-                GeneralSkill.tenant_id == tenant_id,
                 GeneralSkill.id.in_(ids_by_type["general_skill"]),
+                (
+                    (GeneralSkill.tenant_id == tenant_id)
+                    | (
+                        (GeneralSkill.catalog_scope == "platform")
+                        & GeneralSkill.tenant_id.is_(None)
+                    )
+                ),
             )
         ).all()
     } if ids_by_type["general_skill"] else {}
@@ -1375,6 +1607,7 @@ def agent_read(
     bindings: list[AgentResourceBinding],
     used_by_current_user: bool | None = None,
     *,
+    db: Session | None = None,
     viewer: User | None = None,
     copy_summary: dict[str, object] | None = None,
     governance_summary: bool = False,
@@ -1383,6 +1616,7 @@ def agent_read(
     """按调用者关系裁剪数字员工资料，并返回非授权性的责任组织摘要。"""
 
     metadata = dict(row.metadata_json or {})
+    governance = project_agent_governance(db, row) if db is not None else None
     owner_user_id = agent_owner_user_id(row)
     published_to_gallery = agent_is_published(row)
     owned = bool(viewer and owner_user_id == viewer.id)
@@ -1437,6 +1671,14 @@ def agent_read(
         manageable_by_current_user=owned
         or bool(viewer and row.is_overall and _is_admin_user(viewer)),
         view_level="governance" if governance_view else "manager" if owned else "user",
+        governance_form=governance.form if governance else (
+            "template" if row.is_overall else "capability_avatar" if owner_user_id else "template"
+        ),
+        governance_reasons=list(governance.reasons) if governance else [],
+        organization_release_id=governance.organization_release_id if governance else None,
+        active_role_binding_ids=(
+            list(governance.active_role_binding_ids) if governance else []
+        ),
         copy_summary=copy_summary,
         metadata=metadata,
         resources=[
@@ -1473,6 +1715,110 @@ def _responsible_org_names(
         for organization in organizations
         if organization.status == "active"
     }
+
+
+def _organizationization_preview_read(
+    db: Session,
+    row: AgentProfile,
+) -> AgentOrganizationizationPreviewRead:
+    """把集中身份投影转换成组织化向导可直接渲染的检查清单。"""
+
+    projection = project_agent_governance(db, row)
+    owner_id = agent_owner_user_id(row)
+    owner = db.get(User, owner_id) if owner_id else None
+    organization = (
+        db.get(OrganizationUnit, row.responsible_org_unit_id)
+        if row.responsible_org_unit_id
+        else None
+    )
+    owner_ready = bool(
+        owner is not None
+        and owner.tenant_id == row.tenant_id
+        and owner.membership_status == "active"
+    )
+    organization_ready = bool(
+        organization is not None
+        and organization.tenant_id == row.tenant_id
+        and organization.status == "active"
+    )
+    active_binding = (
+        db.get(AgentRoleBinding, projection.active_role_binding_ids[0])
+        if projection.active_role_binding_ids
+        else None
+    )
+    active_role = db.get(BusinessRole, active_binding.business_role_id) if active_binding else None
+    requirement_specs = (
+        (
+            "owner_required",
+            "能力分身所有者",
+            owner_ready,
+            "需要一个当前租户内的活动 owner。",
+        ),
+        (
+            "responsible_organization_required",
+            "责任组织",
+            organization_ready,
+            "需要先指定活动责任组织。",
+        ),
+        (
+            "active_role_and_supervisor_required",
+            "业务角色与监督者",
+            bool(projection.active_role_binding_ids),
+            "需要活动业务角色绑定，并指定活动监督者。",
+        ),
+        (
+            "agent_must_be_active",
+            "Agent 状态",
+            row.status == "active",
+            "只有活动 Agent 才能提交组织审核。",
+        ),
+        (
+            "active_publication_release_required",
+            "组织发布 Release",
+            projection.organization_release_id is not None,
+            "审核通过后才会生成 active Release；它不是提交前可伪造的状态。",
+        ),
+    )
+    requirements = [
+        AgentOrganizationRequirementRead(
+            code=code,
+            label=label,
+            satisfied=satisfied,
+            detail=("已满足" if satisfied else detail),
+        )
+        for code, label, satisfied, detail in requirement_specs
+    ]
+    can_submit = (
+        projection.form == "organization_pending"
+        and all(
+            item.satisfied
+            for item in requirements
+            if item.code != "active_publication_release_required"
+        )
+    )
+    return AgentOrganizationizationPreviewRead(
+        tenant_id=row.tenant_id,
+        agent_id=row.id,
+        agent_name=row.name,
+        governance_form=projection.form,
+        governance_reasons=list(projection.reasons),
+        requirements=requirements,
+        can_submit=can_submit,
+        active_release_id=projection.organization_release_id,
+        profile_revision=row.profile_revision,
+        owner_user_id=owner_id,
+        source_agent_id=row.source_agent_id,
+        responsible_org_unit_id=row.responsible_org_unit_id,
+        responsible_org_unit_name=(
+            organization.name if organization is not None and organization.status == "active" else None
+        ),
+        active_role_binding_ids=list(projection.active_role_binding_ids),
+        active_role_code=active_role.role_code if active_role else None,
+        active_supervisor_employee_profile_id=(
+            active_binding.supervisor_employee_profile_id if active_binding else None
+        ),
+        relationship_checksum=agent_organization_relationship_checksum(db, row),
+    )
 
 
 def _governance_agent_metadata(metadata: dict[str, object]) -> dict[str, object]:
@@ -1584,20 +1930,44 @@ def _agent_gallery_scope_conditions(
         conditions.extend(
             [
                 AgentProfile.published_to_gallery == True,  # noqa: E712
-                AgentProfile.agent_category_code != "professional",
+                _agent_nonprofessional_condition(),
             ]
         )
     else:
-        conditions.append(AgentProfile.agent_category_code == "professional")
-        if not _is_admin_user(user):
-            conditions.append(
-                or_(
-                    AgentProfile.owner_user_id == user.id,
-                    AgentProfile.published_to_gallery == True,  # noqa: E712
-                    AgentProfile.id.in_(used_agent_ids),
-                )
-            )
+        # 专家广场是发现目录，不是所有者的管理视图；未发布模板只能在
+        # AgentsPage 的专家管理筛选中出现，不能因管理员身份绕过广场发布门禁。
+        conditions.extend(
+            [
+                _agent_professional_condition(),
+                AgentProfile.published_to_gallery == True,  # noqa: E712
+            ]
+        )
     return conditions
+
+
+def _agent_professional_condition() -> ColumnElement[bool]:
+    """构造正式 professional 分类及旧 expert metadata 的兼容查询条件。"""
+
+    return or_(
+        AgentProfile.agent_category_code == "professional",
+        and_(
+            AgentProfile.agent_category_code == "assistant",
+            AgentProfile.metadata_json["employee_type"].as_string() == "expert",
+        ),
+    )
+
+
+def _agent_nonprofessional_condition() -> ColumnElement[bool]:
+    """构造数字员工分类条件，避免 JSON 空值使普通员工被 SQL 三值逻辑过滤。"""
+
+    legacy_employee_type = AgentProfile.metadata_json["employee_type"].as_string()
+    return and_(
+        or_(
+            AgentProfile.agent_category_code != "professional",
+            AgentProfile.agent_category_code.is_(None),
+        ),
+        or_(legacy_employee_type != "expert", legacy_employee_type.is_(None)),
+    )
 
 
 def _agent_gallery_scope_count(
@@ -1617,13 +1987,13 @@ def _agent_gallery_scope_count(
     )
 
 
-def _agent_management_conditions(
+def _agent_management_identity_rows(
+    db: Session,
     tenant_id: str,
     user: User,
-    view: AgentManagementView,
     can_govern: bool,
-) -> list[ColumnElement[bool]]:
-    """构造管理端拥有员工或发布治理视图的数据库过滤条件。"""
+) -> list[AgentProfile]:
+    """读取身份分栏的候选集，组织分栏由后续正式关系投影决定。"""
 
     hidden = AgentProfile.metadata_json["hidden_from_product"].as_boolean()
     conditions: list[ColumnElement[bool]] = [
@@ -1631,71 +2001,85 @@ def _agent_management_conditions(
         AgentProfile.is_overall == False,  # noqa: E712
         or_(hidden.is_(None), hidden == False),  # noqa: E712
     ]
-    if view == "governance":
-        if not can_govern:
-            conditions.append(AgentProfile.id == "__forbidden_governance_view__")
-        else:
-            conditions.append(
-                or_(
-                    AgentProfile.owner_user_id.is_(None),
-                    AgentProfile.owner_user_id != user.id,
-                )
-            )
-        return conditions
-    conditions.append(AgentProfile.owner_user_id == user.id)
-    if view == "online":
-        conditions.append(AgentProfile.status == "active")
-    elif view == "offline":
-        conditions.append(AgentProfile.status != "active")
-    elif view == "pending":
-        conditions.append(
-            or_(
-                AgentProfile.status == "pending",
-                AgentProfile.metadata_json["review_status"].as_string() == "pending",
-                AgentProfile.metadata_json["approval_status"].as_string() == "pending",
-                AgentProfile.metadata_json["audit_status"].as_string() == "pending",
-            )
-        )
-    elif view == "expert":
-        conditions.append(AgentProfile.agent_category_code == "professional")
-    return conditions
+    if not can_govern:
+        conditions.append(AgentProfile.owner_user_id == user.id)
+    return db.exec(
+        select(AgentProfile)
+        .where(*conditions)
+        .order_by(AgentProfile.updated_at.desc(), AgentProfile.id.desc())
+    ).all()
 
 
-def _agent_management_count(
-    db: Session,
-    tenant_id: str,
+def _agent_management_view_rows(
+    rows: list[AgentProfile],
+    projections: dict[str, AgentGovernanceProjection],
     user: User,
     view: AgentManagementView,
     can_govern: bool,
-) -> int:
-    """统计管理端某个员工视图的完整数量，不使用当前页长度。"""
+) -> list[AgentProfile]:
+    """按治理投影生成管理页列表，隔离模板与真实员工的统计和分页。
 
-    return int(
-        db.exec(
-            select(func.count())
-            .select_from(AgentProfile)
-            .where(*_agent_management_conditions(tenant_id, user, view, can_govern))
-        ).one()
-    )
+    `AgentProfile.owner_user_id` 不能单独承担模板/能力分身判断：历史专家导入会
+    把管理员写成技术 owner。这里先消费集中治理投影，再根据管理视图选择模板、
+    个人专业能力分身或组织员工，确保“专家模板”不会混入员工总数。
+    """
+
+    if view == "expert":
+        if user.role == "admin":
+            return [
+                row
+                for row in rows
+                if projections[row.id].form == "template"
+                and agent_category(row) == "professional"
+            ]
+        return [
+            row
+            for row in rows
+            if agent_owner_user_id(row) == user.id
+            and agent_category(row) == "professional"
+            and projections[row.id].form in {"capability_avatar", "organization_pending"}
+        ]
+
+    if view == "governance":
+        if not can_govern:
+            return []
+        return [
+            row
+            for row in rows
+            if projections[row.id].form != "template"
+            and agent_owner_user_id(row) != user.id
+        ]
+
+    business_rows = [row for row in rows if projections[row.id].form != "template"]
+    if view == "all":
+        return business_rows
+    if view == "online":
+        return [row for row in business_rows if row.status == "active"]
+    if view == "offline":
+        return [row for row in business_rows if row.status != "active"]
+    if view == "pending":
+        return [
+            row
+            for row in business_rows
+            if row.status == "pending"
+            or any(
+                (row.metadata_json or {}).get(key) == "pending"
+                for key in ("review_status", "approval_status", "audit_status")
+            )
+        ]
+    return []
 
 
 def _agent_management_facets(
-    db: Session,
-    tenant_id: str,
-    user: User,
+    rows: list[AgentProfile],
     source: str,
     department: str,
 ) -> AgentGalleryFacetsRead:
-    """按当前所有者的专家全集生成管理页级联筛选项。"""
+    """按当前管理视图的专家全集生成来源、部门和方向筛选项。"""
 
-    metadata_rows = list(
-        db.exec(
-            select(AgentProfile.metadata_json).where(
-                *_agent_management_conditions(tenant_id, user, "expert", False)
-            )
-        ).all()
-    )
-    source_rows = [row for row in metadata_rows if isinstance(row, dict)]
+    source_rows = [
+        row.metadata_json for row in rows if isinstance(row.metadata_json, dict)
+    ]
     department_rows = [
         row
         for row in source_rows
@@ -2689,7 +3073,13 @@ def _resource_binding_visible_in_agent_summary(
     if model is None:
         return False
     resource = db.get(model, binding.resource_id)
-    if not resource or resource.tenant_id != tenant_id:
+    if not resource or (
+        resource.tenant_id != tenant_id
+        and not (
+            binding.resource_type == "general_skill"
+            and is_platform_catalog_general_skill(resource)
+        )
+    ):
         return False
     if isinstance(resource, KnowledgeBase) and _is_empty_default_knowledge_base(
         db, tenant_id, resource

@@ -106,6 +106,33 @@ def test_capability_selector_allows_general_skill_and_knowledge_together(monkeyp
     assert decision.knowledge_query == "内部出差规范对天气风险有什么要求"
 
 
+def test_managed_catalog_guidance_skill_is_blocked_before_code_runner() -> None:
+    """验证项目内置指导 Skill 不会触发模型代码生成或 Python/Bash 子进程。"""
+
+    skill = GeneralSkill(
+        tenant_id="tenant_demo",
+        slug="catalog-guidance",
+        name="项目内置指导",
+        skill_markdown="# 只读指导",
+        status="published",
+        metadata_json={
+            "managed_catalog": True,
+            "catalog_key": "builtin/catalog-guidance",
+            "runtime_mode": "guidance_only",
+        },
+    )
+
+    response = GeneralSkillRunner().run(skill, "请给出指导", SimpleNamespace())
+
+    assert response.structured_result == {
+        "success": False,
+        "error": "managed_catalog_guidance_only",
+        "retryable": False,
+    }
+    assert response.generated_code == ""
+    assert response.execution_trace[-1]["phase"] == "runner_blocked"
+
+
 def test_capability_selector_still_checks_knowledge_without_general_skills(monkeypatch) -> None:
     received: dict[str, object] = {}
     monkeypatch.setattr(LLMClient, "__init__", lambda self, model_config: None)
@@ -556,6 +583,74 @@ def test_deleted_open_gallery_general_skill_is_hidden_from_agent_branch_binding(
 
         assert list_general_skills("tenant_demo", db, agent_id="agent_branch") == []
         assert AgentLoop(db)._list_published_general_skills("tenant_demo", "agent_branch") == []
+
+
+def test_agent_general_skill_list_resolves_project_catalog_asset() -> None:
+    """验证平台目录 Skill 可被绑定到 Agent，也会在开放平台聚合列表中出现。"""
+
+    with _test_session() as db:
+        _seed_minimal_tenant(db)
+        agent = AgentProfile(
+            id="agent_platform_catalog",
+            tenant_id="tenant_demo",
+            name="项目目录能力分身",
+            owner_user_id="user_demo",
+            is_overall=False,
+        )
+        overall = AgentProfile(
+            id="agent_overall",
+            tenant_id="tenant_demo",
+            name="开放广场",
+            is_overall=True,
+        )
+        skill = GeneralSkill(
+            tenant_id=None,
+            catalog_scope="platform",
+            catalog_key="platform:catalog-guidance",
+            slug="catalog-guidance",
+            name="项目目录指导 Skill",
+            skill_markdown="# 指导",
+            status="published",
+            metadata_json={
+                "managed_catalog": True,
+                "catalog_key": "platform:catalog-guidance",
+            },
+            visibility_scope="platform_gallery",
+        )
+        binding = AgentResourceBinding(
+            tenant_id="tenant_demo",
+            agent_id=agent.id,
+            resource_type="general_skill",
+            resource_id=skill.id,
+            status="active",
+            metadata_json={
+                "schema_version": 1,
+                "revision_policy": "pinned",
+                "pinned_revision_id": "revision-platform-catalog-guidance",
+                "invocation_policy": "model_allowed",
+                "atomic_execution_allowed": False,
+                "created_by_user_id": "user_demo",
+                "managed_catalog": True,
+                "catalog_key": "platform:catalog-guidance",
+            },
+        )
+        db.add(agent)
+        db.add(overall)
+        db.add(skill)
+        db.add(binding)
+        db.commit()
+
+        rows = list_general_skills("tenant_demo", db, agent_id=agent.id)
+
+        assert len(rows) == 1
+        assert rows[0].id == skill.id
+        assert rows[0].tenant_id is None
+        assert rows[0].status == "published"
+        assert rows[0].binding_id == binding.id
+
+        gallery_rows = list_general_skills("tenant_demo", db, agent_id=overall.id)
+        assert [row.id for row in gallery_rows] == [skill.id]
+        assert gallery_rows[0].tenant_id is None
 
 
 def test_import_general_skill_folder_reads_skill_md_metadata() -> None:

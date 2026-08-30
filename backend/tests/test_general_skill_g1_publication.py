@@ -18,13 +18,19 @@ from sqlmodel import Session, SQLModel, create_engine, select
 
 from app.db.models import (
     AgentProfile,
+    AgentPublicationRevision,
+    AgentRoleBinding,
     AgentResourceBinding,
+    BusinessRole,
+    EmployeeProfile,
     GeneralSkill,
     GeneralSkillPublicationRevision,
     GeneralSkillRevision,
     MemoryRecord,
+    ManagementAuditLog,
     PublicationRelease,
     ResourcePublicationRequest,
+    OrganizationUnit,
     Tenant,
     User,
 )
@@ -81,6 +87,47 @@ def _context() -> tuple[Session, PublicationService, User, User, User, AgentProf
         name="B-问卷采用分身",
         owner_user_id=adopter.id,
     )
+    organization = OrganizationUnit(
+        id="org_g1_context",
+        tenant_id=tenant.id,
+        code="g1-context-org",
+        name="G1 Context Organization",
+        unit_type_code="department",
+        tree_path="/g1-context-org",
+        is_root=True,
+        root_tenant_id=tenant.id,
+    )
+    role = BusinessRole(
+        id="role_g1_context",
+        tenant_id=tenant.id,
+        role_code="g1_context_operator",
+        name="G1 Context Operator",
+    )
+    supervisor = EmployeeProfile(
+        id="profile_g1_context",
+        tenant_id=tenant.id,
+        user_id=admin.id,
+        employee_id="G1-CONTEXT-ADMIN",
+        employee_name="G1 Context Admin",
+    )
+    owner_agent.responsible_org_unit_id = organization.id
+    owner_agent_role_binding = AgentRoleBinding(
+        id="binding_g1_context",
+        tenant_id=tenant.id,
+        agent_id=owner_agent.id,
+        business_role_id=role.id,
+        supervisor_employee_profile_id=supervisor.id,
+        assignment_mode="execute",
+    )
+    adopter_agent.responsible_org_unit_id = organization.id
+    adopter_agent_role_binding = AgentRoleBinding(
+        id="binding_g1_context_adopter",
+        tenant_id=tenant.id,
+        agent_id=adopter_agent.id,
+        business_role_id=role.id,
+        supervisor_employee_profile_id=supervisor.id,
+        assignment_mode="assist",
+    )
     markdown = "---\nname: to-questionnaire\ndescription: Convert docs to questions.\n---\n# Questionnaire\n"
     resource_checksum = hashlib.sha256(markdown.encode()).hexdigest()
     skill = GeneralSkill(
@@ -135,6 +182,11 @@ def _context() -> tuple[Session, PublicationService, User, User, User, AgentProf
     db.add(adopter)
     db.add(owner_agent)
     db.add(adopter_agent)
+    db.add(organization)
+    db.add(role)
+    db.add(supervisor)
+    db.add(owner_agent_role_binding)
+    db.add(adopter_agent_role_binding)
     db.add(skill)
     db.add(revision)
     db.add(
@@ -261,8 +313,6 @@ def test_agent_publication_excludes_memory_and_adoption_clones_frozen_components
     submitted = service.submit("agent", owner_agent.id, owner_agent.profile_revision, owner)
     request = db.get(ResourcePublicationRequest, submitted.id)
     assert request is not None
-    from app.db.models import AgentPublicationRevision
-
     snapshot = db.get(AgentPublicationRevision, request.snapshot_id)
     assert snapshot is not None
     assert "PRIVATE-MEMORY-MUST-NOT-PUBLISH" not in str(snapshot.model_dump())
@@ -320,6 +370,65 @@ def test_agent_publication_becomes_stale_when_binding_changes_before_review() ->
             submitted.id,
             command="approve",
             command_id="agent-stale-review",
+            expected_request_row_version=submitted.row_version,
+            expected_attention_revision=0,
+            reviewer=admin,
+            comment=None,
+        )
+    assert stale.value.code == "PUBLICATION_SNAPSHOT_STALE"
+
+
+def test_agent_publication_freezes_governance_facts_before_review() -> None:
+    """验证角色或监督关系变化会使组织发布快照过期，而非只校验 Agent 版本。"""
+
+    db, service, admin, owner, _adopter, _agent, _skill = _context()
+    owner_agent = db.get(AgentProfile, "agent_g1_owner")
+    assert owner_agent is not None
+    organization = OrganizationUnit(
+        id="org_g1_publication",
+        tenant_id=owner.tenant_id,
+        parent_id="org_g1_context",
+        code="g1-publication-org",
+        name="G1 组织",
+        unit_type_code="department",
+        tree_path="/g1-context-org/g1-publication-org",
+        depth=1,
+    )
+    role = BusinessRole(
+        id="role_g1_publication",
+        tenant_id=owner.tenant_id,
+        role_code="g1.operator",
+        name="G1 操作员",
+    )
+    supervisor = db.get(EmployeeProfile, "profile_g1_context")
+    assert supervisor is not None
+    owner_agent.responsible_org_unit_id = organization.id
+    binding = AgentRoleBinding(
+        id="binding_g1_publication",
+        tenant_id=owner.tenant_id,
+        agent_id=owner_agent.id,
+        business_role_id=role.id,
+        supervisor_employee_profile_id=supervisor.id,
+        assignment_mode="execute",
+    )
+    db.add_all([organization, role, binding, owner_agent])
+    db.commit()
+
+    submitted = service.submit("agent", owner_agent.id, owner_agent.profile_revision, owner)
+    snapshot = db.get(AgentPublicationRevision, submitted.snapshot_id)
+    assert snapshot is not None
+    governance = snapshot.governance_snapshot_json
+    assert governance["responsible_org_unit"] == {"id": organization.id, "status": "active"}
+    assert governance["role_bindings"][0]["supervisor_employee_profile_id"] == supervisor.id
+
+    role.status = "inactive"
+    db.add(role)
+    db.commit()
+    with pytest.raises(PublicationError) as stale:
+        service.review(
+            submitted.id,
+            command="approve",
+            command_id="g1-governance-stale",
             expected_request_row_version=submitted.row_version,
             expected_attention_revision=0,
             reviewer=admin,
@@ -485,6 +594,87 @@ def test_release_unpublish_preserves_existing_use_but_security_revoke_fails_clos
         reason="供应链安全事件",
     )
     assert EffectiveGeneralSkillResolver(db).resolve(adopter, adopter_agent.id).items == ()
+
+
+def test_agent_release_rollback_restores_history_with_dual_cas_and_audit() -> None:
+    """证明整 Agent 普通下架历史可双 CAS 回滚，且发现投影和审计同步更新。"""
+
+    db, service, admin, owner, _adopter, _adopter_agent, _skill = _context()
+    owner_agent = db.get(AgentProfile, "agent_g1_owner")
+    assert owner_agent is not None
+    first_request = service.submit("agent", owner_agent.id, owner_agent.profile_revision, owner)
+    service.review(
+        first_request.id,
+        command="approve",
+        command_id="agent-rollback-first-review",
+        expected_request_row_version=first_request.row_version,
+        expected_attention_revision=0,
+        reviewer=admin,
+        comment="第一版组织快照",
+    )
+    first_release = db.exec(
+        select(PublicationRelease).where(
+            PublicationRelease.resource_type == "agent",
+            PublicationRelease.status == "active",
+        )
+    ).one()
+
+    owner_agent.description = "第二版组织快照。"
+    owner_agent.profile_revision += 1
+    db.add(owner_agent)
+    db.commit()
+    second_request = service.submit("agent", owner_agent.id, owner_agent.profile_revision, owner)
+    service.review(
+        second_request.id,
+        command="approve",
+        command_id="agent-rollback-second-review",
+        expected_request_row_version=second_request.row_version,
+        expected_attention_revision=0,
+        reviewer=admin,
+        comment="第二版组织快照",
+    )
+    active_release = db.exec(
+        select(PublicationRelease).where(
+            PublicationRelease.resource_type == "agent",
+            PublicationRelease.status == "active",
+        )
+    ).one()
+    assert active_release.id != first_release.id
+    db.refresh(first_release)
+    assert first_release.status == "unpublished"
+
+    restored = service.rollback_agent_release(
+        first_release.id,
+        command_id="agent-rollback-once",
+        expected_active_release_id=active_release.id,
+        expected_active_row_version=active_release.row_version,
+        expected_target_row_version=first_release.row_version,
+        actor=admin,
+        reason="第二版发现异常，恢复第一版稳定快照",
+    )
+    replay = service.rollback_agent_release(
+        first_release.id,
+        command_id="agent-rollback-once",
+        expected_active_release_id=active_release.id,
+        expected_active_row_version=active_release.row_version,
+        expected_target_row_version=first_release.row_version,
+        actor=admin,
+        reason="第二版发现异常，恢复第一版稳定快照",
+    )
+    assert restored == replay
+    assert restored.id == first_release.id
+    assert restored.status == "active"
+    db.refresh(active_release)
+    db.refresh(owner_agent)
+    assert active_release.status == "unpublished"
+    assert owner_agent.metadata_json["organization_release_id"] == first_release.id
+    audit = db.exec(
+        select(ManagementAuditLog).where(
+            ManagementAuditLog.action == "publication_release_rollback",
+            ManagementAuditLog.resource_id == first_release.id,
+        )
+    ).one()
+    assert audit.after_json["active_release_id"] == first_release.id
 
 
 def test_file_sqlite_concurrent_release_transitions_have_one_cas_winner(

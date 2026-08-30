@@ -2,6 +2,11 @@ export enum EnterpriseRoute {
   Workspace = '/workspace',
   Chat = '/workspace/chat',
   Platform = '/enterprise/platform',
+  PlatformExperts = '/enterprise/platform/experts',
+  ExpertTemplateManagement = '/enterprise/agents?view=expert',
+  SkillManagement = '/enterprise/general-skills/catalog',
+  /** @deprecated Use SkillManagement in new navigation code. */
+  GeneralSkillCatalog = '/enterprise/general-skills/catalog',
   Gallery = '/workspace/gallery',
   Agents = '/enterprise/agents',
   Dashboard = '/enterprise/dashboard',

@@ -308,6 +308,38 @@ def is_open_gallery_resource(
     return overall_binding.status != "deleted" and not _binding_is_private(overall_binding)
 
 
+def is_platform_catalog_general_skill(resource: object) -> bool:
+    """识别没有租户所有者、只能由显式 Agent binding 授权的平台目录 Skill。"""
+
+    return (
+        isinstance(resource, GeneralSkill)
+        and resource.catalog_scope == "platform"
+        and resource.tenant_id is None
+        and resource.visibility_scope == "platform_gallery"
+        and (resource.metadata_json or {}).get("managed_catalog") is True
+        and isinstance(resource.catalog_key, str)
+        and bool(resource.catalog_key)
+    )
+
+
+def is_archived_platform_catalog_binding_continuable(
+    resource: object,
+    binding: AgentResourceBinding,
+) -> bool:
+    """判断普通下架的项目 Skill 是否仍可按原绑定继续运行。"""
+
+    metadata = _resource_metadata(resource)
+    binding_metadata = binding.metadata_json or {}
+    return (
+        is_platform_catalog_general_skill(resource)
+        and getattr(resource, "status", None) == "archived"
+        and metadata.get("catalog_lifecycle_status") == "archived"
+        and binding.status == "active"
+        and binding_metadata.get("managed_catalog") is True
+        and binding_metadata.get("catalog_key") == metadata.get("catalog_key")
+    )
+
+
 def is_bound_resource_visible_for_agent(
     db: Session,
     tenant_id: str,
@@ -319,6 +351,16 @@ def is_bound_resource_visible_for_agent(
 
     if binding.status == "deleted":
         return False
+    if resource_type == "general_skill" and is_platform_catalog_general_skill(resource):
+        metadata = binding.metadata_json or {}
+        return (
+            (
+                getattr(resource, "status", None) == "published"
+                or is_archived_platform_catalog_binding_continuable(resource, binding)
+            )
+            and metadata.get("managed_catalog") is True
+            and metadata.get("catalog_key") == resource.catalog_key
+        )
     if getattr(resource, "tenant_id", None) != tenant_id:
         return False
     if getattr(resource, "visibility_scope", None) in {"user_private", "agent_private"}:

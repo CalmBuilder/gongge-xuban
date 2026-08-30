@@ -24,6 +24,7 @@ from sqlmodel import Session, select
 
 from app.agents.branching import (
     is_bound_resource_visible_for_agent,
+    is_platform_catalog_general_skill,
     is_open_gallery_resource,
     model_for_agent,
     visible_published_skills,
@@ -7681,7 +7682,10 @@ class AgentLoop:
         visible: list[GeneralSkill] = []
         for binding in bindings:
             row = self.db.get(GeneralSkill, binding.resource_id)
-            if not row or row.tenant_id != tenant_id or row.status != "published":
+            if not row or (
+                row.tenant_id != tenant_id
+                and not is_platform_catalog_general_skill(row)
+            ) or row.status != "published":
                 continue
             if is_bound_resource_visible_for_agent(
                 self.db,
@@ -7712,7 +7716,10 @@ class AgentLoop:
         rows: list[GeneralSkill] = []
         for item in catalog.items:
             root = self.db.get(GeneralSkill, item.skill_id)
-            if root is None or root.tenant_id != tenant_id:
+            if root is None or (
+                root.tenant_id != tenant_id
+                and not is_platform_catalog_general_skill(root)
+            ):
                 continue
             if root.usage_mode != "planning_guidance":
                 rows.append(root)

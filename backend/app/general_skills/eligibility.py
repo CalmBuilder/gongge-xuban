@@ -12,9 +12,10 @@ import hashlib
 import json
 from dataclasses import dataclass
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from sqlmodel import Session, select
 
+from app.agents.branching import is_archived_platform_catalog_binding_continuable
 from app.db.models import (
     AgentProfile,
     AgentResourceBinding,
@@ -51,6 +52,16 @@ class GeneralSkillBindingMetadata(BaseModel):
     publication_release_id: str | None = None
     publication_snapshot_id: str | None = None
     published_content_checksum: str | None = None
+    managed_catalog: bool = False
+    catalog_key: str | None = None
+
+    @model_validator(mode="after")
+    def validate_catalog_evidence(self) -> "GeneralSkillBindingMetadata":
+        """要求项目 Skill 绑定携带与资源一致的来源键，拒绝伪造目录授权。"""
+
+        if self.managed_catalog != bool(self.catalog_key):
+            raise ValueError("GENERAL_SKILL_CATALOG_BINDING_EVIDENCE_INVALID")
+        return self
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,16 +131,34 @@ class EffectiveGeneralSkillResolver:
         """把单条 active binding 解析为固定 revision，任一事实异常即 fail-closed。"""
 
         skill = self.db.get(GeneralSkill, binding.resource_id)
+        is_platform_catalog = (
+            skill is not None
+            and skill.catalog_scope == "platform"
+            and skill.tenant_id is None
+            and skill.visibility_scope == "platform_gallery"
+            and (skill.metadata_json or {}).get("managed_catalog") is True
+        )
         if (
             skill is None
-            or skill.tenant_id != current_user.tenant_id
-            or skill.status != "published"
+            or (
+                not is_platform_catalog
+                and (
+                    skill.catalog_scope != "tenant"
+                    or skill.tenant_id != current_user.tenant_id
+                )
+            )
             or not self._visible_to_user(skill, current_user, binding)
         ):
             return None
         try:
             metadata = GeneralSkillBindingMetadata.model_validate(binding.metadata_json)
         except ValidationError:
+            return None
+        can_continue_archived_catalog = is_archived_platform_catalog_binding_continuable(
+            skill,
+            binding,
+        )
+        if skill.status != "published" and not can_continue_archived_catalog:
             return None
         revision_id = (
             metadata.pinned_revision_id
@@ -146,6 +175,7 @@ class EffectiveGeneralSkillResolver:
         )
         if (
             revision is None
+            or revision.catalog_scope != skill.catalog_scope
             or revision.tenant_id != skill.tenant_id
             or revision.skill_id != skill.id
             or revision.status not in allowed_statuses
@@ -176,6 +206,28 @@ class EffectiveGeneralSkillResolver:
 
         if skill.owner_user_id == current_user.id:
             return True
+        skill_metadata = skill.metadata_json or {}
+        binding_metadata = binding.metadata_json or {}
+        if (
+            skill_metadata.get("managed_catalog") is True
+            and binding_metadata.get("managed_catalog") is True
+            and binding_metadata.get("catalog_key") == skill_metadata.get("catalog_key")
+            and isinstance(binding_metadata.get("catalog_key"), str)
+        ):
+            if (
+                skill.catalog_scope == "platform"
+                and skill.tenant_id is None
+                and skill.visibility_scope == "platform_gallery"
+            ):
+                return True
+            from app.agents.branching import is_open_gallery_resource
+
+            return is_open_gallery_resource(
+                self.db,
+                current_user.tenant_id,
+                "general_skill",
+                skill,
+            )
         release_id = binding.metadata_json.get("publication_release_id")
         snapshot_id = binding.metadata_json.get("publication_snapshot_id")
         if not isinstance(release_id, str) or not isinstance(snapshot_id, str):

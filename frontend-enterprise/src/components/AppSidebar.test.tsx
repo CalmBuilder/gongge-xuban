@@ -63,3 +63,20 @@ it('兼容管理员只在拥有对应治理权限时看到组织治理入口', (
   expect(screen.getByText('管理审计')).toBeInTheDocument();
   expect(screen.getByText('模型配置')).toBeInTheDocument();
 });
+
+it('把开放平台发现与 Skill 管理、专家模板管理分开', () => {
+  renderSidebar([]);
+
+  expect(screen.getByText('开放广场平台')).toBeInTheDocument();
+  expect(screen.getByText('Skill 管理')).toBeInTheDocument();
+  expect(screen.queryByText('专家广场')).not.toBeInTheDocument();
+  expect(screen.queryByText('专家模板管理')).not.toBeInTheDocument();
+});
+
+it('管理员通过平级入口管理平台内置专家模板', () => {
+  renderSidebar([], true);
+
+  expect(screen.getByText('专家模板管理')).toBeInTheDocument();
+  expect(screen.getByText('Skill 管理')).toBeInTheDocument();
+  expect(screen.queryByText('专家广场')).not.toBeInTheDocument();
+});

@@ -15,14 +15,27 @@ import {
   Textarea,
   notify,
 } from '@/components/ui';
-import { SELECT_TRIGGER_CLASS } from '@/lib/enterprise-ui';
+import {
+  DIALOG_CANCEL_BUTTON_CLASS,
+  DIALOG_PRIMARY_BUTTON_CLASS,
+  DETAIL_ACTIONS_CLASS,
+  DETAIL_FACT_CARD_CLASS,
+  SELECT_TRIGGER_CLASS,
+} from '@/lib/enterprise-ui';
+import { cn } from '@/lib/utils';
 import { api, getRequestTenantId } from '../api/client';
 import {
   hasGovernancePermission,
   isEnterpriseAdmin,
   type EnterpriseAuthUser,
 } from '../auth';
-import { canManageEmployeeAgent, employeeDisplayName, employeeProfile } from '../employee';
+import {
+  canManageEmployeeAgent,
+  employeeDisplayName,
+  employeeProfile,
+  expertSourceLabel,
+  isExpertTemplate,
+} from '../employee';
 import type { AgentProfileRead } from '../types';
 import type { OrganizationUnit } from '../types/organization';
 import EmployeeAvatar from './EmployeeAvatar';
@@ -65,12 +78,14 @@ export default function EmployeeProfileEditor({
   onClose,
   onSaved,
   currentUser,
+  mode = 'employee',
 }: {
   agent?: AgentProfileRead | null;
   open: boolean;
   onClose: () => void;
   onSaved?: (agent: AgentProfileRead) => void;
   currentUser?: EnterpriseAuthUser;
+  mode?: 'employee' | 'expert-template';
 }) {
   const [form, setForm] = useState<EmployeeProfileFormValues>(BLANK_FORM);
   const [saving, setSaving] = useState(false);
@@ -78,26 +93,45 @@ export default function EmployeeProfileEditor({
   const [selectedResponsibilityOrg, setSelectedResponsibilityOrg] =
     useState<OrganizationUnit | null>(null);
   const profile = useMemo(() => employeeProfile(agent), [agent]);
-  const canEdit = Boolean(agent && canManageEmployeeAgent(agent, currentUser));
+  const isExpertTemplateMode = mode === 'expert-template' && isExpertTemplate(agent);
+  const canEdit = Boolean(
+    agent
+    && !isExpertTemplateMode
+    && canManageEmployeeAgent(agent, currentUser),
+  );
   const canGovernResponsibility = Boolean(
     currentUser
+    && !isExpertTemplateMode
     && (isEnterpriseAdmin(currentUser)
       || hasGovernancePermission(currentUser, 'agent.manage')),
   );
   const metadata = agent?.metadata || {};
-  const relationshipFacts = agent ? [
-    ['所有者', agent.owner_user_id || String(metadata.owner_user_id || '未确认')],
-    ['创建者', String(metadata.created_by_display_name || metadata.created_by_username || '未记录')],
-    ['责任组织', agent.responsible_org_unit_name || agent.responsible_org_unit_id || '暂未指定'],
-    ['最近发布者', agent.gallery_published_by || '未发布'],
-    ['状态 / 修订', `${agent.status} / r${agent.profile_revision ?? 1}`],
-    ['业务分类', agent.agent_category_code || 'assistant'],
-    ['可见范围', agent.visibility_scope || 'private'],
-    ['复制来源', agent.source_agent_id
-      ? `${agent.source_agent_id} @ ${agent.source_agent_version || 'legacy'}`
-      : '原始创建'],
-    ['非敏感资源摘要', `${agent.resources.length} 项绑定`],
-  ] : [];
+  const relationshipFacts = agent
+    ? isExpertTemplateMode
+      ? [
+          ['资产归属', '平台内置'],
+          ['来源', expertSourceLabel(agent) || String(metadata.source_repository || '项目内置快照')],
+          ['发布状态', agent.published_to_gallery ? '已发布到开放平台' : '待发布'],
+          ['模板修订', `r${agent.profile_revision ?? 1}`],
+          ['专家方向', String(metadata.expert_category || '未分类')],
+          ['可见范围', agent.visibility_scope || 'private'],
+          ['复制关系', '用户复制后形成个人能力分身'],
+          ['非敏感资源摘要', `${agent.resources.length} 项绑定`],
+        ]
+      : [
+          ['所有者', agent.owner_user_id || String(metadata.owner_user_id || '未确认')],
+          ['创建者', String(metadata.created_by_display_name || metadata.created_by_username || '未记录')],
+          ['责任组织', agent.responsible_org_unit_name || agent.responsible_org_unit_id || '暂未指定'],
+          ['最近发布者', agent.gallery_published_by || '未发布'],
+          ['状态 / 修订', `${agent.status} / r${agent.profile_revision ?? 1}`],
+          ['业务分类', agent.agent_category_code || 'assistant'],
+          ['可见范围', agent.visibility_scope || 'private'],
+          ['复制来源', agent.source_agent_id
+            ? `${agent.source_agent_id} @ ${agent.source_agent_version || 'legacy'}`
+            : '原始创建'],
+          ['非敏感资源摘要', `${agent.resources.length} 项绑定`],
+        ]
+    : [];
 
   const update = (patch: Partial<EmployeeProfileFormValues>) => setForm((prev) => ({ ...prev, ...patch }));
 
@@ -188,11 +222,13 @@ export default function EmployeeProfileEditor({
     <Dialog open={open} onOpenChange={(next) => { if (!next && !saving) onClose(); }}>
       <DialogContent
         aria-describedby={undefined}
-        className="employee-profile-modal flex max-h-[calc(100dvh-4rem)] w-[calc(100%-2rem)] flex-col gap-[16px] overflow-hidden rounded-[14px] px-[20px] py-[16px] sm:max-w-[860px]"
+        className="employee-profile-modal flex max-h-[calc(100dvh-4rem)] w-[calc(100%-2rem)] flex-col gap-[16px] overflow-hidden rounded-[var(--gg-radius-panel)] border border-[var(--gg-line)] bg-[var(--gg-surface)] px-[20px] py-[16px] shadow-[var(--gg-shadow-card)] sm:max-w-[860px]"
       >
-        <DialogTitle className="px-[12px] text-[14px] font-normal leading-none text-[#757f9c]">
+        <DialogTitle className="gg-type-section-title px-[12px]">
           {agent
-            ? `${canEdit ? '编辑' : '查看'}数字员工档案：${employeeDisplayName(agent)}`
+            ? isExpertTemplateMode
+              ? `查看专家模板：${employeeDisplayName(agent)}`
+              : `${canEdit ? '编辑' : '查看'}数字员工档案：${employeeDisplayName(agent)}`
             : '编辑数字员工档案'}
         </DialogTitle>
 
@@ -201,37 +237,42 @@ export default function EmployeeProfileEditor({
             <div className="employee-profile-preview">
               <EmployeeAvatar agent={agent} size={92} />
               <div>
-                <span className="m-0 block text-[12px] text-muted-foreground">数字员工档案</span>
-                <h4 className="mt-[4px] mb-[6px] text-[18px] font-semibold text-[#18181a]">{agent ? employeeDisplayName(agent) : '数字员工'}</h4>
-                <span className="m-0 block text-[12px] text-muted-foreground">{profile.roleName}</span>
+                <span className="gg-type-meta m-0 block">
+                  {isExpertTemplateMode ? '专家模板（平台内置）' : '数字员工档案'}
+                </span>
+                <h4 className="gg-type-section-title mt-[4px] mb-[6px]">{agent ? employeeDisplayName(agent) : '数字员工'}</h4>
+                <span className="gg-type-meta m-0 block">{profile.roleName}</span>
               </div>
               <span className="employee-profile-preview-icon"><IdcardOutlined /></span>
             </div>
 
             <div className="employee-profile-form flex min-w-0 flex-col gap-[14px]">
-              <div className="grid grid-cols-2 gap-x-[16px] gap-y-[8px] rounded-[12px] border border-[#e4e9f2] bg-[#f8faff] px-[14px] py-[12px] text-[11px] max-[640px]:grid-cols-1">
+              <div className={cn(
+                'grid grid-cols-2 gap-x-[16px] gap-y-[8px] px-[14px] py-[12px] max-[640px]:grid-cols-1',
+                DETAIL_FACT_CARD_CLASS,
+              )}>
                 {relationshipFacts.map(([label, value]) => (
                   <div key={label} className="min-w-0">
-                    <span className="text-[#8992a6]">{label}</span>
-                    <strong className="ml-[6px] break-all font-medium text-[#40485a]">
+                    <span className="gg-type-caption">{label}</span>
+                    <strong className="gg-type-control ml-[6px] break-all font-semibold text-[var(--gg-text-primary)]">
                       {value}
                     </strong>
                   </div>
                 ))}
               </div>
               {canGovernResponsibility && agent && !agent.is_overall ? (
-                <section className="grid gap-[10px] rounded-[12px] border border-[#e4e9f2] bg-white p-[12px]">
+                <section className={cn('grid gap-[10px] p-[12px]', DETAIL_FACT_CARD_CLASS, 'bg-[var(--gg-surface)]')}>
                   <div>
-                    <strong className="flex items-center gap-[5px] text-[12px] font-semibold text-[#40485a]">
+                    <strong className="gg-type-control flex items-center gap-[5px] font-semibold text-[var(--gg-text-primary)]">
                       责任组织
                       <ConceptHelp topic="governance" />
                     </strong>
-                    <span className="text-[11px] leading-[1.6] text-[#858b9c]">
+                    <span className="gg-type-caption leading-[1.6]">
                       只表示谁负责治理该数字员工，不自动改变服务范围、执行授权或知识权限。
                     </span>
                   </div>
                   <OrganizationTreeNavigator
-                    className="max-h-[260px] overflow-y-auto rounded-[10px] border border-[#e5e9f2] bg-[#fafbfe] p-[8px]"
+                    className="max-h-[260px] overflow-y-auto rounded-[var(--gg-radius-control)] border border-[var(--gg-line)] bg-[var(--gg-surface-subtle)] p-[8px]"
                     onSelect={setSelectedResponsibilityOrg}
                     selectedId={
                       selectedResponsibilityOrg?.id
@@ -242,7 +283,7 @@ export default function EmployeeProfileEditor({
                     tenantId={getRequestTenantId()}
                   />
                   <div className="flex flex-wrap items-center justify-between gap-[8px]">
-                    <span className="min-w-0 flex-1 truncate text-[11px] text-[#596174]">
+                    <span className="gg-type-caption min-w-0 flex-1 truncate text-[var(--gg-text-secondary)]">
                       {selectedResponsibilityOrg
                         ? `待设置：${selectedResponsibilityOrg.name}`
                         : `当前：${agent.responsible_org_unit_name || '暂未指定'}`}
@@ -280,35 +321,41 @@ export default function EmployeeProfileEditor({
                 disabled={!canEdit}
               >
                 <div className="employee-profile-form-grid">
-                <LabeledField label="数字员工姓名">
+                <LabeledField label={isExpertTemplateMode ? '模板名称' : '数字员工姓名'}>
                   <Input value={form.name} placeholder="例如：默认员工" onChange={(event) => update({ name: event.target.value })} />
                 </LabeledField>
-                <LabeledField label="岗位">
+                <LabeledField label={isExpertTemplateMode ? '专家方向' : '岗位'}>
                   <Input value={form.roleName} placeholder="例如：研发" onChange={(event) => update({ roleName: event.target.value })} />
                 </LabeledField>
-                <LabeledField label="入职时间">
+                <LabeledField label={isExpertTemplateMode ? '导入时间' : '入职时间'}>
                   <Input type="date" value={form.onboardedAt} onChange={(event) => update({ onboardedAt: event.target.value })} />
                 </LabeledField>
-                <LabeledField label="工作状态">
-                  <Select value={form.status} onValueChange={(value) => update({ status: value as 'active' | 'archived' })}>
-                    <SelectTrigger className={`${SELECT_TRIGGER_CLASS} w-full`}>
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="active">在线</SelectItem>
-                      <SelectItem value="archived">下线</SelectItem>
-                    </SelectContent>
-                  </Select>
+                <LabeledField label={isExpertTemplateMode ? '发布状态' : '工作状态'}>
+                  {isExpertTemplateMode ? (
+                    <div className="gg-type-control flex h-10 items-center rounded-[var(--gg-radius-control)] border border-[var(--gg-line)] bg-[var(--gg-surface-subtle)] px-3 text-[var(--gg-text-secondary)]">
+                      {agent?.published_to_gallery ? '已发布到开放平台' : '待发布'}
+                    </div>
+                  ) : (
+                    <Select value={form.status} onValueChange={(value) => update({ status: value as 'active' | 'archived' })}>
+                      <SelectTrigger className={`${SELECT_TRIGGER_CLASS} w-full`}>
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="active">在线</SelectItem>
+                        <SelectItem value="archived">下线</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  )}
                 </LabeledField>
                 </div>
 
-                <LabeledField label="岗位描述">
+                <LabeledField label={isExpertTemplateMode ? '专家简介' : '岗位描述'}>
                   <Textarea rows={3} value={form.description} placeholder="概括这个数字员工的岗位边界、服务风格和执行重点" onChange={(event) => update({ description: event.target.value })} />
                 </LabeledField>
-                <LabeledField label="看板摘要">
+                <LabeledField label={isExpertTemplateMode ? '能力摘要' : '看板摘要'}>
                   <Textarea rows={2} value={form.systemPromptSummary} placeholder="用于数字员工档案页顶部展示的 system prompt 摘要" onChange={(event) => update({ systemPromptSummary: event.target.value })} />
                 </LabeledField>
-                <LabeledField label="岗位执行约束">
+                <LabeledField label={isExpertTemplateMode ? '专家执行边界' : '岗位执行约束'}>
                   <Textarea rows={4} value={form.personaPrompt} placeholder="员工在对话中的角色、人设、回复风格和执行边界" onChange={(event) => update({ personaPrompt: event.target.value })} />
                 </LabeledField>
 
@@ -328,20 +375,20 @@ export default function EmployeeProfileEditor({
           </div>
         </div>
 
-        <div className="flex items-center justify-end gap-[8px] px-[12px]">
+        <div className={cn(DETAIL_ACTIONS_CLASS, 'px-[12px]')}>
           <UIButton
             variant="outline"
             disabled={saving}
             onClick={onClose}
-            className="h-[32px] w-[80px] rounded-[10px] border-[#e3e7f1] bg-white px-[12px] text-[14px] font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-[#18181a]"
+            className={DIALOG_CANCEL_BUTTON_CLASS}
           >
-            取消
+            {isExpertTemplateMode ? '关闭' : '取消'}
           </UIButton>
           {canEdit && (
             <UIButton
               disabled={saving}
               onClick={() => void save()}
-              className="h-[36px] w-[80px] rounded-[var(--gg-radius-control)] bg-[var(--gg-cobalt)] px-[12px] text-[14px] font-semibold text-white hover:bg-[#244bc7]"
+              className={DIALOG_PRIMARY_BUTTON_CLASS}
             >
               保存
             </UIButton>
@@ -355,7 +402,7 @@ export default function EmployeeProfileEditor({
 function LabeledField({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <label className="flex flex-col gap-[6px]">
-      <span className="text-[12px] font-medium text-[#464c5e]">{label}</span>
+      <span className="gg-type-control text-[var(--gg-text-secondary)]">{label}</span>
       {children}
     </label>
   );
@@ -383,18 +430,18 @@ function TagsField({
 
   return (
     <div className="flex flex-col gap-[8px]">
-      <div className="flex min-h-[34px] flex-wrap items-center gap-[6px] rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[8px] py-[5px] transition-colors focus-within:border-[var(--gg-cobalt)]">
+      <div className="flex min-h-[34px] flex-wrap items-center gap-[6px] rounded-[var(--gg-radius-control)] border border-[var(--gg-line)] bg-[var(--gg-surface)] px-[8px] py-[5px] transition-colors focus-within:border-[var(--gg-interaction)]">
         {value.map((tag) => (
           <span
             key={tag}
-            className="inline-flex items-center gap-[4px] rounded-[6px] bg-[#f2f3f7] px-[8px] py-[2px] text-[12px] text-[#18181a]"
+            className="gg-type-control inline-flex items-center gap-[4px] rounded-[var(--gg-radius-control)] bg-[var(--gg-state-neutral-soft)] px-[8px] py-[2px] text-[var(--gg-text-primary)]"
           >
             {tag}
             <button
               type="button"
               aria-label={`移除 ${tag}`}
               onClick={() => removeTag(tag)}
-              className="grid place-items-center text-[#858b9c] hover:text-[#18181a]"
+              className="grid place-items-center text-[var(--gg-text-muted)] hover:text-[var(--gg-text-primary)]"
             >
               <XIcon className="size-[12px]" />
             </button>
@@ -413,7 +460,7 @@ function TagsField({
             }
           }}
           onBlur={() => draft.trim() && addTags(draft)}
-          className="h-[22px] min-w-[80px] flex-1 bg-transparent text-[12px] text-[#17191f] outline-none placeholder:text-[#c0c6d4]"
+          className="gg-type-control h-[22px] min-w-[80px] flex-1 bg-transparent text-[var(--gg-text-primary)] outline-none placeholder:text-[#9aa6b8]"
         />
       </div>
       {suggestions.length > 0 && (
@@ -423,7 +470,7 @@ function TagsField({
               key={item}
               type="button"
               onClick={() => addTags(item)}
-              className="rounded-[6px] border-[0.5px] border-[#e3e7f1] px-[8px] py-[2px] text-[12px] text-[#858b9c] hover:border-[#18181a] hover:text-[#18181a]"
+              className="gg-type-control rounded-[var(--gg-radius-control)] border border-[var(--gg-line)] px-[8px] py-[2px] text-[var(--gg-text-muted)] hover:border-[var(--gg-interaction)] hover:text-[var(--gg-interaction)]"
             >
               + {item}
             </button>

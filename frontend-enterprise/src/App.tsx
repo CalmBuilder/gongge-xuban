@@ -45,6 +45,7 @@ import {
   employeeDisplayName,
   employeeDisplayNameWithCreator,
   employeeProfile,
+  isExpertTemplate,
   preferredEmployeeAgent,
 } from "./employee";
 import AccountsPage from "./pages/AccountsPage";
@@ -58,6 +59,7 @@ import GeneralSkillsPage, {
   GeneralSkillEditPage,
   GeneralSkillNewPage,
 } from "./pages/GeneralSkillsPage";
+import BuiltinSkillCatalogPage from "./pages/BuiltinSkillCatalogPage";
 import KnowledgeManagePage, { KnowledgeAddPage } from "./pages/KnowledgePage";
 import LoginPage from "./pages/LoginPage";
 import ModelsPage from "./pages/ModelsPage";
@@ -185,9 +187,15 @@ function Shell({
   );
   const accountRoleLabel = isAdmin ? "管理员" : "";
   const isDistillRoute = location.pathname === "/enterprise/skills/distill";
+  const isExpertTemplateManagementRoute = location.pathname === EnterpriseRoute.Agents
+    && new URLSearchParams(location.search).get("view") === "expert";
   const selected =
     location.pathname === "/enterprise"
       ? "/enterprise/dashboard"
+      : location.pathname.startsWith(EnterpriseRoute.GeneralSkillCatalog)
+        ? EnterpriseRoute.GeneralSkillCatalog
+      : isAdmin && isExpertTemplateManagementRoute
+        ? EnterpriseRoute.ExpertTemplateManagement
       : location.pathname.startsWith("/enterprise/platform")
         ? "/enterprise/platform"
         : location.pathname.startsWith("/enterprise/knowledge")
@@ -399,7 +407,7 @@ function Shell({
   const hasEmployees = scopeAgents.some((item) => !item.is_overall);
   const isEmployeeScopedRoute = EMPLOYEE_SCOPED_PREFIXES.some((prefix) =>
     location.pathname.startsWith(prefix),
-  );
+  ) && !location.pathname.startsWith(EnterpriseRoute.GeneralSkillCatalog);
   const showEmployeeEmptyState =
     agentsLoaded && !hasEmployees && isEmployeeScopedRoute;
   const sourceAgents = agents.filter((item) =>
@@ -709,6 +717,24 @@ function Shell({
                 }
               />
               <Route
+                path="/enterprise/general-skills/catalog"
+                element={
+                  <BuiltinSkillCatalogPage
+                    currentUser={auth.user}
+                    onLogout={onLogout}
+                  />
+                }
+              />
+              <Route
+                path="/enterprise/general-skills/catalog/:slug"
+                element={
+                  <BuiltinSkillCatalogPage
+                    currentUser={auth.user}
+                    onLogout={onLogout}
+                  />
+                }
+              />
+              <Route
                 path="/enterprise/general-skills/new"
                 element={
                   <GeneralSkillNewPage
@@ -943,7 +969,7 @@ function Shell({
                       <SelectItem key={agent.id} value={agent.id}>
                         {agent.is_overall
                           ? "开放广场"
-                          : `${employeeDisplayNameWithCreator(agent)} · ${employeeProfile(agent).roleName}${isGalleryEmployee(agent) ? " · 广场" : ""}`}
+                          : `${employeeDisplayNameWithCreator(agent)} · ${employeeProfile(agent).roleName}${isExpertTemplate(agent) ? " · 专家模板" : isGalleryEmployee(agent) ? " · 广场" : ""}`}
                       </SelectItem>
                     ))}
                   </SelectContent>

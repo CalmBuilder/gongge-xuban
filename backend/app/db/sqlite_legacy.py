@@ -6,12 +6,13 @@
 @Description: 负责 SQLite 建表、兼容迁移和旧数据修复。
 """
 
-from collections.abc import Callable
+from collections import defaultdict
+from collections.abc import Callable, Mapping, Sequence
 import hashlib
 import json
 from pathlib import Path
 
-from sqlalchemy import Engine, MetaData, Table, inspect, text
+from sqlalchemy import Column, Engine, MetaData, String, Table, inspect, text
 from sqlmodel import SQLModel
 
 _DEFAULT_MODEL_OUTPUT_LIMIT_MIGRATION_ID = "20260712_default_model_output_tokens_8192"
@@ -102,6 +103,7 @@ def migrate_sqlite_skill_schema(engine: Engine) -> None:
         _migrate_agent_identity_fields(conn, tables)
         _migrate_execution_reliability_fields(conn, tables)
         _migrate_dynamic_capability_fields(conn, tables)
+        _migrate_sqlite_platform_general_skill_catalog(conn, tables)
         _migrate_execution_plan_fields(conn, tables)
         _migrate_execution_control_fields(conn, tables)
 
@@ -466,6 +468,537 @@ def _migrate_dynamic_capability_fields(conn, tables: set[str]) -> None:
                     f"ON {table_name} ({column_name})"
                 )
             )
+
+
+def _migrate_sqlite_platform_general_skill_catalog(conn, tables: set[str]) -> None:
+    """把桌面 SQLite 中的租户内置副本合并为项目级目录资产。"""
+
+    required_tables = {
+        "general_skills",
+        "general_skill_revisions",
+        "general_skill_catalog_commands",
+    }
+    if not required_tables <= tables:
+        return
+    _sqlite_add_catalog_scope_columns(conn)
+    _sqlite_expand_catalog_visibility_constraint(conn)
+    _sqlite_merge_platform_catalog_rows(conn)
+    _sqlite_tighten_catalog_scope_columns(conn)
+    _sqlite_create_catalog_scope_constraints_and_indexes(conn)
+
+
+def _sqlite_operations(conn):
+    """为 SQLite 兼容迁移创建支持表重建的 Alembic 操作对象。"""
+
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+
+    return Operations(MigrationContext.configure(conn))
+
+
+def _sqlite_add_catalog_scope_columns(conn) -> None:
+    """增加目录范围列，并把旧租户主键改成允许平台资产为空。"""
+
+    additions: dict[str, tuple[Column[object], ...]] = {
+        "general_skills": (
+            Column("catalog_scope", String(64), nullable=True, server_default="tenant"),
+            Column("catalog_key", String(128), nullable=True),
+        ),
+        "general_skill_revisions": (
+            Column("catalog_scope", String(64), nullable=True, server_default="tenant"),
+        ),
+        "general_skill_catalog_commands": (
+            Column("catalog_scope", String(64), nullable=True, server_default="tenant"),
+            Column("scope_key", String(128), nullable=True),
+        ),
+    }
+    for table_name, columns in additions.items():
+        existing = {
+            str(column["name"]): column
+            for column in inspect(conn).get_columns(table_name)
+        }
+        missing = [column for column in columns if str(column.name) not in existing]
+        tenant_column = existing.get("tenant_id")
+        needs_nullable_tenant = bool(tenant_column and not tenant_column["nullable"])
+        if not missing and not needs_nullable_tenant:
+            continue
+        operations = _sqlite_operations(conn)
+        with operations.batch_alter_table(table_name, recreate="always") as batch:
+            for column in missing:
+                batch.add_column(column)
+            if needs_nullable_tenant:
+                batch.alter_column(
+                    "tenant_id",
+                    existing_type=String(128),
+                    nullable=True,
+                )
+
+
+def _sqlite_expand_catalog_visibility_constraint(conn) -> None:
+    """在提升旧快照前允许项目级 Skill 广场可见性。"""
+
+    checks = inspect(conn).get_check_constraints("general_skills")
+    visibility_check = next(
+        (item for item in checks if item.get("name") == "ck_general_skill_visibility_scope"),
+        None,
+    )
+    if visibility_check and "platform_gallery" in str(visibility_check.get("sqltext") or ""):
+        return
+    operations = _sqlite_operations(conn)
+    with operations.batch_alter_table("general_skills", recreate="always") as batch:
+        if visibility_check:
+            batch.drop_constraint("ck_general_skill_visibility_scope", type_="check")
+        batch.create_check_constraint(
+            "ck_general_skill_visibility_scope",
+            "visibility_scope IN ('user_private', 'agent_private', 'tenant_gallery', 'platform_gallery')",
+        )
+
+
+def _sqlite_merge_platform_catalog_rows(conn) -> None:
+    """合并内容一致的旧内置副本，冲突时中止迁移而不覆盖业务事实。"""
+
+    rows = conn.execute(
+        text(
+            "SELECT id, tenant_id, slug, status, metadata_json, skill_markdown, "
+            "current_published_revision_id FROM general_skills "
+            "WHERE catalog_scope = 'tenant'"
+        )
+    ).mappings().all()
+    groups: dict[str, list[Mapping[str, object]]] = defaultdict(list)
+    for row in rows:
+        metadata = _json_object(row["metadata_json"])
+        if metadata.get("managed_catalog") is True and isinstance(metadata.get("catalog_key"), str):
+            groups[str(metadata["catalog_key"])].append(row)
+
+    skill_map: dict[str, str] = {}
+    revision_map: dict[str, str] = {}
+    catalog_groups: list[tuple[str, list[Mapping[str, object]], Mapping[str, object]]] = []
+    for catalog_key, group in sorted(groups.items()):
+        _sqlite_ensure_same_catalog_content(catalog_key, group)
+        canonical = sorted(
+            group,
+            key=lambda row: (str(row["status"]) != "published", str(row["id"])),
+        )[0]
+        catalog_groups.append((catalog_key, group, canonical))
+        canonical_id = str(canonical["id"])
+        for row in group:
+            skill_map[str(row["id"])] = canonical_id
+
+    published_pointers: dict[str, str | None] = {}
+    for catalog_key, group, canonical in catalog_groups:
+        canonical_id = str(canonical["id"])
+        revisions_by_skill = {
+            str(row["id"]): _sqlite_skill_revisions(conn, str(row["id"]))
+            for row in group
+        }
+        _sqlite_ensure_same_revision_shapes(catalog_key, revisions_by_skill)
+        canonical_revisions = revisions_by_skill[canonical_id]
+        canonical_by_shape = {
+            (int(row["revision_number"]), str(row["content_checksum"])): row
+            for row in canonical_revisions
+        }
+        for revision in canonical_revisions:
+            revision_map[str(revision["id"])] = str(revision["id"])
+        for revisions in revisions_by_skill.values():
+            for revision in revisions:
+                shape = (int(revision["revision_number"]), str(revision["content_checksum"]))
+                target = canonical_by_shape.get(shape)
+                if target is None:
+                    raise RuntimeError(
+                        f"platform Skill catalog revision conflict for catalog key {catalog_key}"
+                    )
+                revision_map[str(revision["id"])] = str(target["id"])
+        published_pointers[canonical_id] = _sqlite_published_revision_id(
+            group,
+            revisions_by_skill,
+            revision_map,
+        )
+
+    for catalog_key, group, canonical in catalog_groups:
+        canonical_id = str(canonical["id"])
+        metadata = _json_object(canonical["metadata_json"])
+        metadata["catalog_key"] = catalog_key
+        metadata["catalog_scope"] = "platform"
+        status = (
+            "published"
+            if any(str(row["status"]) == "published" for row in group)
+            else str(canonical["status"])
+        )
+        conn.execute(
+            text(
+                "UPDATE general_skills SET tenant_id = NULL, catalog_scope = 'platform', "
+                "catalog_key = :catalog_key, owner_user_id = NULL, "
+                "visibility_scope = 'platform_gallery', status = :status, "
+                "current_published_revision_id = :revision_id, metadata_json = :metadata "
+                "WHERE id = :skill_id"
+            ),
+            {
+                "catalog_key": catalog_key,
+                "status": status,
+                "revision_id": published_pointers[canonical_id],
+                "metadata": json.dumps(metadata, ensure_ascii=False),
+                "skill_id": canonical_id,
+            },
+        )
+        for revision in _sqlite_skill_revisions(conn, canonical_id):
+            conn.execute(
+                text(
+                    "UPDATE general_skill_revisions SET tenant_id = NULL, "
+                    "catalog_scope = 'platform' WHERE id = :revision_id"
+                ),
+                {"revision_id": revision["id"]},
+            )
+
+    _sqlite_remap_platform_catalog_references(conn, skill_map, revision_map)
+    for revision_id, target_id in revision_map.items():
+        if revision_id != target_id:
+            conn.execute(
+                text("DELETE FROM general_skill_revisions WHERE id = :revision_id"),
+                {"revision_id": revision_id},
+            )
+    for skill_id, target_id in skill_map.items():
+        if skill_id != target_id:
+            conn.execute(
+                text("DELETE FROM general_skills WHERE id = :skill_id"),
+                {"skill_id": skill_id},
+            )
+
+
+def _sqlite_ensure_same_catalog_content(
+    catalog_key: str,
+    rows: Sequence[Mapping[str, object]],
+) -> None:
+    """确保同一内置来源键的旧 Skill 正文和来源摘要一致。"""
+
+    fingerprints = {
+        (
+            _json_object(row["metadata_json"]).get("content_checksum"),
+            _json_object(row["metadata_json"]).get("source_normalized_checksum"),
+            str(row["skill_markdown"] or ""),
+        )
+        for row in rows
+    }
+    if len(fingerprints) > 1:
+        raise RuntimeError(
+            f"platform Skill catalog content conflict for catalog key {catalog_key}"
+        )
+
+
+def _sqlite_skill_revisions(conn, skill_id: str) -> list[Mapping[str, object]]:
+    """读取旧 Skill 的租户范围 revision。"""
+
+    return conn.execute(
+        text(
+            "SELECT id, revision_number, content_checksum, manifest_checksum, status, "
+            "published_at FROM general_skill_revisions WHERE skill_id = :skill_id "
+            "AND catalog_scope = 'tenant' ORDER BY revision_number, id"
+        ),
+        {"skill_id": skill_id},
+    ).mappings().all()
+
+
+def _sqlite_ensure_same_revision_shapes(
+    catalog_key: str,
+    revisions_by_skill: Mapping[str, Sequence[Mapping[str, object]]],
+) -> None:
+    """确保重复快照的 revision 结构一致，避免迁移时丢失版本。"""
+
+    shapes = {
+        tuple(
+            (
+                int(row["revision_number"]),
+                str(row["content_checksum"]),
+                str(row["manifest_checksum"]),
+            )
+            for row in revisions
+        )
+        for revisions in revisions_by_skill.values()
+    }
+    if len(shapes) > 1:
+        raise RuntimeError(
+            f"platform Skill catalog revision conflict for catalog key {catalog_key}"
+        )
+
+
+def _sqlite_published_revision_id(
+    group: Sequence[Mapping[str, object]],
+    revisions_by_skill: Mapping[str, Sequence[Mapping[str, object]]],
+    revision_map: Mapping[str, str],
+) -> str | None:
+    """选择旧发布指针映射后的平台 revision。"""
+
+    candidates: list[str] = []
+    for skill in group:
+        if str(skill["status"]) != "published":
+            continue
+        pointer = skill.get("current_published_revision_id")
+        if pointer:
+            candidates.append(revision_map.get(str(pointer), str(pointer)))
+        for revision in revisions_by_skill.get(str(skill["id"]), ()):
+            if str(revision["status"]) == "published":
+                candidates.append(revision_map.get(str(revision["id"]), str(revision["id"])))
+    return sorted(set(candidates))[0] if candidates else None
+
+
+def _sqlite_remap_platform_catalog_references(
+    conn,
+    skill_map: Mapping[str, str],
+    revision_map: Mapping[str, str],
+) -> None:
+    """重定向旧绑定、提案、发布和命令 JSON 中的重复主体标识。"""
+
+    table_names = set(inspect(conn).get_table_names())
+    column_map = {
+        "skill_id": skill_map,
+        "parent_skill_id": skill_map,
+        "child_skill_id": skill_map,
+        "target_skill_id": skill_map,
+        "revision_id": revision_map,
+        "parent_revision_id": revision_map,
+        "child_revision_id": revision_map,
+        "approved_revision_id": revision_map,
+        "base_revision_id": revision_map,
+    }
+    for table_name in sorted(table_names):
+        if not (
+            table_name.startswith("general_skill_")
+            or table_name == "session_general_skill_overrides"
+        ):
+            continue
+        if table_name in {"general_skills", "general_skill_revisions"}:
+            continue
+        columns = {str(column["name"]) for column in inspect(conn).get_columns(table_name)}
+        for column_name, replacements in column_map.items():
+            if column_name not in columns:
+                continue
+            for old_id, new_id in replacements.items():
+                if old_id == new_id:
+                    continue
+                conn.execute(
+                    text(
+                        f"UPDATE {table_name} SET {column_name} = :new_id "
+                        f"WHERE {column_name} = :old_id"
+                    ),
+                    {"old_id": old_id, "new_id": new_id},
+                )
+
+    if "agent_resource_bindings" in table_names:
+        for old_id, new_id in skill_map.items():
+            if old_id == new_id:
+                continue
+            conn.execute(
+                text(
+                    "UPDATE agent_resource_bindings SET resource_id = :new_id "
+                    "WHERE resource_type = 'general_skill' AND resource_id = :old_id"
+                ),
+                {"old_id": old_id, "new_id": new_id},
+            )
+    if "publication_releases" in table_names:
+        for old_id, new_id in skill_map.items():
+            if old_id == new_id:
+                continue
+            conn.execute(
+                text(
+                    "UPDATE publication_releases SET resource_id = :new_id "
+                    "WHERE resource_type = 'general_skill' AND resource_id = :old_id"
+                ),
+                {"old_id": old_id, "new_id": new_id},
+            )
+
+    for table_name, json_column in (
+        ("general_skill_catalog_commands", "result_json"),
+        ("general_skill_install_intents", "installed_revision_ids_json"),
+    ):
+        if table_name not in table_names:
+            continue
+        rows = conn.execute(
+            text(f"SELECT id, {json_column} FROM {table_name}")
+        ).mappings().all()
+        for row in rows:
+            original = _sqlite_json_value(row[json_column])
+            replaced = _sqlite_replace_catalog_ids(original, skill_map, revision_map)
+            if replaced == original:
+                continue
+            conn.execute(
+                text(f"UPDATE {table_name} SET {json_column} = :payload WHERE id = :id"),
+                {"id": row["id"], "payload": json.dumps(replaced, ensure_ascii=False)},
+            )
+
+
+def _sqlite_json_value(value: object) -> object:
+    """解析 SQLite JSON 文本或原生值，供历史命令重写使用。"""
+
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return None
+    return value
+
+
+def _sqlite_replace_catalog_ids(
+    value: object,
+    skill_map: Mapping[str, str],
+    revision_map: Mapping[str, str],
+) -> object:
+    """递归替换历史 JSON 中已合并的 Skill/Revision 标识。"""
+
+    if isinstance(value, str):
+        return revision_map.get(value, skill_map.get(value, value))
+    if isinstance(value, list):
+        return [_sqlite_replace_catalog_ids(item, skill_map, revision_map) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _sqlite_replace_catalog_ids(item, skill_map, revision_map)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _sqlite_tighten_catalog_scope_columns(conn) -> None:
+    """在合并完成后收紧范围列，阻止后续写入无效作用域。"""
+
+    for table_name, columns in (
+        ("general_skills", ("catalog_scope",)),
+        ("general_skill_revisions", ("catalog_scope",)),
+        ("general_skill_catalog_commands", ("catalog_scope", "scope_key")),
+    ):
+        current = {
+            str(column["name"]): column
+            for column in inspect(conn).get_columns(table_name)
+        }
+        if all(not current[column]["nullable"] and current[column]["default"] is None for column in columns):
+            continue
+        operations = _sqlite_operations(conn)
+        with operations.batch_alter_table(table_name, recreate="always") as batch:
+            for column_name in columns:
+                batch.alter_column(
+                    column_name,
+                    existing_type=String(128 if column_name == "scope_key" else 64),
+                    nullable=False,
+                    server_default=None,
+                )
+
+
+def _sqlite_create_catalog_scope_constraints_and_indexes(conn) -> None:
+    """建立 SQLite 兼容的范围检查、唯一索引和查询索引。"""
+
+    checks = {
+        str(item["name"])
+        for item in inspect(conn).get_check_constraints("general_skills")
+        if item.get("name")
+    }
+    if "ck_general_skill_catalog_scope" not in checks:
+        operations = _sqlite_operations(conn)
+        with operations.batch_alter_table("general_skills", recreate="always") as batch:
+            batch.create_check_constraint(
+                "ck_general_skill_catalog_scope",
+                "(catalog_scope = 'platform' AND tenant_id IS NULL AND owner_user_id IS NULL "
+                "AND visibility_scope = 'platform_gallery' AND catalog_key IS NOT NULL) OR "
+                "(catalog_scope = 'tenant' AND tenant_id IS NOT NULL "
+                "AND visibility_scope <> 'platform_gallery')",
+            )
+    revision_checks = {
+        str(item["name"])
+        for item in inspect(conn).get_check_constraints("general_skill_revisions")
+        if item.get("name")
+    }
+    if "ck_general_skill_revision_catalog_scope" not in revision_checks:
+        operations = _sqlite_operations(conn)
+        with operations.batch_alter_table("general_skill_revisions", recreate="always") as batch:
+            batch.create_check_constraint(
+                "ck_general_skill_revision_catalog_scope",
+                "(catalog_scope = 'platform' AND tenant_id IS NULL) OR "
+                "(catalog_scope = 'tenant' AND tenant_id IS NOT NULL)",
+            )
+    command_checks = {
+        str(item["name"])
+        for item in inspect(conn).get_check_constraints("general_skill_catalog_commands")
+        if item.get("name")
+    }
+    if "ck_general_skill_catalog_command_scope" not in command_checks:
+        operations = _sqlite_operations(conn)
+        with operations.batch_alter_table(
+            "general_skill_catalog_commands",
+            recreate="always",
+        ) as batch:
+            batch.create_check_constraint(
+                "ck_general_skill_catalog_command_scope",
+                "(catalog_scope = 'platform' AND tenant_id IS NULL AND scope_key = 'platform') OR "
+                "(catalog_scope = 'tenant' AND tenant_id IS NOT NULL AND scope_key = tenant_id)",
+            )
+
+    _sqlite_create_unique_index_if_missing(
+        conn,
+        "uq_general_skill_catalog_key",
+        "general_skills",
+        ("catalog_key",),
+    )
+    _sqlite_create_unique_index_if_missing(
+        conn,
+        "uq_general_skill_revision_scope_number",
+        "general_skill_revisions",
+        ("catalog_scope", "skill_id", "revision_number"),
+    )
+    _sqlite_create_unique_index_if_missing(
+        conn,
+        "uq_general_skill_revision_scope_checksum",
+        "general_skill_revisions",
+        ("catalog_scope", "skill_id", "content_checksum"),
+    )
+    _sqlite_create_unique_index_if_missing(
+        conn,
+        "uq_general_skill_catalog_scope_command",
+        "general_skill_catalog_commands",
+        ("scope_key", "command_type", "command_id"),
+    )
+    for table_name, index_name, columns in (
+        (
+            "general_skills",
+            "ix_general_skill_catalog_scope_status",
+            ("catalog_scope", "status", "catalog_key"),
+        ),
+        (
+            "general_skill_revisions",
+            "ix_general_skill_revisions_catalog_scope",
+            ("catalog_scope",),
+        ),
+        (
+            "general_skill_catalog_commands",
+            "ix_general_skill_catalog_commands_catalog_scope",
+            ("catalog_scope",),
+        ),
+    ):
+        conn.execute(
+            text(
+                f"CREATE INDEX IF NOT EXISTS {index_name} "
+                f"ON {table_name} ({', '.join(columns)})"
+            )
+        )
+
+
+def _sqlite_create_unique_index_if_missing(
+    conn,
+    index_name: str,
+    table_name: str,
+    columns: tuple[str, ...],
+) -> None:
+    """在 SQLite 中用具名唯一索引补齐旧表的新范围唯一性。"""
+
+    inspector = inspect(conn)
+    index_names = {str(item["name"]) for item in inspector.get_indexes(table_name)}
+    unique_names = {
+        str(item["name"])
+        for item in inspector.get_unique_constraints(table_name)
+        if item.get("name")
+    }
+    if index_name in index_names or index_name in unique_names:
+        return
+    conn.execute(
+        text(
+            f"CREATE UNIQUE INDEX {index_name} ON {table_name} ({', '.join(columns)})"
+        )
+    )
 
 
 def _migrate_execution_plan_fields(conn, tables: set[str]) -> None:

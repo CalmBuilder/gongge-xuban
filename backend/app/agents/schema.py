@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -17,7 +18,22 @@ AgentWorkRecordEventKind = Literal["chat", "task", "sop", "tool", "knowledge", "
 AgentWorkRecordEventPhase = Literal["reply", "last_run", "next_run", "assigned"]
 AgentListScope = Literal["manageable", "owned", "used", "gallery", "expert"]
 AgentGalleryScope = Literal["owned", "used", "gallery", "expert"]
-AgentManagementView = Literal["all", "online", "offline", "pending", "expert", "governance"]
+AgentManagementView = Literal[
+    "all",
+    "online",
+    "offline",
+    "pending",
+    "expert",
+    "governance",
+    "capability",
+    "organization",
+]
+AgentGovernanceForm = Literal[
+    "capability_avatar",
+    "organization_pending",
+    "organization_employee",
+    "template",
+]
 
 
 class AgentProfileCreateRequest(BaseModel):
@@ -91,6 +107,10 @@ class AgentProfileRead(BaseModel):
     used_by_current_user: bool = False
     manageable_by_current_user: bool = False
     view_level: Literal["manager", "user", "governance"] = "user"
+    governance_form: AgentGovernanceForm = "capability_avatar"
+    governance_reasons: list[str] = Field(default_factory=list)
+    organization_release_id: Optional[str] = None
+    active_role_binding_ids: list[str] = Field(default_factory=list)
     copy_summary: Optional[dict[str, Any]] = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     resources: list[AgentResourceBindingRead] = Field(default_factory=list)
@@ -98,6 +118,97 @@ class AgentProfileRead(BaseModel):
     updated_at: str
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class AgentOrganizationRequirementRead(BaseModel):
+    """返回组织化发布前置条件的单项事实和修复提示。"""
+
+    code: str
+    label: str
+    satisfied: bool
+    detail: str
+
+
+class AgentOrganizationizationPreviewRead(BaseModel):
+    """返回 Agent 当前组织化形态、前置条件和发布状态。"""
+
+    tenant_id: str
+    agent_id: str
+    agent_name: str
+    governance_form: AgentGovernanceForm
+    governance_reasons: list[str] = Field(default_factory=list)
+    requirements: list[AgentOrganizationRequirementRead] = Field(default_factory=list)
+    can_submit: bool = False
+    active_release_id: str | None = None
+    profile_revision: int = 1
+    owner_user_id: str | None = None
+    source_agent_id: str | None = None
+    responsible_org_unit_id: str | None = None
+    responsible_org_unit_name: str | None = None
+    active_role_binding_ids: list[str] = Field(default_factory=list)
+    active_role_code: str | None = None
+    active_supervisor_employee_profile_id: str | None = None
+    relationship_checksum: str = ""
+
+
+class AgentOrganizationizationRequest(BaseModel):
+    """以 Agent 版本和关系 checksum CAS 原子配置组织员工前置关系。"""
+
+    tenant_id: str
+    command_id: str = Field(min_length=1, max_length=128)
+    expected_profile_revision: int = Field(ge=1)
+    expected_relationship_checksum: str = Field(min_length=64, max_length=64)
+    responsible_org_unit_id: str = Field(min_length=1, max_length=512)
+    role_code: str = Field(min_length=2, max_length=128)
+    supervisor_employee_profile_id: str = Field(min_length=1, max_length=512)
+    assignment_mode: Literal["assist", "execute"] = "assist"
+    scope_type: Literal["tenant", "org_unit"] = "tenant"
+    scope_id: str = Field(default="*", min_length=1, max_length=128)
+    include_descendants: bool = True
+    effective_from: datetime | None = None
+    effective_until: datetime | None = None
+
+
+class AgentOrganizationizationOrganizationOptionRead(BaseModel):
+    """返回组织化向导可选择的责任组织。"""
+
+    id: str
+    name: str
+
+
+class AgentOrganizationizationRoleOptionRead(BaseModel):
+    """返回组织化向导可选择的活动业务角色。"""
+
+    role_code: str
+    name: str
+
+
+class AgentOrganizationizationSupervisorOptionRead(BaseModel):
+    """返回组织化向导可选择的活动监督员工摘要。"""
+
+    id: str
+    employee_id: str
+    employee_name: str
+
+
+class AgentOrganizationizationOptionsRead(BaseModel):
+    """返回同一权限边界内的组织、业务角色和监督者选择项。"""
+
+    organizations: list[AgentOrganizationizationOrganizationOptionRead] = Field(default_factory=list)
+    roles: list[AgentOrganizationizationRoleOptionRead] = Field(default_factory=list)
+    supervisors: list[AgentOrganizationizationSupervisorOptionRead] = Field(default_factory=list)
+
+
+class AgentOrganizationizationResultRead(BaseModel):
+    """返回组织化原子配置的幂等结果及最新服务端预览。"""
+
+    command_id: str
+    result_status: Literal["configured", "unchanged"]
+    agent_id: str
+    profile_revision: int
+    relationship_checksum: str
+    active_role_binding_id: str
+    preview: AgentOrganizationizationPreviewRead
 
 
 class AgentScopeRead(BaseModel):
@@ -138,6 +249,7 @@ class AgentManagementPageRead(BaseModel):
     items: list[AgentProfileRead]
     total: int
     view_counts: dict[str, int] = Field(default_factory=dict)
+    governance_counts: dict[str, int] = Field(default_factory=dict)
     facets: AgentGalleryFacetsRead = Field(default_factory=AgentGalleryFacetsRead)
     page: int
     page_size: int

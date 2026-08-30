@@ -1011,9 +1011,9 @@ def test_relationship_scopes_and_remove_usage_preserve_chat_history() -> None:
         assert {row.id for row in list_agents("tenant_demo", db, owner, "gallery")} == {
             gallery.id
         }
-        assert {row.id for row in list_agents("tenant_demo", db, owner, "expert")} == {
-            owned.id
-        }
+        # 专家广场是已发布模板的发现目录；个人拥有但未发布的专家能力分身只应
+        # 出现在自己的管理视图，不能被 public expert scope 当成模板暴露。
+        assert {row.id for row in list_agents("tenant_demo", db, owner, "expert")} == set()
 
         removed = remove_chat_agent_usage(
             gallery.id,

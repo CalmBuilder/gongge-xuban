@@ -63,12 +63,18 @@ class GeneralSkillRead(BaseModel):
     """返回通用技能当前内容和已发布规范快照元数据。"""
 
     id: str
-    tenant_id: str
+    tenant_id: str | None
     slug: str
     name: str
+    name_zh: Optional[str] = None
     description: Optional[str] = None
+    description_zh: Optional[str] = None
     homepage: Optional[str] = None
     skill_markdown: str
+    explanation_markdown_zh: Optional[str] = None
+    localization_status: Optional[str] = None
+    localization_source_content_checksum: Optional[str] = None
+    localization_checksum: Optional[str] = None
     skill_files: list[GeneralSkillFile] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
     status: str

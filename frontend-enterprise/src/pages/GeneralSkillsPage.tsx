@@ -106,6 +106,14 @@ const STATUS_BADGE: Record<GeneralSkillRead['status'], { tone: BadgeTone; text: 
   archived: { tone: 'gray', text: '已停用' },
 };
 
+function skillDisplayName(row: GeneralSkillRead): string {
+  return row.name_zh?.trim() || row.name;
+}
+
+function skillDisplayDescription(row: GeneralSkillRead): string {
+  return row.description_zh?.trim() || row.description || '暂无描述';
+}
+
 const EMPTY_SKILL_MARKDOWN = `# 技能说明
 
 在这里编写技能文档。名称、Slug 和描述由上方表单维护，系统不会从文档中自动抽取。`;
@@ -392,8 +400,8 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
   const [governanceTarget, setGovernanceTarget] = useState<GeneralSkillRead | null>(null);
   const [myLibraryOpen, setMyLibraryOpen] = useState(false);
 
-  const pageTitle = isOverallAgent ? '技能广场' : '技能';
-  const listLabel = isOverallAgent ? '技能广场列表' : '技能列表';
+  const pageTitle = isOverallAgent ? 'Skill 配置' : '技能';
+  const listLabel = isOverallAgent ? 'Skill 配置列表' : '技能列表';
   const currentAgent = useMemo(() => agents.find((item) => item.id === agentId), [agents, agentId]);
   const canManageCurrentScope = currentAgent
     ? canManageEmployeeAgent(currentAgent, currentUser)
@@ -539,8 +547,10 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
       const matchesStatus = statusFilter === 'all' || row.status === statusFilter;
       const haystack = [
         row.name,
+        row.name_zh,
         row.slug,
         row.description,
+        row.description_zh,
         row.homepage,
         resourceCreatorName(row),
       ].filter(Boolean).join(' ').toLowerCase();
@@ -994,6 +1004,17 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
     if (isOverallAgent && !canManageCurrentScope) {
       return null;
     }
+    if (row.tenant_id === null && row.metadata?.managed_catalog === true) {
+      return (
+        <UIButton
+          variant="outline"
+          size="sm"
+          onClick={() => navigate(`/enterprise/general-skills/catalog/${encodeURIComponent(row.slug)}`)}
+        >
+          Skill 管理
+        </UIButton>
+      );
+    }
     return (
       <DropdownMenu>
         <DropdownMenuTrigger
@@ -1049,8 +1070,8 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
       className: 'text-[#18181a]',
       render: (row) => (
         <div className="flex min-w-0 flex-col gap-[2px]">
-          <span className="truncate font-medium leading-[18px] text-[#18181a]" title={row.name}>
-            {row.name}
+          <span className="truncate font-medium leading-[18px] text-[#18181a]" title={skillDisplayName(row)}>
+            {skillDisplayName(row)}
           </span>
           <span className="truncate text-[#858b9c]" title={row.slug}>
             {row.slug}
@@ -1062,7 +1083,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
       key: 'description',
       title: '描述',
       className: 'whitespace-normal',
-      render: (row) => <span className="line-clamp-2 wrap-break-word">{row.description || '暂无描述'}</span>,
+      render: (row) => <span className="line-clamp-2 wrap-break-word">{skillDisplayDescription(row)}</span>,
     },
     {
       key: 'files',
@@ -1110,14 +1131,14 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
       <article className={MOBILE_CARD_CLASS} key={row.id}>
         <div className="flex min-w-0 items-start justify-between gap-[10px]">
           <div className="min-w-0">
-            <strong className="block truncate text-[14px] font-semibold text-[#18181a]">{row.name}</strong>
+            <strong className="block truncate text-[14px] font-semibold text-[#18181a]">{skillDisplayName(row)}</strong>
             <span className="mt-[2px] block truncate text-[12px] text-[#858b9c]">{row.slug}</span>
             <span className="mt-[2px] block truncate text-[12px] text-[#858b9c]">创建者：{resourceCreatorName(row) || '-'}</span>
           </div>
           {renderActions(row)}
         </div>
-        {row.description && (
-          <p className="mt-[8px] line-clamp-2 text-[12px] leading-[1.55] text-[#858b9c]">{row.description}</p>
+        {skillDisplayDescription(row) && (
+          <p className="mt-[8px] line-clamp-2 text-[12px] leading-[1.55] text-[#858b9c]">{skillDisplayDescription(row)}</p>
         )}
         <div className="mt-[10px] flex items-center justify-between gap-[10px] text-[12px] text-[#858b9c]">
           <StatusBadge tone={preset.tone}>{preset.text}</StatusBadge>
@@ -1137,6 +1158,13 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
         <>
           <AppHeader onLogout={onLogout} userName={currentUser?.username} title={pageTitle} />
           <div className="mt-[20px] mb-[16px] flex items-center justify-end gap-[12px]">
+            <UIButton
+              variant="outline"
+              onClick={() => navigate('/enterprise/general-skills/catalog')}
+              className="h-[34px] rounded-[10px] border-[0.5px] border-[#d7def5] bg-[#f7f9ff] px-[20px] text-[12px] font-medium text-[var(--gg-cobalt)] hover:border-[#b9c7f2] hover:bg-[#f1f5ff]"
+            >
+              Skill 管理
+            </UIButton>
             <UIButton
               variant="outline"
               onClick={() => setMyLibraryOpen(true)}
@@ -1367,7 +1395,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
           id: item.id,
           label: (
             <>
-              {item.name}
+              {skillDisplayName(item)}
               <span className="text-[#858b9c]"> · {item.slug}</span>
             </>
           ),
@@ -1617,8 +1645,8 @@ function MyGeneralSkillLibraryDialog({
               </section>
             ) : null}
             {releases.length ? (
-              <section className="rounded-xl border border-[#dce5ff] bg-[#fbfcff] p-4" aria-label="组织 Skill 广场">
-                <h3 className="font-medium">组织 Skill 广场</h3>
+              <section className="rounded-xl border border-[#dce5ff] bg-[#fbfcff] p-4" aria-label="已发布 Skill">
+                <h3 className="font-medium">已发布 Skill</h3>
                 <div className="mt-2 grid gap-2">
                   {releases.map((release) => (
                     <div key={release.id} className="flex items-center justify-between gap-3 rounded-lg bg-white px-3 py-2">
@@ -3449,7 +3477,7 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
                   </SelectTrigger>
                   <SelectContent>
                     {rows.map((row) => (
-                      <SelectItem key={row.slug} value={row.slug}>{`${row.name} / ${row.slug}`}</SelectItem>
+                      <SelectItem key={row.slug} value={row.slug}>{`${skillDisplayName(row)} / ${row.slug}`}</SelectItem>
                     ))}
                   </SelectContent>
                 </UISelect>
@@ -3721,7 +3749,7 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
           id: item.id,
           label: (
             <>
-              {item.name}
+              {skillDisplayName(item)}
               <span className="text-[#858b9c]"> · {item.slug}</span>
             </>
           ),

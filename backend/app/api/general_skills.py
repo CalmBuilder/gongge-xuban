@@ -27,6 +27,7 @@ from urllib.request import Request, urlopen
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
+from sqlalchemy import and_, or_
 from sqlmodel import Session, select
 
 from app.agents.branching import (
@@ -35,6 +36,7 @@ from app.agents.branching import (
     get_agent,
     hide_open_gallery_binding,
     is_bound_resource_visible_for_agent,
+    is_platform_catalog_general_skill,
     is_open_gallery_resource,
     mark_resource_open_gallery,
     mark_resource_private_for_agent,
@@ -43,7 +45,15 @@ from app.agents.branching import (
     user_creator_metadata,
 )
 from app.db import get_session
-from app.db.models import AgentProfile, AgentResourceBinding, GeneralSkill, ModelConfig, User, utc_now
+from app.db.models import (
+    AgentProfile,
+    AgentResourceBinding,
+    GeneralSkill,
+    GeneralSkillRevisionLocalization,
+    ModelConfig,
+    User,
+    utc_now,
+)
 from app.dynamic_tasks.capability_catalog import capability_checksum
 from app.general_skills import (
     GeneralSkillClawHubImportRequest,
@@ -58,6 +68,11 @@ from app.general_skills.eligibility import GeneralSkillBindingMetadata
 from app.general_skills.governance import (
     GeneralSkillGovernanceError,
     GeneralSkillGovernanceService,
+)
+from app.general_skills.localization import (
+    get_revision_localization,
+    is_usable_localization,
+    revision_for_skill_display,
 )
 from app.general_skills.runner import GeneralSkillRunner
 from app.security.auth import get_current_user
@@ -95,6 +110,8 @@ def general_skill_read(
     row: GeneralSkill,
     status_override: str | None = None,
     binding: AgentResourceBinding | None = None,
+    *,
+    db: Session | None = None,
 ) -> GeneralSkillRead:
     """投影 Skill 根与可选严格绑定治理字段，legacy metadata 仅返回空治理字段。"""
 
@@ -104,14 +121,44 @@ def general_skill_read(
             binding_metadata = GeneralSkillBindingMetadata.model_validate(binding.metadata_json)
         except ValidationError:
             binding_metadata = None
+    localization = _general_skill_localization(db, row, binding_metadata)
+    localization_revision = (
+        revision_for_skill_display(
+            db,
+            row,
+            pinned_revision_id=(binding_metadata.pinned_revision_id if binding_metadata else None),
+        )
+        if db is not None and row.catalog_scope == "platform" and row.tenant_id is None
+        else None
+    )
     return GeneralSkillRead(
         id=row.id,
         tenant_id=row.tenant_id,
         slug=row.slug,
         name=row.name,
+        name_zh=(
+            localization.localized_name
+            if is_usable_localization(localization, localization_revision)
+            else None
+        ),
         description=row.description,
+        description_zh=(
+            localization.localized_description
+            if is_usable_localization(localization, localization_revision)
+            else None
+        ),
         homepage=row.homepage,
         skill_markdown=row.skill_markdown,
+        explanation_markdown_zh=(
+            localization.explanation_markdown
+            if is_usable_localization(localization, localization_revision)
+            else None
+        ),
+        localization_status=localization.translation_status if localization else None,
+        localization_source_content_checksum=(
+            localization.source_content_checksum if localization else None
+        ),
+        localization_checksum=localization.translation_checksum if localization else None,
         skill_files=[
             GeneralSkillFile.model_validate(item) for item in _skill_files_or_markdown(row)
         ],
@@ -139,6 +186,23 @@ def general_skill_read(
         created_at=row.created_at.isoformat(),
         updated_at=row.updated_at.isoformat(),
     )
+
+
+def _general_skill_localization(
+    db: Session | None,
+    row: GeneralSkill,
+    binding_metadata: GeneralSkillBindingMetadata | None,
+) -> GeneralSkillRevisionLocalization | None:
+    """按平台 Skill 的固定绑定或发布修订读取展示摘要，不触碰租户私有 Skill。"""
+
+    if db is None or row.catalog_scope != "platform" or row.tenant_id is not None:
+        return None
+    revision = revision_for_skill_display(
+        db,
+        row,
+        pinned_revision_id=(binding_metadata.pinned_revision_id if binding_metadata else None),
+    )
+    return get_revision_localization(db, revision.id if revision else None, skill_id=row.id)
 
 
 @router.post("/import", response_model=GeneralSkillRead)
@@ -506,7 +570,13 @@ def list_general_skills(
             row.id: row
             for row in db.exec(
                 select(GeneralSkill).where(
-                    GeneralSkill.tenant_id == tenant_id,
+                    or_(
+                        GeneralSkill.tenant_id == tenant_id,
+                        and_(
+                            GeneralSkill.catalog_scope == "platform",
+                            GeneralSkill.tenant_id.is_(None),
+                        ),
+                    ),
                     GeneralSkill.id.in_([binding.resource_id for binding in bindings]),
                 )
             ).all()
@@ -529,16 +599,33 @@ def list_general_skills(
                         else "archived"
                     ),
                     binding=binding,
+                    db=db,
                 )
             )
         return visible_rows
     rows = db.exec(
         select(GeneralSkill)
-        .where(GeneralSkill.tenant_id == tenant_id)
+        .where(
+            or_(
+                GeneralSkill.tenant_id == tenant_id,
+                and_(
+                    GeneralSkill.catalog_scope == "platform",
+                    GeneralSkill.tenant_id.is_(None),
+                ),
+            )
+        )
         .order_by(GeneralSkill.updated_at.desc())
     ).all()
-    rows = [row for row in rows if is_open_gallery_resource(db, tenant_id, "general_skill", row)]
-    return [general_skill_read(row) for row in rows]
+    rows = [
+        row
+        for row in rows
+        if (
+            is_platform_catalog_general_skill(row)
+            and row.status == "published"
+        )
+        or is_open_gallery_resource(db, tenant_id, "general_skill", row)
+    ]
+    return [general_skill_read(row, db=db) for row in rows]
 
 
 @router.get(
@@ -550,9 +637,9 @@ def get_general_skill(
     db: Session = Depends(get_session),
     agent_id: str | None = Query(None),
 ) -> GeneralSkillRead:
-    row = _get_general_skill(db, tenant_id, slug)
+    row = _get_general_skill(db, tenant_id, slug, include_platform=bool(agent_id))
     _ensure_general_skill_visible(db, tenant_id, row, agent_id)
-    return general_skill_read(row)
+    return general_skill_read(row, db=db)
 
 
 @router.post("/{slug}/publish", response_model=GeneralSkillRead)
@@ -735,7 +822,12 @@ def run_general_skill(
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> GeneralSkillRunResponse:
-    skill = _get_general_skill(db, request.tenant_id, slug)
+    skill = _get_general_skill(
+        db,
+        request.tenant_id,
+        slug,
+        include_platform=bool(request.agent_id),
+    )
     if skill.status != "published":
         raise HTTPException(status_code=400, detail="General skill is not published")
     require_agent_scope_viewer(request.tenant_id, request.agent_id, current_user, db)
@@ -753,7 +845,12 @@ def run_general_skill_stream(
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> StreamingResponse:
-    skill = _get_general_skill(db, request.tenant_id, slug)
+    skill = _get_general_skill(
+        db,
+        request.tenant_id,
+        slug,
+        include_platform=bool(request.agent_id),
+    )
     if skill.status != "published":
         raise HTTPException(status_code=400, detail="General skill is not published")
     require_agent_scope_viewer(request.tenant_id, request.agent_id, current_user, db)
@@ -817,10 +914,28 @@ def run_general_skill_stream(
     return StreamingResponse(stream_events(), media_type="text/event-stream")
 
 
-def _get_general_skill(db: Session, tenant_id: str, slug: str) -> GeneralSkill:
+def _get_general_skill(
+    db: Session,
+    tenant_id: str,
+    slug: str,
+    *,
+    include_platform: bool = False,
+) -> GeneralSkill:
+    """按租户读取普通 Skill，或在显式 Agent 作用域下读取项目级目录 Skill。"""
+
     ensure_tenant(db, tenant_id)
+    tenant_condition = GeneralSkill.tenant_id == tenant_id
+    if include_platform:
+        tenant_condition = or_(
+            tenant_condition,
+            and_(
+                GeneralSkill.catalog_scope == "platform",
+                GeneralSkill.tenant_id.is_(None),
+            ),
+        )
     row = db.exec(
-        select(GeneralSkill).where(GeneralSkill.tenant_id == tenant_id, GeneralSkill.slug == slug)
+        select(GeneralSkill).where(tenant_condition, GeneralSkill.slug == slug)
+        .order_by(GeneralSkill.tenant_id.is_not(None).desc())
     ).first()
     if not row:
         raise HTTPException(status_code=404, detail="General skill not found")
@@ -849,7 +964,13 @@ def _ensure_general_skill_visible(
     else:
         agent = None
     if not agent or agent.is_overall:
-        if is_open_gallery_resource(db, tenant_id, "general_skill", row):
+        if (
+            (
+                is_platform_catalog_general_skill(row)
+                and row.status == "published"
+            )
+            or is_open_gallery_resource(db, tenant_id, "general_skill", row)
+        ):
             return
         raise HTTPException(status_code=404, detail="General skill not visible in open gallery")
     binding = db.exec(

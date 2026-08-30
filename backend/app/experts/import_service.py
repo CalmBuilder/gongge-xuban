@@ -112,6 +112,8 @@ def expert_metadata(
         "owner_user_id": admin.id,
         "owner_username": admin.username,
         "owner_display_name": admin.display_name or admin.username,
+        "owner_semantics": "technical_import_admin",
+        "governance_template": True,
         "created_by_user_id": admin.id,
         "created_by_username": admin.username,
         "created_by": admin.username,

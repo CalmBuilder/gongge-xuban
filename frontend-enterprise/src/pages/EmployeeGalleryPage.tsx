@@ -24,6 +24,7 @@ import {
   isMyEmployeeAgent,
 } from '../employee';
 import { gsap, prefersReducedMotion } from '../lib/gsap';
+import { RESOURCE_GRID_CLASS } from '../lib/enterprise-ui';
 import type { AgentDeletionResult, AgentGalleryPageRead, AgentProfileRead } from '../types';
 
 const ENTERPRISE_AGENT_STORAGE_KEY = 'gongge_enterprise_agent_scope';
@@ -362,7 +363,7 @@ export default function EmployeeGalleryPage({
         { value: 'owned', label: '我创建的', count: scopeCounts.owned },
       ]
     : [
-        { value: 'gallery', label: '数字员工广场', count: scopeCounts.gallery },
+        { value: 'gallery', label: '数字员工', count: scopeCounts.gallery },
         { value: 'expert', label: '专家', count: scopeCounts.expert },
       ];
   const subTabItems: UnderlineTabItem<string>[] = subTabs.map((tab) => ({
@@ -380,9 +381,9 @@ export default function EmployeeGalleryPage({
         ? '还没有常用数字员工'
         : activeScope === 'owned'
           ? '还没有创建数字员工'
-          : '广场暂无数字员工';
+      : '开放平台暂无数字员工';
   const emptyDescription = activeScope === 'expert' && !hasSearchTerm && !hasExpertFilter
-    ? '从开放广场复制专家，或由管理员导入专家库后再来看看'
+    ? '从开放平台的专家分类直接使用或复制专家模板，之后可在“我的员工”中管理'
     : hasSearchTerm
       ? '换个关键词，或切换员工分类再试试'
       : activeScope === 'gallery'
@@ -399,7 +400,7 @@ export default function EmployeeGalleryPage({
   function employeeGrid(expertView: boolean) {
     return (
       <>
-      <div ref={gridRef} className="grid auto-rows-[minmax(262px,auto)] grid-cols-1 content-start gap-[32px] sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 max-[900px]:gap-[18px]">
+      <div ref={gridRef} className={RESOURCE_GRID_CLASS}>
         {agents.map((employee) => (
           <EmployeeCard
             key={employee.id}
@@ -407,11 +408,18 @@ export default function EmployeeGalleryPage({
             busy={startingAgentId === employee.id}
             canManage={canManageEmployeeAgent(employee, currentUser)}
             showMenu={false}
-            relationLabels={[
-              ...(isMyEmployeeAgent(employee, currentUser) ? ['我拥有'] : []),
-              ...(isEmployeeUsedByCurrentUser(employee) ? ['已添加'] : []),
-              ...(isGalleryEmployee(employee) ? ['企业发布'] : []),
-            ]}
+            relationLabels={expertView
+              ? [
+                  ...(isMyEmployeeAgent(employee, currentUser) ? ['我拥有'] : []),
+                  ...(isEmployeeUsedByCurrentUser(employee) ? ['已添加'] : []),
+                ]
+              : [
+                  ...(isMyEmployeeAgent(employee, currentUser) ? ['我拥有'] : []),
+                  ...(isEmployeeUsedByCurrentUser(employee) ? ['已添加'] : []),
+                  ...(isGalleryEmployee(employee) ? ['企业发布'] : []),
+                ]}
+            statusLabel={expertView ? '可使用' : undefined}
+            statusKind={expertView ? 'available' : undefined}
             usageActionLabel={
               !isMyEmployeeAgent(employee, currentUser) && isGalleryEmployee(employee)
                 ? isEmployeeUsedByCurrentUser(employee) ? '移出常用' : '添加到常用'
@@ -446,7 +454,7 @@ export default function EmployeeGalleryPage({
           page={page}
           pageCount={Math.max(1, Math.ceil(total / GALLERY_PAGE_SIZE))}
           onChange={setPage}
-          aria-label="数字员工分页"
+          aria-label={activeScope === 'expert' ? '专家分页' : '数字员工分页'}
           className="mt-[28px]"
         />
       )}
@@ -465,8 +473,8 @@ export default function EmployeeGalleryPage({
             <input
               value={searchTerm}
               onChange={(event) => setSearchTerm(event.target.value)}
-              placeholder="搜索"
-              aria-label="搜索数字员工"
+              placeholder={activeScope === 'expert' ? '搜索专家…' : '搜索数字员工…'}
+              aria-label={activeScope === 'expert' ? '搜索专家' : '搜索数字员工'}
               className="min-w-0 flex-1 border-0 bg-transparent text-[14px] text-[#18181A] outline-none placeholder:text-[#757F9C]"
             />
           </div>

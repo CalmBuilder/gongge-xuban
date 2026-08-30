@@ -1,5 +1,11 @@
 import type { ReactNode } from 'react';
 
+import {
+  RESOURCE_CARD_CLASS,
+  RESOURCE_CARD_DESCRIPTION_CLASS,
+  RESOURCE_CARD_FOOTER_CLASS,
+  RESOURCE_CARD_IDENTITY_CLASS,
+} from '@/lib/enterprise-ui';
 import { cn } from '@/lib/utils';
 
 import PlazaResourceIcon from './PlazaResourceIcon';
@@ -14,28 +20,28 @@ const ACCENT_STYLES: Record<PlatformResourceAccent, {
   identity: string;
 }> = {
   green: {
-    meta: 'text-[#1e9e5a]',
-    tag: 'bg-[#e8f7ee] text-[#1e9e5a]',
-    card: 'border-[#e2f2e8] hover:border-[#c2e5d1]',
-    identity: 'bg-[#edf9f2]',
+    meta: 'text-[var(--gg-capability)]',
+    tag: 'bg-[var(--gg-capability-soft)] text-[var(--gg-capability)]',
+    card: 'border-[var(--gg-capability-line)] hover:border-[var(--gg-capability)]',
+    identity: 'bg-[var(--gg-capability-soft)]',
   },
   blue: {
-    meta: 'text-[#0284c7]',
-    tag: 'bg-[#e0f4fd] text-[#0284c7]',
-    card: 'border-[#dcf0f8] hover:border-[#b7e1f0]',
-    identity: 'bg-[#edf8fd]',
+    meta: 'text-[var(--gg-interaction)]',
+    tag: 'bg-[var(--gg-interaction-soft)] text-[var(--gg-interaction)]',
+    card: 'border-[var(--gg-line)] hover:border-[var(--gg-interaction)]',
+    identity: 'bg-[var(--gg-interaction-soft)]',
   },
   indigo: {
-    meta: 'text-[#2f6ae0]',
-    tag: 'bg-[#e8efff] text-[#2f6ae0]',
-    card: 'border-[#e3eaff] hover:border-[#c7d5ff]',
-    identity: 'bg-[#eef3ff]',
+    meta: 'text-[var(--gg-governance)]',
+    tag: 'bg-[var(--gg-governance-soft)] text-[var(--gg-governance)]',
+    card: 'border-[var(--gg-governance-line)] hover:border-[var(--gg-governance)]',
+    identity: 'bg-[var(--gg-governance-soft)]',
   },
   orange: {
-    meta: 'text-[#c26a09]',
-    tag: 'bg-[#fdf0dd] text-[#c26a09]',
-    card: 'border-[#f7e8d2] hover:border-[#efd5ae]',
-    identity: 'bg-[#fff6e9]',
+    meta: 'text-[var(--gg-state-warning)]',
+    tag: 'bg-[var(--gg-state-warning-soft)] text-[var(--gg-state-warning)]',
+    card: 'border-[#F1D9B2] hover:border-[var(--gg-state-warning)]',
+    identity: 'bg-[var(--gg-state-warning-soft)]',
   },
 };
 
@@ -77,35 +83,36 @@ export default function PlatformResourceCard({
       type="button"
       onClick={onClick}
       className={cn(
-        'gongge-platform-resource-card group relative flex h-full w-full min-w-0 flex-col rounded-[14px] border bg-white p-[14px] text-left transition-[border-color,box-shadow,transform] duration-150 hover:-translate-y-[2px] hover:shadow-[0_12px_28px_rgba(15,23,42,0.08)]',
+        'gongge-platform-resource-card',
+        RESOURCE_CARD_CLASS,
         accentStyles.card,
         className,
       )}
     >
       <div className={cn(
-        'mt-[30px] flex h-[72px] w-full shrink-0 items-center gap-[12px] rounded-[12px] px-[12px]',
+        RESOURCE_CARD_IDENTITY_CLASS,
         accentStyles.identity,
       )}>
         {icon ?? (
           <PlazaResourceIcon kind="knowledge" />
         )}
         <div className="flex min-w-0 flex-1 flex-col gap-[4px]">
-          <p className="truncate text-[14px] font-semibold text-[#262b3d]">{title}</p>
-          <p className={cn('truncate text-[11px] font-medium', accentStyles.meta)}>{meta}</p>
+          <p className="gg-type-card-title truncate">{title}</p>
+          <p className={cn('gg-type-meta truncate', accentStyles.meta)}>{meta}</p>
         </div>
       </div>
 
-      <p className="mt-[14px] line-clamp-3 min-h-[48px] w-full text-[12px] leading-[16px] text-[#6b7488]">
+      <p className={RESOURCE_CARD_DESCRIPTION_CLASS}>
         {description}
       </p>
 
-      <div className="mt-auto flex min-h-[48px] w-full items-center gap-[6px] overflow-hidden rounded-[10px] border border-[#e4e9f2] bg-[#fbfcff] px-[10px]">
+      <div className={RESOURCE_CARD_FOOTER_CLASS}>
         {tags && tags.length > 0 ? (
           tags.slice(0, 2).map((tag) => (
             <span
               key={tag}
               className={cn(
-                'inline-flex min-w-0 max-w-[50%] items-center truncate rounded-full px-[8px] py-[3px] text-[10px] font-medium leading-[normal]',
+                'gg-type-caption inline-flex min-w-0 max-w-[50%] items-center truncate rounded-[var(--gg-radius-control)] px-[8px] py-[3px]',
                 accentStyles.tag,
               )}
             >
@@ -113,7 +120,7 @@ export default function PlatformResourceCard({
             </span>
           ))
         ) : (
-          <span className="text-[11px] text-[#8a93a6]">开放资源</span>
+          <span className="gg-type-caption">开放资源</span>
         )}
       </div>
     </button>

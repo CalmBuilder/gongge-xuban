@@ -7,6 +7,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui';
 import { cn } from '@/lib/utils';
+import { RESOURCE_CARD_CLASS, RESOURCE_CARD_IDENTITY_CLASS } from '@/lib/enterprise-ui';
 
 import IconChat from '../assets/icons/chat.svg?react';
 import IconEdit from '../assets/icons/edit.svg?react';
@@ -27,6 +28,7 @@ import {
   expertUnresolvedRequirements,
   expertUpstreamUrl,
   isExpertEmployee,
+  type EmployeeStatusKind,
   resourceCount,
 } from '../employee';
 import type { AgentProfileRead } from '../types';
@@ -47,11 +49,20 @@ export type EmployeeCardProps = {
   canChat?: boolean;
   selected?: boolean;
   busy?: boolean;
+  /** Override the status text when the card represents a template rather than a live employee. */
+  statusLabel?: string;
+  /** Distinguishes a live employee from a published-but-not-running template. */
+  statusKind?: EmployeeStatusKind;
+  /** The expert-template management card only exposes governance actions. */
+  cardMode?: 'employee' | 'expert-template';
+  /** Override the publication action wording for a resource-specific plaza. */
+  publicationLabel?: string;
   relationLabels?: string[];
   /** Show the top-right "更多" actions menu. Hidden on the 对话端 gallery. */
   showMenu?: boolean;
   showExpertSource?: boolean;
   showExpertDepartment?: boolean;
+  showGovernanceForm?: boolean;
   selectable?: boolean;
   checked?: boolean;
   onOpen: () => void;
@@ -75,10 +86,15 @@ export default function EmployeeCard({
   canChat = true,
   selected = false,
   busy = false,
+  statusLabel,
+  statusKind,
+  cardMode = 'employee',
+  publicationLabel,
   relationLabels = [],
   showMenu = true,
   showExpertSource = true,
   showExpertDepartment = true,
+  showGovernanceForm = false,
   selectable = false,
   checked = false,
   onOpen,
@@ -100,6 +116,22 @@ export default function EmployeeCard({
   const kbCount = resourceCount(employee.resources, 'knowledge_base');
   const galleryPublished = isGalleryEmployee(employee);
   const online = employee.status === 'active';
+  const effectiveStatusKind: EmployeeStatusKind = statusKind || (statusLabel ? 'available' : online ? 'online' : 'offline');
+  const statusPresentation = {
+    online: {
+      badge: 'bg-white/80 text-[var(--gg-slate)]',
+      dot: 'bg-[#22c55e]',
+    },
+    available: {
+      badge: 'bg-[#f0f4ff] text-[#526bc4]',
+      dot: 'bg-[#5474dd]',
+    },
+    offline: {
+      badge: 'bg-white/80 text-[var(--gg-slate)]',
+      dot: 'bg-[#9ca3af]',
+    },
+  }[effectiveStatusKind];
+  const isExpertTemplateManagement = cardMode === 'expert-template';
   const isExpert = isExpertEmployee(employee);
   const expertSource = expertSourceLabel(employee);
   const expertDepartment = expertCategory(employee);
@@ -112,6 +144,21 @@ export default function EmployeeCard({
     partial: { label: '部分能力待接入', className: 'border-[#f0d6a7] bg-[#fff8e8] text-[#9a6414]' },
     blocked: { label: '核心执行能力待接入', className: 'border-[#d8deea] bg-[#f3f5f9] text-[#657087]' },
   }[readiness];
+  const governanceBadge = employee.governance_form === 'organization_employee'
+    ? '专家·组织数字员工'
+    : employee.governance_form === 'organization_pending'
+      ? '专家·待组织化'
+      : employee.governance_form === 'template'
+        ? '专家模板'
+        : '专家能力分身';
+  const governanceFormBadge = employee.governance_form === 'organization_employee'
+    ? '组织数字员工'
+    : employee.governance_form === 'organization_pending'
+      ? '待组织化'
+      : employee.governance_form === 'template'
+        ? '专家模板'
+        : '能力分身';
+  const governanceReasonText = (employee.governance_reasons || []).join('、');
 
   // Show raw API values on the card (bypass the 共格 term relabeling in normalizeProductDisplayText).
   const rawRoleName = (employee.metadata?.role_name as string | undefined) || profile.roleName;
@@ -140,8 +187,8 @@ export default function EmployeeCard({
       aria-pressed={selected}
       aria-busy={busy}
       className={cn(
-        'gongge-employee-card group relative flex h-full flex-col cursor-pointer overflow-visible rounded-[14px] border border-[var(--gg-border)] bg-white px-[14px] py-[14px] transition-[border-color,box-shadow,transform] hover:-translate-y-[2px] hover:border-[#c8d4f0] hover:shadow-[0_12px_28px_rgba(15,23,42,0.08)]',
-        '',
+        'gongge-employee-card cursor-pointer overflow-visible',
+        RESOURCE_CARD_CLASS,
         selected && 'border-[var(--gg-cobalt)] shadow-[0_16px_36px_rgba(49,87,232,0.14)]',
         checked && 'ring-2 ring-[color-mix(in_srgb,var(--gg-cobalt)_24%,transparent)]',
       )}
@@ -158,7 +205,11 @@ export default function EmployeeCard({
         </div>
       )}
       {/* Header band (shorter than the avatar so the illustration overflows above it) */}
-      <div className="gongge-employee-identity mt-[30px] flex h-[72px] box-border gap-[12px] rounded-[12px] bg-[#eef3ff] p-[10px]" >
+      <div className={cn(
+        'gongge-employee-identity box-border p-[10px]',
+        RESOURCE_CARD_IDENTITY_CLASS,
+        'bg-[var(--gg-interaction-soft)]',
+      )}>
 
         {/* Avatar illustration — absolutely positioned so its head pokes above the gray band */}
         <div className='w-[80px] relative'>
@@ -178,22 +229,22 @@ export default function EmployeeCard({
 
         {/* Name / role / status */}
         <div className="flex-1 flex flex-col gap-[2px]">
-          <strong className="truncate text-[14px] font-semibold text-[var(--gg-ink)]">
+          <strong className="gg-type-card-title truncate">
             {employee.is_overall ? displayName : <span data-i18n-ignore>{displayName}</span>}
           </strong>
-          <span className="truncate text-[11px] text-[var(--gg-slate)]">
+          <span className="gg-type-meta truncate">
             {rawRoleName === '待补充岗位' ? rawRoleName : <span data-i18n-ignore>{rawRoleName}</span>}
           </span>
           <div className="leading-none">
-            <span className="inline-flex items-center gap-[4px] rounded-[90px] bg-white/80 px-[7px] py-[2px] text-[11px] font-medium text-[var(--gg-slate)]">
-              <i className={cn('size-[6px] shrink-0 rounded-full', online ? 'bg-[#22c55e]' : 'bg-[#9ca3af]')} aria-hidden="true" />
-              {online ? '在线' : '下线'}
+            <span className={cn('inline-flex items-center gap-[4px] rounded-[90px] px-[7px] py-[2px] text-[11px] font-medium', statusPresentation.badge)}>
+              <i className={cn('size-[6px] shrink-0 rounded-full', statusPresentation.dot)} aria-hidden="true" />
+              {statusLabel || (online ? '在线' : '下线')}
             </span>
           </div>
         </div>
 
         {/* Chat button */}
-        <button
+        {!isExpertTemplateManagement && <button
           type="button"
           aria-label="发起对话"
           disabled={!online || busy || !canChat}
@@ -204,7 +255,7 @@ export default function EmployeeCard({
           className="grid size-[30px] shrink-0 self-center place-items-center rounded-[10px] bg-white text-[var(--gg-cobalt)] shadow-[0_4px_12px_rgba(49,87,232,0.10)] transition-colors hover:bg-[var(--gg-cobalt)] hover:text-white disabled:cursor-not-allowed disabled:opacity-45 disabled:hover:bg-white disabled:hover:text-[var(--gg-slate)]"
         >
           <IconChat className="size-[16px]!" />
-        </button>
+        </button>}
 
       </div>
 
@@ -225,7 +276,7 @@ export default function EmployeeCard({
             className="flex w-auto min-w-[128px] flex-col gap-[4px] rounded-[14px] border-0 bg-white p-[4px] shadow-[0px_0px_8px_rgba(0,0,0,0.1)] ring-0 [--accent:#F6F6F6] [--accent-foreground:#18181A]"
             onCloseAutoFocus={(event) => event.preventDefault()}
           >
-            <DropdownMenuItem
+            {!isExpertTemplateManagement && <DropdownMenuItem
               className={MENU_ITEM_CLASS}
               disabled={!canManage || busy || !onPublication}
               onClick={(event) => event.stopPropagation()}
@@ -233,8 +284,8 @@ export default function EmployeeCard({
             >
               <IconPlatform className="size-[16px]" />
               提交组织审核
-            </DropdownMenuItem>
-            <DropdownMenuItem
+            </DropdownMenuItem>}
+            {!isExpertTemplateManagement && <DropdownMenuItem
               className={MENU_ITEM_CLASS}
               disabled={!online || busy || !canChat}
               onClick={(event) => event.stopPropagation()}
@@ -242,8 +293,8 @@ export default function EmployeeCard({
             >
               <IconChat className="size-[16px]" />
               发起对话
-            </DropdownMenuItem>
-            {online ? (
+            </DropdownMenuItem>}
+            {!isExpertTemplateManagement && (online ? (
               <DropdownMenuItem
                 className={MENU_ITEM_CLASS}
                 disabled={!canManage || busy}
@@ -263,7 +314,7 @@ export default function EmployeeCard({
                 <IconPlay className="size-[16px]" />
                 上线
               </DropdownMenuItem>
-            )}
+            ))}
             <DropdownMenuItem
               className={MENU_ITEM_CLASS}
               disabled={!canGovern || busy}
@@ -271,9 +322,9 @@ export default function EmployeeCard({
               onSelect={() => onGallery(!galleryPublished)}
             >
               <IconPlatform className="size-[16px]" />
-              {galleryPublished ? '从广场下架' : '发布到广场'}
+              {publicationLabel || (galleryPublished ? '从广场下架' : '发布到广场')}
             </DropdownMenuItem>
-            <DropdownMenuItem
+            {!isExpertTemplateManagement && <DropdownMenuItem
               className={MENU_ITEM_CLASS}
               disabled={!canManage || busy}
               onClick={(event) => event.stopPropagation()}
@@ -281,11 +332,11 @@ export default function EmployeeCard({
             >
               <IconEdit className="size-[16px]" />
               编辑资料
-            </DropdownMenuItem>
+            </DropdownMenuItem>}
             {isExpert && onEditClassification && (
               <DropdownMenuItem
                 className={MENU_ITEM_CLASS}
-                disabled={!canManage || busy}
+                disabled={!(isExpertTemplateManagement ? canGovern : canManage) || busy}
                 onClick={(event) => event.stopPropagation()}
                 onSelect={onEditClassification}
               >
@@ -293,7 +344,7 @@ export default function EmployeeCard({
                 编辑专家分类
               </DropdownMenuItem>
             )}
-            <DropdownMenuItem
+            {!isExpertTemplateManagement && <DropdownMenuItem
               className={MENU_ITEM_CLASS}
               disabled={!canManage || busy}
               onClick={(event) => event.stopPropagation()}
@@ -301,9 +352,9 @@ export default function EmployeeCard({
             >
               <IconImage className="size-[16px]" />
               设置头像
-            </DropdownMenuItem>
-            <DropdownMenuSeparator className="my-[2px] bg-[#eef0f4]" />
-            <DropdownMenuItem
+            </DropdownMenuItem>}
+            {!isExpertTemplateManagement && <DropdownMenuSeparator className="my-[2px] bg-[#eef0f4]" />}
+            {!isExpertTemplateManagement && <DropdownMenuItem
               variant="destructive"
               className={MENU_ITEM_DANGER_CLASS}
               disabled={!canManage || busy}
@@ -312,7 +363,7 @@ export default function EmployeeCard({
             >
               <IconTrash className="size-[16px]" />
               删除
-            </DropdownMenuItem>
+            </DropdownMenuItem>}
           </DropdownMenuContent>
         </DropdownMenu>
       </div>
@@ -352,7 +403,7 @@ export default function EmployeeCard({
       {isExpert && (
         <div className="mt-[9px] flex flex-wrap items-center gap-[5px] text-[11px] leading-[16px]">
           <span className="rounded-full border border-[#ccd9f4] bg-[#f2f6ff] px-[7px] py-[2px] font-semibold text-[var(--gg-cobalt)]">
-            专家（能力分身）
+            {governanceBadge}
           </span>
           {showExpertSource && expertSource && (
             <span data-testid="expert-source-badge" className="rounded-full border border-[#e0e5ef] bg-white px-[7px] py-[2px] text-[#657087]" data-i18n-ignore>
@@ -387,6 +438,22 @@ export default function EmployeeCard({
             >
               查看原始来源
             </a>
+          )}
+        </div>
+      )}
+
+      {showGovernanceForm && !isExpert && (
+        <div className="mt-[9px] flex flex-wrap items-center gap-[5px] text-[11px] leading-[16px]">
+          <span
+            className="rounded-full border border-[#ccd9f4] bg-[#f2f6ff] px-[7px] py-[2px] font-semibold text-[var(--gg-cobalt)]"
+            title={governanceReasonText || undefined}
+          >
+            {governanceFormBadge}
+          </span>
+          {employee.governance_form === 'organization_pending' && governanceReasonText && (
+            <span className="rounded-full border border-[#f0d6a7] bg-[#fff8e8] px-[7px] py-[2px] text-[#9a6414]">
+              需补齐组织前置
+            </span>
           )}
         </div>
       )}

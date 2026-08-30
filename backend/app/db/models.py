@@ -2567,13 +2567,21 @@ class GeneralSkill(SQLModel, table=True):
     __tablename__ = "general_skills"
     __table_args__ = (
         UniqueConstraint("tenant_id", "slug", name="uq_general_skill_tenant_slug"),
+        UniqueConstraint("catalog_key", name="uq_general_skill_catalog_key"),
         CheckConstraint(
             "usage_mode IN ('atomic_execution', 'planning_guidance')",
             name="ck_general_skill_usage_mode",
         ),
         CheckConstraint(
-            "visibility_scope IN ('user_private', 'agent_private', 'tenant_gallery')",
+            "visibility_scope IN ('user_private', 'agent_private', 'tenant_gallery', 'platform_gallery')",
             name="ck_general_skill_visibility_scope",
+        ),
+        CheckConstraint(
+            "(catalog_scope = 'platform' AND tenant_id IS NULL AND owner_user_id IS NULL "
+            "AND visibility_scope = 'platform_gallery' AND catalog_key IS NOT NULL) OR "
+            "(catalog_scope = 'tenant' AND tenant_id IS NOT NULL "
+            "AND visibility_scope <> 'platform_gallery')",
+            name="ck_general_skill_catalog_scope",
         ),
         CheckConstraint("row_version >= 1", name="ck_general_skill_row_version"),
         Index(
@@ -2583,10 +2591,22 @@ class GeneralSkill(SQLModel, table=True):
             "visibility_scope",
             "status",
         ),
+        Index(
+            "ix_general_skill_catalog_scope_status",
+            "catalog_scope",
+            "status",
+            "catalog_key",
+        ),
     )
 
     id: PrimaryKeyString = Field(default_factory=lambda: new_id("genskill"), primary_key=True)
-    tenant_id: IdentifierString = Field(index=True)
+    # 平台目录资产没有租户所有者；普通用户 Skill 仍必须填写 tenant_id。
+    tenant_id: OptionalIdentifierString = Field(default=None, index=True)
+    catalog_scope: LabelString = Field(
+        default="tenant",
+        sa_column=Column(String(64), nullable=False, server_default="tenant", index=True),
+    )
+    catalog_key: OptionalIdentifierString = Field(default=None, index=True)
     slug: NameString = Field(index=True)
     name: NameString
     description: OptionalMediumTextString = None
@@ -2626,9 +2646,26 @@ class GeneralSkillRevision(SQLModel, table=True):
             "content_checksum",
             name="uq_general_skill_revision_checksum",
         ),
+        UniqueConstraint(
+            "catalog_scope",
+            "skill_id",
+            "revision_number",
+            name="uq_general_skill_revision_scope_number",
+        ),
+        UniqueConstraint(
+            "catalog_scope",
+            "skill_id",
+            "content_checksum",
+            name="uq_general_skill_revision_scope_checksum",
+        ),
         CheckConstraint(
             "status IN ('draft', 'reviewing', 'published', 'rejected', 'superseded', 'revoked')",
             name="ck_general_skill_revision_status",
+        ),
+        CheckConstraint(
+            "(catalog_scope = 'platform' AND tenant_id IS NULL) OR "
+            "(catalog_scope = 'tenant' AND tenant_id IS NOT NULL)",
+            name="ck_general_skill_revision_catalog_scope",
         ),
         CheckConstraint("revision_number >= 1", name="ck_general_skill_revision_number"),
         CheckConstraint("row_version >= 1", name="ck_general_skill_revision_row_version"),
@@ -2642,7 +2679,11 @@ class GeneralSkillRevision(SQLModel, table=True):
     )
 
     id: PrimaryKeyString = Field(default_factory=lambda: new_id("gsrev"), primary_key=True)
-    tenant_id: IdentifierString = Field(index=True)
+    tenant_id: OptionalIdentifierString = Field(default=None, index=True)
+    catalog_scope: LabelString = Field(
+        default="tenant",
+        sa_column=Column(String(64), nullable=False, server_default="tenant", index=True),
+    )
     skill_id: IdentifierString = Field(index=True)
     revision_number: int = Field(ge=1)
     content_checksum: VersionString = Field(index=True)
@@ -2662,6 +2703,59 @@ class GeneralSkillRevision(SQLModel, table=True):
     created_at: datetime = Field(default_factory=utc_now)
     published_at: datetime | None = None
     revoked_at: datetime | None = None
+
+
+class GeneralSkillRevisionLocalization(SQLModel, table=True):
+    """保存绑定到精确 Skill 修订的展示语言，不参与运行时指令加载。"""
+
+    __tablename__ = "general_skill_revision_localizations"
+    __table_args__ = (
+        UniqueConstraint(
+            "catalog_scope",
+            "revision_id",
+            "locale",
+            name="uq_general_skill_revision_localization",
+        ),
+        CheckConstraint(
+            "(catalog_scope = 'platform' AND tenant_id IS NULL) OR "
+            "(catalog_scope = 'tenant' AND tenant_id IS NOT NULL)",
+            name="ck_general_skill_revision_localization_scope",
+        ),
+        CheckConstraint(
+            "translation_status IN ('verified', 'draft', 'stale', 'rejected')",
+            name="ck_general_skill_revision_localization_status",
+        ),
+        Index(
+            "ix_general_skill_revision_localization_lookup",
+            "catalog_scope",
+            "tenant_id",
+            "skill_id",
+            "locale",
+            "translation_status",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("gsloc"), primary_key=True)
+    tenant_id: OptionalIdentifierString = Field(default=None, index=True)
+    catalog_scope: LabelString = Field(
+        default="platform",
+        sa_column=Column(String(64), nullable=False, server_default="platform", index=True),
+    )
+    skill_id: IdentifierString = Field(index=True)
+    revision_id: IdentifierString = Field(index=True)
+    locale: LabelString = Field(default="zh-CN", index=True)
+    localized_name: NameString
+    localized_description: OptionalMediumTextString = None
+    explanation_markdown: LongTextString
+    translation_status: LabelString = Field(default="draft", index=True)
+    source_content_checksum: VersionString = Field(index=True)
+    translation_checksum: VersionString = Field(index=True)
+    translation_source: OptionalLabelString = None
+    created_by: OptionalIdentifierString = None
+    reviewed_by: OptionalIdentifierString = None
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+    reviewed_at: datetime | None = None
 
 
 class GeneralSkillProposal(SQLModel, table=True):
@@ -3242,6 +3336,97 @@ class GeneralSkillAuthorizationEvent(SQLModel, table=True):
     event_checksum: VersionString = Field(index=True)
     payload_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     created_at: datetime = Field(default_factory=utc_now)
+
+
+class GeneralSkillCatalogCommand(SQLModel, table=True):
+    """保存平台内置 Skill 快照导入命令的幂等回执与结果摘要。"""
+
+    __tablename__ = "general_skill_catalog_commands"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "command_type",
+            "command_id",
+            name="uq_general_skill_catalog_command",
+        ),
+        UniqueConstraint(
+            "scope_key",
+            "command_type",
+            "command_id",
+            name="uq_general_skill_catalog_scope_command",
+        ),
+        CheckConstraint(
+            "status IN ('committed', 'failed')",
+            name="ck_general_skill_catalog_command_status",
+        ),
+        CheckConstraint(
+            "(catalog_scope = 'platform' AND tenant_id IS NULL AND scope_key = 'platform') OR "
+            "(catalog_scope = 'tenant' AND tenant_id IS NOT NULL AND scope_key = tenant_id)",
+            name="ck_general_skill_catalog_command_scope",
+        ),
+        Index(
+            "ix_general_skill_catalog_command_tenant_created",
+            "tenant_id",
+            "created_at",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("gscatalogcmd"), primary_key=True)
+    tenant_id: OptionalIdentifierString = Field(default=None, index=True)
+    catalog_scope: LabelString = Field(
+        default="tenant",
+        sa_column=Column(String(64), nullable=False, server_default="tenant", index=True),
+    )
+    scope_key: IdentifierString = Field(
+        default="platform",
+        sa_column=Column(String(128), nullable=False, server_default="platform", index=True),
+    )
+    command_type: LabelString = Field(index=True)
+    command_id: IdentifierString = Field(index=True)
+    request_checksum: VersionString = Field(index=True)
+    source_revision: VersionString = Field(index=True)
+    status: LabelString = Field(default="committed", index=True)
+    result_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    error_code: OptionalIdentifierString = Field(default=None, index=True)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class AgentOrganizationizationCommand(SQLModel, table=True):
+    """保存数字员工组织化原子配置命令的 CAS、幂等回执和结果摘要。"""
+
+    __tablename__ = "agent_organizationization_commands"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "agent_id",
+            "command_id",
+            name="uq_agent_organizationization_command",
+        ),
+        CheckConstraint(
+            "status IN ('committed', 'failed')",
+            name="ck_agent_organizationization_command_status",
+        ),
+        Index(
+            "ix_agent_organizationization_command_tenant_created",
+            "tenant_id",
+            "created_at",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("agentorgcmd"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    agent_id: IdentifierString = Field(index=True)
+    command_id: IdentifierString = Field(index=True)
+    request_checksum: VersionString = Field(index=True)
+    expected_profile_revision: int = Field(ge=1)
+    expected_relationship_checksum: VersionString = Field(index=True)
+    active_role_binding_id: OptionalIdentifierString = Field(default=None, index=True)
+    status: LabelString = Field(default="committed", index=True)
+    result_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    error_code: OptionalIdentifierString = Field(default=None, index=True)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
 
 
 class GeneralSkillBindingBatchCommand(SQLModel, table=True):

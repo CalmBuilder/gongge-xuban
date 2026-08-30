@@ -415,6 +415,8 @@ def seed_e2e_fixtures() -> None:
     from app.db import engine, init_db
     from app.db.models import (
         AgentProfile,
+        AgentPublicationRevision,
+        AgentRoleBinding,
         BusinessRole,
         ChatSession,
         EmployeeProfile,
@@ -427,6 +429,7 @@ def seed_e2e_fixtures() -> None:
         KnowledgeDocument,
         KnowledgeIngestJob,
         MemoryRecord,
+        PublicationRelease,
         SopInstance,
         SopNodeExecution,
         SopOperation,
@@ -650,6 +653,39 @@ def seed_e2e_fixtures() -> None:
         )
         db.add(
             AgentProfile(
+                id="agent_e2e_expert_template",
+                tenant_id="tenant_demo",
+                name="E2E 数据治理专家",
+                description="用于验证专家广场直接使用与创建能力分身的内置专家模板。",
+                persona_prompt="以数据治理专家身份分析数据质量、口径和整改优先级。",
+                status="active",
+                owner_user_id="admin",
+                published_to_gallery=True,
+                gallery_published_by="admin",
+                agent_category_code="professional",
+                visibility_scope="tenant",
+                metadata_json={
+                    "owner_user_id": "admin",
+                    "owner_username": "admin",
+                    "employee_type": "expert",
+                    "expert_source_code": "agency-agents",
+                    "expert_source_label": "项目内置专家快照",
+                    "expert_category": "数据与分析",
+                    "expert_subcategory": "数据治理",
+                    "expert_tags": ["数据治理", "质量分析"],
+                    "expert_name_original": "Data Governance Expert",
+                    "upstream_path": "data/data-governance-expert.md",
+                    "upstream_commit": "3c9588880b7cafaec325a104899fd1fd854e73c8f1",
+                    "upstream_license": "MIT",
+                    "import_batch_id": "e2e-expert-snapshot",
+                    "owner_semantics": "technical_import_admin",
+                    "governance_template": True,
+                    "published_to_gallery": True,
+                },
+            )
+        )
+        db.add(
+            AgentProfile(
                 id="agent_e2e_diagnosis",
                 tenant_id="tenant_demo",
                 name="E2E 疑难故障诊断分身",
@@ -658,6 +694,64 @@ def seed_e2e_fixtures() -> None:
                 metadata_json={
                     "owner_user_id": "member_e2e",
                     "owner_username": "member",
+                },
+            )
+        )
+        db.add(
+            AgentProfile(
+                id="agent_e2e_pending_organization",
+                tenant_id="tenant_demo",
+                name="E2E 待组织化分身",
+                description="用于验证能力分身配置组织关系后再提交组织审核。",
+                status="active",
+                owner_user_id="member_e2e",
+                metadata_json={
+                    "owner_user_id": "member_e2e",
+                    "owner_username": "member",
+                },
+            )
+        )
+        db.add(
+            AgentProfile(
+                id="agent_e2e_rejected_organization",
+                tenant_id="tenant_demo",
+                name="E2E 被拒组织员工",
+                description="用于验证管理员拒绝组织发布申请后的状态闭环。",
+                status="active",
+                owner_user_id="member_e2e",
+                metadata_json={
+                    "owner_user_id": "member_e2e",
+                    "owner_username": "member",
+                },
+            )
+        )
+        db.add(
+            AgentProfile(
+                id="agent_e2e_ab_org_control",
+                tenant_id="tenant_demo",
+                name="E2E 组织员工 A/B 对照",
+                description="组织数字员工 Skill 四象限回归的无 Skill 对照。",
+                status="active",
+                owner_user_id="member_e2e",
+                metadata_json={
+                    "owner_user_id": "member_e2e",
+                    "owner_username": "member",
+                    "q1_resource_policy": "organization_ab_control",
+                },
+            )
+        )
+        db.add(
+            AgentProfile(
+                id="agent_e2e_ab_org_treatment",
+                tenant_id="tenant_demo",
+                name="E2E 组织员工 A/B 处理",
+                description="组织数字员工 Skill 四象限回归的有 Skill 处理。",
+                status="active",
+                owner_user_id="member_e2e",
+                metadata_json={
+                    "owner_user_id": "member_e2e",
+                    "owner_username": "member",
+                    "q1_resource_policy": "organization_ab_treatment",
                 },
             )
         )
@@ -1330,6 +1424,187 @@ def seed_e2e_fixtures() -> None:
             )
         ).one()
         root = ensure_organization_foundation(db, "tenant_demo")
+        organization_agent = db.get(AgentProfile, "agent_e2e_employee")
+        if organization_agent is None:
+            raise RuntimeError("Organization E2E agent was not created")
+        organization_agent.responsible_org_unit_id = root.id
+        db.add(organization_agent)
+        pending_organization_agent = db.get(AgentProfile, "agent_e2e_pending_organization")
+        if pending_organization_agent is None:
+            raise RuntimeError("Pending organization E2E agent was not created")
+        pending_organization_agent.responsible_org_unit_id = root.id
+        db.add(pending_organization_agent)
+        rejected_organization_agent = db.get(AgentProfile, "agent_e2e_rejected_organization")
+        if rejected_organization_agent is None:
+            raise RuntimeError("Rejected organization E2E agent was not created")
+        rejected_organization_agent.responsible_org_unit_id = root.id
+        db.add(rejected_organization_agent)
+        ab_organization_agents = [
+            db.get(AgentProfile, "agent_e2e_ab_org_control"),
+            db.get(AgentProfile, "agent_e2e_ab_org_treatment"),
+        ]
+        if any(agent is None for agent in ab_organization_agents):
+            raise RuntimeError("Organization A/B E2E agents were not created")
+        for agent in ab_organization_agents:
+            assert agent is not None
+            agent.responsible_org_unit_id = root.id
+            db.add(agent)
+        db.add(
+            AgentRoleBinding(
+                id="agentrole_e2e_employee",
+                tenant_id="tenant_demo",
+                agent_id=organization_agent.id,
+                business_role_id=role.id,
+                assignment_mode="execute",
+                supervisor_employee_profile_id=admin_profile.id,
+                scope_type="tenant",
+                scope_id="*",
+                granted_by_user_id="admin",
+                status="active",
+            )
+        )
+        db.add(
+            AgentRoleBinding(
+                id="agentrole_e2e_rejected_organization",
+                tenant_id="tenant_demo",
+                agent_id=rejected_organization_agent.id,
+                business_role_id=role.id,
+                assignment_mode="execute",
+                supervisor_employee_profile_id=admin_profile.id,
+                scope_type="tenant",
+                scope_id="*",
+                granted_by_user_id="admin",
+                status="active",
+            )
+        )
+        for agent, suffix in zip(ab_organization_agents, ("control", "treatment"), strict=True):
+            assert agent is not None
+            binding_id = f"agentrole_e2e_ab_org_{suffix}"
+            revision_id = f"agentpubrev_e2e_ab_org_{suffix}"
+            release_id = f"pubrel_e2e_ab_org_{suffix}"
+            db.add(
+                AgentRoleBinding(
+                    id=binding_id,
+                    tenant_id="tenant_demo",
+                    agent_id=agent.id,
+                    business_role_id=role.id,
+                    assignment_mode="execute",
+                    supervisor_employee_profile_id=admin_profile.id,
+                    scope_type="tenant",
+                    scope_id="*",
+                    granted_by_user_id="admin",
+                    status="active",
+                )
+            )
+            snapshot_checksum = ("e" if suffix == "control" else "f") * 64
+            db.add(
+                AgentPublicationRevision(
+                    id=revision_id,
+                    tenant_id="tenant_demo",
+                    request_id=f"pubreq_e2e_ab_org_{suffix}",
+                    agent_id=agent.id,
+                    persona_checksum=("1" if suffix == "control" else "2") * 64,
+                    snapshot_checksum=snapshot_checksum,
+                    persona_snapshot_json={
+                        "name": agent.name,
+                        "description": agent.description,
+                    },
+                    governance_snapshot_json={
+                        "responsible_org_unit_id": root.id,
+                        "role_binding_id": binding_id,
+                    },
+                )
+            )
+            db.add(
+                PublicationRelease(
+                    id=release_id,
+                    tenant_id="tenant_demo",
+                    approved_request_id=f"pubreq_e2e_ab_org_{suffix}",
+                    resource_type="agent",
+                    resource_id=agent.id,
+                    snapshot_kind="agent",
+                    snapshot_id=revision_id,
+                    snapshot_checksum=snapshot_checksum,
+                    status="active",
+                )
+            )
+        db.add(
+            AgentPublicationRevision(
+                id="agentpubrev_e2e_employee",
+                tenant_id="tenant_demo",
+                request_id="pubreq_e2e_employee",
+                agent_id=organization_agent.id,
+                persona_checksum="b" * 64,
+                snapshot_checksum="a" * 64,
+                persona_snapshot_json={
+                    "name": organization_agent.name,
+                    "description": organization_agent.description,
+                },
+                governance_snapshot_json={
+                    "responsible_org_unit_id": root.id,
+                    "role_binding_id": "agentrole_e2e_employee",
+                },
+            )
+        )
+        current_organization_release = PublicationRelease(
+            id="pubrel_e2e_employee",
+            tenant_id="tenant_demo",
+            approved_request_id="pubreq_e2e_employee",
+            resource_type="agent",
+            resource_id=organization_agent.id,
+            snapshot_kind="agent",
+            snapshot_id="agentpubrev_e2e_employee",
+            snapshot_checksum="a" * 64,
+            status="active",
+        )
+        db.add(current_organization_release)
+        db.flush()
+        db.add(
+            AgentPublicationRevision(
+                id="agentpubrev_e2e_employee_history",
+                tenant_id="tenant_demo",
+                request_id="pubreq_e2e_employee_history",
+                agent_id=organization_agent.id,
+                persona_checksum="d" * 64,
+                snapshot_checksum="c" * 64,
+                persona_snapshot_json={
+                    "name": organization_agent.name,
+                    "description": "E2E 数字员工的历史组织发布快照。",
+                },
+                governance_snapshot_json={
+                    "responsible_org_unit_id": root.id,
+                    "role_binding_id": "agentrole_e2e_employee",
+                },
+            )
+        )
+        # OptionalLabelString 的模型默认值会在 INSERT 时把显式 None 恢复为 active；
+        # 先临时释放活动槽位，插入历史行后再恢复当前 Release，保持唯一约束成立。
+        current_organization_release.active_slot_key = None
+        db.add(current_organization_release)
+        db.flush()
+        historical_organization_release = PublicationRelease(
+            id="pubrel_e2e_employee_history",
+            tenant_id="tenant_demo",
+            approved_request_id="pubreq_e2e_employee_history",
+            resource_type="agent",
+            resource_id=organization_agent.id,
+            snapshot_kind="agent",
+            snapshot_id="agentpubrev_e2e_employee_history",
+            snapshot_checksum="c" * 64,
+            status="unpublished",
+            row_version=2,
+            terminal_command_id="seed-history-unpublish",
+            terminal_by_user_id="admin",
+            terminal_reason="为浏览器回滚回归保留的普通下架历史版本",
+        )
+        db.add(historical_organization_release)
+        db.flush()
+        historical_organization_release.active_slot_key = None
+        db.add(historical_organization_release)
+        db.flush()
+        current_organization_release.active_slot_key = "active"
+        db.add(current_organization_release)
+        db.flush()
         scoped_branch = create_organization_unit(
             db,
             tenant_id="tenant_demo",

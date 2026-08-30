@@ -12,8 +12,16 @@ import { basename, dirname, isAbsolute, relative, resolve } from 'node:path';
 import { expect, test, type Page, type TestInfo } from '@playwright/test';
 
 const TENANT_ID = 'tenant_demo';
-const CONTROL_AGENT_ID = 'agent_q1_writing_control';
-const TREATMENT_AGENT_ID = 'agent_skill_demo_a_docs';
+const CAPABILITY_AGENT_PAIR = {
+  control: 'agent_q1_writing_control',
+  treatment: 'agent_skill_demo_a_docs',
+  label: '能力分身',
+} as const;
+const ORGANIZATION_AGENT_PAIR = {
+  control: 'agent_e2e_ab_org_control',
+  treatment: 'agent_e2e_ab_org_treatment',
+  label: '组织数字员工',
+} as const;
 const SOURCE_ROOT = resolve(process.cwd(), '..', 'otherpro', 'skills');
 const DEFAULT_SOURCES = [
   '../otherpro/skills/skills/engineering/code-review/SKILL.md',
@@ -73,15 +81,34 @@ type Scenario = {
 
 test.describe.configure({ mode: 'serial', timeout: 180_000 });
 
-test('otherpro/skills 随机抽样四象限回答能力 A/B 不退化', async ({ page }, testInfo) => {
-  /** 对每个抽样 Skill 运行无 Skill/有 Skill与无附件/真实附件四种独立会话。 */
+test('otherpro/skills 能力分身四象限回答能力 A/B 不退化', async ({ page }, testInfo) => {
+  /** 对能力分身的每个抽样 Skill 运行无 Skill/有 Skill与无附件/真实附件四种独立会话。 */
 
   const sources = await Promise.all(SOURCES.map(readSkillSource));
   expect(sources.length).toBeGreaterThan(0);
+  await runAbMatrix(page, testInfo, sources, CAPABILITY_AGENT_PAIR);
+});
+
+test('otherpro/skills 组织数字员工四象限回答能力 A/B 不退化', async ({ page }, testInfo) => {
+  /** 对组织数字员工的每个抽样 Skill 运行同一组四象限，确保身份切换不损失 Skill 增益。 */
+
+  const sources = await Promise.all(SOURCES.map(readSkillSource));
+  expect(sources.length).toBeGreaterThan(0);
+  await runAbMatrix(page, testInfo, sources, ORGANIZATION_AGENT_PAIR);
+});
+
+async function runAbMatrix(
+  page: Page,
+  testInfo: TestInfo,
+  sources: SkillSource[],
+  pair: { control: string; treatment: string; label: string },
+): Promise<void> {
+  /** 为一组 Agent 身份运行固定 Skill 抽样，保留同题 control/treatment 证据。 */
+
   const results: Scenario[] = [];
   for (const source of sources) {
-    await login(page, TREATMENT_AGENT_ID);
-    const skillId = await importSkill(page, source);
+    await login(page, pair.treatment);
+    const skillId = await importSkill(page, source, pair.treatment);
     const cases: Array<{ variant: Variant; inputMode: InputMode }> = [
       { variant: 'control', inputMode: 'inline' },
       { variant: 'treatment', inputMode: 'inline' },
@@ -89,11 +116,12 @@ test('otherpro/skills 随机抽样四象限回答能力 A/B 不退化', async ({
       { variant: 'treatment', inputMode: 'attachment' },
     ];
     for (const item of cases) {
-      results.push(await runScenario(page, testInfo, source, skillId, item.variant, item.inputMode));
+      results.push(await runScenario(page, testInfo, source, skillId, item.variant, item.inputMode, pair));
     }
     assertScenarioPair(results, source);
   }
   console.log(JSON.stringify({
+    agent_identity: pair.label,
     selected_sources: sources.map((item) => ({ path: item.path, name: item.name, checksum: item.checksum })),
     scenarios: results.map((item) => ({
       skill: item.skill,
@@ -104,7 +132,7 @@ test('otherpro/skills 随机抽样四象限回答能力 A/B 不退化', async ({
       session_id: item.sessionId,
     })),
   }, null, 2));
-});
+}
 
 async function readSkillSource(configuredPath: string): Promise<SkillSource> {
   /** 只允许从 otherpro/skills 读取真实 SKILL.md，并冻结来源 checksum。 */
@@ -147,7 +175,7 @@ async function login(page: Page, agentId: string): Promise<void> {
   expect(status).toBe(200);
 }
 
-async function importSkill(page: Page, source: SkillSource): Promise<string> {
+async function importSkill(page: Page, source: SkillSource, targetAgentId: string): Promise<string> {
   /** 通过真实安全导入 UI 上传 otherpro/skills 的原始 SKILL.md 并读取绑定 ID。 */
 
   await page.goto('/enterprise/general-skills');
@@ -184,7 +212,7 @@ async function importSkill(page: Page, source: SkillSource): Promise<string> {
       | { items?: Array<{ id: string; name: string }> };
     const rows = Array.isArray(payload) ? payload : (payload.items || []);
     return rows.find((item) => item.name === name)?.id || '';
-  }, { agentId: TREATMENT_AGENT_ID, name: source.name, tenantId: TENANT_ID });
+  }, { agentId: targetAgentId, name: source.name, tenantId: TENANT_ID });
   expect(skillId).not.toBe('');
   return skillId;
 }
@@ -217,13 +245,19 @@ async function runScenario(
   skillId: string,
   variant: Variant,
   inputMode: InputMode,
+  pair: { control: string; treatment: string; label: string },
 ): Promise<Scenario> {
   /** 发送同一题的一个象限，并从权威会话 API 收集答案、事件和附件回执。 */
 
-  const agentId = variant === 'treatment' ? TREATMENT_AGENT_ID : CONTROL_AGENT_ID;
+  const agentId = variant === 'treatment' ? pair.treatment : pair.control;
   await login(page, agentId);
-  const sessionId = await createSession(page, agentId, `Skill A/B ${source.name} ${variant} ${inputMode}`);
+  const sessionTitle = `Skill A/B ${source.name} ${variant} ${inputMode}`;
+  const sessionId = await createSession(page, agentId, sessionTitle);
   await page.goto(`/workspace/chat/${sessionId}`);
+  // Composer 在会话列表尚未回填时也会渲染；等待标题进入真实列表，避免 send
+  // 读取到旧闭包中的 sessionsLoading=true 而仅提示“任务信息还在加载”。
+  await expect(page.getByRole('main').getByText(sessionTitle, { exact: true }))
+    .toBeVisible({ timeout: 15_000 });
   await expect(page.getByPlaceholder('输入消息，按 Enter 发送...')).toBeVisible();
   let attachmentSha256: string | null = null;
   if (inputMode === 'attachment') {

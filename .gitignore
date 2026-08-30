@@ -33,6 +33,8 @@ agency-agents-zh/*
 agency-agents-import/*
 agency-agents-zh-*/
 agency-agents-import-*/
+agency-agents-library/*
+!agency-agents-library/README.md
 .pnpm-store/
 /frontend-site/
 /official-site/

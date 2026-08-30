@@ -93,6 +93,8 @@ SOURCE_METADATA_KEYS = frozenset(
         "upstream_license",
         "import_batch_id",
         "import_content_sha256",
+        "owner_semantics",
+        "governance_template",
     }
 )
 

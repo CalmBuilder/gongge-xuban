@@ -1,17 +1,18 @@
 import { notify } from '@/components/ui/app-toast';
 import { cn } from '@/lib/utils';
 import { createClientId } from '@/lib/client-id';
+import { RESOURCE_GRID_CLASS } from '@/lib/enterprise-ui';
 
-import { Bot, Clock, ShieldCheck, Star, UserCheck, Users, UserX } from 'lucide-react';
+import { Bot, Clock, RefreshCw, ShieldCheck, Star, UserCheck, Users, UserX } from 'lucide-react';
 
 import IconPlus from '../assets/icons/plus.svg?react';
 import IconSearch from '../assets/icons/search.svg?react';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { useNavigate, useSearchParams } from 'react-router-dom';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 
 import { api, getRequestTenantId } from '../api/client';
-import { hasGovernancePermission, type EnterpriseAuthUser } from '../auth';
+import { hasGovernancePermission, isGalleryEmployee, type EnterpriseAuthUser } from '../auth';
 
 import AppHeader from '../components/AppHeader';
 import { ConceptHelp, ConceptNote } from '../components/ConceptHelp';
@@ -19,12 +20,14 @@ import { ConfirmDialog } from '../components/ConfirmDialog';
 import EmployeeAvatarEditor from '../components/EmployeeAvatarEditor';
 import EmployeeCard from '../components/EmployeeCard';
 import EmployeeProfileEditor from '../components/EmployeeProfileEditor';
+import { EnterpriseCatalogHero, EnterpriseCatalogPageHeader } from '../components/EnterpriseCatalogHeader';
 import { Paginator } from '../components/Paginator';
 import ExpertBulkActionBar from '../components/ExpertBulkActionBar';
 import ExpertClassificationDialog from '../components/ExpertClassificationDialog';
 import ExpertFilterBar from '../components/ExpertFilterBar';
 import SideNavPanel, { type SideNavPanelItem } from '../components/SideNavPanel';
-import { Button, Dialog, DialogContent, DialogTitle } from '@/components/ui';
+import { Button, Dialog, DialogContent, DialogTitle, Textarea } from '@/components/ui';
+import { useI18n } from '@/i18n';
 import {
   canManageEmployeeAgent,
   canSelectCurrentEmployeeAgent,
@@ -37,6 +40,9 @@ import { emitAgentScopeChange, persistSharedAgentScope } from '../lib/agent-scop
 import type {
   AgentDeletionResult,
   AgentManagementPageRead,
+  AgentOrganizationizationOptionsRead,
+  AgentOrganizationizationPreviewRead,
+  AgentOrganizationizationResultRead,
   AgentProfileRead,
   ExpertTaxonomyAssignmentResult,
   ExpertTaxonomyRead,
@@ -47,7 +53,13 @@ const AGENT_PAGE_SIZE = 12;
 const EMPTY_VIEW_COUNTS: AgentManagementPageRead['view_counts'] = {
   all: 0, online: 0, offline: 0, pending: 0, expert: 0, governance: 0,
 };
-type EmployeeFilter = 'all' | 'online' | 'offline' | 'pending' | 'expert' | 'governance';
+const EMPTY_GOVERNANCE_COUNTS: NonNullable<AgentManagementPageRead['governance_counts']> = {
+  capability_avatar: 0,
+  organization_pending: 0,
+  organization_employee: 0,
+  template: 0,
+};
+type EmployeeFilter = 'all' | 'online' | 'offline' | 'pending' | 'expert' | 'governance' | 'capability' | 'organization';
 type AgentPublicationRelease = {
   id: string;
   resource_type: 'agent';
@@ -57,7 +69,10 @@ type AgentPublicationRelease = {
   name: string;
   description: string;
   components: Array<{ resource_type: string; resource_id: string; metadata?: Record<string, unknown> }>;
+  status: 'active' | 'unpublished' | 'security_revoked';
+  row_version: number;
 };
+type AgentReleaseTransitionCommand = 'unpublish' | 'security_revoke';
 const EMPLOYEE_VIEWS: EmployeeFilter[] = [
   'all',
   'online',
@@ -65,6 +80,8 @@ const EMPLOYEE_VIEWS: EmployeeFilter[] = [
   'pending',
   'expert',
   'governance',
+  'capability',
+  'organization',
 ];
 
 const VIEW_META: Record<EmployeeFilter, { title: string; description: string }> = {
@@ -85,12 +102,20 @@ const VIEW_META: Record<EmployeeFilter, { title: string; description: string }> 
     description: '等待审批的员工，审批通过后即可投入使用。',
   },
   expert: {
-    title: '专家（能力分身）',
-    description: '专家仍是数字员工，强调某个用户或专业方向沉淀的知识、方法、SOP 与工具组合。',
+    title: '我的专家能力分身',
+    description: '这里只管理当前账号拥有的专业能力分身；平台内置专家模板请前往开放广场的专家分类。',
   },
   governance: {
     title: '发布治理',
     description: '只审核责任人、分类、状态与发布范围；不会获得所有者的私人配置编辑权。',
+  },
+  capability: {
+    title: '我的能力分身',
+    description: '当前账号拥有的个人工作伙伴；可继续组合知识、Skill、SOP 和工具。',
+  },
+  organization: {
+    title: '组织数字员工',
+    description: '已组织化或正在补齐组织前置条件的 Agent；正式身份由角色、责任、监督和 Release 共同决定。',
   },
 };
 
@@ -116,6 +141,7 @@ export default function AgentsPage({
   onCreateAgent?: () => void;
   onLogout?: () => void;
 }) {
+  const { t } = useI18n();
   const [agents, setAgents] = useState<AgentProfileRead[]>([]);
   const [loading, setLoading] = useState(false);
   const [avatarAgent, setAvatarAgent] = useState<AgentProfileRead | null>(null);
@@ -128,6 +154,7 @@ export default function AgentsPage({
   const [page, setPage] = useState(1);
   const [total, setTotal] = useState(0);
   const [viewCounts, setViewCounts] = useState(EMPTY_VIEW_COUNTS);
+  const [governanceCounts, setGovernanceCounts] = useState(EMPTY_GOVERNANCE_COUNTS);
   const [facets, setFacets] = useState<AgentManagementPageRead['facets']>({ sources: [], departments: [], directions: [] });
   const requestIdRef = useRef(0);
   const [expertSource, setExpertSource] = useState('');
@@ -140,6 +167,19 @@ export default function AgentsPage({
   const [publicationOpen, setPublicationOpen] = useState(false);
   const [publicationBusy, setPublicationBusy] = useState(false);
   const [agentReleases, setAgentReleases] = useState<AgentPublicationRelease[]>([]);
+  const [rollbackTarget, setRollbackTarget] = useState<AgentPublicationRelease | null>(null);
+  const [rollbackReason, setRollbackReason] = useState('');
+  const [transitionTarget, setTransitionTarget] = useState<AgentPublicationRelease | null>(null);
+  const [transitionCommand, setTransitionCommand] = useState<AgentReleaseTransitionCommand>('unpublish');
+  const [transitionReason, setTransitionReason] = useState('');
+  const [organizationPreview, setOrganizationPreview] = useState<AgentOrganizationizationPreviewRead | null>(null);
+  const [organizationOptions, setOrganizationOptions] = useState<AgentOrganizationizationOptionsRead | null>(null);
+  const [organizationDraft, setOrganizationDraft] = useState({
+    responsibleOrgUnitId: '',
+    roleCode: '',
+    supervisorProfileId: '',
+  });
+  const [organizationPreviewBusy, setOrganizationPreviewBusy] = useState(false);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(
     () => window.localStorage.getItem(ENTERPRISE_AGENT_STORAGE_KEY),
   );
@@ -149,6 +189,14 @@ export default function AgentsPage({
   const employeeFilter: EmployeeFilter = isEmployeeFilter(viewParam) ? viewParam : 'all';
   const expertDepartment = searchParams.get('dept') || '';
   const canGovernAgents = isAdmin || hasGovernancePermission(currentUser, 'agent.manage');
+  const canReviewAgentReleases = isAdmin || currentUser?.role === 'admin';
+  const isExpertTemplateManagement = employeeFilter === 'expert' && isAdmin;
+  const activeViewMeta = isExpertTemplateManagement
+    ? {
+        title: '专家模板管理',
+        description: '这里只管理项目内置专家模板；用户复制后才形成自己的专家能力分身。',
+      }
+    : VIEW_META[employeeFilter];
 
   const load = useCallback(async () => {
     const requestId = ++requestIdRef.current;
@@ -171,6 +219,7 @@ export default function AgentsPage({
       setAgents(result.items);
       setTotal(result.total);
       setViewCounts(result.view_counts);
+      setGovernanceCounts(result.governance_counts || EMPTY_GOVERNANCE_COUNTS);
       setFacets(result.facets);
       const lastPage = Math.max(1, Math.ceil(result.total / result.page_size));
       if (page > lastPage) setPage(lastPage);
@@ -304,7 +353,7 @@ export default function AgentsPage({
     }
   }
 
-  async function submitAgentPublication(row: AgentProfileRead) {
+  async function submitAgentPublication(row: AgentProfileRead): Promise<boolean> {
     setPublicationBusy(true);
     try {
       await api.post('/api/enterprise/publications', {
@@ -313,10 +362,87 @@ export default function AgentsPage({
         expected_resource_revision: row.profile_revision || 1,
       });
       notify.success('已提交整 Agent 冻结快照；另一位管理员批准后才会进入组织发布库');
+      return true;
     } catch (error) {
       notify.error(error instanceof Error ? error.message : '提交整 Agent 组织审核失败');
+      return false;
     } finally {
       setPublicationBusy(false);
+    }
+  }
+
+  async function openOrganizationizationPreview(row: AgentProfileRead, submitWhenReady = false) {
+    setOrganizationPreviewBusy(true);
+    try {
+      const preview = await api.get<AgentOrganizationizationPreviewRead>(
+        `/api/enterprise/agents/${encodeURIComponent(row.id)}/organizationization-preview?tenant_id=${getRequestTenantId()}`,
+      );
+      setOrganizationPreview(preview);
+      setOrganizationDraft({
+        responsibleOrgUnitId: preview.responsible_org_unit_id || '',
+        roleCode: preview.active_role_code || '',
+        supervisorProfileId: preview.active_supervisor_employee_profile_id || '',
+      });
+      setOrganizationOptions(null);
+      if (canGovernAgents && preview.governance_form !== 'organization_employee') {
+        try {
+          setOrganizationOptions(await api.get<AgentOrganizationizationOptionsRead>(
+            `/api/enterprise/agents/organizationization-options?tenant_id=${getRequestTenantId()}`,
+          ));
+        } catch (error) {
+          notify.error(error instanceof Error ? error.message : t('加载组织化选项失败'));
+        }
+      }
+      if (submitWhenReady && preview.can_submit) {
+        const submitted = await submitAgentPublication(row);
+        if (submitted) {
+          setOrganizationPreview(null);
+          await load();
+        }
+      }
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '读取组织化条件失败');
+    } finally {
+      setOrganizationPreviewBusy(false);
+    }
+  }
+
+  async function configureOrganizationization() {
+    const preview = organizationPreview;
+    if (!preview || !organizationDraft.responsibleOrgUnitId || !organizationDraft.roleCode || !organizationDraft.supervisorProfileId) {
+      notify.error(t('请先选择责任组织、业务角色和监督者'));
+      return;
+    }
+    setOrganizationPreviewBusy(true);
+    try {
+      const result = await api.post<AgentOrganizationizationResultRead>(
+        `/api/enterprise/agents/${encodeURIComponent(preview.agent_id)}/organizationization`,
+        {
+          tenant_id: preview.tenant_id,
+          command_id: `agent-organizationization-${createClientId()}`,
+          expected_profile_revision: preview.profile_revision,
+          expected_relationship_checksum: preview.relationship_checksum,
+          responsible_org_unit_id: organizationDraft.responsibleOrgUnitId,
+          role_code: organizationDraft.roleCode,
+          supervisor_employee_profile_id: organizationDraft.supervisorProfileId,
+          assignment_mode: 'assist',
+          scope_type: 'tenant',
+          scope_id: '*',
+          include_descendants: true,
+        },
+      );
+      setOrganizationPreview(result.preview);
+      setOrganizationDraft({
+        responsibleOrgUnitId: result.preview.responsible_org_unit_id || '',
+        roleCode: result.preview.active_role_code || '',
+        supervisorProfileId: result.preview.active_supervisor_employee_profile_id || '',
+      });
+      notify.success(result.result_status === 'unchanged' ? t('组织化关系未发生变化') : t('组织化关系已原子保存'));
+      await load();
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : t('保存组织化关系失败，请重新预览'));
+    } finally {
+      setOrganizationPreviewBusy(false);
     }
   }
 
@@ -325,10 +451,82 @@ export default function AgentsPage({
     setPublicationBusy(true);
     try {
       setAgentReleases(await api.get<AgentPublicationRelease[]>(
-        '/api/enterprise/publications/releases?resource_type=agent',
+        `/api/enterprise/publications/releases?resource_type=agent${canReviewAgentReleases ? '&include_history=true' : ''}`,
       ));
     } catch (error) {
       notify.error(error instanceof Error ? error.message : '加载组织数字员工发布库失败');
+    } finally {
+      setPublicationBusy(false);
+    }
+  }
+
+  async function rollbackAgentRelease() {
+    const target = rollbackTarget;
+    if (!target) return;
+    const active = agentReleases.find(
+      (release) => release.resource_id === target.resource_id && release.status === 'active',
+    );
+    if (!active) {
+      notify.error('没有找到可校验的当前 Release，请刷新发布库');
+      return;
+    }
+    const reason = rollbackReason.trim();
+    if (!reason) {
+      notify.error('请填写回滚原因');
+      return;
+    }
+    setPublicationBusy(true);
+    try {
+      await api.post(
+        `/api/enterprise/publications/releases/${encodeURIComponent(target.id)}/rollback`,
+        {
+          command_id: createClientId(),
+          expected_active_release_id: active.id,
+          expected_active_row_version: active.row_version,
+          expected_target_row_version: target.row_version,
+          reason,
+        },
+      );
+      notify.success(`已将「${target.name}」回滚为当前组织发布版本`);
+      setRollbackTarget(null);
+      setRollbackReason('');
+      await openAgentReleases();
+      await load();
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '组织数字员工回滚失败，请刷新后重试');
+      await openAgentReleases();
+    } finally {
+      setPublicationBusy(false);
+    }
+  }
+
+  async function transitionAgentRelease() {
+    const target = transitionTarget;
+    if (!target || target.status !== 'active') return;
+    const reason = transitionReason.trim();
+    if (!reason) {
+      notify.error('请填写发布状态变更原因');
+      return;
+    }
+    setPublicationBusy(true);
+    try {
+      await api.post(
+        `/api/enterprise/publications/releases/${encodeURIComponent(target.id)}/transition`,
+        {
+          command_id: createClientId(),
+          command: transitionCommand,
+          expected_row_version: target.row_version,
+          reason,
+        },
+      );
+      notify.success(transitionCommand === 'security_revoke' ? '已安全撤销组织数字员工 Release' : '已将组织数字员工 Release 下架');
+      setTransitionTarget(null);
+      setTransitionReason('');
+      await openAgentReleases();
+      await load();
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '更新组织数字员工发布状态失败，请刷新后重试');
+      await openAgentReleases();
     } finally {
       setPublicationBusy(false);
     }
@@ -442,6 +640,19 @@ export default function AgentsPage({
 
   const viewItems: SideNavPanelItem[] = [
     {
+      key: 'capability', label: '我的能力分身', description: '我拥有的个人能力伙伴',
+      count: governanceCounts.capability_avatar, icon: Users,
+    },
+    ...(canGovernAgents
+      ? [{
+          key: 'organization',
+          label: '组织数字员工',
+          description: `${governanceCounts.organization_employee} 位已就绪，${governanceCounts.organization_pending} 位待补齐`,
+          count: governanceCounts.organization_employee + governanceCounts.organization_pending,
+          icon: Bot,
+        }]
+      : []),
+    {
       key: 'all', label: '可管理数字员工', description: '当前账号可维护的数字员工',
       count: viewCounts.all, icon: Users,
     },
@@ -457,8 +668,10 @@ export default function AgentsPage({
       key: 'pending', label: '待审批', description: '等待审批通过',
       count: viewCounts.pending, icon: Clock,
     },
-    {
-      key: 'expert', label: '专家（能力分身）', description: '按专业部门浏览',
+    ...(!isAdmin ? [{
+      key: 'expert',
+      label: '我的专家能力分身',
+      description: '管理本人拥有的专业能力分身',
       count: viewCounts.expert, icon: Star,
       children: viewCounts.expert
         ? [
@@ -470,7 +683,7 @@ export default function AgentsPage({
             })),
           ]
         : undefined,
-    },
+    }] : []),
     ...(canGovernAgents
       ? [{
           key: 'governance',
@@ -484,32 +697,60 @@ export default function AgentsPage({
 
   const summaryCardClass =
     'flex h-[100px] flex-1 basis-[220px] items-center gap-[16px] rounded-[20px] bg-[#f6f6f6] px-[32px] py-[20px] text-left transition-shadow';
-  const summaryStats: { key: EmployeeFilter; value: number; label: string; sub: string }[] = [
-    { key: 'all', value: viewCounts.all, label: '员工总数', sub: `${viewCounts.online}位在线` },
-    { key: 'offline', value: viewCounts.offline, label: '下线员工', sub: '0位在线' },
-    { key: 'expert', value: viewCounts.expert, label: '专家总数', sub: '按专业方向管理' },
-    {
-      key: 'pending',
-      value: viewCounts.pending,
-      label: '待审批',
-      sub: '等待审批通过',
-    },
-  ];
+  const summaryStats: { key: EmployeeFilter; value: number; label: string; sub: string }[] = isExpertTemplateManagement
+    ? [{
+        key: 'expert',
+        value: viewCounts.expert,
+        label: '专家模板',
+        sub: '平台内置模板，按专业方向管理',
+      }]
+    : [
+        { key: 'all', value: viewCounts.all, label: '员工总数', sub: `${viewCounts.online}位在线` },
+        { key: 'offline', value: viewCounts.offline, label: '下线员工', sub: '0位在线' },
+        ...(!isAdmin ? [{
+          key: 'expert' as const,
+          value: viewCounts.expert,
+          label: '专业能力分身',
+          sub: '按专业方向管理',
+        }] : []),
+        {
+          key: 'pending',
+          value: viewCounts.pending,
+          label: '待审批',
+          sub: '等待审批通过',
+        },
+      ];
 
   const emptyState: { title: string; description: string; actionLabel?: string; onAction?: () => void } = (() => {
+    if (employeeFilter === 'capability') {
+      return {
+        title: '还没有能力分身',
+        description: '创建个人能力分身，或从开放广场的专家分类创建我的版本。',
+        actionLabel: '新建数字员工',
+        onAction: onCreateAgent,
+      };
+    }
+    if (employeeFilter === 'organization') {
+      return {
+        title: '暂无组织数字员工',
+        description: '先为能力分身补齐责任组织、业务角色、监督者和发布 Release。',
+        actionLabel: '查看全部员工',
+        onAction: () => navigate(viewLink('all')),
+      };
+    }
     if (employeeFilter === 'expert' && viewCounts.expert === 0 && !hasExpertFilters && !hasSearchTerm) {
       return {
-        title: '还没有专家',
+        title: isAdmin ? '暂无专家模板' : '还没有专家能力分身',
         description: isAdmin
-          ? '专家是带有专业部门与方向标签的数字员工，可从开放广场复制已发布的专家，或由管理员导入专家库。'
-          : '专家是带有专业部门与方向标签的数字员工，可从开放广场复制已发布的专家，或联系管理员导入。',
-        actionLabel: '浏览开放广场',
-        onAction: () => navigate(EnterpriseRoute.Platform),
+          ? '开放广场的专家分类展示已发布模板；本页只维护平台内置模板，用户复制后才进入“我的能力分身”。'
+          : '开放广场的专家分类提供已审核的专业 Agent 模板；复制后成为你的能力分身，直接使用则建立使用关系。',
+        actionLabel: '浏览开放广场的专家分类',
+        onAction: () => navigate(EnterpriseRoute.PlatformExperts),
       };
     }
     if (employeeFilter === 'expert') {
       return {
-        title: '没有匹配的专家',
+        title: isAdmin ? '没有匹配的专家模板' : '没有匹配的专家能力分身',
         description: '调整筛选条件，或换个关键词再试试',
         actionLabel: '清除筛选',
         onAction: clearExpertFilters,
@@ -546,17 +787,30 @@ export default function AgentsPage({
 
   const employeeGrid = (
     <div className={cn(
-      'grid auto-rows-[minmax(262px,auto)] grid-cols-1 content-start gap-[32px] sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 max-[900px]:gap-[18px]',
+      RESOURCE_GRID_CLASS,
       selectedExpertIds.size > 0 && 'pb-[92px]',
     )}>
-      {filteredEmployees.map((employee) => (
-        <EmployeeCard
+      {filteredEmployees.map((employee) => {
+        const isExpertTemplateRow = isExpertTemplateManagement && employee.governance_form === 'template';
+        const templateAvailable = employee.status === 'active' && isGalleryEmployee(employee);
+        return <EmployeeCard
           key={employee.id}
           employee={employee}
           busy={selectingAgentId === employee.id}
           canManage={canManageEmployeeAgent(employee, currentUser)}
           canGovern={canGovernAgents}
-          canChat={employeeFilter !== 'governance'}
+          canChat={!isExpertTemplateRow && employeeFilter !== 'governance' && employee.governance_form !== 'organization_pending'}
+          cardMode={isExpertTemplateRow ? 'expert-template' : 'employee'}
+          statusLabel={isExpertTemplateRow
+            ? employee.status !== 'active'
+              ? '已停用'
+              : templateAvailable ? '已发布到开放广场' : '待发布'
+            : undefined}
+          statusKind={isExpertTemplateRow ? templateAvailable ? 'available' : 'offline' : undefined}
+          publicationLabel={isExpertTemplateRow
+            ? templateAvailable ? '从开放广场下架' : '发布到开放广场'
+            : undefined}
+          showGovernanceForm={employeeFilter === 'capability' || employeeFilter === 'organization'}
           selected={employee.id === selectedAgentId}
           selectable={employeeFilter === 'expert' && isAdmin && Boolean(taxonomy)}
           checked={selectedExpertIds.has(employee.id)}
@@ -565,21 +819,30 @@ export default function AgentsPage({
             ? () => setClassificationTargets([employee])
             : undefined}
           onOpen={() => {
-            if (employeeFilter === 'governance') {
+            if (isExpertTemplateManagement) {
               setProfileAgent(employee);
+            } else if (employeeFilter === 'governance') {
+              setProfileAgent(employee);
+            } else if (
+              employeeFilter === 'organization'
+              || (employeeFilter === 'capability' && employee.governance_form === 'organization_pending')
+            ) {
+              void openOrganizationizationPreview(employee);
             } else {
               void selectEmployee(employee);
             }
           }}
           onStatus={(status) => void updateStatus(employee, status)}
           onGallery={(published) => void updateGalleryState(employee, published)}
-          onPublication={() => void submitAgentPublication(employee)}
+          onPublication={!isExpertTemplateManagement && employee.governance_form !== 'template' && employee.owner_user_id === currentUser?.id
+            ? () => void openOrganizationizationPreview(employee, true)
+            : undefined}
           onDelete={() => setDeleteTarget(employee)}
           onAvatar={() => setAvatarAgent(employee)}
           onEdit={() => setProfileAgent(employee)}
           onChat={() => startEmployeeChat(employee)}
-        />
-      ))}
+        />;
+      })}
       {!filteredEmployees.length && (
         <AgentsEmptyState
           title={emptyState.title}
@@ -591,68 +854,104 @@ export default function AgentsPage({
     </div>
   );
 
-  const viewMeta = VIEW_META[employeeFilter];
+  const viewMeta = activeViewMeta;
   const workspaceEyebrow = employeeFilter === 'expert'
-    ? `${total} 位专家`
+    ? isAdmin ? `${total} 个专家模板` : `${total} 个专家能力分身`
     : `${total} 位员工`;
 
   return (
     <div className="min-h-full box-border px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]" aria-busy={loading}>
-      <AppHeader
-        onLogout={onLogout}
-        userName={currentUser?.username}
-        left={(
-          <div className="flex h-[50px] w-full items-center gap-[6px] rounded-[20px] bg-white px-[20px] text-[#757F9C] shadow-[0_0_6px_rgba(0,0,0,0.05)]">
-            <IconSearch className="size-[20px] shrink-0" />
-            <input
-              value={searchTerm}
-              onChange={(event) => setSearchTerm(event.target.value)}
-              placeholder="搜索"
-              aria-label="搜索员工"
-              className="min-w-0 flex-1 border-0 bg-transparent text-[14px] text-[#18181A] outline-none placeholder:text-[#757F9C]"
+      {isExpertTemplateManagement ? (
+        <>
+          <EnterpriseCatalogPageHeader
+            backTo={EnterpriseRoute.Agents}
+            backLabel="返回数字员工管理"
+            title="专家模板管理"
+            description="平台内置模板，按专业方向管理"
+            onLogout={onLogout}
+            userName={currentUser?.username}
+          />
+          <section className="mt-[20px] overflow-hidden rounded-[20px] border border-[#e8ebf3] bg-white shadow-[0_16px_44px_rgba(24,39,75,0.07)]">
+            <EnterpriseCatalogHero
+              icon={Star}
+              title="专家模板目录"
+              description="开放广场的专家分类展示已发布模板；本页只维护平台内置模板，用户复制后才进入“我的能力分身”。"
+              actions={(
+                <>
+                  <Button variant="outline" className="h-[34px] rounded-[10px]" onClick={() => void load()} disabled={loading}>
+                    <RefreshCw className={cn('size-[14px]', loading && 'animate-spin')} />
+                    刷新
+                  </Button>
+                  <Button asChild variant="outline" className="h-[34px] rounded-[10px]">
+                    <Link to={EnterpriseRoute.PlatformExperts}>前往开放广场的专家分类</Link>
+                  </Button>
+                </>
+              )}
             />
-          </div>
-        )}
-      />
-
-      <div className="mt-[16px] flex max-w-[960px] flex-wrap items-center gap-[8px]">
-        <ConceptNote topic="digital-employee" className="max-w-[760px]">
-          本页管理 AI 数字员工；真人账号和组织任职请前往“成员管理”。
-        </ConceptNote>
-        <ConceptHelp topic="forms" triggerLabel="个人专家与组织数字员工" />
-      </div>
-
-      <div className="flex flex-wrap items-stretch gap-[20px] my-[36px]" aria-label="数字员工统计">
-        {summaryStats.map((stat) => (
-          <button
-            key={stat.key}
-            type="button"
-            aria-pressed={employeeFilter === stat.key}
-            onClick={() => navigate(viewLink(stat.key))}
-            className={cn(
-              summaryCardClass,
+          </section>
+        </>
+      ) : (
+        <>
+          <AppHeader
+            onLogout={onLogout}
+            userName={currentUser?.username}
+            left={(
+              <div className="flex h-[50px] w-full items-center gap-[6px] rounded-[20px] bg-white px-[20px] text-[#757F9C] shadow-[0_0_6px_rgba(0,0,0,0.05)]">
+                <IconSearch className="size-[20px] shrink-0" />
+                <input
+                  value={searchTerm}
+                  onChange={(event) => setSearchTerm(event.target.value)}
+                  placeholder="搜索"
+                  aria-label="搜索员工"
+                  className="min-w-0 flex-1 border-0 bg-transparent text-[14px] text-[#18181A] outline-none placeholder:text-[#757F9C]"
+                />
+              </div>
             )}
-          >
-            <span className="shrink-0 text-[34px] font-semibold leading-none text-[#18181A]">{stat.value}</span>
-            <span className="flex min-w-0 flex-col gap-[4px]">
-              <span className="whitespace-nowrap text-[14px] text-[#464C5E]">{stat.label}</span>
-              <span className="whitespace-nowrap text-[12px] text-[#757F9C]">{stat.sub}</span>
-            </span>
-          </button>
-        ))}
-        <button type="button" onClick={onCreateAgent} className={cn(summaryCardClass, 'hover:shadow-[0_16px_30px_0_rgba(0,0,0,0.10)]')}>
-          <span className="grid size-[38px] shrink-0 place-items-center text-[#18181A]">
-            <IconPlus className="size-[38px]" />
-          </span>
-          <span className="flex min-w-0 flex-col gap-[4px]">
-            <span className="whitespace-nowrap text-[14px] text-[#464C5E]">创建新员工</span>
-            <span className="whitespace-nowrap text-[12px] text-[#757F9C]">几步搭好你的数字员工</span>
-          </span>
-        </button>
-      </div>
+          />
 
-      <div className="grid grid-cols-[248px_minmax(0,1fr)] items-start gap-[16px] max-[920px]:grid-cols-1">
-        <SideNavPanel
+          <div className="mt-[16px] flex max-w-[960px] flex-wrap items-center gap-[8px]">
+            <ConceptNote topic="digital-employee" className="max-w-[760px]">
+              {employeeFilter === 'expert'
+                ? '本页只管理当前账号拥有的专家能力分身；平台内置专家模板请前往开放广场的专家分类。'
+                : '本页管理 AI 数字员工；真人账号和组织任职请前往“成员管理”。'}
+            </ConceptNote>
+            <ConceptHelp topic="forms" triggerLabel="个人专家与组织数字员工" />
+          </div>
+
+          <div className="my-[36px] flex flex-wrap items-stretch gap-[20px]" aria-label="数字员工统计">
+            {summaryStats.map((stat) => (
+              <button
+                key={stat.key}
+                type="button"
+                aria-pressed={employeeFilter === stat.key}
+                onClick={() => navigate(viewLink(stat.key))}
+                className={cn(summaryCardClass)}
+              >
+                <span className="shrink-0 text-[34px] font-semibold leading-none text-[#18181A]">{stat.value}</span>
+                <span className="flex min-w-0 flex-col gap-[4px]">
+                  <span className="whitespace-nowrap text-[14px] text-[#464C5E]">{stat.label}</span>
+                  <span className="whitespace-nowrap text-[12px] text-[#757F9C]">{stat.sub}</span>
+                </span>
+              </button>
+            ))}
+            <button type="button" onClick={onCreateAgent} className={cn(summaryCardClass, 'hover:shadow-[0_16px_30px_0_rgba(0,0,0,0.10)]')}>
+              <span className="grid size-[38px] shrink-0 place-items-center text-[#18181A]">
+                <IconPlus className="size-[38px]" />
+              </span>
+              <span className="flex min-w-0 flex-col gap-[4px]">
+                <span className="whitespace-nowrap text-[14px] text-[#464C5E]">创建新员工</span>
+                <span className="whitespace-nowrap text-[12px] text-[#757F9C]">几步搭好你的数字员工</span>
+              </span>
+            </button>
+          </div>
+        </>
+      )}
+
+      <div className={cn(
+        'grid grid-cols-[248px_minmax(0,1fr)] items-start gap-[16px] max-[920px]:grid-cols-1',
+        isExpertTemplateManagement && 'mt-[20px] grid-cols-1',
+      )}>
+        {!isExpertTemplateManagement && <SideNavPanel
           title="员工视图"
           subtitle="按状态与类型浏览"
           icon={Users}
@@ -667,25 +966,43 @@ export default function AgentsPage({
               <p className="mt-[3px]">视图仅筛选本页列表，不会改变员工的运行状态。</p>
             </>
           )}
-        />
+        />}
 
         <main className="min-w-0 overflow-hidden rounded-[20px] border border-[#dfe5f2] bg-white shadow-[0_12px_32px_rgba(35,55,100,0.06)]">
-          <div className="flex items-start justify-between gap-[20px] px-[22px] py-[21px] max-[620px]:flex-col">
-            <div className="min-w-0">
-              <p className="font-mono text-[10px] font-semibold uppercase tracking-[0.13em] text-[#6074a9]">{workspaceEyebrow}</p>
-              <h2 className="mt-[5px] flex items-center gap-[6px] text-[20px] font-semibold tracking-[-0.02em] text-[#18181a]">
-                {viewMeta.title}
-                <ConceptHelp topic={employeeFilter === 'expert' ? 'expert' : 'digital-employee'} />
-              </h2>
-              <p className="mt-[5px] max-w-[680px] text-[12px] leading-[19px] text-[#68718b]">{viewMeta.description}</p>
+          {!isExpertTemplateManagement && (
+            <div className="flex items-start justify-between gap-[20px] px-[22px] py-[21px] max-[620px]:flex-col">
+              <div className="min-w-0">
+                <p className="font-mono text-[10px] font-semibold uppercase tracking-[0.13em] text-[#6074a9]">{workspaceEyebrow}</p>
+                <h2 className="mt-[5px] flex items-center gap-[6px] text-[20px] font-semibold tracking-[-0.02em] text-[#18181a]">
+                  {viewMeta.title}
+                  <ConceptHelp topic={employeeFilter === 'expert' ? 'expert' : 'digital-employee'} />
+                </h2>
+                <p className="mt-[5px] max-w-[680px] text-[12px] leading-[19px] text-[#68718b]">{viewMeta.description}</p>
+              </div>
+              <div className="flex flex-wrap items-center justify-end gap-[8px]">
+                <Button variant="outline" onClick={() => void openAgentReleases()}>
+                  <Bot className="size-4" />
+                  组织数字员工发布库
+                </Button>
+              </div>
             </div>
-            <Button variant="outline" onClick={() => void openAgentReleases()}>
-              <Bot className="size-4" />
-              组织数字员工发布库
-            </Button>
-          </div>
+          )}
 
-          <div className="border-t border-[#eef1f6] p-[18px]">
+          <div className={cn('p-[18px]', !isExpertTemplateManagement && 'border-t border-[#eef1f6]')}>
+            {isExpertTemplateManagement && (
+              <label className="relative mb-[16px] block">
+                <span className="sr-only">搜索专家模板</span>
+                <IconSearch className="pointer-events-none absolute left-[11px] top-1/2 size-[14px] -translate-y-1/2 text-[#939bad]" />
+                <input
+                  value={searchTerm}
+                  onChange={(event) => setSearchTerm(event.target.value)}
+                  placeholder="搜索专家模板"
+                  aria-label="搜索专家模板"
+                  autoComplete="off"
+                  className="h-[34px] w-full rounded-[var(--gg-radius-control)] border border-[var(--gg-border)] bg-white pl-[32px] pr-[12px] text-[12px] text-[var(--gg-ink)] outline-none transition-colors placeholder:text-[var(--gg-slate)] focus:border-[var(--gg-cobalt)] focus:ring-2 focus:ring-[color-mix(in_srgb,var(--gg-cobalt)_16%,transparent)]"
+                />
+              </label>
+            )}
             {employeeFilter === 'expert' && taxonomyUnavailable && isAdmin && (
               <p className="mb-[12px] rounded-[10px] bg-[#fff8e8] px-[12px] py-[9px] text-[11px] text-[#8a6118]">
                 分类规则加载失败，请刷新后重试；当前仍可浏览专家。
@@ -751,6 +1068,7 @@ export default function AgentsPage({
       <EmployeeProfileEditor
         agent={profileAgent}
         open={Boolean(profileAgent)}
+        mode={isExpertTemplateManagement && profileAgent?.governance_form === 'template' ? 'expert-template' : 'employee'}
         currentUser={currentUser}
         onClose={() => setProfileAgent(null)}
         onSaved={updateAgentInList}
@@ -781,25 +1099,321 @@ export default function AgentsPage({
             </div>
           ) : null}
           <div className="grid gap-3">
-            {agentReleases.map((release) => (
+            {agentReleases.map((release) => {
+              const canRollback = canReviewAgentReleases && release.status === 'unpublished'
+                && agentReleases.some((candidate) => candidate.resource_id === release.resource_id && candidate.status === 'active');
+              return (
               <article key={release.id} className="rounded-[14px] border border-[#dce5f6] bg-[#fbfcff] p-4">
                 <div className="flex items-start justify-between gap-4">
                   <div>
                     <h3 className="text-[14px] font-semibold text-[#202536]">{release.name}</h3>
                     <p className="mt-1 text-[12px] leading-5 text-[#68718b]">{release.description || '暂无说明'}</p>
                   </div>
-                  <Button disabled={publicationBusy} onClick={() => void adoptAgentRelease(release)}>
-                    采用为我的员工
-                  </Button>
+                  <div className="flex shrink-0 flex-wrap justify-end gap-2">
+                    {release.status === 'active' ? (
+                      <>
+                        <Button disabled={publicationBusy} onClick={() => void adoptAgentRelease(release)}>
+                          采用为我的员工
+                        </Button>
+                        {canReviewAgentReleases ? (
+                          <>
+                            <Button
+                              variant="outline"
+                              disabled={publicationBusy}
+                              onClick={() => {
+                                setTransitionTarget(release);
+                                setTransitionCommand('unpublish');
+                                setTransitionReason('');
+                              }}
+                            >
+                              普通下架
+                            </Button>
+                            <Button
+                              variant="destructive"
+                              disabled={publicationBusy}
+                              onClick={() => {
+                                setTransitionTarget(release);
+                                setTransitionCommand('security_revoke');
+                                setTransitionReason('');
+                              }}
+                            >
+                              安全撤销
+                            </Button>
+                          </>
+                        ) : null}
+                      </>
+                    ) : null}
+                    {canRollback ? (
+                      <Button
+                        variant="outline"
+                        disabled={publicationBusy}
+                        onClick={() => {
+                          setRollbackTarget(release);
+                          setRollbackReason('');
+                        }}
+                      >
+                        回滚此版本
+                      </Button>
+                    ) : null}
+                  </div>
                 </div>
                 <div className="mt-3 flex flex-wrap gap-2 text-[11px] text-[#53617d]">
                   <span className="rounded-full bg-white px-2.5 py-1 ring-1 ring-[#dfe6f5]">冻结组件 {release.components.length}</span>
                   <span className="rounded-full bg-white px-2.5 py-1 font-mono ring-1 ring-[#dfe6f5]">{release.snapshot_checksum.slice(0, 12)}…</span>
-                  <span className="rounded-full bg-[#eef8f2] px-2.5 py-1 text-[#237a48]">已审 Release</span>
+                  <span className={`rounded-full px-2.5 py-1 ${release.status === 'active' ? 'bg-[#eef8f2] text-[#237a48]' : release.status === 'security_revoked' ? 'bg-[#fce7e7] text-[#b40a0a]' : 'bg-[#fff5df] text-[#936000]'}`}>
+                    {release.status === 'active' ? '已审 Release' : release.status === 'security_revoked' ? '安全撤销' : '历史已下架'}
+                  </span>
                 </div>
               </article>
-            ))}
+              );
+            })}
           </div>
+        </DialogContent>
+      </Dialog>
+      <Dialog
+        open={Boolean(rollbackTarget)}
+        onOpenChange={(open) => {
+          if (!open && !publicationBusy) {
+            setRollbackTarget(null);
+            setRollbackReason('');
+          }
+        }}
+      >
+        <DialogContent aria-describedby={undefined} className="sm:max-w-[520px]">
+          <DialogTitle>回滚组织数字员工版本</DialogTitle>
+          <p className="text-[12px] leading-5 text-[#68718b]">
+            只允许恢复同一 Agent 的普通下架历史 Release；安全撤销版本不可恢复。提交时会校验当前版本和历史版本的行修订，避免覆盖并发变更。
+          </p>
+          {rollbackTarget ? (
+            <div className="grid gap-[12px]">
+              <div className="rounded-[11px] border border-[#dce5ff] bg-[#f7f9ff] px-[12px] py-[10px] text-[12px] text-[#53617d]">
+                目标：<strong className="text-[#202536]">{rollbackTarget.name}</strong>
+                <span className="ml-2 font-mono text-[11px]">{rollbackTarget.snapshot_checksum.slice(0, 16)}…</span>
+              </div>
+              <label className="grid gap-[6px] text-[12px] font-medium text-[#464c5e]">
+                回滚原因
+                <Textarea
+                  aria-label="回滚原因"
+                  value={rollbackReason}
+                  onChange={(event) => setRollbackReason(event.target.value)}
+                  placeholder="说明为何恢复该历史组织员工版本"
+                  rows={4}
+                />
+              </label>
+              <div className="flex justify-end gap-2">
+                <Button variant="outline" disabled={publicationBusy} onClick={() => setRollbackTarget(null)}>取消</Button>
+                <Button disabled={publicationBusy || !rollbackReason.trim()} onClick={() => void rollbackAgentRelease()}>
+                  确认回滚
+                </Button>
+              </div>
+            </div>
+          ) : null}
+        </DialogContent>
+      </Dialog>
+      <Dialog
+        open={Boolean(transitionTarget)}
+        onOpenChange={(open) => {
+          if (!open && !publicationBusy) {
+            setTransitionTarget(null);
+            setTransitionReason('');
+          }
+        }}
+      >
+        <DialogContent aria-describedby={undefined} className="sm:max-w-[520px]">
+          <DialogTitle>{transitionCommand === 'security_revoke' ? '安全撤销组织数字员工 Release' : '普通下架组织数字员工 Release'}</DialogTitle>
+          <p className="text-[12px] leading-5 text-[#68718b]">
+            {transitionCommand === 'security_revoke'
+              ? '安全撤销会停止组织广场发现、停用既有采用副本及其资源绑定，并提升租户授权修订；该版本不可回滚。'
+              : '普通下架只停止组织广场发现和新的采用，既有采用副本继续按原授权运行。'}
+          </p>
+          {transitionTarget ? (
+            <div className="grid gap-[12px]">
+              <div className="rounded-[11px] border border-[#dce5ff] bg-[#f7f9ff] px-[12px] py-[10px] text-[12px] text-[#53617d]">
+                目标：<strong className="text-[#202536]">{transitionTarget.name}</strong>
+                <span className="ml-2 font-mono text-[11px]">Release {transitionTarget.id}</span>
+              </div>
+              <label className="grid gap-[6px] text-[12px] font-medium text-[#464c5e]">
+                变更原因
+                <Textarea
+                  aria-label="发布状态变更原因"
+                  value={transitionReason}
+                  onChange={(event) => setTransitionReason(event.target.value)}
+                  placeholder={transitionCommand === 'security_revoke' ? '说明供应链、权限或内容安全事件' : '说明普通下架原因'}
+                  rows={4}
+                />
+              </label>
+              <div className="flex justify-end gap-2">
+                <Button variant="outline" disabled={publicationBusy} onClick={() => setTransitionTarget(null)}>取消</Button>
+                <Button
+                  variant={transitionCommand === 'security_revoke' ? 'destructive' : 'default'}
+                  disabled={publicationBusy || !transitionReason.trim()}
+                  onClick={() => void transitionAgentRelease()}
+                >
+                  {publicationBusy ? '提交中…' : transitionCommand === 'security_revoke' ? '确认安全撤销' : '确认普通下架'}
+                </Button>
+              </div>
+            </div>
+          ) : null}
+        </DialogContent>
+      </Dialog>
+      <Dialog
+        open={Boolean(organizationPreview)}
+        onOpenChange={(open) => {
+          if (!open && !organizationPreviewBusy) setOrganizationPreview(null);
+        }}
+      >
+        <DialogContent aria-describedby={undefined} className="max-h-[86vh] overflow-y-auto sm:max-w-[620px]">
+          <DialogTitle className="text-[17px] font-semibold">{t('组织化检查：')}{organizationPreview?.agent_name}</DialogTitle>
+          <p className="text-[12px] leading-5 text-[#68718b]">
+            组织化只改变治理关系和发布状态，不复制真人身份、私人凭据或会话记忆。所有事实以服务端回查为准。
+          </p>
+          {organizationPreviewBusy ? <p role="status">{t('正在读取组织化条件…')}</p> : null}
+          {organizationPreview && (
+            <div className="grid gap-[10px]">
+              <div className="rounded-[12px] border border-[#dfe5f2] bg-[#f8faff] px-[14px] py-[11px] text-[12px] text-[#53617d]">
+                  {t('当前形态：')}<strong className="text-[#202536]">
+                  {organizationPreview.governance_form === 'organization_employee'
+                  ? t('组织数字员工')
+                    : organizationPreview.governance_form === 'organization_pending'
+                      ? t('待组织化')
+                      : organizationPreview.governance_form === 'capability_avatar'
+                        ? t('能力分身')
+                        : t('专家模板')}
+                </strong>
+                {organizationPreview.responsible_org_unit_name
+                  ? t('· 责任组织：{1}', { 1: organizationPreview.responsible_org_unit_name })
+                  : ''}
+              </div>
+              {canGovernAgents && organizationPreview.governance_form !== 'organization_employee' && (
+                <section
+                  aria-label={t('组织化关系配置')}
+                  className="grid gap-[10px] rounded-[12px] border border-[#d8e2fb] bg-[#f7f9ff] px-[14px] py-[13px]"
+                >
+                  <div>
+                    <h3 className="text-[12px] font-semibold text-[#303a52]">{t('配置组织关系')}</h3>
+                    <p className="mt-[3px] text-[11px] leading-[17px] text-[#737d92]">
+                      {t('选择后的责任组织、业务角色和监督者会在同一事务中保存；保存后仍需提交组织审核。')}
+                    </p>
+                  </div>
+                  <label className="grid gap-[5px] text-[11px] font-medium text-[#53617d]">
+                    {t('责任组织')}
+                    <select
+                      aria-label={t('选择责任组织')}
+                      value={organizationDraft.responsibleOrgUnitId}
+                      onChange={(event) => setOrganizationDraft((current) => ({
+                        ...current,
+                        responsibleOrgUnitId: event.target.value,
+                      }))}
+                      className="h-9 rounded-[9px] border border-[#d8e0f0] bg-white px-3 text-[12px] font-normal text-[#303a52] outline-none focus:border-[var(--gg-cobalt)] focus:ring-2 focus:ring-[color-mix(in_srgb,var(--gg-cobalt)_16%,transparent)]"
+                    >
+                      <option value="">{t('请选择责任组织')}</option>
+                      {(organizationOptions?.organizations || []).map((option) => (
+                        <option key={option.id} value={option.id}>{option.name}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="grid gap-[5px] text-[11px] font-medium text-[#53617d]">
+                    {t('业务角色')}
+                    <select
+                      aria-label={t('选择业务角色')}
+                      value={organizationDraft.roleCode}
+                      onChange={(event) => setOrganizationDraft((current) => ({
+                        ...current,
+                        roleCode: event.target.value,
+                      }))}
+                      className="h-9 rounded-[9px] border border-[#d8e0f0] bg-white px-3 text-[12px] font-normal text-[#303a52] outline-none focus:border-[var(--gg-cobalt)] focus:ring-2 focus:ring-[color-mix(in_srgb,var(--gg-cobalt)_16%,transparent)]"
+                    >
+                      <option value="">{t('请选择业务角色')}</option>
+                      {(organizationOptions?.roles || []).map((option) => (
+                        <option key={option.role_code} value={option.role_code}>{option.name} · {option.role_code}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="grid gap-[5px] text-[11px] font-medium text-[#53617d]">
+                    {t('监督者')}
+                    <select
+                      aria-label={t('选择监督者')}
+                      value={organizationDraft.supervisorProfileId}
+                      onChange={(event) => setOrganizationDraft((current) => ({
+                        ...current,
+                        supervisorProfileId: event.target.value,
+                      }))}
+                      className="h-9 rounded-[9px] border border-[#d8e0f0] bg-white px-3 text-[12px] font-normal text-[#303a52] outline-none focus:border-[var(--gg-cobalt)] focus:ring-2 focus:ring-[color-mix(in_srgb,var(--gg-cobalt)_16%,transparent)]"
+                    >
+                      <option value="">{t('请选择监督者')}</option>
+                      {(organizationOptions?.supervisors || []).map((option) => (
+                        <option key={option.id} value={option.id}>{option.employee_name} · {option.employee_id}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-[11px] text-[#7b8498]">
+                      {organizationOptions ? t('选项来自当前 agent.manage 授权范围') : t('正在读取可用组织化选项…')}
+                    </span>
+                    <Button
+                      variant="outline"
+                      onClick={() => void configureOrganizationization()}
+                      disabled={organizationPreviewBusy || !organizationOptions}
+                    >
+                      {t('保存组织化配置')}
+                    </Button>
+                  </div>
+                </section>
+              )}
+              <div className="grid gap-[7px]" aria-label="组织化前置条件">
+                {organizationPreview.requirements.map((requirement) => (
+                  <div
+                    key={requirement.code}
+                    className={`flex items-start justify-between gap-[12px] rounded-[10px] border px-[12px] py-[9px] text-[11px] ${requirement.satisfied ? 'border-[#ccebd8] bg-[#f2fbf5]' : 'border-[#f0d6a7] bg-[#fff8e8]'}`}
+                  >
+                    <span className="min-w-0">
+                      <strong className="block text-[#3f485d]">{requirement.label}</strong>
+                      <span className="mt-[2px] block leading-[17px] text-[#737d92]">
+                        {requirement.satisfied ? '当前事实已验证' : requirement.detail}
+                      </span>
+                    </span>
+                    <span className={`shrink-0 font-medium ${requirement.satisfied ? 'text-[#237a48]' : 'text-[#9a6414]'}`}>
+                      {requirement.satisfied ? '已满足' : '待补齐'}
+                    </span>
+                  </div>
+                ))}
+              </div>
+              <div className="flex flex-wrap items-center justify-end gap-[8px]">
+                <Button variant="outline" onClick={() => setOrganizationPreview(null)} disabled={organizationPreviewBusy}>
+                  关闭
+                </Button>
+                {organizationPreview.can_submit
+                  && organizationPreview.governance_form === 'organization_pending'
+                  && organizationPreview.owner_user_id === currentUser?.id && (
+                  <Button
+                    disabled={organizationPreviewBusy}
+                    onClick={() => {
+                      const current = organizationPreview;
+                      void submitAgentPublication({
+                        id: current.agent_id,
+                        tenant_id: current.tenant_id,
+                        name: current.agent_name,
+                        is_overall: false,
+                        status: 'active',
+                        profile_revision: current.profile_revision,
+                        metadata: {},
+                        resources: [],
+                        created_at: '',
+                        updated_at: '',
+                      }).then((submitted) => {
+                        if (submitted) {
+                          setOrganizationPreview(null);
+                          void load();
+                        }
+                      });
+                    }}
+                  >
+                    提交组织审核
+                  </Button>
+                )}
+              </div>
+            </div>
+          )}
         </DialogContent>
       </Dialog>
     </div>

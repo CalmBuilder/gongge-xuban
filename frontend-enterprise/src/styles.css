@@ -15,9 +15,36 @@
   --gg-paper: #FFFFFF;
   --gg-slate: #68738E;
   --gg-border: #DCE3F1;
-  --gg-radius-control: 12px;
-  --gg-radius-card: 14px;
-  --gg-shadow-card: 0 14px 40px rgba(24, 33, 61, 0.08);
+  /* Screenshot-derived palette: aliases make color intent explicit without
+     introducing a second visual language. */
+  --gg-text-primary: var(--gg-ink);
+  --gg-text-secondary: #526B86;
+  --gg-text-muted: var(--gg-slate);
+  --gg-surface-page: var(--gg-cloud);
+  --gg-surface: var(--gg-paper);
+  --gg-surface-subtle: #F8FAFD;
+  --gg-line: #E3EAF3;
+  --gg-interaction: var(--gg-cobalt);
+  --gg-interaction-hover: #244BC7;
+  --gg-interaction-soft: #EAF2FF;
+  --gg-capability: #237A45;
+  --gg-capability-soft: #EAF6EF;
+  --gg-capability-line: #CFE7D7;
+  --gg-governance: #5A3B95;
+  --gg-governance-soft: #F0EBFA;
+  --gg-governance-line: #DDD1F2;
+  --gg-state-success: #18734A;
+  --gg-state-success-soft: #EAF6EF;
+  --gg-state-warning: #A25B0D;
+  --gg-state-warning-soft: #FFF5E5;
+  --gg-state-danger: #B42318;
+  --gg-state-danger-soft: #FDEDEC;
+  --gg-state-neutral: var(--gg-slate);
+  --gg-state-neutral-soft: #EFF3F8;
+  --gg-radius-control: 8px;
+  --gg-radius-card: 12px;
+  --gg-radius-panel: 16px;
+  --gg-shadow-card: 0 10px 26px rgba(24, 33, 61, 0.08);
   --gg-shadow-focus: 0 0 0 3px rgba(49, 87, 232, 0.22);
 
   --background: var(--gg-cloud);
@@ -25,25 +52,26 @@
   --surface: var(--gg-paper);
   --surface-raised: var(--gg-paper);
   --surface-muted: #edf1f9;
-  --surface-subtle: #fafbfe;
+  --surface-subtle: var(--gg-surface-subtle);
   --border: var(--gg-border);
   --border-strong: #c8d2e6;
-  --line: #e7ecf5;
+  --line: var(--gg-line);
   --muted: #edf1f9;
   --muted-soft: #9a9b95;
-  --accent: var(--gg-cobalt);
-  --accent-soft: #e8edff;
+  --accent: var(--gg-interaction);
+  --accent-soft: var(--gg-interaction-soft);
   --accent-foreground: #ffffff;
-  --danger: #dc2626;
-  --warning: #b45309;
-  --success: #138a55;
+  --danger: var(--gg-state-danger);
+  --warning: var(--gg-state-warning);
+  --success: var(--gg-state-success);
   --ink-soft: #343633;
   --copper: #a85d32;
   --olive: #6f7b42;
   --shadow-float: 0 20px 54px rgba(24, 33, 61, 0.12);
   --shadow-soft: var(--gg-shadow-card);
-  --font-body: "Inter", "IBM Plex Sans", "Noto Sans SC", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
-  --font-display: "Inter", "IBM Plex Sans", "Noto Sans SC", "PingFang SC", system-ui, sans-serif;
+  --gg-font-ui: "Geist Variable", "Noto Sans SC", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
+  --font-body: var(--gg-font-ui);
+  --font-display: var(--gg-font-ui);
   --font-mono: "JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
   --page-gradient-a: rgba(15, 118, 110, 0.055);
   --page-gradient-top: #fbfaf6;
@@ -73,12 +101,12 @@
   --card-foreground: #20201d;
   --popover: #ffffff;
   --popover-foreground: #20201d;
-  --primary: var(--gg-cobalt);
+  --primary: var(--gg-interaction);
   --primary-foreground: #ffffff;
   --secondary: #eeece4;
   --secondary-foreground: #20201d;
   --muted-foreground: #6d726e;
-  --destructive: #dc2626;
+  --destructive: var(--gg-state-danger);
   --input: #ded7cc;
   --ring: var(--gg-cobalt);
   --chart-1: var(--gg-cobalt);
@@ -87,14 +115,14 @@
   --chart-4: #138a55;
   --chart-5: #b45309;
   --radius: 0.625rem;
-  --sidebar: #ffffff;
-  --sidebar-foreground: #858b9c;
-  --sidebar-primary: var(--gg-cobalt);
+  --sidebar: var(--gg-paper);
+  --sidebar-foreground: var(--gg-text-muted);
+  --sidebar-primary: var(--gg-interaction);
   --sidebar-primary-foreground: #ffffff;
-  --sidebar-accent: #edf2ff;
-  --sidebar-accent-foreground: #244bc7;
-  --sidebar-border: #d8e0ee;
-  --sidebar-ring: var(--gg-cobalt);
+  --sidebar-accent: var(--gg-interaction-soft);
+  --sidebar-accent-foreground: var(--gg-interaction-hover);
+  --sidebar-border: var(--gg-line);
+  --sidebar-ring: var(--gg-interaction);
 }
 
 html,
@@ -105,9 +133,7 @@ body,
 
 body {
   margin: 0;
-  background:
-    linear-gradient(135deg, var(--page-gradient-a), transparent 30%),
-    linear-gradient(180deg, var(--page-gradient-top) 0%, var(--background) 58%, var(--page-gradient-bottom) 100%);
+  background: var(--gg-surface-page);
   color: var(--foreground);
   font-family: var(--font-body);
   -webkit-font-smoothing: antialiased;
@@ -154,6 +180,74 @@ select,
   outline: 2px solid var(--gg-cobalt);
   outline-offset: 2px;
   box-shadow: var(--gg-shadow-focus);
+}
+
+/* Shared type scale. Page families may compose these classes, but should not
+   invent another size for the same semantic role. */
+.gg-type-page-title {
+  font-size: 24px;
+  line-height: 32px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--gg-text-primary);
+}
+
+.gg-type-section-title {
+  font-size: 18px;
+  line-height: 26px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  color: var(--gg-text-primary);
+}
+
+.gg-type-card-title {
+  font-size: 14px;
+  line-height: 20px;
+  font-weight: 600;
+  color: var(--gg-text-primary);
+}
+
+.gg-type-body {
+  font-size: 13px;
+  line-height: 20px;
+  font-weight: 400;
+  color: var(--gg-text-secondary);
+}
+
+.gg-type-control {
+  font-size: 12px;
+  line-height: 18px;
+  font-weight: 500;
+}
+
+.gg-type-meta {
+  font-size: 12px;
+  line-height: 18px;
+  font-weight: 500;
+  color: var(--gg-text-muted);
+}
+
+.gg-type-caption {
+  font-size: 11px;
+  line-height: 16px;
+  font-weight: 500;
+  color: var(--gg-text-muted);
+}
+
+.gg-type-code {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 20px;
+}
+
+/* Resource cards use the available content width, not page-specific breakpoints.
+   The four-column floor keeps the family at 4 / 3 / 2 / 1 columns and prevents
+   wide screens from creating a fifth, overly dense column. */
+.gg-resource-grid {
+  display: grid;
+  grid-auto-rows: minmax(288px, auto);
+  grid-template-columns: repeat(auto-fit, minmax(max(264px, calc((100% - 48px) / 4)), 1fr));
+  gap: 16px;
 }
 
 .product-icon-spin {
@@ -583,10 +677,10 @@ select,
 }
 
 .gongge-product-sidebar {
-  --sidebar: rgba(255, 255, 255, 0.94);
-  --sidebar-foreground: var(--gg-slate);
-  --sidebar-accent: #edf2ff;
-  --sidebar-accent-foreground: #244bc7;
+  --sidebar: rgba(255, 255, 255, 0.96);
+  --sidebar-foreground: var(--gg-text-muted);
+  --sidebar-accent: var(--gg-interaction-soft);
+  --sidebar-accent-foreground: var(--gg-interaction-hover);
   box-shadow: 10px 0 30px rgba(24, 33, 61, 0.035);
 }
 

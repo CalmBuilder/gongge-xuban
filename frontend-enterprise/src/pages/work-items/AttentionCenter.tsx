@@ -9,7 +9,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { CircleHelp, Clock3, History, KeyRound, MessageSquareText, RefreshCw, Route, ShieldCheck } from 'lucide-react';
 
-import { api, getRequestTenantId } from '@/api/client';
+import { ApiError, api, getRequestTenantId } from '@/api/client';
 import {
   reauthorizeConnectionAttention,
   reauthorizeWeComConnectionAttention,
@@ -211,7 +211,20 @@ export default function AttentionCenter() {
       setReauthCorpSecret('');
       await loadItems(view);
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '处理待办事项失败');
+      const stalePublicationReview = Boolean(
+        selected
+        && selected.kind === 'publication'
+        && stringPayload(selected, 'publication_request_id')
+        && error instanceof ApiError
+        && error.status === 409,
+      );
+      if (stalePublicationReview) {
+        setSelected(null);
+        setAnswer('');
+        notify.error('组织发布审核状态已变化，审核未提交；待办列表已刷新，请重新打开');
+      } else {
+        notify.error(error instanceof Error ? error.message : '处理待办事项失败');
+      }
       await loadItems(view);
     } finally {
       setActing(false);

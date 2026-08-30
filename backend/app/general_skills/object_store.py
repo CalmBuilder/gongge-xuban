@@ -61,6 +61,14 @@ class FileSystemSkillObjectStore:
         self._write_once(destination, source.read_bytes())
         return f"sha256:{normalized}"
 
+    def put_object(self, payload: bytes) -> str:
+        """直接写入全局内容寻址区，供无导入作业的项目目录候选固化资源。"""
+
+        checksum = hashlib.sha256(payload).hexdigest()
+        destination = self.root / "objects" / checksum[:2] / checksum
+        self._write_once(destination, payload)
+        return f"sha256:{checksum}"
+
     def read_staged(self, job_id: str, checksum: str) -> bytes:
         """按服务端作业 ID 和 checksum 读取暂存内容，不接受用户路径。"""
 

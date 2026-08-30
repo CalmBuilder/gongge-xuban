@@ -32,6 +32,7 @@ from app.api import (
     general_skill_library,
     general_skill_governance,
     general_skill_imports,
+    general_skill_catalog,
     general_skill_runtime,
     knowledge,
     knowledge_bases,
@@ -180,6 +181,7 @@ app.include_router(agents.enterprise_router)
 app.include_router(expert_taxonomy.router)
 app.include_router(general_skills.router)
 app.include_router(general_skill_library.router)
+app.include_router(general_skill_catalog.router)
 app.include_router(general_skill_governance.router)
 app.include_router(general_skill_imports.router)
 app.include_router(general_skill_runtime.router)

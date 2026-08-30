@@ -209,7 +209,7 @@ it('combines expert source department and keyword filters', async () => {
   await screen.findByText('前端开发专家');
   expect(screen.getAllByRole('button', { name: '工程研发，1 位' })).toHaveLength(2);
   await user.click(screen.getAllByRole('button', { name: '工程研发，1 位' })[0]);
-  await user.type(screen.getByRole('textbox', { name: '搜索数字员工' }), 'React');
+  await user.type(screen.getByRole('textbox', { name: '搜索专家' }), 'React');
   expect(screen.getByText('前端开发专家')).toBeInTheDocument();
   expect(screen.queryByText('增长营销专家')).not.toBeInTheDocument();
   expect(screen.queryByText('普通员工')).not.toBeInTheDocument();
@@ -223,7 +223,7 @@ it('shows expert empty state, hides filters elsewhere, and preserves chat callba
   await screen.findByText('前端开发专家');
   await user.click(screen.getByRole('button', { name: /前端开发专家/ }));
   await waitFor(() => expect(onStartChat).toHaveBeenCalled());
-  await user.type(screen.getByRole('textbox', { name: '搜索数字员工' }), '不存在');
+  await user.type(screen.getByRole('textbox', { name: '搜索专家' }), '不存在');
   expect(await screen.findByText('没有匹配的专家')).toBeInTheDocument();
   await user.click(screen.getByRole('tab', { name: '我的员工' }));
   expect(screen.queryByLabelText('专家专业部门')).not.toBeInTheDocument();
@@ -260,7 +260,7 @@ it('separates used owned and gallery relationships without treating usage as own
   expect(screen.getByText('我拥有')).toBeInTheDocument();
 
   await user.click(screen.getByRole('tab', { name: '发现' }));
-  await user.click(screen.getByRole('tab', { name: /数字员工广场/ }));
+  await user.click(screen.getByRole('tab', { name: /数字员工/ }));
   expect(screen.getByRole('button', { name: /常用助手/ })).toBeInTheDocument();
   expect(screen.getByRole('button', { name: /广场助手/ })).toBeInTheDocument();
   expect(screen.queryByRole('button', { name: /我创建的助手/ })).not.toBeInTheDocument();
@@ -296,7 +296,7 @@ it('matches expert specialty in keyword search', async () => {
   await user.click(screen.getByRole('tab', { name: '发现' }));
   await user.click(screen.getByRole('tab', { name: /专家/ }));
   await screen.findByText('数据工程师');
-  await user.type(screen.getByRole('textbox', { name: '搜索数字员工' }), '数据与数据库');
+  await user.type(screen.getByRole('textbox', { name: '搜索专家' }), '数据与数据库');
 
   await waitFor(() => expect(screen.queryByText('前端开发工程师')).not.toBeInTheDocument());
   expect(screen.getByText('数据工程师')).toBeInTheDocument();
@@ -308,7 +308,7 @@ it('hides expert filters and shows a guided empty state when no experts exist', 
   await user.click(screen.getByRole('tab', { name: '发现' }));
   await user.click(screen.getByRole('tab', { name: /专家/ }));
   expect(await screen.findByText('当前没有可用专家')).toBeInTheDocument();
-  expect(screen.getByText('从开放广场复制专家，或由管理员导入专家库后再来看看')).toBeInTheDocument();
+  expect(screen.getByText('从开放平台的专家分类直接使用或复制专家模板，之后可在“我的员工”中管理')).toBeInTheDocument();
   expect(screen.queryByLabelText('专家专业部门')).not.toBeInTheDocument();
   expect(screen.queryByRole('button', { name: '清除筛选' })).not.toBeInTheDocument();
 });
@@ -320,11 +320,11 @@ it('clears expert category and keyword filters from the empty state', async () =
   await user.click(screen.getByRole('tab', { name: /专家/ }));
   await screen.findByText('数据工程师');
   await user.click(screen.getAllByRole('button', { name: '工程研发，1 位' })[0]);
-  await user.type(screen.getByRole('textbox', { name: '搜索数字员工' }), '不存在');
+  await user.type(screen.getByRole('textbox', { name: '搜索专家' }), '不存在');
   expect(await screen.findByText('没有匹配的专家')).toBeInTheDocument();
   await user.click(screen.getByRole('button', { name: '清除筛选' }));
   expect(await screen.findByText('数据工程师')).toBeInTheDocument();
-  expect(screen.getByRole('textbox', { name: '搜索数字员工' })).toHaveValue('');
+  expect(screen.getByRole('textbox', { name: '搜索专家' })).toHaveValue('');
 });
 
 it('adds a gallery employee before chat and can remove usage without deleting history', async () => {
@@ -343,7 +343,7 @@ it('adds a gallery employee before chat and can remove usage without deleting hi
   renderGallery([gallery]);
 
   await user.click(screen.getByRole('tab', { name: '发现' }));
-  await user.click(screen.getByRole('tab', { name: /数字员工广场/ }));
+  await user.click(screen.getByRole('tab', { name: /数字员工/ }));
   await user.click(await screen.findByRole('button', { name: '添加到常用' }));
   await waitFor(() => expect(api.post).toHaveBeenCalledWith(
     '/api/chat/agents/gallery-add/use?tenant_id=tenant_demo',

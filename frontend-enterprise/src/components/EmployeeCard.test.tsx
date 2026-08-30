@@ -124,7 +124,7 @@ describe('EmployeeCard', () => {
 
   it('shows expert source and readiness while isolating the source link', () => {
     const onOpen = renderExpertCard();
-    expect(screen.getByText('专家（能力分身）')).toBeInTheDocument();
+    expect(screen.getByText('专家能力分身')).toBeInTheDocument();
     expect(screen.getByText('Agency Agents')).toBeInTheDocument();
     expect(screen.getByText('前端与客户端')).toBeInTheDocument();
     expect(screen.getByText('部分能力待接入')).toBeInTheDocument();

@@ -81,6 +81,24 @@ GENERAL_SKILL_REVIEW_OUTPUT = {
 GENERAL_SKILL_REPLY_OUTPUT = {"reply": "string"}
 
 
+def _is_guidance_only_catalog_skill(skill: GeneralSkill) -> bool:
+    """识别项目内置的只读指导 Skill，阻断其进入 Python/Bash 代码运行器。"""
+
+    metadata = getattr(skill, "metadata_json", None) or {}
+    runtime_config = getattr(skill, "runtime_config_json", None) or {}
+    return (
+        isinstance(metadata, dict)
+        and metadata.get("managed_catalog") is True
+        and (
+            metadata.get("runtime_mode") == "guidance_only"
+            or (
+                isinstance(runtime_config, dict)
+                and runtime_config.get("runtime") == "guidance_only"
+            )
+        )
+    )
+
+
 class GeneralSkillSelector:
     def decide(
         self,
@@ -176,6 +194,29 @@ class GeneralSkillRunner:
 
         raise_if_cancelled(is_cancelled)
         trace: list[dict[str, Any]] = []
+        if _is_guidance_only_catalog_skill(skill):
+            message = "项目内置 Skill 当前仅提供经审核的指导内容，不允许进入代码运行器。"
+            _emit(
+                trace,
+                {
+                    "phase": "runner_blocked",
+                    "message": message,
+                    "slug": skill.slug,
+                    "reason": "managed_catalog_guidance_only",
+                },
+                event_sink,
+            )
+            return GeneralSkillRunResponse(
+                skill_slug=skill.slug,
+                execution_trace=trace,
+                structured_result={
+                    "success": False,
+                    "error": "managed_catalog_guidance_only",
+                    "retryable": False,
+                },
+                stderr=message,
+                reply=message,
+            )
         max_attempts = max(1, min(max_attempts, GENERAL_SKILL_MAX_ATTEMPTS))
         _emit(trace, {"phase": "skill_loaded", "message": f"已加载通用技能 {skill.name}", "slug": skill.slug}, event_sink)
         try:
