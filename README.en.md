@@ -76,6 +76,12 @@ The loop routes a turn, loads only eligible published revisions, executes or wai
 - **Durable waiting and recovery** — persisted executions, leases, fencing tokens, idempotency keys, retries/backoff, recovery signals, dead letters, and external-effect reconciliation protect waiting work and late workers.
 - **From personal productivity to organizational reuse** — chat, administration, gallery, work items, audit, traces, schedules, memory, and feedback share one platform so a proven personal method can become a governed organizational asset.
 
+### Supporting integration: WeCom as an employee work entry point
+
+The WeCom external connection brings the platform into an employee's existing workflow. Employees can start a question or task in a custom WeCom application conversation; callback verification, sender mapping, and Agent routing then hand it to the same Agent Loop. Results can return to WeCom while the platform retains the Execution, audit trail, and external-call receipt.
+
+Connection profiles verify and rotate CorpID, AgentId, Secret, callback Token, and EncodingAESKey, while tenant, profile, and per-Agent bindings constrain what can run. The default grant is minimal read-only access; `wecom.message_send` is a separately enabled, approved, and reconciled external-write action. This is an important adoption channel for SOPs and dynamic tasks—not a second execution semantic.
+
 ## Good fits
 
 | Need | Recommended composition |
@@ -132,6 +138,7 @@ Lifecycle commands are `./app.sh`, `./app.sh status`, and `./app.sh stop` on mac
 - [`backend/app/dynamic_tasks/`](backend/app/dynamic_tasks/) — plans, capability snapshots, recovery worker, verification
 - [`backend/app/general_skills/`](backend/app/general_skills/) — import, review, publication, revisions, runtime
 - [`backend/app/knowledge/`](backend/app/knowledge/) — ingestion, retrieval, concepts, citations
+- [`backend/app/connectors/`](backend/app/connectors/) — WeCom/Slack connections, callbacks, Agent bindings, and governed sends
 - [`frontend-enterprise/`](frontend-enterprise/) — React and TypeScript workbench
 - [`packaging/`](packaging/) — desktop builds and frozen-runtime validation
 

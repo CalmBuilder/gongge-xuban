@@ -116,6 +116,12 @@ SOP 与 DynamicTask 都把重要进展写入持久执行记录。租约、fencin
 
 同一平台包含对话工作台、数字员工与资源管理、开放广场、工作项/关注中心、执行追踪、管理审计、定时任务、记忆和反馈。成熟的个人方法可以变成团队可发布的 Skill、SOP 或数字员工，组织仍能保留版本、授权和使用记录。
 
+### 补充：企业微信作为员工工作入口
+
+企业微信外部连接把平台能力带到员工已有的工作场景中：员工可以在企业微信自建应用会话里直接向绑定的数字员工发起问题或任务，消息经过回调验签、发送者映射和 Agent 路由后，进入同一条 Agent Loop。执行结果可以返回企业微信，系统内同时保留 Execution、审计和外部调用回执。
+
+连接档案支持 CorpID、AgentId、Secret 以及回调 Token/EncodingAESKey 的验证和轮换，并按租户、连接档案和数字员工绑定限制能力。默认采用最小只读授权；`wecom.message_send` 属于单独开启、审批和外部效果对账的外部写动作。它是企业落地的重要工作入口，也是 SOP 与动态任务触达员工现有工作场景的一种方式，而不是另一套执行语义。
+
 ## 典型落点
 
 | 场景类型 | 推荐组合 | 例子 |
@@ -227,6 +233,7 @@ cd backend
 | [`backend/app/dynamic_tasks/`](backend/app/dynamic_tasks/) | 动态计划、能力快照、持久执行、恢复 worker 与结果验证 |
 | [`backend/app/general_skills/`](backend/app/general_skills/) | Skill 导入、审核、发布、版本、资格解析与 runner |
 | [`backend/app/knowledge/`](backend/app/knowledge/) | 知识库、解析、检索、概念与引用 |
+| [`backend/app/connectors/`](backend/app/connectors/) | 企业微信/Slack 外部连接、回调消息、Agent 绑定与受控外发 |
 | [`backend/app/observability/`](backend/app/observability/) | Trace、Span、事件和运行观测 |
 | [`frontend-enterprise/`](frontend-enterprise/) | React + TypeScript 企业工作台 |
 | [`packaging/`](packaging/) | 桌面构建、签名和冻结版验证 |
