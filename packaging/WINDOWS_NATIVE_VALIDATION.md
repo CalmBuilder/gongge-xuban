@@ -9,8 +9,9 @@ Windows PE 产物、Inno Setup 安装行为、Windows 用户目录和 taskbar �
 在仓库根目录打开 Windows PowerShell，准备以下工具：
 
 1. Python 3.11+（x64）和 Node.js；
-2. Inno Setup 6，并让 `ISCC.exe` 位于默认安装目录或通过 `ISCC` 指定；官方下载页为
-   <https://jrsoftware.org/isdl.php>，也可使用 `winget install --id JRSoftware.InnoSetup -e -s winget -i`；
+2. Inno Setup 6 或 7，并让 `ISCC.exe` 位于脚本可识别的默认目录，或通过 `ISCC` 环境变量指定；
+   官方下载页为 <https://jrsoftware.org/isdl.php>，也可使用
+   `winget install --id JRSoftware.InnoSetup -e -s winget -i`；
 3. Windows SDK（仅公开发布或配置签名时需要 `signtool.exe`）；
 4. 可访问 GitHub release 和 Python/npm 包源的网络。
 
@@ -18,6 +19,8 @@ Windows PE 产物、Inno Setup 安装行为、Windows 用户目录和 taskbar �
 
 ```powershell
 $env:VERSION = "0.1.0"
+# 如果 Inno Setup 安装在自定义目录，请先指定 ISCC.exe，例如：
+# $env:ISCC = "C:\Inno Setup 7\ISCC.exe"
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File packaging\build_windows.ps1
 ```
 
@@ -31,7 +34,9 @@ PowerShell 后重试，或者在 cmd 中先执行 `set VERSION=0.1.0`，再调�
 PyInstaller 的 `--clean` 生成并校验 PE machine=`0x8664` 的 x64 可执行文件，最后生成
 `packaging\out\Gongge-Xuban-windows-x64-setup.exe`，并自动调用
 `packaging\smoke_windows.ps1`。未配置证书时只允许本地 unsigned 验证，脚本会明确
-打印 `UNSIGNED`；公开发布必须配置 Authenticode 证书并通过签名校验。
+打印 `UNSIGNED`；公开发布必须配置 Authenticode 证书并通过签名校验。构建阶段还会显式
+收集并验证 `pydantic_core\_pydantic_core*.pyd`，安装后的 Smoke 测试会再次确认该扩展
+存在后才启动冻结版服务。
 
 ## 自动门禁
 
@@ -155,7 +160,8 @@ Get-Content "$env:APPDATA\Gongge-Xuban\logs\gongge-xuban.log" -Tail 100
 通过受控介质传输并校验签名。不要从不明镜像下载编译器。
 
 安装后若构建仍提示 `Inno Setup 6 was not found`，先确认编译器存在，再把完整路径传给
-脚本支持的 `ISCC` 环境变量：
+脚本支持的 `ISCC` 环境变量。脚本会优先使用当前 PowerShell 会话中的 `$env:ISCC`，因此
+自定义目录（例如 `C:\Inno Setup 7`）应显式设置为其中的 `ISCC.exe`：
 
 ```powershell
 Get-ChildItem "$env:ProgramFiles", "${env:ProgramFiles(x86)}", "$env:LOCALAPPDATA\Programs" `
@@ -163,14 +169,52 @@ Get-ChildItem "$env:ProgramFiles", "${env:ProgramFiles(x86)}", "$env:LOCALAPPDAT
   Select-Object -First 5 -ExpandProperty FullName
 
 $env:ISCC = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
-Test-Path $env:ISCC
+# Inno Setup 7 的自定义安装目录示例：
+# $env:ISCC = "C:\Inno Setup 7\ISCC.exe"
+if (-not (Test-Path -LiteralPath $env:ISCC)) {
+  throw "ISCC.exe was not found at $env:ISCC"
+}
 & $env:ISCC /?
 ```
 
-如果安装的是 Inno Setup 7，脚本不会假定其目录名；请将 `$env:ISCC` 指向实际的
-`ISCC.exe` 后再构建，并先用同一版本完成一次本地冒烟。若安装器下载后无法运行，先在
-文件属性中核对数字签名和发布者，再处理 Windows SmartScreen 提示；不要通过关闭系统
-安全防护来绕过校验。
+如果安装的是 Inno Setup 7，脚本不会假定其目录名，也不会从网络自动下载；请将
+`$env:ISCC` 指向实际的 `ISCC.exe` 后再构建，并先用同一版本完成一次本地冒烟。若不确定
+文件位置，可执行：
+
+```powershell
+Get-ChildItem "C:\Inno Setup 7", "$env:ProgramFiles", "${env:ProgramFiles(x86)}", `
+  "$env:LOCALAPPDATA\Programs" -Filter ISCC.exe -Recurse -ErrorAction SilentlyContinue |
+  Select-Object -First 5 -ExpandProperty FullName
+```
+
+若希望后续 PowerShell 会话自动识别自定义安装目录，可设置用户级环境变量；设置后需重新
+打开 PowerShell：
+
+```powershell
+[Environment]::SetEnvironmentVariable("ISCC", "C:\Inno Setup 7\ISCC.exe", "User")
+```
+
+若安装器下载后无法运行，先在文件属性中核对数字签名和发布者，再处理 Windows SmartScreen
+提示；不要通过关闭系统安全防护来绕过校验。
+
+### 冻结版启动时报 `pydantic_core._pydantic_core` 缺失
+
+`pydantic-core` 是 Pydantic v2 的 Rust 原生扩展，Windows wheel 中对应的文件通常是
+`_pydantic_core.cp311-win_amd64.pyd` 或 `_pydantic_core.cp313-win_amd64.pyd`。开发环境中
+`pydantic` 能正常导入，并不代表该 `.pyd` 已进入 PyInstaller 冻结包。项目依赖允许
+`pydantic>=2.7.0`，重新创建环境时可能解析到不同的 Pydantic/PyInstaller 组合，因此旧版本
+曾经成功不代表新版本仍会被隐式识别。
+
+当前 spec 已显式收集 `pydantic_core` 的模块和原生扩展；构建后可在仓库根目录检查：
+
+```powershell
+Get-ChildItem .\packaging\out\gongge-xuban `
+  -Recurse -Filter "_pydantic_core*.pyd"
+```
+
+没有任何输出时不要发布安装器，应使用当前提交重新执行完整构建。若文件存在但仍无法导入，
+再检查其 Python ABI、PE machine 是否为 AMD64，以及依赖 DLL 是否齐全；不要从其他 Python
+环境手工复制 `.pyd` 到安装目录。
 
 如果 `ISCC.exe` 能单独执行但构建仍失败，确认是在仓库根目录运行
 `packaging\build_windows.ps1`，并检查 `packaging\installer\gongge-xuban.iss` 的

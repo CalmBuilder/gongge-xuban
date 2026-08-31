@@ -162,6 +162,22 @@ function Clear-ApplicationBuildOutput {
   }
 }
 
+function Assert-BundledPydanticCore {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Root
+  )
+
+  $nativeModules = @(Get-ChildItem -LiteralPath $Root -Recurse -File -Filter "_pydantic_core*.pyd")
+  if ($nativeModules.Count -eq 0) {
+    throw "PyInstaller output is missing pydantic_core/_pydantic_core*.pyd. Rebuild with the current packaging spec."
+  }
+  foreach ($nativeModule in $nativeModules) {
+    Assert-PeX64 $nativeModule.FullName
+  }
+  Write-Host "Pydantic core native extension verified: $($nativeModules.Count) file(s)"
+}
+
 function ConvertTo-WindowsVersionInfoVersion {
   param(
     [Parameter(Mandatory = $true)]
@@ -248,6 +264,7 @@ Push-Location backend
 Assert-NativeCommandSucceeded "PyInstaller build"
 Pop-Location
 Assert-PeX64 "packaging\out\gongge-xuban\gongge-xuban.exe"
+Assert-BundledPydanticCore "packaging\out\gongge-xuban"
 
 $signingConfigured = Test-SigningConfigured
 if ($signingConfigured) {

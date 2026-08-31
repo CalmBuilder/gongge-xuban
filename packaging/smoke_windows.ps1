@@ -129,6 +129,19 @@ function Invoke-RuntimeProbe {
   }
 }
 
+function Assert-InstalledPydanticCore {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$InstallDirectory
+  )
+
+  $nativeModules = @(Get-ChildItem -LiteralPath $InstallDirectory -Recurse -File -Filter "_pydantic_core*.pyd")
+  if ($nativeModules.Count -eq 0) {
+    throw "Installed package is missing pydantic_core/_pydantic_core*.pyd."
+  }
+  Write-Host "OK: installed pydantic core native extension found ($($nativeModules.Count) file(s))"
+}
+
 if (-not [Environment]::Is64BitOperatingSystem) {
   throw "The Windows package is x64-only; a 64-bit Windows OS is required."
 }
@@ -170,6 +183,7 @@ try {
   if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
     throw "Installed executable was not found: $executable"
   }
+  Assert-InstalledPydanticCore $installDirectory
 
   $runtimePython = Join-Path $installDirectory "runtime\python.exe"
   if (-not (Test-Path -LiteralPath $runtimePython -PathType Leaf)) {

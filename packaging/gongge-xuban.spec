@@ -1,9 +1,18 @@
-# packaging/gongge-xuban.spec
+# PyInstaller injects Analysis/PYZ/EXE/COLLECT/BUNDLE into spec-file globals.
+# ruff: noqa: F821
+"""
+@Time       : 2026/08/31
+@Author     : zhanglp8181
+@File       : gongge-xuban.spec
+@CallChain  : build_windows.ps1/build_linux.sh/build_macos.sh → PyInstaller → 冻结版桌面应用
+@Description: 定义跨平台桌面冻结包的入口、资源、动态依赖和应用元数据。
+"""
+
 # 运行：cd backend && pyinstaller ../packaging/gongge-xuban.spec --noconfirm
 import os
 import sys
 from pathlib import Path
-from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, collect_submodules
 
 BACKEND = Path.cwd()                      # 约定在 backend/ 下执行
 REPO = BACKEND.parent
@@ -29,10 +38,20 @@ datas = [
     (str(BACKEND / "mock_servers"), "mock_servers"),
 ] + collect_data_files("tzdata")
 
+# pydantic-core 以 Rust 原生扩展提供 Pydantic v2 的核心实现。不同版本的
+# wheel 文件名和 Python ABI 会变化，不能只依赖 PyInstaller 对 pydantic 的
+# 静态导入推断；显式收集模块和各平台原生扩展，保证 Windows 的 .pyd、macOS
+# 的 .dylib/.so 以及 Linux 的 .so 都进入冻结包。
+pydantic_core_binaries = collect_dynamic_libs(
+    "pydantic_core",
+    search_patterns=["*.pyd", "*.dll", "*.dylib", "*.so"],
+)
+
 hiddenimports = (
     collect_submodules("uvicorn")
     + collect_submodules("sqlmodel")
     + collect_submodules("app")
+    + collect_submodules("pydantic_core")
     + [
         # 顶层单文件模块：uvicorn 用字符串 "single_port_app:app" 运行时动态 import
         "single_port_app",
@@ -52,7 +71,7 @@ if sys.platform == "darwin":
 a = Analysis(
     [str(BACKEND / "desktop_launcher.py")],
     pathex=[str(BACKEND)],
-    binaries=[],
+    binaries=pydantic_core_binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],

@@ -95,6 +95,22 @@ def test_windows_build_has_native_installation_smoke_gate() -> None:
         assert marker in smoke_script
 
 
+def test_windows_packaging_collects_pydantic_core_extension() -> None:
+    """验证 Windows 冻结包显式携带 Pydantic v2 的原生核心扩展。"""
+
+    spec = (PACKAGING / "gongge-xuban.spec").read_text(encoding="utf-8")
+    build_script = (PACKAGING / "build_windows.ps1").read_text(encoding="utf-8")
+    smoke_script = (PACKAGING / "smoke_windows.ps1").read_text(encoding="utf-8")
+
+    assert "collect_dynamic_libs" in spec
+    assert 'collect_submodules("pydantic_core")' in spec
+    assert 'search_patterns=["*.pyd", "*.dll", "*.dylib", "*.so"]' in spec
+    assert "pydantic_core_binaries" in spec
+    assert "Assert-BundledPydanticCore" in build_script
+    assert "_pydantic_core*.pyd" in build_script
+    assert "Assert-InstalledPydanticCore" in smoke_script
+
+
 def test_macos_build_aligns_dependencies_and_smoke_tests_signed_app() -> None:
     """验证 macOS 构建不会复用失配依赖，并在制 DMG 前启动签名后的应用。"""
 
