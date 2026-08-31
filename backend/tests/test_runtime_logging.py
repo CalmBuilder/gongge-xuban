@@ -90,3 +90,25 @@ def test_uncaught_exception_log_excludes_exception_message(monkeypatch, tmp_path
         assert str(Path(__file__).resolve().parent) not in log_content
     finally:
         runtime_logging.shutdown_runtime_logging()
+
+
+def test_uncaught_import_error_log_includes_safe_diagnostic(monkeypatch, tmp_path: Path) -> None:
+    """导入失败需要保留模块名，才能定位冻结包中的原生扩展问题。"""
+
+    monkeypatch.setenv("GONGGE_XUBAN_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(runtime_logging, "_configured_path", None)
+
+    try:
+        log_path = runtime_logging.configure_runtime_logging()
+        try:
+            raise ModuleNotFoundError("No module named 'pydantic_core._pydantic_core'")
+        except ModuleNotFoundError:
+            exc_type, exc_value, exc_traceback = sys.exc_info()
+            sys.excepthook(exc_type, exc_value, exc_traceback)
+        runtime_logging.shutdown_runtime_logging()
+
+        log_content = log_path.read_text(encoding="utf-8")
+        assert "type=ModuleNotFoundError" in log_content
+        assert "pydantic_core._pydantic_core" in log_content
+    finally:
+        runtime_logging.shutdown_runtime_logging()

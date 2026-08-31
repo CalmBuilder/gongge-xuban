@@ -177,20 +177,33 @@ def _install_exception_hooks() -> None:
             sys.__excepthook__(exc_type, exc_value, traceback)
             return
         logging.getLogger("gongge_xuban.crash").critical(
-            "Unhandled process exception type=%s\n%s",
+            "Unhandled process exception type=%s%s\n%s",
             exc_type.__name__,
+            _safe_import_exception_detail(exc_value),
             _format_stack(traceback),
         )
 
     def log_thread_exception(args: threading.ExceptHookArgs) -> None:
         logging.getLogger("gongge_xuban.crash").critical(
-            "Unhandled thread exception type=%s\n%s",
+            "Unhandled thread exception type=%s%s\n%s",
             args.exc_type.__name__,
+            _safe_import_exception_detail(args.exc_value),
             _format_stack(args.exc_traceback),
         )
 
     sys.excepthook = log_process_exception
     threading.excepthook = log_thread_exception
+
+
+def _safe_import_exception_detail(exc_value: BaseException | None) -> str:
+    """只为导入错误记录截断后的异常消息，便于诊断冻结包且避免泛化记录业务异常内容。"""
+
+    if not isinstance(exc_value, (ImportError, ModuleNotFoundError)):
+        return ""
+    detail = str(exc_value).replace("\r", " ").replace("\n", " ").strip()
+    if not detail:
+        return ""
+    return f" detail={detail[:512]}"
 
 
 def _format_stack(traceback) -> str:

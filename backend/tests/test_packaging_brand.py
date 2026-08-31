@@ -104,11 +104,17 @@ def test_windows_packaging_collects_pydantic_core_extension() -> None:
 
     assert "collect_dynamic_libs" in spec
     assert 'collect_submodules("pydantic_core")' in spec
+    assert '"pydantic_core._pydantic_core"' in spec
+    assert 'destdir="pydantic_core"' in spec
     assert 'search_patterns=["*.pyd", "*.dll", "*.dylib", "*.so"]' in spec
     assert "pydantic_core_binaries" in spec
+    assert (PACKAGING / "runtime_hooks/pyi_rth_pydantic_core.py").is_file()
+    assert "pyi_rth_pydantic_core.py" in spec
     assert "Assert-BundledPydanticCore" in build_script
     assert "_pydantic_core*.pyd" in build_script
     assert "Assert-InstalledPydanticCore" in smoke_script
+    assert "Directory.Name -ieq \"pydantic_core\"" in build_script
+    assert "Directory.Name -ieq \"pydantic_core\"" in smoke_script
 
 
 def test_macos_build_aligns_dependencies_and_smoke_tests_signed_app() -> None:

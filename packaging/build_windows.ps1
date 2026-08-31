@@ -168,12 +168,14 @@ function Assert-BundledPydanticCore {
     [string]$Root
   )
 
-  $nativeModules = @(Get-ChildItem -LiteralPath $Root -Recurse -File -Filter "_pydantic_core*.pyd")
+  $nativeModules = @(Get-ChildItem -LiteralPath $Root -Recurse -File -Filter "_pydantic_core*.pyd" |
+    Where-Object { $_.Directory.Name -ieq "pydantic_core" })
   if ($nativeModules.Count -eq 0) {
-    throw "PyInstaller output is missing pydantic_core/_pydantic_core*.pyd. Rebuild with the current packaging spec."
+    throw "PyInstaller output is missing pydantic_core\_pydantic_core*.pyd under the pydantic_core package directory. Rebuild with the current packaging spec."
   }
   foreach ($nativeModule in $nativeModules) {
     Assert-PeX64 $nativeModule.FullName
+    Write-Host "Pydantic core native extension path: $($nativeModule.FullName)"
   }
   Write-Host "Pydantic core native extension verified: $($nativeModules.Count) file(s)"
 }

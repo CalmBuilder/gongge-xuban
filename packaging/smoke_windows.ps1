@@ -135,9 +135,13 @@ function Assert-InstalledPydanticCore {
     [string]$InstallDirectory
   )
 
-  $nativeModules = @(Get-ChildItem -LiteralPath $InstallDirectory -Recurse -File -Filter "_pydantic_core*.pyd")
+  $nativeModules = @(Get-ChildItem -LiteralPath $InstallDirectory -Recurse -File -Filter "_pydantic_core*.pyd" |
+    Where-Object { $_.Directory.Name -ieq "pydantic_core" })
   if ($nativeModules.Count -eq 0) {
-    throw "Installed package is missing pydantic_core/_pydantic_core*.pyd."
+    throw "Installed package is missing pydantic_core\_pydantic_core*.pyd under the pydantic_core package directory."
+  }
+  foreach ($nativeModule in $nativeModules) {
+    Write-Host "OK: installed pydantic core native extension path: $($nativeModule.FullName)"
   }
   Write-Host "OK: installed pydantic core native extension found ($($nativeModules.Count) file(s))"
 }
@@ -213,8 +217,9 @@ try {
 
   $health = $null
   for ($attempt = 1; $attempt -le 90; $attempt++) {
+    $process.Refresh()
     if ($process.HasExited) {
-      throw "Installed executable exited before health became ready (code $($process.ExitCode))."
+      throw "Installed executable exited before health became ready (code $($process.ExitCode)). Diagnostics: $tempRoot; stdout=$stdoutPath; stderr=$stderrPath; runtimeLog=$(Join-Path $dataDirectory 'logs\gongge-xuban.log')"
     }
     try {
       $health = Invoke-RestMethod -Uri "http://127.0.0.1:$port/api/health" -TimeoutSec 3
@@ -227,7 +232,7 @@ try {
     Start-Sleep -Seconds 1
   }
   if ($null -eq $health -or $health.status -ne "ok" -or $health.product_id -ne "gongge-xuban") {
-    throw "Installed executable did not expose the expected product health response."
+    throw "Installed executable did not expose the expected product health response. Diagnostics: $tempRoot; stdout=$stdoutPath; stderr=$stderrPath; runtimeLog=$(Join-Path $dataDirectory 'logs\gongge-xuban.log')"
   }
 
   $chat = Invoke-WebRequest -Uri "http://127.0.0.1:$port/chat/" -UseBasicParsing -TimeoutSec 5

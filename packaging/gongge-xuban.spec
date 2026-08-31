@@ -44,6 +44,7 @@ datas = [
 # 的 .dylib/.so 以及 Linux 的 .so 都进入冻结包。
 pydantic_core_binaries = collect_dynamic_libs(
     "pydantic_core",
+    destdir="pydantic_core",
     search_patterns=["*.pyd", "*.dll", "*.dylib", "*.so"],
 )
 
@@ -53,6 +54,9 @@ hiddenimports = (
     + collect_submodules("app")
     + collect_submodules("pydantic_core")
     + [
+        # pydantic_core.__init__ 通过相对导入加载 Rust 扩展；显式保留完整模块名，
+        # 防止不同 PyInstaller/Python 组合只收集到包代码而漏掉扩展模块。
+        "pydantic_core._pydantic_core",
         # 顶层单文件模块：uvicorn 用字符串 "single_port_app:app" 运行时动态 import
         "single_port_app",
         "cryptography", "certifi", "python_multipart", "docx", "pypdf", "PIL", "PIL.Image", "bs4", "openai",
@@ -75,7 +79,7 @@ a = Analysis(
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
-    runtime_hooks=[],
+    runtime_hooks=[str(REPO / "packaging" / "runtime_hooks" / "pyi_rth_pydantic_core.py")],
     excludes=["tkinter"],
     noarchive=False,
 )

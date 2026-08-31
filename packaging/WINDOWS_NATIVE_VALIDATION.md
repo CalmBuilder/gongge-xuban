@@ -205,12 +205,19 @@ Get-ChildItem "C:\Inno Setup 7", "$env:ProgramFiles", "${env:ProgramFiles(x86)}"
 `pydantic>=2.7.0`，重新创建环境时可能解析到不同的 Pydantic/PyInstaller 组合，因此旧版本
 曾经成功不代表新版本仍会被隐式识别。
 
-当前 spec 已显式收集 `pydantic_core` 的模块和原生扩展；构建后可在仓库根目录检查：
+当前 spec 已显式收集 `pydantic_core` 的模块和原生扩展，并把扩展固定放到冻结包的
+`pydantic_core` 包目录；冻结启动钩子还会按完整模块名
+`pydantic_core._pydantic_core` 预加载它，避免“文件存在但包路径未被解释器解析”。构建后可在仓库根目录检查：
 
 ```powershell
 Get-ChildItem .\packaging\out\gongge-xuban `
   -Recurse -Filter "_pydantic_core*.pyd"
 ```
+
+输出必须位于 `pydantic_core` 目录下。Smoke 测试会打印完整路径，并在冻结启动前验证该目录；
+若安装包日志仍失败，查看诊断目录中的 `data\logs\gongge-xuban.log`，其中会保留
+`ModuleNotFoundError`/`ImportError` 的模块详情和扩展路径。只看到 `.pyd` 文件或 Inno Setup
+编译成功，均不等于冻结版可导入。
 
 没有任何输出时不要发布安装器，应使用当前提交重新执行完整构建。若文件存在但仍无法导入，
 再检查其 Python ABI、PE machine 是否为 AMD64，以及依赖 DLL 是否齐全；不要从其他 Python
