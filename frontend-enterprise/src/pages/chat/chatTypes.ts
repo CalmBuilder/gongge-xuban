@@ -66,6 +66,9 @@ export type ComposerAttachment = ChatAttachmentRead & {
 
 export type ComposerInteractionMode = 'normal' | 'scheduled_task';
 
+/** 对话页本轮执行引擎；auto 保持既有 SOP/普通能力自动路由。 */
+export type ChatExecutionEngine = 'auto' | 'dynamic_task';
+
 export type GeneralSkillInstallIntentRead = {
   id: string;
   session_id: string;

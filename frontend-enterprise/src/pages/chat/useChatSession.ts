@@ -122,6 +122,7 @@ import {
   createEmptySlot,
   createStreamSlot,
   createTurnTrace,
+  type ChatExecutionEngine,
   type ComposerAttachment,
   type ComposerInteractionMode,
   type GeneralSkillInstallIntentRead,
@@ -148,6 +149,11 @@ const SCHEDULE_WEEKDAY_LABELS = ['周一', '周二', '周三', '周四', '周五
 const ENTERPRISE_SIDEBAR_STORAGE_KEY = 'gongge_enterprise_sidebar_expanded';
 const MISSING_MODEL_CONFIG_PATTERN = /missing_model_config|missing model config|没有默认模型配置|没有可用模型|模型配置不存在|模型未配置/i;
 const MODEL_CONFIGS_UPDATED_EVENT = 'gongge-enterprise-model-configs-updated';
+const EXECUTION_ENGINE_STORAGE_PREFIX = 'gongge-chat-execution-engine';
+
+function executionEngineStorageKey(tenantId: string, userId: string): string {
+  return `${EXECUTION_ENGINE_STORAGE_PREFIX}:${tenantId || 'default'}:${userId || 'anonymous'}`;
+}
 
 type AttachmentStatusRead = {
   ingestion_status: ChatAttachmentRead['ingestion_status'];
@@ -203,6 +209,7 @@ function queuedTurnPreview(turn: PreparedChatTurn): ChatMessage {
       queued: true,
       ...(turn.attachments.length ? { attachments: turn.attachments } : {}),
       ...(turn.interactionMode === 'scheduled_task' ? { interaction_mode: 'scheduled_task' } : {}),
+      ...(turn.executionEngine === 'dynamic_task' ? { execution_engine: 'dynamic_task' } : {}),
     },
     created_at: turn.createdAt,
   };
@@ -362,6 +369,11 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
   const [composerDragActive, setComposerDragActive] = useState(false);
   const [composerPlusOpen, setComposerPlusOpen] = useState(false);
   const [composerIntent, setComposerIntent] = useState<Exclude<ComposerInteractionMode, 'normal'> | null>(null);
+  const [executionEngine, setExecutionEngine] = useState<ChatExecutionEngine>(() => (
+    window.localStorage.getItem(executionEngineStorageKey(tenantId, userId)) === 'dynamic_task'
+      ? 'dynamic_task'
+      : 'auto'
+  ));
   const [sessionGeneralSkills, setSessionGeneralSkills] = useState<SessionGeneralSkillCatalogRead['items']>([]);
   const [generalSkillInstallOpen, setGeneralSkillInstallOpen] = useState(false);
   const [generalSkillInstallIntents, setGeneralSkillInstallIntents] = useState<GeneralSkillInstallIntentRead[]>([]);
@@ -638,6 +650,11 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     )),
     [],
   );
+
+  const changeExecutionEngine = useCallback((value: ChatExecutionEngine) => {
+    setExecutionEngine(value);
+    window.localStorage.setItem(executionEngineStorageKey(tenantId, userId), value);
+  }, [tenantId, userId]);
 
   const refreshGeneralSkillInstallIntents = useCallback(async () => {
     if (!sessionId) return;
@@ -3166,6 +3183,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
         attachments: outgoingAttachments.map(toRequestAttachment),
         channel: 'web',
         interaction_mode: resolvedInteractionMode,
+        execution_engine: prepared.executionEngine || 'auto',
         client_timezone: getClientTimeZone(),
         model_config_id: prepared.modelConfigId,
       };
@@ -3351,6 +3369,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       text: input.trim(),
       attachments: readyComposerAttachments,
       interactionMode: resolvedInteractionMode,
+      executionEngine,
       modelConfigId: selectedModelConfig?.id,
       forcedGeneralSkillId: selectedGeneralSkillId || undefined,
       forcedGeneralSkillIds: selectedGeneralSkillIds.length ? selectedGeneralSkillIds : undefined,
@@ -3380,6 +3399,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     currentSessionRunning,
     displayedAgent?.id,
     enqueuePreparedTurn,
+    executionEngine,
     ensureModelAvailable,
     executePreparedTurn,
     getStreamSlot,
@@ -3547,6 +3567,8 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     setComposerPlusOpen,
     composerIntent,
     setComposerIntent,
+    executionEngine,
+    setExecutionEngine: changeExecutionEngine,
     sessionGeneralSkills,
     generalSkillCatalogLoading,
     generalSkillCatalogError,
@@ -3573,6 +3595,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     tenantId,
     canConfigureModels,
     modelConfigsLoading,
+    modelConfigsLoadError,
     modelSetupOpen,
     setModelSetupOpen,
     completeModelSetup,

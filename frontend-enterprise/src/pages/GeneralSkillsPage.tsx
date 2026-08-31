@@ -703,13 +703,21 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
     }
     setAgentImportLoading(true);
     try {
-      await api.post(`/api/enterprise/agents/${encodeURIComponent(agentId)}/resources/import`, {
+      const result = await api.post<{ imported?: unknown[]; missing?: unknown[] }>(
+        `/api/enterprise/agents/${encodeURIComponent(agentId)}/resources/import`, {
         tenant_id: getRequestTenantId(),
         source_agent_id: agentImportSourceAgentId,
         resource_type: 'general_skill',
         resource_ids: agentImportSelectedSkillIds,
-      });
-      notify.success(`已复制 ${agentImportSelectedSkillIds.length} 个技能`);
+        },
+      );
+      const imported = Array.isArray(result?.imported) ? result.imported : null;
+      const missingCount = Array.isArray(result?.missing) ? result.missing.length : 0;
+      if (imported && imported.length === 0) {
+        notify.error(missingCount ? '所选 Skill 当前不可复制，请刷新后重试' : '没有 Skill 被复制');
+        return;
+      }
+      notify.success(`已复制 ${imported?.length || agentImportSelectedSkillIds.length} 个技能`);
       setAgentImportOpen(false);
       await load();
     } catch (error) {
@@ -2964,13 +2972,21 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
     }
     setAgentImportLoading(true);
     try {
-      await api.post(`/api/enterprise/agents/${encodeURIComponent(agentId)}/resources/import`, {
+      const result = await api.post<{ imported?: unknown[]; missing?: unknown[] }>(
+        `/api/enterprise/agents/${encodeURIComponent(agentId)}/resources/import`, {
         tenant_id: getRequestTenantId(),
         source_agent_id: agentImportSourceAgentId,
         resource_type: 'general_skill',
         resource_ids: agentImportSelectedSkillIds,
-      });
-      notify.success(`已复制 ${agentImportSelectedSkillIds.length} 个技能`);
+        },
+      );
+      const imported = Array.isArray(result?.imported) ? result.imported : null;
+      const missingCount = Array.isArray(result?.missing) ? result.missing.length : 0;
+      if (imported && imported.length === 0) {
+        notify.error(missingCount ? '所选 Skill 当前不可复制，请刷新后重试' : '没有 Skill 被复制');
+        return;
+      }
+      notify.success(`已复制 ${imported?.length || agentImportSelectedSkillIds.length} 个技能`);
       setAgentImportOpen(false);
       await load();
     } catch (error) {

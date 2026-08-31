@@ -19,9 +19,11 @@ BACKEND = Path.cwd()                      # 约定在 backend/ 下执行
 REPO = BACKEND.parent
 DIST = REPO / "frontend-enterprise" / "dist"
 ASSETS = REPO / "packaging" / "assets"
+BUILTIN_EXPERT_FIXTURE = BACKEND / "app" / "experts" / "data" / "agency_agents_builtin_v2.json"
 ICNS = ASSETS / "gongge-xuban.icns"
 ICO = ASSETS / "gongge-xuban.ico"
 assert DIST.exists(), "先构建前端：npm --prefix frontend-enterprise run build"
+assert BUILTIN_EXPERT_FIXTURE.is_file(), "内置专家固定包缺失：请检查 backend/app/experts/data"
 
 RAW_VERSION = os.environ.get("VERSION", "0.1.0").strip() or "0.1.0"
 BUNDLE_VERSION = RAW_VERSION[1:] if RAW_VERSION.startswith("v") else RAW_VERSION
@@ -36,6 +38,7 @@ datas = [
     (str(ASSETS / "gongge-xuban.png"), "packaging/assets"),
     (str(BACKEND / "app" / "llm" / "prompts"), "app/llm/prompts"),
     (str(BACKEND / "app" / "db" / "seed_fixtures"), "app/db/seed_fixtures"),
+    (str(BUILTIN_EXPERT_FIXTURE), "app/experts/data"),
     (str(BACKEND / "mock_servers"), "mock_servers"),
 ] + collect_data_files("tzdata")
 

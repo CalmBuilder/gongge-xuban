@@ -4,6 +4,7 @@ import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { beforeEach, expect, it, vi } from 'vitest';
 
 import { api } from '../api/client';
+import type { EnterpriseAuthUser } from '../auth';
 import { I18nProvider } from '../i18n';
 import type { AgentProfileRead, GeneralSkillRead, KnowledgeBaseRead } from '../types';
 import OpenPlatformPage from './OpenPlatformPage';
@@ -26,6 +27,22 @@ const galleryAgent: AgentProfileRead = {
   resources: [],
   created_at: '2026-08-01T00:00:00Z',
   updated_at: '2026-08-01T00:00:00Z',
+};
+
+const ownedAgent: AgentProfileRead = {
+  ...galleryAgent,
+  id: 'owned-agent',
+  name: '我的能力分身',
+  published_to_gallery: false,
+  owner_user_id: 'member-user',
+  manageable_by_current_user: true,
+};
+
+const provisionedAgent: AgentProfileRead = {
+  ...ownedAgent,
+  id: 'provisioned-agent',
+  name: '新用户的能力分身',
+  owner_user_id: 'new-member',
 };
 
 const galleryExpert: AgentProfileRead = {
@@ -83,13 +100,16 @@ const galleryGeneralSkill: GeneralSkillRead = {
   updated_at: '2026-08-01T00:00:00Z',
 };
 
-function renderPage(initialEntry = '/enterprise/platform') {
+function renderPage(
+  initialEntry = '/enterprise/platform',
+  currentUser?: EnterpriseAuthUser,
+) {
   render(
     <I18nProvider>
       <MemoryRouter initialEntries={[initialEntry]}>
         <Routes>
-          <Route path="/enterprise/platform" element={<OpenPlatformPage />} />
-          <Route path="/enterprise/platform/:kind" element={<OpenPlatformPage />} />
+          <Route path="/enterprise/platform" element={<OpenPlatformPage currentUser={currentUser} />} />
+          <Route path="/enterprise/platform/:kind" element={<OpenPlatformPage currentUser={currentUser} />} />
           <Route path="/enterprise/general-skills/catalog/:slug" element={<div>Skill 详情路由</div>} />
         </Routes>
       </MemoryRouter>
@@ -98,10 +118,12 @@ function renderPage(initialEntry = '/enterprise/platform') {
 }
 
 beforeEach(() => {
+  window.localStorage.clear();
   vi.mocked(api.get).mockReset();
+  vi.mocked(api.post).mockReset();
   vi.mocked(api.get).mockImplementation(async (path: string) => {
     if (path.startsWith('/api/enterprise/agents?')) {
-      return [galleryAgent, galleryExpert] as never;
+      return [galleryAgent, galleryExpert, ownedAgent] as never;
     }
     if (path.startsWith('/api/enterprise/knowledge-bases?')) {
       return Array.from({ length: 13 }, (_, index) => ({
@@ -169,6 +191,65 @@ it('已发布平台 Skill 出现在开放广场的 Skill 分类而不是管理�
   await userEvent.click(screen.getByText('数据统计分析'));
   await userEvent.click(await screen.findByRole('link', { name: '查看详情' }));
   expect(await screen.findByText('Skill 详情路由')).toBeInTheDocument();
+});
+
+it('普通用户从开放广场直接安装 Skill 到本人能力分身', async () => {
+  vi.mocked(api.post).mockResolvedValue({ action: 'created' } as never);
+  renderPage('/enterprise/platform/general-skills', {
+    id: 'member-user',
+    tenant_id: 'tenant_demo',
+    username: 'member',
+    role: 'member',
+    membership_status: 'active',
+    member_category_code: 'employee',
+  });
+
+  await userEvent.click(await screen.findByText('数据统计分析'));
+  await userEvent.click(await screen.findByRole('button', { name: '安装到能力分身' }));
+
+  expect(api.post).toHaveBeenCalledWith(
+    '/api/enterprise/general-skill-catalog/bindings',
+    expect.objectContaining({
+      tenant_id: 'tenant_demo',
+      skill_id: 'gallery-general-skill',
+      agent_id: 'owned-agent',
+      mode: 'install',
+      revision_policy: 'pinned',
+      pinned_revision_id: 'gallery-general-skill-revision',
+    }),
+  );
+});
+
+it('没有能力分身的普通用户首次安装 Skill 时自动创建私有能力分身', async () => {
+  vi.mocked(api.post)
+    .mockResolvedValueOnce(provisionedAgent as never)
+    .mockResolvedValueOnce({ action: 'created' } as never);
+  renderPage('/enterprise/platform/general-skills', {
+    id: 'new-member',
+    tenant_id: 'tenant_demo',
+    username: 'new-member',
+    role: 'member',
+    membership_status: 'active',
+    member_category_code: 'employee',
+  });
+
+  await userEvent.click(await screen.findByText('数据统计分析'));
+  await userEvent.click(await screen.findByRole('button', { name: '安装到能力分身' }));
+
+  expect(api.post).toHaveBeenNthCalledWith(
+    1,
+    '/api/enterprise/agents',
+    expect.objectContaining({
+      tenant_id: 'tenant_demo',
+      source_mode: 'blank',
+      visibility_scope: 'private',
+    }),
+  );
+  expect(api.post).toHaveBeenNthCalledWith(
+    2,
+    '/api/enterprise/general-skill-catalog/bindings',
+    expect.objectContaining({ agent_id: 'provisioned-agent', mode: 'install' }),
+  );
 });
 
 it('每个分类共享十二张一页的分页交互', async () => {

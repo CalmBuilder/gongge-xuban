@@ -3,11 +3,10 @@ import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { api, getRequestTenantId } from '../api/client';
-import { isGalleryEmployee, type EnterpriseAuthUser } from '../auth';
+import { isEmployeeOwnedBy, isGalleryEmployee, type EnterpriseAuthUser } from '../auth';
 import type { PlazaResourceKind } from '../assets/plaza/plaza-resource-icons';
 import {
   agentResourceCount,
-  canManageEmployeeAgent,
   employeeDisplayNameWithCreator,
   employeeProfile,
   resourceDisplayNameWithCreator,
@@ -84,8 +83,8 @@ const PLATFORM_CONFIGS: PlatformConfig[] = [
     kind: 'general-skills',
     title: 'Skill',
     subtitle: '已审核发布的可复用工作能力。',
-    detail: '从广场复制到当前数字员工的技能。',
-    useLabel: '复制到技能',
+    detail: '从广场安装到你的能力分身，安装后即可在会话中使用。',
+    useLabel: '安装到能力分身',
     metricLabel: '技能',
     signals: ['运行测试', 'MCP/浏览器', '能力复用'],
   },
@@ -260,9 +259,16 @@ export default function OpenPlatformPage({
   // 开放平台是发现入口；发布、下架和删除分别在资源管理页完成。
   const canManagePlatform = false;
   const currentAgent = agents.find((item) => item.id === agentId);
-  const targetEmployee = currentAgent && canManageEmployeeAgent(currentAgent, currentUser)
+  const targetEmployee = currentAgent
+    && !currentAgent.is_overall
+    && currentAgent.status === 'active'
+    && isEmployeeOwnedBy(currentAgent, currentUser)
     ? currentAgent
-    : agents.find((item) => canManageEmployeeAgent(item, currentUser) && !item.is_overall);
+    : agents.find((item) => (
+      !item.is_overall
+      && item.status === 'active'
+      && isEmployeeOwnedBy(item, currentUser)
+    ));
 
   const platformItems = useMemo<Record<PlatformKind, PlatformItem[]>>(() => ({
     agents: visibleAgents.map((item) => {
@@ -348,17 +354,39 @@ export default function OpenPlatformPage({
     count: platformItems[config.kind].length,
   }));
 
-  function ensureTargetEmployee(): boolean {
-    if (!targetEmployee) {
-      notify.warning('请先选择一个员工，再从广场复制资源。');
-      return false;
+  async function ensureTargetEmployee(createIfMissing = false): Promise<AgentProfileRead | null> {
+    let resolvedTarget = targetEmployee || null;
+    let createdTarget = false;
+    if (!resolvedTarget && createIfMissing && currentUser) {
+      try {
+        resolvedTarget = await api.post<AgentProfileRead>('/api/enterprise/agents', {
+          tenant_id: getRequestTenantId(),
+          name: `${currentUser.display_name || currentUser.username}的能力分身`,
+          source_mode: 'blank',
+          agent_category_code: 'assistant',
+          visibility_scope: 'private',
+          metadata: { is_default_employee: true, provisioned_for: 'open_platform_skill_install' },
+        });
+        setAgents((current) => [...current, resolvedTarget as AgentProfileRead]);
+        createdTarget = true;
+      } catch (error) {
+        notify.error(error instanceof Error ? error.message : '创建能力分身失败');
+        return null;
+      }
     }
-    if (targetEmployee.id !== agentId) {
-      window.localStorage.setItem(ENTERPRISE_AGENT_STORAGE_KEY, targetEmployee.id);
-      window.dispatchEvent(new CustomEvent('gongge-enterprise-agent-scope-change', { detail: { agentId: targetEmployee.id } }));
-      setAgentId(targetEmployee.id);
+    if (!resolvedTarget) {
+      notify.warning(currentUser ? '请先创建一个能力分身，再安装广场 Skill。' : '请先登录后再安装广场 Skill。');
+      return null;
     }
-    return true;
+    if (resolvedTarget.id !== agentId) {
+      window.localStorage.setItem(ENTERPRISE_AGENT_STORAGE_KEY, resolvedTarget.id);
+      window.dispatchEvent(new CustomEvent('gongge-enterprise-agent-scope-change', { detail: { agentId: resolvedTarget.id } }));
+      setAgentId(resolvedTarget.id);
+    }
+    if (createdTarget) {
+      notify.success(`已创建能力分身「${resolvedTarget.name}」`);
+    }
+    return resolvedTarget;
   }
 
   async function markPlatformAgentUsed(agent: AgentProfileRead) {
@@ -403,10 +431,36 @@ export default function OpenPlatformPage({
       }
       return;
     }
-    if (!ensureTargetEmployee()) return;
+    const target = await ensureTargetEmployee(platformKind === 'general-skills');
+    if (!target) return;
+    if (platformKind === 'general-skills') {
+      const skill = generalSkills.find((item) => item.id === itemId);
+      if (!skill?.current_published_revision_id) {
+        notify.error('该 Skill 缺少已发布修订，暂时不能安装');
+        return;
+      }
+      const metadataInvocationPolicy = skill.metadata?.invocation_policy;
+      const invocationPolicy = skill.invocation_policy
+        || (metadataInvocationPolicy === 'user_only' ? 'user_only' : 'model_allowed');
+      try {
+        await api.post('/api/enterprise/general-skill-catalog/bindings', {
+          tenant_id: getRequestTenantId(),
+          skill_id: skill.id,
+          agent_id: target.id,
+          mode: 'install',
+          revision_policy: 'pinned',
+          pinned_revision_id: skill.current_published_revision_id,
+          invocation_policy: invocationPolicy,
+        });
+        notify.success(`已安装 Skill「${skill.name_zh || skill.name}」`);
+        navigate(`/workspace/chat/draft/${target.id}`);
+      } catch (error) {
+        notify.error(error instanceof Error ? error.message : '安装 Skill 失败');
+      }
+      return;
+    }
     const resourceParam = itemId ? `&resourceId=${encodeURIComponent(itemId)}` : '';
     if (platformKind === 'knowledge') navigate(`/enterprise/knowledge?add=plaza${resourceParam}`);
-    if (platformKind === 'general-skills') navigate(`/enterprise/general-skills?add=plaza${resourceParam}`);
     if (platformKind === 'skills') navigate(`/enterprise/skills?add=plaza${resourceParam}`);
     if (platformKind === 'tools') navigate('/enterprise/tools?add=plaza');
   }

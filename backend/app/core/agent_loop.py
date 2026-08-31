@@ -2441,6 +2441,69 @@ class AgentLoop:
                     user_message_id=user_message_id,
                 )
 
+            if self._dynamic_task_engine_can_override_sop(request, chat_session):
+                yield self._stream_status(
+                    chat_session,
+                    "routing",
+                    "已选择 DynamicTaskAgent，正在准备复杂任务",
+                    {"execution_engine": "dynamic_task"},
+                    user_message_id=user_message_id,
+                )
+                capability_route = self._decide_non_sop_capability(
+                    request.message,
+                    model_config,
+                    chat_session,
+                    chat_session.agent_id,
+                    conversation_context,
+                    memory_context,
+                    user_id=request.user_id,
+                    user_message_id=user_message_id,
+                    forced_general_skill_id=(
+                        request.forced_general_skill_id if request.channel == "web" else None
+                    ),
+                    is_cancelled=(
+                        cancellation_token.is_cancelled
+                        if cancellation_token is not None
+                        else None
+                    ),
+                )
+                self._raise_if_active_turn_cancelled()
+                dynamic_response = self._try_handle_dynamic_task(
+                    request,
+                    chat_session,
+                    model_config,
+                    capability_route,
+                    user_message_id,
+                    memory_context=memory_context,
+                )
+                self._raise_if_active_turn_cancelled()
+                if dynamic_response is not None:
+                    yield self._stream_status(
+                        chat_session,
+                        "completed",
+                        "动态任务已完成",
+                        {"execution_mode": "dynamic_task"},
+                        user_message_id,
+                    )
+                    yield self._stream_event(
+                        "stream_delta",
+                        chat_session,
+                        self._turn_payload(
+                            {"content": dynamic_response.reply}, user_message_id
+                        ),
+                    )
+                    yield self._stream_event(
+                        "stream_end", chat_session, self._turn_payload({}, user_message_id)
+                    )
+                    yield self._stream_event(
+                        "complete",
+                        chat_session,
+                        self._turn_payload(
+                            dynamic_response.model_dump(mode="json"), user_message_id
+                        ),
+                    )
+                    return
+
             yield self._stream_status(
                 chat_session, "routing", "正在判断用户意图", user_message_id=user_message_id
             )
@@ -3362,6 +3425,43 @@ class AgentLoop:
         self.db.commit()
         if self._context_compacted_now(conversation_context):
             status("preparing", {"compacted_now": True})
+
+        if self._dynamic_task_engine_can_override_sop(request, chat_session):
+            status("routing", {"execution_engine": "dynamic_task"})
+            capability_route = self._decide_non_sop_capability(
+                request.message,
+                model_config,
+                chat_session,
+                chat_session.agent_id,
+                conversation_context,
+                memory_context,
+                user_id=request.user_id,
+                user_message_id=user_message.id,
+                forced_general_skill_id=(
+                    request.forced_general_skill_id if request.channel == "web" else None
+                ),
+            )
+            dynamic_response = self._try_handle_dynamic_task(
+                request,
+                chat_session,
+                model_config,
+                capability_route,
+                user_message.id,
+                memory_context=memory_context,
+            )
+            if dynamic_response is not None:
+                return PreparedTurn(
+                    chat_session=chat_session,
+                    model_config=model_config,
+                    active_skill=None,
+                    router_decision=dynamic_response.router_decision or RouterDecision(),
+                    step_result=dynamic_response.step_result or StepAgentResult(),
+                    tool_result=dynamic_response.tool_result,
+                    memory_context=memory_context,
+                    conversation_context=conversation_context,
+                    general_response=dynamic_response,
+                    user_message_id=user_message.id,
+                )
 
         status("routing")
         router_decision = self.router.decide(
@@ -7977,6 +8077,30 @@ class AgentLoop:
         )
         return direct_delivery and no_durable_plan
 
+    @staticmethod
+    def _has_active_sop_state(chat_session: ChatSession) -> bool:
+        """判断会话是否已有必须由正式 SOP Runtime 继续的持久状态。"""
+
+        return bool(
+            chat_session.active_skill_id
+            or chat_session.active_step_id
+            or chat_session.pending_tasks_json
+            or chat_session.awaiting_input_json
+        )
+
+    @classmethod
+    def _dynamic_task_engine_can_override_sop(
+        cls,
+        request: ChatTurnRequest,
+        chat_session: ChatSession,
+    ) -> bool:
+        """判断对话页选择的 DynamicTaskAgent 是否可以接管本轮新任务。"""
+
+        return (
+            request.execution_engine == "dynamic_task"
+            and not cls._has_active_sop_state(chat_session)
+        )
+
     def _try_handle_dynamic_task(
         self,
         request: ChatTurnRequest,
@@ -7986,10 +8110,26 @@ class AgentLoop:
         user_message_id: str,
         memory_context: Sequence[Mapping[str, object]] = (),
     ) -> ChatTurnResponse | None:
-        """只在独立 kill switch 生效且路由通过时委托 DynamicTaskAgent 完整执行。"""
+        """按自动路由、明确请求或页面选择委托 DynamicTaskAgent 完整执行。"""
 
+        if (
+            request.execution_engine == "dynamic_task"
+            and self._has_active_sop_state(chat_session)
+        ):
+            # 对话页选择只影响新的非 SOP 任务；活动 SOP 的游标、等待项和
+            # 人机协作状态必须由正式 Runtime 继续，禁止并行创建 Dynamic Execution。
+            return None
         decision = route.effective_decision
-        if self._explicit_dynamic_task_requested(request.message):
+        if self._dynamic_task_engine_can_override_sop(request, chat_session):
+            decision = NonSopCapabilityDecision(
+                mode="dynamic_task",
+                goal=request.message.strip(),
+                success_criteria=["按用户选择的 DynamicTaskAgent 引擎形成可校验结果"],
+                requires_durable_execution=True,
+                confidence=1.0,
+                reason="用户在对话页选择了 DynamicTaskAgent 复杂任务引擎。",
+            )
+        elif self._explicit_dynamic_task_requested(request.message):
             decision = NonSopCapabilityDecision(
                 mode="dynamic_task",
                 goal=request.message.strip(),
@@ -8191,6 +8331,7 @@ class AgentLoop:
                         "execution_id": instance.id,
                         "execution_created": created,
                         "execution_status": "scheduled",
+                        "requested_execution_engine": request.execution_engine,
                         "signal_id": signal.id,
                     },
                     user_message_id,
@@ -8220,6 +8361,7 @@ class AgentLoop:
                     "execution_id": instance.id,
                     "execution_created": created,
                     "execution_status": str(getattr(instance, "status", "created")),
+                    "requested_execution_engine": request.execution_engine,
                 },
                 user_message_id,
             ),
@@ -9143,6 +9285,8 @@ class AgentLoop:
             metadata["client_turn_id"] = request.client_turn_id
         if request.interaction_mode == "scheduled_task":
             metadata["interaction_mode"] = "scheduled_task"
+        if request.execution_engine != "auto":
+            metadata["execution_engine"] = request.execution_engine
         if request.model_config_id:
             metadata["model_config_id"] = request.model_config_id
         if request.forced_general_skill_id:

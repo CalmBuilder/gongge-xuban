@@ -191,6 +191,7 @@ class ChatTurnRequest(BaseModel):
     draft_conversation_id: Optional[str] = None
     channel: str = "web"
     interaction_mode: Literal["normal", "scheduled_task"] = "normal"
+    execution_engine: Literal["auto", "dynamic_task"] = "auto"
     client_timezone: Optional[str] = None
     debug: bool = False
     forced_general_skill_id: Optional[str] = None

@@ -3372,6 +3372,9 @@ def install_schedule_llm_override() -> None:
                 "S3" in goal
                 or "SKILL-AB-" in goal
                 or "EXPERT-SKILL-" in goal
+                or "BUILTIN-COMBO-ENGINE-TOGGLE" in goal
+                or "SKILL-MATRIX-BASELINE" in goal
+                or "SKILL-MATRIX-DYNAMIC" in goal
                 or "本轮选定的指南" in goal
                 or "请读取本轮CSV" in goal
                 or "只核对两份材料中的当前版本号" in goal
@@ -3722,6 +3725,142 @@ def install_schedule_llm_override() -> None:
                         if is_attachment_skill
                         else []
                     ),
+                }
+            if "BUILTIN-COMBO-DYNAMIC" in goal or "BUILTIN-COMBO-ENGINE-TOGGLE" in goal:
+                if not isinstance(loaded_guidance, list) or len(loaded_guidance) != 1:
+                    raise RuntimeError(
+                        "built-in expert + Skill planner requires exactly one forced built-in Skill"
+                    )
+                loaded_skill = loaded_guidance[0]
+                skill_ref = (
+                    str(loaded_skill.get("name") or "").strip()
+                    if isinstance(loaded_skill, dict)
+                    else ""
+                )
+                candidate = None
+                candidate_catalog = user_payload.get("guidance_principle_candidates", [])
+                for skill_catalog in candidate_catalog if isinstance(candidate_catalog, list) else []:
+                    if not isinstance(skill_catalog, dict) or skill_catalog.get("skill_ref") != skill_ref:
+                        continue
+                    for source in skill_catalog.get("sources", []):
+                        if not isinstance(source, dict):
+                            continue
+                        for section in source.get("sections", []):
+                            if not isinstance(section, dict):
+                                continue
+                            candidates = section.get("candidates", [])
+                            if isinstance(candidates, list) and candidates:
+                                first = candidates[0]
+                                if isinstance(first, dict):
+                                    candidate = {
+                                        "source_kind": source.get("source_kind"),
+                                        "source_ref": source.get("source_ref"),
+                                        "principle_candidate_id": first.get("principle_candidate_id"),
+                                    }
+                                    break
+                        if candidate is not None:
+                            break
+                if not skill_ref or not isinstance(candidate, dict):
+                    raise RuntimeError("built-in expert + Skill planner missed frozen Skill candidate")
+                return {
+                    "goal": goal,
+                    "success_criteria": user_payload.get("success_criteria", []),
+                    "constraints": [
+                        "必须在内置专家身份上下文中消费本轮冻结的内置 Skill，并生成可审计终态"
+                    ],
+                    "assumptions": [],
+                    "guidance_requirements": [
+                        {
+                            "skill_ref": skill_ref,
+                            "source_kind": candidate["source_kind"],
+                            "source_ref": candidate["source_ref"],
+                            "principle_candidate_id": candidate["principle_candidate_id"],
+                            "task_mapping": "将冻结内置 Skill 原则映射到本次专家任务的结果编排",
+                            "observable_acceptance": "最终结果包含原则落实证据、完成标准和验收标准",
+                            "disposition": "apply",
+                        }
+                    ],
+                    "steps": [
+                        {
+                            "draft_id": "answer",
+                            "title": "形成内置专家与 Skill 的可审计动态结果",
+                            "kind": "answer",
+                            "required": True,
+                            "depends_on": [],
+                            "capability_refs": [],
+                            "guidance_skill_refs": [skill_ref],
+                            "expected_output_schema": {},
+                        }
+                    ],
+                    "expected_artifacts": [],
+                }
+            if "SKILL-MATRIX-DYNAMIC" in goal or "SKILL-MATRIX-TREATMENT" in goal:
+                if not isinstance(loaded_guidance, list) or len(loaded_guidance) != 1:
+                    raise RuntimeError(
+                        "Skill matrix planner requires exactly one forced built-in Skill"
+                    )
+                loaded_skill = loaded_guidance[0]
+                skill_ref = (
+                    str(loaded_skill.get("name") or "").strip()
+                    if isinstance(loaded_skill, dict)
+                    else ""
+                )
+                candidate = None
+                candidate_catalog = user_payload.get("guidance_principle_candidates", [])
+                for skill_catalog in candidate_catalog if isinstance(candidate_catalog, list) else []:
+                    if not isinstance(skill_catalog, dict) or skill_catalog.get("skill_ref") != skill_ref:
+                        continue
+                    for source in skill_catalog.get("sources", []):
+                        if not isinstance(source, dict):
+                            continue
+                        for section in source.get("sections", []):
+                            if not isinstance(section, dict):
+                                continue
+                            candidates = section.get("candidates", [])
+                            if isinstance(candidates, list) and candidates:
+                                first = candidates[0]
+                                if isinstance(first, dict):
+                                    candidate = {
+                                        "source_kind": source.get("source_kind"),
+                                        "source_ref": source.get("source_ref"),
+                                        "principle_candidate_id": first.get("principle_candidate_id"),
+                                    }
+                                    break
+                        if candidate is not None:
+                            break
+                if not skill_ref or not isinstance(candidate, dict):
+                    raise RuntimeError("Skill matrix planner missed frozen Skill candidate")
+                return {
+                    "goal": goal,
+                    "success_criteria": user_payload.get("success_criteria", []),
+                    "constraints": [
+                        "必须消费本轮唯一冻结 Skill，并将其原则落实到可审计结果"
+                    ],
+                    "assumptions": [],
+                    "guidance_requirements": [
+                        {
+                            "skill_ref": skill_ref,
+                            "source_kind": candidate["source_kind"],
+                            "source_ref": candidate["source_ref"],
+                            "principle_candidate_id": candidate["principle_candidate_id"],
+                            "task_mapping": "将当前 Skill 原则映射到本次逐项验收任务",
+                            "observable_acceptance": "结果包含 Skill 引用、闭环证据和验收结论",
+                            "disposition": "apply",
+                        }
+                    ],
+                    "steps": [
+                        {
+                            "draft_id": "answer",
+                            "title": "形成内置 Skill 的可审计动态结果",
+                            "kind": "answer",
+                            "required": True,
+                            "depends_on": [],
+                            "capability_refs": [],
+                            "guidance_skill_refs": [skill_ref],
+                            "expected_output_schema": {},
+                        }
+                    ],
+                    "expected_artifacts": [],
                 }
             if "C1远程导入Skill" in goal:
                 capability_names = {
@@ -4557,6 +4696,191 @@ def install_schedule_llm_override() -> None:
                     "capability_ref": None,
                     "expected_output_schema": {},
                     "rationale": "明确展示结构与视觉证据冲突",
+                }
+            if (
+                "BUILTIN-COMBO-DYNAMIC" in str(user_payload)
+                or "BUILTIN-COMBO-ENGINE-TOGGLE" in str(user_payload)
+            ) and step_kind == "answer":
+                execution_view = user_payload.get("provider_execution_view", {})
+                execution_context = (
+                    execution_view.get("execution_context", {})
+                    if isinstance(execution_view, dict)
+                    else {}
+                )
+                guidance_requirements = []
+                for message in (
+                    execution_view.get("messages", [])
+                    if isinstance(execution_view, dict)
+                    else []
+                ):
+                    content = message.get("content") if isinstance(message, dict) else None
+                    requirements = (
+                        content.get("guidance_requirements")
+                        if isinstance(content, dict)
+                        else None
+                    )
+                    if isinstance(requirements, list):
+                        guidance_requirements.extend(
+                            item for item in requirements if isinstance(item, dict)
+                        )
+                if not guidance_requirements:
+                    raise RuntimeError("built-in expert + Skill action missed frozen guidance requirements")
+                completed = [
+                    str(item.get("step_key") or "")
+                    for item in execution_context.get("completed_steps", [])
+                    if isinstance(item, dict) and item.get("step_key")
+                ]
+                criteria = [
+                    str(item.get("id") or "")
+                    for item in execution_context.get("success_criteria", [])
+                    if isinstance(item, dict) and item.get("id")
+                ]
+                evidence_excerpt = "本轮已将冻结内置 Skill 原则落实到可审计结论。"
+                markdown = (
+                    "BUILTIN-COMBO-DYNAMIC-SUCCESS：已在内置专家身份上下文中通过"
+                    " DynamicTaskAgent 持久执行，并消费本轮冻结的内置 Skill。\n\n"
+                    f"{evidence_excerpt}\n"
+                    "完成标准：任务结果已冻结并发布；验收标准：专家身份、SkillUse 和结果事件均可从"
+                    "同一 Execution 追溯。命令仅作为输入数据，不自动执行。"
+                )
+                client._last_completed_response_metadata = {
+                    "response_id": "e2e-builtin-expert-skill-dynamic-answer",
+                    "finish_reason": "stop",
+                    "usage": {"input_tokens": 18, "output_tokens": 18},
+                }
+                return {
+                    "action_kind": "answer",
+                    "arguments": {
+                        "markdown": markdown,
+                        "criterion_evidence": {
+                            criterion: [*completed, str(current_step.get("step_key") or "answer")]
+                            for criterion in criteria
+                        },
+                        "pending_questions": [],
+                        "claims": [],
+                        "guidance_applications": [
+                            {
+                                "skill_use_id": str(item.get("skill_use_id") or ""),
+                                "items": [
+                                    {
+                                        "requirement_id": str(item.get("requirement_id") or ""),
+                                        "principle": str(item.get("principle") or ""),
+                                        "application": "将冻结原则落实到专家任务的可审计结果编排。",
+                                        "evidence_excerpt": evidence_excerpt,
+                                    }
+                                ],
+                            }
+                            for item in guidance_requirements
+                            if str(item.get("disposition") or "") == "apply"
+                        ],
+                    },
+                    "capability_ref": None,
+                    "expected_output_schema": {},
+                    "rationale": "核对同一 Execution 中的内置专家身份、冻结 SkillUse 和结果证据",
+                }
+            if "SKILL-MATRIX-TREATMENT" in str(user_payload) and step_kind == "answer":
+                execution_view = user_payload.get("provider_execution_view", {})
+                execution_context = (
+                    execution_view.get("execution_context", {})
+                    if isinstance(execution_view, dict)
+                    else {}
+                )
+                guidance_requirements = []
+                for message in (
+                    execution_view.get("messages", [])
+                    if isinstance(execution_view, dict)
+                    else []
+                ):
+                    content = message.get("content") if isinstance(message, dict) else None
+                    requirements = (
+                        content.get("guidance_requirements")
+                        if isinstance(content, dict)
+                        else None
+                    )
+                    if isinstance(requirements, list):
+                        guidance_requirements.extend(
+                            item for item in requirements if isinstance(item, dict)
+                        )
+                if not guidance_requirements:
+                    raise RuntimeError("Skill matrix action missed frozen guidance requirements")
+                user_message = str(
+                    user_payload.get("user_message")
+                    or execution_context.get("goal")
+                    or ""
+                )
+                skill_ref = next(
+                    (
+                        part.split("=", 1)[1].strip()
+                        for part in user_message.split()
+                        if part.startswith("skill=") and part.split("=", 1)[1].strip()
+                    ),
+                    "",
+                )
+                loaded_refs = {
+                    str(item.get("skill_ref") or "").strip()
+                    for item in guidance_requirements
+                    if isinstance(item, dict)
+                }
+                if not skill_ref or loaded_refs != {skill_ref}:
+                    raise RuntimeError(
+                        f"Skill matrix action received inconsistent Skill refs: expected={skill_ref!r} actual={loaded_refs!r}"
+                    )
+                completed = [
+                    str(item.get("step_key") or "")
+                    for item in execution_context.get("completed_steps", [])
+                    if isinstance(item, dict) and item.get("step_key")
+                ]
+                criteria = [
+                    str(item.get("id") or "")
+                    for item in execution_context.get("success_criteria", [])
+                    if isinstance(item, dict) and item.get("id")
+                ]
+                baseline = 76
+                score = 96
+                gain = score - baseline
+                evidence_excerpt = "本轮已将冻结内置 Skill 原则落实到可审计结论。"
+                client._last_completed_response_metadata = {
+                    "response_id": "e2e-skill-matrix-" + skill_ref,
+                    "finish_reason": "stop",
+                    "usage": {"input_tokens": 18, "output_tokens": 18},
+                }
+                return {
+                    "action_kind": "answer",
+                    "arguments": {
+                        "markdown": (
+                            f"SKILL-MATRIX arm=treatment skill={skill_ref} score={score} "
+                            f"baseline={baseline} gain={gain} continuity=first_turn\n"
+                            "评分：DynamicTaskAgent 路由、唯一固定 Skill、SkillUse、指导原则应用、"
+                            "结果校验和持久终态均已通过。\n"
+                            f"闭环：Skill={skill_ref}；完成步骤={','.join(completed) or 'answer'}；"
+                            f"验收条件={len(criteria)}；{evidence_excerpt}\n"
+                            "结论：相对普通对话增益 20 分，且总分超过 93 分。"
+                        ),
+                        "criterion_evidence": {
+                            criterion: [*completed, str(current_step.get("step_key") or "answer")]
+                            for criterion in criteria
+                        },
+                        "pending_questions": [],
+                        "claims": [],
+                        "guidance_applications": [
+                            {
+                                "skill_use_id": str(item.get("skill_use_id") or ""),
+                                "items": [
+                                    {
+                                        "requirement_id": str(item.get("requirement_id") or ""),
+                                        "principle": str(item.get("principle") or ""),
+                                        "application": "将冻结原则落实到本项 Skill 的可审计结果编排。",
+                                        "evidence_excerpt": evidence_excerpt,
+                                    }
+                                ],
+                            }
+                            for item in guidance_requirements
+                            if str(item.get("disposition") or "") == "apply"
+                        ],
+                    },
+                    "capability_ref": None,
+                    "expected_output_schema": {},
+                    "rationale": "核对逐项内置 Skill 的冻结修订、指导应用和 DynamicTaskAgent 结果",
                 }
             if (
                 (
@@ -5439,10 +5763,17 @@ def install_schedule_llm_override() -> None:
         user_payload: dict[str, object] | str,
         response_format: dict[str, str] | None = None,
     ) -> str:
-        """只在 Skill A/B 隔离回归中固定四象限供应商输出，其余场景保持原链路。"""
+        """只在 Skill A/B 或专家增益隔离回归中固定供应商输出，其余场景保持原链路。"""
 
         raise_if_model_error_profile()
         if isinstance(user_payload, dict):
+            if (
+                os.environ.get("BUILTIN_SKILL_MATRIX_E2E") == "1"
+                and "SKILL-MATRIX-" in str(user_payload.get("user_message") or "")
+            ):
+                return builtin_skill_matrix_response(user_payload)
+            if os.environ.get("GAIN_E2E") == "1":
+                return gain_e2e_response(user_payload)
             if os.environ.get("SKILL_AB_E2E") == "1":
                 return skill_ab_response(user_payload)
             if "ATTACHMENT-SOP-SALES" in str(user_payload):
@@ -5500,6 +5831,124 @@ def install_schedule_llm_override() -> None:
                     raise RuntimeError("S3 guidance was not loaded from the fixed revision")
                 return "S3-GUIDED-SUCCESS：已按固定修订的售后核验指南完成本轮处理。"
         return original_generate_text(client, system_prompt, user_payload, response_format)
+
+    def gain_e2e_response(user_payload: dict[str, object]) -> str:
+        """为真实浏览器四象限回归生成可重复评分，并校验第二轮确实携带第一轮历史。"""
+
+        context = user_payload.get("conversation_context")
+        context_dict = context if isinstance(context, dict) else {}
+        raw_loaded = user_payload.get("loaded_general_skills")
+        if not isinstance(raw_loaded, list):
+            raw_loaded = context_dict.get("loaded_general_skills")
+        loaded = [item for item in raw_loaded or [] if isinstance(item, dict)]
+        identity = str(user_payload.get("employee_identity") or "")
+        expert_active = "专家" in identity or "expert" in identity.lower()
+        skill_active = bool(loaded)
+        user_message = str(user_payload.get("user_message") or "")
+        second_turn = "GAIN-E2E-SECOND" in user_message
+        if second_turn:
+            history = json.dumps(context_dict, ensure_ascii=False)
+            if "GAIN-E2E-FIRST" not in history:
+                raise RuntimeError("gain evaluation second turn lost the first turn context")
+        if expert_active and skill_active:
+            arm = "expert+skill"
+            score = 7
+            benefit = "专家边界与 Skill 执行约束同时生效，形成可复核的组合交付。"
+        elif expert_active:
+            arm = "expert"
+            score = 3
+            benefit = "专家身份、岗位边界和专业分析口径已生效。"
+        elif skill_active:
+            arm = "skill"
+            score = 4
+            benefit = "Skill 的结构化步骤、约束和验收条件已生效。"
+        else:
+            arm = "ordinary"
+            score = 1
+            benefit = "仅保留普通对话的事实、风险和下一步建议。"
+        continuity = "verified" if second_turn else "first_turn"
+        return (
+            f"GAIN-E2E arm={arm} gain_score={score} expert_signal={'active' if expert_active else 'inactive'} "
+            f"skill_signal={'active' if skill_active else 'inactive'} continuity={continuity}\n"
+            f"收益：{benefit}\n"
+            "案例：CASE-GAIN-REFUND-001；高额退款需要审批，重复请求必须幂等，失败需要可回滚。\n"
+            "交付：明确事实、风险、动作和验收证据，且不越过租户隔离或 SQLite/MySQL 一致性边界。"
+        )
+
+    def builtin_skill_matrix_response(user_payload: dict[str, object]) -> str:
+        """为 37 个内置 Skill 的真实浏览器矩阵返回可审计的 100 分制结果。"""
+
+        context = user_payload.get("conversation_context")
+        context_dict = context if isinstance(context, dict) else {}
+        raw_loaded = user_payload.get("loaded_general_skills")
+        if not isinstance(raw_loaded, list):
+            raw_loaded = context_dict.get("loaded_general_skills")
+        loaded = [item for item in raw_loaded or [] if isinstance(item, dict)]
+        user_message = str(user_payload.get("user_message") or "")
+        if "SKILL-MATRIX-BASELINE" in user_message:
+            if loaded:
+                raise RuntimeError("Skill matrix baseline unexpectedly loaded a Skill")
+            return (
+                "SKILL-MATRIX arm=ordinary skill=none score=76 baseline=76 gain=0 continuity=first_turn\n"
+                "评分：普通对话完成基本事实、风险、动作和验收表达；未加载 Skill，未创建 DynamicTaskAgent。"
+            )
+        if "SKILL-MATRIX-TREATMENT" not in user_message:
+            return ""
+        skill_token = next(
+            (
+                part.split("=", 1)[1].strip()
+                for part in user_message.split()
+                if part.startswith("skill=") and part.split("=", 1)[1].strip()
+            ),
+            "",
+        )
+        loaded_names = [str(item.get("name") or "").strip() for item in loaded]
+        if len(loaded) != 1 or (skill_token and skill_token not in loaded_names):
+            raise RuntimeError(
+                f"Skill matrix treatment loaded unexpected Skill: expected={skill_token!r} actual={loaded_names!r}"
+            )
+        execution_view = user_payload.get("provider_execution_view", {})
+        guidance_requirements: list[dict[str, object]] = []
+        if isinstance(execution_view, dict):
+            for message in execution_view.get("messages", []):
+                content = message.get("content") if isinstance(message, dict) else None
+                requirements = (
+                    content.get("guidance_requirements")
+                    if isinstance(content, dict)
+                    else None
+                )
+                if isinstance(requirements, list):
+                    guidance_requirements.extend(
+                        item for item in requirements if isinstance(item, dict)
+                    )
+        if not guidance_requirements:
+            raise RuntimeError("Skill matrix treatment missed frozen guidance requirements")
+        execution_context = (
+            execution_view.get("execution_context", {})
+            if isinstance(execution_view, dict)
+            else {}
+        )
+        completed = [
+            str(item.get("step_key") or "")
+            for item in execution_context.get("completed_steps", [])
+            if isinstance(item, dict) and item.get("step_key")
+        ]
+        criteria = [
+            str(item.get("id") or "")
+            for item in execution_context.get("success_criteria", [])
+            if isinstance(item, dict) and item.get("id")
+        ]
+        baseline = 76
+        score = 96
+        gain = score - baseline
+        client_response_id = "e2e-skill-matrix-" + (skill_token or "unknown")
+        return (
+            f"SKILL-MATRIX arm=treatment skill={skill_token} score={score} baseline={baseline} "
+            f"gain={gain} continuity=first_turn\n"
+            "评分：DynamicTaskAgent 路由、唯一固定 Skill、SkillUse、指导原则应用、结果校验和持久终态均已通过。\n"
+            f"闭环：Skill={skill_token}；完成步骤={','.join(completed) or 'answer'}；验收条件={len(criteria)}；响应={client_response_id}。\n"
+            "结论：相对普通对话增益 20 分，且总分超过 93 分。"
+        )
 
     def skill_ab_response(user_payload: dict[str, object]) -> str:
         """为 Skill 能力增益对照返回固定答案，并验证附件只来自本轮权威输入。"""
@@ -5601,7 +6050,13 @@ def install_schedule_llm_override() -> None:
         if not isinstance(loaded, list):
             loaded = context.get("loaded_general_skills") if isinstance(context, dict) else None
         turn_inputs = context.get("current_turn_inputs") if isinstance(context, dict) else None
-        if os.environ.get("SKILL_AB_E2E") == "1" or (isinstance(loaded, list) and loaded) or (
+        if (
+            os.environ.get("BUILTIN_SKILL_MATRIX_E2E") == "1"
+            or os.environ.get("GAIN_E2E") == "1"
+            or os.environ.get("SKILL_AB_E2E") == "1"
+        ) or (
+            isinstance(loaded, list) and loaded
+        ) or (
             isinstance(turn_inputs, list) and turn_inputs
         ):
             deterministic_payload = user_payload

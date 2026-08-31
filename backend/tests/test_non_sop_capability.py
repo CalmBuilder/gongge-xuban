@@ -607,6 +607,117 @@ def test_explicit_dynamic_request_cannot_be_downgraded_by_forced_general_skill(
     assert captured["forced_general_skill_ids"] == ()
 
 
+def test_selected_dynamic_engine_delegates_even_when_route_is_answer(monkeypatch) -> None:
+    """对话页选择 DynamicTaskAgent 后，普通路由结果不能把本轮降级为直接回答。"""
+
+    captured: dict[str, object] = {}
+
+    class _DynamicAgent:
+        """捕获页面引擎选择传入的动态任务委托。"""
+
+        def __init__(self, _db) -> None:
+            """兼容生产构造签名。"""
+
+        def start_task(self, **kwargs):
+            """记录动态任务创建参数。"""
+
+            captured.update(kwargs)
+            return SimpleNamespace(id="execution_selected_engine"), True
+
+        def run_until_blocked_or_complete(self, **_kwargs):
+            """模拟动态任务闭环成功。"""
+
+            return DynamicRunOutcome(
+                status="succeeded",
+                execution_id="execution_selected_engine",
+                message=SimpleNamespace(content="复杂任务结果"),
+            )
+
+    monkeypatch.setattr("app.core.agent_loop.DynamicTaskAgent", _DynamicAgent)
+    loop = object.__new__(AgentLoop)
+    loop.db = SimpleNamespace(
+        refresh=lambda _row: None,
+        commit=lambda: None,
+        begin_nested=lambda: nullcontext(),
+    )
+    loop.events = SimpleNamespace(record=lambda *_args, **_kwargs: None)
+    loop._knowledge_capability_payload = lambda *_args: {"available": False}
+    route = NonSopCapabilityRouteResult(
+        selected_general_skill=None,
+        general_selection=GeneralSkillSelection(),
+        effective_decision=NonSopCapabilityDecision(mode="answer"),
+        shadow_decision=None,
+        shadow_attempted=False,
+        shadow_duration_ms=0.0,
+    )
+    session = ChatSession(
+        id="session_selected_engine",
+        tenant_id="tenant_demo",
+        agent_id="agent_demo",
+    )
+
+    response = loop._try_handle_dynamic_task(
+        ChatTurnRequest(
+            tenant_id="tenant_demo",
+            user_id="user_demo",
+            agent_id="agent_demo",
+            message="整理材料并形成结果",
+            execution_engine="dynamic_task",
+        ),
+        session,
+        SimpleNamespace(id="model_1"),
+        route,
+        "message_selected_engine",
+    )
+
+    assert response is not None
+    assert response.reply == "复杂任务结果"
+    assert captured["goal"] == "整理材料并形成结果"
+
+
+def test_selected_dynamic_engine_does_not_interrupt_active_sop(monkeypatch) -> None:
+    """活动 SOP 有游标或等待状态时，页面引擎选择不得并行创建 Dynamic Execution。"""
+
+    monkeypatch.setattr(
+        "app.core.agent_loop.DynamicTaskAgent",
+        lambda _db: pytest.fail("active SOP must remain in the formal runtime"),
+    )
+    loop = object.__new__(AgentLoop)
+    loop.db = SimpleNamespace()
+    loop.events = SimpleNamespace(record=lambda *_args, **_kwargs: None)
+    route = NonSopCapabilityRouteResult(
+        selected_general_skill=None,
+        general_selection=GeneralSkillSelection(),
+        effective_decision=NonSopCapabilityDecision(mode="dynamic_task"),
+        shadow_decision=None,
+        shadow_attempted=False,
+        shadow_duration_ms=0.0,
+    )
+    session = ChatSession(
+        id="session_active_sop",
+        tenant_id="tenant_demo",
+        agent_id="agent_demo",
+        active_skill_id="skill_sop",
+        active_step_id="step_1",
+    )
+
+    response = loop._try_handle_dynamic_task(
+        ChatTurnRequest(
+            tenant_id="tenant_demo",
+            user_id="user_demo",
+            agent_id="agent_demo",
+            message="继续当前任务",
+            execution_engine="dynamic_task",
+        ),
+        session,
+        SimpleNamespace(id="model_1"),
+        route,
+        "message_active_sop",
+    )
+
+    assert response is None
+
+
 def test_explicit_dynamic_request_detection_does_not_capture_explanatory_chat() -> None:
     """服务端只接管明确执行请求，不把概念解释误路由为动态任务。"""
 

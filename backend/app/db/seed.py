@@ -26,6 +26,7 @@ from app.db.models import (
     AgentResourceBinding,
     AgentSkillBranch,
     GeneralSkill,
+    GeneralSkillRevision,
     KnowledgeBase,
     MCPServer,
     ModelConfig,
@@ -65,6 +66,14 @@ from app.general_skills.builtin_catalog import (
     BUILTIN_SKILL_INITIAL_IMPORT_COMMAND_ID,
     BuiltinSkillCatalogService,
 )
+from app.general_skills.catalog_governance import (
+    CatalogGovernanceError,
+    GeneralSkillCatalogGovernanceService,
+)
+from app.experts.builtin import (
+    seed_builtin_experts,
+    seed_builtin_experts_for_existing_tenants,
+)
 from app.organization.reference_data import (
     ensure_agent_category_catalog,
     ensure_member_category_catalog,
@@ -78,6 +87,9 @@ ADAPTIVE_FLOW_RULE = (
     "步骤是可自适应推进的目标，不是固定问答脚本；已由当前用户消息、历史信息或路由意图满足的内容"
     "不得重复追问，应直接推进到下一缺失信息、工具调用或最终回复。"
 )
+
+
+BUILTIN_SKILL_INITIAL_REVIEW_COMMAND_ID = "builtin-skill-initial-review-6654f6b6"
 
 
 REFUND_SKILL = {
@@ -973,16 +985,15 @@ def seed_demo_data(session: Session) -> None:
         select(User).where(User.tenant_id == "tenant_demo", User.username == "admin")
     ).first()
     if not admin_user:
-        session.add(
-            User(
-                id="admin",
-                tenant_id="tenant_demo",
-                username="admin",
-                display_name="Administrator",
-                role="admin",
-                password_hash=hash_password("admin"),
-            )
+        admin_user = User(
+            id="admin",
+            tenant_id="tenant_demo",
+            username="admin",
+            display_name="Administrator",
+            role="admin",
+            password_hash=hash_password("admin"),
         )
+        session.add(admin_user)
     elif admin_user.role != "admin":
         admin_user.role = "admin"
         admin_user.updated_at = utc_now()
@@ -1088,6 +1099,8 @@ def seed_demo_data(session: Session) -> None:
     ensure_expense_special_approval_version(session)
     ensure_expense_special_approval_org_scope_version(session)
     _ensure_public_demo_agents(session)
+    seed_builtin_experts(session, tenant_id="tenant_demo", admin=admin_user)
+    seed_builtin_experts_for_existing_tenants(session, exclude_tenant_ids={"tenant_demo"})
 
     default_model = session.exec(
         select(ModelConfig).where(
@@ -1126,6 +1139,123 @@ def seed_demo_data(session: Session) -> None:
         command_id=BUILTIN_SKILL_INITIAL_IMPORT_COMMAND_ID,
         actor_user_id=catalog_admin.id,
     )
+    _promote_builtin_skills(session, tenant_id="tenant_demo", admin=catalog_admin)
+
+
+def _promote_builtin_skills(session: Session, *, tenant_id: str, admin: User) -> None:
+    """将随应用交付的内置 Skill 从候选状态一次性审核为可用发布状态。"""
+
+    skills = session.exec(
+        select(GeneralSkill).where(
+            GeneralSkill.catalog_scope == "platform",
+            GeneralSkill.tenant_id.is_(None),
+        )
+    ).all()
+    builtin_skills = [
+        skill
+        for skill in skills
+        if (skill.metadata_json or {}).get("managed_catalog") is True
+        and (skill.metadata_json or {}).get("source_kind") == "platform_builtin"
+    ]
+    review_items: list[dict[str, object]] = []
+    for skill in builtin_skills:
+        revision = session.exec(
+            select(GeneralSkillRevision)
+            .where(
+                GeneralSkillRevision.catalog_scope == "platform",
+                GeneralSkillRevision.skill_id == skill.id,
+            )
+            .order_by(GeneralSkillRevision.revision_number.desc())
+        ).first()
+        if revision is None:
+            raise RuntimeError(f"Built-in Skill {skill.id} has no revision")
+        if (
+            skill.status == "published"
+            and revision.status == "published"
+            and skill.current_published_revision_id == revision.id
+            and (skill.metadata_json or {}).get("review_status") == "approved"
+        ):
+            continue
+        if skill.status not in {"draft", "reviewing"} or revision.status not in {
+            "draft",
+            "reviewing",
+        }:
+            raise RuntimeError(f"Built-in Skill {skill.id} has an invalid governance state")
+        review_items.append(
+            {
+                "skill_id": skill.id,
+                "decision": "approve",
+                "expected_skill_row_version": skill.row_version,
+                "expected_revision_row_version": revision.row_version,
+                "review_note": "平台内置 Skill 随应用交付，来源、checksum 和运行边界已审核通过",
+            }
+        )
+
+    if review_items:
+        try:
+            GeneralSkillCatalogGovernanceService(session).review(
+                tenant_id=tenant_id,
+                command_id=BUILTIN_SKILL_INITIAL_REVIEW_COMMAND_ID,
+                actor_user_id=admin.id,
+                items=review_items,
+            )
+        except CatalogGovernanceError as exc:
+            session.expire_all()
+            if not _builtin_skills_are_published(session, builtin_skills):
+                raise RuntimeError("Built-in Skill initial approval failed") from exc
+
+    session.expire_all()
+    published_skills = session.exec(
+        select(GeneralSkill).where(
+            GeneralSkill.catalog_scope == "platform",
+            GeneralSkill.tenant_id.is_(None),
+        )
+    ).all()
+    for skill in published_skills:
+        metadata = skill.metadata_json or {}
+        if (
+            metadata.get("managed_catalog") is not True
+            or metadata.get("source_kind") != "platform_builtin"
+        ):
+            continue
+        metadata = dict(metadata)
+        metadata.update(
+            {
+                "review_status": "approved",
+                "approval_status": "approved",
+                "audit_status": "approved",
+                "availability_status": "available",
+                "builtin_skill_status": "approved",
+            }
+        )
+        if skill.metadata_json != metadata:
+            skill.metadata_json = metadata
+            skill.updated_at = utc_now()
+            session.add(skill)
+    session.commit()
+
+
+def _builtin_skills_are_published(
+    session: Session,
+    skills: list[GeneralSkill],
+) -> bool:
+    """确认并发启动或命令重放后全部内置 Skill 已指向已发布当前修订。"""
+
+    if not skills:
+        return False
+    for original in skills:
+        skill = session.get(GeneralSkill, original.id)
+        if skill is None or skill.status != "published":
+            return False
+        revision = session.get(GeneralSkillRevision, skill.current_published_revision_id or "")
+        if (
+            revision is None
+            or revision.status != "published"
+            or revision.skill_id != skill.id
+            or (skill.metadata_json or {}).get("review_status") != "approved"
+        ):
+            return False
+    return True
 
 
 def _publish_seeded_system_resources(session: Session) -> None:
@@ -1263,6 +1393,22 @@ def _ensure_public_demo_agents(session: Session) -> None:
     )
     for agent_id, name, description, skill_ids, tool_names, knowledge_names in definitions:
         agent = session.get(AgentProfile, agent_id)
+        metadata = _system_seed_metadata(
+            {
+                "published_to_gallery": True,
+                "system_seeded": True,
+                "system_builtin": True,
+                "seed_source": "public_demo_agent",
+                "employee_type": "expert",
+                "governance_template": True,
+                "builtin_expert_status": "approved",
+                "review_status": "approved",
+                "approval_status": "approved",
+                "audit_status": "approved",
+                "availability_status": "available",
+                "gallery_publication_kind": "platform_builtin",
+            }
+        )
         if agent is None:
             agent = AgentProfile(
                 id=agent_id,
@@ -1277,16 +1423,29 @@ def _ensure_public_demo_agents(session: Session) -> None:
                 gallery_published_by=admin.id,
                 agent_category_code="professional",
                 visibility_scope="tenant",
-                metadata_json=_system_seed_metadata(
-                    {
-                        "published_to_gallery": True,
-                        "system_seeded": True,
-                        "seed_source": "public_demo_agent",
-                    }
-                ),
+                metadata_json=metadata,
             )
             session.add(agent)
             session.flush()
+        else:
+            desired_fields = {
+                "status": "active",
+                "published_to_gallery": True,
+                "agent_category_code": "professional",
+                "visibility_scope": "tenant",
+            }
+            changed = any(
+                getattr(agent, field) != value for field, value in desired_fields.items()
+            ) or agent.metadata_json != metadata
+            for field, value in desired_fields.items():
+                setattr(agent, field, value)
+            agent.metadata_json = metadata
+            if agent.gallery_published_at is None:
+                agent.gallery_published_at = utc_now()
+            agent.gallery_published_by = admin.id
+            if changed:
+                agent.updated_at = utc_now()
+                session.add(agent)
         _ensure_public_demo_agent_resources(
             session,
             agent=agent,

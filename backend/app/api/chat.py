@@ -367,6 +367,8 @@ def _user_message_metadata(request: ChatTurnRequest) -> dict[str, object]:
         metadata["client_turn_id"] = request.client_turn_id
     if request.interaction_mode == "scheduled_task":
         metadata["interaction_mode"] = "scheduled_task"
+    if request.execution_engine != "auto":
+        metadata["execution_engine"] = request.execution_engine
     if request.model_config_id:
         metadata["model_config_id"] = request.model_config_id
     if request.forced_general_skill_id:
@@ -2639,6 +2641,7 @@ def _existing_turn_replay(
         or user_message.content != request.message
         or str(payload.get("user_id") or request.user_id) != str(request.user_id or "")
         or str(payload.get("channel") or "web") != request.channel
+        or str(metadata.get("execution_engine") or "auto") != request.execution_engine
         or str(metadata.get("forced_general_skill_id") or "")
         != str(request.forced_general_skill_id or "")
         or list(metadata.get("forced_general_skill_ids") or [])

@@ -289,6 +289,8 @@ def resource_binding_metadata(
 def is_open_gallery_resource(
     db: Session, tenant_id: str, resource_type: str, resource: object
 ) -> bool:
+    if resource_type == "general_skill" and is_platform_catalog_general_skill(resource):
+        return getattr(resource, "status", None) == "published"
     resource_id = getattr(resource, "id", None)
     if not resource_id or getattr(resource, "tenant_id", None) != tenant_id:
         return False

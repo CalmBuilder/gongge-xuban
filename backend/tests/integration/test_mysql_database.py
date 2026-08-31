@@ -39,6 +39,8 @@ from app.db.models import (
     ExecutionArtifact,
     ExecutionPlanRevision,
     ExecutionMutationRejection,
+    GeneralSkill,
+    GeneralSkillRevision,
     Message,
     ManagedInputResource,
     ModelConfig,
@@ -76,6 +78,8 @@ from app.dynamic_tasks.planning import (
     SuccessCriterion,
 )
 from app.dynamic_tasks.agent import DynamicRunOutcome, DynamicTaskAgent
+from app.experts.builtin import BUILTIN_EXPERT_EXPECTED_COUNT
+from app.general_skills.builtin_catalog import BUILTIN_SKILL_EXPECTED_COUNT
 from app.db.seed import (
     EXCHANGE_SKILL,
     PRICE_COMPARE_SKILL,
@@ -2098,7 +2102,7 @@ def test_mysql_round_trips_unicode_and_longtext(mysql_database_url: str) -> None
 
 
 def test_demo_seed_is_idempotent_on_mysql(mysql_database_url: str) -> None:
-    """验证 MySQL 种子幂等，并保持超标特批 v2 到 v2.1 的不可变派生链。"""
+    """验证 MySQL 种子幂等、内置资源状态和超标特批不可变派生链。"""
 
     upgrade(mysql_database_url)
     engine = create_engine(mysql_database_url, pool_pre_ping=True)
@@ -2112,6 +2116,27 @@ def test_demo_seed_is_idempotent_on_mysql(mysql_database_url: str) -> None:
         overall_agent_count = session.execute(
             text("SELECT COUNT(*) FROM agent_profiles WHERE id = 'agent_tenant_demo_overall'")
         ).scalar_one()
+        builtin_experts = [
+            row
+            for row in session.exec(
+                select(AgentProfile).where(AgentProfile.tenant_id == "tenant_demo")
+            )
+            if (row.metadata_json or {}).get("builtin_expert") is True
+        ]
+        builtin_skills = [
+            row
+            for row in session.exec(
+                select(GeneralSkill).where(
+                    GeneralSkill.catalog_scope == "platform",
+                    GeneralSkill.tenant_id.is_(None),
+                )
+            )
+            if (row.metadata_json or {}).get("source_kind") == "platform_builtin"
+        ]
+        builtin_revisions = [
+            session.get(GeneralSkillRevision, row.current_published_revision_id or "")
+            for row in builtin_skills
+        ]
         expense_versions = session.exec(
             select(SkillVersion)
             .where(SkillVersion.skill_id == "expense_over_limit_approval")
@@ -2120,6 +2145,25 @@ def test_demo_seed_is_idempotent_on_mysql(mysql_database_url: str) -> None:
 
     assert tenant_count == 1
     assert overall_agent_count == 1
+    assert len(builtin_experts) == BUILTIN_EXPERT_EXPECTED_COUNT
+    assert all(
+        row.status == "active"
+        and row.published_to_gallery is True
+        and (row.metadata_json or {}).get("review_status") == "approved"
+        for row in builtin_experts
+    )
+    assert len(builtin_skills) == BUILTIN_SKILL_EXPECTED_COUNT
+    assert all(
+        row.status == "published"
+        and (row.metadata_json or {}).get("review_status") == "approved"
+        for row in builtin_skills
+    )
+    assert all(
+        revision is not None
+        and revision.status == "published"
+        and revision.skill_id == builtin_skills[index].id
+        for index, revision in enumerate(builtin_revisions)
+    )
     v2 = next(version for version in expense_versions if version.version == "2.0.0")
     v21 = next(version for version in expense_versions if version.version == "2.1.0")
     v2_nodes = {

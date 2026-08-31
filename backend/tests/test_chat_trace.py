@@ -74,7 +74,11 @@ def test_completed_client_turn_replays_persisted_stream_without_new_execution() 
         session_id=session_row.id,
         role="user",
         content="按指南处理",
-        metadata_json={"client_turn_id": "client_replay", "forced_general_skill_id": "skill_a"},
+        metadata_json={
+            "client_turn_id": "client_replay",
+            "forced_general_skill_id": "skill_a",
+            "execution_engine": "dynamic_task",
+        },
     )
     db.add(session_row)
     db.add(user_message)
@@ -125,6 +129,7 @@ def test_completed_client_turn_replays_persisted_stream_without_new_execution() 
         message=user_message.content,
         client_turn_id="client_replay",
         channel="web",
+        execution_engine="dynamic_task",
         forced_general_skill_id="skill_a",
     )
 
@@ -151,7 +156,13 @@ def test_completed_client_turn_replays_persisted_stream_without_new_execution() 
                 recovered_db,
                 request.model_copy(update={"message": "换一个请求"}),
             )
+        with pytest.raises(HTTPException) as engine_mismatch:
+            _existing_turn_replay(
+                recovered_db,
+                request.model_copy(update={"execution_engine": "auto"}),
+            )
     assert mismatch.value.status_code == 409
+    assert engine_mismatch.value.status_code == 409
 
 
 def test_running_client_turn_reattaches_until_original_worker_persists_terminal(

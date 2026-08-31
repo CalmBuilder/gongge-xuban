@@ -66,6 +66,10 @@
 - `external_write` 和 `destructive` 是独立的高风险能力面：只有它们需要额外授权、可靠性契约、灰度和必要的人工确认；高风险能力未就绪时，不应影响普通只读动态任务。
 - 全局动态开关（当前配置名 `DYNAMIC_TASK_EXECUTION_ENABLED`）只用于故障处置的 kill switch，正常启动基线应为开启，而不是日常发布前置条件。
 
+### 对话页选择复杂任务引擎
+
+对话 Composer 提供 `DynamicTaskAgent` 复杂任务引擎选项。未选中时，平台按现有自动路由处理；选中后，当前没有正在执行的 SOP 时，本轮默认进入 DynamicTaskAgent，并将引擎选择作为请求契约固化到消息和排队 Turn。若会话已有活动 SOP 游标、等待项或人工协作状态，下一条消息仍由正式 SOP Runtime 继续，避免两个运行时并行接管同一会话。SOP 结束后，后续消息重新按当前引擎选择判断。
+
 ## 一个统一的运行闭环
 
 ```mermaid
@@ -96,9 +100,9 @@ flowchart LR
 
 ### 2. Skill 和专家让动态任务更有方法
 
-平台支持以 `SKILL.md` 为核心的通用能力包，以及可由部署侧提供的本地化专家快照和精选岗位资源。Skill 可以从本地文件、ZIP 或固定版本的 GitHub 来源进入候选、审核、发布和绑定流程；运行时固定 revision 与 checksum。Skill 提供的指导属于受审查的 guidance，不能覆盖平台安全策略、租户权限、SOP 或用户明确指令。
+平台支持以 `SKILL.md` 为核心的通用能力包，以及随正式版本交付的已审核 Agency Agents 中文内置专家和精选岗位资源。Skill 可以从本地文件、ZIP 或固定版本的 GitHub 来源进入候选、审核、发布和绑定流程；运行时固定 revision 与 checksum。Skill 提供的指导属于受审查的 guidance，不能覆盖平台安全策略、租户权限、SOP 或用户明确指令。
 
-可运行的 Skill 由 Python/Bash runner 承载，执行受到受控运行环境、依赖/包策略、超时、路径与 shell 规则、权限和取消收敛约束。Agency Agents 专家可作为部署侧离线、版本化的导入资产接入，不是运行时自动跟随 GitHub 更新的连接器。
+可运行的 Skill 由 Python/Bash runner 承载，执行受到受控运行环境、依赖/包策略、超时、路径与 shell 规则、权限和取消收敛约束。Agency Agents 内置专家来自随版本固定交付的中文资源包，运行时不跟随 GitHub 自动更新；升级由下一版发布包显式携带。
 
 ### 3. 知识回答和任务结果都尽量留下依据
 
@@ -247,7 +251,7 @@ cd backend
 - [知识库源码](backend/app/knowledge/)——知识解析、检索、概念与引用
 - [后端开发说明](backend/README.md) · [前端开发说明](frontend-enterprise/README.md)
 
-仓库内的设计、验收材料和 Agency Agents 专家快照属于本地/部署侧资产，按仓库策略不随 GitHub 源码发布；公开入口以 README、源码、测试和各模块 README 为准。
+仓库内的设计、验收材料和 `agency-agents-library/` 历史导入包属于本地/部署侧资产，按仓库策略不随 GitHub 源码发布；随产品运行的内置专家固定包位于 `backend/app/experts/data/`，由发布 spec 显式打入 EXE。公开入口以 README、源码、测试和各模块 README 为准。
 
 ## 开发检查
 

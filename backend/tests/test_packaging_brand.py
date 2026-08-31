@@ -132,6 +132,18 @@ def test_windows_packaging_collects_pydantic_core_extension() -> None:
     assert "_internal\\pydantic_core" in smoke_script
 
 
+def test_frozen_package_carries_builtin_expert_fixture() -> None:
+    """验证 frozen 版会携带启动时生成内置专家所需的固定中文包。"""
+
+    fixture = ROOT / "backend/app/experts/data/agency_agents_builtin_v2.json"
+    spec = (PACKAGING / "gongge-xuban.spec").read_text(encoding="utf-8")
+
+    assert fixture.is_file()
+    assert fixture.stat().st_size > 1_000_000
+    assert "BUILTIN_EXPERT_FIXTURE" in spec
+    assert '"app/experts/data"' in spec
+
+
 def test_macos_build_aligns_dependencies_and_smoke_tests_signed_app() -> None:
     """验证 macOS 构建不会复用失配依赖，并在制 DMG 前启动签名后的应用。"""
 

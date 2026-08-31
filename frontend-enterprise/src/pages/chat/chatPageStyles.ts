@@ -206,6 +206,10 @@ export const CHAT_COMPOSER_PLUS_BTN_CLASS =
   'inline-grid size-[32px] place-items-center rounded-[9px] border border-[#e3e7f1] bg-white p-0 text-[#464c5e] transition-colors hover:border-[#c9d2e4] hover:text-[#18181a] disabled:cursor-not-allowed disabled:opacity-45';
 export const CHAT_COMPOSER_INTENT_CHIP_CLASS =
   'inline-flex cursor-pointer items-center gap-[5px] rounded-full border border-[#e3e7f1] bg-[#f4f5f7] py-[4px] pl-[6px] pr-[10px] gg-type-meta font-medium text-[#464c5e] transition-colors hover:border-[#c9d2e4] hover:text-[#18181a] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#c9d2e4] focus-visible:ring-offset-1';
+export const CHAT_COMPOSER_ENGINE_BTN_CLASS =
+  'inline-flex h-[32px] max-w-[190px] items-center gap-[5px] rounded-[9px] border border-[#e3e7f1] bg-white px-[10px] gg-type-meta font-medium text-[#757f9c] shadow-none transition-colors hover:border-[#c9d2e4] hover:text-[#18181a] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--gg-cobalt)] focus-visible:ring-offset-1';
+export const CHAT_COMPOSER_ENGINE_BTN_ACTIVE_CLASS =
+  'border-[color-mix(in_srgb,var(--gg-cobalt)_34%,white)] bg-[#eef3ff] text-[var(--gg-cobalt)] shadow-[0_4px_12px_rgba(49,87,232,0.12)]';
 export const CHAT_COMPOSER_HINT_CLASS = 'truncate gg-type-caption text-[#b3b8c4] max-[560px]:hidden';
 export const CHAT_COMPOSER_MODEL_BTN_CLASS =
   'inline-flex h-[32px] max-w-[200px] items-center gap-[5px] rounded-[9px] border border-[#e3e7f1] bg-white px-[12px] gg-type-meta font-normal text-[#757f9c] shadow-none transition-colors hover:border-[#c9d2e4] hover:text-[#18181a] disabled:cursor-not-allowed disabled:opacity-45 aria-expanded:border-[#c9d2e4] aria-expanded:text-[#18181a] [&>span:first-child]:min-w-0 [&>span:first-child]:truncate';

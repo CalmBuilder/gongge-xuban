@@ -1,6 +1,6 @@
 import type { ChatAttachmentRead } from '@/types';
 
-import type { ComposerInteractionMode } from './chatTypes';
+import type { ChatExecutionEngine, ComposerInteractionMode } from './chatTypes';
 
 const CHAT_QUEUE_STORAGE_PREFIX = 'skill_agent_chat_queue';
 const INTERACTION_MODES = new Set<ComposerInteractionMode>(['normal', 'scheduled_task']);
@@ -15,6 +15,7 @@ export type PreparedChatTurn = {
   text: string;
   attachments: ChatAttachmentRead[];
   interactionMode: ComposerInteractionMode;
+  executionEngine?: ChatExecutionEngine;
   modelConfigId?: string;
   forcedGeneralSkillId?: string;
   forcedGeneralSkillIds?: string[];
@@ -50,6 +51,11 @@ function isPreparedChatTurn(value: unknown): value is PreparedChatTurn {
     && value.attachments.every(isQueuedAttachment)
     && typeof value.interactionMode === 'string'
     && INTERACTION_MODES.has(value.interactionMode as ComposerInteractionMode)
+    && (
+      value.executionEngine === undefined
+      || value.executionEngine === 'auto'
+      || value.executionEngine === 'dynamic_task'
+    )
     && (value.modelConfigId === undefined || typeof value.modelConfigId === 'string')
     && (value.forcedGeneralSkillId === undefined || typeof value.forcedGeneralSkillId === 'string')
     && (
@@ -84,10 +90,15 @@ export function readQueuedChatTurns(storage: ChatQueueStorage, key: string): Pre
       seen.add(identity);
       return true;
     });
-    if (turns.length !== parsed.length) {
-      writeQueuedChatTurns(storage, key, turns);
+    const normalizedTurns = turns.map((item) => (
+      item.executionEngine === undefined
+        ? { ...item, executionEngine: 'auto' as const }
+        : item
+    ));
+    if (normalizedTurns.length !== parsed.length || normalizedTurns.some((item, index) => item !== turns[index])) {
+      writeQueuedChatTurns(storage, key, normalizedTurns);
     }
-    return turns;
+    return normalizedTurns;
   } catch {
     try {
       storage.removeItem(key);

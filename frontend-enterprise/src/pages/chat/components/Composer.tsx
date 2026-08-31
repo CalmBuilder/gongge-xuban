@@ -30,6 +30,8 @@ import {
   CHAT_COMPOSER_AVATAR_CLASS,
   CHAT_COMPOSER_CONTEXT_ROW_CLASS,
   CHAT_COMPOSER_DROP_HINT_CLASS,
+  CHAT_COMPOSER_ENGINE_BTN_ACTIVE_CLASS,
+  CHAT_COMPOSER_ENGINE_BTN_CLASS,
   CHAT_COMPOSER_FORM_CLASS,
   CHAT_COMPOSER_FORM_DRAG_CLASS,
   CHAT_COMPOSER_HINT_CLASS,
@@ -63,6 +65,8 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
     setComposerPlusOpen,
     composerIntent,
     setComposerIntent,
+    executionEngine,
+    setExecutionEngine,
     sessionGeneralSkills,
     generalSkillCatalogLoading,
     generalSkillCatalogError,
@@ -84,8 +88,11 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
     emptyRoleSummary,
     emptyProfileTags,
     emptyStats,
+    activeConversationId,
     enabledModelConfigs,
     selectedModelConfig,
+    modelConfigsLoading,
+    modelConfigsLoadError,
     changeModelConfig,
     showModelSetupNotice,
     modelSetupNoticeText,
@@ -124,7 +131,14 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
   }, [composerIntent]);
 
   const hasSendContent = Boolean(input.trim() || readyComposerAttachments.length > 0);
-  const sendDisabled = !hasSendContent || uploadingComposerAttachment;
+  const sendDisabled = (
+    !hasSendContent
+    || uploadingComposerAttachment
+    || modelConfigsLoading
+    || Boolean(modelConfigsLoadError)
+    || !selectedModelConfig
+    || !activeConversationId
+  );
   const selectedGeneralSkills = sessionGeneralSkills.filter(
     (item) => selectedGeneralSkillIds.includes(item.skill_id),
   );
@@ -445,6 +459,21 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
                   </DropdownMenuContent>
                 </DropdownMenu>
               )}
+              <button
+                type="button"
+                className={cn(
+                  CHAT_COMPOSER_ENGINE_BTN_CLASS,
+                  executionEngine === 'dynamic_task' && CHAT_COMPOSER_ENGINE_BTN_ACTIVE_CLASS,
+                )}
+                aria-pressed={executionEngine === 'dynamic_task'}
+                aria-label={t('选择 DynamicTaskAgent 复杂任务引擎')}
+                title={t('选中后，当前没有正在执行的 SOP 时，本轮默认使用 DynamicTaskAgent；活动 SOP 会继续原流程')}
+                onClick={() => setExecutionEngine(executionEngine === 'dynamic_task' ? 'auto' : 'dynamic_task')}
+              >
+                <ProductIcon name="tool" size={14} />
+                <span className="truncate">DynamicTaskAgent</span>
+                {executionEngine === 'dynamic_task' && <ProductIcon name="check" size={13} />}
+              </button>
               {selectedGeneralSkills.map((selectedSkill) => (
                 <button
                   key={selectedSkill.skill_id}

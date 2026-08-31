@@ -32,6 +32,7 @@ from app.db.models import (
     User,
     utc_now,
 )
+from app.experts.builtin import ensure_builtin_experts_for_tenant
 from app.organization.assignments import (
     OrganizationAssignmentError,
     assign_member_to_organization,
@@ -235,6 +236,8 @@ def login(request: LoginRequest, db: Session = Depends(get_session)) -> LoginRes
     if not user or not verify_password(request.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid username or password")
     ensure_active_member(user)
+    ensure_builtin_experts_for_tenant(db, tenant_id=request.tenant_id)
+    db.commit()
 
     return LoginResponse(
         token=create_access_token(user),

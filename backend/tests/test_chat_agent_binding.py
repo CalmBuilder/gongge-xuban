@@ -473,6 +473,21 @@ def test_normal_chat_turn_user_message_metadata_is_empty() -> None:
     assert _user_message_metadata(request) == {}
 
 
+def test_dynamic_task_chat_turn_marks_selected_engine_metadata() -> None:
+    """页面选择的 DynamicTaskAgent 必须持久化为本轮请求契约，支持审计与重放校验。"""
+
+    request = ChatTurnRequest(
+        tenant_id="tenant_demo",
+        session_id="session_demo",
+        user_id="user_demo",
+        agent_id="agent_demo",
+        message="整理材料并形成结果",
+        execution_engine="dynamic_task",
+    )
+
+    assert _user_message_metadata(request) == {"execution_engine": "dynamic_task"}
+
+
 def test_chat_turn_can_select_enabled_model_config() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
