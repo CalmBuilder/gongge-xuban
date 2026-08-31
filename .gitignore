@@ -47,6 +47,7 @@ packaging/build/
 packaging/runtime/
 packaging/runtime_dl/
 packaging/_win_reqs.txt
+packaging/.windows-build-venv/
 *.tsbuildinfo
 *.egg-info/
 backend/app/experts/data/taxonomy-apply-*.json

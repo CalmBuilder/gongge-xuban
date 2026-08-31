@@ -9,6 +9,7 @@
 """
 
 # 运行：cd backend && pyinstaller ../packaging/gongge-xuban.spec --noconfirm
+import importlib.machinery
 import os
 import sys
 from pathlib import Path
@@ -42,11 +43,21 @@ datas = [
 # wheel 文件名和 Python ABI 会变化，不能只依赖 PyInstaller 对 pydantic 的
 # 静态导入推断；显式收集模块和各平台原生扩展，保证 Windows 的 .pyd、macOS
 # 的 .dylib/.so 以及 Linux 的 .so 都进入冻结包。
-pydantic_core_binaries = collect_dynamic_libs(
-    "pydantic_core",
-    destdir="pydantic_core",
-    search_patterns=["*.pyd", "*.dll", "*.dylib", "*.so"],
+_python_extension_suffixes = tuple(
+    suffix.casefold()
+    for suffix in importlib.machinery.EXTENSION_SUFFIXES
+    if suffix.casefold() not in {".pyd", ".so", ".dylib"}
 )
+pydantic_core_binaries = [
+    (source, destination)
+    for source, destination in collect_dynamic_libs(
+        "pydantic_core",
+        destdir="pydantic_core",
+        search_patterns=["*.pyd", "*.dll", "*.dylib", "*.so"],
+    )
+    if Path(source).suffix.casefold() not in {".pyd", ".so", ".dylib"}
+    or any(Path(source).name.casefold().endswith(suffix) for suffix in _python_extension_suffixes)
+]
 
 hiddenimports = (
     collect_submodules("uvicorn")

@@ -3,6 +3,9 @@ $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
 $env:PYTHONUTF8 = "1"
 $env:PYTHONIOENCODING = "utf-8"
+$env:PYTHONNOUSERSITE = "1"
+$env:PYTHONHOME = $null
+$env:PYTHONPATH = $null
 $Repo = Split-Path -Parent $PSScriptRoot
 Set-Location $Repo
 if (-not $env:VERSION) { $env:VERSION = "0.1.0" }
@@ -54,6 +57,35 @@ function Assert-PythonX64 {
   & $Python.Command @($Python.PrefixArgs) -c `
     "import platform, struct; machine = platform.machine().lower(); assert struct.calcsize('P') == 8 and machine in ('amd64', 'x86_64'), f'expected x64 Python, got {machine}'; print(f'Python x64: {machine}')"
   Assert-NativeCommandSucceeded "Python x64 architecture check"
+}
+
+function Get-PythonAbiToken {
+  param(
+    [Parameter(Mandatory = $true)]
+    [pscustomobject]$Python
+  )
+
+  $tokenOutput = & $Python.Command @($Python.PrefixArgs) -c "import sys; assert sys.implementation.name == 'cpython'; print(f'cp{sys.version_info[0]}{sys.version_info[1]}')" 2>$null
+  Assert-NativeCommandSucceeded "Python ABI tag probe"
+  $token = ($tokenOutput | Out-String).Trim()
+  if ($token -notmatch '^cp[0-9]+$') {
+    throw "Unsupported CPython ABI token: $token"
+  }
+  return $token
+}
+
+function Assert-PydanticCoreBuildDependency {
+  param(
+    [Parameter(Mandatory = $true)]
+    [pscustomobject]$Python,
+
+    [Parameter(Mandatory = $true)]
+    [string]$ExpectedAbiToken
+  )
+
+  $probeCode = "import pydantic, pydantic_core, pydantic_core._pydantic_core as native; path = native.__file__; assert '.$ExpectedAbiToken-' in path or '.abi3-' in path, f'Pydantic core ABI mismatch: expected $ExpectedAbiToken, native={path}'; print(f'Pydantic core import OK: {pydantic.__version__}, {pydantic_core.__version__}, {path}')"
+  & $Python.Command @($Python.PrefixArgs) -c $probeCode
+  Assert-NativeCommandSucceeded "Pydantic core build-environment import check"
 }
 
 function Assert-PeX64 {
@@ -160,20 +192,52 @@ function Clear-ApplicationBuildOutput {
     Write-Host "==> removing stale application output $applicationOutput"
     Remove-Item -LiteralPath $applicationOutput -Recurse -Force
   }
+
+  $pyinstallerWorkOutput = Join-Path $Repo "packaging\build"
+  if (Test-Path -LiteralPath $pyinstallerWorkOutput) {
+    Write-Host "==> removing stale PyInstaller work output $pyinstallerWorkOutput"
+    Remove-Item -LiteralPath $pyinstallerWorkOutput -Recurse -Force
+  }
 }
 
 function Assert-BundledPydanticCore {
   param(
     [Parameter(Mandatory = $true)]
-    [string]$Root
+    [string]$Root,
+
+    [Parameter(Mandatory = $true)]
+    [string]$ExpectedAbiToken
   )
 
-  $nativeModules = @(Get-ChildItem -LiteralPath $Root -Recurse -File -Filter "_pydantic_core*.pyd" |
-    Where-Object { $_.Directory.Name -ieq "pydantic_core" })
+  $allNativeModules = @(Get-ChildItem -LiteralPath $Root -Recurse -File -Filter "_pydantic_core*.pyd")
+  $expectedDirectories = @(
+    [IO.Path]::GetFullPath((Join-Path $Root "pydantic_core")).TrimEnd('\'),
+    [IO.Path]::GetFullPath((Join-Path $Root "_internal\pydantic_core")).TrimEnd('\')
+  )
+  $misplacedModules = @($allNativeModules | Where-Object {
+    $moduleDirectory = [IO.Path]::GetFullPath($_.Directory.FullName).TrimEnd('\')
+    $expectedDirectories -notcontains $moduleDirectory
+  })
+  if ($misplacedModules.Count -gt 0) {
+    $paths = ($misplacedModules | ForEach-Object { $_.FullName }) -join "; "
+    throw "PyInstaller output contains pydantic_core native extensions outside the pydantic_core package directory: $paths"
+  }
+  $nativeModules = @($allNativeModules | Where-Object {
+    $moduleDirectory = [IO.Path]::GetFullPath($_.Directory.FullName).TrimEnd('\')
+    $_.Directory.Name -ieq "pydantic_core" -and $expectedDirectories -contains $moduleDirectory
+  })
   if ($nativeModules.Count -eq 0) {
     throw "PyInstaller output is missing pydantic_core\_pydantic_core*.pyd under the pydantic_core package directory. Rebuild with the current packaging spec."
   }
+  if ($nativeModules.Count -ne 1) {
+    $names = ($nativeModules | ForEach-Object { $_.Name }) -join ", "
+    throw "PyInstaller output contains multiple pydantic_core native extensions; expected exactly one $ExpectedAbiToken-compatible file, found: $names"
+  }
   foreach ($nativeModule in $nativeModules) {
+    if ($nativeModule.Name -notmatch "\.$([regex]::Escape($ExpectedAbiToken))[-.]" -and
+        $nativeModule.Name -notmatch "\.abi3[-.]" ) {
+      throw "Pydantic core ABI mismatch: expected $ExpectedAbiToken, found $($nativeModule.Name)."
+    }
     Assert-PeX64 $nativeModule.FullName
     Write-Host "Pydantic core native extension path: $($nativeModule.FullName)"
   }
@@ -235,6 +299,8 @@ function Get-PythonCommand {
 $PY = Get-PythonCommand
 Write-Host "Using Python: $($PY.Command) $($PY.PrefixArgs -join ' ')"
 Assert-PythonX64 $PY
+$requestedAbiToken = Get-PythonAbiToken $PY
+Write-Host "Using Python ABI: $requestedAbiToken"
 
 Write-Host "==> [1/7] Build frontend"
 npm ci --prefix frontend-enterprise --no-audit --no-fund
@@ -242,31 +308,44 @@ Assert-NativeCommandSucceeded "npm ci"
 npm --prefix frontend-enterprise run build
 Assert-NativeCommandSucceeded "Frontend build"
 
-Write-Host "==> [2/7] Create backend venv and install packaging dependencies"
-& $PY.Command @($PY.PrefixArgs) -m venv backend\.venv
+Write-Host "==> [2/7] Create isolated Windows packaging venv and install dependencies"
+$venvRoot = Join-Path $Repo "packaging\.windows-build-venv"
+$venvPythonPath = Join-Path $venvRoot "Scripts\python.exe"
+if (Test-Path -LiteralPath $venvRoot) {
+  Write-Host "==> removing stale Windows packaging venv $venvRoot"
+  Remove-Item -LiteralPath $venvRoot -Recurse -Force
+}
+& $PY.Command @($PY.PrefixArgs) -m venv $venvRoot
 Assert-NativeCommandSucceeded "Backend virtual environment creation"
-backend\.venv\Scripts\python -m pip install -U pip
+$BUILD_PY = [pscustomobject]@{ Command = $venvPythonPath; PrefixArgs = @() }
+$builtAbiToken = Get-PythonAbiToken $BUILD_PY
+if ($builtAbiToken -ne $requestedAbiToken) {
+  throw "Backend venv ABI mismatch after creation: expected $requestedAbiToken, found $builtAbiToken."
+}
+Assert-PythonX64 $BUILD_PY
+& $BUILD_PY.Command @($BUILD_PY.PrefixArgs) -m pip install -U pip
 Assert-NativeCommandSucceeded "pip upgrade"
 # Extract runtime dependencies from pyproject without installing the project itself.
 Push-Location backend
-$deps = .\.venv\Scripts\python -c "import tomllib,pathlib; print('\n'.join(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['dependencies']))"
+$deps = & $BUILD_PY.Command @($BUILD_PY.PrefixArgs) -c "import tomllib,pathlib; print('\n'.join(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['dependencies']))"
 Assert-NativeCommandSucceeded "Runtime dependency extraction"
 $deps | Out-File -Encoding utf8 ..\packaging\_win_reqs.txt
 Pop-Location
-backend\.venv\Scripts\python -m pip install -r packaging\_win_reqs.txt
+& $BUILD_PY.Command @($BUILD_PY.PrefixArgs) -m pip install -r packaging\_win_reqs.txt
 Assert-NativeCommandSucceeded "Backend dependency installation"
-backend\.venv\Scripts\python -m pip install "pyinstaller>=6.6.0" "certifi>=2024.2.2"
+& $BUILD_PY.Command @($BUILD_PY.PrefixArgs) -m pip install "pyinstaller>=6.6.0" "certifi>=2024.2.2"
 Assert-NativeCommandSucceeded "Packaging dependency installation"
+Assert-PydanticCoreBuildDependency $BUILD_PY $builtAbiToken
 
 Write-Host "==> [3/7] Build PyInstaller application"
 Stop-ExistingProductProcesses
 Clear-ApplicationBuildOutput
 Push-Location backend
-.\.venv\Scripts\pyinstaller ..\packaging\gongge-xuban.spec --noconfirm --clean --distpath ..\packaging\out --workpath ..\packaging\build
+& $BUILD_PY.Command @($BUILD_PY.PrefixArgs) -m PyInstaller ..\packaging\gongge-xuban.spec --noconfirm --clean --distpath ..\packaging\out --workpath ..\packaging\build
 Assert-NativeCommandSucceeded "PyInstaller build"
 Pop-Location
 Assert-PeX64 "packaging\out\gongge-xuban\gongge-xuban.exe"
-Assert-BundledPydanticCore "packaging\out\gongge-xuban"
+Assert-BundledPydanticCore "packaging\out\gongge-xuban" $builtAbiToken
 
 $signingConfigured = Test-SigningConfigured
 if ($signingConfigured) {
@@ -281,22 +360,36 @@ if ($signingConfigured) {
 }
 
 Write-Host "==> [4/7] Bundle the Python skill runtime"
-backend\.venv\Scripts\python packaging\fetch_runtime_python.py packaging\runtime_dl --expect-arch x86_64
+& $BUILD_PY.Command @($BUILD_PY.PrefixArgs) packaging\fetch_runtime_python.py packaging\runtime_dl --expect-arch x86_64
 Assert-NativeCommandSucceeded "Python skill runtime download"
 if (Test-Path packaging\out\gongge-xuban\runtime) { Remove-Item -Recurse -Force packaging\out\gongge-xuban\runtime }
 Copy-Item -Recurse -Force packaging\runtime_dl\python packaging\out\gongge-xuban\runtime
 Assert-BundlePeX64 "packaging\out\gongge-xuban"
 
 Write-Host "==> [5/7] Build the Inno Setup installer"
+$isccSearchRoots = @(
+  $env:ProgramFiles,
+  ${env:ProgramFiles(x86)},
+  $env:LOCALAPPDATA,
+  "C:\"
+) | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Container) } | Select-Object -Unique
+$isccDiscovered = foreach ($searchRoot in $isccSearchRoots) {
+  Get-ChildItem -LiteralPath $searchRoot -Directory -Filter "Inno Setup *" -ErrorAction SilentlyContinue |
+    ForEach-Object { Join-Path -Path $_.FullName -ChildPath "ISCC.exe" }
+}
 $isccCandidates = @(
   $env:ISCC,
   "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
   "${env:ProgramFiles}\Inno Setup 6\ISCC.exe",
-  "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
-) | Where-Object { $_ }
+  "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe",
+  "${env:ProgramFiles(x86)}\Inno Setup 7\ISCC.exe",
+  "${env:ProgramFiles}\Inno Setup 7\ISCC.exe",
+  "$env:LOCALAPPDATA\Programs\Inno Setup 7\ISCC.exe",
+  $isccDiscovered
+) | Where-Object { $_ } | Select-Object -Unique
 $iscc = $isccCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $iscc) {
-  throw "Inno Setup 6 was not found. Install it or set ISCC to the full path of ISCC.exe."
+  throw "Inno Setup ISCC.exe was not found. Install Inno Setup 6 or 7, or set ISCC to the full path of ISCC.exe."
 }
 Write-Host "Using Inno Setup: $iscc"
 $unsignedInstaller = "packaging\out\Gongge-Xuban-setup.exe"
@@ -330,7 +423,8 @@ Write-Host "==> [7/7] Smoke-test installation, frozen runtime, health and uninst
 $smokeScript = (Resolve-Path packaging\smoke_windows.ps1).Path
 $resolvedOut = (Resolve-Path -LiteralPath $out).Path
 & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $smokeScript `
-  -InstallerPath $resolvedOut
+  -InstallerPath $resolvedOut `
+  -ExpectedPydanticCoreAbi $builtAbiToken
 Assert-NativeCommandSucceeded "Windows native smoke test"
 Write-Host "built $out"
 Get-ChildItem packaging\out\Gongge-Xuban-windows-x64-setup.exe

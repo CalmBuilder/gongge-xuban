@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import importlib.machinery
 import importlib.util
 import sys
 from pathlib import Path
@@ -51,7 +52,25 @@ def _load_frozen_pydantic_core() -> None:
         # 让常规 import 继续给出标准错误；构建门禁会在发布前阻止这种包进入产物。
         return
 
-    native_path = candidates[0]
+    extension_suffixes = tuple(
+        suffix.casefold()
+        for suffix in importlib.machinery.EXTENSION_SUFFIXES
+        if suffix.casefold() not in {".pyd", ".so", ".dylib"}
+    )
+    compatible_candidates = [
+        candidate
+        for candidate in candidates
+        if any(candidate.name.casefold().endswith(suffix) for suffix in extension_suffixes)
+    ]
+    if not compatible_candidates:
+        expected = ", ".join(extension_suffixes) or sys.implementation.cache_tag
+        found = ", ".join(str(candidate) for candidate in candidates)
+        raise ImportError(
+            "冻结版 Pydantic 原生扩展与当前 Python ABI 不匹配；"
+            f"期望后缀：{expected}；实际文件：{found}"
+        )
+
+    native_path = sorted(compatible_candidates)[0]
     spec = importlib.util.spec_from_file_location(_MODULE_NAME, native_path)
     if spec is None or spec.loader is None:
         raise ImportError(f"无法为冻结版 Pydantic 原生扩展创建加载器：{native_path}")

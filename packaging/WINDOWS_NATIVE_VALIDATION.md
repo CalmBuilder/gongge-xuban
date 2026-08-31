@@ -30,7 +30,8 @@ PowerShell 后重试，或者在 cmd 中先执行 `set VERSION=0.1.0`，再调�
 `powershell.exe -File packaging\build_windows.ps1`。
 
 构建脚本会先校验宿主机和 Python 均为 x64，并在 PyInstaller 前停止同名的旧版
-`gongge-xuban` 进程、清理旧的产品输出目录；随后按 `backend/pyproject.toml` 安装依赖，使用
+`gongge-xuban` 进程、清理旧的产品输出目录和 `packaging\build` 工作目录；随后按
+`backend/pyproject.toml` 安装依赖，使用
 PyInstaller 的 `--clean` 生成并校验 PE machine=`0x8664` 的 x64 可执行文件，最后生成
 `packaging\out\Gongge-Xuban-windows-x64-setup.exe`，并自动调用
 `packaging\smoke_windows.ps1`。未配置证书时只允许本地 unsigned 验证，脚本会明确
@@ -159,7 +160,7 @@ Get-Content "$env:APPDATA\Gongge-Xuban\logs\gongge-xuban.log" -Tail 100
 包源的 Windows 主机使用官方页面提供的 `winget` 安装方式，或在另一台可信机器下载后
 通过受控介质传输并校验签名。不要从不明镜像下载编译器。
 
-安装后若构建仍提示 `Inno Setup 6 was not found`，先确认编译器存在，再把完整路径传给
+安装后若构建仍提示 `Inno Setup ISCC.exe was not found`，先确认编译器存在，再把完整路径传给
 脚本支持的 `ISCC` 环境变量。脚本会优先使用当前 PowerShell 会话中的 `$env:ISCC`，因此
 自定义目录（例如 `C:\Inno Setup 7`）应显式设置为其中的 `ISCC.exe`：
 
@@ -177,8 +178,8 @@ if (-not (Test-Path -LiteralPath $env:ISCC)) {
 & $env:ISCC /?
 ```
 
-如果安装的是 Inno Setup 7，脚本不会假定其目录名，也不会从网络自动下载；请将
-`$env:ISCC` 指向实际的 `ISCC.exe` 后再构建，并先用同一版本完成一次本地冒烟。若不确定
+如果安装的是 Inno Setup 7，脚本会优先自动发现标准目录和磁盘根目录下的 `Inno Setup *` 目录，
+也不会从网络自动下载；自定义目录仍请将 `$env:ISCC` 指向实际的 `ISCC.exe` 后再构建，并先用同一版本完成一次本地冒烟。若不确定
 文件位置，可执行：
 
 ```powershell
@@ -214,10 +215,24 @@ Get-ChildItem .\packaging\out\gongge-xuban `
   -Recurse -Filter "_pydantic_core*.pyd"
 ```
 
-输出必须位于 `pydantic_core` 目录下。Smoke 测试会打印完整路径，并在冻结启动前验证该目录；
+注意：`cp313`/`cp314` 是 CPython 原生扩展的 ABI 标记；正常产物会保留一个与本次构建解释器
+一致的标记。需要消除的是同一包中同时出现不同 ABI，或出现与当前解释器不匹配的扩展，不能
+通过删名或改名来“修复”原生文件。输出必须只有一个，且必须直接位于 `pydantic_core` 目录下
+（PyInstaller 6 的 onedir 布局通常是 `_internal\pydantic_core`）；文件名中的
+`cp311`/`cp313`/`cp314` 必须与本次构建解释器一致，不能同时残留多个 Python ABI 的文件。
+构建脚本会检查 Python ABI、在构建环境中实际执行
+`import pydantic_core._pydantic_core`，并通过同一解释器的 `python -m PyInstaller` 构建，避免
+复用旧 `backend\.venv` 或旧 PyInstaller 启动器造成错配。Windows 构建使用并在每轮清理独立的
+`packaging\.windows-build-venv`，不会改写开发环境；最终输出和安装后的 Smoke 测试都会再次拒绝
+错 ABI、重复或放错目录的扩展。Smoke 测试会打印完整路径，并在冻结启动前验证该目录；
 若安装包日志仍失败，查看诊断目录中的 `data\logs\gongge-xuban.log`，其中会保留
 `ModuleNotFoundError`/`ImportError` 的模块详情和扩展路径。只看到 `.pyd` 文件或 Inno Setup
 编译成功，均不等于冻结版可导入。
+
+如果看到 `Module use of python314.dll conflicts with this version of Python`，说明构建过程中
+混用了不同 Python 小版本或不同环境的原生扩展。脚本会自动清理并重建独立的
+`packaging\.windows-build-venv`；若目录被占用或无法重建，先退出正在运行的开发服务，再重新执行完整构建，
+不要手工复制 `cp314`/`cp313` 文件。
 
 没有任何输出时不要发布安装器，应使用当前提交重新执行完整构建。若文件存在但仍无法导入，
 再检查其 Python ABI、PE machine 是否为 AMD64，以及依赖 DLL 是否齐全；不要从其他 Python

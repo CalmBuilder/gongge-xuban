@@ -106,6 +106,7 @@ def test_windows_packaging_collects_pydantic_core_extension() -> None:
     assert 'collect_submodules("pydantic_core")' in spec
     assert '"pydantic_core._pydantic_core"' in spec
     assert 'destdir="pydantic_core"' in spec
+    assert "EXTENSION_SUFFIXES" in spec
     assert 'search_patterns=["*.pyd", "*.dll", "*.dylib", "*.so"]' in spec
     assert "pydantic_core_binaries" in spec
     assert (PACKAGING / "runtime_hooks/pyi_rth_pydantic_core.py").is_file()
@@ -115,6 +116,20 @@ def test_windows_packaging_collects_pydantic_core_extension() -> None:
     assert "Assert-InstalledPydanticCore" in smoke_script
     assert "Directory.Name -ieq \"pydantic_core\"" in build_script
     assert "Directory.Name -ieq \"pydantic_core\"" in smoke_script
+    assert "Get-PythonAbiToken" in build_script
+    assert "Assert-PydanticCoreBuildDependency" in build_script
+    assert "packaging\\.windows-build-venv" in build_script
+    assert "-m PyInstaller" in build_script
+    assert "Pydantic core ABI mismatch" in build_script
+    assert "packaging\\build" in build_script
+    assert "multiple pydantic_core native extensions" in build_script
+    assert "_internal\\pydantic_core" in build_script
+    assert "Inno Setup 7" in build_script
+    assert "ISCC.exe was not found" in build_script
+    assert "ExpectedPydanticCoreAbi" in build_script
+    assert "ExpectedPydanticCoreAbi" in smoke_script
+    assert "multiple pydantic_core native extensions" in smoke_script
+    assert "_internal\\pydantic_core" in smoke_script
 
 
 def test_macos_build_aligns_dependencies_and_smoke_tests_signed_app() -> None:

@@ -11,6 +11,8 @@ param(
 
   [int]$Port = 0,
 
+  [string]$ExpectedPydanticCoreAbi = "",
+
   [switch]$KeepArtifacts
 )
 
@@ -132,15 +134,41 @@ function Invoke-RuntimeProbe {
 function Assert-InstalledPydanticCore {
   param(
     [Parameter(Mandatory = $true)]
-    [string]$InstallDirectory
+    [string]$InstallDirectory,
+
+    [string]$ExpectedAbiToken = ""
   )
 
-  $nativeModules = @(Get-ChildItem -LiteralPath $InstallDirectory -Recurse -File -Filter "_pydantic_core*.pyd" |
-    Where-Object { $_.Directory.Name -ieq "pydantic_core" })
+  $allNativeModules = @(Get-ChildItem -LiteralPath $InstallDirectory -Recurse -File -Filter "_pydantic_core*.pyd")
+  $expectedDirectories = @(
+    [IO.Path]::GetFullPath((Join-Path $InstallDirectory "pydantic_core")).TrimEnd('\'),
+    [IO.Path]::GetFullPath((Join-Path $InstallDirectory "_internal\pydantic_core")).TrimEnd('\')
+  )
+  $misplacedModules = @($allNativeModules | Where-Object {
+    $moduleDirectory = [IO.Path]::GetFullPath($_.Directory.FullName).TrimEnd('\')
+    $expectedDirectories -notcontains $moduleDirectory
+  })
+  if ($misplacedModules.Count -gt 0) {
+    $paths = ($misplacedModules | ForEach-Object { $_.FullName }) -join "; "
+    throw "Installed package contains pydantic_core native extensions outside the pydantic_core package directory: $paths"
+  }
+  $nativeModules = @($allNativeModules | Where-Object {
+    $moduleDirectory = [IO.Path]::GetFullPath($_.Directory.FullName).TrimEnd('\')
+    $_.Directory.Name -ieq "pydantic_core" -and $expectedDirectories -contains $moduleDirectory
+  })
   if ($nativeModules.Count -eq 0) {
     throw "Installed package is missing pydantic_core\_pydantic_core*.pyd under the pydantic_core package directory."
   }
+  if ($nativeModules.Count -ne 1) {
+    $names = ($nativeModules | ForEach-Object { $_.Name }) -join ", "
+    throw "Installed package contains multiple pydantic_core native extensions; expected exactly one file, found: $names"
+  }
   foreach ($nativeModule in $nativeModules) {
+    if ($ExpectedAbiToken -and
+        $nativeModule.Name -notmatch "\.$([regex]::Escape($ExpectedAbiToken))[-.]" -and
+        $nativeModule.Name -notmatch "\.abi3[-.]" ) {
+      throw "Installed package Pydantic core ABI mismatch: expected $ExpectedAbiToken, found $($nativeModule.Name)."
+    }
     Write-Host "OK: installed pydantic core native extension path: $($nativeModule.FullName)"
   }
   Write-Host "OK: installed pydantic core native extension found ($($nativeModules.Count) file(s))"
@@ -187,7 +215,7 @@ try {
   if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
     throw "Installed executable was not found: $executable"
   }
-  Assert-InstalledPydanticCore $installDirectory
+  Assert-InstalledPydanticCore $installDirectory $ExpectedPydanticCoreAbi
 
   $runtimePython = Join-Path $installDirectory "runtime\python.exe"
   if (-not (Test-Path -LiteralPath $runtimePython -PathType Leaf)) {
