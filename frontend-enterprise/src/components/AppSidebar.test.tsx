@@ -4,6 +4,7 @@ import { beforeEach, expect, it, vi } from 'vitest';
 import { SidebarProvider } from '@/components/ui/sidebar';
 import { TooltipProvider } from '@/components/ui/tooltip';
 
+import type { AgentProfileRead } from '../types';
 import AppSidebar from './AppSidebar';
 
 beforeEach(() => {
@@ -17,6 +18,7 @@ beforeEach(() => {
 function renderSidebar(
   governancePermissions: string[],
   isAdmin = false,
+  sidebarAgent?: AgentProfileRead,
 ) {
   return render(
     <TooltipProvider>
@@ -27,6 +29,7 @@ function renderSidebar(
           onNavigate={vi.fn()}
           onOpenChat={vi.fn()}
           onSelectAgent={vi.fn()}
+          sidebarAgent={sidebarAgent}
           scopeAgents={[]}
           selected="/enterprise/platform"
           selectedAgentId=""
@@ -95,4 +98,28 @@ it('keeps the lower management panel intrinsic and lets only primary navigation 
   expect(content).not.toHaveClass('flex-1', 'overflow-y-auto');
   expect(footer).toHaveClass('min-h-[var(--gg-sidebar-footer-slot)]', 'shrink-0');
   expect(primaryButton).toHaveClass('h-[40px]', 'gap-[var(--gg-sidebar-control-gap)]', 'px-[16px]');
+});
+
+it('keeps the current expert context on one stable line so it cannot grow the lower panel', () => {
+  const expertTemplate: AgentProfileRead = {
+    id: 'expert-template',
+    tenant_id: 'tenant',
+    name: '数据可视化工程师',
+    is_overall: false,
+    status: 'active',
+    governance_form: 'template',
+    metadata: { employee_type: 'expert' },
+    resources: [],
+    created_at: '',
+    updated_at: '',
+  };
+
+  renderSidebar([], false, expertTemplate);
+
+  const context = screen.getByText('当前专家模板（直接使用）');
+  const name = screen.getByText('数据可视化工程师 @平台内置');
+  expect(context).toHaveClass('truncate');
+  expect(context).toHaveAttribute('title', '当前专家模板（直接使用）');
+  expect(name).toHaveClass('truncate');
+  expect(name).toHaveAttribute('title', '数据可视化工程师 @平台内置');
 });

@@ -75,11 +75,12 @@
   --gg-metric-card-min-height: 136px;
   --gg-info-card-min-height: 220px;
   --gg-sidebar-primary-item-gap: 6px;
+  --gg-sidebar-primary-divider-gap: 12px;
   --gg-sidebar-secondary-item-gap: 2px;
   --gg-sidebar-control-gap: 10px;
   --gg-sidebar-secondary-control-gap: 8px;
-  --gg-sidebar-lower-top-gap: 36px;
-  --gg-sidebar-lower-bottom-gap: 24px;
+  --gg-sidebar-lower-top-gap: 16px;
+  --gg-sidebar-lower-bottom-gap: 8px;
   --gg-sidebar-footer-slot: 64px;
 
   --background: var(--gg-cloud);

@@ -319,8 +319,10 @@ function AgentSwitcher({
             </div>
           )}
           <span className="flex min-w-0 flex-1 flex-col gap-[4px] group-data-[collapsible=icon]:hidden">
-            <span className="gg-type-caption text-[#757f9c]">{caption}</span>
-            <span className="block truncate gg-type-meta font-medium text-[#464c5e]">
+            <span title={caption} className="block truncate gg-type-caption text-[#757f9c]">
+              {caption}
+            </span>
+            <span title={nameLabel} className="block truncate gg-type-meta font-medium text-[#464c5e]">
               {nameLabel}
             </span>
           </span>
@@ -684,7 +686,7 @@ function ManagementSidebar({
           )}
         </div>
 
-        <div className="flex min-h-0 flex-1 flex-col gap-[18px]">
+        <div className="flex min-h-0 flex-1 flex-col gap-[var(--gg-sidebar-primary-divider-gap)]">
           <SidebarMenu className="no-scrollbar min-h-0 flex-1 gap-[var(--gg-sidebar-primary-item-gap)] overflow-y-auto overscroll-contain pr-[4px]">
             {primaryItems.map((item) => (
               <PrimaryNavButton

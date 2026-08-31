@@ -34,8 +34,9 @@ describe('Gongge design tokens', () => {
     expect(styles).toContain('.gg-resource-grid');
     expect(styles).toContain('.gg-metric-grid');
     expect(styles).toContain('.gg-info-grid');
-    expect(styles).toContain('--gg-sidebar-lower-top-gap: 36px');
-    expect(styles).toContain('--gg-sidebar-lower-bottom-gap: 24px');
+    expect(styles).toContain('--gg-sidebar-primary-divider-gap: 12px');
+    expect(styles).toContain('--gg-sidebar-lower-top-gap: 16px');
+    expect(styles).toContain('--gg-sidebar-lower-bottom-gap: 8px');
     expect(styles).toContain('--gg-sidebar-primary-item-gap: 6px');
   });
 });
