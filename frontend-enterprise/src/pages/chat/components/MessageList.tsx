@@ -46,6 +46,12 @@ export default function MessageList({ chat }: { chat: UseChatSession }) {
     lastTurn,
   } = chat;
   const renderMessages = placeQueuedMessagesLast(displayedMessages);
+  const latestUserMessageId = [...renderMessages].reverse().find((item) => (
+    item.role === 'user' && item.metadata?.queued !== true
+  ))?.id;
+  const latestAssistantMessageId = [...renderMessages].reverse().find((item) => (
+    item.role === 'assistant' && !item.isStreaming && Boolean(normalizeMessageText(item.content))
+  ))?.id;
 
   return (
     <div className={CHAT_MESSAGES_CLASS} ref={chatMessagesRef} onScroll={handleChatMessagesScroll}>
@@ -148,6 +154,8 @@ export default function MessageList({ chat }: { chat: UseChatSession }) {
             scheduledTaskPrompt,
             attachments,
             statusOnly,
+            canEdit: item.id === latestUserMessageId,
+            canRetry: item.id === latestAssistantMessageId,
           };
 
           return <MessageBubble key={`${item.id}:message`} chat={chat} item={item} render={render} />;

@@ -10,6 +10,7 @@ export type ProductIconName =
   | 'cloud'
   | 'clock'
   | 'code'
+  | 'copy'
   | 'database'
   | 'desktop'
   | 'download'
@@ -66,6 +67,7 @@ const iconPaths: Record<ProductIconName, string[]> = {
   cloud: ['M7.5 18h9.5a4 4 0 0 0 .7-7.9A6.2 6.2 0 0 0 5.8 11.5 3.4 3.4 0 0 0 7.5 18Z'],
   clock: ['M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18Z', 'M12 7v5l3.5 2'],
   code: ['M9 8l-4 4 4 4', 'M15 8l4 4-4 4', 'M13 5l-2 14'],
+  copy: ['M8 8h10a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2Z', 'M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2'],
   database: ['M5 7c0 2 14 2 14 0S5 5 5 7Z', 'M5 7v5c0 2 14 2 14 0V7', 'M5 12v5c0 2 14 2 14 0v-5'],
   desktop: ['M4 5h16v11H4V5Z', 'M9 20h6', 'M12 16v4'],
   download: ['M12 4v10', 'M8 10l4 4 4-4', 'M5 20h14'],

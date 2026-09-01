@@ -253,6 +253,75 @@ def test_running_client_turn_reattaches_until_original_worker_persists_terminal(
     assert "event: complete" in stream
 
 
+def test_chat_stream_releases_preflight_agent_lock_before_worker_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """流式接口把预检事务交给后台 worker 前必须提交，避免请求锁住同一 Agent。"""
+
+    class _Db:
+        """记录流式路由是否释放了预检事务。"""
+
+        def __init__(self) -> None:
+            """初始化提交计数。"""
+
+            self.commit_count = 0
+
+        def commit(self) -> None:
+            """记录一次释放预检锁的提交。"""
+
+            self.commit_count += 1
+
+    class _Thread:
+        """不执行 worker、只观察线程启动前的事务状态。"""
+
+        def __init__(self, *, target, daemon: bool) -> None:
+            """保存待执行目标并校验线程以 daemon 方式创建。"""
+
+            self.target = target
+            self.daemon = daemon
+
+        def start(self) -> None:
+            """记录 worker 启动点；测试不真正调用后台模型链路。"""
+
+            assert db.commit_count == 1
+
+    db = _Db()
+    user = User(
+        id="user_demo",
+        tenant_id="tenant_demo",
+        username="demo",
+        password_hash="hashed",
+    )
+    request = ChatTurnRequest(
+        tenant_id="tenant_demo",
+        session_id="session_stream_lock",
+        agent_id="agent_demo",
+        user_id="user_demo",
+        message="检查首轮流式执行",
+    )
+    monkeypatch.setattr(chat_api, "_ensure_request_tenant", lambda *_args: None)
+    monkeypatch.setattr(chat_api, "ensure_tenant", lambda *_args: None)
+    monkeypatch.setattr(
+        chat_api,
+        "_ensure_chat_session_available",
+        lambda *_args: ChatSession(
+            id="session_stream_lock",
+            tenant_id="tenant_demo",
+            user_id="user_demo",
+            agent_id="agent_demo",
+        ),
+    )
+    monkeypatch.setattr(chat_api, "_bind_request_to_session_agent", lambda *_args: request)
+    monkeypatch.setattr(chat_api, "_existing_turn_replay", lambda *_args: None)
+    monkeypatch.setattr(chat_api, "_latest_event_cursor", lambda *_args: None)
+    monkeypatch.setattr(chat_api.threading, "Thread", _Thread)
+
+    response = chat_api.chat_stream(request, current_user=user, db=db)  # type: ignore[arg-type]
+
+    assert response.media_type == "text/event-stream"
+    assert db.commit_count == 1
+
+
 def test_stream_end_only_replay_stays_open_until_business_terminal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

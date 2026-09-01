@@ -192,7 +192,7 @@ class GeneralSkillRuntimeService:
     ) -> SessionGeneralSkillOverride:
         """CAS 写入会话收窄状态；unmute 仍需当前上层 eligibility 成立。"""
 
-        self._session(current_user, session_id=session_id, agent_id=agent_id)
+        self._session(current_user, session_id=session_id, agent_id=agent_id, lock_agent=True)
         eligible_ids = {
             item.skill_id
             for item in EffectiveGeneralSkillResolver(self.db).resolve(current_user, agent_id).items
@@ -266,6 +266,9 @@ class GeneralSkillRuntimeService:
     ) -> LoadedGeneralSkill:
         """在模型运行前固定 revision、校验预算并按调用方事务边界写入 active Use。"""
 
+        # 目录查询保持无锁；真正创建 Use 前短暂锁定 Agent，防止删除墓碑在
+        # eligibility 校验与写入之间穿过，同时不让只读菜单请求阻塞流式执行。
+        self._session(current_user, session_id=session_id, agent_id=agent_id, lock_agent=True)
         items = self.session_catalog(current_user, session_id=session_id, agent_id=agent_id)
         item = next((candidate for candidate in items if candidate.skill_id == skill_id), None)
         if item is None:
@@ -1227,17 +1230,24 @@ class GeneralSkillRuntimeService:
             raise SkillObjectStoreError("skill resource checksum mismatch")
         return payload
 
-    def _session(self, current_user: User, *, session_id: str, agent_id: str) -> ChatSession:
-        """按 Agent→会话锁序验证活动生命周期，拒绝墓碑旁路和由请求重绑。"""
+    def _session(
+        self,
+        current_user: User,
+        *,
+        session_id: str,
+        agent_id: str,
+        lock_agent: bool = False,
+    ) -> ChatSession:
+        """验证会话与 Agent 生命周期；仅写入边界按需持有短时 Agent 锁。"""
 
+        statement = select(AgentProfile).where(
+            AgentProfile.tenant_id == current_user.tenant_id,
+            AgentProfile.id == agent_id,
+        )
+        if lock_agent:
+            statement = statement.with_for_update()
         agent = self.db.exec(
-            select(AgentProfile)
-            .where(
-                AgentProfile.tenant_id == current_user.tenant_id,
-                AgentProfile.id == agent_id,
-            )
-            .with_for_update()
-            .execution_options(populate_existing=True)
+            statement.execution_options(populate_existing=True)
         ).first()
         deletion = (agent.metadata_json or {}).get("agent_deletion") if agent else None
         deletion_state = deletion.get("state") if isinstance(deletion, dict) else None

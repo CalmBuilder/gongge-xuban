@@ -33,6 +33,13 @@ FALLBACK_REPLY = "抱歉，我暂时无法处理这个问题。您可以换个�
 MODEL_FAILURE_SUGGESTION = "请检查模型配置、API Key、网络或模型服务状态后重试。"
 TOOL_FAILURE_SUGGESTION = "请检查工具配置、调用参数或外部服务状态后重试。"
 RUNTIME_CONTROL_FALLBACK = "流程已被系统规则终止，请查看执行记录或联系管理员。"
+DYNAMIC_TASK_ROLLOUT_GUIDANCE = (
+    "DynamicTaskAgent 当前被服务端普通动态总开关拒绝；普通能力不需要在前端勾选，"
+    "请管理员检查 DYNAMIC_TASK_EXECUTION_ENABLED 和运行时容量配置。"
+)
+DYNAMIC_TASK_QUOTA_GUIDANCE = (
+    "DynamicTaskAgent 的运行时容量尚未配置；请管理员为 tenant、Agent、用户和工具配置大于 0 的运行槽位。"
+)
 GUIDANCE_APPLICATION_CONTRACT = {
     "version": "guidance-application-checkpoint-v1",
     "required_checks": [
@@ -77,6 +84,26 @@ def format_runtime_failure_reply(
     normalized_detail = normalized_detail.rstrip("。.!！")
     suffix = (suggestion or "请稍后重试，或联系管理员查看执行记录。").strip()
     return f"{title}{code_part}：{normalized_detail}。{suffix}"
+
+
+def dynamic_task_failure_message(code: str) -> str | None:
+    """为动态任务基础门禁返回不暴露内部实现的可行动错误说明。"""
+
+    if code == "DYNAMIC_TASK_ROLLOUT_DENIED":
+        return DYNAMIC_TASK_ROLLOUT_GUIDANCE
+    if code == "DYNAMIC_TASK_QUOTA_NOT_CONFIGURED":
+        return DYNAMIC_TASK_QUOTA_GUIDANCE
+    return None
+
+
+def dynamic_task_failure_suggestion(code: str) -> str:
+    """为动态任务失败选择与总开关或运行容量对应的用户提示。"""
+
+    if code == "DYNAMIC_TASK_ROLLOUT_DENIED":
+        return "开启服务端普通动态能力后重试；无需重复选择 DynamicTaskAgent。"
+    if code == "DYNAMIC_TASK_QUOTA_NOT_CONFIGURED":
+        return "补齐运行时容量后重试；这不是模型余额或外部日志本身导致的错误。"
+    return "请查看执行记录或服务日志定位具体原因后重试。"
 
 
 def model_failure_suggestion(detail: object) -> str:

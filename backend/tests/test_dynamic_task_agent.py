@@ -88,6 +88,7 @@ from app.dynamic_tasks.agent import (
     _repair_feedback_has_guidance_error,
     _restore_guidance_repair_hints,
     _normalize_dynamic_result_arguments,
+    _project_dynamic_input_elements,
     _redact_untrusted_instruction_echoes,
     _untrusted_instruction_echo_errors,
 )
@@ -332,6 +333,22 @@ class _Planner:
             ),
             budget={"max_steps": 4},
         )
+
+
+class _RecordingPlanner(_Planner):
+    """记录每一轮规划实际收到的附件投影，验证会话续接没有丢失输入。"""
+
+    def __init__(self) -> None:
+        """初始化父类调用计数和逐轮附件记录。"""
+
+        super().__init__()
+        self.resource_batches: list[tuple[dict[str, object], ...]] = []
+
+    def create_plan(self, *, input_resources=(), **kwargs):
+        """保留规划器原有计划，同时记录每轮的安全附件元数据。"""
+
+        self.resource_batches.append(tuple(input_resources))
+        return super().create_plan(input_resources=input_resources, **kwargs)
 
 
 class _EmptyStartCatalog(_StartCatalog):
@@ -1287,6 +1304,37 @@ def test_dynamic_result_arguments_normalize_single_guidance_object() -> None:
     )
     assert isinstance(normalized["guidance_applications"], list)
     assert isinstance(normalized["guidance_applications"][0]["items"], list)
+
+
+def test_dynamic_input_projection_keeps_late_relevant_log_window() -> None:
+    """超长日志的后段关键告警必须进入有界投影，不能只截取文件开头。"""
+
+    before = [f"INFO routine event {index}" for index in range(4000)]
+    after = [f"INFO trailing event {index}" for index in range(4000)]
+    target = (
+        "2026-08-31 16:58:20:898 acct-corp WARN - "
+        "No content length specified for stream data."
+    )
+    elements, metadata = _project_dynamic_input_elements(
+        [
+            {
+                "element_id": "element_log",
+                "type": "text",
+                "text": "\n".join([*before, target, *after]),
+                "locator": {"line_start": 1, "line_end": 8001},
+                "content_checksum": "a" * 64,
+            }
+        ],
+        search_text="分析 No content length specified for stream data 告警",
+        max_chars=4_000,
+    )
+
+    projected_text = str(elements[0]["text"])
+    assert target in projected_text
+    assert len(projected_text) <= 4_000
+    assert metadata["mode"] == "relevant_windows"
+    assert int(metadata["omitted_char_count"]) > 0
+    assert elements[0]["content_checksum"] == "a" * 64
 
 
 def test_dynamic_result_arguments_strip_only_known_action_envelope_fields() -> None:
@@ -2962,6 +3010,224 @@ def test_start_task_uses_preflight_catalog_and_reuses_same_active_execution() ->
         assert first.goal_snapshot_json["success_criteria"][0]["id"] == "criterion_01"
 
 
+def test_continue_chat_turn_reuses_terminal_lineage_and_is_idempotent() -> None:
+    """终态后的追问必须沿同一会话链创建下一轮，并可按消息幂等重放。"""
+
+    engine = create_engine("sqlite://", poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as db:
+        _ensure_dynamic_agent(db)
+        capabilities = _model_capabilities()
+        model = ModelConfig(
+            id="model_continuation",
+            tenant_id="tenant_demo",
+            name="动态续接模型",
+            api_key_encrypted="encrypted",
+            model="model-demo",
+            capability_snapshot_json=capabilities,
+            capability_checksum=capability_checksum(capabilities),
+            preflight_status="ready",
+        )
+        db.add(model)
+        db.flush()
+        planner = _Planner()
+        agent = DynamicTaskAgent(
+            db,
+            catalog=_StartCatalog(model, _snapshot()),
+            tool_executor=_Executor(),
+            planner=planner,
+        )
+        parent, created = agent.start_task(
+            tenant_id="tenant_demo",
+            session_id="session_continuation",
+            agent_id="agent_demo",
+            initiator_user_id="user_demo",
+            goal="分析同一份 S3 日志并形成可校验结论",
+            success_criteria=("覆盖日志根因",),
+            model_config=model,
+            source_ref="message_1",
+            conversation_context={
+                "messages": [
+                    {"role": "user", "content": "分析同一份 S3 日志并形成可校验结论"},
+                ]
+            },
+        )
+        assert created is True
+        with agent.store.owned(parent, worker_id="test-fail-parent"):
+            agent.store.fail_instance(parent, context_patch={"failure_code": "TEST_FAILED"})
+        db.commit()
+
+        child, child_created = agent.continue_chat_turn(
+            tenant_id="tenant_demo",
+            session_id="session_continuation",
+            agent_id="agent_demo",
+            initiator_user_id="user_demo",
+            user_message_id="message_2",
+            message="根据上轮继续核对上传次数",
+            success_criteria=("不能被新路由覆盖",),
+            model_config=model,
+            source_ref="message_2",
+            conversation_context={
+                "messages": [
+                    {"role": "user", "content": "分析同一份 S3 日志并形成可校验结论"},
+                    {"role": "assistant", "content": "上一轮结论"},
+                    {"role": "user", "content": "根据上轮继续核对上传次数"},
+                ]
+            },
+        )
+
+        assert child_created is True
+        assert child.id != parent.id
+        assert parent.status == "failed"
+        assert child.goal_snapshot_json["continued_from_execution_id"] == parent.id
+        assert child.goal_snapshot_json["conversation_base_goal"] == (
+            "分析同一份 S3 日志并形成可校验结论"
+        )
+        assert child.goal_snapshot_json["conversation_root_execution_id"] == parent.id
+        assert child.goal_snapshot_json["conversation_turn_number"] == 2
+        assert child.goal_snapshot_json["success_criteria"][0]["spec"]["description"] == (
+            "覆盖日志根因"
+        )
+        assert child.context_json["conversation_context"][-1]["content"] == (
+            "根据上轮继续核对上传次数"
+        )
+        assert child.context_json["dynamic_chat_continuation"][
+            "conversation_root_execution_id"
+        ] == parent.id
+        assert child.context_json["dynamic_chat_continuation"]["conversation_turn_number"] == 2
+        assert "原始任务：分析同一份 S3 日志并形成可校验结论" in child.goal_snapshot_json["goal"]
+        assert "本轮用户追加输入：根据上轮继续核对上传次数" in child.goal_snapshot_json["goal"]
+        assert planner.calls == 2
+
+        with agent.store.owned(child, worker_id="test-fail-child"):
+            agent.store.fail_instance(child, context_patch={"failure_code": "TEST_FAILED"})
+        db.commit()
+        replayed, replayed_created = agent.continue_chat_turn(
+            tenant_id="tenant_demo",
+            session_id="session_continuation",
+            agent_id="agent_demo",
+            initiator_user_id="user_demo",
+            user_message_id="message_2",
+            message="根据上轮继续核对上传次数",
+            success_criteria=("不能被新路由覆盖",),
+            model_config=model,
+            source_ref="message_2",
+        )
+
+        assert replayed_created is False
+        assert replayed.id == child.id
+        assert planner.calls == 2
+
+
+def test_continue_chat_turn_inherits_parent_input_resource_snapshot(tmp_path) -> None:
+    """终态追问应继续携带父轮已冻结的附件版本，而不是要求用户重复上传。"""
+
+    engine = create_engine("sqlite://", poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as db:
+        user = User(
+            id="user_demo",
+            tenant_id="tenant_demo",
+            username="demo",
+            password_hash="x",
+        )
+        profile = AgentProfile(
+            id="agent_demo",
+            tenant_id="tenant_demo",
+            name="附件续接数字员工",
+            owner_user_id=user.id,
+        )
+        capabilities = _model_capabilities()
+        model = ModelConfig(
+            id="model_continuation_input",
+            tenant_id="tenant_demo",
+            name="附件续接动态模型",
+            api_key_encrypted="encrypted",
+            model="model-demo",
+            capability_snapshot_json=capabilities,
+            capability_checksum=capability_checksum(capabilities),
+            preflight_status="ready",
+        )
+        db.add_all([user, profile, model])
+        db.flush()
+        resource_service = ManagedInputResourceService(db, storage_root=tmp_path)
+        resource, _attachment = resource_service.persist_upload(
+            tenant_id="tenant_demo",
+            owner_user_id=user.id,
+            agent_id=profile.id,
+            filename="conversation-log.txt",
+            content_type="text/plain",
+            data=b"parent attachment",
+        )
+        parent_message = Message(
+            id="message_parent_input",
+            tenant_id="tenant_demo",
+            session_id="session_continuation_input",
+            role="user",
+            content="请分析附件并形成结论",
+            metadata_json={},
+        )
+        db.add(parent_message)
+        db.flush()
+        _publish_test_input(
+            db,
+            resource=resource,
+            message=parent_message,
+            text="parent attachment",
+            file_format="text",
+        )
+        planner = _RecordingPlanner()
+        agent = DynamicTaskAgent(
+            db,
+            catalog=_StartCatalog(model, _snapshot()),
+            tool_executor=_Executor(),
+            planner=planner,
+            resource_service=resource_service,
+        )
+        parent, created = agent.start_task(
+            tenant_id="tenant_demo",
+            session_id=parent_message.session_id,
+            agent_id=profile.id,
+            initiator_user_id=user.id,
+            goal=parent_message.content,
+            success_criteria=("覆盖附件证据",),
+            model_config=model,
+            source_ref=parent_message.id,
+            input_resource_ids=(resource.id,),
+            input_resource_versions={resource.id: resource.version},
+        )
+        assert created is True
+        with agent.store.owned(parent, worker_id="test-fail-input-parent"):
+            agent.store.fail_instance(parent, context_patch={"failure_code": "TEST_FAILED"})
+        db.commit()
+
+        child, child_created = agent.continue_chat_turn(
+            tenant_id="tenant_demo",
+            session_id=parent_message.session_id,
+            agent_id=profile.id,
+            initiator_user_id=user.id,
+            user_message_id="message_child_input",
+            message="根据上轮附件继续核对结论",
+            success_criteria=("不能丢失附件证据",),
+            model_config=model,
+            source_ref="message_child_input",
+        )
+        assert child_created is True
+        snapshots = db.exec(
+            select(InputResourceSnapshot).where(
+                InputResourceSnapshot.tenant_id == "tenant_demo",
+                InputResourceSnapshot.execution_id == child.id,
+            )
+        ).all()
+        assert len(snapshots) == 1
+        assert snapshots[0].source_resource_id == resource.id
+        assert snapshots[0].source_version == resource.version
+        assert snapshots[0].source_message_id == parent_message.id
+        assert planner.resource_batches[0][0]["resource_id"] == resource.id
+        assert planner.resource_batches[1][0]["resource_id"] == resource.id
+        assert planner.resource_batches[1][0]["version"] == resource.version
+
+
 def test_start_task_without_tools_can_create_clarification_and_answer_plan() -> None:
     """空工具目录仍可创建只含澄清/回答的持久动态任务，且冻结快照不伪造能力。"""
 
@@ -3466,12 +3732,23 @@ def test_run_loop_serially_reaches_verified_terminal_result() -> None:
             model_config=model,
             worker_id="worker_loop",
             actor_user_id="user_demo",
+            user_message_id="user_message_loop",
         )
 
         assert outcome.status == "succeeded"
         assert outcome.message is not None
         assert executor.calls == 1
         assert proposer.calls == 2
+        assert outcome.message.metadata_json["user_message_id"] == "user_message_loop"
+        assert outcome.message.metadata_json["turn_id"] == "user_message_loop"
+        assistant_event = db.exec(
+            select(AgentEvent).where(
+                AgentEvent.session_id == "session_loop",
+                AgentEvent.event_type == "assistant_message_created",
+            )
+        ).one()
+        assert assistant_event.payload_json["user_message_id"] == "user_message_loop"
+        assert assistant_event.payload_json["turn_id"] == "user_message_loop"
 
 
 def test_run_loop_repairs_invalid_result_once_and_settles_skill_use() -> None:

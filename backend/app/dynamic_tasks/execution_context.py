@@ -52,6 +52,7 @@ class ExecutionContextProjection(BaseModel):
     operations: tuple[dict[str, Any], ...]
     input_resources: tuple[dict[str, Any], ...]
     memory_context: tuple[dict[str, Any], ...] = ()
+    conversation_context: tuple[dict[str, Any], ...] = ()
     attention_refs: tuple[str, ...] = ()
 
 
@@ -210,6 +211,11 @@ def build_execution_context_projection(
         memory_context=tuple(
             dict(item)
             for item in (instance.context_json or {}).get("memory_context", [])
+            if isinstance(item, dict)
+        ),
+        conversation_context=tuple(
+            dict(item)
+            for item in (instance.context_json or {}).get("conversation_context", [])
             if isinstance(item, dict)
         ),
     )

@@ -159,6 +159,65 @@ class SopExecutionStore:
 
         return self._active_instance(tenant_id, session_id)
 
+    def latest_dynamic_instance(
+        self,
+        tenant_id: str,
+        session_id: str,
+        *,
+        agent_id: str,
+        initiator_user_id: str,
+    ) -> SopInstance | None:
+        """返回同一聊天会话中指定 Agent/发起人的最近动态终态 Execution。
+
+        活动 Execution 仍由 active_instance 独占；该查询只用于把终态后的聊天追问
+        接回同一 DynamicTask 会话链，不会重新打开已经冻结的执行账本。
+        """
+
+        return self.db.exec(
+            select(SopInstance)
+            .where(
+                SopInstance.tenant_id == tenant_id,
+                SopInstance.session_id == session_id,
+                SopInstance.kind == "dynamic_task",
+                SopInstance.agent_id == agent_id,
+                SopInstance.initiator_user_id == initiator_user_id,
+                SopInstance.status.in_(
+                    ("succeeded", "failed", "cancelled", "timed_out")
+                ),
+            )
+            .order_by(SopInstance.run_number.desc(), SopInstance.created_at.desc())
+        ).first()
+
+    def dynamic_instance_for_source(
+        self,
+        tenant_id: str,
+        session_id: str,
+        *,
+        agent_id: str,
+        initiator_user_id: str,
+        source_ref: str,
+    ) -> SopInstance | None:
+        """按当前聊天消息幂等读取已终结的动态 Execution。"""
+
+        if not source_ref.strip():
+            return None
+        return self.db.exec(
+            select(SopInstance)
+            .where(
+                SopInstance.tenant_id == tenant_id,
+                SopInstance.session_id == session_id,
+                SopInstance.kind == "dynamic_task",
+                SopInstance.agent_id == agent_id,
+                SopInstance.initiator_user_id == initiator_user_id,
+                SopInstance.source_kind == "chat",
+                SopInstance.source_ref == source_ref,
+                SopInstance.status.in_(
+                    ("succeeded", "failed", "cancelled", "timed_out")
+                ),
+            )
+            .order_by(SopInstance.created_at.desc(), SopInstance.id.desc())
+        ).first()
+
     @contextmanager
     def owned(
         self,
@@ -551,6 +610,8 @@ class SopExecutionStore:
         capability_snapshot: Mapping[str, object],
         source_kind: str = "chat",
         source_ref: str | None = None,
+        goal_metadata: Mapping[str, object] | None = None,
+        context: Mapping[str, object] | None = None,
         enforce_agent_lifecycle: bool = True,
     ) -> tuple[SopInstance, ExecutionPlanRevision]:
         """原子创建动态 Execution 与首个活动计划，不伪造 SkillVersion 身份。"""
@@ -605,12 +666,14 @@ class SopExecutionStore:
                 "success_criteria": [
                     criterion.model_dump(mode="json") for criterion in plan.success_criteria
                 ],
+                **dict(goal_metadata or {}),
             },
             current_node_id=plan.steps[0].step_key,
             current_plan_checksum=plan_checksum,
             capability_snapshot_json=capability_payload,
             capability_checksum=capability_digest,
             budget_snapshot_json=dict(plan.budget),
+            context_json=dict(context or {}),
         )
         revision = ExecutionPlanRevision(
             tenant_id=tenant_id,

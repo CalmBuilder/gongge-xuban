@@ -520,6 +520,110 @@ def test_agent_loop_delegates_effective_dynamic_route_without_copying_loop(monke
     assert calls == ["init", "start", "run"]
 
 
+def test_agent_loop_continues_terminal_dynamic_chat_turn(monkeypatch) -> None:
+    """终态 DynamicTask 的聊天追问必须走续接接口而不能重新走首轮 start。"""
+
+    route = _route(
+        NonSopCapabilityRouter(
+            shadow_enabled=False,
+            execution_enabled=True,
+            shadow_selector=_ShadowSelector(
+                NonSopCapabilityDecision(
+                    mode="dynamic_task",
+                    goal="分析同一份日志",
+                    success_criteria=["形成可校验结论"],
+                    confidence=0.95,
+                )
+            ),
+        ),
+        _GeneralSelector(GeneralSkillSelection()),
+    )
+    calls: list[str] = []
+    captured: dict[str, object] = {}
+
+    class _DynamicAgent:
+        """模拟具备终态聊天续接能力的 DynamicTaskAgent。"""
+
+        def __init__(self, _db) -> None:
+            """记录 Agent 初始化。"""
+
+            calls.append("init")
+
+        def continue_chat_turn(self, **kwargs):
+            """返回父执行之后的新一轮 Execution。"""
+
+            calls.append("continue")
+            captured.update(kwargs)
+            return (
+                SimpleNamespace(
+                    id="execution_child",
+                    status="running",
+                    goal_snapshot_json={
+                        "continued_from_execution_id": "execution_parent",
+                    },
+                ),
+                True,
+            )
+
+        def run_until_blocked_or_complete(self, **_kwargs):
+            """模拟续接轮次完成并生成回复。"""
+
+            calls.append("run")
+            return DynamicRunOutcome(
+                status="succeeded",
+                execution_id="execution_child",
+                message=SimpleNamespace(content="基于同一会话的续接结论"),
+            )
+
+    monkeypatch.setattr("app.core.agent_loop.DynamicTaskAgent", _DynamicAgent)
+    loop = object.__new__(AgentLoop)
+    loop.db = SimpleNamespace(
+        refresh=lambda _row: None,
+        commit=lambda: None,
+        begin_nested=lambda: nullcontext(),
+    )
+    recorded_events: list[tuple] = []
+    loop.events = SimpleNamespace(record=lambda *args, **_kwargs: recorded_events.append(args))
+    loop._knowledge_capability_payload = lambda *_args: {"available": False}
+    session = ChatSession(
+        id="session_terminal_continuation",
+        tenant_id="tenant_demo",
+        agent_id="agent_demo",
+    )
+
+    response = loop._try_handle_dynamic_task(
+        ChatTurnRequest(
+            tenant_id="tenant_demo",
+            user_id="user_demo",
+            agent_id="agent_demo",
+            message="根据刚才的日志继续核对上传次数",
+        ),
+        session,
+        SimpleNamespace(id="model_1"),
+        route,
+        "message_2",
+        conversation_context={
+            "messages": [
+                {"role": "assistant", "content": "上一轮结论"},
+                {"role": "user", "content": "根据刚才的日志继续核对上传次数"},
+            ]
+        },
+    )
+
+    assert response is not None
+    assert response.reply == "基于同一会话的续接结论"
+    assert calls == ["init", "continue", "run"]
+    assert captured["conversation_context"]["messages"][-1]["content"] == (
+        "根据刚才的日志继续核对上传次数"
+    )
+    continued_events = [
+        args for args in recorded_events if args[2] == "dynamic_task_continued"
+    ]
+    assert len(continued_events) == 1
+    assert continued_events[0][3]["execution_id"] == "execution_child"
+    assert continued_events[0][3]["parent_execution_id"] == "execution_parent"
+
+
 def test_explicit_dynamic_request_cannot_be_downgraded_by_forced_general_skill(
     monkeypatch,
 ) -> None:
@@ -986,7 +1090,7 @@ def test_agent_loop_optional_dynamic_rollout_denial_can_fall_back(monkeypatch) -
     )
     recorded: list[tuple] = []
     loop = object.__new__(AgentLoop)
-    loop.db = SimpleNamespace()
+    loop.db = SimpleNamespace(commit=lambda: None)
     loop.events = SimpleNamespace(record=lambda *args, **_kwargs: recorded.append(args))
     loop._dynamic_task_rollout_allows = lambda _tenant, _agent: False
     session = ChatSession(
@@ -1035,7 +1139,7 @@ def test_runtime_capacity_denial_has_stable_capacity_code_without_model_quota_ga
     )
     recorded: list[tuple] = []
     loop = object.__new__(AgentLoop)
-    loop.db = SimpleNamespace()
+    loop.db = SimpleNamespace(commit=lambda: None)
     loop.events = SimpleNamespace(record=lambda *args, **_kwargs: recorded.append(args))
     loop._dynamic_task_rollout_allows = lambda _tenant, _agent: False
     loop._dynamic_task_rollout_denial_code = "DYNAMIC_TASK_QUOTA_NOT_CONFIGURED"
@@ -1081,7 +1185,7 @@ def test_durable_dynamic_rollout_denial_fails_instead_of_fake_answer(monkeypatch
         _GeneralSelector(GeneralSkillSelection()),
     )
     loop = object.__new__(AgentLoop)
-    loop.db = SimpleNamespace()
+    loop.db = SimpleNamespace(commit=lambda: None)
     loop.events = SimpleNamespace(record=lambda *_args, **_kwargs: None)
     loop._dynamic_task_rollout_allows = lambda _tenant, _agent: False
 
@@ -1122,7 +1226,7 @@ def test_scheduled_dynamic_task_rollout_denial_fails_instead_of_fake_success(
         lambda _db: pytest.fail("灰度拒绝前不得初始化 DynamicTaskAgent"),
     )
     loop = object.__new__(AgentLoop)
-    loop.db = SimpleNamespace()
+    loop.db = SimpleNamespace(commit=lambda: None)
     loop.events = SimpleNamespace(record=lambda *_args, **_kwargs: None)
     loop._dynamic_task_rollout_allows = lambda _tenant, _agent: False
     loop._forced_general_skill_capability = lambda *_args, **_kwargs: (
@@ -1163,7 +1267,7 @@ def test_multi_skill_rollout_denial_fails_instead_of_consuming_only_first_skill(
         _GeneralSelector(GeneralSkillSelection()),
     )
     loop = object.__new__(AgentLoop)
-    loop.db = SimpleNamespace()
+    loop.db = SimpleNamespace(commit=lambda: None)
     loop.events = SimpleNamespace(record=lambda *_args, **_kwargs: None)
     loop._dynamic_task_rollout_allows = lambda _tenant, _agent: False
     loop._forced_general_skill_capability = lambda *_args, **_kwargs: (

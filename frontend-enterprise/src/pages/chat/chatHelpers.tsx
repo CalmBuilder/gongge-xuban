@@ -109,6 +109,16 @@ export function isMissingChatSessionError(error: unknown): boolean {
   return error instanceof ApiError && error.status === 404;
 }
 
+export function isRelayRecoveryNetworkFailureTimedOut(
+  startedAt: number | null | undefined,
+  now = Date.now(),
+): boolean {
+  /** 仅在事件恢复持续遭遇网络失败超过心跳宽限期后结束本轮等待。 */
+
+  if (!startedAt || now < startedAt) return false;
+  return now - startedAt >= CHAT_STREAM_HEARTBEAT_GRACE_MS;
+}
+
 export function modelStorageKey(tenantId: string): string {
   return `${MODEL_CONFIG_STORAGE_PREFIX}:${tenantId}`;
 }
@@ -862,8 +872,40 @@ export function computeMergedMessages(slot: SessionSlot, activeTurnId?: string |
     ...extras.map((messageItem, index) => ({ messageItem, index: slot.serverMessages.length + index, source: 'realtime' as const })),
   ];
   const aliasMap = buildTurnAliasMap(combined.map((entry) => entry.messageItem));
+  // DynamicTaskAgent 的旧成功消息可能没有 turn_id：流式临时消息已经带有
+  // turn_id，而回放消息没有。两者正文完全一致时，保留服务端消息并丢弃
+  // 这份仅存在于前端的临时副本，避免同一轮答案渲染两次；只有唯一匹配
+  // 才合并，防止两轮合法的相同回答被误删。
+  const orphanServerAssistantByContent = new Map<string, ChatMessage[]>();
+  const realtimeAssistantByContent = new Map<string, ChatMessage[]>();
+  combined.forEach((entry) => {
+    if (entry.messageItem.role !== 'assistant') return;
+    const content = normalizeMessageText(entry.messageItem.content);
+    if (!content) return;
+    if (entry.source === 'server') {
+      if (canonicalMessageTurnId(entry.messageItem, aliasMap)) return;
+      const candidates = orphanServerAssistantByContent.get(content) || [];
+      candidates.push(entry.messageItem);
+      orphanServerAssistantByContent.set(content, candidates);
+      return;
+    }
+    if (!canonicalMessageTurnId(entry.messageItem, aliasMap)) return;
+    const candidates = realtimeAssistantByContent.get(content) || [];
+    candidates.push(entry.messageItem);
+    realtimeAssistantByContent.set(content, candidates);
+  });
+  const duplicateRealtimeAssistantIds = new Set<string>();
+  realtimeAssistantByContent.forEach((realtimeCandidates, content) => {
+    const serverCandidates = orphanServerAssistantByContent.get(content) || [];
+    if (serverCandidates.length === 1 && realtimeCandidates.length === 1) {
+      duplicateRealtimeAssistantIds.add(realtimeCandidates[0].id);
+    }
+  });
+  const reconciledCombined = combined.filter(
+    (entry) => !duplicateRealtimeAssistantIds.has(entry.messageItem.id),
+  );
   const turnStarts = new Map<string, number>();
-  combined.forEach(({ messageItem }) => {
+  reconciledCombined.forEach(({ messageItem }) => {
     if (messageItem.role !== 'user') return;
     const turnId = canonicalMessageTurnId(messageItem, aliasMap);
     if (!turnId) return;
@@ -873,7 +915,7 @@ export function computeMergedMessages(slot: SessionSlot, activeTurnId?: string |
       turnStarts.set(turnId, createdAt);
     }
   });
-  combined.forEach(({ messageItem }) => {
+  reconciledCombined.forEach(({ messageItem }) => {
     const turnId = canonicalMessageTurnId(messageItem, aliasMap);
     if (!turnId || turnStarts.has(turnId)) return;
     turnStarts.set(turnId, parseMessageTime(messageItem.created_at));
@@ -885,7 +927,7 @@ export function computeMergedMessages(slot: SessionSlot, activeTurnId?: string |
     system: 3,
   };
 
-  const sorted = combined
+  const sorted = reconciledCombined
     .sort((left, right) => {
       const leftQueued = left.messageItem.role === 'user' && left.messageItem.metadata?.queued === true;
       const rightQueued = right.messageItem.role === 'user' && right.messageItem.metadata?.queued === true;
@@ -1132,9 +1174,24 @@ export function reflectionTraceDetail(data: Record<string, unknown>): string | u
   return parts.length > 0 ? parts.join(' · ') : undefined;
 }
 
+function dynamicTaskFailureGuidance(code: string): string | undefined {
+  /** 把动态任务基础门禁转换为用户可执行的说明，避免只展示内部错误码。 */
+
+  if (code === 'DYNAMIC_TASK_ROLLOUT_DENIED') {
+    return 'DynamicTaskAgent 当前被服务端普通动态总开关拒绝；普通能力不需要在前端勾选，请管理员检查运行配置。';
+  }
+  if (code === 'DYNAMIC_TASK_QUOTA_NOT_CONFIGURED') {
+    return 'DynamicTaskAgent 的运行时容量尚未配置，请管理员检查 tenant、Agent、用户和工具的运行槽位。';
+  }
+  return undefined;
+}
+
 function streamErrorText(data: Record<string, unknown>, eventName: string): string {
   const code = typeof data.code === 'string' ? data.code.trim() : '';
   if (code === 'LLM_ERROR') return '模型调用失败';
+  if (code === 'DYNAMIC_TASK_ROLLOUT_DENIED' || code === 'DYNAMIC_TASK_QUOTA_NOT_CONFIGURED') {
+    return 'DynamicTaskAgent 未执行';
+  }
   if (eventName === 'stream_interrupted') return '响应生成中断';
   if (code) return `执行失败 ${code}`;
   const errorType = typeof data.error_type === 'string' ? data.error_type.trim() : '';
@@ -1142,8 +1199,10 @@ function streamErrorText(data: Record<string, unknown>, eventName: string): stri
 }
 
 function streamErrorDetail(data: Record<string, unknown>): string | undefined {
+  const code = typeof data.code === 'string' ? data.code.trim() : '';
   const parts = [
-    typeof data.code === 'string' ? data.code.trim() : '',
+    code,
+    dynamicTaskFailureGuidance(code) || '',
     typeof data.error_type === 'string' ? data.error_type.trim() : '',
     typeof data.message === 'string' ? data.message.trim() : '',
     typeof data.reason === 'string' ? data.reason.trim() : '',

@@ -137,6 +137,7 @@ from app.session.input_runtime import (
 from app.session.provider_input_dispatch import ProviderInputDispatchGateway
 from app.sop_runtime.execution_control import ExecutionControlService
 from app.sop_runtime.execution_store import (
+    SopExecutionConflictError,
     SopExecutionSkillAuthorizationError,
     SopExecutionStore,
 )
@@ -217,6 +218,233 @@ _CONNECTION_REAUTH_CODES = frozenset(
 _EXPLORE_MAX_MODEL_CALLS = 6
 _EXPLORE_MAX_TOOL_CALLS = 5
 _EXPLORE_MAX_RUNTIME_SECONDS = 120
+_DYNAMIC_INPUT_MAX_DISCLOSED_CHARS_PER_RESOURCE = 48_000
+_DYNAMIC_INPUT_MAX_MATCH_WINDOWS = 24
+_DYNAMIC_INPUT_CONTEXT_LINES = 4
+_DYNAMIC_INPUT_EDGE_CHARS = 2_000
+_DYNAMIC_INPUT_SIGNAL_PATTERN = re.compile(
+    r"(?:\b(?:error|exception|traceback|fatal|warn(?:ing)?|failed|failure|"
+    r"timeout|oom|denied|rejected|rollback|recovered|recovery|started|completed)\b|"
+    r"out\s+of\s+memory)",
+    re.IGNORECASE,
+)
+_DYNAMIC_INPUT_QUERY_STOPWORDS = frozenset(
+    {
+        "please",
+        "analyze",
+        "analyse",
+        "attachment",
+        "attachments",
+        "file",
+        "log",
+        "logs",
+        "warning",
+        "warnings",
+        "cause",
+        "root",
+        "risk",
+        "fix",
+        "suggestion",
+        "suggestions",
+        "issue",
+        "problem",
+    }
+)
+
+
+def _dynamic_input_query_terms(search_text: str) -> tuple[str, ...]:
+    """从任务目标提取有限检索词，避免把用户全文再次复制进附件投影。"""
+
+    normalized = " ".join(str(search_text or "").casefold().split())
+    candidates = [
+        *re.findall(r"[a-z][a-z0-9_.-]*(?:\s+[a-z][a-z0-9_.-]*){1,}", normalized),
+        *re.findall(r"[\u4e00-\u9fff]{2,}", normalized),
+        *re.findall(r"[a-z][a-z0-9_.-]{2,}", normalized),
+    ]
+    terms: list[str] = []
+    for candidate in candidates:
+        term = " ".join(candidate.split())
+        if len(term) < 2 or (" " not in term and term in _DYNAMIC_INPUT_QUERY_STOPWORDS):
+            continue
+        if term not in terms:
+            terms.append(term)
+    return tuple(terms[:40])
+
+
+def _project_dynamic_input_text(
+    text: str,
+    *,
+    search_text: str,
+    max_chars: int,
+) -> tuple[str, dict[str, object]]:
+    """将超长文本压缩为首尾与问题相关窗口，并保留原文连续片段。"""
+
+    source_chars = len(text)
+    bounded_chars = max(1, max_chars)
+    if source_chars <= bounded_chars:
+        return text, {
+            "mode": "full",
+            "source_char_count": source_chars,
+            "disclosed_char_count": source_chars,
+            "omitted_char_count": 0,
+            "matched_window_count": 0,
+        }
+    lines = text.splitlines(keepends=True)
+    if not lines:
+        disclosed = text[:bounded_chars]
+        return disclosed, {
+            "mode": "head_only",
+            "source_char_count": source_chars,
+            "disclosed_char_count": len(disclosed),
+            "omitted_char_count": max(0, source_chars - len(disclosed)),
+            "matched_window_count": 0,
+        }
+
+    terms = _dynamic_input_query_terms(search_text)
+    line_starts: list[int] = []
+    cursor = 0
+    scored_lines: list[tuple[int, int]] = []
+    for index, line in enumerate(lines):
+        line_starts.append(cursor)
+        cursor += len(line)
+        folded_line = line.casefold()
+        score = sum(
+            min(folded_line.count(term), 3) * (8 if " " in term else 2)
+            for term in terms
+            if term in folded_line
+        )
+        if _DYNAMIC_INPUT_SIGNAL_PATTERN.search(line):
+            score += 1
+        if score > 0:
+            scored_lines.append((score, index))
+
+    selected_lines = [
+        index
+        for _, index in sorted(
+            scored_lines,
+            key=lambda item: (-item[0], item[1]),
+        )[:_DYNAMIC_INPUT_MAX_MATCH_WINDOWS]
+    ]
+    ranges: list[tuple[int, int]] = [
+        (0, min(source_chars, _DYNAMIC_INPUT_EDGE_CHARS)),
+        (
+            max(0, source_chars - _DYNAMIC_INPUT_EDGE_CHARS),
+            source_chars,
+        ),
+    ]
+    for index in selected_lines:
+        start_index = max(0, index - _DYNAMIC_INPUT_CONTEXT_LINES)
+        end_index = min(len(lines), index + _DYNAMIC_INPUT_CONTEXT_LINES + 1)
+        ranges.append(
+            (
+                line_starts[start_index],
+                line_starts[end_index] if end_index < len(lines) else source_chars,
+            )
+        )
+    ranges.sort()
+    merged_ranges: list[list[int]] = []
+    for start, end in ranges:
+        if not merged_ranges or start > merged_ranges[-1][1]:
+            merged_ranges.append([start, end])
+        else:
+            merged_ranges[-1][1] = max(merged_ranges[-1][1], end)
+
+    chunks: list[str] = []
+    used_chars = 0
+    previous_end = 0
+    for start, end in merged_ranges:
+        if used_chars >= bounded_chars:
+            break
+        if chunks and previous_end < start:
+            omission = "\n[…中间内容已省略…]\n"
+            if used_chars + len(omission) <= bounded_chars:
+                chunks.append(omission)
+                used_chars += len(omission)
+        remaining = bounded_chars - used_chars
+        chunk = text[start : min(end, start + remaining)]
+        if chunk:
+            chunks.append(chunk)
+            used_chars += len(chunk)
+        previous_end = end
+    disclosed = "".join(chunks)
+    return disclosed, {
+        "mode": "relevant_windows" if selected_lines else "edge_windows",
+        "source_char_count": source_chars,
+        "disclosed_char_count": len(disclosed),
+        "omitted_char_count": max(0, source_chars - len(disclosed)),
+        "matched_window_count": len(selected_lines),
+    }
+
+
+def _project_dynamic_input_elements(
+    elements: Sequence[Mapping[str, object]],
+    *,
+    search_text: str,
+    max_chars: int = _DYNAMIC_INPUT_MAX_DISCLOSED_CHARS_PER_RESOURCE,
+) -> tuple[list[dict[str, object]], dict[str, object]]:
+    """按附件资源总预算投影元素，确保大日志不会完整写入Operation和模型上下文。"""
+
+    rows = [dict(element) for element in elements]
+    source_chars = sum(len(str(element.get("text") or "")) for element in rows)
+    if source_chars <= max_chars:
+        return rows, {
+            "mode": "full",
+            "source_char_count": source_chars,
+            "disclosed_char_count": source_chars,
+            "omitted_char_count": 0,
+            "element_count": len(rows),
+        }
+    if not rows:
+        return [], {
+            "mode": "empty",
+            "source_char_count": 0,
+            "disclosed_char_count": 0,
+            "omitted_char_count": 0,
+            "element_count": 0,
+        }
+
+    terms = _dynamic_input_query_terms(search_text)
+    ranked_indices = sorted(
+        range(len(rows)),
+        key=lambda index: (
+            -sum(
+                min(str(rows[index].get("text") or "").casefold().count(term), 3)
+                * (8 if " " in term else 2)
+                for term in terms
+                if term in str(rows[index].get("text") or "").casefold()
+            ),
+            index,
+        ),
+    )
+    per_element_budget = max(4_096, max_chars // max(1, min(len(rows), 8)))
+    remaining = max(1, max_chars)
+    projected_by_index: dict[int, dict[str, object]] = {}
+    projection_modes: set[str] = set()
+    for index in ranked_indices:
+        if remaining <= 0:
+            break
+        row = dict(rows[index])
+        text = str(row.get("text") or "")
+        limit = min(remaining, per_element_budget)
+        projected_text, metadata = _project_dynamic_input_text(
+            text,
+            search_text=search_text,
+            max_chars=limit,
+        )
+        row["text"] = projected_text
+        projected_by_index[index] = row
+        projection_modes.add(str(metadata.get("mode") or "full"))
+        remaining -= len(projected_text)
+    projected = [projected_by_index[index] for index in sorted(projected_by_index)]
+    disclosed_chars = sum(len(str(row.get("text") or "")) for row in projected)
+    mode = "relevant_windows" if "relevant_windows" in projection_modes else "bounded"
+    return projected, {
+        "mode": mode,
+        "source_char_count": source_chars,
+        "disclosed_char_count": disclosed_chars,
+        "omitted_char_count": max(0, source_chars - disclosed_chars),
+        "element_count": len(projected),
+    }
 
 
 @dataclass(frozen=True)
@@ -784,6 +1012,7 @@ class DynamicTaskAgent:
         model_config: ModelConfig,
         worker_id: str,
         actor_user_id: str,
+        user_message_id: str | None = None,
         organization_unit_id: str | None = None,
         resume_signal_id: str | None = None,
         signal_worker_id: str | None = None,
@@ -1066,6 +1295,7 @@ class DynamicTaskAgent:
                             resume_signal_id=resume_signal_id,
                             signal_worker_id=signal_worker_id,
                             expected_plan_revision_id=expected_plan_revision_id,
+                            user_message_id=user_message_id,
                         )
                         break
                     except DynamicTaskAgentError as exc:
@@ -1736,6 +1966,7 @@ class DynamicTaskAgent:
         model_config: ModelConfig,
         worker_id: str,
         actor_user_id: str,
+        user_message_id: str | None = None,
     ) -> DynamicRunOutcome:
         """消费已决定 clarification 的持久 signal，并从同一 Execution 继续执行。"""
 
@@ -1752,6 +1983,7 @@ class DynamicTaskAgent:
                 model_config=model_config,
                 worker_id=worker_id,
                 actor_user_id=instance.initiator_user_id,
+                user_message_id=user_message_id,
             )
         control.claim_signal(signal, worker_id=worker_id, ttl_seconds=300)
         self.db.commit()
@@ -1817,9 +2049,354 @@ class DynamicTaskAgent:
             model_config=model_config,
             worker_id=worker_id,
             actor_user_id=actor_user_id,
+            user_message_id=user_message_id,
             resume_signal_id=signal.id,
             signal_worker_id=worker_id,
         )
+
+    def resume_chat_clarification(
+        self,
+        *,
+        tenant_id: str,
+        session_id: str,
+        agent_id: str,
+        initiator_user_id: str,
+        user_message_id: str,
+        message: str,
+        model_config: ModelConfig,
+        input_resource_ids: Sequence[str] = (),
+        input_resource_versions: Mapping[str, str] | None = None,
+        conversation_context: Mapping[str, object] | None = None,
+        worker_id: str,
+    ) -> DynamicRunOutcome | None:
+        """把聊天新一轮输入作为 clarification 的 resume，并冻结本轮新增附件。
+
+        仅当同一会话存在由当前发起人创建、且正停在 clarification Attention 的
+        动态 Execution 时才接管本轮；审批、重新授权、外部效果对账等其他等待态
+        仍由对应的待办流程处理，不能被普通聊天文本旁路。
+        """
+
+        instance = self.store.active_instance(tenant_id, session_id)
+        if (
+            instance is None
+            or instance.kind != "dynamic_task"
+            or instance.agent_id != agent_id
+            or instance.initiator_user_id != initiator_user_id
+            or instance.status != "waiting"
+        ):
+            return None
+
+        attention = None
+        signal_id = ""
+        normalized_message = message.strip() or "请根据本轮输入继续处理。"
+        resource_ids = tuple(
+            dict.fromkeys(
+                str(item).strip() for item in input_resource_ids if str(item).strip()
+            )
+        )
+        control = ExecutionControlService(self.db, self.store)
+        with self.store.owned(instance, worker_id=worker_id):
+            self.db.refresh(instance)
+            attention = self.db.exec(
+                select(SopWorkItem)
+                .where(
+                    SopWorkItem.tenant_id == tenant_id,
+                    SopWorkItem.instance_id == instance.id,
+                    SopWorkItem.attention_kind == "clarification",
+                    SopWorkItem.status.in_(("offered", "claimed")),
+                )
+                .order_by(SopWorkItem.created_at, SopWorkItem.id)
+            ).first()
+            if attention is None:
+                return None
+            if attention.initiator_user_id != initiator_user_id:
+                raise DynamicTaskAgentError("DYNAMIC_CLARIFICATION_ACTOR_DENIED")
+
+            for resource_id in resource_ids:
+                resource_query = select(ManagedInputResource).where(
+                    ManagedInputResource.id == resource_id,
+                    ManagedInputResource.tenant_id == tenant_id,
+                )
+                resource_version = (input_resource_versions or {}).get(resource_id)
+                if resource_version:
+                    resource_query = resource_query.where(
+                        ManagedInputResource.version == resource_version
+                    )
+                resource = self.db.exec(resource_query).first()
+                if resource is None:
+                    raise DynamicTaskAgentError("DYNAMIC_INPUT_RESOURCE_UNAVAILABLE")
+                try:
+                    self.store.snapshot_input_resource(
+                        instance,
+                        resource,
+                        source_message_id=user_message_id,
+                    )
+                except SopExecutionConflictError as exc:
+                    raise DynamicTaskAgentError(
+                        "DYNAMIC_INPUT_RESOURCE_UNAVAILABLE"
+                    ) from exc
+
+            command_id = (
+                f"chat-clarification:{instance.id}:{attention.id}:{user_message_id}"
+            )[:128]
+            resolved, completed = control.resolve_attention(
+                instance,
+                attention,
+                actor_user_id=initiator_user_id,
+                command_id=command_id,
+                command="answer",
+                expected_revision=attention.revision,
+                comment=normalized_message,
+            )
+            if not completed:
+                raise DynamicTaskAgentError("DYNAMIC_CLARIFICATION_RESOLUTION_INVALID")
+            conversation_projection = self._conversation_context_projection(
+                conversation_context
+            )
+            if conversation_projection:
+                instance.context_json = {
+                    **(instance.context_json or {}),
+                    "conversation_context": [
+                        dict(item) for item in conversation_projection
+                    ],
+                }
+                self.db.add(instance)
+            signal = self.db.exec(
+                select(ExecutionSignal).where(
+                    ExecutionSignal.tenant_id == tenant_id,
+                    ExecutionSignal.execution_id == instance.id,
+                    ExecutionSignal.signal_type == "attention_decided",
+                    ExecutionSignal.causation_id == f"{resolved.id}:{resolved.revision}",
+                )
+            ).first()
+            if signal is None:
+                raise DynamicTaskAgentError("DYNAMIC_CLARIFICATION_SIGNAL_NOT_FOUND")
+            signal_id = signal.id
+            control.append_execution_event(
+                instance,
+                event_type="dynamic_task_chat_resumed",
+                causation_id=user_message_id,
+                payload={
+                    "execution_id": instance.id,
+                    "attention_id": resolved.id,
+                    "source_message_id": user_message_id,
+                    "input_resource_ids": list(resource_ids),
+                },
+            )
+            self.db.commit()
+
+        return self.resume_clarification_signal(
+            signal_id=signal_id,
+            model_config=model_config,
+            worker_id=worker_id,
+            actor_user_id=initiator_user_id,
+            user_message_id=user_message_id,
+        )
+
+    def continue_chat_turn(
+        self,
+        *,
+        tenant_id: str,
+        session_id: str,
+        agent_id: str,
+        initiator_user_id: str,
+        user_message_id: str,
+        message: str,
+        success_criteria: Sequence[str],
+        model_config: ModelConfig,
+        source_ref: str | None = None,
+        input_resource_ids: Sequence[str] = (),
+        input_resource_versions: Mapping[str, str] | None = None,
+        knowledge_capability: dict[str, object] | None = None,
+        forced_general_skill_id: str | None = None,
+        forced_general_skill_ids: Sequence[str] = (),
+        memory_context: Sequence[Mapping[str, object]] = (),
+        conversation_context: Mapping[str, object] | None = None,
+    ) -> tuple[SopInstance, bool] | None:
+        """把终态后的聊天输入接回同一 DynamicTask 会话链。
+
+        终态 Execution 的结果、计划和权限快照保持不可变；本方法创建带有父执行
+        lineage 的下一轮 Execution，并把同一聊天会话的有界历史传给 planner/runtime。
+        这对应 OpenWorker 的“session 持有连续上下文、turn 负责推进”的语义。
+        """
+
+        previous = self.store.latest_dynamic_instance(
+            tenant_id,
+            session_id,
+            agent_id=agent_id,
+            initiator_user_id=initiator_user_id,
+        )
+        if previous is None:
+            return None
+        resolved_source_ref = source_ref or user_message_id
+        existing = self.store.dynamic_instance_for_source(
+            tenant_id,
+            session_id,
+            agent_id=agent_id,
+            initiator_user_id=initiator_user_id,
+            source_ref=resolved_source_ref,
+        )
+        if existing is not None:
+            return existing, False
+        parent_snapshot = dict(previous.goal_snapshot_json or {})
+        inherited_criteria = self._success_criteria_projection(
+            parent_snapshot.get("success_criteria")
+        )
+        inherited_snapshots = self.db.exec(
+            select(InputResourceSnapshot)
+            .where(
+                InputResourceSnapshot.tenant_id == tenant_id,
+                InputResourceSnapshot.execution_id == previous.id,
+            )
+            .order_by(InputResourceSnapshot.created_at, InputResourceSnapshot.id)
+        ).all()
+        inherited_resource_ids: list[str] = []
+        inherited_resource_versions: dict[str, str] = {}
+        inherited_source_message_ids: dict[str, str] = {}
+        for snapshot in inherited_snapshots:
+            resource_id = str(snapshot.source_resource_id or "").strip()
+            resource_version = str(snapshot.source_version or "").strip()
+            if (
+                not resource_id
+                or not resource_version
+                or resource_id in inherited_resource_versions
+            ):
+                continue
+            inherited_resource_ids.append(resource_id)
+            inherited_resource_versions[resource_id] = resource_version
+            if snapshot.source_message_id:
+                inherited_source_message_ids[resource_id] = snapshot.source_message_id
+
+        current_resource_ids = [
+            str(resource_id).strip()
+            for resource_id in input_resource_ids
+            if str(resource_id).strip()
+        ]
+        resource_ids = list(dict.fromkeys((*inherited_resource_ids, *current_resource_ids)))
+        resource_versions = dict(inherited_resource_versions)
+        resource_versions.update(
+            {
+                str(resource_id).strip(): str(resource_version).strip()
+                for resource_id, resource_version in (input_resource_versions or {}).items()
+                if str(resource_id).strip() and str(resource_version).strip()
+            }
+        )
+        source_message_ids = dict(inherited_source_message_ids)
+        source_message_ids.update(
+            {resource_id: resolved_source_ref for resource_id in current_resource_ids}
+        )
+        return self.start_task(
+            tenant_id=tenant_id,
+            session_id=session_id,
+            agent_id=agent_id,
+            initiator_user_id=initiator_user_id,
+            goal=message,
+            success_criteria=inherited_criteria or tuple(success_criteria),
+            model_config=model_config,
+            source_ref=resolved_source_ref,
+            source_kind="chat",
+            input_resource_ids=resource_ids,
+            input_resource_versions=resource_versions,
+            input_resource_source_message_ids=source_message_ids,
+            knowledge_capability=knowledge_capability,
+            forced_general_skill_id=forced_general_skill_id,
+            forced_general_skill_ids=forced_general_skill_ids,
+            memory_context=memory_context,
+            conversation_context=conversation_context,
+            continuation_of_execution_id=previous.id,
+        )
+
+    @staticmethod
+    def _success_criteria_projection(value: object) -> tuple[str, ...]:
+        """从父 Execution 的冻结成功标准提取下一轮可复用的描述文本。"""
+
+        if not isinstance(value, list):
+            return ()
+        projected: list[str] = []
+        for item in value:
+            if isinstance(item, Mapping):
+                spec = item.get("spec")
+                description = (
+                    spec.get("description")
+                    if isinstance(spec, Mapping)
+                    else item.get("description")
+                )
+            else:
+                description = item
+            normalized = str(description or "").strip()
+            if normalized:
+                projected.append(normalized[:1000])
+        return tuple(projected)
+
+    @staticmethod
+    def _conversation_context_projection(
+        conversation_context: Mapping[str, object] | None,
+    ) -> tuple[dict[str, object], ...]:
+        """将聊天上下文压缩为不含附件正文、凭据和内部侧带的有限历史。"""
+
+        if not isinstance(conversation_context, Mapping):
+            return ()
+        projected: list[dict[str, object]] = []
+        summary = str(conversation_context.get("compacted_summary") or "").strip()
+        if summary:
+            projected.append(
+                {
+                    "kind": "conversation_summary",
+                    "content": summary[:6000],
+                }
+            )
+        messages = conversation_context.get("messages")
+        if not isinstance(messages, list):
+            return tuple(projected)
+        for item in messages[-12:]:
+            if not isinstance(item, Mapping):
+                continue
+            role = str(item.get("role") or "").strip()
+            content = str(item.get("content") or "").strip()
+            if role not in {"user", "assistant"} or not content:
+                continue
+            projected.append(
+                {
+                    "kind": "conversation_turn",
+                    "role": role,
+                    "content": content[:3000],
+                }
+            )
+        return tuple(projected)
+
+    @staticmethod
+    def _conversation_memory_projection(
+        conversation_context: Sequence[Mapping[str, object]],
+    ) -> tuple[dict[str, object], ...]:
+        """把有界会话历史转换成 planner 可理解且不改变能力权限的记忆条目。"""
+
+        projected: list[dict[str, object]] = []
+        for item in conversation_context:
+            kind = str(item.get("kind") or "conversation_turn")
+            content = str(item.get("content") or "").strip()
+            if not content:
+                continue
+            role = str(item.get("role") or "").strip()
+            prefix = f"{role}: " if role else ""
+            projected.append(
+                {
+                    "kind": kind,
+                    "content": f"{prefix}{content}"[:4000],
+                    # provider view 将 source 视为审计侧带；会话来源已经由 kind
+                    # 和受控的 memory_context 位置表达，不应把内部 metadata 带出。
+                    "metadata": {"origin": "same_chat_session"},
+                }
+            )
+        return tuple(projected)
+
+    @staticmethod
+    def _compose_continuation_goal(base_goal: str, current_message: str) -> str:
+        """生成保留原始任务事实、同时突出本轮追问的有界 planner 目标。"""
+
+        base = " ".join(base_goal.split())[:1800]
+        current = current_message.strip() or "请根据当前会话上下文继续处理。"
+        current = current[:1800]
+        return f"继续同一 DynamicTask 会话任务。原始任务：{base}；本轮用户追加输入：{current}"[:4000]
 
     def advance_next_write_step(
         self,
@@ -4616,12 +5193,77 @@ class DynamicTaskAgent:
         source_ref: str | None = None,
         source_kind: str = "chat",
         input_resource_ids: Sequence[str] = (),
+        input_resource_versions: Mapping[str, str] | None = None,
+        input_resource_source_message_ids: Mapping[str, str] | None = None,
         knowledge_capability: dict[str, object] | None = None,
         forced_general_skill_id: str | None = None,
         forced_general_skill_ids: Sequence[str] = (),
         memory_context: Sequence[Mapping[str, object]] = (),
+        conversation_context: Mapping[str, object] | None = None,
+        continuation_of_execution_id: str | None = None,
     ) -> tuple[SopInstance, bool]:
-        """经模型 preflight、实时能力目录和有界规划创建或复用统一动态 Execution。"""
+        """经模型 preflight、实时能力目录和有界规划创建或复用统一动态 Execution。
+
+        当提供 continuation_of_execution_id 时，当前输入属于同一聊天 DynamicTask
+        会话的后续 turn；父 Execution 只读继承其任务身份，不会被重新打开或覆盖。
+        """
+
+        continuation_parent: SopInstance | None = None
+        continuation_metadata: dict[str, object] = {}
+        conversation_projection = self._conversation_context_projection(conversation_context)
+        if continuation_of_execution_id:
+            continuation_parent = self.db.get(SopInstance, continuation_of_execution_id)
+            if (
+                continuation_parent is None
+                or continuation_parent.tenant_id != tenant_id
+                or continuation_parent.session_id != session_id
+                or continuation_parent.kind != "dynamic_task"
+                or continuation_parent.agent_id != agent_id
+                or continuation_parent.initiator_user_id != initiator_user_id
+                or continuation_parent.status
+                not in {"succeeded", "failed", "cancelled", "timed_out"}
+            ):
+                raise DynamicTaskAgentError("DYNAMIC_CONTINUATION_PARENT_INVALID")
+            parent_goal_snapshot = dict(continuation_parent.goal_snapshot_json or {})
+            base_goal = str(
+                parent_goal_snapshot.get("conversation_base_goal")
+                or parent_goal_snapshot.get("goal")
+                or ""
+            ).strip()
+            if not base_goal:
+                raise DynamicTaskAgentError("DYNAMIC_CONTINUATION_CONTEXT_MISSING")
+            goal = self._compose_continuation_goal(base_goal, goal)
+            parent_context = dict(continuation_parent.context_json or {})
+            parent_lineage = parent_context.get("dynamic_chat_continuation")
+            parent_lineage = parent_lineage if isinstance(parent_lineage, Mapping) else {}
+            root_execution_id = str(
+                parent_lineage.get("conversation_root_execution_id")
+                or parent_lineage.get("root_execution_id")
+                or continuation_parent.id
+            )
+            parent_turn_number = int(
+                parent_lineage.get("conversation_turn_number")
+                or parent_lineage.get("turn_number")
+                or 1
+            )
+            continuation_metadata = {
+                "conversation_base_goal": base_goal[:4000],
+                "continued_from_execution_id": continuation_parent.id,
+                "conversation_root_execution_id": root_execution_id,
+                "conversation_turn_number": parent_turn_number + 1,
+                "conversation_user_message_id": (source_ref or "")[:512],
+            }
+        elif source_kind == "chat":
+            continuation_metadata = {
+                "conversation_base_goal": goal.strip()[:4000],
+                "conversation_turn_number": 1,
+            }
+        planning_memory_context = tuple(memory_context)
+        if conversation_projection:
+            planning_memory_context = (
+                *planning_memory_context,
+                *self._conversation_memory_projection(conversation_projection),
+            )
 
         verified_model = self.catalog.require_dynamic_model(tenant_id, model_config.id)
         actor_tool_loader = getattr(self.catalog, "list_actor_tools", None)
@@ -4683,14 +5325,29 @@ class DynamicTaskAgent:
         )
         if len(requested_forced_ids) > 8:
             raise DynamicTaskAgentError("GENERAL_SKILL_SELECTION_LIMIT_EXCEEDED")
-        memory_projection = self._memory_projection(memory_context)
+        memory_projection = self._memory_projection(planning_memory_context)
         resources: list[ManagedInputResource] = []
-        for resource_id in dict.fromkeys(input_resource_ids):
-            resource = self.db.get(ManagedInputResource, resource_id)
+        requested_resource_versions = dict(input_resource_versions or {})
+        requested_source_message_ids = dict(input_resource_source_message_ids or {})
+        for resource_id in dict.fromkeys(
+            str(item).strip() for item in input_resource_ids if str(item).strip()
+        ):
+            resource_query = select(ManagedInputResource).where(
+                ManagedInputResource.id == resource_id,
+                ManagedInputResource.tenant_id == tenant_id,
+            )
+            resource_version = requested_resource_versions.get(resource_id)
+            if resource_version:
+                resource_query = resource_query.where(
+                    ManagedInputResource.version == resource_version
+                )
+            resource = self.db.exec(resource_query).first()
             if (
                 resource is None
-                or resource.tenant_id != tenant_id
                 or resource.owner_user_id != initiator_user_id
+                or (resource.agent_id is not None and resource.agent_id != agent_id)
+                or resource.access_status != "active"
+                or resource.destruction_status not in {"retained", "held"}
                 or resource.ingestion_status != "ready"
                 or resource.revoked_at is not None
             ):
@@ -4700,8 +5357,8 @@ class DynamicTaskAgent:
         if existing is not None:
             requested_criteria = [item.model_dump(mode="json") for item in criteria]
             frozen_model = (existing.capability_snapshot_json or {}).get("model", {})
-            frozen_resource_ids = {
-                row.source_resource_id
+            frozen_resource_identities = {
+                (row.source_resource_id, row.source_version)
                 for row in self.db.exec(
                     select(InputResourceSnapshot).where(
                         InputResourceSnapshot.tenant_id == tenant_id,
@@ -4721,7 +5378,8 @@ class DynamicTaskAgent:
                 and isinstance(frozen_model, dict)
                 and frozen_model.get("model_config_id") == verified_model.id
                 and frozen_model.get("checksum") == verified_model.capability_checksum
-                and frozen_resource_ids == {item.id for item in resources}
+                and frozen_resource_identities
+                == {(item.id, item.version) for item in resources}
                 and tuple(
                     sorted(
                         str(value)
@@ -4990,8 +5648,30 @@ class DynamicTaskAgent:
             capability_snapshot=snapshot,
             source_kind=source_kind,
             source_ref=source_ref or session_id,
+            goal_metadata=continuation_metadata,
+            context={
+                "conversation_context": [dict(item) for item in conversation_projection],
+                "dynamic_chat_continuation": continuation_metadata,
+            },
             enforce_agent_lifecycle=True,
         )
+        if source_kind == "chat" and continuation_parent is None:
+            root_lineage = {
+                **continuation_metadata,
+                "conversation_root_execution_id": instance.id,
+                "conversation_turn_number": 1,
+            }
+            instance.goal_snapshot_json = {
+                **(instance.goal_snapshot_json or {}),
+                "conversation_root_execution_id": instance.id,
+                "conversation_turn_number": 1,
+            }
+            instance.context_json = {
+                **(instance.context_json or {}),
+                "dynamic_chat_continuation": root_lineage,
+            }
+            self.db.add(instance)
+            self.db.flush()
         for use_id in loaded_use_ids:
             use = self.db.get(GeneralSkillUse, use_id)
             if use is None:
@@ -5019,7 +5699,10 @@ class DynamicTaskAgent:
                     self.store.snapshot_input_resource(
                         instance,
                         resource,
-                        source_message_id=source_ref,
+                        source_message_id=requested_source_message_ids.get(
+                            resource.id,
+                            source_ref,
+                        ),
                     )
         return instance, True
 
@@ -5802,6 +6485,7 @@ class DynamicTaskAgent:
         resume_signal_id: str | None = None,
         signal_worker_id: str | None = None,
         expected_plan_revision_id: str | None = None,
+        user_message_id: str | None = None,
     ) -> Message:
         """逐项验证最终结果，并原子写消息、publication 与 Execution 成功终态。"""
 
@@ -6157,17 +6841,25 @@ class DynamicTaskAgent:
                     thread_binding_id=connector_thread.id,
                     content=result.markdown,
                 )
+            message_metadata = {
+                "execution_id": instance.id,
+                "result_id": result_row.id,
+                "result_checksum": result_row.checksum,
+                "artifact_ids": [item.id for item in artifacts],
+            }
+            if user_message_id:
+                message_metadata.update(
+                    {
+                        "user_message_id": user_message_id,
+                        "turn_id": user_message_id,
+                    }
+                )
             message = Message(
                 tenant_id=instance.tenant_id,
                 session_id=instance.session_id,
                 role="assistant",
                 content=result.markdown,
-                metadata_json={
-                    "execution_id": instance.id,
-                    "result_id": result_row.id,
-                    "result_checksum": result_row.checksum,
-                    "artifact_ids": [item.id for item in artifacts],
-                },
+                metadata_json=message_metadata,
             )
             self.db.add(message)
             self.db.flush()
@@ -6182,19 +6874,27 @@ class DynamicTaskAgent:
                 session.status = "active"
                 session.summary = f"最近回复：{result.markdown[:120]}"
                 self.db.add(session)
+            assistant_event_payload = {
+                "message_id": message.id,
+                "assistant_message_id": message.id,
+                "reply": result.markdown,
+                "execution_id": instance.id,
+                "result_id": result_row.id,
+                "artifact_ids": [item.id for item in artifacts],
+            }
+            if user_message_id:
+                assistant_event_payload.update(
+                    {
+                        "user_message_id": user_message_id,
+                        "turn_id": user_message_id,
+                    }
+                )
             self.db.add(
                 AgentEvent(
                     tenant_id=instance.tenant_id,
                     session_id=instance.session_id,
                     event_type="assistant_message_created",
-                    payload_json={
-                        "message_id": message.id,
-                        "assistant_message_id": message.id,
-                        "reply": result.markdown,
-                        "execution_id": instance.id,
-                        "result_id": result_row.id,
-                        "artifact_ids": [item.id for item in artifacts],
-                    },
+                    payload_json=assistant_event_payload,
                 )
             )
             control.append_execution_event(
@@ -6734,24 +7434,37 @@ class DynamicTaskAgent:
                 )
             ).all()
         )
+        # 这里只读取证据目录所需的四列；不能对包含大型 result_json 的 ORM 行做
+        # ORDER BY，否则 MySQL 会把完整 JSON 带入排序缓冲并触发 1038。
         read_operations = self.db.exec(
-            select(SopOperation)
-            .where(
+            select(
+                SopOperation.id,
+                SopOperation.completed_at,
+                SopOperation.created_at,
+                SopOperation.result_json,
+            ).where(
                 SopOperation.tenant_id == instance.tenant_id,
                 SopOperation.instance_id == instance.id,
                 SopOperation.operation_name == "input.read",
                 SopOperation.status == "succeeded",
             )
-            .order_by(SopOperation.completed_at.desc(), SopOperation.id.desc())
         ).all()
-        operation_by_snapshot: dict[str, tuple[SopOperation, Mapping[str, object]]] = {}
-        for operation in read_operations:
-            data = (operation.result_json or {}).get("data")
+        read_operations = sorted(
+            read_operations,
+            key=lambda row: (
+                (row[1] or row[2]).isoformat() if row[1] or row[2] else "",
+                str(row[0]),
+            ),
+            reverse=True,
+        )
+        operation_by_snapshot: dict[str, tuple[str, Mapping[str, object]]] = {}
+        for operation_id, _, _, result_json in read_operations:
+            data = (result_json or {}).get("data") if isinstance(result_json, Mapping) else None
             if not isinstance(data, Mapping):
                 continue
             snapshot_id = str(data.get("snapshot_id") or "")
             if snapshot_id and snapshot_id not in operation_by_snapshot:
-                operation_by_snapshot[snapshot_id] = (operation, data)
+                operation_by_snapshot[snapshot_id] = (str(operation_id), data)
 
         visual_values_by_snapshot: dict[str, dict[str, list[str]]] = {}
         visual_operations = self.db.exec(
@@ -6787,22 +7500,51 @@ class DynamicTaskAgent:
             operation_fact = operation_by_snapshot.get(snapshot.id)
             if operation_fact is None:
                 continue
-            read_operation, read_data = operation_fact
-            elements = self.db.exec(
+            read_operation_id, read_data = operation_fact
+            disclosed_elements = read_data.get("elements")
+            if not isinstance(disclosed_elements, list):
+                continue
+            element_ids = [
+                str(item.get("element_id") or "")
+                for item in disclosed_elements
+                if isinstance(item, Mapping) and item.get("element_id")
+            ]
+            if not element_ids:
+                continue
+            authoritative_elements = self.db.exec(
                 select(InputDocumentElement).where(
                     InputDocumentElement.tenant_id == instance.tenant_id,
                     InputDocumentElement.extraction_id == snapshot.extraction_id,
+                    InputDocumentElement.id.in_(element_ids),
                 )
             ).all()
-            for element in elements:
-                catalog[element.id] = {
+            authoritative_by_id = {element.id: element for element in authoritative_elements}
+            for disclosed in disclosed_elements:
+                if not isinstance(disclosed, Mapping):
+                    continue
+                element_id = str(disclosed.get("element_id") or "")
+                element = authoritative_by_id.get(element_id)
+                if (
+                    element is None
+                    or str(disclosed.get("content_checksum") or "")
+                    != element.content_checksum
+                ):
+                    continue
+                locator = disclosed.get("locator")
+                catalog[element_id] = {
                     "snapshot_id": snapshot.id,
                     "extraction_id": snapshot.extraction_id,
-                    "read_operation_id": read_operation.id,
+                    "read_operation_id": read_operation_id,
                     "slice_checksum": str(read_data.get("slice_checksum") or ""),
                     "element_checksum": element.content_checksum,
-                    "locator": dict(element.locator_json or {}),
-                    "text": element.text or "",
+                    "locator": (
+                        dict(locator)
+                        if isinstance(locator, Mapping)
+                        else dict(element.locator_json or {})
+                    ),
+                    # 使用 input.read 已披露的文本，而不是重新读取Extraction全文，
+                    # 让结果校验与实际发送给模型的最小片段保持同一证据边界。
+                    "text": str(disclosed.get("text") or ""),
                     "visual_fact_values": visual_values_by_snapshot.get(snapshot.id, {}),
                 }
         if unavailable_snapshot_ids:
@@ -7730,6 +8472,17 @@ class DynamicTaskAgent:
         if node.status != "running":
             raise DynamicTaskAgentError("DYNAMIC_INPUT_READ_NODE_INVALID")
         runtime = TurnInputRuntimeService(self.db)
+        plan = self._current_plan(instance)
+        search_text = "\n".join(
+            [
+                plan.goal,
+                step.title,
+                *[
+                    str(criterion.spec.get("description", ""))
+                    for criterion in plan.success_criteria
+                ],
+            ]
+        )
         for snapshot in snapshots:
             resource, data = self.resource_service.resolve_snapshot(
                 snapshot,
@@ -7776,8 +8529,13 @@ class DynamicTaskAgent:
                         offset = next_offset
                     if read_payload is None:
                         raise InputBindingError("ATTACHMENT_INPUT_PAGE_INVALID")
-                    read_payload["elements"] = combined_elements
-                    read_payload["slice_checksum"] = capability_checksum(combined_elements)
+                    projected_elements, projection = _project_dynamic_input_elements(
+                        combined_elements,
+                        search_text=search_text,
+                    )
+                    read_payload["elements"] = projected_elements
+                    read_payload["projection"] = projection
+                    read_payload["slice_checksum"] = capability_checksum(projected_elements)
                     read_payload["next_offset"] = None
                 except InputBindingError as exc:
                     self.store.finish_operation(
@@ -7828,6 +8586,7 @@ class DynamicTaskAgent:
                 "read_operation_id": operation.id,
                 "slice_checksum": read_payload.get("slice_checksum"),
                 "element_manifest_checksum": snapshot.element_manifest_checksum,
+                "projection": read_payload.get("projection"),
                 "elements": element_payloads,
                 "provider_mode": "reviewed_elements",
             }

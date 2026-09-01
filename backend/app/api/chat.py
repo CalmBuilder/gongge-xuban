@@ -1634,6 +1634,10 @@ def chat_stream(
     if not request.message.strip() and not request.attachments:
         raise HTTPException(status_code=400, detail="Message cannot be empty")
     replay = _existing_turn_replay(db, request)
+    # 流式响应会在返回后继续使用独立 worker_db。预检阶段的 Agent 可用性查询
+    # 采用了行锁，必须在交接 worker 前提交，不能让请求级依赖会话把这把锁
+    # 持有到 SSE 结束，否则 worker 会等待自己持有的锁并最终触发 1205。
+    db.commit()
     if replay is not None:
         message_id, rows, cursor, terminal = replay
         return StreamingResponse(

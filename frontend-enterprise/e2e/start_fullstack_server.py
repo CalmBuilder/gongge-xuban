@@ -274,8 +274,6 @@ def configure_environment(database_path: Path) -> None:
         # Skill A/B 只替换供应商响应，不应借测试变量把普通动态执行重新关掉。
         # 这样同一套隔离服务仍能验证 Skill、附件和 DynamicTask 的组合契约。
         "DYNAMIC_TASK_EXECUTION_ENABLED": "true",
-        "DYNAMIC_TASK_TENANT_ALLOWLIST": "",
-        "DYNAMIC_TASK_AGENT_ALLOWLIST": "",
         "DYNAMIC_TASK_STEERING_ENABLED": "true",
         "DYNAMIC_TASK_EXPLORE_ENABLED": "true",
         "DYNAMIC_TASK_MAX_PARALLEL_READS": "2",
@@ -362,8 +360,8 @@ def apply_dynamic_e2e_profile(environment: dict[str, str]) -> None:
         environment.update(
             {
                 "DYNAMIC_TASK_EXTERNAL_WRITE_ENABLED": "true",
-                "DYNAMIC_TASK_TENANT_ALLOWLIST": "tenant_demo",
-                "DYNAMIC_TASK_AGENT_ALLOWLIST": "agent_e2e_employee",
+                "DYNAMIC_TASK_EXTERNAL_WRITE_TENANT_ALLOWLIST": "tenant_demo",
+                "DYNAMIC_TASK_EXTERNAL_WRITE_AGENT_ALLOWLIST": "agent_e2e_employee",
                 "DYNAMIC_TASK_ALERT_SIGNAL_BACKLOG_THRESHOLD": "100",
                 "DYNAMIC_TASK_ALERT_DEAD_LETTER_THRESHOLD": "1",
                 "DYNAMIC_TASK_ALERT_UNKNOWN_OPERATION_THRESHOLD": "1",
@@ -3491,6 +3489,35 @@ def install_schedule_llm_override() -> None:
 
                 return [loaded_ref_by_base[name] for name in names]
             goal = str(user_payload.get("goal") or "")
+            if "No content length specified for stream data" in goal:
+                return {
+                    "goal": goal,
+                    "success_criteria": [
+                        {
+                            "id": "s3_log_analysis",
+                            "type": "assertion",
+                            "spec": {
+                                "description": "解释 S3 上传警告的来源并给出修复建议",
+                                "required": True,
+                            },
+                        }
+                    ],
+                    "constraints": ["仅分析日志，不执行外部写入或破坏性操作"],
+                    "assumptions": [],
+                    "steps": [
+                        {
+                            "draft_id": "answer",
+                            "title": "分析 S3 上传警告",
+                            "kind": "answer",
+                            "required": True,
+                            "depends_on": [],
+                            "capability_refs": [],
+                            "guidance_skill_refs": [],
+                            "expected_output_schema": {},
+                        }
+                    ],
+                    "expected_artifacts": [],
+                }
             if "EXTERNAL-WRITE-GRAY" in goal:
                 capability_ref = next(
                     (
@@ -5702,6 +5729,45 @@ def install_schedule_llm_override() -> None:
                     "expected_output_schema": {},
                     "rationale": "按固定 Skill 和真实检索证据完成任务",
                 }
+            if step_kind == "answer" and step_title == "分析 S3 上传警告":
+                execution_view = user_payload.get("provider_execution_view", {})
+                execution_context = (
+                    execution_view.get("execution_context", {})
+                    if isinstance(execution_view, dict)
+                    else {}
+                )
+                criteria = [
+                    str(item.get("id") or "")
+                    for item in execution_context.get("success_criteria", [])
+                    if isinstance(item, dict) and item.get("id")
+                ]
+                completed = [
+                    str(item.get("step_key") or "")
+                    for item in execution_context.get("completed_steps", [])
+                    if isinstance(item, dict) and item.get("step_key")
+                ]
+                current_step_key = str(current_step.get("step_key") or "")
+                evidence_steps = [current_step_key] if current_step_key else completed
+                client._last_completed_response_metadata = {
+                    "response_id": "e2e-s3-log-answer-response",
+                    "finish_reason": "stop",
+                    "usage": {"input_tokens": 24, "output_tokens": 24},
+                }
+                return {
+                    "action_kind": "answer",
+                    "arguments": {
+                        "markdown": (
+                            "S3 日志分析：这是 AWS SDK 在上传未知长度的流时发出的内存缓冲警告，"
+                            "不是 DynamicTaskAgent 或业务权限错误。请为上传请求提供准确的 Content-Length，"
+                            "或使用可重复读取且明确长度的请求体；同时关注大文件上传的内存占用。"
+                        ),
+                        "criterion_evidence": {criterion: evidence_steps for criterion in criteria},
+                        "pending_questions": [],
+                    },
+                    "capability_ref": None,
+                    "expected_output_schema": {},
+                    "rationale": "根据日志中的 AWS SDK 警告给出只读分析",
+                }
             if step_kind == "answer" and step_title == "生成巡检结果":
                 execution_view = user_payload.get("provider_execution_view", {})
                 execution_context = (
@@ -5767,6 +5833,14 @@ def install_schedule_llm_override() -> None:
 
         raise_if_model_error_profile()
         if isinstance(user_payload, dict):
+            if "No content length specified for stream data" in str(
+                user_payload.get("user_message") or ""
+            ):
+                return (
+                    "S3 日志分析：这是 AWS SDK 在上传未知长度的流时发出的内存缓冲警告，"
+                    "不是 DynamicTaskAgent 或业务权限错误。请为上传请求提供准确的 Content-Length，"
+                    "或使用可重复读取且明确长度的请求体；同时关注大文件上传的内存占用。"
+                )
             if (
                 os.environ.get("BUILTIN_SKILL_MATRIX_E2E") == "1"
                 and "SKILL-MATRIX-" in str(user_payload.get("user_message") or "")

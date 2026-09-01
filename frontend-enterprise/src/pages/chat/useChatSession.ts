@@ -82,6 +82,7 @@ import {
   isDraftConversationKey,
   isKnowledgeTracePhase,
   isMissingChatSessionError,
+  isRelayRecoveryNetworkFailureTimedOut,
   isRecoverableRunningTrace,
   isScheduledSession,
   isStreamingMessageId,
@@ -94,6 +95,7 @@ import {
   loadSessionReadTimes,
   mergeTraceLine,
   mergeTurnTraceSnapshot,
+  messageAttachments,
   modelStorageKey,
   normalizeMessageText,
   normalizeSessionEventForStream,
@@ -344,6 +346,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
   ));
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [sessionsLoading, setSessionsLoading] = useState(true);
+  const [chatServiceUnavailable, setChatServiceUnavailable] = useState(false);
   const [sessionReadTimes, setSessionReadTimes] = useState<Record<string, string>>(() => loadSessionReadTimes(userId));
   const [agents, setAgents] = useState<AgentProfileRead[]>([]);
   const [agentsLoaded, setAgentsLoaded] = useState(false);
@@ -504,6 +507,16 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     });
     return false;
   }, [redirectToLogin]);
+
+  const markChatServiceUnavailable = useCallback((error: unknown): boolean => {
+    if (!(error instanceof TypeError)) return false;
+    setChatServiceUnavailable(true);
+    return true;
+  }, []);
+
+  const markChatServiceAvailable = useCallback(() => {
+    setChatServiceUnavailable(false);
+  }, []);
 
   const scrollChatToBottom = useCallback((options?: { preserveShortContentTop?: boolean; force?: boolean }) => {
     const element = chatMessagesRef.current;
@@ -1211,7 +1224,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     currentStream.loading
     || (activeConversationId && runningTurn?.sessionId === activeConversationId)
     || hasRunningDisplayedTrace
-    || activeSessionReportsRunning,
+    || (!chatServiceUnavailable && activeSessionReportsRunning),
   );
   const readyComposerAttachments = useMemo(
     () => composerAttachments.filter((item) => item.uploadStatus === 'ready'),
@@ -1251,6 +1264,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     api
       .get<ChatSession[]>(`/api/chat/sessions?tenant_id=${tenantId}`)
       .then((rows) => {
+        markChatServiceAvailable();
         const previousIds = new Set(knownSessionIdsRef.current);
         const initialized = sessionsInitializedRef.current;
         if (!initialized) {
@@ -1288,12 +1302,13 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
         }
       })
       .catch((error) => {
+        markChatServiceUnavailable(error);
         notifyRequestError('sessions', error, '会话加载失败');
       })
       .finally(() => {
         setSessionsLoading(false);
       });
-  }, [getSlot, input, navigate, notifyRequestError, tenantId, userId]);
+  }, [getSlot, input, markChatServiceAvailable, markChatServiceUnavailable, navigate, notifyRequestError, tenantId, userId]);
 
   const handleMissingSession = useCallback((id: string) => {
     forgetMissingSession(id);
@@ -1308,6 +1323,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     return api
       .get<ChatMessage[]>(`/api/chat/sessions/${id}/messages?tenant_id=${tenantId}`)
       .then((rows) => {
+        markChatServiceAvailable();
         const slot = getSlot(id);
         slot.serverMessages = attachTurnIdsToServerMessages(rows, slot.realtimeMessages);
         const stream = getStreamSlot(id);
@@ -1326,15 +1342,17 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
           handleMissingSession(id);
           return [];
         }
+        markChatServiceUnavailable(error);
         notifyRequestError('messages', error, '消息加载失败');
         return [];
       });
-  }, [clearStreamSlot, getSlot, getStreamSlot, handleMissingSession, notifyRequestError, notifyStore, pruneRealtime, tenantId]);
+  }, [clearStreamSlot, getSlot, getStreamSlot, handleMissingSession, markChatServiceAvailable, markChatServiceUnavailable, notifyRequestError, notifyStore, pruneRealtime, tenantId]);
 
   const loadTraces = useCallback((id: string) => {
     return api
       .get<TurnTraceRead[]>(`/api/chat/sessions/${id}/trace?tenant_id=${tenantId}`)
       .then((rows) => {
+        markChatServiceAvailable();
         const slot = getSlot(id);
         const stream = getStreamSlot(id);
         const locallyCancelled = locallyCancelledSessionIdsRef.current.has(id);
@@ -1451,9 +1469,10 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
           handleMissingSession(id);
           return;
         }
+        markChatServiceUnavailable(error);
         notifyRequestError('trace', error, '轨迹加载失败');
       });
-  }, [getSlot, getStreamSlot, handleMissingSession, notifyRequestError, notifyStore, notifyStream, notifyTrace, tenantId]);
+  }, [getSlot, getStreamSlot, handleMissingSession, markChatServiceAvailable, markChatServiceUnavailable, notifyRequestError, notifyStore, notifyStream, notifyTrace, tenantId]);
 
   const stopTerminalTurnSync = useCallback((sessionIdToStop: string, turnIdToStop: string) => {
     const key = `${sessionIdToStop}:${turnIdToStop}`;
@@ -2627,6 +2646,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     return api
       .get<ChatSessionEventRead[]>(`/api/chat/sessions/${id}/events?tenant_id=${tenantId}`)
       .then((events) => {
+        markChatServiceAvailable();
         const traceEvents = events.filter((event) => Boolean(eventTraceTurnId(event)));
         if (!traceEvents.length) return;
         hydrateRunningSessionFromEvents(id, traceEvents);
@@ -2757,7 +2777,46 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       .catch((error) => {
         if (isAuthError(error)) {
           redirectToLogin();
+          return;
         }
+        if (!markChatServiceUnavailable(error)) return;
+        notifyRequestError('events', error, '事件加载失败');
+        const stream = getStreamSlot(id);
+        const recoveryStartedAt = stream.relayRecoveryStartedAt;
+        const recoveringTurnId = stream.relayRecoveryTurnId || stream.turnId || '';
+        if (
+          !recoveryStartedAt
+          || stream.abortController
+          || !isRelayRecoveryNetworkFailureTimedOut(recoveryStartedAt)
+        ) return;
+        clearStreamSlot(id, true);
+        if (recoveringTurnId) {
+          upsertTraceLine(recoveringTurnId, {
+            id: 'stream_relay_network_error',
+            kind: 'thinking',
+            text: '服务连接中断',
+            detail: '无法连接服务端，已停止等待。请确认 5137 服务已启动后重新发送。',
+            state: 'failed',
+            icon: 'loading',
+          });
+          finishTrace(recoveringTurnId, true);
+          appendRealtime(id, {
+            id: `stream_relay_network_error_${recoveringTurnId}_${Date.now()}`,
+            turnId: recoveringTurnId,
+            role: 'assistant',
+            content: '服务连接中断，未能完成本次响应。请确认服务已启动后重新发送。',
+            created_at: new Date().toISOString(),
+            isError: true,
+          });
+        }
+        setRunningTurn((current) => (
+          current?.sessionId === id
+            && (!recoveringTurnId || current.turnId === recoveringTurnId)
+            ? null
+            : current
+        ));
+        notifyStore();
+        notifyStream();
       });
   }, [
     appendRealtime,
@@ -2769,9 +2828,13 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     getStreamSlot,
     handleStreamEvent,
     hydrateRunningSessionFromEvents,
+    isRelayRecoveryNetworkFailureTimedOut,
     isTerminalEvent,
     loadMessages,
     loadTraces,
+    markChatServiceAvailable,
+    markChatServiceUnavailable,
+    notifyRequestError,
     notifyStore,
     notifyStream,
     redirectToLogin,
@@ -3309,15 +3372,26 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     userId,
   ]);
 
-  const send = useCallback(async (interactionMode?: ComposerInteractionMode) => {
+  const send = useCallback(async (
+    interactionMode?: ComposerInteractionMode,
+    messageOverride?: string,
+    attachmentsOverride?: ChatAttachmentRead[],
+  ) => {
     const resolvedInteractionMode = interactionMode || composerIntent || 'normal';
+    const isOverrideTurn = messageOverride !== undefined;
+    const messageText = messageOverride ?? input;
+    const requestedAttachments = attachmentsOverride ?? readyComposerAttachments;
     if (!activeConversationId) return;
-    if (resolvedInteractionMode === 'scheduled_task' && !input.trim()) {
+    if (resolvedInteractionMode === 'scheduled_task' && !messageText.trim()) {
       notify.warning('请输入要创建的定时任务内容');
       return;
     }
-    if (!input.trim() && readyComposerAttachments.length === 0) return;
-    if (uploadingComposerAttachment) {
+    if (!messageText.trim() && requestedAttachments.length === 0) return;
+    if (chatServiceUnavailable) {
+      notify.warning('当前服务连接失败，请恢复服务后再发送');
+      return;
+    }
+    if (!isOverrideTurn && uploadingComposerAttachment) {
       notify.warning('文件还在解析中，请稍后发送');
       return;
     }
@@ -3331,19 +3405,21 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
         notify.warning('待回答会话仅支持发送人工回复');
         return;
       }
-      if (readyComposerAttachments.length > 0) {
+      if (requestedAttachments.length > 0) {
         notify.warning('待回答暂不支持附件，请发送文字回复');
         return;
       }
-      const reply = input.trim();
+      const reply = messageText.trim();
       if (!reply) {
         notify.warning('请输入回复内容');
         return;
       }
       if (await replyToHandoff(pendingHandoff, reply)) {
-        setInput('');
-        setComposerAttachments([]);
-        setComposerIntent(null);
+        if (!isOverrideTurn) {
+          setInput('');
+          setComposerAttachments([]);
+          setComposerIntent(null);
+        }
       }
       return;
     }
@@ -3366,8 +3442,8 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       conversationId: currentConversationId,
       agentId: sessionAgentId,
       turnId: `turn_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-      text: input.trim(),
-      attachments: readyComposerAttachments,
+      text: messageText.trim(),
+      attachments: requestedAttachments,
       interactionMode: resolvedInteractionMode,
       executionEngine,
       modelConfigId: selectedModelConfig?.id,
@@ -3375,10 +3451,12 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       forcedGeneralSkillIds: selectedGeneralSkillIds.length ? selectedGeneralSkillIds : undefined,
       createdAt: new Date().toISOString(),
     };
-    setInput('');
-    setComposerAttachments([]);
-    setComposerIntent(null);
-    setSelectedGeneralSkillIds([]);
+    if (!isOverrideTurn) {
+      setInput('');
+      setComposerAttachments([]);
+      setComposerIntent(null);
+      setSelectedGeneralSkillIds([]);
+    }
     const stream = getStreamSlot(currentConversationId);
     const hasQueuedTurnForConversation = queuedTurnsRef.current.some(
       (item) => item.conversationId === currentConversationId,
@@ -3395,6 +3473,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
   }, [
     activeConversationId,
     activeDraftAgentId,
+    chatServiceUnavailable,
     composerIntent,
     currentSessionRunning,
     displayedAgent?.id,
@@ -3419,10 +3498,59 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     uploadingComposerAttachment,
   ]);
 
+  const editMessage = useCallback((item: ChatMessage) => {
+    if (item.role !== 'user' || item.metadata?.queued === true || currentSessionRunning) return;
+    setInput(item.content);
+    setComposerIntent(null);
+    setSelectedGeneralSkillIds([]);
+    const editableAttachments: ComposerAttachment[] = messageAttachments(item)
+      .filter((attachment) => Boolean(attachment.resource_id && attachment.resource_version))
+      .map((attachment) => ({
+        ...attachment,
+        uploadStatus: 'ready' as const,
+        uploadKey: `message_${item.id}_${attachment.id}`,
+      }));
+    setComposerAttachments(editableAttachments);
+    window.requestAnimationFrame(() => {
+      const textarea = document.querySelector<HTMLTextAreaElement>('[data-chat-composer-input]');
+      if (!textarea) return;
+      textarea.focus();
+      const cursorPosition = textarea.value.length;
+      textarea.setSelectionRange(cursorPosition, cursorPosition);
+    });
+  }, [currentSessionRunning]);
+
+  const retryMessage = useCallback(async (item: ChatMessage) => {
+    if (item.role !== 'assistant' || item.isStreaming || currentSessionRunning) return;
+    const assistantIndex = displayedMessages.findIndex((candidate) => candidate.id === item.id);
+    const messagesBeforeAssistant = assistantIndex >= 0
+      ? displayedMessages.slice(0, assistantIndex)
+      : displayedMessages;
+    const userMessages = messagesBeforeAssistant.filter((candidate) => (
+      candidate.role === 'user' && candidate.metadata?.queued !== true && Boolean(candidate.content.trim())
+    ));
+    const aliasMap = buildTurnAliasMap(displayedMessages);
+    const assistantTurnId = canonicalMessageTurnId(item, aliasMap);
+    const sameTurnUserMessages = assistantTurnId
+      ? userMessages.filter((candidate) => canonicalMessageTurnId(candidate, aliasMap) === assistantTurnId)
+      : [];
+    const candidates = sameTurnUserMessages.length ? sameTurnUserMessages : userMessages;
+    const sourceMessage = candidates[candidates.length - 1];
+    if (!sourceMessage) {
+      notify.warning(t('找不到对应的用户消息，无法重试'));
+      return;
+    }
+    const attachments = messageAttachments(sourceMessage).filter((attachment) => (
+      Boolean(attachment.resource_id && attachment.resource_version)
+    ));
+    await send('normal', sourceMessage.content, attachments);
+  }, [currentSessionRunning, displayedMessages, send]);
+
   const drainQueuedTurns = useCallback(() => {
     if (queuedTurnProcessingRef.current) return;
     const nextTurn = queuedTurnsRef.current[0];
     if (!nextTurn) return;
+    if (chatServiceUnavailable) return;
     if (sessionsLoading) return;
     if (modelConfigsLoading || modelConfigsLoadError) return;
     if (!selectedModelConfig) {
@@ -3455,6 +3583,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     });
   }, [
     executePreparedTurn,
+    chatServiceUnavailable,
     getStreamSlot,
     canConfigureModels,
     modelConfigsLoadError,
@@ -3503,6 +3632,17 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     navigate(`${CHAT_BASE_PATH}/draft/${encodeURIComponent(agentId)}`);
   }, [navigate, persistChatSessionAgentFilter, userId]);
 
+  const startNewSession = useCallback(() => {
+    const agentId = displayedAgent?.id || selectedAgentId || '';
+    if (!agentId) return;
+    setInput('');
+    setComposerAttachments([]);
+    setComposerIntent(null);
+    setSelectedGeneralSkillIds([]);
+    setActiveCitation(null);
+    navigate(`${CHAT_BASE_PATH}/draft/${encodeURIComponent(agentId)}`);
+  }, [displayedAgent?.id, navigate, selectedAgentId]);
+
   const openGallery = useCallback(() => {
     navigate('/workspace/gallery');
   }, [navigate]);
@@ -3549,6 +3689,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     currentStream,
     runningTurn,
     currentSessionRunning,
+    chatServiceUnavailable,
     isCurrentStreamingTrace,
     // scheduled
     scheduledDrafts,
@@ -3605,6 +3746,8 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     // handlers
     handleChatMessagesScroll,
     send,
+    editMessage,
+    retryMessage,
     abortStream,
     rateMessage,
     setActiveCitation,
@@ -3615,6 +3758,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     openSession,
     refreshAgents: loadAgents,
     openDraftForAgent,
+    startNewSession,
     openGallery,
     openRename,
     requestDelete,

@@ -150,9 +150,13 @@ export const CHAT_ATTACHMENT_META_CLASS = 'truncate gg-type-caption text-[#858b9
 // ---------------------------------------------------------------------------
 // Feedback actions
 // ---------------------------------------------------------------------------
-export const CHAT_FEEDBACK_CLASS = 'mt-[10px] flex items-center gap-[4px]';
-export const CHAT_FEEDBACK_BTN_CLASS =
-  'inline-grid size-[28px] place-items-center rounded-[8px] border-0 bg-transparent p-0 text-[#a2a8b8] transition-colors hover:bg-[#f1f2f5] hover:text-[#18181a]';
+export const CHAT_MESSAGE_ACTIONS_CLASS = 'mt-[8px] flex items-center gap-[2px]';
+export const CHAT_MESSAGE_ACTIONS_USER_CLASS = 'self-end justify-end';
+export const CHAT_MESSAGE_ACTIONS_ASSISTANT_CLASS = 'self-start justify-start';
+export const CHAT_MESSAGE_ACTION_BTN_CLASS =
+  'inline-grid size-[28px] place-items-center rounded-[8px] border-0 bg-transparent p-0 text-[#a2a8b8] transition-colors hover:bg-[#f1f2f5] hover:text-[#18181a] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--gg-cobalt)] focus-visible:ring-offset-1';
+export const CHAT_FEEDBACK_CLASS = CHAT_MESSAGE_ACTIONS_CLASS;
+export const CHAT_FEEDBACK_BTN_CLASS = CHAT_MESSAGE_ACTION_BTN_CLASS;
 export const CHAT_FEEDBACK_BTN_ACTIVE_CLASS = 'bg-[#eef0f4] text-[#18181a]';
 export const CHAT_FEEDBACK_BTN_DISLIKE_ACTIVE_CLASS = 'bg-[#fce7e7] text-[#d20b0b] hover:bg-[#fce7e7] hover:text-[#d20b0b]';
 
@@ -181,6 +185,8 @@ export const CHAT_INPUT_SHELL_CLASS = 'shrink-0 px-[24px] pb-[20px] pt-[6px]';
 export const CHAT_COMPOSER_STAGE_CLASS = 'relative mx-auto w-full max-w-[820px]';
 export const CHAT_COMPOSER_AVATAR_CLASS =
   'absolute left-[16px] top-0 z-10 size-[44px] -translate-y-[calc(100%-8px)] shrink-0 overflow-hidden rounded-[10px] border-[3px] border-[var(--gg-cloud)] bg-[var(--gg-cloud)] shadow-[0_8px_18px_rgba(24,33,61,0.14)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--gg-cobalt)] focus-visible:ring-offset-2';
+export const CHAT_COMPOSER_NEW_SESSION_BTN_CLASS =
+  'inline-grid size-[26px] shrink-0 place-items-center rounded-[8px] border-[0.5px] border-[#e3e7f1] bg-white text-[#858b9c] transition-colors hover:border-[#c9d2e4] hover:bg-[#edf2ff] hover:text-[var(--gg-cobalt)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--gg-cobalt)] focus-visible:ring-offset-1';
 export const CHAT_COMPOSER_FORM_CLASS =
   'relative flex min-w-0 flex-1 flex-col gap-[10px] rounded-[14px] border border-[var(--gg-cobalt)] bg-white p-[12px] shadow-[0_10px_32px_rgba(49,87,232,0.10)] transition-colors';
 export const CHAT_COMPOSER_FORM_DRAG_CLASS = 'border-dashed border-[#0b6cf5] bg-[#f5f9ff]';

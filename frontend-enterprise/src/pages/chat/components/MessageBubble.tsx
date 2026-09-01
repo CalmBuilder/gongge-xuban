@@ -3,6 +3,7 @@ import { notify } from '@/components/ui/app-toast';
 import IconThumbUp from '@/assets/icons/thumb-up.svg?react';
 import IconThumbDown from '@/assets/icons/thumb-down.svg?react';
 import { cn } from '@/lib/utils';
+import { useI18n } from '@/i18n';
 import type {
   ChatAttachmentRead,
   ChatMessage,
@@ -28,7 +29,10 @@ import {
   CHAT_FEEDBACK_BTN_ACTIVE_CLASS,
   CHAT_FEEDBACK_BTN_CLASS,
   CHAT_FEEDBACK_BTN_DISLIKE_ACTIVE_CLASS,
-  CHAT_FEEDBACK_CLASS,
+  CHAT_MESSAGE_ACTIONS_CLASS,
+  CHAT_MESSAGE_ACTIONS_ASSISTANT_CLASS,
+  CHAT_MESSAGE_ACTIONS_USER_CLASS,
+  CHAT_MESSAGE_ACTION_BTN_CLASS,
   CHAT_MESSAGE_ITEM_CLASS,
   CHAT_MESSAGE_MODE_CHIP_CLASS,
   CHAT_PLAIN_ANSWER_CLASS,
@@ -63,6 +67,8 @@ export type MessageRender = {
   scheduledTaskPrompt: boolean;
   attachments: ChatAttachmentRead[];
   statusOnly: boolean;
+  canEdit: boolean;
+  canRetry: boolean;
 };
 
 type MessageBubbleProps = {
@@ -72,7 +78,17 @@ type MessageBubbleProps = {
 };
 
 export default function MessageBubble({ chat, item, render }: MessageBubbleProps) {
-  const { toggleTrace, rateMessage, setActiveCitation, confirmScheduledTask, dismissScheduledTaskDraft } = chat;
+  const { t } = useI18n();
+  const {
+    toggleTrace,
+    rateMessage,
+    setActiveCitation,
+    confirmScheduledTask,
+    dismissScheduledTaskDraft,
+    editMessage,
+    retryMessage,
+    currentSessionRunning,
+  } = chat;
   const {
     traceTurnId,
     summary,
@@ -86,17 +102,25 @@ export default function MessageBubble({ chat, item, render }: MessageBubbleProps
     scheduledTaskPrompt,
     attachments,
     statusOnly,
+    canEdit,
+    canRetry,
   } = render;
   const queuedMessage = item.role === 'user' && item.metadata?.queued === true;
+  const canCopy = (
+    item.role === 'user' || item.role === 'assistant'
+  ) && !item.isStreaming && !statusOnly && Boolean(visibleContent);
+  const showEdit = canCopy && item.role === 'user' && canEdit && !queuedMessage && !currentSessionRunning;
+  const showRetry = canCopy && item.role === 'assistant' && canRetry && !currentSessionRunning;
+  const showFeedback = canRateMessage(item);
 
-  async function copyVisibleAnswer() {
-    /** 只复制页面实际展示的已完成回答，不复制执行轨迹或隐藏 metadata。 */
+  async function copyVisibleMessage() {
+    /** 只复制页面实际展示的已完成消息，不复制执行轨迹或隐藏 metadata。 */
 
     try {
-      await navigator.clipboard.writeText(visibleContent);
-      notify.success('回答已复制');
+      await copyTextToClipboard(visibleContent);
+      notify.success(t(item.role === 'user' ? '消息已复制' : '回答已复制'));
     } catch {
-      notify.error('复制失败，请手动选择文本');
+      notify.error(t('复制失败，请手动选择文本'));
     }
   }
 
@@ -194,20 +218,42 @@ export default function MessageBubble({ chat, item, render }: MessageBubbleProps
             />
           )}
 
-          {canRateMessage(item) && (
-            <div className={CHAT_FEEDBACK_CLASS}>
-              <button
-                type="button"
-                className={CHAT_FEEDBACK_BTN_CLASS}
-                aria-label="复制回答"
-                onClick={() => void copyVisibleAnswer()}
-              >
-                <ProductIcon name="file" size={15} />
-              </button>
+        </div>
+      </div>
+      {(canCopy || showEdit || showRetry || showFeedback) && (
+        <div className={cn(
+          CHAT_MESSAGE_ACTIONS_CLASS,
+          item.role === 'user' ? CHAT_MESSAGE_ACTIONS_USER_CLASS : CHAT_MESSAGE_ACTIONS_ASSISTANT_CLASS,
+        )}>
+          {canCopy && (
+            <button
+              type="button"
+              className={CHAT_MESSAGE_ACTION_BTN_CLASS}
+              aria-label={t('复制')}
+              title={t('复制')}
+              onClick={() => void copyVisibleMessage()}
+            >
+              <ProductIcon name="copy" size={15} />
+            </button>
+          )}
+          {showEdit && (
+            <button
+              type="button"
+              className={CHAT_MESSAGE_ACTION_BTN_CLASS}
+              aria-label={t('编辑')}
+              title={t('编辑')}
+              onClick={() => editMessage(item)}
+            >
+              <ProductIcon name="edit" size={15} />
+            </button>
+          )}
+          {showFeedback && (
+            <>
               <button
                 type="button"
                 className={cn(CHAT_FEEDBACK_BTN_CLASS, item.feedback_rating === 'up' && CHAT_FEEDBACK_BTN_ACTIVE_CLASS)}
-                aria-label="点赞"
+                aria-label={t('点赞')}
+                title={t('点赞')}
                 onClick={() => rateMessage(item, 'up')}
               >
                 <IconThumbUp width={15} height={15} />
@@ -218,15 +264,27 @@ export default function MessageBubble({ chat, item, render }: MessageBubbleProps
                   CHAT_FEEDBACK_BTN_CLASS,
                   item.feedback_rating === 'down' && CHAT_FEEDBACK_BTN_DISLIKE_ACTIVE_CLASS,
                 )}
-                aria-label="点踩"
+                aria-label={t('点踩')}
+                title={t('点踩')}
                 onClick={() => rateMessage(item, 'down')}
               >
                 <IconThumbDown width={15} height={15} />
               </button>
-            </div>
+            </>
+          )}
+          {showRetry && (
+            <button
+              type="button"
+              className={CHAT_MESSAGE_ACTION_BTN_CLASS}
+              aria-label={t('重试')}
+              title={t('重试')}
+              onClick={() => void retryMessage(item)}
+            >
+              <ProductIcon name="refresh" size={15} />
+            </button>
           )}
         </div>
-      </div>
+      )}
       {queuedMessage && (
         <div className={CHAT_QUEUED_STATUS_ROW_CLASS}>
           <span className={CHAT_QUEUED_STATUS_CLASS} role="status">
@@ -237,4 +295,30 @@ export default function MessageBubble({ chat, item, render }: MessageBubbleProps
       )}
     </div>
   );
+}
+
+async function copyTextToClipboard(text: string): Promise<void> {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch {
+      // 浏览器拒绝 Clipboard API 时继续尝试兼容路径。
+    }
+  }
+
+  const textarea = document.createElement('textarea');
+  textarea.value = text;
+  textarea.setAttribute('readonly', 'true');
+  textarea.style.position = 'fixed';
+  textarea.style.opacity = '0';
+  document.body.appendChild(textarea);
+  textarea.select();
+  let copied = false;
+  try {
+    copied = document.execCommand('copy');
+  } finally {
+    textarea.remove();
+  }
+  if (!copied) throw new Error('Clipboard copy failed');
 }

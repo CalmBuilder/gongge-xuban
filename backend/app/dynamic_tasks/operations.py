@@ -89,8 +89,12 @@ class DynamicTaskOperationsService:
             base_execution_available
             and settings.dynamic_task_external_write_enabled
             and settings.dynamic_task_alert_thresholds_configured
-            and settings._identifier_allowlist(settings.dynamic_task_tenant_allowlist)
-            and settings._identifier_allowlist(settings.dynamic_task_agent_allowlist)
+            and settings._identifier_allowlist(
+                settings.dynamic_task_external_write_tenant_allowlist
+            )
+            and settings._identifier_allowlist(
+                settings.dynamic_task_external_write_agent_allowlist
+            )
         )
         high_risk_destructive_available = bool(
             base_execution_available

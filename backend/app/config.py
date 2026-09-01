@@ -52,6 +52,9 @@ class Settings(BaseSettings):
     dynamic_task_parallel_dispatch_workers: int = Field(default=8, ge=1, le=64)
     dynamic_task_parallel_read_timeout_seconds: int = Field(default=120, ge=5, le=3600)
     dynamic_task_external_write_enabled: bool = False
+    # 普通 DynamicTaskAgent 不使用租户/Agent 白名单；外部写入的灰度范围必须单独配置。
+    dynamic_task_external_write_tenant_allowlist: str = ""
+    dynamic_task_external_write_agent_allowlist: str = ""
     dynamic_task_destructive_enabled: bool = False
     dynamic_task_destructive_tenant_allowlist: str = ""
     dynamic_task_destructive_agent_allowlist: str = ""
@@ -63,8 +66,6 @@ class Settings(BaseSettings):
     general_skill_agent_proposal_approval_ttl_seconds: int = Field(
         default=900, ge=30, le=86_400
     )
-    dynamic_task_tenant_allowlist: str = ""
-    dynamic_task_agent_allowlist: str = ""
     dynamic_task_signal_dispatch_workers: int = Field(default=4, ge=1, le=64)
     dynamic_task_signal_dispatch_capacity: int = Field(default=16, ge=1, le=4096)
     dynamic_task_alert_signal_backlog_threshold: int = Field(default=0, ge=0)
@@ -171,13 +172,13 @@ class Settings(BaseSettings):
 
     @staticmethod
     def _identifier_allowlist(value: str) -> frozenset[str]:
-        """把逗号分隔灰度标识规范化为不可变集合，保留星号作为显式全量选择。"""
+        """把高风险能力的逗号分隔标识规范化为不可变集合。"""
 
         return frozenset(item.strip() for item in value.split(",") if item.strip())
 
     @classmethod
     def _allowlist_matches(cls, value: str, identifier: str, *, require_non_empty: bool) -> bool:
-        """判断标识是否命中指定名单，并区分普通空名单与高风险必填名单语义。"""
+        """判断标识是否命中高风险能力名单，并区分空名单是否允许通过。"""
 
         identifiers = cls._identifier_allowlist(value)
         if not identifiers:
@@ -185,21 +186,11 @@ class Settings(BaseSettings):
         return "*" in identifiers or identifier in identifiers
 
     def dynamic_task_base_execution_allows(self, tenant_id: str, agent_id: str) -> bool:
-        """判断普通 DynamicTaskAgent 是否具备基础入场条件，不读取模型或告警额度。"""
+        """判断普通 DynamicTaskAgent 是否具备基础入场条件，所有租户和 Agent 均通用。"""
 
         return (
             self.dynamic_task_execution_enabled
             and self.dynamic_task_runtime_capacity_limits_configured
-            and self._allowlist_matches(
-                self.dynamic_task_tenant_allowlist,
-                tenant_id,
-                require_non_empty=False,
-            )
-            and self._allowlist_matches(
-                self.dynamic_task_agent_allowlist,
-                agent_id,
-                require_non_empty=False,
-            )
         )
 
     def dynamic_task_high_risk_external_write_allows(
@@ -216,12 +207,12 @@ class Settings(BaseSettings):
             self.dynamic_task_base_execution_allows(tenant_id, agent_id)
             and self.dynamic_task_external_write_enabled
             and self._allowlist_matches(
-                self.dynamic_task_tenant_allowlist,
+                self.dynamic_task_external_write_tenant_allowlist,
                 tenant_id,
                 require_non_empty=True,
             )
             and self._allowlist_matches(
-                self.dynamic_task_agent_allowlist,
+                self.dynamic_task_external_write_agent_allowlist,
                 agent_id,
                 require_non_empty=True,
             )

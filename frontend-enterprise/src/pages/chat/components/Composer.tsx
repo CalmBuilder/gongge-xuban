@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from 'react';
 
 import EmployeeAvatar from '@/components/EmployeeAvatar';
 import ProductIcon from '@/components/ProductIcon';
+import IconAdd from '@/assets/icons/add.svg?react';
 import { notify } from '@/components/ui/app-toast';
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
 import { Button as UIButton } from '@/components/ui/button';
@@ -37,6 +38,7 @@ import {
   CHAT_COMPOSER_HINT_CLASS,
   CHAT_COMPOSER_INTENT_CHIP_CLASS,
   CHAT_COMPOSER_MODEL_BTN_CLASS,
+  CHAT_COMPOSER_NEW_SESSION_BTN_CLASS,
   CHAT_COMPOSER_PLUS_BTN_CLASS,
   CHAT_COMPOSER_SEND_BTN_CLASS,
   CHAT_COMPOSER_STAGE_CLASS,
@@ -85,6 +87,7 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
     showComposerAvatar,
     displayedProfile,
     displayedAgent,
+    startNewSession,
     emptyRoleSummary,
     emptyProfileTags,
     emptyStats,
@@ -148,6 +151,11 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
     void send();
   };
 
+  const handleNewSession = () => {
+    setPreviewAttachment(null);
+    startNewSession();
+  };
+
   return (
     <div className={CHAT_INPUT_SHELL_CLASS}>
       <div className={CHAT_COMPOSER_STAGE_CLASS}>
@@ -189,8 +197,8 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
             >
               <div className="flex w-full flex-col px-[6px]">
                 <div className="flex h-[46px] w-full flex-col items-center justify-end rounded-[14px] bg-[#f6f6f6] pb-[4px] pl-[8px] pr-[16px] pt-[8px]">
-                  <div className="flex w-full items-end">
-                    <div className="flex items-end gap-[4px]">
+                  <div className="flex w-full items-end justify-between gap-[8px]">
+                    <div className="flex min-w-0 items-end gap-[4px]">
                       <EmployeeAvatar
                         profile={displayedProfile}
                         agent={displayedAgent ?? undefined}
@@ -199,13 +207,22 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
                         radius={30}
                         objectPosition="bottom"
                       />
-                      <div className="flex h-[36px] flex-col justify-center gap-[2px] whitespace-nowrap pb-[2px] gg-type-caption capitalize ">
-                        <p className="gg-type-meta font-medium text-[#464c5e]">
+                      <div className="flex min-w-0 h-[36px] flex-col justify-center gap-[2px] whitespace-nowrap pb-[2px] gg-type-caption capitalize ">
+                        <p className="truncate gg-type-meta font-medium text-[#464c5e]">
                           {displayedAgent ? employeeDisplayName(displayedAgent) : displayedProfile.roleName}
                         </p>
-                        <p className="gg-type-meta text-[#757f9c]">{displayedProfile.roleName}</p>
+                        <p className="truncate gg-type-meta text-[#757f9c]">{displayedProfile.roleName}</p>
                       </div>
                     </div>
+                    <button
+                      type="button"
+                      aria-label={t('新建会话')}
+                      title={t('新建会话')}
+                      className={CHAT_COMPOSER_NEW_SESSION_BTN_CLASS}
+                      onClick={handleNewSession}
+                    >
+                      <IconAdd className="size-[14px]!" />
+                    </button>
                   </div>
                 </div>
               </div>
@@ -329,6 +346,8 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
           <textarea
             ref={textareaRef}
             className={CHAT_COMPOSER_TEXTAREA_CLASS}
+            data-chat-composer-input
+            aria-label={t('输入消息，按 Enter 发送...')}
             value={input}
             rows={2}
             placeholder={t('输入消息，按 Enter 发送...')}

@@ -588,21 +588,29 @@ def _execution_read(db: Session, instance: SopInstance, current_user: User) -> E
             .order_by(ArtifactRendererJob.created_at, ArtifactRendererJob.id)
         ).all()
     ]
+    # 执行卡只需要Operation摘要；禁止把包含大型 result_json 的整行拿来排序，
+    # 否则 MySQL 可能在长附件执行完成后触发 1038 Out of sort memory。
+    operation_rows = db.exec(
+        select(
+            SopOperation.id,
+            SopOperation.operation_name,
+            SopOperation.effect_kind,
+            SopOperation.status,
+        )
+        .where(
+            SopOperation.tenant_id == instance.tenant_id,
+            SopOperation.instance_id == instance.id,
+        )
+        .order_by(SopOperation.created_at, SopOperation.id)
+    ).all()
     operations = [
         ExecutionOperationSummary(
-            id=operation.id,
-            operation_name=operation.operation_name,
-            effect_kind=operation.effect_kind,
-            status=operation.status,
+            id=row[0],
+            operation_name=row[1],
+            effect_kind=row[2],
+            status=row[3],
         )
-        for operation in db.exec(
-            select(SopOperation)
-            .where(
-                SopOperation.tenant_id == instance.tenant_id,
-                SopOperation.instance_id == instance.id,
-            )
-            .order_by(SopOperation.created_at, SopOperation.id)
-        ).all()
+        for row in operation_rows
     ]
     input_binding_count = len(
         db.exec(

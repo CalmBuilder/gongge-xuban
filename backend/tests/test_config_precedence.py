@@ -116,9 +116,9 @@ def test_dynamic_task_router_shadow_is_safe_by_default(monkeypatch) -> None:
     assert settings.attachment_parser_worker_enabled is True
     assert settings.dynamic_task_max_parallel_reads == 2
     assert settings.dynamic_task_external_write_enabled is False
+    assert settings.dynamic_task_external_write_tenant_allowlist == ""
+    assert settings.dynamic_task_external_write_agent_allowlist == ""
     assert settings.dynamic_task_destructive_enabled is False
-    assert settings.dynamic_task_tenant_allowlist == ""
-    assert settings.dynamic_task_agent_allowlist == ""
     assert settings.dynamic_task_rollout_allows("tenant_demo", "agent_demo") is True
     assert settings.dynamic_task_signal_dispatch_workers == 4
     assert settings.dynamic_task_signal_dispatch_capacity == 16
@@ -138,50 +138,51 @@ def test_dynamic_task_router_shadow_is_safe_by_default(monkeypatch) -> None:
     assert settings.dynamic_task_router_shadow_min_confidence == 0.7
 
 
-@pytest.mark.parametrize(
-    ("tenant_allowlist", "agent_allowlist", "tenant_id", "agent_id", "allowed"),
-    [
-        ("tenant_a", "agent_a", "tenant_a", "agent_a", True),
-        ("tenant_a", "agent_a", "tenant_b", "agent_a", False),
-        ("tenant_a", "agent_a", "tenant_a", "agent_b", False),
-        ("*", "agent_a", "tenant_b", "agent_a", True),
-        ("tenant_a", "*", "tenant_a", "agent_b", True),
-        ("", "", "tenant_a", "agent_a", True),
-    ],
-)
-def test_dynamic_task_rollout_allows_empty_or_matching_optional_allowlists(
-    tenant_allowlist: str,
-    agent_allowlist: str,
+def test_dynamic_task_has_no_common_tenant_or_agent_allowlist_contract(tmp_path: Path) -> None:
+    """验证历史普通白名单环境变量会被忽略，不能限制通用 DynamicTaskAgent。"""
+
+    dotenv = tmp_path / ".env"
+    dotenv.write_text(
+        'PUBLIC_MOCK_API_KEY="test-key"\n'
+        'DYNAMIC_TASK_TENANT_ALLOWLIST="legacy_tenant_only"\n'
+        'DYNAMIC_TASK_AGENT_ALLOWLIST="legacy_agent_only"\n',
+        encoding="utf-8",
+    )
+    settings = Settings(_env_file=dotenv)
+
+    assert not hasattr(settings, "dynamic_task_tenant_allowlist")
+    assert not hasattr(settings, "dynamic_task_agent_allowlist")
+    assert settings.dynamic_task_base_execution_allows("tenant_demo", "agent_demo") is True
+
+
+@pytest.mark.parametrize(("tenant_id", "agent_id"), [("tenant_a", "agent_a"), ("tenant_b", "agent_b")])
+def test_dynamic_task_base_is_universal_for_every_tenant_and_agent(
     tenant_id: str,
     agent_id: str,
-    allowed: bool,
 ) -> None:
-    """验证普通动态空名单默认开放，非空名单只按部署方主动收窄范围。"""
+    """验证普通动态对任意租户和 Agent 开放，不存在普通白名单契约。"""
 
     settings = Settings(
         _env_file=None,
         public_mock_api_key="test-key",
         dynamic_task_execution_enabled=True,
-        dynamic_task_tenant_allowlist=tenant_allowlist,
-        dynamic_task_agent_allowlist=agent_allowlist,
         dynamic_task_max_active_per_tenant=16,
         dynamic_task_max_active_per_agent=8,
         dynamic_task_max_active_per_user=4,
         dynamic_task_max_active_per_tool=4,
     )
 
-    assert settings.dynamic_task_rollout_allows(tenant_id, agent_id) is allowed
+    assert settings.dynamic_task_base_execution_allows(tenant_id, agent_id) is True
+    assert settings.dynamic_task_rollout_allows(tenant_id, agent_id) is True
 
 
-def test_dynamic_task_rollout_global_kill_switch_overrides_wildcards() -> None:
-    """验证显式全量灰度也不能绕过关闭的全局执行开关。"""
+def test_dynamic_task_rollout_global_kill_switch_blocks_every_tenant_and_agent() -> None:
+    """验证全局 kill switch 关闭时，任意租户和 Agent 都不能进入普通动态。"""
 
     settings = Settings(
         _env_file=None,
         public_mock_api_key="test-key",
         dynamic_task_execution_enabled=False,
-        dynamic_task_tenant_allowlist="*",
-        dynamic_task_agent_allowlist="*",
     )
 
     assert settings.dynamic_task_rollout_allows("tenant_a", "agent_a") is False
@@ -194,8 +195,6 @@ def test_dynamic_task_base_allows_without_alert_thresholds() -> None:
         _env_file=None,
         public_mock_api_key="test-key",
         dynamic_task_execution_enabled=True,
-        dynamic_task_tenant_allowlist="tenant_a",
-        dynamic_task_agent_allowlist="agent_a",
     )
 
     assert settings.dynamic_task_alert_thresholds_configured is False
@@ -211,8 +210,6 @@ def test_dynamic_task_base_rejects_zero_runtime_capacity() -> None:
         _env_file=None,
         public_mock_api_key="test-key",
         dynamic_task_execution_enabled=True,
-        dynamic_task_tenant_allowlist="tenant_a",
-        dynamic_task_agent_allowlist="agent_a",
         dynamic_task_max_active_per_tenant=0,
         dynamic_task_max_active_per_agent=8,
         dynamic_task_max_active_per_user=4,
@@ -233,8 +230,8 @@ def test_dynamic_task_external_write_requires_explicit_high_risk_configuration()
         public_mock_api_key="test-key",
         dynamic_task_execution_enabled=True,
         dynamic_task_external_write_enabled=True,
-        dynamic_task_tenant_allowlist="tenant_a",
-        dynamic_task_agent_allowlist="agent_a",
+        dynamic_task_external_write_tenant_allowlist="tenant_a",
+        dynamic_task_external_write_agent_allowlist="agent_a",
         dynamic_task_max_active_per_tenant=16,
         dynamic_task_max_active_per_agent=8,
         dynamic_task_max_active_per_user=4,
@@ -268,8 +265,8 @@ def test_dynamic_task_destructive_gate_uses_independent_allowlists() -> None:
         public_mock_api_key="test-key",
         dynamic_task_execution_enabled=True,
         dynamic_task_destructive_enabled=True,
-        dynamic_task_tenant_allowlist="tenant_a",
-        dynamic_task_agent_allowlist="agent_a",
+        dynamic_task_external_write_tenant_allowlist="tenant_a",
+        dynamic_task_external_write_agent_allowlist="agent_a",
         dynamic_task_destructive_tenant_allowlist="tenant_d",
         dynamic_task_destructive_agent_allowlist="agent_d",
         dynamic_task_alert_signal_backlog_threshold=10,
@@ -283,12 +280,8 @@ def test_dynamic_task_destructive_gate_uses_independent_allowlists() -> None:
         dynamic_task_max_active_per_tool=4,
     )
 
-    assert settings.dynamic_task_high_risk_destructive_allows("tenant_d", "agent_d") is False
-    assert settings.dynamic_task_high_risk_destructive_allows("tenant_a", "agent_a") is False
-
-    settings.dynamic_task_tenant_allowlist = "tenant_d"
-    settings.dynamic_task_agent_allowlist = "agent_d"
     assert settings.dynamic_task_high_risk_destructive_allows("tenant_d", "agent_d") is True
+    assert settings.dynamic_task_high_risk_destructive_allows("tenant_a", "agent_a") is False
 
 
 def test_dynamic_task_signal_capacity_must_cover_all_workers() -> None:

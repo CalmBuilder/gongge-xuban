@@ -52,6 +52,8 @@ from app.core.reflection_agent import ReflectionAgent, ReflectionDecision, actio
 from app.core.response_generator import (
     FALLBACK_REPLY,
     ResponseGenerator,
+    dynamic_task_failure_message,
+    dynamic_task_failure_suggestion,
     format_runtime_failure_reply,
     model_failure_suggestion,
 )
@@ -661,6 +663,22 @@ class AgentLoop:
         except AgentLoopPreconditionError as exc:
             chat_session = chat_session or self._get_or_create_session(request)
             return self._finish_with_error(chat_session, exc.code, exc.message)
+        except DynamicTaskAgentError as exc:
+            error_code = exc.code
+            error_message = dynamic_task_failure_message(error_code) or str(exc)
+            chat_session = chat_session or self._get_or_create_session(request)
+            self.events.record(
+                request.tenant_id,
+                chat_session.id,
+                "error_occurred",
+                {"code": error_code, "message": error_message},
+            )
+            reply = format_runtime_failure_reply(
+                "DynamicTaskAgent 未执行",
+                error_message,
+                error_code,
+                dynamic_task_failure_suggestion(error_code),
+            )
         except LLMError as exc:
             chat_session = chat_session or self._get_or_create_session(request)
             self.events.record(
@@ -2282,6 +2300,7 @@ class AgentLoop:
                     capability_route,
                     user_message.id,
                     memory_context=memory_context,
+                    conversation_context=no_skill_context,
                 )
                 self._raise_if_active_turn_cancelled()
                 if dynamic_response is not None:
@@ -2475,6 +2494,7 @@ class AgentLoop:
                     capability_route,
                     user_message_id,
                     memory_context=memory_context,
+                    conversation_context=conversation_context,
                 )
                 self._raise_if_active_turn_cancelled()
                 if dynamic_response is not None:
@@ -2573,6 +2593,7 @@ class AgentLoop:
                     capability_route,
                     user_message.id,
                     memory_context=memory_context,
+                    conversation_context=conversation_context,
                 )
                 self._raise_if_active_turn_cancelled()
                 if dynamic_response is not None:
@@ -3049,6 +3070,16 @@ class AgentLoop:
                 message=exc.message,
             )
             return
+        except DynamicTaskAgentError as exc:
+            error_code = exc.code
+            yield from stream_failure_response(
+                "DynamicTaskAgent 未执行",
+                exc,
+                error_code,
+                dynamic_task_failure_suggestion(error_code),
+                message=dynamic_task_failure_message(error_code),
+            )
+            return
         except LLMError as exc:
             yield from stream_failure_response(
                 "模型调用失败", exc, "LLM_ERROR", model_failure_suggestion(exc)
@@ -3356,6 +3387,7 @@ class AgentLoop:
                 capability_route,
                 user_message.id,
                 memory_context=memory_context,
+                conversation_context=no_skill_context,
             )
             if dynamic_response is not None:
                 return PreparedTurn(
@@ -3448,6 +3480,7 @@ class AgentLoop:
                 capability_route,
                 user_message.id,
                 memory_context=memory_context,
+                conversation_context=conversation_context,
             )
             if dynamic_response is not None:
                 return PreparedTurn(
@@ -3515,6 +3548,7 @@ class AgentLoop:
                 capability_route,
                 user_message.id,
                 memory_context=memory_context,
+                conversation_context=conversation_context,
             )
             if dynamic_response is not None:
                 return PreparedTurn(
@@ -8109,6 +8143,7 @@ class AgentLoop:
         route: NonSopCapabilityRouteResult,
         user_message_id: str,
         memory_context: Sequence[Mapping[str, object]] = (),
+        conversation_context: Mapping[str, object] | None = None,
     ) -> ChatTurnResponse | None:
         """按自动路由、明确请求或页面选择委托 DynamicTaskAgent 完整执行。"""
 
@@ -8212,6 +8247,9 @@ class AgentLoop:
                     user_message_id,
                 ),
             )
+            # 流式异常处理会先回滚当前 Turn，再写入可见错误；先提交这条门禁事实，
+            # 才能保留“为何没有进入 DynamicTaskAgent”的审计事件，而不是只留下通用错误。
+            self.db.commit()
             requires_dynamic_contract = (
                 request.interaction_mode == "scheduled_task"
                 or decision.requires_durable_execution
@@ -8245,6 +8283,188 @@ class AgentLoop:
         # selector/planner 外呼；先提交这些事实，禁止请求级 Session 把 SQLite 写锁带入
         # 长模型等待。Execution/Plan/Use 仍由 start_task 在规划返回后以短事务创建。
         self.db.commit()
+        resume_chat_clarification = getattr(dynamic_agent, "resume_chat_clarification", None)
+        if source_kind == "chat" and callable(resume_chat_clarification):
+            resumed_outcome = resume_chat_clarification(
+                tenant_id=request.tenant_id,
+                session_id=stable_session_id,
+                agent_id=stable_agent_id,
+                initiator_user_id=request.user_id,
+                user_message_id=user_message_id,
+                message=request.message,
+                model_config=model_config,
+                input_resource_ids=tuple(
+                    item.resource_id
+                    for item in request.attachments
+                    if item.resource_id is not None
+                ),
+                input_resource_versions={
+                    item.resource_id: item.resource_version
+                    for item in request.attachments
+                    if item.resource_id is not None
+                },
+                conversation_context=conversation_context,
+                worker_id=f"chat-resume:{user_message_id}",
+            )
+            if resumed_outcome is not None:
+                self.events.record(
+                    request.tenant_id,
+                    chat_session.id,
+                    "dynamic_task_resumed",
+                    self._turn_payload(
+                        {
+                            "execution_id": resumed_outcome.execution_id,
+                            "execution_created": False,
+                            "execution_status": resumed_outcome.status,
+                            "requested_execution_engine": request.execution_engine,
+                        },
+                        user_message_id,
+                    ),
+                )
+                self.db.commit()
+                return self._dynamic_task_response(
+                    chat_session=chat_session,
+                    outcome=resumed_outcome,
+                    user_message_id=user_message_id,
+                )
+        if source_kind == "chat":
+            active_lookup = getattr(getattr(dynamic_agent, "store", None), "active_instance", None)
+            active_instance = (
+                active_lookup(request.tenant_id, stable_session_id)
+                if callable(active_lookup)
+                else None
+            )
+            if (
+                active_instance is not None
+                and getattr(active_instance, "kind", None) == "dynamic_task"
+                and getattr(active_instance, "agent_id", None) == stable_agent_id
+                and getattr(active_instance, "initiator_user_id", None) == request.user_id
+            ):
+                # clarification 已在上面的聊天 resume 分支消费；审批、外部效果
+                # 对账和并发运行态不能被普通文本旁路，但也不能把本轮误报为
+                # DYNAMIC_ACTIVE_EXECUTION_CONFLICT。让用户看到同一 Execution 的
+                # 当前等待状态，继续由对应的受控 Attention/worker 推进。
+                blocking_step_key = "active_execution"
+                self.events.record(
+                    request.tenant_id,
+                    chat_session.id,
+                    "dynamic_task_chat_turn_deferred",
+                    self._turn_payload(
+                        {
+                            "execution_id": active_instance.id,
+                            "execution_status": getattr(active_instance, "status", "running"),
+                            "reason": "active_execution_requires_governed_resume",
+                        },
+                        user_message_id,
+                    ),
+                )
+                self.db.commit()
+                return self._dynamic_task_response(
+                    chat_session=chat_session,
+                    outcome=DynamicRunOutcome(
+                        "waiting",
+                        active_instance.id,
+                        blocking_step_key=blocking_step_key,
+                    ),
+                    user_message_id=user_message_id,
+                )
+        continue_chat_turn = getattr(dynamic_agent, "continue_chat_turn", None)
+        if source_kind == "chat" and callable(continue_chat_turn):
+            continued: tuple[SopInstance, bool] | None = None
+            try:
+                continued = continue_chat_turn(
+                    tenant_id=request.tenant_id,
+                    session_id=stable_session_id,
+                    agent_id=stable_agent_id,
+                    initiator_user_id=request.user_id,
+                    user_message_id=user_message_id,
+                    message=request.message,
+                    success_criteria=tuple(decision.success_criteria),
+                    model_config=model_config,
+                    source_ref=source_ref,
+                    input_resource_ids=tuple(
+                        item.resource_id
+                        for item in request.attachments
+                        if item.resource_id is not None
+                    ),
+                    input_resource_versions={
+                        item.resource_id: item.resource_version
+                        for item in request.attachments
+                        if item.resource_id is not None
+                    },
+                    knowledge_capability=knowledge_capability,
+                    forced_general_skill_id=(
+                        request.forced_general_skill_id if request.channel == "web" else None
+                    ),
+                    forced_general_skill_ids=(
+                        tuple(request.forced_general_skill_ids)
+                        if request.channel == "web"
+                        else ()
+                    ),
+                    memory_context=memory_context,
+                    conversation_context=conversation_context,
+                )
+                if continued is not None and continued[1] and quota_limits is not None:
+                    DynamicTaskQuotaService(self.db).acquire_execution(
+                        continued[0],
+                        limits=quota_limits,
+                    )
+            except Exception as exc:
+                failure_code = str(getattr(exc, "code", "") or type(exc).__name__)
+                self._fail_unbound_dynamic_skill_uses(
+                    request=request,
+                    chat_session=chat_session,
+                    user_message_id=user_message_id,
+                    failure_code=failure_code,
+                )
+                self.events.record(
+                    request.tenant_id,
+                    chat_session.id,
+                    "dynamic_task_continuation_failed",
+                    self._turn_payload(
+                        {"code": failure_code[:128]},
+                        user_message_id,
+                    ),
+                )
+                self.db.commit()
+                raise DynamicTaskAgentError(failure_code[:128]) from exc
+            if continued is not None:
+                instance, created = continued
+                goal_snapshot = getattr(instance, "goal_snapshot_json", {}) or {}
+                continuation_parent_id = str(
+                    goal_snapshot.get("continued_from_execution_id") or ""
+                )
+                self.events.record(
+                    request.tenant_id,
+                    chat_session.id,
+                    "dynamic_task_continued",
+                    self._turn_payload(
+                        {
+                            "execution_id": instance.id,
+                            "parent_execution_id": continuation_parent_id,
+                            "execution_created": created,
+                            "execution_status": str(
+                                getattr(instance, "status", "created")
+                            ),
+                            "requested_execution_engine": request.execution_engine,
+                        },
+                        user_message_id,
+                    ),
+                )
+                self.db.commit()
+                outcome = self._run_dynamic_execution(
+                    dynamic_agent=dynamic_agent,
+                    instance=instance,
+                    model_config=model_config,
+                    request=request,
+                    chat_session=chat_session,
+                    user_message_id=user_message_id,
+                )
+                return self._dynamic_task_response(
+                    chat_session=chat_session,
+                    outcome=outcome,
+                    user_message_id=user_message_id,
+                )
         try:
             instance, created = dynamic_agent.start_task(
                 tenant_id=request.tenant_id,
@@ -8262,6 +8482,11 @@ class AgentLoop:
                     for item in request.attachments
                     if item.resource_id is not None
                 ),
+                input_resource_versions={
+                    item.resource_id: item.resource_version
+                    for item in request.attachments
+                    if item.resource_id is not None
+                },
                 knowledge_capability=knowledge_capability,
                 forced_general_skill_id=(
                     request.forced_general_skill_id if request.channel == "web" else None
@@ -8272,6 +8497,7 @@ class AgentLoop:
                     else ()
                 ),
                 memory_context=memory_context,
+                conversation_context=conversation_context,
             )
             if created and quota_limits is not None:
                 DynamicTaskQuotaService(self.db).acquire_execution(
@@ -8368,12 +8594,53 @@ class AgentLoop:
         )
         # 在任何长模型外呼前公开权威Execution身份，使另一请求可以精确取消当前Turn。
         self.db.commit()
+        outcome = self._run_dynamic_execution(
+            dynamic_agent=dynamic_agent,
+            instance=instance,
+            model_config=model_config,
+            request=request,
+            chat_session=chat_session,
+            user_message_id=user_message_id,
+        )
+        return self._dynamic_task_response(
+            chat_session=chat_session,
+            outcome=outcome,
+            user_message_id=user_message_id,
+        )
+
+    def _run_dynamic_execution(
+        self,
+        *,
+        dynamic_agent: DynamicTaskAgent,
+        instance: SopInstance,
+        model_config: ModelConfig,
+        request: ChatTurnRequest,
+        chat_session: ChatSession,
+        user_message_id: str,
+    ) -> DynamicRunOutcome:
+        """运行已创建或已续接的 Dynamic Execution，并统一处理容量与失败收敛。"""
+
         try:
-            outcome = dynamic_agent.run_until_blocked_or_complete(
+            self.events.record(
+                request.tenant_id,
+                chat_session.id,
+                "stream_status",
+                self._turn_payload(
+                    {
+                        "execution_id": instance.id,
+                        "phase": "dynamic_execution",
+                        "text": "已接管任务，正在读取附件并执行分析；长日志可能需要一些时间。",
+                    },
+                    user_message_id,
+                ),
+            )
+            self.db.commit()
+            return dynamic_agent.run_until_blocked_or_complete(
                 execution_id=instance.id,
                 model_config=model_config,
                 worker_id=f"chat:{user_message_id}",
                 actor_user_id=request.user_id,
+                user_message_id=user_message_id,
             )
         except DynamicTaskQuotaError as exc:
             control = ExecutionControlService(self.db, dynamic_agent.store)
@@ -8399,7 +8666,7 @@ class AgentLoop:
                 ),
             )
             self.db.commit()
-            outcome = DynamicRunOutcome(
+            return DynamicRunOutcome(
                 "waiting",
                 instance.id,
                 blocking_step_key="capacity_retry",
@@ -8412,10 +8679,10 @@ class AgentLoop:
                 error_code=failure_code,
                 diagnostics=getattr(exc, "details", None),
             )
-            if self.db.get(ChatSession, stable_session_id) is not None:
+            if self.db.get(ChatSession, chat_session.id) is not None:
                 self.events.record(
                     request.tenant_id,
-                    stable_session_id,
+                    chat_session.id,
                     "dynamic_task_execution_failed",
                     self._turn_payload(
                         {"execution_id": instance.id, "code": failure_code},
@@ -8424,45 +8691,6 @@ class AgentLoop:
                 )
             self.db.commit()
             raise
-        if outcome.status == "waiting" and outcome.blocking_step_key:
-            waiting_message = self._persist_dynamic_waiting_message(
-                chat_session=chat_session,
-                execution_id=instance.id,
-                blocking_step_key=outcome.blocking_step_key,
-                user_message_id=user_message_id,
-            )
-            self.db.commit()
-            self.db.refresh(chat_session)
-            return ChatTurnResponse(
-                reply=waiting_message.content,
-                session_id=chat_session.id,
-                router_decision=RouterDecision(
-                    decision="answer_only",
-                    reason="DynamicTaskAgent paused on a governed clarification.",
-                ),
-                step_result=StepAgentResult(
-                    reply=waiting_message.content,
-                    is_step_completed=False,
-                ),
-                session_state=public_session(chat_session),
-            )
-        if outcome.status != "succeeded" or outcome.message is None:
-            raise DynamicTaskAgentError("DYNAMIC_TASK_DID_NOT_CLOSE")
-        self.db.commit()
-        self.db.refresh(chat_session)
-        return ChatTurnResponse(
-            reply=outcome.message.content,
-            session_id=chat_session.id,
-            router_decision=RouterDecision(
-                decision="answer_only",
-                reason="DynamicTaskAgent completed a governed read-only execution.",
-            ),
-            step_result=StepAgentResult(
-                reply=outcome.message.content,
-                is_step_completed=True,
-            ),
-            session_state=public_session(chat_session),
-        )
 
     def _attachments_require_dynamic(self, request: ChatTurnRequest) -> bool:
         """依据权威资源与已发布Extraction判断附件是否超出普通问答安全快路径。"""
@@ -8665,11 +8893,62 @@ class AgentLoop:
         )
         return message
 
+    def _dynamic_task_response(
+        self,
+        *,
+        chat_session: ChatSession,
+        outcome: DynamicRunOutcome,
+        user_message_id: str,
+    ) -> ChatTurnResponse:
+        """将动态任务的等待或完成结果投影为统一聊天响应。"""
+
+        if outcome.status == "waiting" and outcome.blocking_step_key:
+            waiting_message = self._persist_dynamic_waiting_message(
+                chat_session=chat_session,
+                execution_id=outcome.execution_id,
+                blocking_step_key=outcome.blocking_step_key,
+                user_message_id=user_message_id,
+            )
+            self.db.commit()
+            self.db.refresh(chat_session)
+            return ChatTurnResponse(
+                reply=waiting_message.content,
+                session_id=chat_session.id,
+                router_decision=RouterDecision(
+                    decision="answer_only",
+                    reason="DynamicTaskAgent paused on a governed clarification.",
+                ),
+                step_result=StepAgentResult(
+                    reply=waiting_message.content,
+                    is_step_completed=False,
+                ),
+                session_state=public_session(chat_session),
+            )
+        if outcome.status != "succeeded" or outcome.message is None:
+            raise DynamicTaskAgentError("DYNAMIC_TASK_DID_NOT_CLOSE")
+        self.db.commit()
+        self.db.refresh(chat_session)
+        return ChatTurnResponse(
+            reply=outcome.message.content,
+            session_id=chat_session.id,
+            router_decision=RouterDecision(
+                decision="answer_only",
+                reason="DynamicTaskAgent completed a governed read-only execution.",
+            ),
+            step_result=StepAgentResult(
+                reply=outcome.message.content,
+                is_step_completed=True,
+            ),
+            session_state=public_session(chat_session),
+        )
+
 
     @staticmethod
     def _dynamic_waiting_content(blocking_step_key: str) -> str:
         """按真实阻塞原因返回人工办理或自动恢复文案，禁止把容量队列伪装成 Attention。"""
 
+        if blocking_step_key == "active_execution":
+            return "上一轮动态任务仍在执行中，当前输入已保留在本会话；请稍后继续。"
         if blocking_step_key == "capacity_retry":
             return (
                 "当前执行容量繁忙，任务已进入持久重试队列，将从原执行记录自动恢复；"
