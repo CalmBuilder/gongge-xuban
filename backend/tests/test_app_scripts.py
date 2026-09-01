@@ -1,9 +1,18 @@
+"""
+@Time       : 2026/09/01 10:10
+@Author     : zhanglp8181
+@File       : test_app_scripts.py
+@CallChain  : pytest → app/app_supervisor readiness → HTTP 状态与进程生命周期
+@Description: 验证统一启动器的正向就绪、连接提前关闭和失败边界。
+"""
+
 from __future__ import annotations
 
 import importlib.util
 import os
 import subprocess
 import sys
+from types import SimpleNamespace
 from pathlib import Path
 
 
@@ -149,6 +158,215 @@ def test_supervisor_does_not_restart_during_startup_grace(monkeypatch) -> None:
 
     assert service.unhealthy_count == 0
     assert service.restart_count == 0
+
+
+def test_app_readiness_accepts_status_before_response_body_finishes(monkeypatch) -> None:
+    """对端已返回成功状态但读取 body 提前关闭时，app readiness 仍应通过。"""
+
+    lifecycle = _load_script("app", "gongge_xuban_app_readiness_closed")
+
+    class EarlyClosedResponse:
+        status = 200
+
+        def __enter__(self):
+            """返回模拟响应本身，兼容旧实现的上下文管理器调用。"""
+
+            return self
+
+        def __exit__(self, *_args):
+            """模拟响应关闭阶段抛出连接异常，验证新实现会吞掉该异常。"""
+
+            self.close()
+
+        def read(self):
+            """模拟对端在 body 尚未读取完时主动关闭连接。"""
+
+            raise OSError("peer closed response body")
+
+        def close(self):
+            """模拟 close 阶段的可忽略网络异常。"""
+
+            raise OSError("peer closed during close")
+
+    monkeypatch.setattr(
+        lifecycle.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: EarlyClosedResponse(),
+    )
+
+    assert lifecycle._url_ready("http://127.0.0.1:5137/api/health") is True
+
+
+def test_app_readiness_rejects_server_error_without_masking_status(monkeypatch) -> None:
+    """HTTP 5xx 仍是明确未就绪，不能因探测只看连接成功而误判通过。"""
+
+    lifecycle = _load_script("app", "gongge_xuban_app_readiness_5xx")
+
+    class ErrorResponse:
+        status = 503
+
+        def __enter__(self):
+            """返回模拟 5xx 响应以覆盖兼容上下文管理路径。"""
+
+            return self
+
+        def __exit__(self, *_args):
+            """关闭模拟响应，不改变 5xx 的未就绪判定。"""
+
+            self.close()
+
+        def close(self):
+            """模拟正常释放 5xx 响应。"""
+
+            return None
+
+    monkeypatch.setattr(
+        lifecycle.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: ErrorResponse(),
+    )
+
+    assert lifecycle._url_ready("http://127.0.0.1:5137/api/health") is False
+
+
+def test_supervisor_health_accepts_peer_close_after_success_status(monkeypatch) -> None:
+    """supervisor health 与 app readiness 使用同一关闭容错契约。"""
+
+    supervisor = _load_script("app_supervisor", "gongge_xuban_supervisor_health_closed")
+
+    class EarlyClosedResponse:
+        status = 204
+
+        def __enter__(self):
+            """返回模拟响应本身，兼容旧 supervisor 实现。"""
+
+            return self
+
+        def __exit__(self, *_args):
+            """模拟响应 close 阶段的连接异常。"""
+
+            self.close()
+
+        def read(self):
+            """模拟 body 尚未读完时连接被对端关闭。"""
+
+            raise OSError("peer closed response body")
+
+        def close(self):
+            """模拟 close 阶段异常应被 health 探测忽略。"""
+
+            raise OSError("peer closed during close")
+
+    monkeypatch.setattr(
+        supervisor.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: EarlyClosedResponse(),
+    )
+    service = supervisor.Service(
+        name="app",
+        cwd=ROOT_DIR,
+        command=["unused"],
+        health_url="http://127.0.0.1:5137/api/health",
+    )
+
+    assert service.healthy() is True
+
+
+def test_supervisor_health_rejects_server_error(monkeypatch) -> None:
+    """supervisor 不得把明确的 5xx 健康检查响应当成可用服务。"""
+
+    supervisor = _load_script("app_supervisor", "gongge_xuban_supervisor_health_5xx")
+
+    class ErrorResponse:
+        status = 503
+
+        def __enter__(self):
+            """返回模拟 5xx 响应，覆盖 supervisor 上下文管理路径。"""
+
+            return self
+
+        def __exit__(self, *_args):
+            """关闭模拟 5xx 响应。"""
+
+            self.close()
+
+        def close(self):
+            """模拟正常释放响应资源。"""
+
+            return None
+
+    monkeypatch.setattr(
+        supervisor.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: ErrorResponse(),
+    )
+    service = supervisor.Service(
+        name="app",
+        cwd=ROOT_DIR,
+        command=["unused"],
+        health_url="http://127.0.0.1:5137/api/health",
+    )
+
+    assert service.healthy() is False
+
+
+def test_detached_startup_failure_cleans_the_supervisor_it_started(monkeypatch) -> None:
+    """后台服务探活失败时应清理本次刚启动的 supervisor，避免残留进程污染下次启动。"""
+
+    lifecycle = _load_script("app", "gongge_xuban_app_startup_cleanup")
+    cleanup_calls: list[bool] = []
+
+    class FakeSupervisor:
+        SINGLE_PORT = True
+        APP_HOST = "127.0.0.1"
+        APP_PORT = "5137"
+
+        @staticmethod
+        def validate_prerequisites() -> None:
+            """模拟依赖检查通过。"""
+
+        @staticmethod
+        def build_services() -> list[SimpleNamespace]:
+            """返回一个需要探活的模拟服务。"""
+
+            return [
+                SimpleNamespace(
+                    name="app",
+                    health_url="http://127.0.0.1:5137/api/health",
+                    log_file=ROOT_DIR / ".runtime-test-app.log",
+                )
+            ]
+
+        @staticmethod
+        def url_host(host: str) -> str:
+            """返回可拼接到健康 URL 的主机名。"""
+
+            return host
+
+    monkeypatch.setattr(lifecycle, "_load_supervisor", lambda: FakeSupervisor)
+    monkeypatch.setattr(
+        lifecycle,
+        "stop_services",
+        lambda verbose=True: cleanup_calls.append(bool(verbose)),
+    )
+    monkeypatch.setattr(lifecycle, "_service_ports", lambda _supervisor: [])
+    monkeypatch.setattr(lifecycle, "_free_configured_port", lambda _host, _port: None)
+    monkeypatch.setattr(lifecycle, "_build_frontend", lambda: None)
+    monkeypatch.setattr(lifecycle, "_start_detached", lambda _supervisor: 9876)
+
+    def fail_readiness(_label: str, _url: str, _log_file: Path) -> None:
+        """模拟首个服务探活失败。"""
+
+        raise RuntimeError("app did not become ready")
+
+    monkeypatch.setattr(lifecycle, "_wait_for_url", fail_readiness)
+
+    import pytest
+
+    with pytest.raises(RuntimeError, match="did not become ready"):
+        lifecycle.command_up(detach_flag=True, mode="production")
+
+    assert cleanup_calls == [False, False]
 
 
 def test_app_shell_exposes_the_unified_command_contract() -> None:

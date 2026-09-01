@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Process supervisor for Gongge Xuban application services."""
+"""
+@Time       : 2026/09/01 12:20
+@Author     : zhanglp8181
+@File       : app_supervisor.py
+@CallChain  : app.py → app_supervisor → Service.start/poll/healthy → 应用进程
+@Description: 管理应用服务进程、健康检查、启动宽限和异常重启。
+"""
 
 from __future__ import annotations
 
@@ -238,12 +244,19 @@ class Service:
     def healthy(self) -> bool:
         if not self.health_url:
             return True
+        response = None
         try:
-            with urllib.request.urlopen(self.health_url, timeout=2) as response:
-                response.read()
-                return 200 <= response.status < 500
+            response = urllib.request.urlopen(self.health_url, timeout=2)
+            status = int(getattr(response, "status", 0))
+            return 200 <= status < 500
         except Exception:
             return False
+        finally:
+            if response is not None:
+                try:
+                    response.close()
+                except OSError:
+                    pass
 
 
 def build_services() -> list[Service]:

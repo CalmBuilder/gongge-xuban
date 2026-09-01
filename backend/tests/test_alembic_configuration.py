@@ -21,7 +21,7 @@ def test_alembic_has_single_expected_head_and_baseline() -> None:
     config = Config(str(BACKEND_DIR / "alembic.ini"))
     script = ScriptDirectory.from_config(config)
 
-    assert script.get_heads() == ["20260830_0077"]
+    assert script.get_heads() == ["20260901_0078"]
     member_lifecycle = script.get_revision("20260728_0016")
     assert member_lifecycle.down_revision == "20260727_0015"
     organization_units = script.get_revision("20260728_0017")
@@ -159,6 +159,18 @@ def test_alembic_has_single_expected_head_and_baseline() -> None:
     context_compaction_config = script.get_revision("20260828_0072")
     assert context_compaction_config is not None
     assert context_compaction_config.down_revision == "20260820_0071"
+
+
+def test_context_summary_budget_migration_follows_current_head_without_a_branch() -> None:
+    """验证上下文摘要预算迁移从 0077 单向接续，不能产生第二条迁移分支。"""
+
+    config = Config(str(BACKEND_DIR / "alembic.ini"))
+    script = ScriptDirectory.from_config(config)
+    migration = script.get_revision("20260901_0078")
+
+    assert migration is not None
+    assert migration.down_revision == "20260830_0077"
+    assert script.get_heads() == ["20260901_0078"]
 
 
 def test_alembic_files_do_not_embed_runtime_credentials() -> None:

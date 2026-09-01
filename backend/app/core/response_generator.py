@@ -21,7 +21,7 @@ from app.core.context_projection import (
 from app.db.models import ChatSession, ModelConfig, Skill
 from app.knowledge.citations import knowledge_citations_from_results
 from app.llm import LLMClient
-from app.llm.client import LLMStreamCancelled
+from app.llm.client import LLMStreamCancelled, is_context_overflow_error
 from app.llm.stage_protocol import stage_payload, unified_system_prompt
 from app.observability.spans import llm_operation
 from app.session.session_schema import RouterDecision, StepAgentResult
@@ -207,7 +207,7 @@ class ResponseGenerator:
                 reply, session, router_decision, step_result, tool_result, skill
             )
         except Exception as exc:
-            if propagate_model_failure:
+            if propagate_model_failure or is_context_overflow_error(exc):
                 raise
             return format_runtime_failure_reply("模型调用失败", exc, "LLM_ERROR", model_failure_suggestion(exc))
 
@@ -301,7 +301,7 @@ class ResponseGenerator:
         except LLMStreamCancelled:
             raise
         except Exception as exc:
-            if propagate_model_failure:
+            if propagate_model_failure or is_context_overflow_error(exc):
                 raise
             yield from self.chunk_text(
                 format_runtime_failure_reply("模型调用失败", exc, "LLM_ERROR", model_failure_suggestion(exc))

@@ -10,7 +10,7 @@ import pytest
 
 from app.core.response_generator import PROMPT_PATH, ResponseGenerator
 from app.db.models import ChatSession, Skill
-from app.llm.client import LLMClient
+from app.llm.client import LLMClient, LLMError
 from app.session.session_schema import RouterDecision, StepAgentResult
 from app.tools.tool_schema import ToolError, ToolResult
 
@@ -446,6 +446,82 @@ def test_model_failure_returns_explicit_reason(monkeypatch):
     )
 
     assert reply == "模型调用失败（LLM_ERROR）：upstream timeout。请检查模型配置、API Key、网络或模型服务状态后重试。"
+
+
+def test_context_overflow_is_re_raised_for_agent_loop_recovery(monkeypatch) -> None:
+    """上下文超限不能被普通失败文案吞掉，必须交给 AgentLoop 做一次压缩重试。"""
+
+    def fake_init(self, model_config):  # noqa: ANN001
+        return None
+
+    def fake_generate_text(self, system_prompt, payload):  # noqa: ANN001
+        raise LLMError("context_length_exceeded")
+
+    monkeypatch.setattr(LLMClient, "__init__", fake_init)
+    monkeypatch.setattr(LLMClient, "generate_text", fake_generate_text)
+
+    with pytest.raises(LLMError, match="context_length_exceeded"):
+        ResponseGenerator().generate(
+            message="继续分析当前会话",
+            session=ChatSession(id="session_test", tenant_id="tenant_demo"),
+            skill=None,
+            router_decision=RouterDecision(decision="answer_only"),
+            step_result=StepAgentResult(),
+            tool_result=None,
+            model_config=None,  # type: ignore[arg-type]
+        )
+
+
+def test_stream_context_overflow_is_re_raised_for_agent_loop_recovery(monkeypatch) -> None:
+    """流式上下文超限同样必须透传给 AgentLoop，不能先输出普通失败文案。"""
+
+    def fake_init(self, model_config):  # noqa: ANN001
+        return None
+
+    def fake_generate_text_stream(self, system_prompt, payload):  # noqa: ANN001
+        raise LLMError("maximum context length is 128000 tokens")
+        yield ""  # pragma: no cover
+
+    monkeypatch.setattr(LLMClient, "__init__", fake_init)
+    monkeypatch.setattr(LLMClient, "generate_text_stream", fake_generate_text_stream)
+
+    with pytest.raises(LLMError, match="maximum context length"):
+        list(
+            ResponseGenerator().generate_stream(
+                message="继续分析当前会话",
+                session=ChatSession(id="session_test", tenant_id="tenant_demo"),
+                skill=None,
+                router_decision=RouterDecision(decision="answer_only"),
+                step_result=StepAgentResult(),
+                tool_result=None,
+                model_config=None,  # type: ignore[arg-type]
+            )
+        )
+
+
+def test_non_overflow_provider_failure_still_uses_visible_failure_reply(monkeypatch) -> None:
+    """非上下文超限错误仍沿用普通用户可见失败文案，不扩大重试范围。"""
+
+    def fake_init(self, model_config):  # noqa: ANN001
+        return None
+
+    def fake_generate_text(self, system_prompt, payload):  # noqa: ANN001
+        raise LLMError("rate limit exceeded")
+
+    monkeypatch.setattr(LLMClient, "__init__", fake_init)
+    monkeypatch.setattr(LLMClient, "generate_text", fake_generate_text)
+
+    reply = ResponseGenerator().generate(
+        message="继续分析当前会话",
+        session=ChatSession(id="session_test", tenant_id="tenant_demo"),
+        skill=None,
+        router_decision=RouterDecision(decision="answer_only"),
+        step_result=StepAgentResult(),
+        tool_result=None,
+        model_config=None,  # type: ignore[arg-type]
+    )
+
+    assert "模型调用失败（LLM_ERROR）：rate limit exceeded" in reply
 
 
 def test_pending_reply_without_tool_result_uses_model_reply(monkeypatch):

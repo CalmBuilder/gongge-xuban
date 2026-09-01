@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Application lifecycle commands for Gongge Xuban."""
+"""
+@Time       : 2026/09/01 12:20
+@Author     : zhanglp8181
+@File       : app.py
+@CallChain  : app.sh/app.ps1 → app.py → supervisor/readiness/进程清理
+@Description: 提供统一开发与生产式启动、探活、停止和状态检查命令。
+"""
 
 from __future__ import annotations
 
@@ -196,12 +202,18 @@ def _build_frontend() -> None:
 
 
 def _url_ready(url: str) -> bool:
+    response = None
     try:
-        with urllib.request.urlopen(url, timeout=2) as response:
-            response.read()
-            return response.status < 500
+        response = urllib.request.urlopen(url, timeout=2)
+        return int(getattr(response, "status", 500)) < 500
     except (OSError, urllib.error.URLError):
         return False
+    finally:
+        if response is not None:
+            try:
+                response.close()
+            except OSError:
+                pass
 
 
 def _wait_for_url(label: str, url: str, log_file: Path) -> None:
@@ -271,25 +283,29 @@ def command_up(detach_flag: bool, mode: str) -> int:
         return supervisor.main()
 
     pid = _start_detached(supervisor)
-    services = supervisor.build_services()
-    for service in services:
-        if service.health_url:
-            _wait_for_url(service.name, service.health_url, service.log_file)
-    if supervisor.SINGLE_PORT:
-        base = f"http://{supervisor.url_host(supervisor.APP_HOST)}:{supervisor.APP_PORT}"
-        _wait_for_url("chat", base + "/chat/", LOG_DIR / "app.log")
-        _wait_for_url("enterprise", base + "/enterprise/dashboard", LOG_DIR / "app.log")
-        print(f"Started Gongge Xuban supervisor ({pid})")
-        print(f"  app        {base}/chat/")
-        print(f"  enterprise {base}/enterprise/dashboard")
-        print(f"  api docs   {base}/docs")
-    else:
-        backend = f"http://{supervisor.url_host(supervisor.BACKEND_HOST)}:{supervisor.BACKEND_PORT}"
-        frontend = f"http://{supervisor.url_host(supervisor.ENTERPRISE_HOST)}:{supervisor.ENTERPRISE_PORT}"
-        print(f"Started Gongge Xuban supervisor ({pid})")
-        print(f"  backend    {backend}/docs")
-        print(f"  enterprise {frontend}/enterprise/dashboard")
-        print(f"  chat       {frontend}/chat/")
+    try:
+        services = supervisor.build_services()
+        for service in services:
+            if service.health_url:
+                _wait_for_url(service.name, service.health_url, service.log_file)
+        if supervisor.SINGLE_PORT:
+            base = f"http://{supervisor.url_host(supervisor.APP_HOST)}:{supervisor.APP_PORT}"
+            _wait_for_url("chat", base + "/chat/", LOG_DIR / "app.log")
+            _wait_for_url("enterprise", base + "/enterprise/dashboard", LOG_DIR / "app.log")
+            print(f"Started Gongge Xuban supervisor ({pid})")
+            print(f"  app        {base}/chat/")
+            print(f"  enterprise {base}/enterprise/dashboard")
+            print(f"  api docs   {base}/docs")
+        else:
+            backend = f"http://{supervisor.url_host(supervisor.BACKEND_HOST)}:{supervisor.BACKEND_PORT}"
+            frontend = f"http://{supervisor.url_host(supervisor.ENTERPRISE_HOST)}:{supervisor.ENTERPRISE_PORT}"
+            print(f"Started Gongge Xuban supervisor ({pid})")
+            print(f"  backend    {backend}/docs")
+            print(f"  enterprise {frontend}/enterprise/dashboard")
+            print(f"  chat       {frontend}/chat/")
+    except Exception:
+        stop_services(verbose=False)
+        raise
     print(f"Logs: {LOG_DIR}")
     return 0
 

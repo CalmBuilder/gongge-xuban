@@ -3489,6 +3489,68 @@ def install_schedule_llm_override() -> None:
 
                 return [loaded_ref_by_base[name] for name in names]
             goal = str(user_payload.get("goal") or "")
+            if "只回复查村情相关的问题" in goal:
+                return {
+                    "goal": goal,
+                    "success_criteria": [
+                        {
+                            "id": "sample_a_prompt_boundary",
+                            "type": "assertion",
+                            "spec": {
+                                "description": "沿用提示词附件和截图语境复核村情问答范围",
+                                "required": True,
+                            },
+                        }
+                    ],
+                    "constraints": [
+                        "只核对提示词附件及其指代的截图语境，不执行外部写入"
+                    ],
+                    "assumptions": [],
+                    "steps": [
+                        {
+                            "draft_id": "answer",
+                            "title": "复核提示词的村情问答边界",
+                            "kind": "answer",
+                            "required": True,
+                            "depends_on": [],
+                            "capability_refs": [],
+                            "guidance_skill_refs": [],
+                            "expected_output_schema": {},
+                        }
+                    ],
+                    "expected_artifacts": [],
+                }
+            if "你搜一个github，看看有没有能让我参照开发ai-platform-service的项目" in goal:
+                return {
+                    "goal": goal,
+                    "success_criteria": [
+                        {
+                            "id": "sample_b_runtime_architecture",
+                            "type": "assertion",
+                            "spec": {
+                                "description": "沿用样本 B 的 Hermes Runtime 架构语境完成连续追问",
+                                "required": True,
+                            },
+                        }
+                    ],
+                    "constraints": [
+                        "仅讨论 ai-platform-service、Runtime 抽象、隔离和并发治理，不执行外部写入"
+                    ],
+                    "assumptions": [],
+                    "steps": [
+                        {
+                            "draft_id": "answer",
+                            "title": "复核 Hermes Runtime 架构取舍",
+                            "kind": "answer",
+                            "required": True,
+                            "depends_on": [],
+                            "capability_refs": [],
+                            "guidance_skill_refs": [],
+                            "expected_output_schema": {},
+                        }
+                    ],
+                    "expected_artifacts": [],
+                }
             if "No content length specified for stream data" in goal:
                 return {
                     "goal": goal,
@@ -4567,6 +4629,109 @@ def install_schedule_llm_override() -> None:
                 )
                 or (step_title.startswith("确认 ") and "阶段产物" in step_title)
             )
+            if "只回复查村情相关的问题" in str(user_payload) and step_kind == "answer":
+                execution_view = user_payload.get("provider_execution_view", {})
+                execution_context = (
+                    execution_view.get("execution_context", {})
+                    if isinstance(execution_view, dict)
+                    else {}
+                )
+                criteria = [
+                    str(item.get("id") or "")
+                    for item in execution_context.get("success_criteria", [])
+                    if isinstance(item, dict) and item.get("id")
+                ]
+                current_goal = str(execution_context.get("goal") or "")
+                if "这份提示词没用" in current_goal or "这份提示词没用" in str(user_payload):
+                    markdown = (
+                        "样本 A 第二轮复核：已将“这份提示词”解析为上一轮上传的提示词及其截图语境，"
+                        "继续核对查村情范围限制；未把本轮指代误当成新的无关任务。"
+                    )
+                else:
+                    markdown = (
+                        "样本 A 首轮复核：已读取提示词附件，确认回答范围应限制为查村情相关问题；"
+                        "其他需求统一回复当前应用不支持该功能。"
+                    )
+                client._last_completed_response_metadata = {
+                    "response_id": "e2e-sample-a-prompt-boundary-answer",
+                    "finish_reason": "stop",
+                    "usage": {"input_tokens": 20, "output_tokens": 20},
+                }
+                return {
+                    "action_kind": "answer",
+                    "arguments": {
+                        "markdown": markdown,
+                        "criterion_evidence": {
+                            criterion: [str(current_step.get("step_key") or "answer")]
+                            for criterion in criteria
+                        },
+                        "pending_questions": [],
+                        "claims": [],
+                    },
+                    "capability_ref": None,
+                    "expected_output_schema": {},
+                    "rationale": "根据提示词附件和当前轮指代形成可追溯的范围复核结果",
+                }
+            if (
+                "你搜一个github，看看有没有能让我参照开发ai-platform-service的项目" in str(user_payload)
+                and step_kind == "answer"
+            ):
+                execution_view = user_payload.get("provider_execution_view", {})
+                execution_context = (
+                    execution_view.get("execution_context", {})
+                    if isinstance(execution_view, dict)
+                    else {}
+                )
+                criteria = [
+                    str(item.get("id") or "")
+                    for item in execution_context.get("success_criteria", [])
+                    if isinstance(item, dict) and item.get("id")
+                ]
+                conversation = execution_context.get("conversation_context", [])
+                user_message = next(
+                    (
+                        str(item.get("content") or "")
+                        for item in reversed(conversation)
+                        if isinstance(item, dict) and item.get("role") == "user"
+                    ),
+                    "",
+                )
+                if "你搜一个github" in user_message:
+                    markdown = (
+                        "样本 B 首轮：已围绕 ai-platform-service 梳理可参考的 Agent Gateway、"
+                        "模型网关和产品化项目，并保留 Hermes Runtime 作为可插拔运行时。"
+                    )
+                elif "为什么要参考dify" in user_message:
+                    markdown = (
+                        "样本 B 第二轮：结合已有知识库、SOP 和 agent runtime，重新判断后，"
+                        "中间层的核心是 Runtime 抽象、隔离和并发治理；Dify 只能作为产品能力参考，"
+                        "不应替代现有运行时。"
+                    )
+                else:
+                    markdown = (
+                        "样本 B 后续追问：已沿用前两轮的 Hermes Runtime 与 ai-platform-service 上下文，"
+                        "继续完成本轮架构取舍核对。"
+                    )
+                client._last_completed_response_metadata = {
+                    "response_id": "e2e-sample-b-runtime-answer",
+                    "finish_reason": "stop",
+                    "usage": {"input_tokens": 24, "output_tokens": 24},
+                }
+                return {
+                    "action_kind": "answer",
+                    "arguments": {
+                        "markdown": markdown,
+                        "criterion_evidence": {
+                            criterion: [str(current_step.get("step_key") or "answer")]
+                            for criterion in criteria
+                        },
+                        "pending_questions": [],
+                        "claims": [],
+                    },
+                    "capability_ref": None,
+                    "expected_output_schema": {},
+                    "rationale": "沿用样本 B 的原始多轮上下文完成只读架构分析",
+                }
             if (
                 (
                     "ATTACHMENT-FORMULA-MATCH-DYNAMIC" in str(user_payload)
@@ -6915,6 +7080,60 @@ def seed_skill_demo_agents() -> None:
         )
 
 
+def seed_context_128k_browser_fixture() -> None:
+    """为真实模型浏览器回归写入约 100K token 的既有历史和 128K 租户配置。"""
+
+    from datetime import timedelta
+
+    from sqlmodel import Session
+
+    from app.db import engine
+    from app.db.models import ChatSession, Message, UIConfig, utc_now
+
+    now = utc_now()
+    session_id = "session_e2e_context_128k"
+    sentinel = "CTX128K_BROWSER_SENTINEL"
+    filler = "这是一段用于验证历史会话上下文预算的真实回归正文，必须保留在模型请求中。"
+    with Session(engine) as db:
+        config = db.get(UIConfig, "tenant_demo")
+        if config is None:
+            config = UIConfig(tenant_id="tenant_demo")
+        config.context_token_budget = 128_000
+        config.context_compaction_trigger_ratio = 0.95
+        config.context_recent_round_limit = 50
+        config.long_summary_token_budget = 4_000
+        config.medium_summary_token_budget = 4_000
+        db.add(config)
+
+        db.add(
+            ChatSession(
+                id=session_id,
+                tenant_id="tenant_demo",
+                user_id="admin",
+                agent_id="agent_e2e_employee",
+                agent_profile_revision=1,
+                origin="owned",
+                title="真实 128K 上下文浏览器回归",
+                status="active",
+            )
+        )
+        for index in range(20):
+            role = "user" if index % 2 == 0 else "assistant"
+            prefix = f"{sentinel}：历史第 {index + 1} 条；" if index == 0 else f"历史第 {index + 1} 条；"
+            content = prefix + filler * 140
+            db.add(
+                Message(
+                    id=f"message_e2e_context_128k_{index:02d}",
+                    tenant_id="tenant_demo",
+                    session_id=session_id,
+                    role=role,
+                    content=content,
+                    created_at=now + timedelta(microseconds=index),
+                )
+            )
+        db.commit()
+
+
 def main() -> None:
     """启动临时全栈服务，并确保普通与大组织浏览器夹具都可用。"""
 
@@ -6932,6 +7151,8 @@ def main() -> None:
     if not reuse_runtime:
         seed_e2e_fixtures()
         seed_skill_demo_agents()
+        if os.environ.get("FULLSTACK_E2E_CONTEXT_128K") == "1":
+            seed_context_128k_browser_fixture()
         if live_attachment:
             certify_live_dynamic_model()
         seed_managed_workspace_browser_fixture()

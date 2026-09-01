@@ -13,6 +13,7 @@ from time import monotonic
 import pytest
 
 from app.llm.client import (
+    DEFAULT_INPUT_TOKEN_BUDGET,
     OPTIONAL_INPUT_PROBE_MAX_TOKENS,
     PROVIDER_CONTENT_PARTS_KEY,
     LLMClient,
@@ -20,6 +21,8 @@ from app.llm.client import (
     LLMStreamCancelled,
     _json_repair_output_token_budget,
     _prepare_user_input,
+    _request_input_token_budget,
+    _request_tokens,
     _thinking_mode_for_model,
 )
 from app.llm.output_policy import operation_output_tokens, operation_thinking_mode
@@ -1074,6 +1077,122 @@ def test_generate_text_projects_conversation_context_messages():
     assert '"active_step_id"' not in current_input["content"]
     assert '"slots"' not in current_input["content"]
     assert '"pending_tasks"' not in current_input["content"]
+
+
+def test_generate_text_uses_128k_context_budget_from_conversation_metadata() -> None:
+    """验证 128K 租户配置会传到最终请求裁剪层，而不是退回旧的 32K。"""
+
+    client = object.__new__(LLMClient)
+    client.client = _FakeOpenAIClient()
+    client.model = "demo-model"
+    client.temperature = 0.2
+    client.max_output_tokens = 256
+    history = [
+        {
+            "role": "user" if index % 2 == 0 else "assistant",
+            "content": f"历史消息 {index}：" + "中" * 8_000,
+        }
+        for index in range(10)
+    ]
+
+    assert DEFAULT_INPUT_TOKEN_BUDGET == 128_000
+    assert _request_input_token_budget(
+        {"conversation_context": {"metadata": {"token_budget": 128_000}}}
+    ) == 128_000
+    client.generate_text(
+        "system prompt",
+        {
+            "user_message": "继续处理当前任务",
+            "conversation_context": {
+                "messages": history,
+                "metadata": {"token_budget": 128_000},
+            },
+        },
+    )
+
+    request = client.client.chat.completions.calls[0]["messages"]
+    assert len(request) == len(history) + 2
+    assert _request_tokens(request) > 32_000
+
+
+def test_generate_text_preserves_explicit_32k_context_budget() -> None:
+    """验证已有租户显式 32K 配置仍然生效，不被新默认值覆盖。"""
+
+    client = object.__new__(LLMClient)
+    client.client = _FakeOpenAIClient()
+    client.model = "demo-model"
+    client.temperature = 0.2
+    client.max_output_tokens = 256
+    history = [
+        {
+            "role": "user" if index % 2 == 0 else "assistant",
+            "content": f"历史消息 {index}：" + "中" * 8_000,
+        }
+        for index in range(10)
+    ]
+
+    assert _request_input_token_budget(
+        {"conversation_context": {"metadata": {"token_budget": 32_000}}}
+    ) == 32_000
+    client.generate_text(
+        "system prompt",
+        {
+            "user_message": "继续处理当前任务",
+            "conversation_context": {
+                "messages": history,
+                "metadata": {"token_budget": 32_000},
+            },
+        },
+    )
+
+    request = client.client.chat.completions.calls[0]["messages"]
+    assert len(request) < len(history) + 2
+    assert _request_tokens(request) <= 32_000
+
+
+def test_generate_text_stream_uses_context_metadata_budget() -> None:
+    """验证流式模型请求与非流式请求使用相同的 128K 上下文预算契约。"""
+
+    client = object.__new__(LLMClient)
+    client.client = _FakeOpenAIClient()
+    client.model = "demo-model"
+    client.base_url = "https://example.test/v1"
+    client.temperature = 0.2
+    client.max_output_tokens = 256
+    history = [
+        {
+            "role": "user" if index % 2 == 0 else "assistant",
+            "content": f"历史消息 {index}：" + "中" * 8_000,
+        }
+        for index in range(10)
+    ]
+
+    def chunk(content: str, finish_reason: str | None = None):
+        """构造最小流式响应块，覆盖首正文和正常终态。"""
+
+        delta = type("Delta", (), {"content": content, "reasoning_content": None})()
+        choice = type("Choice", (), {"delta": delta, "finish_reason": finish_reason})()
+        return type("Chunk", (), {"id": "context-budget-chunk", "choices": [choice]})()
+
+    def fake_create(**kwargs):  # noqa: ANN003
+        """记录流式请求，并返回正常结束的单块响应。"""
+
+        client.client.chat.completions.calls.append(kwargs)
+        return iter([chunk("ok", "stop")])
+
+    client.client.chat.completions.create = fake_create
+    payload = {
+        "user_message": "继续处理当前任务",
+        "conversation_context": {
+            "messages": history,
+            "metadata": {"token_budget": 128_000},
+        },
+    }
+
+    assert "".join(client.generate_text_stream("system prompt", payload)) == "ok"
+    request = client.client.chat.completions.calls[0]["messages"]
+    assert len(request) == len(history) + 2
+    assert _request_tokens(request) > 32_000
 
 
 def test_stage_input_uses_stable_history_and_puts_memory_time_and_question_first():

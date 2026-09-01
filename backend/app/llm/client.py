@@ -26,6 +26,7 @@ from openai import OpenAI
 
 from app.cancellation import raise_if_cancelled, run_cancellable
 from app.config import get_settings
+from app.context_limits import DEFAULT_CONTEXT_TOKEN_BUDGET, MAX_CONTEXT_TOKEN_BUDGET
 from app.db.models import ModelConfig
 from app.llm.output_policy import operation_output_tokens, operation_thinking_mode
 from app.llm.stage_protocol import (
@@ -43,6 +44,36 @@ class LLMError(Exception):
 
 class LLMStreamCancelled(LLMError):
     """表示用户已取消模型流，调用方应保留已发送部分而非生成失败文案。"""
+
+
+_CONTEXT_OVERFLOW_MARKERS = (
+    "context_length_exceeded",
+    "maximum context length",
+    "context window",
+    "prompt is too long",
+    "prompt too long",
+    "input is too long",
+    "input too long",
+    "too many tokens",
+    "input length and `max_tokens` exceed",
+    "exceeds the maximum number of tokens",
+)
+
+
+def is_context_overflow_error(error: BaseException) -> bool:
+    """识别 provider 的上下文超限错误，供回复层执行一次有界压缩重试。"""
+
+    visited: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        detail = str(current).lower()
+        if any(marker in detail for marker in _CONTEXT_OVERFLOW_MARKERS):
+            return True
+        cause = current.__cause__
+        context = current.__context__
+        current = cause if cause is not None else context
+    return False
 
 
 _STREAM_DONE = object()
@@ -131,7 +162,7 @@ PROVIDER_TRANSIENT_RETRIES = 2
 PROVIDER_RETRY_BASE_SECONDS = 1.0
 EMPTY_RESPONSE_MESSAGE = "Model returned an empty response"
 DEFAULT_MODEL_API_TIMEOUT_SECONDS = 600.0
-DEFAULT_INPUT_TOKEN_BUDGET = 32_000
+DEFAULT_INPUT_TOKEN_BUDGET = DEFAULT_CONTEXT_TOKEN_BUDGET
 TURN_STAGE_MESSAGE_MARKER = "_agent_turn_message"
 REASONING_TOKEN_ESCALATION_CEILING = 32_768
 OPTIONAL_INPUT_PROBE_MAX_TOKENS = 256
@@ -304,7 +335,10 @@ class LLMClient:
         )
         context_messages, serialized = _prepare_user_input(user_payload)
         request_messages = _request_messages(system_prompt, context_messages, serialized)
-        request_messages = _fit_request_messages(request_messages)
+        request_messages = _fit_request_messages(
+            request_messages,
+            _request_input_token_budget(user_payload),
+        )
         if isinstance(user_payload, dict) and isinstance(
             user_payload.get(STAGE_PROTOCOL_KEY), dict
         ):
@@ -433,7 +467,10 @@ class LLMClient:
         )
         context_messages, serialized = _prepare_user_input(user_payload)
         request_messages = _request_messages(system_prompt, context_messages, serialized)
-        request_messages = _fit_request_messages(request_messages)
+        request_messages = _fit_request_messages(
+            request_messages,
+            _request_input_token_budget(user_payload),
+        )
         if isinstance(user_payload, dict) and isinstance(
             user_payload.get(STAGE_PROTOCOL_KEY), dict
         ):
@@ -1153,6 +1190,29 @@ def _request_messages(
     elif not context_messages:
         messages.append({"role": "user", "content": "{}"})
     return messages
+
+
+def _request_input_token_budget(user_payload: dict[str, Any] | str) -> int:
+    """从会话上下文元数据读取已归一化的历史预算，兼容无上下文的控制请求。"""
+
+    if not isinstance(user_payload, dict):
+        return DEFAULT_INPUT_TOKEN_BUDGET
+    context = user_payload.get("conversation_context")
+    if not isinstance(context, dict):
+        return DEFAULT_INPUT_TOKEN_BUDGET
+    metadata = context.get("metadata")
+    if not isinstance(metadata, dict):
+        return DEFAULT_INPUT_TOKEN_BUDGET
+    value = metadata.get("token_budget")
+    if isinstance(value, bool):
+        return DEFAULT_INPUT_TOKEN_BUDGET
+    try:
+        token_budget = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return DEFAULT_INPUT_TOKEN_BUDGET
+    if token_budget <= 0:
+        return DEFAULT_INPUT_TOKEN_BUDGET
+    return min(token_budget, MAX_CONTEXT_TOKEN_BUDGET)
 
 
 def _fit_request_messages(

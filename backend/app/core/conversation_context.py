@@ -13,17 +13,18 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any
 
+from app.context_limits import DEFAULT_CONTEXT_TOKEN_BUDGET, MAX_CONTEXT_TOKEN_BUDGET
 
-DEFAULT_CONTEXT_TOKEN_BUDGET = 32_000
 COMPACTION_TRIGGER_RATIO = 0.70
 RECENT_ROUND_LIMIT = 6
 LONG_SUMMARY_TOKEN_BUDGET = 4_000
 MEDIUM_SUMMARY_TOKEN_BUDGET = 4_000
 MIN_CONTEXT_TOKEN_BUDGET = 4_096
-MAX_CONTEXT_TOKEN_BUDGET = DEFAULT_CONTEXT_TOKEN_BUDGET
-MIN_COMPACTION_TRIGGER_RATIO = 0.45
+MIN_COMPACTION_TRIGGER_RATIO = 0.10
 MAX_COMPACTION_TRIGGER_RATIO = 0.95
-MAX_RECENT_ROUND_LIMIT = 20
+MAX_RECENT_ROUND_LIMIT = 50
+MIN_SUMMARY_TOKEN_BUDGET = 128
+MAX_SUMMARY_TOKEN_BUDGET = 32_768
 ALLOWED_CONTEXT_ROLES = {"user", "assistant"}
 LONG_SUMMARY_PREFIX = "历史的信息可以被总结为："
 MEDIUM_SUMMARY_PREFIX = "近期的历史信息总结为："
@@ -63,7 +64,7 @@ class ConversationContextSettings:
             minimum=1,
             maximum=MAX_RECENT_ROUND_LIMIT,
         )
-        summary_maximum = max(1, min(token_budget, LONG_SUMMARY_TOKEN_BUDGET))
+        summary_maximum = max(1, min(token_budget, MAX_SUMMARY_TOKEN_BUDGET))
         long_summary_token_budget = _bounded_int(
             self.long_summary_token_budget,
             default=LONG_SUMMARY_TOKEN_BUDGET,
@@ -75,6 +76,11 @@ class ConversationContextSettings:
             default=MEDIUM_SUMMARY_TOKEN_BUDGET,
             minimum=1,
             maximum=summary_maximum,
+        )
+        long_summary_token_budget, medium_summary_token_budget = _normalize_summary_budgets(
+            token_budget,
+            long_summary_token_budget,
+            medium_summary_token_budget,
         )
         return replace(
             self,
@@ -96,6 +102,12 @@ class ConversationContextSettings:
             ),
             recent_round_limit=_config_value(
                 config, "context_recent_round_limit", RECENT_ROUND_LIMIT
+            ),
+            long_summary_token_budget=_config_value(
+                config, "long_summary_token_budget", LONG_SUMMARY_TOKEN_BUDGET
+            ),
+            medium_summary_token_budget=_config_value(
+                config, "medium_summary_token_budget", MEDIUM_SUMMARY_TOKEN_BUDGET
             ),
         ).normalized(minimum_token_budget=MIN_CONTEXT_TOKEN_BUDGET)
 
@@ -155,19 +167,20 @@ def build_conversation_context(
         older_count = len(unsummarized) - len(recent)
         older = unsummarized[:older_count]
         if older:
-            previous_history = _joined_existing_history(state)
-            state["long_term_summary"] = _summarize(
-                "长期历史信息",
-                previous_history,
-                effective_settings.long_summary_token_budget,
-                summary_builder,
-            )
-            state["medium_term_summary"] = _summarize(
-                "近期历史信息",
-                _transcript(older),
-                effective_settings.medium_summary_token_budget,
-                summary_builder,
-            )
+            if any(message["role"] == "user" for message in unsummarized):
+                previous_history = _joined_existing_history(state)
+                state["long_term_summary"] = _summarize(
+                    "长期历史信息",
+                    previous_history,
+                    effective_settings.long_summary_token_budget,
+                    summary_builder,
+                )
+                state["medium_term_summary"] = _summarize(
+                    "近期历史信息",
+                    _transcript(older),
+                    effective_settings.medium_summary_token_budget,
+                    summary_builder,
+                )
             state["summarized_through_message_id"] = older[-1]["_message_id"]
             state["compaction_count"] = int(state.get("compaction_count") or 0) + 1
             unsummarized = recent
@@ -229,6 +242,37 @@ def _bounded_float(value: object, *, default: float, minimum: float, maximum: fl
     if not math.isfinite(parsed):
         parsed = default
     return max(minimum, min(parsed, maximum))
+
+
+def _normalize_summary_budgets(
+    token_budget: int,
+    long_summary_token_budget: int,
+    medium_summary_token_budget: int,
+) -> tuple[int, int]:
+    """按固定顺序收敛摘要预算，优先缩减近期摘要且不突破总预算。"""
+
+    total = long_summary_token_budget + medium_summary_token_budget
+    if total <= token_budget:
+        return long_summary_token_budget, medium_summary_token_budget
+
+    minimum_each = min(MIN_SUMMARY_TOKEN_BUDGET, max(1, token_budget // 2))
+    excess = total - token_budget
+    medium_reduction = min(
+        excess,
+        max(0, medium_summary_token_budget - minimum_each),
+    )
+    medium_summary_token_budget -= medium_reduction
+    excess -= medium_reduction
+    long_reduction = min(
+        excess,
+        max(0, long_summary_token_budget - minimum_each),
+    )
+    long_summary_token_budget -= long_reduction
+    excess -= long_reduction
+    if excess > 0:
+        # 仅在极小的内部预算连两个最小值都放不下时，继续从近期摘要收敛到零。
+        medium_summary_token_budget = max(0, medium_summary_token_budget - excess)
+    return long_summary_token_budget, medium_summary_token_budget
 
 
 def _normalize_state(value: dict[str, Any] | None) -> dict[str, Any]:
@@ -318,6 +362,8 @@ def _recent_rounds(
     user_indexes = [
         index for index, message in enumerate(messages) if message.get("role") == "user"
     ]
+    if not user_indexes:
+        return messages[-max(1, round_limit) :]
     if len(user_indexes) <= round_limit:
         return messages
     return messages[user_indexes[-round_limit] :]

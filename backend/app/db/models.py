@@ -3802,9 +3802,11 @@ class UIConfig(SQLModel, table=True):
     show_tool_trace: bool = True
     reflection_max_rounds: int = 1
     agent_loop_max_actions: int = 6
-    context_token_budget: int = 32_000
+    context_token_budget: int = 128_000
     context_compaction_trigger_ratio: float = 0.70
     context_recent_round_limit: int = 6
+    long_summary_token_budget: int = 4_000
+    medium_summary_token_budget: int = 4_000
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 

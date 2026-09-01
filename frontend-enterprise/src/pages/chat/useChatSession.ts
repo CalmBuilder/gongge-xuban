@@ -110,6 +110,7 @@ import {
   scheduledDraftForMessage,
   sessionFilterStorageKey,
   shouldKeepRealtimeMessage,
+  shouldDeferPersistedEventToLiveStream,
   stepResultTraceLine,
   streamErrorTraceLine,
   streamSkillLabel,
@@ -420,9 +421,11 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     show_tool_trace: true,
     reflection_max_rounds: 1,
     agent_loop_max_actions: 6,
-    context_token_budget: 32000,
+    context_token_budget: 128000,
     context_compaction_trigger_ratio: 0.7,
     context_recent_round_limit: 6,
+    long_summary_token_budget: 4000,
+    medium_summary_token_budget: 4000,
     updated_at: '',
   });
   const chatMessagesRef = useRef<HTMLDivElement>(null);
@@ -2734,7 +2737,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
           const eventTurnId = eventTraceTurnId(event);
           if (!eventTurnId) return;
           const liveSseOwnsTurn = Boolean(stream.abortController && stream.turnId === eventTurnId);
-          if (liveSseOwnsTurn) return;
+          if (shouldDeferPersistedEventToLiveStream(event, liveSseOwnsTurn)) return;
           scheduledEventIdsRef.current.add(event.id);
           const terminalEvent = isTerminalSessionEvent(event, isTerminalEvent);
           const hasFinalAssistant = hasAssistantMessageForTurn(slot, eventTurnId);

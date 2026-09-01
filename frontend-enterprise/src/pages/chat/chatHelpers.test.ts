@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { ChatMessage, ChatSessionEventRead } from '@/types';
+import * as chatHelperModule from './chatHelpers';
 
 import {
   computeMergedMessages,
@@ -11,6 +12,24 @@ import {
   stripTrailingCitationSummary,
   streamErrorTraceLine,
 } from './chatHelpers';
+
+type PersistedEventDeferrer = (eventName: string, liveSseOwnsTurn: boolean) => boolean;
+
+function isPersistedEventDeferrer(value: unknown): value is PersistedEventDeferrer {
+  return typeof value === 'function';
+}
+
+function persistedEventDeferrer(): PersistedEventDeferrer {
+  const candidate = (
+    chatHelperModule as unknown as {
+      shouldDeferPersistedEventToLiveStream?: unknown;
+    }
+  ).shouldDeferPersistedEventToLiveStream;
+  if (!isPersistedEventDeferrer(candidate)) {
+    throw new Error('shouldDeferPersistedEventToLiveStream is not exported');
+  }
+  return candidate;
+}
 
 function event(eventName: string): ChatSessionEventRead {
   return { id: eventName, created_at: '2026-08-27T00:00:00Z', event: eventName, data: {} };
@@ -39,6 +58,27 @@ it('only ends relay recovery after the network failure grace period', () => {
   expect(isRelayRecoveryNetworkFailureTimedOut(startedAt, startedAt + 19_999)).toBe(false);
   expect(isRelayRecoveryNetworkFailureTimedOut(startedAt, startedAt + 20_000)).toBe(true);
   expect(isRelayRecoveryNetworkFailureTimedOut(null, startedAt + 20_000)).toBe(false);
+});
+
+describe('persisted event ownership', () => {
+  it('defers only live-owned intermediate events and replays terminal facts', () => {
+    const shouldDefer = persistedEventDeferrer();
+
+    expect(shouldDefer('stream_delta', true)).toBe(true);
+    expect(shouldDefer('stream_status', true)).toBe(true);
+    expect(shouldDefer('stream_end', true)).toBe(true);
+    expect(shouldDefer('assistant_message_created', true)).toBe(false);
+    expect(shouldDefer('complete', true)).toBe(false);
+    expect(shouldDefer('error_occurred', true)).toBe(false);
+  });
+
+  it('does not defer persisted events when no live SSE owns the turn', () => {
+    const shouldDefer = persistedEventDeferrer();
+
+    expect(shouldDefer('stream_delta', false)).toBe(false);
+    expect(shouldDefer('assistant_message_created', false)).toBe(false);
+    expect(shouldDefer('complete', false)).toBe(false);
+  });
 });
 
 describe('chat citation rendering', () => {

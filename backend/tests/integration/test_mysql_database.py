@@ -319,6 +319,8 @@ def test_alembic_upgrades_empty_mysql_database(mysql_database_url: str) -> None:
         "context_token_budget",
         "context_compaction_trigger_ratio",
         "context_recent_round_limit",
+        "long_summary_token_budget",
+        "medium_summary_token_budget",
     }.issubset(ui_config_columns)
     assert {
         "membership_status",
@@ -525,20 +527,26 @@ def test_mysql_context_compaction_config_round_trips_into_runtime(
         db.commit()
 
         defaults = get_or_create_ui_config(db, tenant_id)
-        assert defaults.context_token_budget == 32_000
+        assert defaults.context_token_budget == 128_000
+        assert defaults.long_summary_token_budget == 4_000
+        assert defaults.medium_summary_token_budget == 4_000
         updated = update_enterprise_ui_config(
             UIConfigUpdateRequest(
                 tenant_id=tenant_id,
-                context_token_budget=8_192,
-                context_compaction_trigger_ratio=0.50,
-                context_recent_round_limit=3,
+                context_token_budget=131_072,
+                context_compaction_trigger_ratio=0.25,
+                context_recent_round_limit=12,
+                long_summary_token_budget=8_192,
+                medium_summary_token_budget=4_096,
             ),
             db,
             admin,
         )
-        assert updated.context_token_budget == 8_192
-        assert updated.context_compaction_trigger_ratio == 0.50
-        assert updated.context_recent_round_limit == 3
+        assert updated.context_token_budget == 131_072
+        assert updated.context_compaction_trigger_ratio == 0.25
+        assert updated.context_recent_round_limit == 12
+        assert updated.long_summary_token_budget == 8_192
+        assert updated.medium_summary_token_budget == 4_096
 
         stored = db.get(UIConfig, tenant_id)
         assert stored is not None
@@ -550,17 +558,70 @@ def test_mysql_context_compaction_config_round_trips_into_runtime(
                     "role": "user" if index % 2 == 0 else "assistant",
                     "content": "MySQL 上下文回归记录 " * 300,
                 }
-                for index in range(12)
+                for index in range(26)
             ],
             settings=settings,
         )
 
         metadata = context["metadata"]
-        assert metadata["token_budget"] == 8_192
-        assert metadata["compaction_trigger_ratio"] == 0.50
-        assert metadata["recent_round_limit"] == 3
+        assert metadata["token_budget"] == 131_072
+        assert metadata["compaction_trigger_ratio"] == 0.25
+        assert metadata["recent_round_limit"] == 12
+        assert metadata["long_summary_token_budget"] == 8_192
+        assert metadata["medium_summary_token_budget"] == 4_096
         assert context["context_state"]["compaction_count"] == 1
 
+    engine.dispose()
+
+
+def test_mysql_context_summary_migration_preserves_explicit_32k_row(
+    mysql_database_url: str,
+) -> None:
+    """验证 MySQL 0078 只改变未来默认值，不改写已有租户明确保存的 32K。"""
+
+    upgrade(mysql_database_url, "20260830_0077")
+    engine = create_engine(mysql_database_url, pool_pre_ping=True)
+    tenant_id = "tenant_existing_32k_mysql"
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO ui_configs ("
+                "tenant_id, show_thinking_trace, show_skill_trace, show_tool_trace, "
+                "reflection_max_rounds, agent_loop_max_actions, context_token_budget, "
+                "context_compaction_trigger_ratio, context_recent_round_limit, created_at, updated_at"
+                ") VALUES (:tenant_id, 0, 0, 0, 1, 6, 32000, 0.7, 6, "
+                "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            ),
+            {"tenant_id": tenant_id},
+        )
+
+    upgrade(mysql_database_url)
+    with engine.connect() as connection:
+        columns = {
+            column["name"]: column for column in inspect(connection).get_columns("ui_configs")
+        }
+        assert {"long_summary_token_budget", "medium_summary_token_budget"} <= set(columns)
+        assert str(columns["context_token_budget"]["default"]).strip("'") in {
+            "128000",
+            "128000.0",
+        }
+        assert str(columns["long_summary_token_budget"]["default"]).strip("'") in {
+            "4000",
+            "4000.0",
+        }
+        assert str(columns["medium_summary_token_budget"]["default"]).strip("'") in {
+            "4000",
+            "4000.0",
+        }
+        stored = connection.execute(
+            text(
+                "SELECT context_token_budget, long_summary_token_budget, "
+                "medium_summary_token_budget FROM ui_configs WHERE tenant_id=:tenant_id"
+            ),
+            {"tenant_id": tenant_id},
+        ).one()
+
+    assert stored == (32_000, 4_000, 4_000)
     engine.dispose()
 
 

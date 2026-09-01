@@ -803,6 +803,17 @@ export function isTerminalSessionEvent(
   return isTerminalStreamEvent(event);
 }
 
+export function shouldDeferPersistedEventToLiveStream(
+  event: ChatSessionEventRead | string,
+  liveSseOwnsTurn: boolean,
+): boolean {
+  /** 实时流拥有同一轮时只延迟中间事件，终态事实必须允许从事件账本恢复。 */
+
+  if (!liveSseOwnsTurn) return false;
+  const eventName = typeof event === 'string' ? event : event.event;
+  return eventName !== 'assistant_message_created' && !STREAM_TERMINAL_EVENTS.has(eventName);
+}
+
 export function attachTurnIdsToServerMessages(
   serverMessages: ChatMessage[],
   realtimeMessages: ChatMessage[],

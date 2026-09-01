@@ -25,7 +25,7 @@ from app.db.migrations import (
     assert_schema_current,
     current_revision,
 )
-from app.db.models import ExecutionCommand, Skill, SkillVersion
+from app.db.models import ExecutionCommand, Skill, SkillVersion, UIConfig
 from app.db.seed import (
     EXCHANGE_SKILL,
     PRICE_COMPARE_SKILL,
@@ -3291,6 +3291,149 @@ def test_context_compaction_migration_resumes_after_partial_ddl(tmp_path) -> Non
             "context_compaction_trigger_ratio",
             "context_recent_round_limit",
         } & columns
+
+
+def test_context_summary_budget_migration_preserves_existing_sqlite_values_and_defaults(
+    tmp_path,
+) -> None:
+    """验证 0078 正向升级、重复执行、默认值和已有 32K 配置保留契约。"""
+
+    database_url = f"sqlite:///{tmp_path / 'context-summary-budget.db'}"
+    config = Config(str(BACKEND_DIR / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
+    config.attributes["database_url"] = database_url
+    engine = create_engine(database_url)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE TABLE ui_configs ("
+                "tenant_id VARCHAR(128) PRIMARY KEY, "
+                "context_token_budget INTEGER NOT NULL DEFAULT 32000, "
+                "context_compaction_trigger_ratio FLOAT NOT NULL DEFAULT 0.7, "
+                "context_recent_round_limit INTEGER NOT NULL DEFAULT 6)"
+            )
+        )
+        connection.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)"))
+        connection.execute(text("INSERT INTO alembic_version VALUES ('20260830_0077')"))
+        connection.execute(
+            text(
+                "INSERT INTO ui_configs (tenant_id, context_token_budget) "
+                "VALUES ('tenant_existing_32k', 32000)"
+            )
+        )
+
+    command.upgrade(config, "20260901_0078")
+    command.upgrade(config, "20260901_0078")
+
+    with engine.begin() as connection:
+        connection.execute(text("INSERT INTO ui_configs (tenant_id) VALUES ('tenant_new_default')"))
+
+    with engine.connect() as connection:
+        columns = {column["name"] for column in inspect(connection).get_columns("ui_configs")}
+        assert {"long_summary_token_budget", "medium_summary_token_budget"} <= columns
+        defaults = {
+            column["name"]: str(column["default"] or "")
+            for column in inspect(connection).get_columns("ui_configs")
+        }
+        assert defaults["context_token_budget"] in {"128000", "128000.0"}
+        assert defaults["long_summary_token_budget"] in {"4000", "4000.0"}
+        assert defaults["medium_summary_token_budget"] in {"4000", "4000.0"}
+        stored = connection.execute(
+            text(
+                "SELECT tenant_id, context_token_budget, long_summary_token_budget, "
+                "medium_summary_token_budget FROM ui_configs ORDER BY tenant_id"
+            )
+        ).mappings().all()
+
+    assert stored == [
+        {
+            "tenant_id": "tenant_existing_32k",
+            "context_token_budget": 32_000,
+            "long_summary_token_budget": 4_000,
+            "medium_summary_token_budget": 4_000,
+        },
+        {
+            "tenant_id": "tenant_new_default",
+            "context_token_budget": 128_000,
+            "long_summary_token_budget": 4_000,
+            "medium_summary_token_budget": 4_000,
+        },
+    ]
+
+
+def test_context_summary_budget_migration_skips_partial_schema_without_ui_configs(
+    tmp_path: Path,
+) -> None:
+    """反向验证局部历史库缺少 ui_configs 时，0078 升降级仍保持迁移链可用。"""
+
+    database_url = f"sqlite:///{tmp_path / 'context-summary-partial.db'}"
+    config = Config(str(BACKEND_DIR / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
+    config.attributes["database_url"] = database_url
+    engine = create_engine(database_url)
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)"))
+        connection.execute(text("INSERT INTO alembic_version VALUES ('20260830_0077')"))
+
+    command.upgrade(config, "20260901_0078")
+    command.downgrade(config, "20260830_0077")
+
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
+            "20260830_0077"
+        )
+
+
+def test_sqlite_legacy_context_defaults_upgrade_only_missing_columns(tmp_path) -> None:
+    """反向验证旧 SQLite 仅缺列时补齐 128K/摘要默认值，不覆盖已有上下文字段。"""
+
+    database_url = f"sqlite:///{tmp_path / 'legacy-context-summary.db'}"
+    engine = create_engine(database_url)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE TABLE ui_configs ("
+                "tenant_id VARCHAR(128) PRIMARY KEY, "
+                "context_token_budget INTEGER NOT NULL DEFAULT 32000)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO ui_configs (tenant_id, context_token_budget) "
+                "VALUES ('tenant_legacy', 32000)"
+            )
+        )
+
+    initialize_sqlite_database(engine)
+
+    with engine.connect() as connection:
+        columns = {column["name"] for column in inspect(connection).get_columns("ui_configs")}
+        assert {"context_compaction_trigger_ratio", "context_recent_round_limit"} <= columns
+        assert {"long_summary_token_budget", "medium_summary_token_budget"} <= columns
+        value = connection.execute(
+            text(
+                "SELECT context_token_budget, long_summary_token_budget, "
+                "medium_summary_token_budget FROM ui_configs WHERE tenant_id='tenant_legacy'"
+            )
+        ).one()
+
+    assert value == (32_000, 4_000, 4_000)
+
+
+def test_new_sqlite_ui_config_uses_128k_context_default() -> None:
+    """验证 SQLite 新建 UIConfig 行使用 128K 默认预算和 4K 摘要预算。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as db:
+        db.add(UIConfig(tenant_id="tenant_new"))
+        db.commit()
+        row = db.get(UIConfig, "tenant_new")
+
+    assert row is not None
+    assert row.context_token_budget == 128_000
+    assert row.long_summary_token_budget == 4_000
+    assert row.medium_summary_token_budget == 4_000
 
 
 def _prepare_0039_execution_control_database(engine, config: Config) -> None:

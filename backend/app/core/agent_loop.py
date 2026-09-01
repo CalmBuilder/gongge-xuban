@@ -86,6 +86,7 @@ from app.db.models import (
     new_id,
     utc_now,
 )
+from app.llm.client import is_context_overflow_error
 from app.db.database import engine
 from app.dynamic_tasks.agent import DynamicRunOutcome, DynamicTaskAgent, DynamicTaskAgentError
 from app.dynamic_tasks.planner_service import DynamicTaskPlannerError
@@ -3956,27 +3957,43 @@ class AgentLoop:
                 raise ValueError("ATTACHMENT_DISPATCH_INVALID")
             gateway.authorize(group, worker_id=f"turn:{chat_session.id}")
             self.db.commit()
-        try:
-            reply = self.response_generator.generate(
-                message,
-                chat_session,
-                active_skill,
-                router_decision,
-                step_result,
-                tool_result,
-                model_config,
-                persona_prompt,
-                memory_context,
-                conversation_context,
-                task_results,
-                propagate_model_failure or bool(group),
-                bool(read_receipt_ids),
-            )
-        except Exception:
-            if gateway is not None and group is not None:
-                gateway.mark_unknown(group)
-                self.db.commit()
-            raise
+        response_context = conversation_context
+        overflow_retry_used = False
+        while True:
+            try:
+                reply = self.response_generator.generate(
+                    message,
+                    chat_session,
+                    active_skill,
+                    router_decision,
+                    step_result,
+                    tool_result,
+                    model_config,
+                    persona_prompt,
+                    memory_context,
+                    response_context,
+                    task_results,
+                    propagate_model_failure or bool(group),
+                    bool(read_receipt_ids),
+                )
+                break
+            except Exception as exc:
+                if not overflow_retry_used and is_context_overflow_error(exc):
+                    overflow_retry_used = True
+                    try:
+                        response_context = self._rebuild_context_after_overflow(
+                            chat_session, model_config
+                        )
+                    except Exception:
+                        if gateway is not None and group is not None:
+                            gateway.mark_unknown(group)
+                            self.db.commit()
+                        raise
+                    continue
+                if gateway is not None and group is not None:
+                    gateway.mark_unknown(group)
+                    self.db.commit()
+                raise
         if gateway is not None and group is not None:
             gateway.settle_delivered(group)
             self.db.commit()
@@ -4025,38 +4042,70 @@ class AgentLoop:
                 raise ValueError("ATTACHMENT_DISPATCH_INVALID")
             gateway.authorize(group, worker_id=f"turn:{chat_session.id}")
             self.db.commit()
-        try:
-            stream = self.response_generator.generate_stream(
-                message,
-                chat_session,
-                active_skill,
-                router_decision,
-                step_result,
-                tool_result,
-                model_config,
-                persona_prompt,
-                memory_context,
-                conversation_context,
-                task_results,
-                is_cancelled,
-                bool(read_receipt_ids),
-                bool(group),
-            )
-            if group is None:
-                yield from stream
-                return
-            # 附件正文已经越过provider边界时，先缓冲并完成外发审计，再向浏览器公开回答；
-            # 撤权或provider异常因此不会留下“页面已显示但Receipt仍未结算”的假终态。
-            buffered_chunks = list(stream)
-        except Exception:
-            if gateway is not None and group is not None:
-                gateway.mark_unknown(group)
-                self.db.commit()
-            raise
+        response_context = conversation_context
+        overflow_retry_used = False
+        while True:
+            emitted_chunk = False
+            try:
+                stream = self.response_generator.generate_stream(
+                    message,
+                    chat_session,
+                    active_skill,
+                    router_decision,
+                    step_result,
+                    tool_result,
+                    model_config,
+                    persona_prompt,
+                    memory_context,
+                    response_context,
+                    task_results,
+                    is_cancelled,
+                    bool(read_receipt_ids),
+                    bool(group),
+                )
+                if group is None:
+                    for chunk in stream:
+                        emitted_chunk = True
+                        yield chunk
+                    return
+                # 附件正文已经越过provider边界时，先缓冲并完成外发审计，再向浏览器公开回答；
+                # 撤权或provider异常因此不会留下“页面已显示但Receipt仍未结算”的假终态。
+                buffered_chunks = []
+                for chunk in stream:
+                    emitted_chunk = True
+                    buffered_chunks.append(chunk)
+                break
+            except Exception as exc:
+                if not overflow_retry_used and not emitted_chunk and is_context_overflow_error(exc):
+                    overflow_retry_used = True
+                    try:
+                        response_context = self._rebuild_context_after_overflow(
+                            chat_session, model_config
+                        )
+                    except Exception:
+                        if gateway is not None and group is not None:
+                            gateway.mark_unknown(group)
+                            self.db.commit()
+                        raise
+                    continue
+                if gateway is not None and group is not None:
+                    gateway.mark_unknown(group)
+                    self.db.commit()
+                raise
         if gateway is not None and group is not None:
             gateway.settle_delivered(group)
             self.db.commit()
             yield from buffered_chunks
+
+    def _rebuild_context_after_overflow(
+        self,
+        chat_session: ChatSession,
+        model_config: ModelConfig,
+    ) -> dict[str, object]:
+        """在同一 turn 内重建一次 outbound 上下文，保留 canonical 消息和附件身份。"""
+
+        rebuilt = self._conversation_context(chat_session, model_config)
+        return self._refresh_response_input_context(chat_session, rebuilt)
 
     def _refresh_response_input_context(
         self,

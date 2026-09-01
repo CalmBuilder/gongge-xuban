@@ -144,7 +144,7 @@ def migrate_sqlite_skill_schema(engine: Engine) -> None:
                 )
             if "context_token_budget" not in ui_columns:
                 conn.execute(
-                    text("ALTER TABLE ui_configs ADD COLUMN context_token_budget INTEGER NOT NULL DEFAULT 32000")
+                    text("ALTER TABLE ui_configs ADD COLUMN context_token_budget INTEGER NOT NULL DEFAULT 128000")
                 )
             if "context_compaction_trigger_ratio" not in ui_columns:
                 conn.execute(
@@ -156,6 +156,14 @@ def migrate_sqlite_skill_schema(engine: Engine) -> None:
             if "context_recent_round_limit" not in ui_columns:
                 conn.execute(
                     text("ALTER TABLE ui_configs ADD COLUMN context_recent_round_limit INTEGER NOT NULL DEFAULT 6")
+                )
+            if "long_summary_token_budget" not in ui_columns:
+                conn.execute(
+                    text("ALTER TABLE ui_configs ADD COLUMN long_summary_token_budget INTEGER NOT NULL DEFAULT 4000")
+                )
+            if "medium_summary_token_budget" not in ui_columns:
+                conn.execute(
+                    text("ALTER TABLE ui_configs ADD COLUMN medium_summary_token_budget INTEGER NOT NULL DEFAULT 4000")
                 )
 
         if "skill_feedback" in tables:

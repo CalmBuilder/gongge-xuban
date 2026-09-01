@@ -662,6 +662,8 @@ export type UIConfigRead = {
   context_token_budget: number;
   context_compaction_trigger_ratio: number;
   context_recent_round_limit: number;
+  long_summary_token_budget: number;
+  medium_summary_token_budget: number;
   updated_at: string;
 };
 
