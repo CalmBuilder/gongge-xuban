@@ -8629,7 +8629,7 @@ class AgentLoop:
                     {
                         "execution_id": instance.id,
                         "phase": "dynamic_execution",
-                        "text": "已接管任务，正在读取附件并执行分析；长日志可能需要一些时间。",
+                        "text": self._dynamic_execution_status_text(request),
                     },
                     user_message_id,
                 ),
@@ -8691,6 +8691,14 @@ class AgentLoop:
                 )
             self.db.commit()
             raise
+
+    @staticmethod
+    def _dynamic_execution_status_text(request: ChatTurnRequest) -> str:
+        """按本轮是否提交附件选择准确的动态任务进度文案，避免无附件任务误称正在读附件。"""
+
+        if request.attachments:
+            return "已接管任务，正在读取附件并执行分析；长日志可能需要一些时间。"
+        return "已接管任务，正在执行分析；任务可能需要一些时间。"
 
     def _attachments_require_dynamic(self, request: ChatTurnRequest) -> bool:
         """依据权威资源与已发布Extraction判断附件是否超出普通问答安全快路径。"""

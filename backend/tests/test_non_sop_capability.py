@@ -24,7 +24,7 @@ from app.db.models import ChatSession, GeneralSkill, Skill
 from app.dynamic_tasks.agent import DynamicRunOutcome, DynamicTaskAgentError
 from app.dynamic_tasks.quotas import DynamicTaskQuotaError
 from app.general_skills.schema import GeneralSkillSelection
-from app.session.session_schema import ChatTurnRequest, RouterDecision
+from app.session.session_schema import ChatAttachmentRef, ChatTurnRequest, RouterDecision
 
 
 class _GeneralSelector:
@@ -166,6 +166,34 @@ def _route(
         conversation_context={"messages": [{"role": "user", "content": "历史消息"}]},
         memory_context=[{"kind": "profile", "content": "内部记忆"}],
         knowledge_capability={"available": True, "accessible_count": 1},
+    )
+
+
+def test_dynamic_execution_status_text_matches_current_input_scope() -> None:
+    """动态任务进度文案必须区分本轮有无附件，避免普通问题被误报为读取日志。"""
+
+    without_attachment = ChatTurnRequest(
+        tenant_id="tenant_demo",
+        user_id="user_demo",
+        agent_id="agent_demo",
+        message="计算机专业，山东所有大学排名",
+    )
+    with_attachment = without_attachment.model_copy(
+        update={
+            "attachments": [
+                ChatAttachmentRef(
+                    resource_id="resource_demo",
+                    resource_version="v1",
+                )
+            ]
+        }
+    )
+
+    assert AgentLoop._dynamic_execution_status_text(without_attachment) == (
+        "已接管任务，正在执行分析；任务可能需要一些时间。"
+    )
+    assert AgentLoop._dynamic_execution_status_text(with_attachment) == (
+        "已接管任务，正在读取附件并执行分析；长日志可能需要一些时间。"
     )
 
 

@@ -212,6 +212,16 @@ test('DynamicTask 首轮成功后沿同一会话连续 21 轮并继承日志附�
   );
   let facts = await readFacts(page, sessionId);
   expect(facts.messages.filter((item) => item.role === 'assistant')[0]?.content).toContain('S3 日志分析');
+  expect(streamRequests[0]?.body.attachments).toEqual([]);
+  const dynamicExecutionStatus = facts.events.find((event) => (
+    event.event_type === 'stream_status'
+    && String(eventData(event).phase || '') === 'dynamic_execution'
+  ));
+  const dynamicExecutionStatusText = dynamicExecutionStatus
+    ? String(eventData(dynamicExecutionStatus).text || '')
+    : '';
+  expect(dynamicExecutionStatusText).toBe('已接管任务，正在执行分析；任务可能需要一些时间。');
+  expect(dynamicExecutionStatusText).not.toContain('读取附件');
 
   await uploadLog(page);
   await sendTurn(
@@ -326,5 +336,153 @@ test('DynamicTask 首轮等待后用附件恢复同一 Execution', async ({ page
     session_id: sessionId,
     execution_id: eventExecutionId(delegated[0]),
     event_types: eventTypes(facts),
+  }));
+});
+
+test('DynamicTask 真实浏览器断流刷新后重连且不重复渲染', async ({ page }) => {
+  /** 让首个 SSE 请求真实发出后刷新页面，验证事件回放能够补齐同一轮终态。 */
+
+  const streamRequests: BrowserStreamRequest[] = [];
+  let reloadPromise: Promise<void> | null = null;
+  page.on('request', (request) => {
+    if (request.method() !== 'POST' || new URL(request.url()).pathname !== '/api/chat/stream') return;
+    streamRequests.push({ body: JSON.parse(request.postData() || '{}') as Record<string, unknown> });
+    if (reloadPromise) return;
+    reloadPromise = new Promise((resolve) => {
+      setTimeout(() => {
+        void page.reload({ waitUntil: 'domcontentloaded' }).then(() => resolve()).catch(() => resolve());
+      }, 75);
+    });
+  });
+
+  await login(page);
+  const sessionId = await createSession(page, 'DynamicTask 断流刷新重连回归');
+  const composer = await prepareChat(page, sessionId);
+  await composer.fill(`断流刷新后继续分析 ${S3_MARKER}，并给出可执行修复建议。`);
+  const sendPromise = page.getByRole('button', { name: '发送', exact: true }).click().catch(() => undefined);
+  await expect.poll(
+    async () => (await readFacts(page, sessionId)).messages.filter((item) => item.role === 'user').length,
+    { timeout: 30_000, intervals: [100, 250, 500] },
+  ).toBe(1);
+  await expect(reloadPromise).not.toBeNull();
+  await reloadPromise;
+  await sendPromise;
+
+  await expect.poll(
+    async () => (await readFacts(page, sessionId)).messages.filter((item) => item.role === 'assistant').length,
+    { timeout: 90_000, intervals: [250, 500, 1_000, 2_000] },
+  ).toBe(1);
+  const facts = await readFacts(page, sessionId);
+  expect(facts.messages.filter((item) => item.role === 'user')).toHaveLength(1);
+  expect(facts.messages.filter((item) => item.role === 'assistant')).toHaveLength(1);
+  expect(facts.messages.filter((item) => item.role === 'assistant')[0]?.content).toContain('S3 日志分析');
+  expect(facts.events.filter((event) => event.event_type === 'assistant_message_created')).toHaveLength(1);
+  expect(facts.events.filter((event) => event.event_type === 'execution_succeeded')).toHaveLength(1);
+  expect(eventTypes(facts).filter((type) => (
+    type === 'error_occurred'
+    || type === 'dynamic_task_execution_failed'
+    || type === 'dynamic_task_chat_turn_deferred'
+  ))).toEqual([]);
+  expect(streamRequests).toHaveLength(1);
+  console.log('DYNAMIC_RECONNECT_RESULT', JSON.stringify({
+    session_id: sessionId,
+    stream_requests: streamRequests.length,
+    user_messages: facts.messages.filter((item) => item.role === 'user').length,
+    assistant_messages: facts.messages.filter((item) => item.role === 'assistant').length,
+    event_types: eventTypes(facts),
+  }));
+});
+
+test('DynamicTask 重复提交同一 client_turn_id 只保留一份回答', async ({ page }) => {
+  /** 在真实浏览器上下文重放同一幂等请求，验证服务端回放不会追加第二份答案。 */
+
+  const streamRequests: BrowserStreamRequest[] = [];
+  page.on('request', (request) => {
+    if (request.method() !== 'POST' || new URL(request.url()).pathname !== '/api/chat/stream') return;
+    streamRequests.push({ body: JSON.parse(request.postData() || '{}') as Record<string, unknown> });
+  });
+
+  await login(page);
+  const sessionId = await createSession(page, 'DynamicTask 重复请求幂等回归');
+  const composer = await prepareChat(page, sessionId);
+  await sendTurn(page, composer, sessionId, `请分析 ${S3_MARKER} 并输出一份简明结论。`, 1);
+  expect(streamRequests).toHaveLength(1);
+  const originalBody = streamRequests[0].body;
+  expect(originalBody.session_id).toBe(sessionId);
+  expect(String(originalBody.client_turn_id || '')).not.toBe('');
+
+  const replay = await page.evaluate(async (body) => {
+    const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
+    const response = await fetch('/api/chat/stream', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${auth.token || ''}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    });
+    return { status: response.status, stream: await response.text() };
+  }, originalBody);
+  expect(replay.status).toBe(200);
+  expect(replay.stream).toContain('complete');
+
+  const facts = await readFacts(page, sessionId);
+  expect(facts.messages.filter((item) => item.role === 'user')).toHaveLength(1);
+  expect(facts.messages.filter((item) => item.role === 'assistant')).toHaveLength(1);
+  expect(facts.events.filter((event) => event.event_type === 'user_message_received')).toHaveLength(1);
+  expect(facts.events.filter((event) => event.event_type === 'assistant_message_created')).toHaveLength(1);
+  expect(facts.events.filter((event) => event.event_type === 'execution_succeeded')).toHaveLength(1);
+  console.log('DYNAMIC_IDEMPOTENCY_RESULT', JSON.stringify({
+    session_id: sessionId,
+    client_turn_id: originalBody.client_turn_id,
+    replay_status: replay.status,
+    user_messages: facts.messages.filter((item) => item.role === 'user').length,
+    assistant_messages: facts.messages.filter((item) => item.role === 'assistant').length,
+  }));
+});
+
+test('DynamicTask 编辑最新问题后可真实重发且不复制旧回答', async ({ page }) => {
+  /** 通过页面编辑按钮回填最新用户消息，修改后再次发送并核验两轮各自唯一。 */
+
+  const streamRequests: BrowserStreamRequest[] = [];
+  page.on('request', (request) => {
+    if (request.method() !== 'POST' || new URL(request.url()).pathname !== '/api/chat/stream') return;
+    streamRequests.push({ body: JSON.parse(request.postData() || '{}') as Record<string, unknown> });
+  });
+
+  await login(page);
+  const sessionId = await createSession(page, 'DynamicTask 编辑重发回归');
+  const composer = await prepareChat(page, sessionId);
+  const firstPrompt = `请分析 ${S3_MARKER}，先输出第一版结论。`;
+  const editedPrompt = `请重新分析 ${S3_MARKER}，只保留根因、风险和修复建议。`;
+  await sendTurn(page, composer, sessionId, firstPrompt, 1);
+
+  const editButton = page.getByRole('button', { name: '编辑', exact: true }).last();
+  await expect(editButton).toBeVisible({ timeout: 30_000 });
+  await editButton.click();
+  await expect(composer).toHaveValue(firstPrompt);
+  await composer.fill(editedPrompt);
+  await page.getByRole('button', { name: '发送', exact: true }).click();
+  await expect.poll(
+    async () => (await readFacts(page, sessionId)).messages.filter((item) => item.role === 'assistant').length,
+    { timeout: 90_000, intervals: [250, 500, 1_000, 2_000] },
+  ).toBe(2);
+
+  const facts = await readFacts(page, sessionId);
+  const userMessages = facts.messages.filter((item) => item.role === 'user');
+  const assistantMessages = facts.messages.filter((item) => item.role === 'assistant');
+  expect(userMessages).toHaveLength(2);
+  expect(userMessages.map((item) => item.content)).toEqual([firstPrompt, editedPrompt]);
+  expect(assistantMessages).toHaveLength(2);
+  expect(assistantMessages.every((item) => item.content.includes('S3 日志分析'))).toBe(true);
+  expect(facts.events.filter((event) => event.event_type === 'assistant_message_created')).toHaveLength(2);
+  expect(facts.events.filter((event) => event.event_type === 'execution_succeeded')).toHaveLength(2);
+  expect(streamRequests).toHaveLength(2);
+  console.log('DYNAMIC_EDIT_RESEND_RESULT', JSON.stringify({
+    session_id: sessionId,
+    stream_requests: streamRequests.length,
+    user_messages: userMessages.length,
+    assistant_messages: assistantMessages.length,
+    client_turn_ids: streamRequests.map((item) => item.body.client_turn_id),
   }));
 });
