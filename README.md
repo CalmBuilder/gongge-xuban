@@ -218,13 +218,14 @@ cd ..
 - **浏览器工作台**：对话、管理、广场、工作项、审计和执行追踪共用单端口应用。
 - **桌面打包**：`packaging/` 提供 macOS、Windows、Linux 的 PyInstaller 构建与冻结运行时校验链路。
 
-配置优先级为：操作系统环境变量 → `backend/.env` → `backend/app/config.py` 默认值。MySQL 部署必须先执行：
+配置优先级为：操作系统环境变量 → `backend/.env` → `backend/app/config.py` 默认值。MySQL 部署或拉取包含新迁移的版本后，先启动 MySQL，再执行项目提供的迁移脚本：
 
 ```bash
 docker compose up -d mysql
-cd backend
-.venv/bin/alembic -c alembic.ini upgrade head
+./db.sh
 ```
+
+`./db.sh` 默认执行 MySQL Alembic 迁移，`./db.sh check` 只检查版本。`./app.sh` 和 `./app.sh dev` 会在启动服务前执行不超过 10 秒的只读迁移检查。若当前版本落后于 Alembic head，启动会立即停止并打印当前版本、目标版本和 `./db.sh`，不会让 supervisor 反复拉起失败的应用；SQLite 会跳过这条 MySQL 检查并继续使用现有初始化路径。底层 Python 脚本仍支持 `--check`，在需要迁移时返回退出码 2。
 
 不要用 `SQLModel.metadata.create_all()` 替代 MySQL 迁移，也不要使用 MySQL root 账号作为应用账号。
 

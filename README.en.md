@@ -129,7 +129,7 @@ Open:
 
 Configure an OpenAI Chat Completions-compatible model in the management console before testing model-backed features. Do not reuse demo credentials or secrets in production.
 
-Lifecycle commands are `./app.sh`, `./app.sh status`, and `./app.sh stop` on macOS/Linux/WSL; use `app.ps1` on Windows. MySQL deployments must run `alembic -c alembic.ini upgrade head` and must use a dedicated application account.
+Lifecycle commands are `./app.sh`, `./app.sh status`, and `./app.sh stop` on macOS/Linux/WSL; use `app.ps1` on Windows. Before starting, the unified launcher performs a bounded 10-second read-only MySQL migration check; if the schema is stale, run `./db.sh` and start again. Use `./db.sh check` for a read-only check; SQLite is skipped. MySQL deployments must use a dedicated application account.
 
 ## Source map
 

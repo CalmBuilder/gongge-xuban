@@ -28,6 +28,7 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 RUN_DIR = ROOT_DIR / ".dev"
 LOG_DIR = RUN_DIR / "logs"
 SERVICE_NAMES = ("supervisor", "app", "backend", "enterprise", "chat")
+DATABASE_CHECK_TIMEOUT_SECONDS = 10.0
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -201,6 +202,52 @@ def _build_frontend() -> None:
     )
 
 
+def _check_database_migration() -> None:
+    """在启动服务前快速检查 MySQL 迁移状态，避免 supervisor 反复拉起失败进程。"""
+
+    migration_script = ROOT_DIR / "scripts" / "migrate_mysql.py"
+    try:
+        result = subprocess.run(
+            [sys.executable, str(migration_script), "--check"],
+            cwd=ROOT_DIR,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=DATABASE_CHECK_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"数据库迁移检查超过 {int(DATABASE_CHECK_TIMEOUT_SECONDS)} 秒，应用未启动。"
+            "请检查 MySQL 连通性后执行：\n"
+            "  cd backend\n"
+            "  .venv/bin/python ../scripts/migrate_mysql.py"
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(
+            f"无法启动数据库迁移检查脚本 {migration_script}，应用未启动。"
+        ) from exc
+
+    output = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part.strip())
+    if result.returncode == 0:
+        if output:
+            print(output)
+        return
+    if result.returncode == 2:
+        detail = f"\n{output}" if output else ""
+        raise RuntimeError(
+            "数据库需要迁移，应用未启动。"
+            f"{detail}\n"
+            "请先执行：\n"
+            "  cd backend\n"
+            "  .venv/bin/python ../scripts/migrate_mysql.py\n"
+            "迁移完成后重新运行 ./app.sh。"
+        )
+    detail = f"\n{output}" if output else ""
+    raise RuntimeError(
+        f"数据库迁移检查失败（退出码 {result.returncode}），应用未启动。{detail}"
+    )
+
+
 def _url_ready(url: str) -> bool:
     response = None
     try:
@@ -275,6 +322,7 @@ def command_up(detach_flag: bool, mode: str) -> int:
     stop_services(verbose=False)
     for host, port in _service_ports(supervisor):
         _free_configured_port(host, port)
+    _check_database_migration()
     if supervisor.SINGLE_PORT:
         _build_frontend()
 

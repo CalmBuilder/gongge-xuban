@@ -37,8 +37,7 @@ To use the repository MySQL service:
 
 ```bash
 docker compose up -d mysql
-cd backend
-.venv/bin/python -m alembic -c alembic.ini upgrade head
+./db.sh
 ```
 
 Set a URL-encoded application-account URL in `backend/.env` before running the
@@ -55,8 +54,13 @@ DATABASE_POOL_RECYCLE_SECONDS="1800"
 Do not use the MySQL root account as the application account. Characters such as
 `&`, `%`, `@`, `/`, and `:` in a password must be percent-encoded inside a URL.
 The MySQL adapter checks the Alembic revision at startup and refuses to run against
-an empty or stale schema; apply `alembic upgrade head` explicitly after pulling a
-new migration. SQLite keeps its legacy in-process upgrade path for compatibility.
+an empty or stale schema. The unified `app.sh` launcher performs a bounded (10
+second) read-only check before starting the supervisor; when migration is needed it
+exits promptly and prints the current/head revisions plus the command
+`./db.sh`. Run `./db.sh` explicitly after pulling a new migration; it upgrades to
+Alembic `head` and verifies the result. Use `./db.sh check` for a read-only check.
+SQLite keeps its legacy in-process upgrade path for compatibility and is skipped by
+this MySQL-only script.
 
 The root `.env` configures only the Compose container (`MYSQL_DATABASE`,
 `MYSQL_USER`, `MYSQL_PASSWORD`, and `MYSQL_ROOT_PASSWORD`). `backend/.env` configures

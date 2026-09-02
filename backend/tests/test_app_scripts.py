@@ -110,6 +110,67 @@ def test_app_cli_waits_for_socket_release_without_listener_pid(monkeypatch) -> N
     lifecycle._free_configured_port("0.0.0.0", 5137)
 
 
+def test_app_cli_blocks_startup_when_database_migration_is_required(monkeypatch) -> None:
+    """MySQL 版本落后时应在启动 supervisor 前快速给出迁移命令。"""
+
+    lifecycle = _load_script("app", "gongge_xuban_app_database_migration_required")
+    calls: list[list[str]] = []
+
+    def fake_run(command, **_kwargs):
+        """模拟迁移检查子进程返回版本落后结果。"""
+
+        calls.append(command)
+        return SimpleNamespace(
+            returncode=2,
+            stdout="检测到 MySQL 数据库需要迁移：mysql+pymysql://user:***@127.0.0.1/db",
+            stderr="当前版本：20260830_0077\n目标版本：20260901_0078",
+        )
+
+    monkeypatch.setattr(lifecycle.subprocess, "run", fake_run)
+
+    import pytest
+
+    with pytest.raises(RuntimeError, match="数据库需要迁移"):
+        lifecycle._check_database_migration()
+
+    assert calls == [[sys.executable, str(ROOT_DIR / "scripts" / "migrate_mysql.py"), "--check"]]
+
+
+def test_app_cli_stops_quickly_when_database_check_times_out(monkeypatch) -> None:
+    """MySQL 不可达时检查超时应立即终止启动并给出可执行诊断。"""
+
+    lifecycle = _load_script("app", "gongge_xuban_app_database_migration_timeout")
+
+    def timeout_run(*_args, **_kwargs):
+        """模拟数据库检查超过启动前置检查的时间预算。"""
+
+        raise subprocess.TimeoutExpired("migrate_mysql.py", lifecycle.DATABASE_CHECK_TIMEOUT_SECONDS)
+
+    monkeypatch.setattr(lifecycle.subprocess, "run", timeout_run)
+
+    import pytest
+
+    with pytest.raises(RuntimeError, match="超过 10 秒"):
+        lifecycle._check_database_migration()
+
+
+def test_app_cli_accepts_current_database_schema(monkeypatch) -> None:
+    """MySQL 已经位于 Alembic head 时启动前置检查应正常通过。"""
+
+    lifecycle = _load_script("app", "gongge_xuban_app_database_current")
+    monkeypatch.setattr(
+        lifecycle.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="数据库迁移检查通过：当前版本 20260901_0078。",
+            stderr="",
+        ),
+    )
+
+    lifecycle._check_database_migration()
+
+
 def test_port_probe_uses_reusable_server_socket_semantics(monkeypatch) -> None:
     lifecycle = _load_script("app", "gongge_xuban_app_cli_socket_probe")
 
@@ -344,6 +405,7 @@ def test_detached_startup_failure_cleans_the_supervisor_it_started(monkeypatch) 
             return host
 
     monkeypatch.setattr(lifecycle, "_load_supervisor", lambda: FakeSupervisor)
+    monkeypatch.setattr(lifecycle, "_check_database_migration", lambda: None)
     monkeypatch.setattr(
         lifecycle,
         "stop_services",
@@ -376,6 +438,25 @@ def test_app_shell_exposes_the_unified_command_contract() -> None:
     assert 'scripts/app.py" up --mode development' in script
     assert 'scripts/app.py" status' in script
     assert 'scripts/app.py" down' in script
+
+
+def test_db_shell_exposes_the_mysql_migration_command_contract() -> None:
+    """短命名数据库脚本应同时支持主动迁移和只读检查。"""
+
+    script = (ROOT_DIR / "db.sh").read_text(encoding="utf-8")
+
+    assert 'scripts/migrate_mysql.py"' in script
+    assert 'scripts/migrate_mysql.py" --check' in script
+    assert 'Usage: ./db.sh [check|migrate]' in script
+    result = subprocess.run(
+        ["bash", "-n", str(ROOT_DIR / "db.sh")],
+        cwd=ROOT_DIR,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_app_powershell_exposes_the_unified_command_contract() -> None:
