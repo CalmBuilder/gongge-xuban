@@ -12,11 +12,37 @@ import argparse
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 
 
 DEFAULT_OPENCLI_VERSION = "1.8.7"
 _VERSION_PATTERN = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$")
+
+
+def _resolve_npm_command(*, is_windows: bool | None = None) -> str:
+    """解析可直接交给 Python 子进程的 npm 启动器，兼容 Windows 的 npm.cmd。"""
+
+    windows = os.name == "nt" if is_windows is None else is_windows
+    configured = os.environ.get("NPM_COMMAND", "").strip()
+    candidates = [configured] if configured else []
+    if not configured:
+        candidates.extend(("npm.cmd", "npm") if windows else ("npm",))
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+        explicit_path = Path(candidate).expanduser()
+        if explicit_path.is_file():
+            return str(explicit_path.resolve())
+
+    requested = configured or ("npm.cmd/npm" if windows else "npm")
+    raise FileNotFoundError(
+        f"找不到 npm 启动器：{requested}。请安装 Node.js，或设置 NPM_COMMAND 为 npm.cmd 的完整路径。"
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -31,7 +57,7 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError(f"OpenCLI 版本格式无效：{version}")
     output = args.output.expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
-    npm = os.environ.get("NPM_COMMAND", "npm").strip() or "npm"
+    npm = _resolve_npm_command()
     command = [
         npm,
         "install",

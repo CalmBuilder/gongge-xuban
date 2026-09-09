@@ -7,6 +7,7 @@
 """
 
 import ast
+import importlib.util
 import re
 import subprocess
 from pathlib import Path, PureWindowsPath
@@ -251,6 +252,25 @@ def test_windows_package_carries_browser_relay_and_fixed_opencli_runtime() -> No
     assert '"runtime" / "opencli"' in platform_runtime
     assert "shutil.which(name)" in platform_runtime
     assert "node.exe" in launcher and "node_modules" in launcher
+
+
+def test_opencli_fetch_resolves_windows_npm_launcher(monkeypatch: pytest.MonkeyPatch) -> None:
+    """OpenCLI 构建必须把 Windows 的 npm.cmd 解析为可执行启动器。"""
+
+    script_path = PACKAGING / "fetch_opencli_runtime.py"
+    spec = importlib.util.spec_from_file_location("fetch_opencli_runtime", script_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    monkeypatch.delenv("NPM_COMMAND", raising=False)
+    monkeypatch.setattr(
+        module.shutil,
+        "which",
+        lambda name: r"C:\Program Files\nodejs\npm.cmd" if name == "npm.cmd" else None,
+    )
+
+    assert module._resolve_npm_command(is_windows=True).endswith(r"nodejs\npm.cmd")
 
 
 @pytest.mark.parametrize("spec_name,variable", [
