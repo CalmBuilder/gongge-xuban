@@ -95,6 +95,10 @@ def test_windows_build_has_native_installation_smoke_gate() -> None:
         'product_id -eq "gongge-xuban"',
         "GONGGE_XUBAN_DOTENV",
         "PUBLIC_MOCK_API_KEY",
+        "browser-relay-connector.stdout.log",
+        "browser-relay-connector.stderr.log",
+        "Start-Process -FilePath $relayConnector",
+        "Full output:",
         "WINDOWS_NATIVE_SMOKE_PASS",
     ):
         assert marker in smoke_script
@@ -249,6 +253,9 @@ def test_windows_package_carries_browser_relay_and_fixed_opencli_runtime() -> No
     assert 'Source: "..\\out\\gongge-xuban\\*"' in installer
     assert '"--prefix"' in fetch_opencli
     assert '"--ignore-scripts"' in fetch_opencli
+    assert 'collect_submodules("yaml")' in (PACKAGING / "browser-relay-connector.spec").read_text(
+        encoding="utf-8"
+    )
     assert '"runtime" / "opencli"' in platform_runtime
     assert "shutil.which(name)" in platform_runtime
     assert "node.exe" in launcher and "node_modules" in launcher
@@ -264,6 +271,30 @@ def test_opencli_fetch_resolves_windows_npm_launcher(monkeypatch: pytest.MonkeyP
     spec.loader.exec_module(module)
 
     monkeypatch.delenv("NPM_COMMAND", raising=False)
+    monkeypatch.setattr(
+        module.shutil,
+        "which",
+        lambda name: r"C:\Program Files\nodejs\npm.cmd" if name == "npm.cmd" else None,
+    )
+
+    assert module._resolve_npm_command(is_windows=True).endswith(r"nodejs\npm.cmd")
+
+
+def test_opencli_fetch_falls_back_when_npm_override_is_malformed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """错误拼接的 NPM_COMMAND 不得阻断构建，应回退到 PATH 中的 npm.cmd。"""
+
+    script_path = PACKAGING / "fetch_opencli_runtime.py"
+    spec = importlib.util.spec_from_file_location("fetch_opencli_runtime_fallback", script_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    monkeypatch.setenv(
+        "NPM_COMMAND",
+        r"D:\Program Files\nodejs\npm.cmd C:\Users\Administrator\AppData\Roaming\npm\npm.cmd",
+    )
     monkeypatch.setattr(
         module.shutil,
         "which",

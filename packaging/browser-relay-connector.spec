@@ -9,6 +9,7 @@
 """
 
 from pathlib import Path
+from PyInstaller.utils.hooks import collect_submodules
 
 
 BACKEND = Path.cwd()
@@ -23,7 +24,7 @@ a = Analysis(
         "app.vertical_abilities.platform_runtime",
         "app.vertical_abilities.browser_runtime",
         "app.cancellation",
-    ],
+    ] + collect_submodules("yaml"),
     hookspath=[],
     runtime_hooks=[],
     excludes=["tkinter"],

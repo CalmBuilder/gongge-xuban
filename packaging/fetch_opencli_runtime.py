@@ -14,6 +14,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 
 
 DEFAULT_OPENCLI_VERSION = "1.8.7"
@@ -26,8 +27,7 @@ def _resolve_npm_command(*, is_windows: bool | None = None) -> str:
     windows = os.name == "nt" if is_windows is None else is_windows
     configured = os.environ.get("NPM_COMMAND", "").strip()
     candidates = [configured] if configured else []
-    if not configured:
-        candidates.extend(("npm.cmd", "npm") if windows else ("npm",))
+    candidates.extend(("npm.cmd", "npm") if windows else ("npm",))
 
     for candidate in candidates:
         if not candidate:
@@ -39,6 +39,11 @@ def _resolve_npm_command(*, is_windows: bool | None = None) -> str:
         if explicit_path.is_file():
             return str(explicit_path.resolve())
 
+    if configured:
+        print(
+            "警告：NPM_COMMAND 不是有效的 npm 启动器，已回退到系统 PATH 自动查找。",
+            file=sys.stderr,
+        )
     requested = configured or ("npm.cmd/npm" if windows else "npm")
     raise FileNotFoundError(
         f"找不到 npm 启动器：{requested}。请安装 Node.js，或设置 NPM_COMMAND 为 npm.cmd 的完整路径。"

@@ -250,10 +250,26 @@ try {
       throw "Bundled OpenCLI runtime file was not found: $requiredPath"
     }
   }
-  $connectorHelp = (& $relayConnector --help 2>&1 | Out-String)
-  $connectorHelpExitCode = $LASTEXITCODE
-  Assert-ExitCode "Bundled browser Relay connector help probe" $connectorHelpExitCode
-  if ($connectorHelp -notmatch "宿主机浏览器 Relay|browser") {
+  $connectorHelpStdoutPath = Join-Path $tempRoot "browser-relay-connector.stdout.log"
+  $connectorHelpStderrPath = Join-Path $tempRoot "browser-relay-connector.stderr.log"
+  $connectorHelpProcess = Start-Process -FilePath $relayConnector `
+    -ArgumentList @("--help") `
+    -Wait -PassThru `
+    -RedirectStandardOutput $connectorHelpStdoutPath `
+    -RedirectStandardError $connectorHelpStderrPath
+  $connectorHelpExitCode = $connectorHelpProcess.ExitCode
+  $connectorHelpOutput = @(
+    if (Test-Path -LiteralPath $connectorHelpStdoutPath) {
+      Get-Content -LiteralPath $connectorHelpStdoutPath -Raw
+    }
+    if (Test-Path -LiteralPath $connectorHelpStderrPath) {
+      Get-Content -LiteralPath $connectorHelpStderrPath -Raw
+    }
+  ) -join "`n"
+  if ($connectorHelpExitCode -ne 0) {
+    throw "Bundled browser Relay connector help probe failed with exit code $connectorHelpExitCode. Full output: $connectorHelpOutput Diagnostics: $tempRoot"
+  }
+  if ($connectorHelpOutput -notmatch "宿主机浏览器 Relay|browser") {
     throw "Bundled browser Relay connector help output was not recognized."
   }
 
