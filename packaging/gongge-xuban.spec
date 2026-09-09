@@ -40,7 +40,7 @@ datas = [
     (str(BACKEND / "app" / "db" / "seed_fixtures"), "app/db/seed_fixtures"),
     (str(BUILTIN_EXPERT_FIXTURE), "app/experts/data"),
     (str(BACKEND / "mock_servers"), "mock_servers"),
-] + collect_data_files("tzdata")
+] + collect_data_files("tzdata") + collect_data_files("yt_dlp") + collect_data_files("yt_dlp_ejs")
 
 # pydantic-core 以 Rust 原生扩展提供 Pydantic v2 的核心实现。不同版本的
 # wheel 文件名和 Python ABI 会变化，不能只依赖 PyInstaller 对 pydantic 的
@@ -67,6 +67,8 @@ hiddenimports = (
     + collect_submodules("sqlmodel")
     + collect_submodules("app")
     + collect_submodules("pydantic_core")
+    + collect_submodules("yt_dlp")
+    + collect_submodules("yt_dlp_ejs")
     + [
         # pydantic_core.__init__ 通过相对导入加载 Rust 扩展；显式保留完整模块名，
         # 防止不同 PyInstaller/Python 组合只收集到包代码而漏掉扩展模块。

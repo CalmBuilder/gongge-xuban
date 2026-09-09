@@ -10,8 +10,11 @@ from app.cancellation import (
     TurnCancellationRequested,
     TurnCancellationToken,
     cancel_chat_turn,
+    cancel_unbound_chat_turn,
     clear_chat_turn_cancelled,
+    clear_unbound_chat_turn_cancelled,
     is_chat_turn_cancelled,
+    is_unbound_chat_turn_cancelled,
     raise_if_cancelled,
     run_cancellable,
 )
@@ -20,8 +23,11 @@ __all__ = [
     "TurnCancellationRequested",
     "TurnCancellationToken",
     "cancel_chat_turn",
+    "cancel_unbound_chat_turn",
     "clear_chat_turn_cancelled",
+    "clear_unbound_chat_turn_cancelled",
     "is_chat_turn_cancelled",
+    "is_unbound_chat_turn_cancelled",
     "raise_if_cancelled",
     "run_cancellable",
 ]

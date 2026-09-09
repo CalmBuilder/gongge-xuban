@@ -31,8 +31,9 @@ from app.db.models import (
     Tenant,
     Tool,
     User,
+    utc_now,
 )
-from app.dynamic_tasks.agent import DynamicTaskAgent
+from app.dynamic_tasks.agent import DynamicTaskAgent, DynamicTaskAgentError
 from app.dynamic_tasks.worker import reconcile_parallel_read_batches
 from app.dynamic_tasks.capability_catalog import (
     DynamicCapabilityCatalog,
@@ -170,7 +171,7 @@ def test_parallel_read_wave_uses_independent_sessions_and_stable_plan_order(
     _BlockingExecutor.active = 0
     _BlockingExecutor.max_active = 0
     _BlockingExecutor.session_ids = set()
-    with Session(engine, expire_on_commit=False) as db:
+    with Session(engine) as db:
         tenant = Tenant(id="tenant_parallel", name="Parallel")
         user = User(
             id="user_parallel",
@@ -331,6 +332,72 @@ def test_parallel_read_wave_uses_independent_sessions_and_stable_plan_order(
                 DynamicTaskQuotaLease.holder_type == "operation"
             )
         ).all() == []
+
+        existing, _ = SopExecutionStore(db).start_dynamic_instance(
+            tenant_id=tenant.id,
+            session_id="session_parallel_existing_operation",
+            agent_id=profile.id,
+            initiator_user_id=user.id,
+            plan=plan,
+            capability_snapshot={
+                "tools": [row.model_dump(mode="json") for row in snapshots],
+                "model": {
+                    "model_config_id": model.id,
+                    "capabilities": model_capabilities,
+                    "checksum": model.capability_checksum,
+                },
+            },
+        )
+        existing_store = SopExecutionStore(db)
+        with existing_store.owned(existing, worker_id="seed-existing-operation"):
+            existing_node = existing_store.enter_node(
+                existing,
+                "read_a",
+                step_key="read_a",
+                plan_revision_id=existing.current_plan_revision_id,
+                step_kind="tool.read",
+                title="读取 A",
+            )
+            existing_operation = SopOperation(
+                tenant_id=tenant.id,
+                instance_id=existing.id,
+                node_execution_id=existing_node.id,
+                operation_name="read.a",
+                idempotency_key="existing-retry-wait-read",
+                logical_action_id="existing-retry-wait-read",
+                effect_kind="read",
+                status="retry_wait",
+                request_json={"source": "read.a"},
+                request_fingerprint="e" * 64,
+                capability_checksum=snapshots[0].checksum,
+                revision=1,
+            )
+            db.add(existing_operation)
+            db.flush()
+            db.add(SopOperationAttempt(
+                tenant_id=tenant.id,
+                instance_id=existing.id,
+                operation_id=existing_operation.id,
+                node_execution_id=existing_node.id,
+                attempt_number=1,
+                status="retry_wait",
+                retry_at=utc_now(),
+            ))
+        db.commit()
+
+        with pytest.raises(DynamicTaskAgentError, match="DYNAMIC_READ_OPERATION_RETRY_WAIT"):
+            agent.advance_ready_parallel_reads(
+                execution_id=existing.id,
+                model_config=model,
+                worker_id="parallel-existing-retry-wait",
+                actor_user_id=user.id,
+            )
+        assert len(db.exec(
+            select(SopNodeExecution).where(SopNodeExecution.instance_id == existing.id)
+        ).all()) == 1
+        assert len(db.exec(
+            select(SopOperation).where(SopOperation.instance_id == existing.id)
+        ).all()) == 1
     engine.dispose()
 
 
@@ -489,3 +556,35 @@ def test_parallel_result_projection_never_persists_declared_secret_fields() -> N
     )
 
     assert projected == {"name": "ok", "nested": {}}
+
+
+def test_open_result_projection_preserves_agent_reach_collections_and_objects() -> None:
+    """Agent-Reach 开放式数组/对象 schema 不得把真实结果投影为空容器。"""
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "results": {"type": "array"},
+            "repository": {"type": "object"},
+        },
+    }
+    projected = project_result_for_model(
+        {
+            "results": [
+                {"url": "https://github.com/example/project", "title": "Project"},
+            ],
+            "repository": {
+                "name": "project",
+                "description": "A public project",
+                "token": "MUST-NOT-LEAK",
+            },
+        },
+        schema,
+    )
+
+    assert projected == {
+        "results": [
+            {"url": "https://github.com/example/project", "title": "Project"},
+        ],
+        "repository": {"name": "project", "description": "A public project"},
+    }

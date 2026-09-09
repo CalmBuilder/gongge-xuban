@@ -1,3 +1,5 @@
+import { createElement } from 'react';
+import { render, screen } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 
 import type { ChatMessage, ChatSessionEventRead } from '@/types';
@@ -8,9 +10,11 @@ import {
   isRelayRecoveryNetworkFailureTimedOut,
   isTerminalSessionEvent,
   knowledgeCitations,
+  isIntelligenceReport,
   STREAM_TERMINAL_EVENTS,
   stripTrailingCitationSummary,
   streamErrorTraceLine,
+  MarkdownMessage,
 } from './chatHelpers';
 
 type PersistedEventDeferrer = (eventName: string, liveSseOwnsTurn: boolean) => boolean;
@@ -103,6 +107,59 @@ describe('chat citation rendering', () => {
     ]);
 
     expect(knowledgeCitations(item, item.content).map((citation) => citation.label)).toEqual(['[4]']);
+  });
+});
+
+describe('chat external URL rendering', () => {
+  it('turns plain HTTP(S) URLs into links that open in a new tab', () => {
+    const url = 'https://example.com/research/report.pdf?source=agent-reach';
+
+    render(createElement(MarkdownMessage, { content: `来源：${url}。` }));
+
+    const link = screen.getByRole('link', { name: url });
+    expect(link).toHaveAttribute('href', url);
+    expect(link).toHaveAttribute('target', '_blank');
+    expect(link).toHaveAttribute('rel', 'noopener noreferrer');
+    expect(link.parentElement).toHaveTextContent(`${url}。`);
+  });
+
+  it('does not turn code URLs or non-HTTP schemes into external links', () => {
+    const codeUrl = 'https://example.com/code';
+
+    render(createElement(MarkdownMessage, { content: `\`${codeUrl}\` javascript:alert(1)` }));
+
+    expect(screen.queryByRole('link')).not.toBeInTheDocument();
+    expect(screen.getByText(codeUrl)).toBeInTheDocument();
+    expect(screen.getByText('javascript:alert(1)')).toBeInTheDocument();
+  });
+});
+
+describe('structured intelligence report rendering', () => {
+  const zh = (...codePoints: number[]) => String.fromCodePoint(...codePoints);
+  const report = [
+    `## ${zh(32467, 35770, 25688, 35201)}`,
+    `${zh(32467, 35770, 20869, 23481)}${zh(12290)}`,
+    `## ${zh(20851, 38190, 20107, 23454)}`,
+    `- ${zh(20107, 23454)}${zh(19968)}`,
+    `## ${zh(26469, 28304, 19982, 35777, 25454)}`,
+    '1. https://example.com/source',
+  ].join('\n');
+
+  it('recognizes the stable report contract without classifying ordinary answers', () => {
+    expect(isIntelligenceReport({ role: 'assistant' }, report)).toBe(true);
+    expect(isIntelligenceReport(
+      { role: 'assistant' },
+      `${zh(26222, 36890, 38382, 31572)}${zh(65292)}${zh(27809, 26377, 25253, 21578, 20998, 33410)}${zh(12290)}`,
+    )).toBe(false);
+    expect(isIntelligenceReport({ role: 'user' }, report)).toBe(false);
+  });
+
+  it('adds semantic evidence and fact list classes while preserving clickable sources', () => {
+    render(createElement(MarkdownMessage, { content: report, variant: 'intelligence' }));
+
+    expect(document.querySelector('.md-report-facts-list')).toBeInTheDocument();
+    expect(document.querySelector('.md-report-evidence-list')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'https://example.com/source' })).toHaveAttribute('target', '_blank');
   });
 });
 

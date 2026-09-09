@@ -12,10 +12,13 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from queue import Empty, Full, Queue
 from threading import Lock, Thread
+from time import monotonic
 from typing import TypeVar
 
 _lock = Lock()
 _cancelled_turns: set[tuple[str, str]] = set()
+_unbound_cancelled_turns: dict[str, float] = {}
+_UNBOUND_CANCEL_TTL_SECONDS = 15 * 60
 _T = TypeVar("_T")
 
 
@@ -50,6 +53,51 @@ def is_chat_turn_cancelled(session_id: str, turn_id: str) -> bool:
         return (session_id, turn_id) in _cancelled_turns
 
 
+def cancel_unbound_chat_turn(turn_id: str) -> None:
+    """登记尚未创建会话的流式 Turn 取消，等待 worker 建立会话后接管。"""
+
+    normalized_turn_id = str(turn_id or "").strip()
+    if not normalized_turn_id:
+        return
+    now = monotonic()
+    with _lock:
+        expired = [
+            key
+            for key, created_at in _unbound_cancelled_turns.items()
+            if now - created_at > _UNBOUND_CANCEL_TTL_SECONDS
+        ]
+        for key in expired:
+            _unbound_cancelled_turns.pop(key, None)
+        _unbound_cancelled_turns[normalized_turn_id] = now
+
+
+def clear_unbound_chat_turn_cancelled(turn_id: str) -> None:
+    """清理已被 worker 接管或已结束的无会话 Turn 取消登记。"""
+
+    normalized_turn_id = str(turn_id or "").strip()
+    if not normalized_turn_id:
+        return
+    with _lock:
+        _unbound_cancelled_turns.pop(normalized_turn_id, None)
+
+
+def is_unbound_chat_turn_cancelled(turn_id: str) -> bool:
+    """查询尚未绑定会话的 Turn 是否已收到取消，并清理过期登记。"""
+
+    normalized_turn_id = str(turn_id or "").strip()
+    if not normalized_turn_id:
+        return False
+    now = monotonic()
+    with _lock:
+        created_at = _unbound_cancelled_turns.get(normalized_turn_id)
+        if created_at is None:
+            return False
+        if now - created_at > _UNBOUND_CANCEL_TTL_SECONDS:
+            _unbound_cancelled_turns.pop(normalized_turn_id, None)
+            return False
+        return True
+
+
 @dataclass(frozen=True, slots=True)
 class TurnCancellationToken:
     """合并 server/client Turn 别名与持久事件探针，提供稳定取消边界。"""
@@ -67,6 +115,8 @@ class TurnCancellationToken:
             turn_id and is_chat_turn_cancelled(self.session_id, turn_id)
             for turn_id in aliases
         ):
+            return True
+        if self.client_turn_id and is_unbound_chat_turn_cancelled(self.client_turn_id):
             return True
         return bool(self.persistent_probe and self.persistent_probe())
 

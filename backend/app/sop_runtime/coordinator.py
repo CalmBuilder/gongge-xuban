@@ -750,6 +750,8 @@ class DeterministicSopCoordinator:
                 arguments=current_plan.operation_arguments,
             )
             operation = self._running_operation(instance, tool_call.name)
+            if operation is not None and operation.status in {"retry_wait", "unknown"}:
+                return self._wait_for_operation_plan(current_plan, operation)
             started_payload = tool_call.model_dump(mode="json")
             if operation is not None:
                 started_payload["idempotency_key"] = operation.idempotency_key
@@ -822,7 +824,7 @@ class DeterministicSopCoordinator:
                 SopOperationAttempt.tenant_id == instance.tenant_id,
                 SopOperationAttempt.node_execution_id == execution.id,
                 SopOperation.operation_name == operation_name,
-                SopOperation.status.in_(("prepared", "running")),
+                SopOperation.status.in_(("prepared", "running", "retry_wait", "unknown")),
             )
             .order_by(SopOperation.created_at.desc())
         ).first()
@@ -867,7 +869,7 @@ class DeterministicSopCoordinator:
                     )
                 if operation.status == "prepared":
                     self.store.cancel_prepared_operation(operation)
-                elif operation.status in {"running", "unknown"}:
+                elif operation.status in {"running", "retry_wait", "unknown"}:
                     raise WorkItemError(
                         "WORK_ITEM_OPERATION_EFFECT_UNSETTLED",
                         "工作项到期时关联操作的效果尚未收敛。",
@@ -1147,7 +1149,7 @@ class DeterministicSopCoordinator:
                 if operation.status == "prepared":
                     self.store.start_operation(operation)
                     return plan
-                if operation.status in {"running", "unknown"}:
+                if operation.status in {"running", "retry_wait", "unknown"}:
                     if operation.status == "running":
                         self.store.mark_stale_running_operation_unknown(
                             operation,
@@ -1180,7 +1182,7 @@ class DeterministicSopCoordinator:
                 if operation.status == "prepared":
                     self.store.start_operation(operation)
                     return plan
-                if operation.status in {"running", "unknown"}:
+                if operation.status in {"running", "retry_wait", "unknown"}:
                     return self._wait_for_operation_plan(plan, operation)
                 if operation.status in {"succeeded", "failed"}:
                     self._restore_operation_receipt(instance, current_execution, operation)
@@ -1706,9 +1708,10 @@ class DeterministicSopCoordinator:
 
     @staticmethod
     def _wait_for_operation_plan(plan: RuntimePlan, operation: SopOperation) -> RuntimePlan:
-        """把 running/unknown 逻辑动作转换为禁止重复 dispatch 的显式等待计划。"""
+        """把活动或效果未决逻辑动作转换为禁止重复 dispatch 的显式等待计划。"""
 
         unknown = operation.status == "unknown"
+        retry_wait = operation.status == "retry_wait"
         return RuntimePlan(
             action=RuntimeAction.WAIT_OPERATION,
             node_id=plan.node_id,
@@ -1716,11 +1719,15 @@ class DeterministicSopCoordinator:
             error_code=(
                 "RUNTIME_OPERATION_RECONCILIATION_REQUIRED"
                 if unknown
+                else "RUNTIME_OPERATION_RETRY_WAIT"
+                if retry_wait
                 else "RUNTIME_OPERATION_IN_PROGRESS"
             ),
             control_reply=(
                 "外部操作结果尚未确认，系统已停止重复提交并等待对账。"
                 if unknown
+                else "操作正在等待下一次重试，系统不会重复提交。"
+                if retry_wait
                 else "外部操作仍在处理中，系统不会重复提交。"
             ),
         )

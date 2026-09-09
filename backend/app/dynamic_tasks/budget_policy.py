@@ -24,7 +24,7 @@ class DynamicBudgetTier(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class DynamicBudgetProfile:
-    """保存单个预算档位的总量上限和阶段超时上限。"""
+    """保存单个档位的步骤/调用/阶段安全边界及兼容用量观测字段。"""
 
     tier: DynamicBudgetTier
     max_steps: int
@@ -127,6 +127,7 @@ _EXTENDED_MARKERS = (
     "视觉核验",
     "交叉比对",
     "冲突核验",
+    "交叉核验",
     "逐项核验",
     "生成报告",
     "可恢复",
@@ -152,8 +153,9 @@ def select_dynamic_budget(
     goal: str,
     resources: Sequence[Mapping[str, object]],
     guidance_count: int,
+    vertical_ability_count: int = 0,
 ) -> DynamicBudgetProfile:
-    """依据服务端文件事实和用户目标选档，不接受模型自报复杂度。"""
+    """依据服务端事实、垂直能力和用户目标选档，不接受模型自报复杂度。"""
 
     normalized_goal = " ".join(goal.casefold().split())
     resource_count = len(resources)
@@ -196,6 +198,10 @@ def select_dynamic_budget(
         # 一次运行时 Skill 发现；它仍是普通 DynamicTask，只需要更大的运行时
         # 预算，不能因为没有附件而被交互级/标准级预算截断。
         or guidance_count >= 3
+        # 每个垂直能力包都把多个受管适配器、关联证据和结构化交付合同
+        # 冻结到同一个 Execution；它是服务端已知的复杂度事实，不是用户
+        # 资格门槛，也不依赖模型自报。
+        or vertical_ability_count > 0
         or (resource_count > 0 and extended_goal)
         # 纯对话也可能是需要持久计划、恢复和结果核验的复杂任务。不能因为
         # 没有附件就把它压回 300 秒交互预算；用户目标本身是服务端可重放的

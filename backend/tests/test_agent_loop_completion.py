@@ -10,20 +10,28 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.core.agent_loop import GRAPH_PENDING_STEPS_SLOT, AgentLoop, PreparedTurn
+from app.core.agent_loop import (
+    GRAPH_PENDING_STEPS_SLOT,
+    AgentLoop,
+    AgentLoopPreconditionError,
+    PreparedTurn,
+)
 from app.core.non_sop_capability import (
     NonSopCapabilityDecision,
     NonSopCapabilityRouter,
 )
 from app.core.skill_runtime import SkillRuntime
 from app.db.models import AgentEvent, ChatSession, MemoryRecord, Message, Skill, Tool
+from app.dynamic_tasks.agent import DynamicRunOutcome
 from app.knowledge.schema import KnowledgeSearchResponse
 from app.general_skills.schema import GeneralSkillSelection
 from app.session.session_schema import (
     AwaitingInput,
+    ChatTurnResponse,
     KnowledgeQuery,
     PendingTask,
     RouterDecision,
+    SessionPublic,
     StepAgentResult,
 )
 from app.sop_runtime.coordinator import DeterministicSopCoordinator
@@ -176,6 +184,7 @@ def test_sync_turn_returns_the_reply_persisted_by_finalization() -> None:
 
     loop = object.__new__(AgentLoop)
     loop.db = FakeDb()
+    loop.events = FakeEvents()
     loop._prepare_turn = lambda _request: PreparedTurn(
         chat_session=ChatSession(id="session_test", tenant_id="tenant_demo"),
         model_config=_model_config(),
@@ -194,6 +203,39 @@ def test_sync_turn_returns_the_reply_persisted_by_finalization() -> None:
     response = loop.handle_turn(_request("请回答"))
 
     assert response.reply == "规范化回复 [1]"
+    assert loop.events.records[-1][2] == "complete"
+    assert loop.events.records[-1][3]["status"] == "completed"
+
+
+def test_precondition_failure_keeps_created_user_turn_identity() -> None:
+    """验证用户消息创建后发生模型前置失败时仍携带同一 Turn 身份。"""
+
+    loop = object.__new__(AgentLoop)
+    session = ChatSession(id="session_precondition", tenant_id="tenant_demo")
+    user_message = Message(
+        id="message_precondition",
+        tenant_id="tenant_demo",
+        session_id=session.id,
+        role="user",
+        content="需要模型配置",
+    )
+    loop.db = FakeDb()
+    loop.events = FakeEvents()
+    loop._get_or_create_session = lambda _request: session
+    loop._assert_agent_available_for_final_write = lambda *_args, **_kwargs: None
+    loop._mark_session_running = lambda *_args, **_kwargs: None
+    loop._append_message = lambda *_args, **_kwargs: user_message
+    loop._get_request_model = lambda *_args, **_kwargs: None
+    loop._list_published_skills = lambda *_args, **_kwargs: []
+    loop._list_enabled_tools = lambda *_args, **_kwargs: []
+    loop._tools_with_general_skills = lambda *_args, **_kwargs: []
+
+    with pytest.raises(AgentLoopPreconditionError) as captured:
+        loop._prepare_turn(_request("需要模型配置"))
+
+    assert captured.value.code == "missing_model_config"
+    assert captured.value.user_message_id == user_message.id
+    assert [record[2] for record in loop.events.records] == ["user_message_received"]
 
 
 def test_generic_knowledge_query_forwards_frozen_intent_and_budget(monkeypatch) -> None:
@@ -390,6 +432,283 @@ def _no_sop_stream_with_shadow(
         request.interaction_mode = "scheduled_task"
     streamed = list(loop.handle_turn_stream(request))
     return streamed, events
+
+
+def test_stream_dynamic_waiting_does_not_close_turn() -> None:
+    """验证聊天动态任务进入等待后只写 waiting，不提前写入 complete 或 interrupted。"""
+
+    db = FakeDb()
+    events = FakeEvents()
+    loop = object.__new__(AgentLoop)
+    session = ChatSession(
+        id="session_dynamic_waiting",
+        tenant_id="tenant_demo",
+        user_id="user_demo",
+        agent_id="agent_demo",
+        slots_json={},
+        skill_stack_json=[],
+        pending_tasks_json=[],
+        knowledge_context_json=[],
+    )
+    user_message = Message(
+        id="message_dynamic_waiting",
+        tenant_id="tenant_demo",
+        session_id=session.id,
+        role="user",
+        content="搜索最新的开发者工具趋势",
+    )
+    waiting_reply = "动态任务已创建，等待后续步骤继续。"
+    waiting_response = ChatTurnResponse(
+        reply=waiting_reply,
+        session_id=session.id,
+        router_decision=RouterDecision(
+            decision="answer_only",
+            reason="DynamicTaskAgent paused on a governed clarification.",
+        ),
+        step_result=StepAgentResult(reply=waiting_reply, is_step_completed=False),
+        session_state=SessionPublic(
+            session_id=session.id,
+            tenant_id=session.tenant_id,
+            user_id=session.user_id,
+            agent_id=session.agent_id,
+        ),
+    )
+
+    loop.db = db
+    loop.events = events
+    loop.memory = SimpleNamespace(context_memories=lambda *_args, **_kwargs: [])
+    loop._get_or_create_session = lambda _request: session
+    loop._mark_session_running = lambda *_args, **_kwargs: None
+    loop._append_message = lambda *_args, **_kwargs: user_message
+    loop._get_request_model = lambda *_args, **_kwargs: _model_config()
+    loop._list_published_skills = lambda *_args, **_kwargs: []
+    loop._list_enabled_tools = lambda *_args, **_kwargs: []
+    loop._tools_with_general_skills = lambda *_args, **_kwargs: []
+    loop._list_published_general_skills = lambda *_args, **_kwargs: []
+    loop._get_persona_prompt = lambda *_args, **_kwargs: None
+    loop._drop_unavailable_skill_state = lambda *_args, **_kwargs: False
+    loop._conversation_context = lambda *_args, **_kwargs: {}
+    loop._decide_non_sop_capability = lambda *_args, **_kwargs: SimpleNamespace()
+    loop._try_handle_dynamic_task = lambda *_args, **_kwargs: waiting_response
+    loop._assert_agent_available_for_final_write = lambda *_args, **_kwargs: None
+    loop._pace_stream = lambda: None
+
+    request = _request("搜索最新的开发者工具趋势")
+    request.execution_engine = "dynamic_task"
+    request.client_turn_id = "client_dynamic_waiting"
+
+    streamed = list(loop.handle_turn_stream(request))
+    names = [event["event"] for event in streamed]
+
+    assert "turn_waiting" in names
+    assert "complete" not in names
+    assert "stream_interrupted" not in [record[2] for record in events.records]
+    assert [record[2] for record in events.records].count("turn_waiting") == 1
+    assert [record[2] for record in events.records].count("complete") == 0
+
+
+def test_scheduled_dynamic_waiting_is_not_misclassified_as_success() -> None:
+    """调度动态任务的等待投影必须保持 waiting，不能被同步边界写成 complete。"""
+
+    request = _request("按计划生成并等待后续信号")
+    request.channel = "scheduled_task"
+    request.interaction_mode = "scheduled_task"
+    response = ChatTurnResponse(
+        reply="调度任务已排队，等待持久信号继续。",
+        session_id="session_scheduled_waiting",
+        router_decision=RouterDecision(
+            decision="answer_only",
+            reason="DynamicTaskAgent queued by a durable schedule signal.",
+        ),
+        step_result=StepAgentResult(
+            reply="调度任务已排队，等待持久信号继续。",
+            is_step_completed=False,
+        ),
+        session_state=SessionPublic(
+            session_id="session_scheduled_waiting",
+            tenant_id="tenant_demo",
+        ),
+    )
+
+    assert AgentLoop._is_chat_dynamic_waiting_response(request, response) is True
+
+
+def test_stream_dynamic_success_does_not_append_after_runtime_terminal() -> None:
+    """动态成功已由 Runtime 闭合后，聊天流不再追加迟到的普通流事件。"""
+
+    db = FakeDb()
+    events = FakeEvents()
+    loop = object.__new__(AgentLoop)
+    session = ChatSession(
+        id="session_dynamic_success",
+        tenant_id="tenant_demo",
+        user_id="user_demo",
+        agent_id="agent_demo",
+        slots_json={},
+        skill_stack_json=[],
+        pending_tasks_json=[],
+        knowledge_context_json=[],
+    )
+    user_message = Message(
+        id="message_dynamic_success",
+        tenant_id="tenant_demo",
+        session_id=session.id,
+        role="user",
+        content="搜索并整理开发者工具趋势",
+    )
+    success_reply = "动态任务已完成。"
+    success_response = ChatTurnResponse(
+        reply=success_reply,
+        session_id=session.id,
+        router_decision=RouterDecision(
+            decision="answer_only",
+            reason="DynamicTaskAgent completed a governed read-only execution.",
+        ),
+        step_result=StepAgentResult(reply=success_reply, is_step_completed=True),
+        session_state=SessionPublic(
+            session_id=session.id,
+            tenant_id=session.tenant_id,
+            user_id=session.user_id,
+            agent_id=session.agent_id,
+        ),
+    )
+
+    loop.db = db
+    loop.events = events
+    loop.memory = SimpleNamespace(context_memories=lambda *_args, **_kwargs: [])
+    loop._get_or_create_session = lambda _request: session
+    loop._mark_session_running = lambda *_args, **_kwargs: None
+    loop._append_message = lambda *_args, **_kwargs: user_message
+    loop._get_request_model = lambda *_args, **_kwargs: _model_config()
+    loop._list_published_skills = lambda *_args, **_kwargs: []
+    loop._list_enabled_tools = lambda *_args, **_kwargs: []
+    loop._tools_with_general_skills = lambda *_args, **_kwargs: []
+    loop._list_published_general_skills = lambda *_args, **_kwargs: []
+    loop._get_persona_prompt = lambda *_args, **_kwargs: None
+    loop._drop_unavailable_skill_state = lambda *_args, **_kwargs: False
+    loop._conversation_context = lambda *_args, **_kwargs: {}
+    loop._decide_non_sop_capability = lambda *_args, **_kwargs: SimpleNamespace()
+    loop._assert_agent_available_for_final_write = lambda *_args, **_kwargs: None
+    loop._try_handle_dynamic_task = lambda *_args, **_kwargs: (
+        events.record(
+            "tenant_demo",
+            session.id,
+            "complete",
+            {"turn_id": user_message.id, "user_message_id": user_message.id},
+        )
+        or success_response
+    )
+
+    request = _request("搜索并整理开发者工具趋势")
+    request.execution_engine = "dynamic_task"
+    request.client_turn_id = "client_dynamic_success"
+
+    streamed = list(loop.handle_turn_stream(request))
+    streamed_names = [event["event"] for event in streamed]
+    recorded_names = [record[2] for record in events.records]
+
+    assert recorded_names.count("complete") == 1
+    assert "stream_end" not in recorded_names
+    assert "complete" not in streamed_names
+
+
+def test_chat_clarification_resume_does_not_append_after_success_terminal(monkeypatch) -> None:
+    """澄清恢复成功已写入 complete 后，Agent Loop 不再追加迟到 resumed 事件。"""
+
+    recorded: list[tuple] = []
+
+    class _DynamicAgent:
+        """模拟已原子闭合成功结果的聊天动态 Agent。"""
+
+        def __init__(self, _db) -> None:
+            """保存测试依赖。"""
+
+        def bind_turn(self, *_args, **_kwargs) -> None:
+            """兼容生产 Turn 绑定接口。"""
+
+        def resume_chat_clarification(self, **_kwargs):
+            """返回已经由 Runtime 写入成功终态的恢复结果。"""
+
+            return DynamicRunOutcome(
+                status="succeeded",
+                execution_id="execution_resume_success",
+                message=SimpleNamespace(content="澄清后的最终结果"),
+            )
+
+    monkeypatch.setattr("app.core.agent_loop.DynamicTaskAgent", _DynamicAgent)
+    loop = object.__new__(AgentLoop)
+    loop.db = SimpleNamespace(
+        commit=lambda: None,
+        refresh=lambda _row: None,
+    )
+    loop.events = SimpleNamespace(
+        record=lambda *args, **_kwargs: recorded.append(args),
+    )
+    loop._knowledge_capability_payload = lambda *_args, **_kwargs: {"available": False}
+    session = ChatSession(
+        id="session_resume_success",
+        tenant_id="tenant_demo",
+        agent_id="agent_demo",
+        user_id="user_demo",
+    )
+    route = SimpleNamespace(
+        effective_decision=NonSopCapabilityDecision(
+            mode="dynamic_task",
+            goal="继续澄清任务",
+            success_criteria=["形成最终结果"],
+            requires_durable_execution=True,
+        ),
+        general_selection=None,
+    )
+    request = _request("补充澄清信息")
+    request.execution_engine = "dynamic_task"
+    request.user_id = "user_demo"
+    request.agent_id = "agent_demo"
+    request.client_turn_id = "client_resume_success"
+
+    response = loop._try_handle_dynamic_task(
+        request,
+        session,
+        _model_config(),
+        route,
+        "message_resume_success",
+    )
+
+    assert response is not None
+    assert response.reply == "澄清后的最终结果"
+    assert [args[2] for args in recorded] == []
+
+
+def test_dynamic_blocked_projects_as_resumable_waiting_with_client_turn_identity() -> None:
+    """动态读取因重新认证或限流阻塞时，聊天层必须保留等待态和客户端 Turn 身份。"""
+
+    loop = object.__new__(AgentLoop)
+    loop.db = FakeDb()
+    loop.events = FakeEvents()
+    session = ChatSession(
+        id="session_dynamic_blocked",
+        tenant_id="tenant_demo",
+        user_id="user_demo",
+        agent_id="agent_demo",
+    )
+
+    response = loop._dynamic_task_response(
+        chat_session=session,
+        outcome=DynamicRunOutcome(
+            status="blocked",
+            execution_id="execution_blocked",
+            blocking_step_key="public_search",
+        ),
+        user_message_id="message_blocked",
+        client_turn_id="client_blocked",
+    )
+
+    assert response.step_result is not None
+    assert response.step_result.is_step_completed is False
+    messages = [row for row in loop.db.added if isinstance(row, Message)]
+    assert len(messages) == 1
+    assert messages[0].metadata_json["client_turn_id"] == "client_blocked"
+    assert loop.events.records[0][3]["client_turn_id"] == "client_blocked"
 
 
 def _no_sop_prepared_turn_with_shadow(

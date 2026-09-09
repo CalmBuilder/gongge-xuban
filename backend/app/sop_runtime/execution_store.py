@@ -32,6 +32,9 @@ from app.db.models import (
     InputResourceSnapshot,
     InputResourceExtraction,
     AgentProfile,
+    DynamicReadDispatchBatch,
+    DynamicReadDispatchItem,
+    DynamicReadDispatchResult,
     ManagedInputResource,
     MessageInputResourceLink,
     SelectedResourceExtraction,
@@ -60,6 +63,7 @@ from app.session.managed_resources import (
 from app.sop_runtime.contracts import (
     IdempotencyPolicy,
     IdempotencyScope,
+    NONTERMINAL_OPERATION_STATUSES,
     NodeExecutionStatus,
     OperationStatus,
     SopInstanceStatus,
@@ -78,6 +82,26 @@ ACTIVE_INSTANCE_STATUSES = (
     SopInstanceStatus.WAITING.value,
 )
 _EFFECTS_WITH_UNKNOWN_RECONCILIATION = frozenset({"external_write", "destructive"})
+_OPERATION_EFFECT_KINDS = frozenset(
+    {"read", "local_write", "execute", "external_write", "destructive"}
+)
+_OPERATION_EFFECT_SIDES = {
+    "read": "none",
+    "local_write": "local",
+    "execute": "local",
+    "external_write": "external",
+    "destructive": "external",
+}
+_ACTIVE_OPERATION_ATTEMPT_STATUSES = frozenset(
+    {"prepared", "running", "retry_wait"}
+)
+_DISPATCH_ITEM_ACTIVE_STATUSES = frozenset(
+    {"dispatch_pending", "dispatched", "result_ready"}
+)
+_PARALLEL_BATCH_RECLAIM_SECONDS = 30
+_RETRY_WAIT_CANCEL_SAFE_CLASSES = frozenset({"NEVER_DISPATCHED", "SAFE_READ"})
+_VERTICAL_GUIDANCE_ID_PREFIX = "vertical_ability:"
+_VERTICAL_SNAPSHOT_RUNTIME_FIELDS = frozenset({"agent_id", "checksum"})
 
 
 class SopExecutionConflictError(ValueError):
@@ -1622,8 +1646,25 @@ class SopExecutionStore:
             GeneralSkillRuntimeService,
         )
 
-        runtime = GeneralSkillRuntimeService(self.db)
+        regular_use_ids = tuple(
+            use_id for use_id in use_ids if not use_id.startswith(_VERTICAL_GUIDANCE_ID_PREFIX)
+        )
         for use_id in use_ids:
+            if not use_id.startswith(_VERTICAL_GUIDANCE_ID_PREFIX):
+                continue
+            if not self._authorize_virtual_vertical_cause(
+                instance,
+                operation,
+                use_id,
+            ):
+                raise SopExecutionSkillAuthorizationError(
+                    "垂直能力包因果链或执行快照不完整。",
+                    authorization_code="GENERAL_SKILL_TOOL_CAUSE_INVALID",
+                )
+        if not regular_use_ids:
+            return
+        runtime = GeneralSkillRuntimeService(self.db)
+        for use_id in regular_use_ids:
             use = self.db.get(GeneralSkillUse, use_id)
             actor = self.db.get(User, use.user_id) if use is not None else None
             if (
@@ -1651,6 +1692,116 @@ class SopExecutionStore:
                     "Skill 未授权本次工具动作。",
                     authorization_code=exc.code,
                 ) from exc
+
+    @staticmethod
+    def _has_frozen_vertical_guidance(
+        instance: SopInstance,
+        capability_snapshot: Mapping[str, object],
+        use_id: str,
+    ) -> bool:
+        """核验虚拟指导确属当前已冻结能力；不把指导来源当作工具授权列表。"""
+
+        original = instance.capability_snapshot_json or {}
+        ability_id = use_id.removeprefix(_VERTICAL_GUIDANCE_ID_PREFIX)
+        if (
+            instance.kind != "dynamic_task"
+            or not instance.capability_checksum
+            or capability_checksum(original) != instance.capability_checksum
+            or ability_id not in original.get("ability_ids", ())
+            or ability_id not in (instance.context_json or {}).get("vertical_ability_ids", ())
+            or ability_id not in capability_snapshot.get("ability_ids", ())
+        ):
+            return False
+        original_guidance = original.get("vertical_guidance")
+        proposed_guidance = capability_snapshot.get("vertical_guidance")
+        if not isinstance(original_guidance, list) or not isinstance(proposed_guidance, list):
+            return False
+        matches = [
+            row for row in original_guidance
+            if isinstance(row, Mapping) and row.get("ability_id") == ability_id
+            and use_id in row.get("skill_use_ids", ())
+        ]
+        return len(matches) == 1 and matches[0] in proposed_guidance
+
+    @staticmethod
+    def _authorize_virtual_vertical_cause(
+        instance: SopInstance,
+        operation: SopOperation,
+        use_id: str,
+    ) -> bool:
+        """分别验证冻结指导和实际能力，普通工具仍经平台既有实时授权。"""
+
+        ability_id = use_id.removeprefix(_VERTICAL_GUIDANCE_ID_PREFIX).strip()
+        if (
+            not ability_id
+            or instance.kind != "dynamic_task"
+            or not instance.agent_id
+            or operation.instance_id != instance.id
+            or operation.tenant_id != instance.tenant_id
+        ):
+            return False
+        operation_snapshot = operation.capability_snapshot_json or {}
+        if not isinstance(operation_snapshot, Mapping):
+            return False
+        if (
+            operation_snapshot.get("capability_type") not in {"tool", "connector", "knowledge"}
+            or operation_snapshot.get("tenant_id") != operation.tenant_id
+            or not operation.capability_checksum
+            or capability_checksum(operation_snapshot) != operation.capability_checksum
+        ):
+            return False
+        context = instance.context_json or {}
+        context_ability_ids = {
+            str(value).strip()
+            for value in context.get("vertical_ability_ids", ())
+            if str(value).strip()
+        }
+        frozen_catalog = instance.capability_snapshot_json
+        if (
+            not isinstance(frozen_catalog, Mapping)
+            or ability_id not in context_ability_ids
+            or ability_id not in {
+                str(value).strip()
+                for value in frozen_catalog.get("ability_ids", ())
+                if str(value).strip()
+            }
+            or not instance.capability_checksum
+            or capability_checksum(frozen_catalog) != instance.capability_checksum
+            or not SopExecutionStore._has_frozen_vertical_guidance(instance, frozen_catalog, use_id)
+        ):
+            return False
+        matches = [
+            item
+            for items in frozen_catalog.values()
+            for item in (items if isinstance(items, list) else [items])
+            if isinstance(item, Mapping)
+            and item.get("capability_type") == operation_snapshot.get("capability_type")
+            and item.get("name") == operation_snapshot.get("name")
+        ]
+        if len(matches) != 1:
+            return False
+        frozen_snapshot = dict(matches[0])
+        frozen_checksum = str(frozen_snapshot.get("checksum") or "").strip()
+        if (
+            frozen_snapshot.get("tenant_id") != operation.tenant_id
+            or frozen_snapshot.get("agent_id") != instance.agent_id
+            or not frozen_checksum
+            or capability_checksum(
+                {
+                    key: value
+                    for key, value in frozen_snapshot.items()
+                    if key not in _VERTICAL_SNAPSHOT_RUNTIME_FIELDS
+                }
+            )
+            != frozen_checksum
+        ):
+            return False
+        expected_operation_snapshot = {
+            key: value
+            for key, value in frozen_snapshot.items()
+            if key not in _VERTICAL_SNAPSHOT_RUNTIME_FIELDS
+        }
+        return operation_snapshot == expected_operation_snapshot
 
     def authorize_external_operation_dispatch(
         self,
@@ -1951,12 +2102,16 @@ class SopExecutionStore:
             select(SopOperation).where(
                 SopOperation.tenant_id == instance.tenant_id,
                 SopOperation.instance_id == instance.id,
-                SopOperation.status.in_(("prepared", "running", "unknown")),
+                SopOperation.status.in_(NONTERMINAL_OPERATION_STATUSES),
             )
         ).all()
         for operation in operations:
             if operation.status == OperationStatus.PREPARED.value:
                 self.cancel_prepared_operation(operation)
+            elif operation.status == OperationStatus.RETRY_WAIT.value:
+                # retry_wait 必须先按冻结事实分类；只有未派发或纯读安全分支可终结，
+                # 非 read/证据冲突保持未决，不能伪装成当前外部调用效果未知。
+                self._cancel_retry_wait_operation(operation)
             elif operation.status == OperationStatus.RUNNING.value:
                 if operation.effect_kind in _EFFECTS_WITH_UNKNOWN_RECONCILIATION:
                     self.mark_operation_unknown(
@@ -2603,6 +2758,555 @@ class SopExecutionStore:
             .order_by(SopOperationAttempt.attempt_number.desc())
         ).first()
 
+    def _operation_attempts(self, operation: SopOperation) -> list[SopOperationAttempt]:
+        """按稳定操作身份读取全部 Attempt，取消和恢复不得只结算最新一条。"""
+
+        return self.db.exec(
+            select(SopOperationAttempt)
+            .where(
+                SopOperationAttempt.tenant_id == operation.tenant_id,
+                SopOperationAttempt.operation_id == operation.id,
+            )
+            .order_by(SopOperationAttempt.attempt_number)
+        ).all()
+
+    def _classify_retry_wait_cancellation(self, operation: SopOperation) -> str:
+        """依据冻结事实把 retry_wait 取消分类为未派发、纯读安全或保守阻塞。
+
+        该分类只读取当前 Operation、全部 Attempt、效果账本和并行纯读 inbox，不能
+        使用当前可变 Tool 配置或调用方传入的安全布尔值替代历史事实。
+        """
+
+        if operation.effect_kind not in _OPERATION_EFFECT_KINDS:
+            return "INVALID"
+        instance = self.db.get(SopInstance, operation.instance_id)
+        if (
+            instance is None
+            or instance.tenant_id != operation.tenant_id
+            or operation.tenant_id != instance.tenant_id
+        ):
+            return "INVALID"
+        node = self.db.get(SopNodeExecution, operation.node_execution_id)
+        if (
+            node is None
+            or node.tenant_id != operation.tenant_id
+            or node.instance_id != instance.id
+        ):
+            return "INVALID"
+
+        snapshot = operation.capability_snapshot_json
+        if snapshot is None or snapshot == {}:
+            if operation.effect_kind != "read":
+                # 历史无快照纯读可以兼容；非 read 无法证明风险契约，不能推断未派发。
+                return "BLOCKED"
+        else:
+            if not isinstance(snapshot, Mapping) or not snapshot or not operation.capability_checksum:
+                return "INVALID"
+            try:
+                checksum_matches = capability_checksum(snapshot) == operation.capability_checksum
+            except (TypeError, ValueError):
+                checksum_matches = False
+            contract = snapshot.get("contract") if isinstance(snapshot, Mapping) else None
+            if (
+                not checksum_matches
+                or not isinstance(contract, Mapping)
+                or contract.get("risk_class") != operation.effect_kind
+                or contract.get("side_effect") != _OPERATION_EFFECT_SIDES[operation.effect_kind]
+            ):
+                return "INVALID"
+        allowed_effect_states = {"none", "complete", "unknown", "compensated"}
+        if operation.effect_state not in allowed_effect_states:
+            return "INVALID"
+        if (
+            operation.effect_kind == "read"
+            and (
+                operation.effect_state != "none"
+                or operation.compensates_operation_id is not None
+                or operation.external_reference is not None
+            )
+        ):
+            return "INVALID"
+        if not isinstance(operation.result_json, Mapping) or not isinstance(
+            operation.error_json, Mapping
+        ):
+            return "INVALID"
+
+        effects = self.db.exec(
+            select(SopOperationEffect).where(
+                SopOperationEffect.tenant_id == operation.tenant_id,
+                SopOperationEffect.operation_id == operation.id,
+            )
+        ).all()
+        for effect in effects:
+            if (
+                effect.instance_id != instance.id
+                or effect.operation_id != operation.id
+                or effect.logical_action_id != operation.logical_action_id
+                or effect.effect_state not in allowed_effect_states
+            ):
+                return "INVALID"
+            if operation.effect_kind == "read":
+                if (
+                    effect.effect_state != "none"
+                    or effect.external_reference is not None
+                    or effect.compensation_operation_id is not None
+                    or effect.evidence_json
+                ):
+                    return "INVALID"
+
+        attempts = self._operation_attempts(operation)
+        allowed_attempt_states = {
+            "prepared",
+            "running",
+            "retry_wait",
+            "succeeded",
+            "failed",
+            "unknown",
+            "cancelled",
+            "reused",
+        }
+        for attempt in attempts:
+            if (
+                attempt.instance_id != instance.id
+                or attempt.node_execution_id != node.id
+                or attempt.status not in allowed_attempt_states
+            ):
+                return "INVALID"
+            if attempt.status == "unknown":
+                return "BLOCKED"
+
+        dispatch_items = self.db.exec(
+            select(DynamicReadDispatchItem).where(
+                DynamicReadDispatchItem.tenant_id == operation.tenant_id,
+                DynamicReadDispatchItem.operation_id == operation.id,
+            )
+        ).all()
+        dispatch_tokens: set[str] = set()
+        for item in dispatch_items:
+            batch = self.db.get(DynamicReadDispatchBatch, item.batch_id)
+            if (
+                batch is None
+                or batch.tenant_id != operation.tenant_id
+                or batch.execution_id != instance.id
+                or item.execution_id != instance.id
+                or item.node_execution_id != node.id
+                or item.operation_id != operation.id
+                or item.status
+                not in {
+                    "dispatch_pending",
+                    "dispatched",
+                    "result_ready",
+                    "settled",
+                    "discarded",
+                }
+                or not item.dispatch_token
+            ):
+                return "INVALID"
+            dispatch_tokens.add(item.dispatch_token)
+
+        dispatch_results = (
+            self.db.exec(
+                select(DynamicReadDispatchResult).where(
+                    DynamicReadDispatchResult.tenant_id == operation.tenant_id,
+                    DynamicReadDispatchResult.dispatch_token.in_(tuple(dispatch_tokens)),
+                )
+            ).all()
+            if dispatch_tokens
+            else []
+        )
+        for result in dispatch_results:
+            if result.status not in {"succeeded", "failed"}:
+                return "INVALID"
+
+        if operation.effect_kind != "read":
+            # 非 read 只要不是 INVALID，都必须继续保留未决取消意图。
+            return "BLOCKED"
+        if operation.effect_state != "none" or any(
+            effect.effect_state != "none" for effect in effects
+        ):
+            return "INVALID"
+
+        never_dispatched = (
+            operation.started_at is None
+            and operation.dispatched_at is None
+            and operation.completed_at is None
+            and operation.reconciled_at is None
+            and operation.external_reference is None
+            and operation.compensates_operation_id is None
+            and not operation.result_json
+            and not operation.error_json
+            and not effects
+            and not dispatch_items
+            and not dispatch_results
+            and all(
+                attempt.status == OperationStatus.PREPARED.value
+                and attempt.started_at is None
+                and attempt.completed_at is None
+                and attempt.dispatch_token is None
+                for attempt in attempts
+            )
+        )
+        return "NEVER_DISPATCHED" if never_dispatched else "SAFE_READ"
+
+    def discard_parallel_read_item(self, item: DynamicReadDispatchItem) -> bool:
+        """以派发身份 CAS 丢弃并行纯读项，阻断取消或恢复后的迟到回执。"""
+
+        changed = self.db.execute(
+            update(DynamicReadDispatchItem)
+            .where(
+                DynamicReadDispatchItem.id == item.id,
+                DynamicReadDispatchItem.tenant_id == item.tenant_id,
+                DynamicReadDispatchItem.execution_id == item.execution_id,
+                DynamicReadDispatchItem.batch_id == item.batch_id,
+                DynamicReadDispatchItem.dispatch_token == item.dispatch_token,
+                DynamicReadDispatchItem.status.in_(tuple(_DISPATCH_ITEM_ACTIVE_STATUSES)),
+            )
+            .values(status="discarded", updated_at=utc_now())
+            .execution_options(synchronize_session=False)
+        )
+        return changed.rowcount == 1
+
+    def claim_parallel_read_batch(self, batch: DynamicReadDispatchBatch) -> bool:
+        """以波次 revision CAS 取得一次恢复写入权，避免双 worker 重复结算同一波次。"""
+
+        expected_revision = batch.revision
+        now = utc_now()
+        reclaim_before = now - timedelta(seconds=_PARALLEL_BATCH_RECLAIM_SECONDS)
+        changed = self.db.execute(
+            update(DynamicReadDispatchBatch)
+            .where(
+                DynamicReadDispatchBatch.id == batch.id,
+                DynamicReadDispatchBatch.tenant_id == batch.tenant_id,
+                or_(
+                    DynamicReadDispatchBatch.status == "dispatched",
+                    and_(
+                        DynamicReadDispatchBatch.status == "settling",
+                        DynamicReadDispatchBatch.updated_at <= reclaim_before,
+                    ),
+                ),
+                DynamicReadDispatchBatch.revision == expected_revision,
+            )
+            .values(
+                status="settling",
+                revision=expected_revision + 1,
+                updated_at=now,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if changed.rowcount != 1:
+            return False
+        batch.status = "settling"
+        batch.revision = expected_revision + 1
+        batch.updated_at = now
+        return True
+
+    def defer_parallel_read_batch(self, batch: DynamicReadDispatchBatch) -> bool:
+        """把暂不能安全结算的波次按 revision CAS 放回 dispatched，等待原入口处理。"""
+
+        expected_revision = batch.revision
+        now = utc_now()
+        changed = self.db.execute(
+            update(DynamicReadDispatchBatch)
+            .where(
+                DynamicReadDispatchBatch.id == batch.id,
+                DynamicReadDispatchBatch.tenant_id == batch.tenant_id,
+                DynamicReadDispatchBatch.status == "settling",
+                DynamicReadDispatchBatch.revision == expected_revision,
+            )
+            .values(
+                status="dispatched",
+                revision=expected_revision + 1,
+                updated_at=now,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if changed.rowcount != 1:
+            return False
+        batch.status = "dispatched"
+        batch.revision = expected_revision + 1
+        batch.updated_at = now
+        return True
+
+    def settle_parallel_read_item(self, item: DynamicReadDispatchItem) -> bool:
+        """以派发身份 CAS 结算并行纯读项，避免恢复 worker 直接覆盖迟到状态。"""
+
+        if item.status == "settled":
+            return True
+        changed = self.db.execute(
+            update(DynamicReadDispatchItem)
+            .where(
+                DynamicReadDispatchItem.id == item.id,
+                DynamicReadDispatchItem.tenant_id == item.tenant_id,
+                DynamicReadDispatchItem.execution_id == item.execution_id,
+                DynamicReadDispatchItem.batch_id == item.batch_id,
+                DynamicReadDispatchItem.dispatch_token == item.dispatch_token,
+                DynamicReadDispatchItem.status.in_(tuple(_DISPATCH_ITEM_ACTIVE_STATUSES)),
+            )
+            .values(status="settled", updated_at=utc_now())
+            .execution_options(synchronize_session=False)
+        )
+        if changed.rowcount != 1:
+            return False
+        item.status = "settled"
+        item.updated_at = utc_now()
+        return True
+
+    def finalize_parallel_read_batch(
+        self,
+        batch: DynamicReadDispatchBatch,
+        *,
+        status: Literal["succeeded", "failed", "cancelled"],
+    ) -> bool:
+        """以波次 revision CAS 写入唯一终态，统一收口恢复 worker 的 batch 写入。"""
+
+        expected_revision = batch.revision
+        now = utc_now()
+        changed = self.db.execute(
+            update(DynamicReadDispatchBatch)
+            .where(
+                DynamicReadDispatchBatch.id == batch.id,
+                DynamicReadDispatchBatch.tenant_id == batch.tenant_id,
+                DynamicReadDispatchBatch.status == "settling",
+                DynamicReadDispatchBatch.revision == expected_revision,
+            )
+            .values(
+                status=status,
+                revision=expected_revision + 1,
+                updated_at=now,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if changed.rowcount != 1:
+            return False
+        batch.status = status
+        batch.revision = expected_revision + 1
+        batch.updated_at = now
+        return True
+
+    def recover_parallel_read_batch(
+        self,
+        batch: DynamicReadDispatchBatch,
+        *,
+        instance: SopInstance | None,
+        items: Sequence[DynamicReadDispatchItem],
+        results: Mapping[str, DynamicReadDispatchResult],
+    ) -> bool:
+        """在 Store 内完成并行纯读波次的 claim、子事实结算和唯一 batch 终态。"""
+
+        if instance is not None and (
+            instance.tenant_id != batch.tenant_id
+            or instance.id != batch.execution_id
+        ):
+            return False
+        with self.db.begin_nested() as recovery_savepoint:
+            if not self.claim_parallel_read_batch(batch):
+                return False
+            child_facts = [
+                self._parallel_recovery_child_facts(batch, item)
+                for item in items
+            ]
+            if any(facts is None for facts in child_facts):
+                # 关联链不完整时回滚 claim；绝不只凭 item 自身 CAS 丢弃，留待维护/重建处理。
+                recovery_savepoint.rollback()
+                return False
+            if instance is None and items:
+                # 没有父 Execution 时不能安全结算子事实，也不能仅凭 item 自身结束它。
+                recovery_savepoint.rollback()
+                return False
+            resolved_children = [facts for facts in child_facts if facts is not None]
+            if any(
+                inbox is not None
+                and (
+                    inbox.tenant_id != batch.tenant_id
+                    or inbox.dispatch_token != item.dispatch_token
+                    or inbox.status not in {"succeeded", "failed"}
+                )
+                for item in items
+                for inbox in (results.get(item.dispatch_token),)
+            ):
+                # 结果 token/租户不匹配时也回滚整个恢复事务，避免把错误回执投影到别的子动作。
+                recovery_savepoint.rollback()
+                return False
+
+            terminal_instance = instance is None or instance.status not in ACTIVE_INSTANCE_STATUSES
+            if terminal_instance:
+                batch_status: Literal["succeeded", "failed", "cancelled"] = (
+                    "cancelled"
+                    if instance is not None and instance.status == SopInstanceStatus.CANCELLED.value
+                    else "failed"
+                )
+                parent_terminal_error = {"code": "DYNAMIC_PARALLEL_PARENT_TERMINAL"}
+                if instance is not None:
+                    for item, child in zip(items, resolved_children, strict=True):
+                        operation, node = child
+                        child_settled = self.settle_parallel_child_after_parent_terminal(
+                            instance,
+                            operation,
+                            node,
+                            item=item,
+                            error=parent_terminal_error,
+                        )
+                        if not child_settled:
+                            self.discard_parallel_read_item(item)
+                if not self.finalize_parallel_read_batch(batch, status=batch_status):
+                    recovery_savepoint.rollback()
+                    return False
+                return True
+
+            operations = [operation for operation, _node in resolved_children]
+            if any(
+                operation.status in {OperationStatus.RETRY_WAIT.value, OperationStatus.UNKNOWN.value}
+                for operation in operations
+            ):
+                # 恢复扫描器不替 retry_wait/unknown 激活第二个 writer；交还原有合法入口。
+                if not self.defer_parallel_read_batch(batch):
+                    recovery_savepoint.rollback()
+                    return False
+                return False
+
+            failed = False
+            for item, (operation, node) in zip(items, resolved_children, strict=True):
+                if operation.status != OperationStatus.RUNNING.value:
+                    if operation.status in {
+                        OperationStatus.SUCCEEDED.value,
+                        OperationStatus.FAILED.value,
+                    }:
+                        if not self.settle_parallel_read_item(item):
+                            recovery_savepoint.rollback()
+                            return False
+                    else:
+                        if not self.discard_parallel_read_item(item):
+                            recovery_savepoint.rollback()
+                            return False
+                    failed = failed or operation.status != OperationStatus.SUCCEEDED.value
+                    continue
+                inbox = results.get(item.dispatch_token)
+                succeeded = inbox is not None and inbox.status == "succeeded"
+                error = (
+                    dict(inbox.error_json or {})
+                    if inbox is not None
+                    else {
+                        "code": "DYNAMIC_PARALLEL_DISPATCH_TIMEOUT",
+                        "message": "纯读派发在恢复期限内没有产生回执。",
+                    }
+                )
+                self.finish_operation(
+                    operation,
+                    succeeded=succeeded,
+                    result=dict(inbox.result_json or {}) if succeeded and inbox else None,
+                    error=error if not succeeded else None,
+                )
+                if node.status == NodeExecutionStatus.RUNNING.value:
+                    if succeeded:
+                        self.complete_node(instance, node, output=dict(inbox.result_json or {}))
+                    else:
+                        self.fail_node(instance, node, error=error)
+                if not self.settle_parallel_read_item(item):
+                    recovery_savepoint.rollback()
+                    return False
+                failed = failed or not succeeded
+
+            batch_status = "failed" if failed else "succeeded"
+            if not self.finalize_parallel_read_batch(batch, status=batch_status):
+                # 子 Operation/Attempt/Node 变更必须和 batch 最终 CAS 同生共死，不能让 worker
+                # 在方法返回 False 后把半套恢复事实提交出去。
+                recovery_savepoint.rollback()
+                return False
+            if failed:
+                self.fail_instance(
+                    instance,
+                    context_patch={"failure_code": "DYNAMIC_PARALLEL_READ_FAILED"},
+                )
+            else:
+                from app.sop_runtime.execution_control import ExecutionControlService
+
+                ExecutionControlService(self.db, self).enqueue_signal(
+                    instance,
+                    signal_type="capacity_retry",
+                    causation_type="parallel_read_batch",
+                    causation_id=batch.id,
+                    payload={"batch_id": batch.id, "reason": "parallel_read_recovered"},
+                )
+            return True
+
+    def _parallel_recovery_child_facts(
+        self,
+        batch: DynamicReadDispatchBatch,
+        item: DynamicReadDispatchItem,
+    ) -> tuple[SopOperation, SopNodeExecution] | None:
+        """校验 batch→instance→item→node→operation 的完整同租户关联链。"""
+
+        ordered_steps = batch.ordered_step_keys_json
+        if (
+            item.tenant_id != batch.tenant_id
+            or item.batch_id != batch.id
+            or item.execution_id != batch.execution_id
+            or item.plan_revision_id != batch.plan_revision_id
+            or not item.dispatch_token
+            or item.status not in {
+                "dispatch_pending",
+                "dispatched",
+                "result_ready",
+                "settled",
+                "discarded",
+            }
+            or not isinstance(ordered_steps, list)
+            or item.position < 0
+            or item.position >= len(ordered_steps)
+            or ordered_steps[item.position] != item.step_key
+        ):
+            return None
+        operation = self.db.get(SopOperation, item.operation_id)
+        node = self.db.get(SopNodeExecution, item.node_execution_id)
+        if (
+            operation is None
+            or node is None
+            or operation.tenant_id != batch.tenant_id
+            or operation.instance_id != batch.execution_id
+            or operation.node_execution_id != node.id
+            or operation.effect_kind != "read"
+            or node.tenant_id != batch.tenant_id
+            or node.instance_id != batch.execution_id
+            or node.plan_revision_id != batch.plan_revision_id
+            or node.step_key != item.step_key
+            or item.operation_revision_at_start > operation.revision
+        ):
+            return None
+        return operation, node
+
+    def _cancel_active_operation_node(
+        self,
+        operation: SopOperation,
+        *,
+        completed_at: datetime,
+        error_code: str,
+    ) -> None:
+        """在取消 Operation 的同一事务内用节点状态机结算其活动 Node。"""
+
+        execution = self.db.get(SopNodeExecution, operation.node_execution_id)
+        if execution is None:
+            raise SopExecutionConflictError("取消 Operation 找不到所属 Node。")
+        if (
+            execution.tenant_id != operation.tenant_id
+            or execution.instance_id != operation.instance_id
+        ):
+            raise SopExecutionConflictError("取消 Operation 的 Node 归属不一致。")
+        if execution.status not in {
+            NodeExecutionStatus.SCHEDULED.value,
+            NodeExecutionStatus.RUNNING.value,
+            NodeExecutionStatus.WAITING.value,
+        }:
+            return
+        transition = transition_node(
+            NodeExecutionStatus(execution.status),
+            NodeExecutionStatus.CANCELLED,
+            actual_revision=execution.revision,
+        )
+        self._apply_node_transition(execution, transition)
+        execution.error_json = {"code": error_code}
+        execution.completed_at = completed_at
+        self.db.add(execution)
+
     def _append_operation_effect(
         self,
         operation: SopOperation,
@@ -2683,7 +3387,7 @@ class SopExecutionStore:
         self.db.add(target)
 
     def _cancel_running_read(self, operation: SopOperation) -> None:
-        """取消无外部写效果的运行中读取，并终结其当前 attempt。"""
+        """取消无外部写效果的运行中或等待重试读取，并终结其当前 attempt。"""
 
         self._guard_operation_mutation(operation, "operation.cancel_running_read")
         transition = transition_operation(
@@ -2694,17 +3398,176 @@ class SopExecutionStore:
         self._apply_operation_transition(operation, transition)
         operation.cancellation_disposition = "cancelled_no_effect"
         operation.completed_at = utc_now()
-        attempt = self._latest_operation_attempt(operation)
-        if attempt is not None and attempt.status == OperationStatus.RUNNING.value:
-            attempt.status = OperationStatus.CANCELLED.value
-            attempt.completed_at = operation.completed_at
-            attempt.updated_at = operation.completed_at
-            self.db.add(attempt)
+        for attempt in self._operation_attempts(operation):
+            if attempt.status in _ACTIVE_OPERATION_ATTEMPT_STATUSES:
+                attempt.status = OperationStatus.CANCELLED.value
+                attempt.retry_at = None
+                attempt.completed_at = operation.completed_at
+                attempt.updated_at = operation.completed_at
+                self.db.add(attempt)
+        self._cancel_active_operation_node(
+            operation,
+            completed_at=operation.completed_at,
+            error_code="DYNAMIC_EXECUTION_CANCELLED",
+        )
         self.db.add(operation)
         DynamicTaskQuotaService(self.db).release_tool_operation(operation)
 
+    def _cancel_retry_wait_operation(self, operation: SopOperation) -> bool:
+        """按历史证据取消 retry_wait；风险或证据不足时保持未决而不伪造终态。"""
+
+        self._guard_operation_mutation(operation, "operation.cancel_retry_wait")
+        classification = self._classify_retry_wait_cancellation(operation)
+        if classification not in _RETRY_WAIT_CANCEL_SAFE_CLASSES:
+            return False
+        transition = transition_operation(
+            OperationStatus(operation.status),
+            OperationStatus.CANCELLED,
+            actual_revision=operation.revision,
+        )
+        self._apply_operation_transition(operation, transition)
+        operation.cancellation_disposition = (
+            "not_dispatched"
+            if classification == "NEVER_DISPATCHED"
+            else "cancelled_no_effect"
+        )
+        operation.completed_at = utc_now()
+        for attempt in self._operation_attempts(operation):
+            if attempt.status in _ACTIVE_OPERATION_ATTEMPT_STATUSES:
+                attempt.status = OperationStatus.CANCELLED.value
+                attempt.retry_at = None
+                attempt.completed_at = operation.completed_at
+                attempt.updated_at = operation.completed_at
+                self.db.add(attempt)
+        if classification == "SAFE_READ":
+            for item in self._parallel_read_items(operation):
+                self.discard_parallel_read_item(item)
+        self._cancel_active_operation_node(
+            operation,
+            completed_at=operation.completed_at,
+            error_code="DYNAMIC_EXECUTION_CANCELLED",
+        )
+        self.db.add(operation)
+        DynamicTaskQuotaService(self.db).release_tool_operation(operation)
+        return True
+
+    def _parallel_read_items(self, operation: SopOperation) -> list[DynamicReadDispatchItem]:
+        """读取同一纯读 Operation 的并行派发项，保持租户和逻辑动作边界。"""
+
+        return self.db.exec(
+            select(DynamicReadDispatchItem).where(
+                DynamicReadDispatchItem.tenant_id == operation.tenant_id,
+                DynamicReadDispatchItem.operation_id == operation.id,
+            )
+        ).all()
+
+    def settle_parallel_child_after_parent_terminal(
+        self,
+        instance: SopInstance,
+        operation: SopOperation,
+        execution: SopNodeExecution | None,
+        *,
+        item: DynamicReadDispatchItem,
+        error: Mapping[str, object],
+    ) -> bool:
+        """经 Store 统一结算父实例已终态后遗留的并行纯读子事实。
+
+        这是崩溃恢复的受限入口：只校验同租户、同 Execution 的 read Operation，
+        不重新打开或修改父实例；Operation、全部活动 Attempt、Node 和配额仍沿用
+        原状态机/释放路径，避免 worker 直接拼写 revision 与状态。
+        """
+
+        if (
+            instance.status not in {
+                SopInstanceStatus.SUCCEEDED.value,
+                SopInstanceStatus.FAILED.value,
+                SopInstanceStatus.CANCELLED.value,
+                SopInstanceStatus.TIMED_OUT.value,
+            }
+            or operation.tenant_id != instance.tenant_id
+            or operation.instance_id != instance.id
+            or operation.effect_kind != "read"
+            or execution is None
+            or execution.tenant_id != instance.tenant_id
+            or execution.instance_id != instance.id
+            or operation.node_execution_id != execution.id
+            or operation.status not in _ACTIVE_OPERATION_ATTEMPT_STATUSES
+            or item.tenant_id != instance.tenant_id
+            or item.execution_id != instance.id
+            or item.operation_id != operation.id
+            or item.node_execution_id != execution.id
+        ):
+            return False
+        batch = self.db.get(DynamicReadDispatchBatch, item.batch_id)
+        if (
+            batch is None
+            or batch.tenant_id != instance.tenant_id
+            or batch.execution_id != instance.id
+            or not item.dispatch_token
+            or item.status not in {
+                "dispatch_pending",
+                "dispatched",
+                "result_ready",
+                "settled",
+                "discarded",
+            }
+        ):
+            return False
+        attempts = self._operation_attempts(operation)
+        if any(
+            attempt.tenant_id != instance.tenant_id
+            or attempt.instance_id != instance.id
+            or attempt.operation_id != operation.id
+            or attempt.node_execution_id != execution.id
+            for attempt in attempts
+        ):
+            return False
+        target_status = (
+            OperationStatus.CANCELLED
+            if instance.status == SopInstanceStatus.CANCELLED.value
+            else OperationStatus.FAILED
+        )
+        transition = transition_operation(
+            OperationStatus(operation.status),
+            target_status,
+            actual_revision=operation.revision,
+        )
+        self._apply_operation_transition(operation, transition)
+        operation.error_json = dict(error)
+        operation.completed_at = utc_now()
+        for attempt in self._operation_attempts(operation):
+            if attempt.status in _ACTIVE_OPERATION_ATTEMPT_STATUSES:
+                attempt.status = target_status.value
+                attempt.retry_at = None
+                attempt.error_json = dict(error)
+                attempt.completed_at = operation.completed_at
+                attempt.updated_at = operation.completed_at
+                self.db.add(attempt)
+        if execution.status in {
+            NodeExecutionStatus.SCHEDULED.value,
+            NodeExecutionStatus.RUNNING.value,
+            NodeExecutionStatus.WAITING.value,
+        }:
+            node_transition = transition_node(
+                NodeExecutionStatus(execution.status),
+                (
+                    NodeExecutionStatus.CANCELLED
+                    if target_status is OperationStatus.CANCELLED
+                    else NodeExecutionStatus.FAILED
+                ),
+                actual_revision=execution.revision,
+            )
+            self._apply_node_transition(execution, node_transition)
+            execution.error_json = dict(error)
+            execution.completed_at = operation.completed_at
+            self.db.add(execution)
+        self.db.add(operation)
+        DynamicTaskQuotaService(self.db).release_tool_operation(operation)
+        self.discard_parallel_read_item(item)
+        return True
+
     def _settle_requested_cancellation(self, instance: SopInstance) -> bool:
-        """仅在没有 running/unknown 动作时把已请求取消的实例推进到终态。"""
+        """仅在没有未结算动作时把已请求取消的实例推进到终态。"""
 
         if instance.cancellation_requested_at is None:
             return False
@@ -2712,7 +3575,7 @@ class SopExecutionStore:
             select(SopOperation.id).where(
                 SopOperation.tenant_id == instance.tenant_id,
                 SopOperation.instance_id == instance.id,
-                SopOperation.status.in_(("running", "unknown")),
+                SopOperation.status.in_(NONTERMINAL_OPERATION_STATUSES),
             )
         ).first()
         if unresolved is not None:
@@ -2904,11 +3767,20 @@ class SopExecutionStore:
         plan: NormalizedPlan,
         capability_snapshot: Mapping[str, object],
     ) -> None:
-        """机械核对计划引用的 Skill Use 归属、活动终态及固定修订快照。"""
+        """分别核对虚拟能力包指导和数据库 Skill Use 的固定身份与活动归属。"""
 
         planned_ids = {
             use_id for step in plan.steps for use_id in step.guidance_skill_use_ids
         }
+        if not planned_ids:
+            return
+        virtual_ids = {
+            use_id for use_id in planned_ids if use_id.startswith(_VERTICAL_GUIDANCE_ID_PREFIX)
+        }
+        for use_id in virtual_ids:
+            if not self._has_frozen_vertical_guidance(instance, capability_snapshot, use_id):
+                raise SopExecutionConflictError("计划引用的能力包 Guidance 与冻结快照不一致。")
+        planned_ids -= virtual_ids
         if not planned_ids:
             return
         uses = self.db.exec(
@@ -2923,8 +3795,8 @@ class SopExecutionStore:
         raw_frozen = capability_snapshot.get("general_skill_uses")
         frozen = {
             str(item.get("use_id")): item
-            for item in raw_frozen
-            if isinstance(raw_frozen, list) and isinstance(item, Mapping)
+            for item in (raw_frozen if isinstance(raw_frozen, list) else [])
+            if isinstance(item, Mapping)
         }
         for use in uses:
             item = frozen.get(use.id)

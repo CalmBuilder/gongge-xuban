@@ -60,6 +60,7 @@ from app.db.models import (
     ProviderInputDispatchReceipt,
     ResourceSessionBinding,
     SopInstance,
+    SopNodeExecution,
     SopOperation,
     SopWorkItem,
     Tenant,
@@ -79,18 +80,27 @@ from app.dynamic_tasks.agent import (
     _result_claim_repair_hints,
     _append_authoritative_claim_disclosures,
     _append_frozen_guidance_disclosures,
+    _build_public_read_fallback_plan,
+    _build_public_read_gap_plan,
     _ensure_diagnostic_guidance_scaffold,
     _ensure_guidance_coverage_scaffold,
     _ensure_guidance_evidence_disclosures,
     _ensure_claim_repair_hint_disclosures,
+    _ensure_vertical_projection_limit_disclosures,
     _guidance_repair_hints,
     _prune_guidance_duplicate_commands,
     _repair_feedback_has_guidance_error,
     _restore_guidance_repair_hints,
     _normalize_dynamic_result_arguments,
+    _parallel_read_source_selection_allowed,
     _project_dynamic_input_elements,
     _redact_untrusted_instruction_echoes,
     _untrusted_instruction_echo_errors,
+    _validate_read_action_arguments,
+    _validate_vertical_read_source,
+    _vertical_completed_read_urls,
+    _vertical_discovery_source_urls,
+    _successful_vertical_projection_limitations,
 )
 from app.dynamic_tasks.attachment_evidence import (
     AttachmentVisualReview,
@@ -113,6 +123,7 @@ from app.dynamic_tasks.result_verifier import (
 )
 from app.dynamic_tasks.worker import (
     _is_terminal_signal_error,
+    _record_chat_dynamic_outcome,
     due_dynamic_task_signals,
     process_dynamic_task_signal,
 )
@@ -143,7 +154,7 @@ from app.session.input_extraction import (
     parse_xlsx_bytes,
 )
 from app.session.managed_resources import ManagedInputResourceService
-from app.tools.tool_schema import ToolResult
+from app.tools.tool_schema import ToolError, ToolResult
 from app.tools.tool_executor import ToolExecutor
 
 
@@ -231,6 +242,23 @@ class _Executor:
             tool_name=tool_call.name,
             success=True,
             data={"contracts": ["C-001"]},
+        )
+
+
+class _FailingExecutor(_Executor):
+    """返回稳定 Provider 失败回执，验证失败节点的终态幂等性。"""
+
+    def execute(self, tenant_id, tool_call, **kwargs):
+        """模拟一次没有数据交付的外部读取失败。"""
+
+        self.calls += 1
+        return ToolResult(
+            tool_name=tool_call.name,
+            success=False,
+            error=ToolError(
+                code="TEST_PROVIDER_UNAVAILABLE",
+                message="测试 Provider 不可用。",
+            ),
         )
 
 
@@ -592,6 +620,30 @@ class _ShapeRepairRunProposer(_RunProposer):
         return super().propose(view=view, step=step)
 
 
+class _ReadShapeRepairProposer(_Proposer):
+    """首次返回非法 read 动作，验证纯读路径只进行一次结构化修复。"""
+
+    def __init__(self, *, always_invalid: bool = False) -> None:
+        """记录首轮失败、修复提示可见性以及是否持续返回非法动作。"""
+
+        super().__init__()
+        self.always_invalid = always_invalid
+        self.repair_feedback_seen = False
+
+    def propose(self, *, view, step):
+        """对 read 步骤制造非法动作，或在修复轮返回合法工具动作。"""
+
+        self.calls += 1
+        if step.kind != "tool.read":
+            return super().propose(view=view, step=step)
+        self.repair_feedback_seen = self.repair_feedback_seen or (
+            "DYNAMIC_ACTION_PROPOSAL_INVALID" in str(view.messages)
+        )
+        if self.always_invalid or not self.repair_feedback_seen:
+            raise ValueError("能力型动作必须且只能声明 capability_ref")
+        return _response()
+
+
 def test_result_claim_repair_hints_replay_only_supported_undisclosed_claims() -> None:
     """修复反馈只回放上轮唯一问题为未披露的短Claim，不鼓励复用无支持内容。"""
 
@@ -626,6 +678,218 @@ def test_result_claim_repair_hints_replay_only_supported_undisclosed_claims() ->
             "normalized_value": "BEGIN IMMEDIATE",
         }
     ]
+
+
+def test_succeeded_dynamic_outcome_returns_message_bound_to_execution() -> None:
+    """同会话存在多个助手消息时，成功结果只能回传当前 Execution 的交付消息。"""
+
+    instance = SopInstance(
+        id="execution_bound_result",
+        tenant_id="tenant_demo",
+        session_id="session_bound_result",
+        kind="dynamic_task",
+        agent_id="agent_demo",
+        initiator_user_id="user_demo",
+        goal_snapshot_json={},
+        current_plan_revision_id="plan_bound_result",
+        current_plan_checksum="a" * 64,
+        capability_snapshot_json={},
+        current_result_id="result_bound",
+        status="succeeded",
+    )
+    unrelated = Message(
+        id="message_other_execution",
+        tenant_id=instance.tenant_id,
+        session_id=instance.session_id,
+        role="assistant",
+        content="另一个回合的结果",
+        metadata_json={"execution_id": "execution_other"},
+    )
+    expected = Message(
+        id="message_bound_execution",
+        tenant_id=instance.tenant_id,
+        session_id=instance.session_id,
+        role="assistant",
+        content="当前 Execution 的结果",
+        metadata_json={"execution_id": instance.id, "result_id": "result_bound"},
+    )
+
+    class _Rows:
+        """返回按最新优先排列的同会话消息。"""
+
+        def all(self) -> list[Message]:
+            """返回候选消息列表。"""
+
+            return [unrelated, expected]
+
+    class _Db:
+        """提供成功态结果投影所需的最小数据库替身。"""
+
+        def get(self, model, _identifier):
+            """返回当前已成功的动态 Execution。"""
+
+            assert model is SopInstance
+            return instance
+
+        def refresh(self, _row) -> None:
+            """模拟刷新 Execution 状态。"""
+
+        def exec(self, _statement):
+            """返回同会话消息查询结果。"""
+
+            return _Rows()
+
+    agent = object.__new__(DynamicTaskAgent)
+    agent.db = _Db()
+    agent._turn_id = None
+    agent._current_plan = lambda _instance: type(
+        "Plan", (), {"budget": {"max_steps": 1}, "steps": ()}
+    )()
+
+    outcome = agent.run_until_blocked_or_complete(
+        execution_id=instance.id,
+        model_config=object(),
+        worker_id="worker_bound_result",
+        actor_user_id="user_demo",
+    )
+
+    assert outcome.status == "succeeded"
+    assert outcome.message is expected
+
+
+def test_command_rejected_or_conflicted_does_not_close_original_chat_turn() -> None:
+    """后台命令被拒绝或发生并发冲突时，只结束命令本身，不伪造原 Turn 终态。"""
+
+    class _Instance:
+        """提供聊天动态结果投影所需的最小 Execution 身份。"""
+
+        id = "execution_command_projection"
+        tenant_id = "tenant_demo"
+        session_id = "session_command_projection"
+
+    instance = _Instance()
+    for status in ("rejected", "conflicted"):
+        _record_chat_dynamic_outcome(
+            object(),
+            instance,
+            DynamicRunOutcome(status=status, execution_id=instance.id),
+            turn_binding=("message_command_projection", "client_command_projection"),
+        )
+
+
+def test_worker_rejects_dynamic_success_message_from_another_execution() -> None:
+    """后台成功投影必须同时匹配 Execution、消息和结果三方血缘。"""
+
+    class _Instance:
+        """提供聊天动态结果投影所需的 Execution 身份。"""
+
+        id = "execution_expected"
+        tenant_id = "tenant_demo"
+        session_id = "session_result_ownership"
+
+    instance = _Instance()
+    foreign_message = Message(
+        id="message_foreign",
+        tenant_id=instance.tenant_id,
+        session_id=instance.session_id,
+        role="assistant",
+        content="不属于当前 Execution 的结果",
+        metadata_json={"execution_id": "execution_foreign", "result_id": "result_foreign"},
+    )
+
+    class _Db:
+        """只返回伪造消息与结果，验证 Worker 不信任回调对象本身。"""
+
+        def get(self, model, identifier):
+            """按模型返回测试中的伪造结果。"""
+
+            if model is Message:
+                assert identifier == foreign_message.id
+                return foreign_message
+            if model is ExecutionResult:
+                return ExecutionResult(
+                    id=identifier,
+                    tenant_id=instance.tenant_id,
+                    execution_id="execution_foreign",
+                    result_json={},
+                    verification_json={},
+                    checksum="foreign-result-checksum",
+                )
+            raise AssertionError(f"unexpected model: {model}")
+
+    with pytest.raises(DynamicTaskAgentError) as captured:
+        _record_chat_dynamic_outcome(
+            _Db(),
+            instance,
+            DynamicRunOutcome(
+                status="succeeded",
+                execution_id=instance.id,
+                message=foreign_message,
+            ),
+            turn_binding=("message_user", "client_result_ownership"),
+        )
+
+    assert captured.value.code == "DYNAMIC_CHAT_RESULT_OWNERSHIP_INVALID"
+
+
+def test_worker_does_not_close_original_turn_for_foreground_clarification_result() -> None:
+    """旧 signal 看到前台新回答 Turn 的结果时，不得把结果投影回原等待 Turn。"""
+
+    class _Instance:
+        """提供聊天动态结果投影所需的 Execution 身份。"""
+
+        id = "execution_clarification_identity"
+        tenant_id = "tenant_demo"
+        session_id = "session_clarification_identity"
+
+    instance = _Instance()
+    published_message = Message(
+        id="message_foreground_answer",
+        tenant_id=instance.tenant_id,
+        session_id=instance.session_id,
+        role="assistant",
+        content="前台澄清已完成",
+        metadata_json={
+            "execution_id": instance.id,
+            "result_id": "result_clarification_identity",
+            "turn_id": "message_foreground_turn",
+            "user_message_id": "message_foreground_turn",
+            "client_turn_id": "client_foreground_turn",
+        },
+    )
+
+    class _Db:
+        """返回已由前台新 Turn 发布的消息与同一 Execution 结果。"""
+
+        def get(self, model, identifier):
+            """按模型返回消息和同源结果，确保只测试 Turn 身份分叉。"""
+
+            if model is Message:
+                return published_message if identifier == published_message.id else None
+            if model is ExecutionResult:
+                return ExecutionResult(
+                    id=identifier,
+                    tenant_id=instance.tenant_id,
+                    execution_id=instance.id,
+                    result_json={},
+                    verification_json={},
+                    checksum="clarification-result-checksum",
+                )
+            raise AssertionError(f"unexpected model: {model}")
+
+        def commit(self) -> None:
+            """模拟正常结果路径的提交接口。"""
+
+    _record_chat_dynamic_outcome(
+        _Db(),
+        instance,
+        DynamicRunOutcome(
+            status="succeeded",
+            execution_id=instance.id,
+            message=published_message,
+        ),
+        turn_binding=("message_original_waiting", "client_original_waiting"),
+    )
 
 
 def test_diagnostic_guidance_scaffold_repairs_short_provider_answer_without_facts() -> None:
@@ -2224,6 +2488,250 @@ def _ensure_dynamic_agent(db: Session, *, agent_id: str = "agent_demo") -> None:
         db.flush()
 
 
+def test_read_action_arguments_follow_frozen_input_schema_before_dispatch() -> None:
+    """读取动作缺少 URL 或携带未声明字段时必须在外发前进入 repair 路径。"""
+
+    capability_view = {
+        "input_schema": {
+            "type": "object",
+            "properties": {"url": {"type": "string", "format": "uri"}},
+            "required": ["url"],
+            "additionalProperties": False,
+        }
+    }
+
+    with pytest.raises(ValueError, match="缺少必填参数"):
+        _validate_read_action_arguments({}, capability_view)
+    with pytest.raises(ValueError, match="URL 参数无效"):
+        _validate_read_action_arguments({"url": "not-a-url"}, capability_view)
+    with pytest.raises(ValueError, match="未声明参数"):
+        _validate_read_action_arguments(
+            {"url": "https://example.com", "unexpected": True}, capability_view
+        )
+    _validate_read_action_arguments({"url": "https://example.com"}, capability_view)
+
+
+def test_vertical_web_read_uses_completed_search_sources_or_explicit_goal_url() -> None:
+    """全网原文读取必须从当前搜索回执下钻，但保留用户直给网页的合法入口。"""
+
+    plan = NormalizedPlan(
+        goal="比较两个公开 CLI 方案",
+        success_criteria=(
+            SuccessCriterion(id="done", type="assertion", spec={"required": True}),
+        ),
+        steps=(
+            PlanStep(
+                step_key="search",
+                title="搜索候选来源",
+                kind="tool.read",
+                capability_refs=("intelligence.web_search",),
+            ),
+            PlanStep(
+                step_key="read",
+                title="读取原文",
+                kind="tool.read",
+                depends_on=("search",),
+                capability_refs=("intelligence.web_read",),
+            ),
+        ),
+    )
+    completed_steps = (
+        {
+            "step_key": "search",
+            "model_output": {
+                "results": [{"url": "https://example.com/article/"}],
+            },
+        },
+    )
+
+    assert _vertical_discovery_source_urls(completed_steps, plan) == (
+        "https://example.com/article/",
+    )
+    completed_with_read = (
+        *completed_steps,
+        {
+            "step_key": "read",
+            "model_output": {"url": "https://example.com/article"},
+        },
+    )
+    assert _vertical_completed_read_urls(completed_with_read, plan) == (
+        "https://example.com/article",
+    )
+    _validate_vertical_read_source(
+        {"url": "https://example.com/article"},
+        step=plan.steps[1],
+        plan=plan,
+        completed_steps=completed_steps,
+        goal=plan.goal,
+    )
+    _validate_vertical_read_source(
+        {"url": "https://user.example/direct"},
+        step=plan.steps[1],
+        plan=plan,
+        completed_steps=completed_steps,
+        goal="请读取 https://user.example/direct",
+    )
+    with pytest.raises(ValueError, match="必须来自已完成 intelligence.web_search"):
+        _validate_vertical_read_source(
+            {"url": "https://memory.example/not-in-search"},
+            step=plan.steps[1],
+            plan=plan,
+            completed_steps=completed_steps,
+            goal=plan.goal,
+        )
+    with pytest.raises(ValueError, match="不能重复读取同一 URL"):
+        _validate_vertical_read_source(
+            {"url": "https://example.com/article/"},
+            step=plan.steps[1],
+            plan=plan,
+            completed_steps=completed_with_read,
+            goal=plan.goal,
+        )
+    with pytest.raises(ValueError, match="不能重复读取同一 URL"):
+        _validate_vertical_read_source(
+            {"url": "https://example.com/article"},
+            step=plan.steps[1],
+            plan=plan,
+            completed_steps=completed_steps,
+            goal=plan.goal,
+            already_read_urls=("https://example.com/article/",),
+        )
+
+
+def test_github_repo_sources_drive_a_transparent_web_read_fallback_branch() -> None:
+    """GitHub 专用详情失败时应改建可回证 web_read 分支并保留旧步骤语义。"""
+
+    issue_url = "https://github.com/acme/tool/issues/42"
+    repository_url = "https://github.com/acme/tool"
+    plan = NormalizedPlan(
+        goal="评估公开 MCP Server 的 Issue 反馈",
+        success_criteria=(
+            SuccessCriterion(id="done", type="assertion", spec={"required": True}),
+        ),
+        steps=(
+            PlanStep(
+                step_key="repo",
+                title="读取仓库摘要",
+                kind="tool.read",
+                capability_refs=("intelligence.github_repo",),
+            ),
+            PlanStep(
+                step_key="issue",
+                title="读取 Issue 详情",
+                kind="tool.read",
+                depends_on=("repo",),
+                capability_refs=("intelligence.github_issue",),
+            ),
+            PlanStep(
+                step_key="answer",
+                title="形成结论",
+                kind="answer",
+                depends_on=("issue",),
+            ),
+        ),
+    )
+    completed_steps = (
+        {
+            "step_key": "repo",
+            "model_output": {
+                "repository": {"url": repository_url},
+                "issues": [{"url": issue_url}],
+            },
+        },
+    )
+
+    assert _vertical_discovery_source_urls(completed_steps, plan) == (
+        issue_url,
+        repository_url,
+    )
+    recovered = _build_public_read_fallback_plan(
+        plan,
+        failed_steps=((plan.steps[1], "intelligence.github_issue", (issue_url,)),),
+        completed_step_keys=("repo",),
+        recovery_number=1,
+    )
+    assert recovered is not None
+    fallback_plan, metadata = recovered
+    fallback_step = next(
+        step for step in fallback_plan.steps if step.step_key.endswith("__web_read_recovery_1")
+    )
+    assert fallback_step.capability_refs == ("intelligence.web_read",)
+    assert fallback_step.depends_on == ("repo",)
+    assert "issue" not in {step.step_key for step in fallback_plan.steps}
+    assert metadata["issue"]["fallback_step_key"] == fallback_step.step_key
+    fallback_answer = next(step for step in fallback_plan.steps if step.kind == "answer")
+    assert fallback_answer.depends_on == (fallback_step.step_key,)
+    _validate_vertical_read_source(
+        {"url": issue_url},
+        step=fallback_step,
+        plan=fallback_plan,
+        completed_steps=completed_steps,
+        goal=plan.goal,
+    )
+
+
+def test_parallel_web_reads_are_serialized_at_the_source_selection_boundary() -> None:
+    """同一波次只串行选择 web_read，其他不同能力仍可进入并发候选。"""
+
+    web_read = PlanStep(
+        step_key="read_web",
+        title="读取网页",
+        kind="tool.read",
+        capability_refs=("intelligence.web_read",),
+    )
+    other_read = web_read.model_copy(
+        update={"step_key": "read_other", "capability_refs": ("intelligence.rss_read",)}
+    )
+    assert _parallel_read_source_selection_allowed(web_read, web_read_selected=False)
+    assert not _parallel_read_source_selection_allowed(web_read, web_read_selected=True)
+    assert _parallel_read_source_selection_allowed(other_read, web_read_selected=True)
+
+
+def test_github_detail_without_public_page_keeps_failure_and_continues_to_gap_report() -> None:
+    """GitHub 关联详情无可替代页面时不得重复失败，应保留失败并让报告显式说明缺口。"""
+
+    plan = NormalizedPlan(
+        goal="核对公开项目的 Issue 反馈",
+        success_criteria=(
+            SuccessCriterion(id="done", type="assertion", spec={"required": True}),
+        ),
+        steps=(
+            PlanStep(
+                step_key="repo",
+                title="读取仓库摘要",
+                kind="tool.read",
+                capability_refs=("intelligence.github_repo",),
+            ),
+            PlanStep(
+                step_key="issue",
+                title="读取 Issue 详情",
+                kind="tool.read",
+                depends_on=("repo",),
+                capability_refs=("intelligence.github_issue",),
+            ),
+            PlanStep(
+                step_key="answer",
+                title="形成结论",
+                kind="answer",
+                depends_on=("repo", "issue"),
+            ),
+        ),
+    )
+    recovered = _build_public_read_gap_plan(
+        plan,
+        failed_steps=((plan.steps[1], "intelligence.github_issue"),),
+        completed_step_keys=("repo",),
+        recovery_number=1,
+    )
+    assert recovered is not None
+    gap_plan, metadata = recovered
+    assert "issue" not in {step.step_key for step in gap_plan.steps}
+    gap_answer = next(step for step in gap_plan.steps if step.kind == "answer")
+    assert gap_answer.step_key.endswith("__gap_recovery_1")
+    assert gap_answer.depends_on == ("repo",)
+    assert metadata["issue"]["gap_step_keys"] == (gap_answer.step_key,)
+
+
 def test_file_sqlite_model_heartbeat_prevents_duplicate_claim_and_then_expires(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2571,6 +3079,8 @@ def test_reauth_signal_resumes_same_connector_read_operation_without_duplicate_d
                     "checksum": model.capability_checksum,
                 },
             },
+            source_kind="connector",
+            source_ref="connector-reauth-read",
         )[0]
         runtime = DynamicTaskAgent(db, connection_service=connection_service)
 
@@ -2794,6 +3304,47 @@ def test_completed_read_operation_is_reused_without_second_adapter_call() -> Non
         assert operation.status == "succeeded"
         assert executor.calls == 1
         assert catalog.calls == 1
+
+
+def test_failed_read_step_is_not_retried_or_failed_twice() -> None:
+    """验证 Provider 失败后不重复落账同一失败节点，并以原错误码终结 Execution。"""
+
+    engine = create_engine("sqlite://", poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as db:
+        snapshot = _snapshot()
+        instance = _instance(db, snapshot)
+        executor = _FailingExecutor()
+        agent = DynamicTaskAgent(db, catalog=_Catalog(), tool_executor=executor)
+        first = agent.execute_read_proposal(
+            execution_id=instance.id,
+            step_key="query_contract",
+            completed_response=_response(),
+            provider="openai_compatible",
+            model="model_demo",
+            model_capabilities=_model_capabilities(),
+            worker_id="worker_failed_read",
+            actor_user_id="user_demo",
+        )
+        db.commit()
+
+        assert first.success is False
+        with pytest.raises(DynamicTaskAgentError, match="TEST_PROVIDER_UNAVAILABLE"):
+            agent.run_until_blocked_or_complete(
+                execution_id=instance.id,
+                model_config=ModelConfig(id="unused_model", tenant_id="tenant_demo"),
+                worker_id="worker_failed_read_resume",
+                actor_user_id="user_demo",
+            )
+
+        db.refresh(instance)
+        node = db.exec(select(SopNodeExecution).where(SopNodeExecution.instance_id == instance.id)).one()
+        operations = db.exec(select(SopOperation).where(SopOperation.instance_id == instance.id)).all()
+        assert instance.status == "failed"
+        assert instance.terminal_reason_json == {"code": "TEST_PROVIDER_UNAVAILABLE"}
+        assert node.status == "failed"
+        assert len(operations) == 1
+        assert executor.calls == 1
 
 
 def test_non_read_frozen_capability_is_rejected_before_dispatch() -> None:
@@ -3296,7 +3847,7 @@ def test_advance_connects_plan_provider_view_proposal_and_read_operation() -> No
         snapshot = _snapshot()
         catalog = _StartCatalog(model, snapshot)
         executor = _Executor()
-        proposer = _Proposer()
+        proposer = _ReadShapeRepairProposer()
         agent = DynamicTaskAgent(
             db,
             catalog=catalog,
@@ -3324,8 +3875,42 @@ def test_advance_connects_plan_provider_view_proposal_and_read_operation() -> No
 
         assert step.step_key == "query_contract"
         assert result.success is True
-        assert proposer.calls == 1
+        assert proposer.calls == 2
+        assert proposer.repair_feedback_seen is True
         assert executor.calls == 1
+
+
+def test_read_action_shape_repair_ends_with_stable_error_after_one_retry() -> None:
+    """纯读动作连续非法时只请求一次修复，并转换为稳定运行时错误。"""
+
+    agent = DynamicTaskAgent.__new__(DynamicTaskAgent)
+    repair_feedback: list[object] = []
+
+    def invalid_proposal(**kwargs):
+        """记录首轮与修复轮输入，并持续返回动作形状错误。"""
+
+        repair_feedback.append(kwargs.get("repair_feedback"))
+        raise ValueError("能力型动作必须且只能声明 capability_ref")
+
+    agent._propose_action = invalid_proposal
+    step = PlanStep(
+        step_key="query_contract",
+        title="读取合同",
+        kind="tool.read",
+        capability_refs=("contract.query",),
+    )
+
+    with pytest.raises(DynamicTaskAgentError, match="DYNAMIC_ACTION_PROPOSAL_INVALID"):
+        agent._propose_read_action(
+            instance=None,
+            step=step,
+            model_config=ModelConfig(id="model_read_repair", tenant_id="tenant_demo"),
+            worker_id="worker_read_repair",
+        )
+
+    assert len(repair_feedback) == 2
+    assert repair_feedback[0] is None
+    assert repair_feedback[1]["code"] == "DYNAMIC_ACTION_PROPOSAL_INVALID"
 
 
 def test_completed_read_result_is_schema_projected_into_answer_context() -> None:
@@ -3392,6 +3977,112 @@ def test_completed_read_result_is_schema_projected_into_answer_context() -> None
             "contracts": ["C-001"]
         }
         assert "must-not-enter-provider-view" not in projection.model_dump_json()
+
+
+def test_vertical_model_projection_clip_is_bound_to_operation_and_disclosed() -> None:
+    """验证模型侧网页裁剪按真实 Operation/请求 URL 绑定，并自动进入最终限制说明。"""
+
+    engine = create_engine("sqlite://", poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    source_url = "https://example.org/long-document"
+    instance = SopInstance(
+        id="inst_projection_clip",
+        tenant_id="tenant_demo",
+        session_id="session_projection_clip",
+        kind="dynamic_task",
+    )
+    plan = NormalizedPlan(
+        goal="读取网页并形成报告",
+        success_criteria=(
+            SuccessCriterion(id="criterion_clip", type="assertion", spec={}),
+        ),
+        steps=(
+            PlanStep(
+                step_key="read_source",
+                title="读取网页",
+                kind="tool.read",
+                capability_refs=("intelligence.web_read",),
+            ),
+        ),
+    )
+    with Session(engine, expire_on_commit=False) as db:
+        db.add(
+            SopOperation(
+                id="op_projection_clip",
+                tenant_id=instance.tenant_id,
+                instance_id=instance.id,
+                node_execution_id="node_projection_clip",
+                operation_name="intelligence.web_read",
+                idempotency_key="projection-clip-idempotency",
+                logical_action_id="projection-clip-action",
+                request_fingerprint="projection-clip-fingerprint",
+                request_json={"url": source_url},
+                result_json={
+                    "data": {
+                        "url": source_url,
+                        "content": "网页正文片段",
+                        "provider": "Jina Reader",
+                        "retrieved_at": "2026-09-08T00:00:00Z",
+                    }
+                },
+                capability_snapshot_json={
+                    "audit_view": {"vertical_ability": {"id": "web-intelligence"}}
+                },
+                status="succeeded",
+            )
+        )
+        db.commit()
+
+        limitations = _successful_vertical_projection_limitations(
+            db,
+            instance,
+            completed_steps=(
+                {
+                    "step_key": "read_source",
+                    "output_ref": {"node_execution_id": "node_projection_clip"},
+                    "model_output": {
+                        "url": source_url,
+                        "content": (
+                            "网页正文片段\n[模型上下文已截断：原始字段共 18000 字符，"
+                            "仅展示开头内容；不得视为全文。]"
+                        ),
+                    },
+                },
+            ),
+            plan=plan,
+        )
+        assert limitations == (
+            (
+                "intelligence.web_read",
+                f"请求 URL：{source_url}",
+                "模型上下文已截断：原始字段共 18000 字符，仅展示开头内容；不得视为全文。",
+            ),
+        )
+
+        response = CompletedProviderProposal(
+            response_id="projection-clip-response",
+            finish_reason="stop",
+            proposal=RuntimeActionProposal(
+                action_kind=ActionKind.ANSWER,
+                arguments={
+                    "markdown": (
+                        "## 结论摘要\n网页内容已读取。\n## 关键事实\n待整理。\n"
+                        f"## 来源与证据\n{source_url}\n## 冲突/缺口\n暂无。\n"
+                        "## 后续建议\n继续核验。"
+                    )
+                },
+                rationale="完成网页读取结果交付",
+            ),
+        )
+        disclosed = _ensure_vertical_projection_limit_disclosures(
+            response,
+            limitations=limitations,
+        )
+        markdown = disclosed.proposal.arguments["markdown"]
+        assert "intelligence.web_read" in markdown
+        assert source_url in markdown
+        assert "原始字段共 18000 字符" in markdown
+        assert markdown.index("系统回证限制（模型上下文投影）") < markdown.index("## 后续建议")
 
 
 def test_verified_result_message_publication_and_terminal_state_commit_together() -> None:
@@ -4101,6 +4792,7 @@ def test_signal_error_disposition_separates_deterministic_and_transient_failures
     assert _is_terminal_signal_error("DYNAMIC_RESULT_VERIFICATION_FAILED") is True
     assert _is_terminal_signal_error("DYNAMIC_ACTION_PROPOSAL_INVALID") is True
     assert _is_terminal_signal_error("DYNAMIC_RUNTIME_BUDGET_EXCEEDED") is True
+    assert _is_terminal_signal_error("DYNAMIC_TOKEN_BUDGET_EXCEEDED") is False
     assert _is_terminal_signal_error("TimeoutError") is False
     assert _is_terminal_signal_error("LLM_PROVIDER_UNAVAILABLE") is False
 
@@ -4260,8 +4952,8 @@ def test_claimed_signal_transient_retry_exhaustion_closes_execution_and_command(
         assert instance.terminal_reason_json == {"code": "DYNAMIC_SIGNAL_RETRY_EXHAUSTED"}
 
 
-def test_persistent_model_and_token_budgets_block_before_unbounded_followup_calls() -> None:
-    """验证规划调用计入账本，模型次数和 token 越界后不会继续调用工具或下一轮模型。"""
+def test_persistent_model_budget_blocks_loops_but_provider_token_usage_stays_authoritative() -> None:
+    """验证模型调用次数仍阻断失控循环，但 Provider token 超过平台估算值仍可继续完成。"""
 
     engine = create_engine("sqlite://", poolclass=StaticPool)
     SQLModel.metadata.create_all(engine)
@@ -4351,23 +5043,24 @@ def test_persistent_model_and_token_budgets_block_before_unbounded_followup_call
         }
         db.add(token_instance)
         db.commit()
-        try:
-            token_agent.run_until_blocked_or_complete(
-                execution_id=token_instance.id,
-                model_config=model,
-                worker_id="worker_token_budget",
-                actor_user_id="user_demo",
-            )
-        except DynamicTaskAgentError as exc:
-            assert str(exc) == "DYNAMIC_TOKEN_BUDGET_EXCEEDED"
-        else:
-            raise AssertionError("provider 返回 token 超过冻结上限后必须停止")
+        outcome = token_agent.run_until_blocked_or_complete(
+            execution_id=token_instance.id,
+            model_config=model,
+            worker_id="worker_token_budget",
+            actor_user_id="user_demo",
+        )
+        assert outcome.status == "succeeded"
         db.refresh(token_instance)
         usage = token_instance.context_json["dynamic_budget_usage"]
-        assert usage["input_tokens"] == 10
-        assert usage["total_tokens"] == 15
-        assert token_proposer.calls == 1
-        assert token_executor.calls == 0
+        assert usage["input_tokens"] == 20
+        assert usage["output_tokens"] == 10
+        assert usage["total_tokens"] == 30
+        assert token_instance.context_json["dynamic_budget_observations"] == {
+            "token_budget_mode": "provider_authoritative",
+            "last_exceeded_counters": ["input_tokens", "output_tokens", "total_tokens"],
+        }
+        assert token_proposer.calls == 2
+        assert token_executor.calls == 1
 
 
 def test_managed_attachment_is_snapshotted_and_reauthorized_into_provider_view(tmp_path) -> None:
@@ -5656,6 +6349,8 @@ def test_clarification_attention_resumes_same_execution_after_restart_style_sign
             goal="生成合作方合同风险简报",
             success_criteria=("覆盖合同证据",),
             model_config=model,
+            source_kind="manual",
+            source_ref="clarification-restart-test",
         )
 
         waiting = agent.run_until_blocked_or_complete(
@@ -5789,6 +6484,8 @@ def _steering_execution(db: Session):
         goal="生成合作方合同风险简报",
         success_criteria=("覆盖合同证据",),
         model_config=model,
+        source_kind="manual",
+        source_ref="steering-test",
     )
     agent.advance_next_read_step(
         execution_id=instance.id,

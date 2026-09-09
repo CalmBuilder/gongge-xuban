@@ -79,7 +79,7 @@ class DynamicTaskPlanner:
         max_runtime_seconds: int = 900,
         explore_enabled: bool = False,
     ) -> None:
-        """冻结服务端预算；任何 provider 输出都不能扩大这些上限。"""
+        """冻结步骤、调用和墙钟安全边界；token 用量字段仅为兼容快照与观测，不是失败门禁。"""
 
         self.client = client
         self.max_steps = max_steps
@@ -228,6 +228,10 @@ class DynamicTaskPlanner:
                 "max_input_tokens": self.max_input_tokens,
                 "max_output_tokens": self.max_output_tokens,
                 "max_total_tokens": self.max_total_tokens,
+                "token_usage_semantics": (
+                    "max_input_tokens、max_output_tokens、max_total_tokens 仅记录 Provider usage 和兼容旧快照；"
+                    "Provider 接受请求时不得因这些观测值停止或省略必需步骤。"
+                ),
                 "max_runtime_seconds": self.max_runtime_seconds,
                 "allowed_step_kinds": allowed_step_kinds,
             },
@@ -249,6 +253,10 @@ class DynamicTaskPlanner:
             guidance_sources_by_name
         )
         repair_payload = dict(payload)
+        research_depth_repair_instruction = _research_depth_repair_instruction(
+            goal=goal,
+            loaded_guidance=loaded_guidance,
+        )
         last_error: ValueError | ValidationError | None = None
         for attempt in range(3):
             with llm_operation("dynamic_task.plan"):
@@ -434,6 +442,12 @@ class DynamicTaskPlanner:
                     has_input_resources=bool(input_resources),
                 )
                 _validate_plan_convergence(plan)
+                _validate_research_depth_plan(
+                    plan,
+                    goal=goal,
+                    loaded_guidance=loaded_guidance,
+                    capabilities=executable_capabilities,
+                )
                 return plan
             except (ValidationError, ValueError) as exc:
                 last_error = exc
@@ -496,6 +510,7 @@ class DynamicTaskPlanner:
                             "不要猜测或修补该 ID；改用对应来源中的 principle 原文，"
                             "将 principle_candidate_id 设为 null，并保持 source_kind/source_ref"
                             "逐字正确。服务端仍会按固定来源校验，禁止自行改写原则。"
+                            + research_depth_repair_instruction
                         ),
                     },
                 }
@@ -1081,6 +1096,11 @@ def _planner_guidance_catalog(
             {
                 "name": str(loaded.get("name") or ""),
                 "description": str(loaded.get("description") or ""),
+                "output_contract": (
+                    dict(loaded.get("output_contract"))
+                    if isinstance(loaded.get("output_contract"), Mapping)
+                    else {}
+                ),
                 "skill_use_ids": [
                     str(value)
                     for value in loaded.get("skill_use_ids", ())
@@ -2198,3 +2218,169 @@ def _validate_plan_convergence(plan: NormalizedPlan) -> None:
     }
     if missing:
         raise ValueError("动态计划 required 步骤必须汇聚到最终 answer")
+
+
+_RESEARCH_MULTI_SOURCE_MARKERS = (
+    "比较",
+    "对比",
+    "调查",
+    "评估",
+    "趋势",
+    "最新",
+    "多来源",
+    "交叉",
+    "核对",
+    "核查",
+    "竞品",
+    "文献",
+    "反馈",
+    "compare",
+    "comparison",
+    "investigate",
+    "evaluate",
+    "trend",
+    "latest",
+    "multi-source",
+    "cross-check",
+)
+
+
+def _research_depth_requirement(
+    *,
+    goal: str,
+    loaded_guidance: Sequence[dict[str, object]],
+) -> tuple[int, bool] | None:
+    """读取能力包声明的研究深度契约，并按本轮目标选择实际读取下限。"""
+
+    normalized_goal = " ".join(goal.casefold().split())
+    multi_source = any(marker in normalized_goal for marker in _RESEARCH_MULTI_SOURCE_MARKERS)
+    policy_candidates: list[tuple[int, bool]] = []
+    for loaded in loaded_guidance:
+        output_contract = loaded.get("output_contract")
+        if not isinstance(output_contract, Mapping):
+            continue
+        protocol = output_contract.get("research_depth_protocol")
+        if not isinstance(protocol, Mapping):
+            continue
+        policy = protocol.get("read_depth_policy")
+        if not isinstance(policy, Mapping):
+            continue
+        policy_key = (
+            "multi_source_task_minimum_independent_reads"
+            if multi_source
+            else "single_object_task_minimum_independent_reads"
+        )
+        raw_requirement = policy.get(policy_key)
+        if isinstance(raw_requirement, bool):
+            continue
+        try:
+            requirement = int(raw_requirement)
+        except (TypeError, ValueError):
+            continue
+        if requirement > 0:
+            policy_candidates.append((requirement, multi_source))
+    if not policy_candidates:
+        return None
+    return max(policy_candidates, key=lambda item: item[0])
+
+
+def _research_depth_repair_instruction(
+    *,
+    goal: str,
+    loaded_guidance: Sequence[dict[str, object]],
+) -> str:
+    """为研究契约修复提供明确的步骤语义，不把它扩散为普通任务限制。"""
+
+    requirement = _research_depth_requirement(goal=goal, loaded_guidance=loaded_guidance)
+    if requirement is None:
+        return ""
+    count, multi_source = requirement
+    task_kind = "多来源/交叉核验任务" if multi_source else "单对象研究任务"
+    return (
+        f"当前加载的能力包研究深度协议将本目标识别为{task_kind}，最终 answer 的 required 依赖链中"
+        f"必须规划至少 {count} 个独立的 tool.read 实际原文/详情读取步骤；"
+        "intelligence.*_search 等搜索摘要不计入读取，不能用搜索结果集合或标题替代原文；"
+        "每个读取步骤只能引用一个实际垂直读取能力，并让最终 answer 依赖这些步骤。"
+    )
+
+
+def _is_research_discovery_capability(name: str) -> bool:
+    """识别 Agent-Reach 的发现能力，避免把搜索摘要计入原文读取数量。"""
+
+    normalized = name.strip().casefold().replace("-", "_")
+    leaf = normalized.rsplit(".", 1)[-1]
+    return leaf == "search" or leaf.endswith("_search")
+
+
+def _research_read_capability_names(
+    capabilities: Sequence[CapabilitySnapshot],
+) -> set[str]:
+    """返回当前冻结能力包中的实际读取能力，不纳入普通工具或搜索能力。"""
+
+    names: set[str] = set()
+    for snapshot in capabilities:
+        if snapshot.capability_type not in {"tool", "connector"}:
+            continue
+        if snapshot.contract.get("risk_class") != "read":
+            continue
+        if not isinstance(snapshot.audit_view.get("vertical_ability"), Mapping):
+            continue
+        if _is_research_discovery_capability(snapshot.name):
+            continue
+        names.add(snapshot.name)
+    return names
+
+
+def _answer_ancestors(plan: NormalizedPlan) -> set[str]:
+    """返回最终 answer 的全部依赖祖先，确保研究读取不会落在未执行分支。"""
+
+    answer = next((step for step in plan.steps if step.kind == "answer"), None)
+    if answer is None:
+        return set()
+    by_key = {step.step_key: step for step in plan.steps}
+    ancestors: set[str] = set()
+    pending = list(answer.depends_on)
+    while pending:
+        step_key = pending.pop()
+        if step_key in ancestors:
+            continue
+        ancestors.add(step_key)
+        dependency = by_key.get(step_key)
+        if dependency is not None:
+            pending.extend(dependency.depends_on)
+    return ancestors
+
+
+def _validate_research_depth_plan(
+    plan: NormalizedPlan,
+    *,
+    goal: str,
+    loaded_guidance: Sequence[dict[str, object]],
+    capabilities: Sequence[CapabilitySnapshot],
+) -> None:
+    """把能力包研究深度落到可执行读取步骤，搜索结果不能伪装成原文证据。"""
+
+    requirement = _research_depth_requirement(goal=goal, loaded_guidance=loaded_guidance)
+    if requirement is None:
+        return
+    required_reads, multi_source = requirement
+    read_capabilities = _research_read_capability_names(capabilities)
+    ancestors = _answer_ancestors(plan)
+    actual_read_steps = [
+        step
+        for step in plan.steps
+        if (
+            step.required
+            and step.step_key in ancestors
+            and step.kind == "tool.read"
+            and len(step.capability_refs) == 1
+            and step.capability_refs[0] in read_capabilities
+        )
+    ]
+    if len(actual_read_steps) >= required_reads:
+        return
+    scope = "多来源研究" if multi_source else "研究"
+    raise ValueError(
+        f"{scope}深度计划缺少至少 {required_reads} 个实际原文/详情读取步骤；"
+        f"当前仅 {len(actual_read_steps)} 个。搜索摘要不能替代原文读取。"
+    )

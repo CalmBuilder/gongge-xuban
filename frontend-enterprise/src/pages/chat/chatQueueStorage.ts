@@ -19,6 +19,7 @@ export type PreparedChatTurn = {
   modelConfigId?: string;
   forcedGeneralSkillId?: string;
   forcedGeneralSkillIds?: string[];
+  abilityIds?: string[];
   createdAt: string;
 };
 
@@ -64,6 +65,13 @@ function isPreparedChatTurn(value: unknown): value is PreparedChatTurn {
         Array.isArray(value.forcedGeneralSkillIds)
         && value.forcedGeneralSkillIds.length <= 8
         && value.forcedGeneralSkillIds.every((item) => typeof item === 'string')
+      )
+    )
+    && (
+      value.abilityIds === undefined
+      || (
+        Array.isArray(value.abilityIds)
+        && value.abilityIds.every((item) => typeof item === 'string')
       )
     )
     && typeof value.createdAt === 'string'

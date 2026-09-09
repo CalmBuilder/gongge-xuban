@@ -4,6 +4,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
 VERSION="${VERSION:-0.1.0}"
 ARCH="$(uname -m)"
+YOUTUBE_NODE_VERSION="${YOUTUBE_NODE_VERSION:-22.14.0}"
 MAC_SIGN_ID="${MAC_SIGN_ID:-}"
 NOTARY_PROFILE="${NOTARY_PROFILE:-}"
 NOTARY_KEYCHAIN="${NOTARY_KEYCHAIN:-}"
@@ -101,6 +102,9 @@ echo "==> [4/5] 附带 python 运行时（放 .app/Contents/Resources/runtime）
 python3 packaging/fetch_runtime_python.py packaging/runtime_dl --expect-arch "$ARCH"
 rm -rf "$APP/Contents/Resources/runtime" "$APP/Contents/MacOS/runtime"
 cp -R packaging/runtime_dl/python "$APP/Contents/Resources/runtime"
+python3 packaging/fetch_youtube_js_runtime.py \
+  "$APP/Contents/Resources/runtime/youtube-js/node" \
+  --version "$YOUTUBE_NODE_VERSION"
 
 echo "==> [5/5] 签名 + 打 dmg"
 sign_app_bundle "$APP"

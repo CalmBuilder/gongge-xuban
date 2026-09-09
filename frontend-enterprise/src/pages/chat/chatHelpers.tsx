@@ -18,6 +18,7 @@ import type {
 
 import {
   CHAT_MARKDOWN_CLASS,
+  CHAT_MARKDOWN_REPORT_CLASS,
   CHAT_MD_TABLE_CLASS,
   CHAT_MD_TABLE_SCROLL_CLASS,
 } from './chatPageStyles';
@@ -59,6 +60,52 @@ const DRAFT_SCHEDULE_TYPE_LABELS: Record<DraftScheduleType, string> = {
   monthly: '每月',
 };
 const DRAFT_WEEKDAY_LABELS = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
+const EXTERNAL_LINK_REL = 'noopener noreferrer';
+
+export type MarkdownMessageVariant = 'default' | 'intelligence';
+
+const INTELLIGENCE_ABILITY_IDS = new Set(['web-intelligence']);
+const INTELLIGENCE_REPORT_SECTION_PATTERNS = {
+  summary: /^(?:结论摘要|执行摘要|研究摘要|executive summary|summary)$/iu,
+  evidence: /(?:来源与证据|证据来源|研究来源|sources?|evidence)/iu,
+  facts: /(?:关键事实|核心事实|主要发现|研究发现|key facts?|findings?)/iu,
+  conflicts: /(?:冲突|缺口|局限|待核实|不确定|conflicts?|gaps?|limitations?|uncertaint)/iu,
+};
+
+function markdownHeadingTexts(content: string): string[] {
+  return content
+    .replace(/```[\s\S]*?```/g, '')
+    .split('\n')
+    .map((line) => line.trim().match(/^#{1,6}\s+(.+)$/)?.[1]?.trim() || '')
+    .filter(Boolean);
+}
+
+function metadataAbilityIds(item: Pick<ChatMessage, 'metadata'>): string[] {
+  const values = item.metadata?.ability_ids;
+  if (!Array.isArray(values)) return [];
+  return values.filter((value): value is string => typeof value === 'string');
+}
+
+/** 判断回答是否具备可视化情报报告的稳定结构，避免把普通问答强行套成报告卡片。 */
+export function isIntelligenceReport(item: Pick<ChatMessage, 'role' | 'metadata'>, content: string): boolean {
+  if (item.role !== 'assistant') return false;
+  if (metadataAbilityIds(item).some((value) => INTELLIGENCE_ABILITY_IDS.has(value))) return true;
+
+  const headings = markdownHeadingTexts(content);
+  const hasSummary = headings.some((heading) => INTELLIGENCE_REPORT_SECTION_PATTERNS.summary.test(heading));
+  const hasEvidence = headings.some((heading) => INTELLIGENCE_REPORT_SECTION_PATTERNS.evidence.test(heading));
+  const hasFacts = headings.some((heading) => INTELLIGENCE_REPORT_SECTION_PATTERNS.facts.test(heading));
+  const hasConflicts = headings.some((heading) => INTELLIGENCE_REPORT_SECTION_PATTERNS.conflicts.test(heading));
+  return hasSummary && hasEvidence && (hasFacts || hasConflicts);
+}
+
+function reportListClass(variant: MarkdownMessageVariant, sectionTitle: string): string {
+  if (variant !== 'intelligence') return '';
+  if (INTELLIGENCE_REPORT_SECTION_PATTERNS.evidence.test(sectionTitle)) return 'md-report-list md-report-evidence-list';
+  if (INTELLIGENCE_REPORT_SECTION_PATTERNS.facts.test(sectionTitle)) return 'md-report-list md-report-facts-list';
+  if (INTELLIGENCE_REPORT_SECTION_PATTERNS.conflicts.test(sectionTitle)) return 'md-report-list md-report-conflicts-list';
+  return 'md-report-list';
+}
 
 export function sessionReadStorageKey(userId: string): string {
   return `${SESSION_READ_STORAGE_PREFIX}:${userId || 'anonymous'}`;
@@ -163,9 +210,35 @@ export function placeQueuedMessagesLast(messages: ChatMessage[]): ChatMessage[] 
   return [...timeline, ...queued];
 }
 
+/** 从裸 URL 末尾移除属于句子的标点，同时保留 URL 内合法的查询字符。 */
+function trimPlainUrlPunctuation(value: string): { href: string; trailing: string } {
+  let href = value;
+  while (/[.,;:!?，。；：！？、》】）]$/u.test(href)) {
+    href = href.slice(0, -1);
+  }
+  while (href.endsWith(')') && (href.match(/\(/g) || []).length < (href.match(/\)/g) || []).length) {
+    href = href.slice(0, -1);
+  }
+  while (href.endsWith(']') && (href.match(/\[/g) || []).length < (href.match(/\]/g) || []).length) {
+    href = href.slice(0, -1);
+  }
+  return { href, trailing: value.slice(href.length) };
+}
+
+/** 仅允许带主机名的 HTTP(S) 地址，避免把回复内容变成脚本或站内跳转。 */
+function safeExternalHref(value: string): string | null {
+  try {
+    const parsed = new URL(value.trim());
+    if (!['http:', 'https:'].includes(parsed.protocol) || !parsed.hostname) return null;
+    return value.trim();
+  } catch {
+    return null;
+  }
+}
+
 export function renderInlineMarkdown(text: string, keyPrefix: string): ReactNode[] {
   const nodes: ReactNode[] = [];
-  const pattern = /(`[^`]*`|\*\*[^*]+?\*\*|!?\[[^\]\n]*\]\([^\)\n]+\))/g;
+  const pattern = /(`[^`]*`|\*\*[^*]+?\*\*|!?\[[^\]\n]*\]\([^\)\n]+\)|https?:\/\/[^\s<>"']+)/giu;
   let cursor = 0;
   let index = 0;
   let match: RegExpExecArray | null;
@@ -194,7 +267,7 @@ export function renderInlineMarkdown(text: string, keyPrefix: string): ReactNode
         const label = link[1] || href;
         if (/^https?:\/\//i.test(href)) {
           nodes.push(
-            <a key={key} href={href} target="_blank" rel="noreferrer">
+            <a key={key} href={href} target="_blank" rel={EXTERNAL_LINK_REL}>
               {label}
             </a>,
           );
@@ -204,6 +277,19 @@ export function renderInlineMarkdown(text: string, keyPrefix: string): ReactNode
               {label}
             </span>,
           );
+        }
+      } else if (/^https?:\/\//i.test(token)) {
+        const { href: candidate, trailing } = trimPlainUrlPunctuation(token);
+        const href = safeExternalHref(candidate);
+        if (href) {
+          nodes.push(
+            <a key={key} href={href} target="_blank" rel={EXTERNAL_LINK_REL}>
+              {href}
+            </a>,
+          );
+          if (trailing) nodes.push(trailing);
+        } else {
+          nodes.push(token);
         }
       } else {
         nodes.push(token);
@@ -356,11 +442,16 @@ function isBlockBoundary(line: string): boolean {
   );
 }
 
-export function renderMarkdownBlocks(content: string, preserveLineBreaks = true): ReactNode[] {
+export function renderMarkdownBlocks(
+  content: string,
+  preserveLineBreaks = true,
+  variant: MarkdownMessageVariant = 'default',
+): ReactNode[] {
   const lines = content.replace(/\r\n/g, '\n').split('\n');
   const blocks: ReactNode[] = [];
   let index = 0;
   let blockIndex = 0;
+  let activeSectionTitle = '';
 
   while (index < lines.length) {
     const line = lines[index];
@@ -398,6 +489,7 @@ export function renderMarkdownBlocks(content: string, preserveLineBreaks = true)
     if (heading) {
       const level = Math.min(heading[1].length, 4) as 1 | 2 | 3 | 4;
       const Tag = `h${level}` as keyof JSX.IntrinsicElements;
+      activeSectionTitle = heading[2].trim();
       blocks.push(<Tag key={key}>{renderInlineMarkdown(heading[2], key)}</Tag>);
       index += 1;
       blockIndex += 1;
@@ -410,7 +502,11 @@ export function renderMarkdownBlocks(content: string, preserveLineBreaks = true)
         quoteLines.push(lines[index].trim().replace(/^>\s?/, ''));
         index += 1;
       }
-      blocks.push(<blockquote key={key}>{renderMarkdownBlocks(quoteLines.join('\n'), preserveLineBreaks)}</blockquote>);
+      blocks.push(
+        <blockquote key={key}>
+          {renderMarkdownBlocks(quoteLines.join('\n'), preserveLineBreaks, variant)}
+        </blockquote>,
+      );
       blockIndex += 1;
       continue;
     }
@@ -430,7 +526,7 @@ export function renderMarkdownBlocks(content: string, preserveLineBreaks = true)
         index += 1;
       }
       blocks.push(
-        <ul key={key}>
+        <ul key={key} className={reportListClass(variant, activeSectionTitle)}>
           {items.map((item, itemIndex) => (
             <li key={`${key}-${itemIndex}`}>{renderInlineMarkdown(item, `${key}-${itemIndex}`)}</li>
           ))}
@@ -447,7 +543,7 @@ export function renderMarkdownBlocks(content: string, preserveLineBreaks = true)
         index += 1;
       }
       blocks.push(
-        <ol key={key}>
+        <ol key={key} className={reportListClass(variant, activeSectionTitle)}>
           {items.map((item, itemIndex) => (
             <li key={`${key}-${itemIndex}`}>{renderInlineMarkdown(item, `${key}-${itemIndex}`)}</li>
           ))}
@@ -477,11 +573,17 @@ export function renderMarkdownBlocks(content: string, preserveLineBreaks = true)
 export function MarkdownMessage({
   content,
   preserveLineBreaks = true,
+  variant = 'default',
 }: {
   content: string;
   preserveLineBreaks?: boolean;
+  variant?: MarkdownMessageVariant;
 }) {
-  return <div className={CHAT_MARKDOWN_CLASS}>{renderMarkdownBlocks(content, preserveLineBreaks)}</div>;
+  return (
+    <div className={variant === 'intelligence' ? CHAT_MARKDOWN_REPORT_CLASS : CHAT_MARKDOWN_CLASS}>
+      {renderMarkdownBlocks(content, preserveLineBreaks, variant)}
+    </div>
+  );
 }
 
 export function traceSummaryIconName(_summary: { state: TraceLine['state'] }): CotTraceIconName {
@@ -1347,6 +1449,7 @@ export function mergeTurnTraceSnapshot(existing: TurnTrace | undefined, incoming
     lines: mergedLines.slice(-80),
     startedAt,
     completedAt: incoming.completedAt || existing.completedAt,
+    closedByCancellation: incoming.closedByCancellation || existing.closedByCancellation,
   };
 }
 

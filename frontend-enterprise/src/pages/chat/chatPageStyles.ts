@@ -44,6 +44,8 @@ export const CHAT_BUBBLE_BASE_CLASS =
   'relative box-border min-w-0 max-w-[min(680px,92%)] gg-type-body  wrap-anywhere text-[#18181a]';
 export const CHAT_BUBBLE_ASSISTANT_CLASS =
   'w-full max-w-full rounded-[14px] border border-[var(--gg-border)] bg-white px-[18px] py-[14px] shadow-[0_8px_24px_rgba(24,33,61,0.04)]';
+export const CHAT_BUBBLE_REPORT_CLASS =
+  'overflow-hidden border-[#dbe4fb] shadow-[0_12px_32px_rgba(49,87,232,0.07)]';
 export const CHAT_BUBBLE_USER_CLASS =
   'rounded-[14px] border border-[color-mix(in_srgb,var(--gg-cobalt)_18%,white)] bg-[color-mix(in_srgb,var(--gg-cobalt)_8%,white)] px-[16px] py-[11px] text-[var(--gg-ink)]';
 export const CHAT_BUBBLE_ERROR_CLASS = 'border-[#f38989] bg-[#fce7e7] text-[#d20b0b]';
@@ -90,6 +92,30 @@ export const CHAT_MARKDOWN_CLASS = cn(
   '[&_strong]:font-semibold',
   '[&_code]:rounded-[5px] [&_code]:bg-[#f1f2f5] [&_code]:px-[5px] [&_code]:py-[1px] [&_code]:font-mono',
   '[&_.code-block-vscode]:my-[10px]',
+);
+export const CHAT_REPORT_HEADER_CLASS =
+  '-mx-[18px] -mt-[14px] mb-[16px] flex items-center justify-between gap-[12px] border-b border-[#e5eafb] bg-[linear-gradient(110deg,#f4f7ff_0%,#ffffff_76%)] px-[18px] py-[12px]';
+export const CHAT_REPORT_HEADER_IDENTITY_CLASS = 'flex min-w-0 items-center gap-[10px]';
+export const CHAT_REPORT_HEADER_ICON_CLASS =
+  'inline-grid size-[30px] shrink-0 place-items-center rounded-[9px] bg-[#e9efff] text-[var(--gg-cobalt)]';
+export const CHAT_REPORT_HEADER_COPY_CLASS = 'grid min-w-0 gap-px';
+export const CHAT_REPORT_HEADER_KICKER_CLASS = 'gg-type-caption font-medium text-[#7582a1]';
+export const CHAT_REPORT_HEADER_TITLE_CLASS = 'gg-type-control font-semibold text-[var(--gg-ink)]';
+export const CHAT_REPORT_HEADER_BADGE_CLASS =
+  'shrink-0 rounded-full border border-[#dbe4fb] bg-white/80 px-[9px] py-[4px] gg-type-caption font-medium text-[var(--gg-cobalt)]';
+export const CHAT_MARKDOWN_REPORT_CLASS = cn(
+  CHAT_MARKDOWN_CLASS,
+  '[&_p]:my-[10px]',
+  '[&_h1]:mb-[10px] [&_h1]:text-[20px] [&_h1]:tracking-[-0.01em]',
+  '[&_h2]:mt-[25px] [&_h2]:mb-[10px] [&_h2]:rounded-[8px] [&_h2]:border-l-[3px] [&_h2]:border-[var(--gg-cobalt)] [&_h2]:bg-[linear-gradient(90deg,#f4f7ff_0%,rgba(244,247,255,0)_78%)] [&_h2]:px-[10px] [&_h2]:py-[8px] [&_h2]:text-[16px] [&_h2]:tracking-[0.01em]',
+  '[&_h3]:mt-[18px] [&_h3]:mb-[8px] [&_h3]:text-[14px] [&_h3]:text-[#34415f]',
+  '[&_.md-report-list]:my-[13px]',
+  '[&_.md-report-evidence-list]:list-none [&_.md-report-evidence-list]:space-y-[8px] [&_.md-report-evidence-list]:pl-0',
+  '[&_.md-report-evidence-list>li]:my-0 [&_.md-report-evidence-list>li]:rounded-[10px] [&_.md-report-evidence-list>li]:border [&_.md-report-evidence-list>li]:border-[#dfe6fb] [&_.md-report-evidence-list>li]:border-l-[3px] [&_.md-report-evidence-list>li]:border-l-[#8ca5f5] [&_.md-report-evidence-list>li]:bg-[#f8faff] [&_.md-report-evidence-list>li]:px-[12px] [&_.md-report-evidence-list>li]:py-[9px]',
+  '[&_.md-report-facts-list]:rounded-[10px] [&_.md-report-facts-list]:border [&_.md-report-facts-list]:border-[#e8ecf7] [&_.md-report-facts-list]:bg-[#fbfcff] [&_.md-report-facts-list]:px-[12px] [&_.md-report-facts-list]:py-[6px]',
+  '[&_.md-report-conflicts-list]:list-none [&_.md-report-conflicts-list]:rounded-[10px] [&_.md-report-conflicts-list]:border [&_.md-report-conflicts-list]:border-[#f1dfb7] [&_.md-report-conflicts-list]:bg-[#fffaf0] [&_.md-report-conflicts-list]:px-[12px] [&_.md-report-conflicts-list]:py-[6px]',
+  "[&_.md-report-conflicts-list>li]:relative [&_.md-report-conflicts-list>li]:my-[6px] [&_.md-report-conflicts-list>li]:pl-[18px] [&_.md-report-conflicts-list>li]:before:absolute [&_.md-report-conflicts-list>li]:before:left-0 [&_.md-report-conflicts-list>li]:before:top-[0.78em] [&_.md-report-conflicts-list>li]:before:size-[6px] [&_.md-report-conflicts-list>li]:before:rounded-full [&_.md-report-conflicts-list>li]:before:bg-[#d99b2b] [&_.md-report-conflicts-list>li]:before:content-['•']",
+  '[&_table]:text-[13px]',
 );
 export const CHAT_MD_TABLE_SCROLL_CLASS = 'my-[10px] max-w-full overflow-x-auto';
 export const CHAT_MD_TABLE_CLASS =

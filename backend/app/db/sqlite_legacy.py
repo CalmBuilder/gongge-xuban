@@ -107,6 +107,7 @@ def migrate_sqlite_skill_schema(engine: Engine) -> None:
         _migrate_sqlite_platform_general_skill_catalog(conn, tables)
         _migrate_execution_plan_fields(conn, tables)
         _migrate_execution_control_fields(conn, tables)
+        _migrate_browser_pairing_transport(conn, tables)
 
         if "messages" in tables:
             message_columns = {column["name"] for column in inspector.get_columns("messages")}
@@ -503,6 +504,27 @@ def _sqlite_operations(conn):
     from alembic.operations import Operations
 
     return Operations(MigrationContext.configure(conn))
+
+
+def _migrate_browser_pairing_transport(conn, tables: set[str]) -> None:
+    """桌面旧库自动兼容双模式设备配对，保留旧会话与索引且可重复启动。"""
+
+    table_name = "vertical_ability_browser_relay_sessions"
+    constraint_name = "ck_vertical_ability_browser_relay_session_transport"
+    if table_name not in tables:
+        return
+    existing = next(
+        (item for item in inspect(conn).get_check_constraints(table_name)
+         if item["name"] == constraint_name), None,
+    )
+    if existing is not None and "local_loopback" in existing["sqltext"]:
+        return
+    with _sqlite_operations(conn).batch_alter_table(table_name) as batch:
+        if existing is not None:
+            batch.drop_constraint(constraint_name, type_="check")
+        batch.create_check_constraint(
+            constraint_name, "transport IN ('local_loopback', 'browser_relay')",
+        )
 
 
 def _sqlite_add_catalog_scope_columns(conn) -> None:

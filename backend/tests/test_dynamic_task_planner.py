@@ -25,6 +25,8 @@ from app.dynamic_tasks.planner_service import (
     _repair_guidance_phase_continuity,
     _repair_terminal_answer_steps,
     _repair_guidance_identity_fields,
+    _research_depth_repair_instruction,
+    _validate_research_depth_plan,
     _strip_platform_owned_attachment_steps,
     _validate_clarification_semantics,
     _validate_guidance_step_alignment,
@@ -3102,3 +3104,127 @@ def test_planner_repairs_missing_required_knowledge_before_execution_creation() 
 
     assert len(client.payloads) == 2
     assert [step.kind for step in plan.steps] == ["knowledge", "answer"]
+
+
+def _research_guidance_contract() -> list[dict[str, object]]:
+    """构造最小 Agent-Reach 研究契约，隔离测试不依赖数据库或真实网络。"""
+
+    return [
+        {
+            "name": "vertical_ability:web-intelligence",
+            "output_contract": {
+                "research_depth_protocol": {
+                    "read_depth_policy": {
+                        "multi_source_task_minimum_independent_reads": 2,
+                        "single_object_task_minimum_independent_reads": 1,
+                    }
+                }
+            },
+        }
+    ]
+
+
+def _research_capability(name: str) -> CapabilitySnapshot:
+    """构造带垂直能力审计标记的只读能力，验证搜索不冒充原文读取。"""
+
+    payload = {
+        "capability_type": "tool",
+        "capability_id": name,
+        "tenant_id": "tenant_demo",
+        "name": name,
+        "contract": {"risk_class": "read"},
+        "model_view": {"name": name},
+        "user_view": {"name": name},
+        "audit_view": {"vertical_ability": {"id": "web-intelligence"}},
+    }
+    return CapabilitySnapshot(
+        **payload,
+        agent_id="agent_demo",
+        checksum=capability_checksum(payload),
+    )
+
+
+def _research_plan(read_names: tuple[str, ...], *, goal: str) -> NormalizedPlan:
+    """构造读取步骤全部汇聚到唯一 answer 的研究计划。"""
+
+    steps = tuple(
+        PlanStep(
+            step_key=f"read_{index}",
+            title=f"读取来源 {index}",
+            kind="tool.read",
+            required=True,
+            capability_refs=(name,),
+        )
+        for index, name in enumerate(read_names, start=1)
+    )
+    return NormalizedPlan(
+        goal=goal,
+        success_criteria=(
+            SuccessCriterion(id="done", type="assertion", spec={"required": True}),
+        ),
+        steps=(
+            *steps,
+            PlanStep(
+                step_key="answer",
+                title="交付报告",
+                kind="answer",
+                required=True,
+                depends_on=tuple(step.step_key for step in steps),
+            ),
+        ),
+    )
+
+
+def test_research_depth_plan_requires_actual_reads_but_does_not_affect_plain_plans() -> None:
+    """多来源只接受两个真实读取，单对象接受一个，普通无协议计划不受影响。"""
+
+    guidance = _research_guidance_contract()
+    capabilities = (
+        _research_capability("intelligence.web_search"),
+        _research_capability("intelligence.web_read"),
+        _research_capability("intelligence.rss_read"),
+    )
+    with pytest.raises(ValueError, match="至少 2 个实际原文/详情读取步骤"):
+        _validate_research_depth_plan(
+            _research_plan(("intelligence.web_search",), goal="比较最新的 CLI 工具"),
+            goal="比较最新的 CLI 工具",
+            loaded_guidance=guidance,
+            capabilities=capabilities,
+        )
+
+    _validate_research_depth_plan(
+        _research_plan(
+            ("intelligence.web_read", "intelligence.rss_read"),
+            goal="比较最新的 CLI 工具",
+        ),
+        goal="比较最新的 CLI 工具",
+        loaded_guidance=guidance,
+        capabilities=capabilities,
+    )
+    _validate_research_depth_plan(
+        _research_plan(("intelligence.web_read",), goal="解释一个公开网页"),
+        goal="解释一个公开网页",
+        loaded_guidance=guidance,
+        capabilities=capabilities,
+    )
+    _validate_research_depth_plan(
+        _research_plan(("contract.query",), goal="比较最新的 CLI 工具"),
+        goal="比较最新的 CLI 工具",
+        loaded_guidance=(),
+        capabilities=capabilities,
+    )
+
+
+def test_research_depth_repair_instruction_is_scoped_to_loaded_protocol() -> None:
+    """仅能力包声明研究协议时才向模型追加原文读取修复指令。"""
+
+    instruction = _research_depth_repair_instruction(
+        goal="交叉核验最新的 CLI 工具",
+        loaded_guidance=_research_guidance_contract(),
+    )
+    assert "至少 2 个" in instruction
+    assert "搜索摘要不计入读取" in instruction
+    assert _research_depth_repair_instruction(
+        goal="交叉核验最新的 CLI 工具",
+        loaded_guidance=(),
+    ) == ""

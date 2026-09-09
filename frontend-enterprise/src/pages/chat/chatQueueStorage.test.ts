@@ -30,6 +30,7 @@ function turn(): PreparedChatTurn {
     interactionMode: 'normal',
     executionEngine: 'dynamic_task',
     forcedGeneralSkillId: 'skill-refund',
+    abilityIds: ['web-intelligence'],
     createdAt: '2026-08-13T02:00:00.000Z',
   };
 }
@@ -58,6 +59,18 @@ describe('chatQueueStorage', () => {
 
     expect(writeQueuedChatTurns(storage, key, [turn()])).toBe(true);
     expect(readQueuedChatTurns(storage, key)[0]?.executionEngine).toBe('dynamic_task');
+  });
+
+  it('persists selected vertical abilities without applying an artificial count limit', () => {
+    const storage = memoryStorage();
+    const key = chatQueueStorageKey('tenant-1', 'user-1');
+
+    const queued = {
+      ...turn(),
+      abilityIds: ['web-intelligence', 'contract-review', 'business-analysis'],
+    };
+    expect(writeQueuedChatTurns(storage, key, [queued])).toBe(true);
+    expect(readQueuedChatTurns(storage, key)[0]?.abilityIds).toEqual(queued.abilityIds);
   });
 
   it('persists display metadata but requires opaque resource identity for queued attachments', () => {

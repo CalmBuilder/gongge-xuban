@@ -667,6 +667,21 @@ test('DynamicTask 重复提交同一 client_turn_id 只保留一份回答', asyn
   expect(replay.status).toBe(200);
   expect(replay.stream).toContain('complete');
 
+  const mismatch = await page.evaluate(async (body) => {
+    const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
+    const response = await fetch('/api/chat/stream', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${auth.token || ''}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ ...body, message: `${String(body.message || '')}（变更正文）` }),
+    });
+    return { status: response.status, body: await response.text() };
+  }, originalBody);
+  expect(mismatch.status).toBe(409);
+  expect(mismatch.body).toContain('different request');
+
   const facts = await readFacts(page, sessionId);
   expect(facts.messages.filter((item) => item.role === 'user')).toHaveLength(1);
   expect(facts.messages.filter((item) => item.role === 'assistant')).toHaveLength(1);

@@ -41,7 +41,7 @@ from app.general_skills.schema import GeneralSkillSelection
 from app.scheduled_tasks import service as scheduled_service
 from app.scheduled_tasks.schema import ScheduledTaskUpdateRequest
 from app.scheduled_tasks import worker as scheduled_worker
-from app.session.session_schema import ChatTurnRequest
+from app.session.session_schema import ChatTurnRequest, ChatTurnResponse, RouterDecision, SessionPublic, StepAgentResult
 from app.sop_runtime.execution_control import ExecutionControlService, canonical_checksum
 from app.sop_runtime.execution_store import SopExecutionStore
 
@@ -607,6 +607,66 @@ def test_agent_loop_queues_durable_start_signal_without_inline_execution(monkeyp
         assert len(signals) == 1
         assert signals[0].signal_type == "scheduled_start"
         assert signals[0].payload_json == {"scheduled_task_run_id": run.id}
+
+
+def test_scheduled_runner_accepts_dynamic_waiting_projection(monkeypatch) -> None:
+    """调度 runner 收到 turn_waiting 时应把运行保留为 waiting，而不是误报失败。"""
+
+    class _WaitingLoop:
+        """只投影持久动态任务的等待结果，模拟真实 AgentLoop 流式出口。"""
+
+        def __init__(self, _db: Session) -> None:
+            """保留与生产构造一致的数据库参数。"""
+
+        def handle_turn_stream(self, _request: ChatTurnRequest):
+            """返回调度动态任务已进入持久等待的完整响应数据。"""
+
+            session_id = str(_request.session_id or "")
+            response = ChatTurnResponse(
+                reply="调度任务已排队，等待持久信号继续。",
+                session_id=session_id,
+                router_decision=RouterDecision(
+                    decision="answer_only",
+                    reason="DynamicTaskAgent queued by a durable schedule signal.",
+                ),
+                step_result=StepAgentResult(
+                    reply="调度任务已排队，等待持久信号继续。",
+                    is_step_completed=False,
+                ),
+                session_state=SessionPublic(
+                    session_id=session_id,
+                    tenant_id=_request.tenant_id,
+                    user_id=_request.user_id,
+                    agent_id=_request.agent_id,
+                ),
+            )
+            yield {"event": "turn_waiting", "data": response.model_dump(mode="json")}
+
+    monkeypatch.setattr(scheduled_service, "AgentLoop", _WaitingLoop)
+    with _session() as db:
+        task = _seed_task(db)
+        run = scheduled_service._prepare_scheduled_task_run(
+            db,
+            task,
+            utc_now() + timedelta(minutes=1),
+            False,
+        )
+        assert run.session_id is not None
+        execution = _dynamic_execution(run, status="waiting")
+        run.execution_id = execution.id
+        db.add(execution)
+        db.add(run)
+        db.commit()
+
+        result = scheduled_service._execute_prepared_scheduled_task(
+            db,
+            task,
+            run,
+            manual=False,
+        )
+
+        assert result.status == "waiting"
+        assert result.result_summary == "调度任务已排队，等待持久信号继续。"
 
 
 def test_scheduled_entry_forces_durable_execution_when_model_routes_answer(monkeypatch) -> None:

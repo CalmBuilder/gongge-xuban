@@ -223,6 +223,40 @@ try {
   }
   Invoke-RuntimeProbe $runtimePython $tempRoot
 
+  $youtubeNode = Join-Path $installDirectory "runtime\youtube-js\node.exe"
+  if (-not (Test-Path -LiteralPath $youtubeNode -PathType Leaf)) {
+    throw "Bundled YouTube Node.js runtime was not found: $youtubeNode"
+  }
+  $nodeVersionOutput = (& $youtubeNode --version 2>&1 | Out-String).Trim()
+  $nodeVersionExitCode = $LASTEXITCODE
+  Assert-ExitCode "Bundled YouTube Node.js runtime probe" $nodeVersionExitCode
+  if ($nodeVersionOutput -notmatch '^v(\d+)\.') {
+    throw "Bundled YouTube Node.js runtime returned an invalid version: $nodeVersionOutput"
+  }
+  if ([int]$Matches[1] -lt 22) {
+    throw "Bundled YouTube Node.js runtime must be version 22 or newer: $nodeVersionOutput"
+  }
+
+  $relayConnector = Join-Path $installDirectory "browser-relay-connector.exe"
+  if (-not (Test-Path -LiteralPath $relayConnector -PathType Leaf)) {
+    throw "Bundled browser Relay connector was not found: $relayConnector"
+  }
+  $opencliNode = Join-Path $installDirectory "runtime\opencli\node.exe"
+  $opencliExecutable = Join-Path $installDirectory "runtime\opencli\opencli.exe"
+  $opencliWrapper = Join-Path $installDirectory "runtime\opencli\opencli.cmd"
+  $opencliEntry = Join-Path $installDirectory "runtime\opencli\node_modules\@jackwener\opencli\dist\src\main.js"
+  foreach ($requiredPath in @($opencliNode, $opencliExecutable, $opencliWrapper, $opencliEntry)) {
+    if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
+      throw "Bundled OpenCLI runtime file was not found: $requiredPath"
+    }
+  }
+  $connectorHelp = (& $relayConnector --help 2>&1 | Out-String)
+  $connectorHelpExitCode = $LASTEXITCODE
+  Assert-ExitCode "Bundled browser Relay connector help probe" $connectorHelpExitCode
+  if ($connectorHelp -notmatch "宿主机浏览器 Relay|browser") {
+    throw "Bundled browser Relay connector help output was not recognized."
+  }
+
   [Environment]::SetEnvironmentVariable("GONGGE_XUBAN_HEADLESS", "1", "Process")
   [Environment]::SetEnvironmentVariable("GONGGE_XUBAN_DATA_DIR", $dataDirectory, "Process")
   [Environment]::SetEnvironmentVariable("GONGGE_XUBAN_PORT", "$port", "Process")

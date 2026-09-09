@@ -21,10 +21,12 @@ from sqlmodel import Session, SQLModel, create_engine, select
 from app.agents.branching import ensure_private_resource_binding
 from app.config import get_settings
 from app.db.models import (
+    AgentEvent,
     AgentProfile,
     AgentResourceBinding,
     ChatSession,
     ExecutionSignal,
+    Message,
     ModelConfig,
     SopOperation,
     SopWorkItem,
@@ -259,6 +261,14 @@ def test_dynamic_workspace_write_waits_for_approval_and_resumes_once(
                 user_id=requester.id,
                 agent_id=agent.id,
             )
+            workspace_message = Message(
+                id="workspace-message",
+                tenant_id=tenant.id,
+                session_id=chat.id,
+                role="user",
+                content="修改退款状态",
+                metadata_json={"client_turn_id": "workspace-client-turn"},
+            )
             facts = {
                 "protocol_version": "dynamic-v1",
                 "sdk_available": True,
@@ -276,7 +286,7 @@ def test_dynamic_workspace_write_waits_for_approval_and_resumes_once(
                 capability_snapshot_json=facts,
                 capability_checksum=capability_checksum(facts),
             )
-            db.add_all([tenant, requester, approver, agent, chat, model])
+            db.add_all([tenant, requester, approver, agent, chat, workspace_message, model])
             db.flush()
             image = (
                 "python@sha256:"
@@ -562,12 +572,23 @@ def test_dynamic_workspace_write_waits_for_approval_and_resumes_once(
                     )
                     assert completed is not None
                 else:
-                    completed = dynamic.resume_tool_approval_signal(
-                        signal_id=last_signal.id,
-                        model_config=model,
-                        worker_id=f"workspace-dispatch-{index}",
-                        actor_user_id=approver.id,
-                    )
+                    if index == 2:
+                        completed = process_dynamic_task_signal(
+                            db,
+                            last_signal,
+                            agent_factory=lambda session: DynamicTaskAgent(
+                                session,
+                                action_proposer=_WorkspaceProposer(before_sha),
+                            ),
+                        )
+                        assert completed is not None
+                    else:
+                        completed = dynamic.resume_tool_approval_signal(
+                            signal_id=last_signal.id,
+                            model_config=model,
+                            worker_id=f"workspace-dispatch-{index}",
+                            actor_user_id=approver.id,
+                        )
                 assert completed.status == ("waiting" if index < 2 else "succeeded")
             assert last_signal is not None
             replay = dynamic.resume_tool_approval_signal(
@@ -600,6 +621,25 @@ def test_dynamic_workspace_write_waits_for_approval_and_resumes_once(
             assert operations[1].effect_state == operations[3].effect_state == "complete"
             assert operations[2].result_json["data"]["passed"] is True
             assert operations[3].result_json["data"]["commit_sha"]
+            turn_terminals = db.exec(
+                select(AgentEvent).where(
+                    AgentEvent.tenant_id == tenant.id,
+                    AgentEvent.session_id == chat.id,
+                    AgentEvent.event_type == "complete",
+                )
+            ).all()
+            assert len(turn_terminals) == 1
+            assert turn_terminals[0].payload_json["turn_id"] == "workspace-message"
+            assert turn_terminals[0].payload_json["client_turn_id"] == "workspace-client-turn"
+            assistant_message = db.exec(
+                select(Message).where(
+                    Message.tenant_id == tenant.id,
+                    Message.session_id == chat.id,
+                    Message.role == "assistant",
+                )
+            ).one()
+            assert assistant_message.metadata_json["execution_id"] == instance.id
+            assert assistant_message.metadata_json["client_turn_id"] == "workspace-client-turn"
     finally:
         settings.dynamic_task_managed_workspace_enabled = old_enabled
         settings.dynamic_task_managed_workspace_root = old_root

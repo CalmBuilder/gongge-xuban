@@ -6,7 +6,7 @@
  * @Description: 展示动态计划、并行读取证据，并允许在安全边界追加固定 Skill 或约束。
  */
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { CircleCheck, CircleX, Download, LoaderCircle, Route, Sparkles, SlidersHorizontal } from 'lucide-react';
 
 import { api, getRequestTenantId } from '@/api/client';
@@ -23,6 +23,8 @@ type ExecutionState = {
   kind: string;
   status: string;
   revision: number;
+  effect_state?: string | null;
+  cancellation_disposition?: string | null;
   goal?: string | null;
   current_step_key?: string | null;
   plan_revision_number?: number | null;
@@ -38,14 +40,22 @@ type ExecutionState = {
     mime_type: string;
     size_bytes: number;
   }>;
+  latest_command?: CommandState | null;
 };
 
 type CommandState = {
   command_id: string;
   command_type: 'steer' | 'cancel' | 'add_skill';
   status: 'pending' | 'claimed' | 'applied' | 'conflicted' | 'rejected';
+  result?: {
+    cancelled?: boolean;
+    execution_status?: string;
+  } | null;
   reason_code?: string | null;
   result_plan_revision_id?: string | null;
+  issued_at?: string;
+  consumed_at?: string | null;
+  updated_at?: string;
 };
 
 type SessionSkill = {
@@ -69,19 +79,88 @@ export default function DynamicExecutionControl({ executionId }: { executionId: 
   const [instruction, setInstruction] = useState('');
   const [command, setCommand] = useState<CommandState | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const submittingRef = useRef(false);
+  const executionRequestRef = useRef<{
+    executionId: string;
+    generation: number;
+    nextSequence: number;
+    appliedSequence: number;
+    latestExecution: ExecutionState | null;
+    latestCommand: CommandState | null;
+    executionInFlight: Promise<ExecutionState | null> | null;
+    commandPollInFlight: Promise<void> | null;
+    commandPollId: string | null;
+  }>({
+    executionId,
+    generation: 0,
+    nextSequence: 0,
+    appliedSequence: 0,
+    latestExecution: null,
+    latestCommand: null,
+    executionInFlight: null,
+    commandPollInFlight: null,
+    commandPollId: null,
+  });
+  if (executionRequestRef.current.executionId !== executionId) {
+    executionRequestRef.current = {
+      executionId,
+      generation: executionRequestRef.current.generation + 1,
+      nextSequence: 0,
+      appliedSequence: 0,
+      latestExecution: null,
+      latestCommand: null,
+      executionInFlight: null,
+      commandPollInFlight: null,
+      commandPollId: null,
+    };
+  }
 
-  const loadExecution = useCallback(async () => {
-    const result = await api.get<ExecutionState>(
-      `/api/executions/${executionId}?tenant_id=${encodeURIComponent(getRequestTenantId())}`,
+  const loadExecution = useCallback(() => {
+    const requestState = executionRequestRef.current;
+    if (requestState.executionInFlight) return requestState.executionInFlight;
+    const generation = requestState.generation;
+    const sequence = ++requestState.nextSequence;
+    const request = (async () => {
+      const result = await api.get<ExecutionState>(
+        `/api/executions/${executionId}?tenant_id=${encodeURIComponent(getRequestTenantId())}`,
+      );
+      const currentState = executionRequestRef.current;
+      if (
+        currentState.executionId !== executionId
+        || currentState.generation !== generation
+        || sequence < currentState.appliedSequence
+        || (
+          currentState.latestExecution !== null
+          && result.revision < currentState.latestExecution.revision
+        )
+      ) {
+        return currentState.latestExecution;
+      }
+      currentState.appliedSequence = sequence;
+      currentState.latestExecution = result;
+      if (result.latest_command) {
+        currentState.latestCommand = newerCommand(currentState.latestCommand, result.latest_command);
+      }
+      setExecution(result);
+      setCommand(currentState.latestCommand);
+      return result;
+    })();
+    requestState.executionInFlight = request;
+    void request.then(
+      () => {
+        if (executionRequestRef.current === requestState) requestState.executionInFlight = null;
+      },
+      () => {
+        if (executionRequestRef.current === requestState) requestState.executionInFlight = null;
+      },
     );
-    setExecution(result);
-    return result;
+    return request;
   }, [executionId]);
 
   useEffect(() => {
     let active = true;
     void loadExecution().catch(() => {
-      if (active) setExecution(null);
+      if (active && executionRequestRef.current.latestExecution === null) setExecution(null);
     });
     return () => { active = false; };
   }, [loadExecution]);
@@ -89,28 +168,92 @@ export default function DynamicExecutionControl({ executionId }: { executionId: 
   useEffect(() => {
     if (!command || !['pending', 'claimed'].includes(command.status)) return undefined;
     let active = true;
+    const commandId = command.command_id;
+    const poll = () => {
+      const requestState = executionRequestRef.current;
+      if (
+        requestState.commandPollInFlight
+        && requestState.commandPollId === commandId
+      ) return;
+      const generation = requestState.generation;
+      const request = (async () => {
+        try {
+          const next = await api.get<CommandState>(
+            `/api/executions/${executionId}/commands/${commandId}?tenant_id=${encodeURIComponent(getRequestTenantId())}`,
+          );
+          const currentState = executionRequestRef.current;
+          if (!active || currentState.executionId !== executionId || currentState.generation !== generation) return;
+          const merged = newerCommand(currentState.latestCommand, next);
+          currentState.latestCommand = merged;
+          setCommand(merged);
+          if (merged && !['pending', 'claimed'].includes(merged.status)) void loadExecution();
+        } catch {
+          // 短暂网络错误不改变服务端命令事实，下次轮询继续读取。
+        }
+      })();
+      requestState.commandPollId = commandId;
+      requestState.commandPollInFlight = request;
+      void request.then(
+        () => {
+          if (
+            executionRequestRef.current === requestState
+            && requestState.commandPollInFlight === request
+          ) {
+            requestState.commandPollInFlight = null;
+            requestState.commandPollId = null;
+          }
+        },
+        () => {
+          if (
+            executionRequestRef.current === requestState
+            && requestState.commandPollInFlight === request
+          ) {
+            requestState.commandPollInFlight = null;
+            requestState.commandPollId = null;
+          }
+        },
+      );
+    };
+    const timer = window.setInterval(poll, 1_500);
+    return () => { active = false; window.clearInterval(timer); };
+  }, [command, executionId, loadExecution]);
+
+  useEffect(() => {
+    if (
+      !command
+      || command.command_type !== 'cancel'
+      || command.status !== 'applied'
+      || !execution
+      || !ACTIVE_STATUSES.has(execution.status)
+      || isCancellationSettled(command, execution)
+    ) return undefined;
+    let active = true;
     const poll = async () => {
       try {
-        const next = await api.get<CommandState>(
-          `/api/executions/${executionId}/commands/${command.command_id}?tenant_id=${encodeURIComponent(getRequestTenantId())}`,
-        );
-        if (!active) return;
-        setCommand(next);
-        if (!['pending', 'claimed'].includes(next.status)) void loadExecution();
+        await loadExecution();
       } catch {
-        // 短暂网络错误不改变服务端命令事实，下次轮询继续读取。
+        // 对账期间的短暂网络错误不覆盖最后一次权威 Execution 快照。
       }
+      if (!active) return;
     };
     const timer = window.setInterval(() => void poll(), 1_500);
     return () => { active = false; window.clearInterval(timer); };
-  }, [command, executionId, loadExecution]);
+  }, [
+    command,
+    execution?.cancellation_disposition,
+    execution?.effect_state,
+    execution?.status,
+    loadExecution,
+  ]);
 
   if (!execution || !['dynamic_task', 'sop'].includes(execution.kind)) return null;
   const dynamicExecution = execution.kind === 'dynamic_task';
   const active = dynamicExecution && ACTIVE_STATUSES.has(execution.status);
+  const cancellationPending = isCancellationPending(command, execution);
 
   async function issue(commandType: 'steer' | 'cancel' | 'add_skill') {
-    if (!execution || !active) return;
+    if (!execution || !active || submittingRef.current || (commandType !== 'cancel' && cancellationPending)) return;
+    if (commandType === 'cancel' && cancellationPending) return;
     const normalized = instruction.trim();
     if (commandType === 'steer' && !normalized) {
       notify.error('请填写要追加到当前任务的约束');
@@ -120,6 +263,7 @@ export default function DynamicExecutionControl({ executionId }: { executionId: 
       notify.error('请选择要增加到当前任务的 Skill');
       return;
     }
+    submittingRef.current = true;
     setSubmitting(true);
     try {
       const result = await api.post<CommandState>(`/api/executions/${execution.id}/commands`, {
@@ -133,7 +277,11 @@ export default function DynamicExecutionControl({ executionId }: { executionId: 
             ? { skill_id: selectedSkillId, trigger: 'user' }
             : { reason: 'user_requested' },
       });
-      setCommand(result);
+      executionRequestRef.current.latestCommand = newerCommand(
+        executionRequestRef.current.latestCommand,
+        result,
+      );
+      setCommand(executionRequestRef.current.latestCommand);
       setDialogOpen(false);
       setSkillDialogOpen(false);
       setInstruction('');
@@ -150,6 +298,7 @@ export default function DynamicExecutionControl({ executionId }: { executionId: 
       notify.error(error instanceof Error ? error.message : '执行命令提交失败');
       await loadExecution().catch(() => undefined);
     } finally {
+      submittingRef.current = false;
       setSubmitting(false);
     }
   }
@@ -208,19 +357,19 @@ export default function DynamicExecutionControl({ executionId }: { executionId: 
         </span>
         {active ? (
           <span className="flex flex-wrap justify-end gap-[6px]">
-            <Button variant="outline" size="sm" disabled={submitting} onClick={() => void openSkillDialog()}>
+            <Button variant="outline" size="sm" disabled={submitting || cancellationPending} onClick={() => void openSkillDialog()}>
               <Sparkles className="size-[13px]" />运行中增加 Skill
             </Button>
-            <Button variant="outline" size="sm" disabled={submitting} onClick={() => setDialogOpen(true)}>
+            <Button variant="outline" size="sm" disabled={submitting || cancellationPending} onClick={() => setDialogOpen(true)}>
               <SlidersHorizontal className="size-[13px]" />追加约束
             </Button>
-            <Button variant="ghost" size="sm" disabled={submitting} onClick={() => void issue('cancel')}>
+            <Button variant="ghost" size="sm" disabled={submitting || cancellationPending} onClick={() => void issue('cancel')}>
               取消任务
             </Button>
           </span>
         ) : null}
       </div>
-      {command ? <CommandStatus command={command} /> : null}
+      {command ? <CommandStatus command={command} execution={execution} /> : null}
       {execution.parallel_waves?.length ? (
         <div className="mt-[8px] grid gap-[5px]" aria-label="并行读取记录">
           {execution.parallel_waves.map((wave) => (
@@ -288,19 +437,30 @@ export default function DynamicExecutionControl({ executionId }: { executionId: 
   );
 }
 
-function CommandStatus({ command }: { command: CommandState }) {
-  const pending = ['pending', 'claimed'].includes(command.status);
-  const applied = command.status === 'applied';
+function CommandStatus({ command, execution }: { command: CommandState; execution: ExecutionState }) {
+  const pending = ['pending', 'claimed'].includes(command.status)
+    || (command.command_type === 'cancel' && command.status === 'applied' && !isCancellationSettled(command, execution));
+  const applied = command.status === 'applied' && !pending;
   const Icon = pending ? LoaderCircle : applied ? CircleCheck : CircleX;
   return (
     <div className={cn('mt-[8px] flex items-center gap-[6px] rounded-[8px] px-[8px] py-[6px] gg-type-caption', pending ? 'bg-[#fff5df] text-[#8a5b00]' : applied ? 'bg-[#eaf8ef] text-[#16723c]' : 'bg-[#fff0f0] text-[#9b3434]')} role="status">
       <Icon className={cn('size-[13px]', pending && 'animate-spin')} />
-      {commandStatusLabel(command)}
+      {commandStatusLabel(command, execution)}
     </div>
   );
 }
 
-function commandStatusLabel(command: CommandState): string {
+function commandStatusLabel(command: CommandState, execution: ExecutionState): string {
+  if (command.command_type === 'cancel') {
+    if (command.status === 'pending' || command.status === 'claimed') return '取消命令等待执行';
+    if (command.status === 'applied') {
+      return isCancellationSettled(command, execution)
+        ? '任务已取消'
+        : '取消已提交，等待效果对账';
+    }
+    if (command.status === 'conflicted') return '取消时执行状态已变化，请刷新后确认最新状态';
+    return '取消未完成，请刷新后重试';
+  }
   if (command.command_type === 'add_skill') {
     if (command.status === 'pending' || command.status === 'claimed') return 'Skill 等待安全边界加载';
     if (command.status === 'applied') return 'Skill 已固定修订并应用到新计划';
@@ -311,6 +471,54 @@ function commandStatusLabel(command: CommandState): string {
   if (command.status === 'applied') return '约束已应用，任务已按新计划继续';
   if (command.status === 'conflicted') return '当前计划已变化，请确认最新状态后重新提交';
   return command.reason_code === 'DYNAMIC_STEERING_DISABLED' ? '追加约束能力当前已关闭' : '约束未被应用';
+}
+
+function isCancellationSettled(command: CommandState, execution: ExecutionState): boolean {
+  if (execution.status === 'cancelled' && execution.cancellation_disposition === 'cancelled') return true;
+  return command.result?.cancelled === true;
+}
+
+function isCancellationPending(command: CommandState | null, execution: ExecutionState): boolean {
+  if (!command || command.command_type !== 'cancel') return false;
+  return command.status === 'pending'
+    || command.status === 'claimed'
+    || (command.status === 'applied' && !isCancellationSettled(command, execution));
+}
+
+const COMMAND_STATUS_ORDER: Record<CommandState['status'], number> = {
+  pending: 0,
+  claimed: 1,
+  applied: 2,
+  conflicted: 2,
+  rejected: 2,
+};
+
+/** 以服务端状态进度和更新时间合并命令快照，避免旧 GET 覆盖新状态。 */
+function newerCommand(current: CommandState | null, candidate: CommandState | null): CommandState | null {
+  if (!current) return candidate;
+  if (!candidate) return current;
+  if (current.command_id === candidate.command_id) {
+    const currentOrder = COMMAND_STATUS_ORDER[current.status];
+    const candidateOrder = COMMAND_STATUS_ORDER[candidate.status];
+    if (candidateOrder < currentOrder) return current;
+    if (candidateOrder > currentOrder) return candidate;
+    const currentTimestamp = current.updated_at || current.consumed_at || current.issued_at;
+    const candidateTimestamp = candidate.updated_at || candidate.consumed_at || candidate.issued_at;
+    if (currentTimestamp && candidateTimestamp && candidateTimestamp < currentTimestamp) return current;
+    return candidate;
+  }
+  if (current.issued_at && candidate.issued_at && current.issued_at > candidate.issued_at) {
+    return current;
+  }
+  if (
+    current.issued_at === candidate.issued_at
+    && current.updated_at
+    && candidate.updated_at
+    && current.updated_at > candidate.updated_at
+  ) {
+    return current;
+  }
+  return candidate;
 }
 
 function parallelStatusLabel(status: string): string {

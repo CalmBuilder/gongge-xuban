@@ -114,6 +114,16 @@ class Settings(BaseSettings):
     tool_timeout_seconds: float = 8.0
     tool_base_url: str = "http://localhost:5137"
     tool_outbound_allowed_hosts: str = ""
+    vertical_ability_exa_mcp_url: str = "https://mcp.exa.ai/mcp"
+    vertical_ability_provider_timeout_seconds: float = Field(
+        default=30.0,
+        ge=5.0,
+        le=120.0,
+    )
+    vertical_ability_jina_api_key: str = ""
+    vertical_ability_groq_api_key: str = ""
+    vertical_ability_openai_api_key: str = ""
+    vertical_ability_media_timeout_seconds: int = Field(default=1800, ge=30, le=7200)
     public_mock_api_key: str
     public_mock_llm_enabled: bool = False
     cors_origins: str = "http://localhost:5137,http://127.0.0.1:5137"

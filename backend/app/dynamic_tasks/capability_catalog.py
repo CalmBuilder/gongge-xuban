@@ -134,6 +134,25 @@ class ReconcileContract(BaseModel):
         return self
 
 
+class ResultQualityContract(BaseModel):
+    """声明列表型工具结果的集合字段、数量字段和空结果语义。"""
+
+    collection_path: str = Field(pattern=r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$")
+    count_path: str = Field(default="count", pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
+    state_path: str = Field(default="result_state", pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
+    non_empty_state: str = Field(default="success_with_data", min_length=1, max_length=64)
+    empty_state: str = Field(default="no_results", min_length=1, max_length=64)
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    @model_validator(mode="after")
+    def validate_states(self) -> "ResultQualityContract":
+        """拒绝列表型结果使用相同状态或把空结果伪装成有数据。"""
+
+        if self.non_empty_state == self.empty_state:
+            raise ValueError("有数据和空结果必须使用不同状态")
+        return self
+
+
 class ModelVisibilityContract(BaseModel):
     """声明模型可见、用户可见和仅审计可见的 schema 路径。"""
 
@@ -198,6 +217,7 @@ class ToolReliabilityContract(BaseModel):
     confirmation_policy: Literal["none", "once", "always", "forbidden"]
     idempotency: IdempotencyContract = Field(default_factory=IdempotencyContract)
     reconcile: ReconcileContract = Field(default_factory=ReconcileContract)
+    result_quality: ResultQualityContract | None = None
     model_visibility: ModelVisibilityContract = Field(default_factory=ModelVisibilityContract)
     applicability: CapabilityApplicabilityContract | None = None
     timeout_policy: Literal["failed", "unknown"]
@@ -946,6 +966,19 @@ class DynamicCapabilityCatalog:
         active_skill_id: str | None = None,
     ) -> Tool | None:
         """忽略快照的历史授权含义，重查实时启用、绑定、契约和组织权限。"""
+
+        vertical_ability = snapshot.audit_view.get("vertical_ability")
+        if isinstance(vertical_ability, Mapping):
+            # 业务版本沿用历史快照；实时再授权仍核对适配器、安全及输入输出合同。
+            from app.vertical_abilities.resolver import VerticalAbilityResolver
+
+            try:
+                VerticalAbilityResolver().compatible_capability(snapshot)
+            except KeyError as exc:
+                raise CapabilityAccessDenied("VERTICAL_ABILITY_NOT_AVAILABLE") from exc
+            except ValueError as exc:
+                raise CapabilityAccessDenied("VERTICAL_ABILITY_REVISION_CHANGED") from exc
+            return None
 
         if snapshot.name == SKILL_PROPOSAL_TOOL_NAME:
             actor = self.db.get(User, actor_user_id or "")

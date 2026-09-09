@@ -82,6 +82,19 @@ def test_complex_goal_without_resources_gets_long_runtime_budget() -> None:
     assert recovery_wording.tier == DynamicBudgetTier.EXTENDED
 
 
+def test_cross_source_research_gets_budget_for_multiple_provider_reads() -> None:
+    """确认需要多来源原文交叉核验的互联网研究不会因默认预算过小而中途截断。"""
+
+    selected = select_dynamic_budget(
+        goal="完成公共互联网发现、原文读取和交叉核验后生成报告",
+        resources=(),
+        guidance_count=0,
+    )
+
+    assert selected.tier == DynamicBudgetTier.EXTENDED
+    assert selected.max_input_tokens == 240_000
+
+
 def test_multi_skill_goal_gets_runtime_budget_for_guidance_replay() -> None:
     """确认多 Skill 组合只提升运行时容量，不改变普通动态能力的开放语义。"""
 
@@ -93,6 +106,20 @@ def test_multi_skill_goal_gets_runtime_budget_for_guidance_replay() -> None:
 
     assert selected.tier == DynamicBudgetTier.EXTENDED
     assert selected.max_model_calls == 20
+
+
+def test_vertical_ability_gets_runtime_budget_for_composed_research() -> None:
+    """确认一个平台内置垂直能力的多适配器研究不会被标准 token 上限截断。"""
+
+    selected = select_dynamic_budget(
+        goal="回答用户问题并形成可追溯结果",
+        resources=(),
+        guidance_count=1,
+        vertical_ability_count=1,
+    )
+
+    assert selected.tier == DynamicBudgetTier.EXTENDED
+    assert selected.max_total_tokens == 288_000
 
 
 def test_simple_plain_goal_keeps_interactive_budget() -> None:

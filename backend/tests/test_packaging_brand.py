@@ -1,13 +1,17 @@
 """
-@Time       : 2026/07/27 16:35
+@Time       : 2026/09/05
 @Author     : zhanglp8181
 @File       : test_packaging_brand.py
 @CallChain  : pytest → packaging 脚本/资源静态契约 → 跨平台发布入口
-@Description: 验证打包身份、资源命名和 macOS 原生产物启动门禁。
+@Description: 验证打包身份、资源命名、Windows 单文件产物路径和原生产物启动门禁。
 """
 
+import ast
+import re
 import subprocess
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -179,3 +183,101 @@ def test_bundled_runtime_preloads_attachment_parser_dependencies() -> None:
     assert "import ssl, requests, docx, openpyxl, pypdf, PIL" in fetch_script
     assert 'import requests, docx, openpyxl, pypdf, PIL' in linux_script
     assert "libsframe1" in linux_script
+
+
+def test_desktop_package_carries_youtube_runtime_dependencies() -> None:
+    """桌面包必须同时携带 yt-dlp-ejs 数据和 Node.js，避免公开视频能力依赖开发机。"""
+
+    pyproject = (ROOT / "backend/pyproject.toml").read_text(encoding="utf-8")
+    spec = (PACKAGING / "gongge-xuban.spec").read_text(encoding="utf-8")
+    fetch_script = (PACKAGING / "fetch_youtube_js_runtime.py").read_text(encoding="utf-8")
+    build_linux = (PACKAGING / "build_linux.sh").read_text(encoding="utf-8")
+    build_macos = (PACKAGING / "build_macos.sh").read_text(encoding="utf-8")
+    build_windows = (PACKAGING / "build_windows.ps1").read_text(encoding="utf-8")
+    smoke_windows = (PACKAGING / "smoke_windows.ps1").read_text(encoding="utf-8")
+
+    assert '"yt-dlp[default]>=2026.07.04"' in pyproject
+    assert 'collect_submodules("yt_dlp")' in spec
+    assert 'collect_submodules("yt_dlp_ejs")' in spec
+    assert 'collect_data_files("yt_dlp")' in spec
+    assert 'collect_data_files("yt_dlp_ejs")' in spec
+    assert "SHASUMS256.txt" in fetch_script
+    assert "node-v{version}-win-x64.zip" in fetch_script
+    assert "runtime/youtube-js/node" in build_linux
+    assert "runtime/youtube-js/node" in build_macos
+    assert "runtime\\youtube-js\\node.exe" in build_windows
+    assert "runtime\\youtube-js\\node.exe" in smoke_windows
+    assert "Bundled YouTube Node.js runtime probe" in smoke_windows
+
+
+def test_windows_package_carries_browser_relay_and_fixed_opencli_runtime() -> None:
+    """Windows 安装包必须携带 Relay 连接器和安装目录内 OpenCLI，不依赖用户全局 PATH。"""
+
+    build_windows = (PACKAGING / "build_windows.ps1").read_text(encoding="utf-8")
+    smoke_windows = (PACKAGING / "smoke_windows.ps1").read_text(encoding="utf-8")
+    installer = (PACKAGING / "installer/gongge-xuban.iss").read_text(encoding="utf-8")
+    fetch_opencli = (PACKAGING / "fetch_opencli_runtime.py").read_text(encoding="utf-8")
+    platform_runtime = (ROOT / "backend/app/vertical_abilities/platform_runtime.py").read_text(encoding="utf-8")
+    launcher = (ROOT / "backend/opencli_launcher.py").read_text(encoding="utf-8")
+
+    for name in (
+        "browser-relay-connector.spec",
+        "opencli-shim.spec",
+        "fetch_opencli_runtime.py",
+        "assets/opencli-wrapper.cmd",
+    ):
+        assert (PACKAGING / name).is_file(), name
+    for marker in (
+        "browser-relay-connector.spec",
+        "browser-relay-connector.exe",
+        "opencli-shim.spec",
+        "runtime\\opencli\\opencli.exe",
+        "runtime\\opencli\\node.exe",
+        "fetch_opencli_runtime.py",
+        "OPENCLI_VERSION",
+    ):
+        assert marker in build_windows
+    for marker in (
+        "browser-relay-connector.exe",
+        "runtime\\opencli\\opencli.exe",
+        "runtime\\opencli\\node.exe",
+        "node_modules\\@jackwener\\opencli\\dist\\src\\main.js",
+        "Bundled browser Relay connector help probe",
+    ):
+        assert marker in smoke_windows
+    assert 'Source: "..\\out\\gongge-xuban\\*"' in installer
+    assert '"--prefix"' in fetch_opencli
+    assert '"--ignore-scripts"' in fetch_opencli
+    assert '"runtime" / "opencli"' in platform_runtime
+    assert "shutil.which(name)" in platform_runtime
+    assert "node.exe" in launcher and "node_modules" in launcher
+
+
+@pytest.mark.parametrize("spec_name,variable", [
+    ("browser-relay-connector.spec", "relayConnector"),
+    ("opencli-shim.spec", "opencliShim"),
+])
+def test_windows_onefile_lookup_matches_spec_output(spec_name: str, variable: str) -> None:
+    """根据 EXE 名称核对单文件实际输出，不执行打包且不能用 spec 文件名猜子目录。"""
+
+    tree = ast.parse((PACKAGING / spec_name).read_text(encoding="utf-8"))
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    ]
+    exe_calls = [node for node in calls if node.func.id == "EXE"]
+    assert len(exe_calls) == 1
+    assert not any(node.func.id == "COLLECT" for node in calls)
+    options = {keyword.arg: ast.literal_eval(keyword.value) for keyword in exe_calls[0].keywords}
+    # PyInstaller EXE 默认 exclude_binaries=False，输出为 DISTPATH/name，而不是 spec/name。
+    assert options.get("exclude_binaries", False) is False
+    name = options["name"]
+    assert isinstance(name, str)
+    filename = name if name.casefold().endswith(".exe") else name + ".exe"
+    expected = PureWindowsPath("packaging", "out", filename)
+    build_script = (PACKAGING / "build_windows.ps1").read_text(encoding="utf-8")
+    invocation = next(line for line in build_script.splitlines() if f"\\{spec_name} " in line)
+    assert "--distpath ..\\packaging\\out" in invocation
+    match = re.search(r"^\$" + re.escape(variable) + r' = "([^"]+)"', build_script, re.MULTILINE)
+    assert match is not None
+    assert PureWindowsPath(match.group(1)) == expected

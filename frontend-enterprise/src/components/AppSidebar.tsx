@@ -128,6 +128,11 @@ const SYSTEM_NAV: NavItem[] = [
   },
   { route: EnterpriseRoute.Models, label: '模型配置', Icon: IconModels },
   {
+    route: EnterpriseRoute.VerticalAbilitySettings,
+    label: '能力包配置',
+    Icon: IconGlobe,
+  },
+  {
     route: EnterpriseRoute.Connections,
     label: '外部连接',
     Icon: IconGlobe,

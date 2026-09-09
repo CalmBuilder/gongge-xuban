@@ -753,7 +753,9 @@ def _execute_prepared_scheduled_task(
                 item,
                 lease_owner=lease_owner,
             )
-            if item.get("event") in {"complete", "done"} and isinstance(item.get("data"), dict):
+            if item.get("event") in {"complete", "done", "turn_waiting"} and isinstance(
+                item.get("data"), dict
+            ):
                 result = ChatTurnResponse.model_validate(item["data"])
         if result is None:
             raise RuntimeError("自动任务执行未返回完整结果")

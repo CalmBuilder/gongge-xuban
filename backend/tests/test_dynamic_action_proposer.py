@@ -1,18 +1,23 @@
 """
-@Time       : 2026/08/04 02:59
+@Time       : 2026/09/05 19:01
 @Author     : zhanglp8181
 @File       : test_dynamic_action_proposer.py
-@CallChain  : pytest → DynamicActionProposer → completed JSON client
-@Description: 验证单步动作的 provider 身份、步骤类别和能力范围契约。
+@CallChain  : pytest → DynamicActionProposer → completed JSON client/真实 LLMClient 元数据方法
+@Description: 验证单步动作身份和范围，以及取消回调透传、取消异常保真和旧客户端兼容。
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import Any
+
 import pytest
 
+from app.cancellation import TurnCancellationRequested
 from app.dynamic_tasks.action_proposer import DynamicActionProposer
 from app.dynamic_tasks.planning import PlanStep
 from app.dynamic_tasks.provider_view import build_provider_execution_view
+from app.llm.client import LLMClient, LLMStreamCancelled
 
 
 class _Client:
@@ -146,6 +151,20 @@ class _AnnotatedEvidenceAnswerClient(_AnswerClient):
         return raw, metadata
 
 
+class _ListCriterionEvidenceAnswerClient(_AnswerClient):
+    """模拟 provider 将单一成功标准的证据数组直接放在 criterion_evidence 中。"""
+
+    def generate_json_with_metadata(self, system_prompt, user_payload):
+        """返回可安全归属到唯一成功标准的步骤证据数组。"""
+
+        raw, metadata = super().generate_json_with_metadata(system_prompt, user_payload)
+        raw["arguments"]["criterion_evidence"] = [
+            "query_contract：查询步骤已完成",
+            "final_answer",
+        ]
+        return raw, metadata
+
+
 class _MissingRationaleAnswerClient(_AnswerClient):
     """模拟模型给出完整answer结果但遗漏非权威动作说明。"""
 
@@ -154,6 +173,17 @@ class _MissingRationaleAnswerClient(_AnswerClient):
 
         raw, metadata = super().generate_json_with_metadata(system_prompt, user_payload)
         raw.pop("rationale", None)
+        return raw, metadata
+
+
+class _MissingActionKindAnswerClient(_AnswerClient):
+    """模拟结果修复轮只返回最终结果、遗漏动作类别的 provider。"""
+
+    def generate_json_with_metadata(self, system_prompt, user_payload):
+        """删除 action_kind，验证宿主仅按当前 answer 步骤收敛结果。"""
+
+        raw, metadata = super().generate_json_with_metadata(system_prompt, user_payload)
+        raw.pop("action_kind", None)
         return raw, metadata
 
 
@@ -408,6 +438,137 @@ def test_proposer_preserves_provider_identity_and_current_step_scope() -> None:
     }
     assert "contract.query" in client.payload["output_contract"]["capability_ref"]
     assert "工具ID" in client.payload["output_contract"]["capability_ref"]
+    assert "必须为 call_tool" in client.payload["output_contract"]["action_kind"]
+
+
+def test_proposer_forwards_same_cancellation_callback_through_real_json_metadata_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """保留真实 LLMClient 元数据方法，仅替换 JSON 生成，验证收到同一个取消回调。"""
+
+    client = object.__new__(LLMClient)
+    callbacks: list[Callable[[], bool] | None] = []
+
+    def probe() -> bool:
+        """表示当前任务尚未取消，客户端可以完成动作生成。"""
+
+        return False
+
+    def generate(
+        system_prompt: str,
+        user_payload: dict[str, Any],
+        *,
+        is_cancelled: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
+        """记录真实元数据方法透传的回调，并提供固定动作和完成身份而不访问网络。"""
+
+        callbacks.append(is_cancelled)
+        raw, metadata = _Client().generate_json_with_metadata(system_prompt, user_payload)
+        client._last_completed_response_metadata = metadata
+        return raw
+
+    monkeypatch.setattr(client, "generate_json", generate)
+    completed = DynamicActionProposer(client, is_cancelled=probe).propose(
+        view=_view(),
+        step=PlanStep(
+            step_key="query_contract", title="查询合同", kind="tool.read",
+            capability_refs=("contract.query",),
+        ),
+    )
+
+    assert len(callbacks) == 1
+    assert callbacks[0] is probe
+    assert completed.response_id == "response_1"
+    assert completed.proposal.capability_ref == "contract.query"
+
+
+@pytest.mark.parametrize("error_type", [TurnCancellationRequested, LLMStreamCancelled])
+def test_proposer_preserves_cancellation_exception_identity_without_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[Exception],
+) -> None:
+    """客户端生成过程中取消时原样抛出同一异常，不转为校验失败、重试或完成提案。"""
+
+    client = object.__new__(LLMClient)
+    error = error_type("固定取消回执")
+    callbacks: list[Callable[[], bool] | None] = []
+
+    def probe() -> bool:
+        """调用前尚未取消，取消由生成过程中的客户端异常体现。"""
+
+        return False
+
+    def generate(
+        _system_prompt: str,
+        _user_payload: dict[str, Any],
+        *,
+        is_cancelled: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
+        """模拟底层生成已收到取消信号，检查宿主不会吞异常或降级重试。"""
+
+        callbacks.append(is_cancelled)
+        raise error
+
+    monkeypatch.setattr(client, "generate_json", generate)
+    with pytest.raises(error_type) as caught:
+        DynamicActionProposer(client, is_cancelled=probe).propose(
+            view=_view(),
+            step=PlanStep(
+                step_key="query_contract", title="查询合同", kind="tool.read",
+                capability_refs=("contract.query",),
+            ),
+        )
+
+    assert caught.value is error
+    assert len(callbacks) == 1
+    assert callbacks[0] is probe
+
+
+def test_proposer_cancellation_reaches_real_client_before_json_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """预先取消的回调必须到达真实客户端检查点，不进入实际 JSON 生成。"""
+
+    client = object.__new__(LLMClient)
+
+    def probe() -> bool:
+        """表示当前任务已取消，使客户端在生成前终止。"""
+
+        return True
+
+    def generate(*_args: object, **_kwargs: object) -> dict[str, Any]:
+        """任何生成调用都说明取消透传没有生效。"""
+
+        pytest.fail("已取消任务不应进入 JSON 生成")
+
+    monkeypatch.setattr(client, "generate_json", generate)
+    with pytest.raises(TurnCancellationRequested):
+        DynamicActionProposer(client, is_cancelled=probe).propose(
+            view=_view(),
+            step=PlanStep(
+                step_key="query_contract", title="查询合同", kind="tool.read",
+                capability_refs=("contract.query",),
+            ),
+        )
+
+
+@pytest.mark.parametrize("explicit_none", [False, True])
+def test_proposer_without_cancellation_keeps_legacy_client_signature(explicit_none: bool) -> None:
+    """省略回调或显式 None 时不传新增 keyword，兼容仅支持原两参数的客户端。"""
+
+    client = _Client()
+    proposer = (
+        DynamicActionProposer(client, is_cancelled=None)
+        if explicit_none else DynamicActionProposer(client)
+    )
+    completed = proposer.propose(
+        view=_view(),
+        step=PlanStep(
+            step_key="query_contract", title="查询合同", kind="tool.read",
+            capability_refs=("contract.query",),
+        ),
+    )
+    assert completed.response_id == "response_1"
 
 
 def test_proposer_unwraps_strict_provider_action_envelope() -> None:
@@ -727,6 +888,18 @@ def test_answer_step_supplies_stable_non_authoritative_rationale_when_omitted() 
     assert completed.proposal.rationale == "提交当前计划步骤的最终结果"
 
 
+def test_answer_step_infers_missing_action_kind_only_from_current_answer_step() -> None:
+    """结果修复遗漏动作类别时只按当前 answer 步骤补齐，不放宽未知字段。"""
+
+    completed = DynamicActionProposer(_MissingActionKindAnswerClient()).propose(
+        view=_view(include_result_facts=True),
+        step=PlanStep(step_key="answer", title="形成验收结果", kind="answer"),
+    )
+
+    assert completed.proposal.action_kind.value == "answer"
+    assert completed.proposal.arguments["markdown"] == "# 验收结果"
+
+
 def test_answer_without_input_resources_drops_unverifiable_attachment_claims() -> None:
     """无附件任务只使用成功标准步骤证据，不保留模型自造的空 EvidenceRef Claim。"""
 
@@ -753,6 +926,19 @@ def test_annotated_criterion_step_reference_is_canonicalized_to_known_key() -> N
 
     assert completed.proposal.arguments["criterion_evidence"] == {
         "criterion_01": ["query_contract"]
+    }
+
+
+def test_single_criterion_evidence_list_is_normalized_to_criterion_mapping() -> None:
+    """单一成功标准的数组证据可收敛为规范映射，并继续校验步骤引用。"""
+
+    completed = DynamicActionProposer(_ListCriterionEvidenceAnswerClient()).propose(
+        view=_view(include_result_facts=True),
+        step=PlanStep(step_key="final_answer", title="形成验收结果", kind="answer"),
+    )
+
+    assert completed.proposal.arguments["criterion_evidence"] == {
+        "criterion_01": ["query_contract", "final_answer"]
     }
 
 

@@ -9,6 +9,7 @@ import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
 import { Button as UIButton } from '@/components/ui/button';
 import {
   DropdownMenu,
+  DropdownMenuCheckboxItem,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuTrigger,
@@ -17,6 +18,7 @@ import { HoverCard, HoverCardContent, HoverCardTrigger } from '@/components/ui/h
 import { employeeDisplayName } from '@/employee';
 import { cn } from '@/lib/utils';
 import { useI18n } from '@/i18n';
+import type { VerticalAbilityReadinessRead } from '@/types';
 
 import {
   CHAT_COMPOSER_ACTIONS_ROW_CLASS,
@@ -55,6 +57,7 @@ import {
 import { attachmentTypeLabel, modelDetailText, modelDisplayName } from '../chatHelpers';
 import type { UseChatSession } from '../useChatSession';
 import type { GeneralSkillInstallIntentRead } from '../chatTypes';
+import WebsiteConnectionDialog from './WebsiteConnectionDialog';
 
 export default function Composer({ chat }: { chat: UseChatSession }) {
   const { t } = useI18n();
@@ -75,6 +78,14 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
     selectedGeneralSkillIds,
     selectSessionGeneralSkill,
     clearSelectedGeneralSkill,
+    verticalAbilities,
+    verticalAbilityCatalogLoading,
+    verticalAbilityCatalogError,
+    selectedVerticalAbilityIds,
+    selectVerticalAbility,
+    clearSelectedVerticalAbility,
+    verticalAbilityReadinessById,
+    checkVerticalAbilityReadiness,
     generalSkillInstallOpen,
     setGeneralSkillInstallOpen,
     generalSkillInstallIntents,
@@ -118,7 +129,15 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [scheduleIntentHovered, setScheduleIntentHovered] = useState(false);
+  const [verticalAbilityMenuOpen, setVerticalAbilityMenuOpen] = useState(false);
+  const [websiteConnectionOpen, setWebsiteConnectionOpen] = useState(false);
   const [previewAttachment, setPreviewAttachment] = useState<UseChatSession['composerAttachments'][number] | null>(null);
+  const [verticalAbilityConfigurationWarnings, setVerticalAbilityConfigurationWarnings] = useState<
+    Record<string, VerticalAbilityReadinessRead>
+  >({});
+  const [verticalAbilityConfigurationDialog, setVerticalAbilityConfigurationDialog] = useState<
+    VerticalAbilityReadinessRead | null
+  >(null);
 
   useEffect(() => {
     const element = textareaRef.current;
@@ -145,10 +164,89 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
   const selectedGeneralSkills = sessionGeneralSkills.filter(
     (item) => selectedGeneralSkillIds.includes(item.skill_id),
   );
+  const selectedVerticalAbilities = verticalAbilities.filter(
+    (item) => selectedVerticalAbilityIds.includes(item.id),
+  );
+  const activeVerticalAbilityWarnings = selectedVerticalAbilities
+    .map((item) => verticalAbilityConfigurationWarnings[item.id])
+    .filter((item): item is VerticalAbilityReadinessRead => Boolean(item && !item.configured));
+  const dynamicTaskSelected = executionEngine === 'dynamic_task' || selectedVerticalAbilityIds.length > 0;
+
+  const handleVerticalAbilitySelect = (abilityId: string) => {
+    setVerticalAbilityMenuOpen(false);
+    void Promise.resolve(selectVerticalAbility(abilityId)).then((readiness) => {
+      if (!readiness || readiness.configured) return;
+      setVerticalAbilityConfigurationWarnings((current) => ({
+        ...current,
+        [readiness.ability_id]: readiness,
+      }));
+      setVerticalAbilityConfigurationDialog(readiness);
+    }).catch(() => undefined);
+  };
+
+  const handleVerticalAbilitySend = async () => {
+    if (hasSendContent) {
+      const knownMissing = activeVerticalAbilityWarnings[0]
+        || selectedVerticalAbilityIds
+          .map((abilityId) => verticalAbilityReadinessById?.[abilityId])
+          .find((item): item is VerticalAbilityReadinessRead => Boolean(item && !item.configured));
+      if (knownMissing) {
+        setVerticalAbilityConfigurationDialog(knownMissing);
+        return;
+      }
+      const unknownAbilityId = selectedVerticalAbilityIds.find(
+        (abilityId) => !verticalAbilityReadinessById?.[abilityId],
+      );
+      if (unknownAbilityId && checkVerticalAbilityReadiness) {
+        const readiness = await checkVerticalAbilityReadiness(unknownAbilityId);
+        if (readiness && !readiness.configured) {
+          setVerticalAbilityConfigurationWarnings((current) => ({
+            ...current,
+            [readiness.ability_id]: readiness,
+          }));
+          setVerticalAbilityConfigurationDialog(readiness);
+          return;
+        }
+      }
+    }
+    void send();
+  };
+
+  const handleVerticalAbilityRecheck = async (abilityId: string) => {
+    if (!checkVerticalAbilityReadiness) return;
+    const readiness = await checkVerticalAbilityReadiness(abilityId);
+    if (!readiness) return;
+    if (readiness.configured) {
+      setVerticalAbilityConfigurationWarnings((current) => {
+        const next = { ...current };
+        delete next[abilityId];
+        return next;
+      });
+      setVerticalAbilityConfigurationDialog(null);
+      return;
+    }
+    setVerticalAbilityConfigurationWarnings((current) => ({ ...current, [abilityId]: readiness }));
+    setVerticalAbilityConfigurationDialog(readiness);
+  };
+
+  useEffect(() => {
+    setVerticalAbilityConfigurationWarnings((current) => {
+      const next = Object.fromEntries(
+        Object.entries(current).filter(([abilityId]) => selectedVerticalAbilityIds.includes(abilityId)),
+      );
+      return Object.keys(next).length === Object.keys(current).length ? current : next;
+    });
+    if (
+      verticalAbilityConfigurationDialog
+      && !selectedVerticalAbilityIds.includes(verticalAbilityConfigurationDialog.ability_id)
+    ) {
+      setVerticalAbilityConfigurationDialog(null);
+    }
+  }, [selectedVerticalAbilityIds, verticalAbilityConfigurationDialog]);
 
   const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    void send();
+    void handleVerticalAbilitySend();
   };
 
   const handleNewSession = () => {
@@ -365,7 +463,7 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
                 && nativeEvent.keyCode !== 229
               ) {
                 event.preventDefault();
-                void send();
+                void handleVerticalAbilitySend();
               }
             }}
           />
@@ -478,20 +576,86 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
                   </DropdownMenuContent>
                 </DropdownMenu>
               )}
+              <DropdownMenu open={verticalAbilityMenuOpen} onOpenChange={setVerticalAbilityMenuOpen}>
+                <DropdownMenuTrigger asChild>
+                  <button
+                    type="button"
+                    className={cn(
+                      CHAT_COMPOSER_MODEL_BTN_CLASS,
+                      selectedVerticalAbilityIds.length > 0 && CHAT_COMPOSER_ENGINE_BTN_ACTIVE_CLASS,
+                    )}
+                    aria-label={t('选择垂直能力包')}
+                  >
+                    <ProductIcon name="globe" size={14} />
+                    <span className="max-w-[150px] truncate">
+                      {selectedVerticalAbilities.length === 1
+                        ? t('能力包：{1}', { 1: selectedVerticalAbilities[0].name })
+                        : selectedVerticalAbilityIds.length
+                          ? t('能力包 · {1}', { 1: selectedVerticalAbilityIds.length })
+                          : t('能力包')}
+                    </span>
+                  </button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent
+                  align="start"
+                  side="top"
+                  className={cn(CHAT_MENU_CONTENT_CLASS, 'max-h-[360px] min-w-[300px] overflow-y-auto')}
+                >
+                  {verticalAbilityCatalogLoading && <DropdownMenuItem disabled>{t('正在加载能力包…')}</DropdownMenuItem>}
+                  {verticalAbilityCatalogError && <DropdownMenuItem disabled>{t('能力包加载失败，请刷新重试')}</DropdownMenuItem>}
+                  {!verticalAbilityCatalogLoading && !verticalAbilityCatalogError && !verticalAbilities.length && (
+                    <DropdownMenuItem disabled>{t('当前没有可用能力包')}</DropdownMenuItem>
+                  )}
+                  {verticalAbilities.map((item) => (
+                    <DropdownMenuCheckboxItem
+                      key={item.id}
+                      checked={selectedVerticalAbilityIds.includes(item.id)}
+                      className={CHAT_MODEL_MENU_ITEM_CLASS}
+                      onSelect={(event) => {
+                        event.preventDefault();
+                        handleVerticalAbilitySelect(item.id);
+                      }}
+                    >
+                      <ProductIcon name={item.icon_key === 'globe' ? 'globe' : 'spark'} size={15} />
+                      <span className={CHAT_MODEL_MENU_COPY_CLASS}>
+                        <span className={CHAT_MODEL_MENU_NAME_CLASS}>{item.name}</span>
+                        <span className={CHAT_MODEL_MENU_DETAIL_CLASS}>
+                          {item.category} · v{item.version} · {item.health.status === 'degraded' ? t('部分渠道异常') : t('可用')}
+                        </span>
+                        <span className={CHAT_MODEL_MENU_DETAIL_CLASS}>{item.description}</span>
+                      </span>
+                    </DropdownMenuCheckboxItem>
+                  ))}
+                  <DropdownMenuItem
+                    className={CHAT_MENU_ITEM_CLASS}
+                    onSelect={(event) => {
+                      event.preventDefault();
+                      setVerticalAbilityMenuOpen(false);
+                      setWebsiteConnectionOpen(true);
+                    }}
+                  >
+                    <ProductIcon name="globe" size={15} />
+                    <span>配置网站连接</span>
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
               <button
                 type="button"
                 className={cn(
                   CHAT_COMPOSER_ENGINE_BTN_CLASS,
-                  executionEngine === 'dynamic_task' && CHAT_COMPOSER_ENGINE_BTN_ACTIVE_CLASS,
+                  dynamicTaskSelected && CHAT_COMPOSER_ENGINE_BTN_ACTIVE_CLASS,
                 )}
-                aria-pressed={executionEngine === 'dynamic_task'}
+                aria-pressed={dynamicTaskSelected}
                 aria-label={t('选择 DynamicTaskAgent 复杂任务引擎')}
                 title={t('选中后，当前没有正在执行的 SOP 时，本轮默认使用 DynamicTaskAgent；活动 SOP 会继续原流程')}
-                onClick={() => setExecutionEngine(executionEngine === 'dynamic_task' ? 'auto' : 'dynamic_task')}
+                onClick={() => {
+                  if (selectedVerticalAbilityIds.length) return;
+                  setExecutionEngine(executionEngine === 'dynamic_task' ? 'auto' : 'dynamic_task');
+                }}
               >
                 <ProductIcon name="tool" size={14} />
                 <span className="truncate">DynamicTaskAgent</span>
-                {executionEngine === 'dynamic_task' && <ProductIcon name="check" size={13} />}
+                {dynamicTaskSelected && <ProductIcon name="check" size={13} />}
               </button>
               {selectedGeneralSkills.map((selectedSkill) => (
                 <button
@@ -504,6 +668,32 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
                 >
                   <ProductIcon name="close" size={10} />
                   <span>{selectedSkill.name}</span>
+                </button>
+              ))}
+              {selectedVerticalAbilities.map((ability) => (
+                <button
+                  key={ability.id}
+                  type="button"
+                  className={CHAT_COMPOSER_INTENT_CHIP_CLASS}
+                  onClick={() => clearSelectedVerticalAbility(ability.id)}
+                  aria-label={t('取消能力包 {1}', { 1: ability.name })}
+                  title={t('取消当前对话的能力包选择')}
+                >
+                  <ProductIcon name="close" size={10} />
+                  <span>{ability.name}</span>
+                </button>
+              ))}
+              {activeVerticalAbilityWarnings.map((warning) => (
+                <button
+                  key={warning.ability_id}
+                  type="button"
+                  className="inline-flex max-w-[220px] items-center gap-1 rounded-[var(--gg-radius-control)] border border-[#f1c982] bg-[#fff8e8] px-2 py-1 gg-type-caption font-medium text-[#805000] hover:bg-[#fff1cf]"
+                  onClick={() => setVerticalAbilityConfigurationDialog(warning)}
+                  aria-label={t('查看{1}配置提示', { 1: warning.provider_name || t('外部服务') })}
+                  title={t('查看能力包配置提示')}
+                >
+                  <ProductIcon name="warning" size={12} />
+                  <span className="truncate">{t('{1}待配置', { 1: warning.provider_name || t('外部服务') })}</span>
                 </button>
               ))}
               <div className={CHAT_COMPOSER_HINT_CLASS}>Enter 发送 / Shift+Enter 换行</div>
@@ -571,6 +761,15 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
           onCreate={createGeneralSkillInstallIntent}
           onResolve={resolveGeneralSkillInstallIntent}
         />
+        <VerticalAbilityConfigurationDialog
+          readiness={verticalAbilityConfigurationDialog}
+          onClose={() => setVerticalAbilityConfigurationDialog(null)}
+          onRecheck={handleVerticalAbilityRecheck}
+        />
+        <WebsiteConnectionDialog
+          open={websiteConnectionOpen}
+          onOpenChange={setWebsiteConnectionOpen}
+        />
       </div>
     </div>
   );
@@ -634,6 +833,50 @@ function GeneralSkillInstallDialog({
             {activeIntent.status === 'installed' ? <UIButton onClick={onClose}>安装完成，开始使用</UIButton> : null}
           </section>
         )}
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function VerticalAbilityConfigurationDialog({
+  readiness,
+  onClose,
+  onRecheck,
+}: {
+  readiness: VerticalAbilityReadinessRead | null;
+  onClose: () => void;
+  onRecheck: (abilityId: string) => Promise<void>;
+}) {
+  const { t } = useI18n();
+  const [checking, setChecking] = useState(false);
+
+  const handleRecheck = async () => {
+    if (!readiness) return;
+    setChecking(true);
+    try {
+      await onRecheck(readiness.ability_id);
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  return (
+    <Dialog open={Boolean(readiness)} onOpenChange={(next) => !next && onClose()}>
+      <DialogContent aria-describedby={undefined} className="sm:max-w-[480px]">
+        <DialogTitle>{t('{1}需要配置', { 1: readiness?.provider_name || t('能力包 Provider') })}</DialogTitle>
+        <div className="flex items-start gap-3 rounded-xl border border-[#f1c982] bg-[#fff8e8] p-4 text-[#805000]" role="alert">
+          <ProductIcon name="warning" size={18} className="mt-0.5 shrink-0" />
+          <p className="gg-type-body">{readiness?.message || t('请联系管理员完成能力包配置。')}</p>
+        </div>
+        <p className="gg-type-meta text-[#596078]">
+          {t('关闭提示不会移除已选能力包；再次发送时仍会检查配置。管理员完成配置后，可点击“重新检查”继续使用。')}
+        </p>
+        <div className="flex justify-end gap-2">
+          <UIButton variant="outline" disabled={checking} onClick={() => void handleRecheck()}>
+            {checking ? t('检查中…') : t('重新检查')}
+          </UIButton>
+          <UIButton onClick={onClose}>{t('关闭提示')}</UIButton>
+        </div>
       </DialogContent>
     </Dialog>
   );

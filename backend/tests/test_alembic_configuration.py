@@ -21,7 +21,7 @@ def test_alembic_has_single_expected_head_and_baseline() -> None:
     config = Config(str(BACKEND_DIR / "alembic.ini"))
     script = ScriptDirectory.from_config(config)
 
-    assert script.get_heads() == ["20260901_0078"]
+    assert script.get_heads() == ["20260906_0083"]
     member_lifecycle = script.get_revision("20260728_0016")
     assert member_lifecycle.down_revision == "20260727_0015"
     organization_units = script.get_revision("20260728_0017")
@@ -162,7 +162,7 @@ def test_alembic_has_single_expected_head_and_baseline() -> None:
 
 
 def test_context_summary_budget_migration_follows_current_head_without_a_branch() -> None:
-    """验证上下文摘要预算迁移从 0077 单向接续，不能产生第二条迁移分支。"""
+    """验证上下文摘要、平台密钥和浏览器 Relay 迁移单向接续，不能产生第二条迁移分支。"""
 
     config = Config(str(BACKEND_DIR / "alembic.ini"))
     script = ScriptDirectory.from_config(config)
@@ -170,7 +170,19 @@ def test_context_summary_budget_migration_follows_current_head_without_a_branch(
 
     assert migration is not None
     assert migration.down_revision == "20260830_0077"
-    assert script.get_heads() == ["20260901_0078"]
+    platform_secrets = script.get_revision("20260902_0079")
+    assert platform_secrets is not None
+    assert platform_secrets.down_revision == "20260901_0078"
+    browser_relay = script.get_revision("20260904_0081")
+    assert browser_relay is not None
+    assert browser_relay.down_revision == "20260903_0080"
+    local_pairing = script.get_revision("20260905_0082")
+    assert local_pairing is not None
+    assert local_pairing.down_revision == "20260904_0081"
+    event_precision = script.get_revision("20260906_0083")
+    assert event_precision is not None
+    assert event_precision.down_revision == "20260905_0082"
+    assert script.get_heads() == ["20260906_0083"]
 
 
 def test_alembic_files_do_not_embed_runtime_credentials() -> None:

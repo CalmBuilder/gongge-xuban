@@ -1,0 +1,297 @@
+[
+  {
+    "case_id": "engineering-developer-tooling-engineer",
+    "category": "工程研发",
+    "expert_name": "开发者工具工程师",
+    "upstream_path": "engineering/engineering-developer-tooling-engineer.md",
+    "research_question": "比较当前公开的 CLI 与内部开发者平台方案，重点判断命令设计、错误提示、Shell 补全、启动速度、跨平台分发、脚本化和可组合接口。",
+    "focus_dimensions": ["命令设计", "错误提示", "Shell 补全", "快速启动", "跨平台分发", "脚本化", "可组合接口"]
+  },
+  {
+    "case_id": "engineering-api-platform-engineer",
+    "category": "工程研发",
+    "expert_name": "API 平台工程师",
+    "upstream_path": "engineering/engineering-api-platform-engineer.md",
+    "research_question": "调查当前 API 平台和开发者门户的公开实践，比较契约、版本、认证、可观测性、限流、SDK 和故障排查体验。",
+    "focus_dimensions": ["API 契约", "版本策略", "认证", "可观测性", "限流", "SDK", "故障排查"]
+  },
+  {
+    "case_id": "product-manager",
+    "category": "产品管理",
+    "expert_name": "产品经理",
+    "upstream_path": "product/product-manager.md",
+    "research_question": "研究一个近期开发者产品方向的用户问题、竞品变化和公开需求证据，形成带优先级依据的产品判断。",
+    "focus_dimensions": ["用户问题", "竞品变化", "需求证据", "优先级", "产品决策"]
+  },
+  {
+    "case_id": "product-trend-researcher",
+    "category": "产品管理",
+    "expert_name": "市场趋势研究员",
+    "upstream_path": "product/product-trend-researcher.md",
+    "research_question": "追踪一个正在变化的 AI 或开发者工具市场趋势，读取原始公告和行业讨论，区分事实、趋势信号和推断。",
+    "focus_dimensions": ["时间线", "市场信号", "原始公告", "行业讨论", "趋势推断"]
+  },
+  {
+    "case_id": "paid-media-auditor",
+    "category": "付费媒体",
+    "expert_name": "付费媒体审计师",
+    "upstream_path": "paid-media/paid-media-auditor.md",
+    "research_question": "调查当前广告平台公开政策或指标口径变化，核对官方文档、变更时间和营销行业解读，指出审计风险。",
+    "focus_dimensions": ["平台政策", "指标口径", "变更时间", "官方文档", "审计风险"]
+  },
+  {
+    "case_id": "paid-media-search-query-analyst",
+    "category": "付费媒体",
+    "expert_name": "搜索词分析师",
+    "upstream_path": "paid-media/paid-media-search-query-analyst.md",
+    "natural_question": "以 GitHub Copilot coding agent 与企业 AI 编码助手为主题，研究公开搜索意图、用户问题和竞品表达，给出可验证的关键词分组。",
+    "research_question": "围绕一个开发者产品或企业软件主题，研究公开搜索意图、用户问题和竞品表达，给出可验证的关键词分组。",
+    "focus_dimensions": ["搜索意图", "关键词分组", "用户问题", "竞品表达", "证据时间"]
+  },
+  {
+    "case_id": "healthcare-clinical-evidence-agent",
+    "category": "医疗健康",
+    "expert_name": "临床证据智能体",
+    "upstream_path": "healthcare/healthcare-clinical-evidence-agent.md",
+    "natural_question": "围绕成人流感疫苗有效性的公开研究，检索并核对人群、研究方法、主要结果和限制；优先使用公开可访问的 PubMed、PMC 或公共卫生机构原文，不输出诊疗建议。",
+    "research_question": "检索一个公开医疗研究主题的临床证据，读取研究原文或摘要，核对人群、方法、结果和限制，不输出诊疗建议。",
+    "focus_dimensions": ["研究人群", "研究方法", "结果", "发布日期", "局限性", "证据等级"]
+  },
+  {
+    "case_id": "healthcare-innovation-strategist",
+    "category": "医疗健康",
+    "expert_name": "医疗创新策略师",
+    "upstream_path": "healthcare/healthcare-innovation-strategist.md",
+    "research_question": "研究一个医疗技术创新方向的公开产品、监管或临床进展，整理采用条件、利益相关者和未解决风险。",
+    "focus_dimensions": ["技术进展", "监管信息", "临床采用", "利益相关者", "风险缺口"]
+  },
+  {
+    "case_id": "gis-analyst",
+    "category": "地理信息",
+    "expert_name": "GIS 分析师",
+    "upstream_path": "gis/gis-analyst.md",
+    "research_question": "调查一个公开 GIS 数据或工具方案，核对数据源、空间方法、坐标/指标定义、版本和可复核限制。",
+    "focus_dimensions": ["数据源", "空间方法", "坐标定义", "指标定义", "工具版本", "复核限制"]
+  },
+  {
+    "case_id": "gis-geoai-ml-engineer",
+    "category": "地理信息",
+    "expert_name": "GeoAI/ML 工程师",
+    "upstream_path": "gis/gis-geoai-ml-engineer.md",
+    "research_question": "比较一个 GeoAI/空间机器学习工具或开源项目的公开实现，读取文档、仓库和问题反馈，判断模型与部署边界。",
+    "focus_dimensions": ["模型方法", "空间数据", "训练/推理", "部署", "版本", "已知问题"]
+  },
+  {
+    "case_id": "research-synthesist",
+    "category": "学术研究",
+    "expert_name": "研究综合专家",
+    "upstream_path": "research/research-synthesist.md",
+    "research_question": "围绕一个近期技术研究问题完成文献发现、关键原文读取、方法比较、相互印证和研究缺口总结。",
+    "focus_dimensions": ["文献发现", "原文证据", "方法比较", "结论冲突", "研究缺口"]
+  },
+  {
+    "case_id": "academic-statistician",
+    "category": "学术研究",
+    "expert_name": "统计学家",
+    "upstream_path": "academic/academic-statistician.md",
+    "research_question": "调查一个公开实验或基准结果，核对样本、指标、统计方法、比较基线和原文限制，避免把相关性写成因果性。",
+    "focus_dimensions": ["样本", "指标", "统计方法", "基线", "不确定性", "因果边界"]
+  },
+  {
+    "case_id": "security-ai-generated-code-auditor",
+    "category": "安全",
+    "expert_name": "AI生成代码安全审计员",
+    "upstream_path": "security/security-ai-generated-code-auditor.md",
+    "research_question": "调查 AI 生成代码相关的公开安全事件、漏洞公告或审计实践，建立时间线、风险事实、官方证据和修复边界。",
+    "focus_dimensions": ["漏洞事实", "安全公告", "时间线", "严重性", "修复边界", "证据缺口"]
+  },
+  {
+    "case_id": "security-threat-intelligence-analyst",
+    "category": "安全",
+    "expert_name": "威胁情报分析师",
+    "upstream_path": "security/security-threat-intelligence-analyst.md",
+    "natural_question": "围绕 2025 年 npm 生态供应链攻击事件，跟踪官方安全公告与独立技术分析，核对受影响范围、时间线、可验证的威胁标识和防御性处置边界；只给防御建议，不执行攻击步骤。",
+    "research_question": "跟踪一个公开威胁活动或漏洞的情报线索，关联官方公告、技术分析和时间线，只给防御性建议，不执行攻击步骤。",
+    "focus_dimensions": ["威胁事实", "IOC/标识", "时间线", "来源可靠性", "防御建议", "未知项"]
+  },
+  {
+    "case_id": "support-responder",
+    "category": "客户支持",
+    "expert_name": "客户支持专员",
+    "upstream_path": "support/support-support-responder.md",
+    "natural_question": "围绕 Docker Compose 服务启动失败或健康检查不通过的常见公开问题，核对官方文档、版本说明和社区排查经验，形成用户可执行的排查路径与升级条件。",
+    "research_question": "针对一个公开软件故障或配置问题，检索官方文档、版本说明和社区讨论，形成用户可理解的排查路径与升级条件。",
+    "focus_dimensions": ["故障现象", "官方文档", "版本差异", "排查路径", "升级条件"]
+  },
+  {
+    "case_id": "support-executive-summary-generator",
+    "category": "客户支持",
+    "expert_name": "高管摘要生成师",
+    "upstream_path": "support/support-executive-summary-generator.md",
+    "natural_question": "围绕一次公开的 GitHub Actions 服务中断事件，至少读取两篇互相独立的实际原文：一篇官方状态说明或事件复盘，以及一篇独立行业报道；汇总影响、时间线、证据、风险与待决策事项，形成面向高管的简报。",
+    "research_question": "把一个近期公开产品或服务事件的多来源资料压缩成高管简报，保留影响、时间线、证据、风险和待决策事项。",
+    "focus_dimensions": ["影响", "时间线", "证据", "风险", "待决策事项"]
+  },
+  {
+    "case_id": "specialized-mcp-builder",
+    "category": "专业服务",
+    "expert_name": "MCP 构建专家",
+    "upstream_path": "specialized/specialized-mcp-builder.md",
+    "natural_question": "围绕一个公开的 GitHub MCP Server 实现，结合协议说明、仓库文档和一个真实 Issue（不是 Pull Request）反馈，评价工具契约、错误处理、部署方式与组合边界；如果专用详情接口不可用，使用公开页面原文并说明缺口。",
+    "research_question": "调查一个公开 MCP Server 或工具集成方案，读取仓库、协议说明和 Issue，评价工具契约、错误处理、部署与组合方式。",
+    "focus_dimensions": ["工具契约", "协议", "错误处理", "部署", "组合方式", "Issue 证据"]
+  },
+  {
+    "case_id": "specialized-business-strategist",
+    "category": "专业服务",
+    "expert_name": "商业策略师",
+    "upstream_path": "specialized/business-strategist.md",
+    "natural_question": "围绕企业采用 Model Context Protocol 的公开产品与供应商方向，研究市场事实、竞争位置、客户价值和成本收益假设，明确仍需验证的结论。",
+    "research_question": "研究一个公开产品或供应商方向的市场事实、竞争位置、客户价值和成本/收益假设，明确哪些结论仍需验证。",
+    "focus_dimensions": ["市场事实", "竞争位置", "客户价值", "成本收益", "假设验证"]
+  },
+  {
+    "case_id": "marketing-seo-specialist",
+    "category": "市场营销",
+    "expert_name": "SEO 专家（SEO Specialist）",
+    "upstream_path": "marketing/marketing-seo-specialist.md",
+    "natural_question": "围绕 AI coding agent 这一技术主题，调查公开搜索结果和权威内容，分析用户搜索意图、内容缺口、引用来源和可验证的内容机会。",
+    "research_question": "调查一个技术主题的公开搜索结果和权威内容，分析搜索意图、内容缺口、引用来源和可验证的内容机会。",
+    "focus_dimensions": ["搜索意图", "权威来源", "内容缺口", "主题覆盖", "引用证据"]
+  },
+  {
+    "case_id": "marketing-xiaohongshu-specialist",
+    "category": "市场营销",
+    "expert_name": "小红书运营专家",
+    "upstream_path": "marketing/marketing-xiaohongshu-specialist.md",
+    "natural_question": "围绕 AI coding agent 的开发者内容营销，先用公开互联网研究用户关注点、竞品表达和内容趋势，再明确哪些口碑结论仍需要小红书登录态来源补充。",
+    "research_question": "先用公开互联网研究一个消费或内容营销主题的事实、用户关注点和竞品表达，再指出哪些平台口碑结论需要登录态来源补充。",
+    "focus_dimensions": ["用户关注点", "竞品表达", "内容趋势", "公开证据", "登录态缺口"]
+  },
+  {
+    "case_id": "testing-api-tester",
+    "category": "测试质量",
+    "expert_name": "API 测试工程师",
+    "upstream_path": "testing/testing-api-tester.md",
+    "natural_question": "围绕 GitHub REST API 的速率限制与条件请求公开契约，读取官方文档、版本说明和相关 Issue，形成可复核的错误响应、兼容性与测试边界清单。",
+    "research_question": "研究一个公开 API 或 CLI 项目的契约、版本变更、错误响应和 Issue，形成可复核的测试关注点与边界。",
+    "focus_dimensions": ["API 契约", "版本变更", "错误响应", "Issue", "测试边界"]
+  },
+  {
+    "case_id": "testing-reality-checker",
+    "category": "测试质量",
+    "expert_name": "生产就绪验证员（Reality Checker）",
+    "upstream_path": "testing/testing-reality-checker.md",
+    "natural_question": "围绕 Kubernetes Gateway API 的生产采用情况，核对官方文档、发布记录和真实问题反馈，区分宣传承诺与可验证事实，并列出上线前缺口。",
+    "research_question": "对一个公开软件或服务方案做生产就绪核查，读取官方文档、发布记录和真实问题反馈，区分宣传承诺与可验证事实。",
+    "focus_dimensions": ["宣传承诺", "发布记录", "故障反馈", "可验证事实", "上线缺口"]
+  },
+  {
+    "case_id": "game-game-designer",
+    "category": "游戏开发",
+    "expert_name": "游戏设计师",
+    "upstream_path": "game-development/game-designer.md",
+    "natural_question": "围绕 roguelike 游戏的局外成长系统这一公开设计趋势，读取设计资料、开发者说明和玩家反馈，比较机制目标、玩家体验和实现取舍。",
+    "research_question": "调查一个公开游戏系统或设计趋势，读取设计资料、开发者说明和社区反馈，比较机制目标、玩家体验和实现取舍。",
+    "focus_dimensions": ["机制目标", "玩家体验", "设计资料", "社区反馈", "实现取舍"]
+  },
+  {
+    "case_id": "game-unity-editor-tool-developer",
+    "category": "游戏开发",
+    "expert_name": "Unity 编辑器工具开发者",
+    "upstream_path": "game-development/unity/unity-editor-tool-developer.md",
+    "natural_question": "围绕 Unity 6 UI Toolkit 编辑器扩展，研究公开 API、版本兼容、安装方式、已知问题和工作流价值。",
+    "research_question": "研究一个公开 Unity 编辑器工具或插件的 API、版本兼容、安装方式、已知问题和工作流价值。",
+    "focus_dimensions": ["Unity API", "版本兼容", "安装方式", "已知问题", "工作流价值"]
+  },
+  {
+    "case_id": "spatial-xr-immersive-developer",
+    "category": "空间计算",
+    "expert_name": "WebXR 沉浸式开发者",
+    "upstream_path": "spatial-computing/xr-immersive-developer.md",
+    "natural_question": "围绕 WebXR Device API 的 immersive-ar 与 immersive-vr 能力，调查公开规范、浏览器支持和示例项目，核对设备要求、交互模式与兼容性限制。",
+    "research_question": "调查当前公开 WebXR 能力、浏览器支持和示例项目，核对设备/浏览器版本、交互模式和兼容性限制。",
+    "focus_dimensions": ["WebXR API", "浏览器支持", "设备能力", "交互模式", "兼容性"]
+  },
+  {
+    "case_id": "spatial-visionos-engineer",
+    "category": "空间计算",
+    "expert_name": "visionOS 空间工程师",
+    "upstream_path": "spatial-computing/visionos-spatial-engineer.md",
+    "natural_question": "围绕 visionOS 的 ImmersiveSpace 与 volumetric window 公开开发方式，读取官方资料和开发者反馈，比较 SDK 版本、设备约束与交互设计。",
+    "research_question": "研究一个公开 visionOS 空间计算 API 或案例，读取官方资料和开发者反馈，比较 SDK 版本、设备约束与交互设计。",
+    "focus_dimensions": ["visionOS SDK", "API", "设备约束", "交互设计", "版本反馈"]
+  },
+  {
+    "case_id": "design-ux-researcher",
+    "category": "设计创意",
+    "expert_name": "用户体验研究员",
+    "upstream_path": "design/design-ux-researcher.md",
+    "natural_question": "围绕 Material 3 Expressive 这一公开产品体验方向，读取研究资料、产品文档和用户反馈，归纳用户问题、证据强度和设计机会。",
+    "research_question": "研究一个公开产品体验或交互模式，读取研究资料、产品文档和用户反馈，归纳用户问题、证据强度和设计机会。",
+    "focus_dimensions": ["用户问题", "研究证据", "产品文档", "用户反馈", "设计机会"]
+  },
+  {
+    "case_id": "design-ui-designer",
+    "category": "设计创意",
+    "expert_name": "UI 设计师",
+    "upstream_path": "design/design-ui-designer.md",
+    "natural_question": "围绕 WCAG 2.2 Focus Appearance 与现代设计系统的焦点样式，调查公开规范、组件实现约束和真实产品采用情况。",
+    "research_question": "调查一个公开设计系统或 UI 模式，核对组件规范、无障碍要求、实现约束和真实产品采用情况。",
+    "focus_dimensions": ["设计系统", "组件规范", "无障碍", "实现约束", "产品采用"]
+  },
+  {
+    "case_id": "finance-investment-researcher",
+    "category": "财务金融",
+    "expert_name": "投资研究员",
+    "upstream_path": "finance/finance-investment-researcher.md",
+    "natural_question": "围绕 NVIDIA 数据中心业务这一公开公司主题，整理公司事实、行业变化、财务口径和风险来源，明确时间窗口且不输出投资建议。",
+    "research_question": "围绕一个公开公司或行业主题整理公司事实、行业变化、财务口径和风险来源，明确这不是投资建议。",
+    "focus_dimensions": ["公司事实", "行业变化", "财务口径", "时间窗口", "风险来源"]
+  },
+  {
+    "case_id": "finance-financial-analyst",
+    "category": "财务金融",
+    "expert_name": "财务分析师",
+    "upstream_path": "finance/finance-financial-analyst.md",
+    "natural_question": "围绕 Microsoft FY2025 云业务增长这一公开财务事件，交叉读取公司公告、年度报告和市场资料，说明数据口径、时间点与缺失项。",
+    "research_question": "研究一个公开财务指标或商业事件，交叉读取公告、报告和市场资料，说明数据口径、时间点和缺失项。",
+    "focus_dimensions": ["指标口径", "公告", "报告", "市场资料", "时间点", "缺失项"]
+  },
+  {
+    "case_id": "sales-sales-engineer",
+    "category": "销售",
+    "expert_name": "售前工程师",
+    "upstream_path": "sales/sales-engineer.md",
+    "natural_question": "围绕 Model Context Protocol 在企业工具集成中的公开应用，研究客户场景、核心能力、竞品差异、集成约束和演示证据，形成可复核的售前判断。",
+    "research_question": "研究一个公开技术产品的客户场景、核心能力、竞品差异、集成约束和演示证据，形成可复核的售前判断。",
+    "focus_dimensions": ["客户场景", "核心能力", "竞品差异", "集成约束", "演示证据"]
+  },
+  {
+    "case_id": "sales-pipeline-analyst",
+    "category": "销售",
+    "expert_name": "销售漏斗分析师",
+    "upstream_path": "sales/sales-pipeline-analyst.md",
+    "natural_question": "围绕企业 AI coding assistant 的公开市场需求，调查需求信号、竞品定位和转化障碍，明确哪些是事实证据、哪些只是销售假设。",
+    "research_question": "调查公开市场和产品资料中可影响销售漏斗的需求信号、竞品定位和转化障碍，区分事实与销售假设。",
+    "focus_dimensions": ["需求信号", "竞品定位", "转化障碍", "市场证据", "销售假设"]
+  },
+  {
+    "case_id": "project-management-project-shepherd",
+    "category": "项目管理",
+    "expert_name": "项目协调专家",
+    "upstream_path": "project-management/project-management-project-shepherd.md",
+    "natural_question": "围绕一个公开的 OpenAI Agents SDK 开源仓库，读取路线、Issue、发布记录和依赖，整理当前状态、风险、阻塞项和下一步行动。",
+    "research_question": "研究一个公开项目或开源仓库的路线、Issue、发布记录和依赖，整理状态、风险、阻塞项和下一步行动。",
+    "focus_dimensions": ["路线图", "Issue", "发布记录", "依赖", "风险", "阻塞项"]
+  },
+  {
+    "case_id": "project-management-senior-project-manager",
+    "category": "项目管理",
+    "expert_name": "高级项目经理",
+    "upstream_path": "project-management/project-manager-senior.md",
+    "natural_question": "围绕 Kubernetes Gateway API 的公开项目交付成熟度，交叉核对版本、文档、问题反馈和维护信号，提出带证据的行动建议。",
+    "research_question": "对一个公开技术项目做交付成熟度分析，交叉核对版本、文档、问题反馈和维护信号，提出带证据的行动建议。",
+    "focus_dimensions": ["交付状态", "版本", "文档", "问题反馈", "维护信号", "行动建议"]
+  }
+]

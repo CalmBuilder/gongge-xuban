@@ -196,6 +196,7 @@ class ChatTurnRequest(BaseModel):
     debug: bool = False
     forced_general_skill_id: Optional[str] = None
     forced_general_skill_ids: list[str] = Field(default_factory=list, max_length=8)
+    ability_ids: list[str] = Field(default_factory=list)
 
 
 class ChatAttachmentRead(BaseModel):

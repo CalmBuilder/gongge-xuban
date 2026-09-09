@@ -9,6 +9,8 @@ $env:PYTHONPATH = $null
 $Repo = Split-Path -Parent $PSScriptRoot
 Set-Location $Repo
 if (-not $env:VERSION) { $env:VERSION = "0.1.0" }
+$youtubeNodeVersion = if ($env:YOUTUBE_NODE_VERSION) { $env:YOUTUBE_NODE_VERSION } else { "22.14.0" }
+$opencliVersion = if ($env:OPENCLI_VERSION) { $env:OPENCLI_VERSION } else { "1.8.7" }
 
 function Test-SigningConfigured {
   return [bool]($env:WINDOWS_CERT_THUMBPRINT -or $env:WINDOWS_PFX_PATH)
@@ -198,6 +200,16 @@ function Clear-ApplicationBuildOutput {
     Write-Host "==> removing stale PyInstaller work output $pyinstallerWorkOutput"
     Remove-Item -LiteralPath $pyinstallerWorkOutput -Recurse -Force
   }
+  $relayConnectorOutput = Join-Path $Repo "packaging\out\browser-relay-connector"
+  if (Test-Path -LiteralPath $relayConnectorOutput) {
+    Write-Host "==> removing stale browser relay connector output $relayConnectorOutput"
+    Remove-Item -LiteralPath $relayConnectorOutput -Recurse -Force
+  }
+  $opencliShimOutput = Join-Path $Repo "packaging\out\opencli-shim"
+  if (Test-Path -LiteralPath $opencliShimOutput) {
+    Write-Host "==> removing stale OpenCLI shim output $opencliShimOutput"
+    Remove-Item -LiteralPath $opencliShimOutput -Recurse -Force
+  }
 }
 
 function Assert-BundledPydanticCore {
@@ -347,12 +359,28 @@ Pop-Location
 Assert-PeX64 "packaging\out\gongge-xuban\gongge-xuban.exe"
 Assert-BundledPydanticCore "packaging\out\gongge-xuban" $builtAbiToken
 
+Write-Host "==> Build the browser relay connector"
+Push-Location backend
+& $BUILD_PY.Command @($BUILD_PY.PrefixArgs) -m PyInstaller ..\packaging\browser-relay-connector.spec --noconfirm --clean --distpath ..\packaging\out --workpath ..\packaging\build
+Assert-NativeCommandSucceeded "Browser relay connector PyInstaller build"
+Pop-Location
+$relayConnector = "packaging\out\browser-relay-connector.exe"
+if (-not (Test-Path -LiteralPath $relayConnector -PathType Leaf)) {
+  throw "PyInstaller completed without producing $relayConnector."
+}
+Copy-Item -LiteralPath $relayConnector -Destination "packaging\out\gongge-xuban\browser-relay-connector.exe" -Force
+Assert-PeX64 "packaging\out\gongge-xuban\browser-relay-connector.exe"
+
 $signingConfigured = Test-SigningConfigured
 if ($signingConfigured) {
   Write-Host "Signing gongge-xuban.exe"
   powershell.exe -NoProfile -ExecutionPolicy Bypass -File packaging\sign_windows.ps1 `
     -FilePath packaging\out\gongge-xuban\gongge-xuban.exe
   Assert-NativeCommandSucceeded "gongge-xuban.exe signing"
+  Write-Host "Signing browser-relay-connector.exe"
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File packaging\sign_windows.ps1 `
+    -FilePath packaging\out\gongge-xuban\browser-relay-connector.exe
+  Assert-NativeCommandSucceeded "browser-relay-connector.exe signing"
   $env:WINDOWS_SIGN_ENABLED = "1"
 } else {
   $env:WINDOWS_SIGN_ENABLED = "0"
@@ -364,6 +392,37 @@ Write-Host "==> [4/7] Bundle the Python skill runtime"
 Assert-NativeCommandSucceeded "Python skill runtime download"
 if (Test-Path packaging\out\gongge-xuban\runtime) { Remove-Item -Recurse -Force packaging\out\gongge-xuban\runtime }
 Copy-Item -Recurse -Force packaging\runtime_dl\python packaging\out\gongge-xuban\runtime
+& $BUILD_PY.Command @($BUILD_PY.PrefixArgs) packaging\fetch_youtube_js_runtime.py `
+  packaging\out\gongge-xuban\runtime\youtube-js\node.exe --version $youtubeNodeVersion
+Assert-NativeCommandSucceeded "YouTube Node.js runtime download"
+& $BUILD_PY.Command @($BUILD_PY.PrefixArgs) packaging\fetch_opencli_runtime.py `
+  packaging\out\gongge-xuban\runtime\opencli --version $opencliVersion
+Assert-NativeCommandSucceeded "OpenCLI Node.js package installation"
+Copy-Item -LiteralPath "packaging\out\gongge-xuban\runtime\youtube-js\node.exe" `
+  -Destination "packaging\out\gongge-xuban\runtime\opencli\node.exe" -Force
+Copy-Item -LiteralPath "packaging\assets\opencli-wrapper.cmd" `
+  -Destination "packaging\out\gongge-xuban\runtime\opencli\opencli.cmd" -Force
+Push-Location backend
+& $BUILD_PY.Command @($BUILD_PY.PrefixArgs) -m PyInstaller ..\packaging\opencli-shim.spec --noconfirm --clean --distpath ..\packaging\out --workpath ..\packaging\build
+Assert-NativeCommandSucceeded "Bundled OpenCLI executable PyInstaller build"
+Pop-Location
+$opencliShim = "packaging\out\opencli.exe"
+if (-not (Test-Path -LiteralPath $opencliShim -PathType Leaf)) {
+  throw "PyInstaller completed without producing $opencliShim."
+}
+Copy-Item -LiteralPath $opencliShim -Destination "packaging\out\gongge-xuban\runtime\opencli\opencli.exe" -Force
+if ($signingConfigured) {
+  Write-Host "Signing bundled runtime/opencli/opencli.exe"
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File packaging\sign_windows.ps1 `
+    -FilePath packaging\out\gongge-xuban\runtime\opencli\opencli.exe
+  Assert-NativeCommandSucceeded "bundled opencli.exe signing"
+}
+if (-not (Test-Path -LiteralPath "packaging\out\gongge-xuban\runtime\opencli\opencli.cmd" -PathType Leaf)) {
+  throw "OpenCLI wrapper was not copied into the Windows runtime."
+}
+if (-not (Test-Path -LiteralPath "packaging\out\gongge-xuban\runtime\opencli\opencli.exe" -PathType Leaf)) {
+  throw "OpenCLI executable was not copied into the Windows runtime."
+}
 Assert-BundlePeX64 "packaging\out\gongge-xuban"
 
 Write-Host "==> [5/7] Build the Inno Setup installer"

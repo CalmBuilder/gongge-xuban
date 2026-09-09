@@ -22,12 +22,13 @@ from app.db.models import (
     DynamicReadDispatchItem,
     DynamicReadDispatchResult,
     ExecutionCommand,
+    ExecutionResult,
     ExecutionSignal,
+    ChatSession,
+    Message,
     ModelConfig,
     SopInstance,
-    SopNodeExecution,
     SopOperation,
-    SopOperationAttempt,
     SopWorkItem,
 )
 from app.dynamic_tasks.agent import DynamicRunOutcome, DynamicTaskAgent, DynamicTaskAgentError
@@ -37,6 +38,7 @@ from app.dynamic_tasks.quotas import (
     DynamicTaskQuotaService,
     quota_limits_from_settings,
 )
+from app.observability.event_log import EventLog
 from app.sop_runtime.execution_control import ExecutionControlService
 from app.sop_runtime.execution_store import SopExecutionStore
 
@@ -152,10 +154,14 @@ def reconcile_parallel_read_batches(db: Session, *, limit: int = 50) -> int:
             .order_by(DynamicReadDispatchItem.position)
         ).all()
         if not items:
-            batch.status = "failed"
-            batch.updated_at = now
-            db.add(batch)
-            settled += 1
+            store = SopExecutionStore(db)
+            if store.recover_parallel_read_batch(
+                batch,
+                instance=None,
+                items=(),
+                results={},
+            ):
+                settled += 1
             continue
         results = {
             row.dispatch_token: row
@@ -173,112 +179,168 @@ def reconcile_parallel_read_batches(db: Session, *, limit: int = 50) -> int:
             continue
         instance = db.get(SopInstance, batch.execution_id)
         if instance is None or instance.status not in {"created", "running", "waiting"}:
-            batch.status = "cancelled" if instance and instance.status == "cancelled" else "failed"
-            batch.updated_at = now
-            for item in items:
-                operation = db.get(SopOperation, item.operation_id)
-                node = db.get(SopNodeExecution, item.node_execution_id)
-                if operation is not None and operation.status == "running":
-                    operation.status = (
-                        "cancelled" if instance and instance.status == "cancelled" else "failed"
-                    )
-                    operation.error_json = {"code": "DYNAMIC_PARALLEL_PARENT_TERMINAL"}
-                    operation.completed_at = now
-                    operation.updated_at = now
-                    operation.revision += 1
-                    db.add(operation)
-                    DynamicTaskQuotaService(db).release_tool_operation(operation)
-                    attempts = db.exec(
-                        select(SopOperationAttempt).where(
-                            SopOperationAttempt.operation_id == operation.id,
-                            SopOperationAttempt.status.in_(("prepared", "running", "retry_wait")),
-                        )
-                    ).all()
-                    for attempt in attempts:
-                        attempt.status = operation.status
-                        attempt.error_json = {"code": "DYNAMIC_PARALLEL_PARENT_TERMINAL"}
-                        attempt.completed_at = now
-                        attempt.updated_at = now
-                        db.add(attempt)
-                if node is not None and node.status == "running":
-                    node.status = (
-                        "cancelled" if instance and instance.status == "cancelled" else "failed"
-                    )
-                    node.error_json = {"code": "DYNAMIC_PARALLEL_PARENT_TERMINAL"}
-                    node.completed_at = now
-                    node.updated_at = now
-                    node.revision += 1
-                    db.add(node)
-                if item.status != "settled":
-                    item.status = "discarded"
-                    item.updated_at = now
-                    db.add(item)
-            db.add(batch)
-            settled += 1
+            store = SopExecutionStore(db)
+            if store.recover_parallel_read_batch(
+                batch,
+                instance=instance,
+                items=items,
+                results=results,
+            ):
+                settled += 1
             continue
         store = SopExecutionStore(db)
+        operations = [db.get(SopOperation, item.operation_id) for item in items]
+        if any(
+            operation is not None and operation.status in {"retry_wait", "unknown"}
+            for operation in operations
+        ):
+            # 本批不替 retry_wait 激活新的重试 writer；保留波次和 Operation 原状，等待原有
+            # 合法入口或取消分类处理，不能把未决动作伪装成失败并终结父实例。
+            continue
         worker_id = f"parallel-recovery:{batch.id}"
         with store.owned(instance, worker_id=worker_id):
-            failed = False
-            batch.status = "settling"
-            db.add(batch)
-            for item in items:
-                operation = db.get(SopOperation, item.operation_id)
-                node = db.get(SopNodeExecution, item.node_execution_id)
-                if operation is None or node is None:
-                    failed = True
-                    item.status = "discarded"
-                    db.add(item)
-                    continue
-                if operation.status != "running":
-                    item.status = "settled" if operation.status in {"succeeded", "failed"} else "discarded"
-                    db.add(item)
-                    failed = failed or operation.status != "succeeded"
-                    continue
-                inbox = results.get(item.dispatch_token)
-                succeeded = inbox is not None and inbox.status == "succeeded"
-                error = (
-                    dict(inbox.error_json or {})
-                    if inbox is not None
-                    else {
-                        "code": "DYNAMIC_PARALLEL_DISPATCH_TIMEOUT",
-                        "message": "纯读派发在恢复期限内没有产生回执。",
-                    }
-                )
-                store.finish_operation(
-                    operation,
-                    succeeded=succeeded,
-                    result=dict(inbox.result_json or {}) if succeeded and inbox else None,
-                    error=error if not succeeded else None,
-                )
-                if node.status == "running":
-                    if succeeded:
-                        store.complete_node(instance, node, output=dict(inbox.result_json or {}))
-                    else:
-                        store.fail_node(instance, node, error=error)
-                item.status = "settled"
-                item.updated_at = now
-                db.add(item)
-                failed = failed or not succeeded
-            batch.status = "failed" if failed else "succeeded"
-            batch.updated_at = now
-            db.add(batch)
-            if failed:
-                store.fail_instance(
-                    instance,
-                    context_patch={"failure_code": "DYNAMIC_PARALLEL_READ_FAILED"},
-                )
-            else:
-                ExecutionControlService(db, store).enqueue_signal(
-                    instance,
-                    signal_type="capacity_retry",
-                    causation_type="parallel_read_batch",
-                    causation_id=batch.id,
-                    payload={"batch_id": batch.id, "reason": "parallel_read_recovered"},
-                )
-        settled += 1
+            if store.recover_parallel_read_batch(
+                batch,
+                instance=instance,
+                items=items,
+                results=results,
+            ):
+                settled += 1
     db.commit()
     return settled
+
+
+def _chat_turn_binding(
+    db: Session,
+    instance: SopInstance,
+) -> tuple[str, str | None] | None:
+    """校验聊天动态 Execution 的原始用户消息，并返回服务端与客户端 Turn 身份。"""
+
+    if instance.source_kind != "chat":
+        return None
+    source_ref = str(instance.source_ref or "").strip()
+    session = db.get(ChatSession, instance.session_id)
+    message = db.get(Message, source_ref) if source_ref else None
+    if (
+        not source_ref
+        or session is None
+        or message is None
+        or session.tenant_id != instance.tenant_id
+        or session.user_id != instance.initiator_user_id
+        or session.agent_id != instance.agent_id
+        or message.tenant_id != instance.tenant_id
+        or message.session_id != instance.session_id
+        or message.role != "user"
+        or message.id != source_ref
+    ):
+        raise DynamicTaskAgentError("DYNAMIC_CHAT_SOURCE_INVALID")
+    metadata = message.metadata_json or {}
+    client_turn_id = str(metadata.get("client_turn_id") or "").strip() or None
+    return source_ref, client_turn_id
+
+
+def _record_chat_dynamic_outcome(
+    db: Session,
+    instance: SopInstance,
+    outcome: DynamicRunOutcome | None,
+    *,
+    turn_binding: tuple[str, str | None] | None,
+    error_code: str | None = None,
+) -> None:
+    """把后台聊天动态任务的最终结果写回原 Turn，等待结果保持非终态。"""
+
+    if turn_binding is None:
+        return
+    if outcome is not None:
+        status = str(outcome.status or "").strip().lower()
+        if str(outcome.execution_id or "").strip() != instance.id:
+            raise DynamicTaskAgentError("DYNAMIC_CHAT_RESULT_OWNERSHIP_INVALID")
+        if status == "succeeded":
+            event_type = "complete"
+        elif status in {"failed", "timed_out"}:
+            event_type = "error_occurred"
+            error_code = error_code or f"DYNAMIC_TASK_{status.upper()}"
+        elif status == "cancelled":
+            event_type = "stream_cancelled"
+        else:
+            return
+    elif error_code:
+        event_type = "error_occurred"
+        status = "failed"
+    else:
+        return
+
+    turn_id, client_turn_id = turn_binding
+    payload: dict[str, object] = {
+        "execution_id": instance.id,
+        "status": status,
+        "turn_id": turn_id,
+        "user_message_id": turn_id,
+        "client_turn_id": client_turn_id,
+    }
+    if error_code:
+        payload["code"] = error_code
+        payload["message"] = "后台动态任务未能完成。"
+    if outcome is not None and status == "succeeded" and outcome.message is None:
+        raise DynamicTaskAgentError("DYNAMIC_CHAT_RESULT_OWNERSHIP_INVALID")
+    if outcome is not None and outcome.message is not None:
+        message_id = str(outcome.message.id or "").strip()
+        message = db.get(Message, message_id) if message_id else None
+        metadata = message.metadata_json if message is not None else {}
+        metadata = metadata if isinstance(metadata, dict) else {}
+        message_execution_id = str(metadata.get("execution_id") or "").strip()
+        message_result_id = str(metadata.get("result_id") or "").strip()
+        message_turn_id = str(
+            metadata.get("turn_id") or metadata.get("user_message_id") or ""
+        ).strip()
+        message_client_turn_id = str(metadata.get("client_turn_id") or "").strip()
+        result = db.get(ExecutionResult, message_result_id) if message_result_id else None
+        if (
+            message is not None
+            and message.id == message_id
+            and message_execution_id == instance.id
+            and (
+                not message_result_id
+                or (
+                    result is not None
+                    and result.tenant_id == instance.tenant_id
+                    and result.execution_id == instance.id
+                )
+            )
+            and message.tenant_id == instance.tenant_id
+            and message.session_id == instance.session_id
+            and message.role == "assistant"
+        ):
+            bound_turn_ids = {
+                value for value in (turn_id, client_turn_id or "") if str(value).strip()
+            }
+            published_turn_ids = {
+                value
+                for value in (message_turn_id, message_client_turn_id)
+                if str(value).strip()
+            }
+            if published_turn_ids and not bound_turn_ids.intersection(published_turn_ids):
+                # 前台 clarification 可能已经用新的回答 Turn 发布了结果；旧 signal
+                # 恢复时只能认领 Execution 事实，不能把该结果再次投影到最初等待 Turn。
+                return
+            payload.update(
+                {
+                    "message_id": message.id,
+                    "assistant_message_id": message.id,
+                    "reply": message.content,
+                }
+            )
+        elif status == "succeeded":
+            raise DynamicTaskAgentError("DYNAMIC_CHAT_RESULT_OWNERSHIP_INVALID")
+    event_log = EventLog(db)
+    event_log.bind_turn(turn_id, client_turn_id)
+    event_log.record_terminal_once(
+        instance.tenant_id,
+        instance.session_id,
+        event_type,
+        payload,
+    )
+    db.commit()
 
 
 def process_dynamic_task_signal(
@@ -320,8 +382,16 @@ def process_dynamic_task_signal(
             worker_id=worker_id,
             code="DYNAMIC_SIGNAL_CONTEXT_INVALID",
         )
+    agent: DynamicTaskAgent | None = None
+    turn_binding: tuple[str, str | None] | None = None
     try:
         agent = agent_factory(db)
+        turn_binding = _chat_turn_binding(db, instance)
+        if turn_binding is not None:
+            bind_turn = getattr(agent, "bind_turn", None)
+            if not callable(bind_turn):
+                raise DynamicTaskAgentError("DYNAMIC_CHAT_TURN_BINDING_UNSUPPORTED")
+            bind_turn(*turn_binding)
         quota_limits = quota_limits_from_settings(get_settings())
         if quota_limits.configured:
             agent.quota_limits = quota_limits
@@ -338,82 +408,107 @@ def process_dynamic_task_signal(
                 )
         if signal.signal_type == "command":
             if command is not None and command.command_type == "add_skill":
-                return agent.resume_add_skill_signal(
+                outcome = agent.resume_add_skill_signal(
                     signal_id=signal.id,
                     model_config=model,
                     worker_id=worker_id,
                     actor_user_id=actor_user_id,
                     skill_loading_enabled=get_settings().dynamic_task_skill_loading_enabled,
                 )
-            return agent.resume_steer_signal(
+            else:
+                outcome = agent.resume_steer_signal(
+                    signal_id=signal.id,
+                    model_config=model,
+                    worker_id=worker_id,
+                    actor_user_id=actor_user_id,
+                    steering_enabled=get_settings().dynamic_task_steering_enabled,
+                )
+        elif signal.signal_type == "scheduled_start":
+            outcome = agent.resume_scheduled_start_signal(
+                signal_id=signal.id,
+                model_config=model,
+                worker_id=worker_id,
+            )
+        elif signal.signal_type == "timer":
+            outcome = agent.resume_connector_timer_signal(
+                signal_id=signal.id,
+                model_config=model,
+                worker_id=worker_id,
+            )
+        elif signal.signal_type == "operation_settled":
+            outcome = agent.resume_standing_dispatch_signal(
+                signal_id=signal.id,
+                model_config=model,
+                worker_id=worker_id,
+            )
+        elif signal.signal_type == "capacity_retry":
+            outcome = agent.resume_capacity_retry_signal(
+                signal_id=signal.id,
+                model_config=model,
+                worker_id=worker_id,
+            )
+        elif attention is not None and attention.attention_kind == "reauth":
+            outcome = agent.resume_reauth_signal(
                 signal_id=signal.id,
                 model_config=model,
                 worker_id=worker_id,
                 actor_user_id=actor_user_id,
-                steering_enabled=get_settings().dynamic_task_steering_enabled,
             )
-        if signal.signal_type == "scheduled_start":
-            return agent.resume_scheduled_start_signal(
-                signal_id=signal.id,
-                model_config=model,
-                worker_id=worker_id,
-            )
-        if signal.signal_type == "timer":
-            return agent.resume_connector_timer_signal(
-                signal_id=signal.id,
-                model_config=model,
-                worker_id=worker_id,
-            )
-        if signal.signal_type == "operation_settled":
-            return agent.resume_standing_dispatch_signal(
-                signal_id=signal.id,
-                model_config=model,
-                worker_id=worker_id,
-            )
-        if signal.signal_type == "capacity_retry":
-            return agent.resume_capacity_retry_signal(
-                signal_id=signal.id,
-                model_config=model,
-                worker_id=worker_id,
-            )
-        if attention is not None and attention.attention_kind == "reauth":
-            return agent.resume_reauth_signal(
-                signal_id=signal.id,
-                model_config=model,
-                worker_id=worker_id,
-                actor_user_id=actor_user_id,
-            )
-        if attention is not None and attention.attention_kind in {
+        elif attention is not None and attention.attention_kind in {
             "tool_approval",
             "publication",
         }:
-            return agent.resume_tool_approval_signal(
+            outcome = agent.resume_tool_approval_signal(
                 signal_id=signal.id,
                 model_config=model,
                 worker_id=worker_id,
                 actor_user_id=actor_user_id,
             )
-        if attention is not None and attention.attention_kind == "exception":
-            return agent.resume_write_reconciliation_signal(
+        elif attention is not None and attention.attention_kind == "exception":
+            outcome = agent.resume_write_reconciliation_signal(
                 signal_id=signal.id,
                 model_config=model,
                 worker_id=worker_id,
                 actor_user_id=actor_user_id,
             )
-        return agent.resume_clarification_signal(
-            signal_id=signal.id,
-            model_config=model,
-            worker_id=worker_id,
-            actor_user_id=actor_user_id,
+        else:
+            outcome = agent.resume_clarification_signal(
+                signal_id=signal.id,
+                model_config=model,
+                worker_id=worker_id,
+                actor_user_id=actor_user_id,
+            )
+        _record_chat_dynamic_outcome(
+            db,
+            instance,
+            outcome,
+            turn_binding=turn_binding,
         )
+        return outcome
     except Exception as exc:
         db.rollback()
         db.refresh(signal)
         db.refresh(instance)
+        error_code = _stable_signal_error_code(exc)
+        if (
+            error_code
+            in {
+                "DYNAMIC_CHAT_SOURCE_INVALID",
+                "DYNAMIC_CHAT_TURN_BINDING_UNSUPPORTED",
+            }
+            and signal.status != "claimed"
+        ):
+            try:
+                ExecutionControlService(db).claim_signal(signal, worker_id=worker_id)
+                db.commit()
+                db.refresh(signal)
+            except Exception:
+                db.rollback()
+                return None
         if signal.status == "claimed" and signal.lease_owner == worker_id:
             store = SopExecutionStore(db)
             control = ExecutionControlService(db, store)
-            error = {"code": _stable_signal_error_code(exc)}
+            error = {"code": error_code}
             if instance.status in {"succeeded", "failed", "timed_out", "cancelled"}:
                 control.settle_claimed_signal_for_terminal_execution(
                     instance,
@@ -441,10 +536,24 @@ def process_dynamic_task_signal(
                             terminal_command.updated_at = terminal_command.consumed_at
                             db.add(terminal_command)
                 db.commit()
-                agent.fail_execution(
-                    execution_id=instance.id,
-                    worker_id=f"{worker_id}:terminal",
-                    error_code=str(error["code"]),
+                # 来源身份损坏时，Execution 可能仍持有等待中的 Operation；强行调用
+                # fail_execution 会违反统一终态闭合约束。先将唤醒信号死信，保留执行
+                # 账本供管理员按数据修复流程处理。
+                if agent is not None and error_code not in {
+                    "DYNAMIC_CHAT_SOURCE_INVALID",
+                    "DYNAMIC_CHAT_TURN_BINDING_UNSUPPORTED",
+                }:
+                    agent.fail_execution(
+                        execution_id=instance.id,
+                        worker_id=f"{worker_id}:terminal",
+                        error_code=str(error["code"]),
+                    )
+                _record_chat_dynamic_outcome(
+                    db,
+                    instance,
+                    None,
+                    turn_binding=turn_binding,
+                    error_code=error_code,
                 )
             else:
                 with store.owned(instance, worker_id=worker_id):
@@ -467,9 +576,17 @@ def process_dynamic_task_signal(
                             db.add(exhausted_command)
                 if retry_status == "dead_letter":
                     db.commit()
-                    agent.fail_execution(
-                        execution_id=instance.id,
-                        worker_id=f"{worker_id}:exhausted",
+                    if agent is not None:
+                        agent.fail_execution(
+                            execution_id=instance.id,
+                            worker_id=f"{worker_id}:exhausted",
+                            error_code="DYNAMIC_SIGNAL_RETRY_EXHAUSTED",
+                        )
+                    _record_chat_dynamic_outcome(
+                        db,
+                        instance,
+                        None,
+                        turn_binding=turn_binding,
                         error_code="DYNAMIC_SIGNAL_RETRY_EXHAUSTED",
                     )
             db.commit()
@@ -504,11 +621,13 @@ def _is_terminal_signal_error(code: str) -> bool:
         "DYNAMIC_STEP_BUDGET_EXHAUSTED",
         "DYNAMIC_RUNTIME_BUDGET_EXCEEDED",
         "DYNAMIC_INPUT_BUDGET_EXCEEDED",
-        "DYNAMIC_TOKEN_BUDGET_EXCEEDED",
         "DYNAMIC_TOOL_CALLS_BUDGET_EXCEEDED",
         "DYNAMIC_MODEL_CALLS_BUDGET_EXCEEDED",
         "DYNAMIC_EXPLORE_TOOL_BUDGET_EXCEEDED",
         "DYNAMIC_EXPLORE_MODEL_BUDGET_EXCEEDED",
+        "DYNAMIC_CHAT_SOURCE_INVALID",
+        "DYNAMIC_CHAT_TURN_BINDING_UNSUPPORTED",
+        "DYNAMIC_CHAT_RESULT_OWNERSHIP_INVALID",
     }
 
 

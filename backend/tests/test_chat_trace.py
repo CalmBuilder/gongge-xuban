@@ -6,20 +6,33 @@
 @Description: 验证会话事件窗口的恢复锚点、边界、终态和租户隔离契约。
 """
 
+import asyncio
+from collections.abc import Iterator
 from datetime import datetime, timedelta
-from threading import Thread
+from pathlib import Path
+from threading import Event, Thread
 from time import sleep
 
 import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
-from sqlalchemy.pool import StaticPool
+from sqlalchemy.pool import NullPool, StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
+from app.cancellation import (
+    TurnCancellationToken,
+    cancel_unbound_chat_turn,
+    clear_chat_turn_cancelled,
+    clear_unbound_chat_turn_cancelled,
+    is_chat_turn_cancelled,
+    is_unbound_chat_turn_cancelled,
+)
 from app.api.chat import (
     _build_turn_traces,
+    _active_dynamic_execution_for_turn,
     _cancel_active_dynamic_execution,
+    _ensure_stream_client_turn_id,
     _events_after_cursor,
     _existing_turn_replay,
     _format_scheduled_task_schedule,
@@ -27,6 +40,8 @@ from app.api.chat import (
     _normalized_session_event_payload,
     _persist_chat_turn_cancelled,
     _persist_chat_turn_interrupted,
+    _persist_relay_only_event,
+    _persist_stream_relay_timeout,
     _relay_event_payload,
     _session_event_history_rows,
     _stream_existing_turn,
@@ -40,6 +55,8 @@ from app.api.chat import (
     message_read,
 )
 from app.api import chat as chat_api
+from app.core import agent_loop as agent_loop_module
+from app.core.agent_loop import AgentLoop
 from app.db import get_session
 from app.db.models import (
     AgentEvent,
@@ -52,7 +69,7 @@ from app.db.models import (
     Tenant,
     User,
 )
-from app.observability.event_log import EventLog
+from app.observability.event_log import EventLog, TURN_TERMINAL_EVENT_TYPES, TurnEventFenceClosed
 from app.security.auth import get_current_user
 from app.session.session_schema import ChatTurnRequest
 from app.sop_runtime.execution_store import SopExecutionFencedError, SopExecutionStore
@@ -313,6 +330,7 @@ def test_chat_stream_releases_preflight_agent_lock_before_worker_start(
     )
     monkeypatch.setattr(chat_api, "_bind_request_to_session_agent", lambda *_args: request)
     monkeypatch.setattr(chat_api, "_existing_turn_replay", lambda *_args: None)
+    monkeypatch.setattr(chat_api, "_existing_turn_replay_in_snapshot", lambda *_args: None)
     monkeypatch.setattr(chat_api, "_latest_event_cursor", lambda *_args: None)
     monkeypatch.setattr(chat_api.threading, "Thread", _Thread)
 
@@ -320,6 +338,889 @@ def test_chat_stream_releases_preflight_agent_lock_before_worker_start(
 
     assert response.media_type == "text/event-stream"
     assert db.commit_count == 1
+
+
+def test_chat_stream_generates_internal_turn_alias_when_client_omits_one() -> None:
+    """流式公共 API 未收到客户端 ID 时也必须具备隔离并发 Turn 的目标别名。"""
+
+    request = ChatTurnRequest(
+        tenant_id="tenant_demo",
+        session_id="session_without_client_id",
+        agent_id="agent_demo",
+        user_id="user_demo",
+        message="使用服务端关联号",
+    )
+
+    normalized = _ensure_stream_client_turn_id(request)
+
+    assert request.client_turn_id is None
+    assert normalized.client_turn_id
+    assert normalized.client_turn_id.startswith("server_turn_")
+    assert normalized.client_turn_id != _ensure_stream_client_turn_id(request).client_turn_id
+
+
+def test_stream_relay_timeout_cancels_worker_and_returns_terminal_frame() -> None:
+    """中继超时必须写入取消事实、通知 worker，并向客户端返回可识别终态。"""
+
+    db = _test_db()
+    session_row = ChatSession(
+        id="session_relay_timeout",
+        tenant_id="tenant_demo",
+        user_id="user_demo",
+    )
+    db.add_all(
+        [
+            session_row,
+            Message(
+                id="msg_relay_timeout",
+                tenant_id="tenant_demo",
+                session_id=session_row.id,
+                role="user",
+                content="超时取消",
+            ),
+            AgentEvent(
+                id="evt_relay_timeout_received",
+                tenant_id="tenant_demo",
+                session_id=session_row.id,
+                event_type="user_message_received",
+                payload_json={
+                    "message_id": "msg_relay_timeout",
+                    "turn_id": "msg_relay_timeout",
+                    "client_turn_id": "client_relay_timeout",
+                    "message": "超时取消",
+                },
+            ),
+        ]
+    )
+    db.commit()
+
+    try:
+        terminal = _persist_stream_relay_timeout(
+            db,
+            "tenant_demo",
+            session_row,
+            "client_relay_timeout",
+            "user_demo",
+        )
+
+        assert terminal is not None
+        event_id, event_name, payload = terminal
+        assert event_id
+        assert event_name == "stream_cancelled"
+        assert payload["turn_id"] == "msg_relay_timeout"
+        assert is_chat_turn_cancelled("session_relay_timeout", "client_relay_timeout")
+        assert is_chat_turn_cancelled("session_relay_timeout", "msg_relay_timeout")
+        cancel_events = db.exec(
+            select(AgentEvent).where(
+                AgentEvent.session_id == session_row.id,
+                AgentEvent.event_type == "stream_cancelled",
+            )
+        ).all()
+        assert [event.id for event in cancel_events] == [event_id]
+    finally:
+        clear_chat_turn_cancelled("session_relay_timeout", "client_relay_timeout")
+        clear_chat_turn_cancelled("session_relay_timeout", "msg_relay_timeout")
+
+
+def test_chat_stream_timeout_uses_cancelled_relay_protocol(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """真实 chat_stream 生成器超时后应发送取消终态而不是继续空转等待 worker。"""
+
+    db = _test_db()
+    session_row = ChatSession(
+        id="session_chat_stream_timeout",
+        tenant_id="tenant_demo",
+        user_id="user_demo",
+    )
+    db.add_all(
+        [
+            session_row,
+            Message(
+                id="msg_chat_stream_timeout",
+                tenant_id="tenant_demo",
+                session_id=session_row.id,
+                role="user",
+                content="stream 超时",
+            ),
+            AgentEvent(
+                id="evt_chat_stream_timeout_received",
+                tenant_id="tenant_demo",
+                session_id=session_row.id,
+                event_type="user_message_received",
+                payload_json={
+                    "message_id": "msg_chat_stream_timeout",
+                    "turn_id": "msg_chat_stream_timeout",
+                    "client_turn_id": "client_chat_stream_timeout",
+                    "message": "stream 超时",
+                },
+            ),
+        ]
+    )
+    db.commit()
+    test_engine = db.get_bind()
+    user = User(
+        id="user_demo",
+        tenant_id="tenant_demo",
+        username="demo",
+        password_hash="hashed",
+    )
+
+    class _Thread:
+        """只启动路由需要的线程对象，不执行 worker 以稳定触发中继超时。"""
+
+        def __init__(self, *, target, daemon: bool) -> None:
+            """保存线程参数并校验生产路径使用 daemon worker。"""
+
+            self.target = target
+            self.daemon = daemon
+
+        def start(self) -> None:
+            """保持 worker 未完成，使测试只覆盖 relay 超时收敛。"""
+
+    monkeypatch.setattr(chat_api, "engine", test_engine)
+    monkeypatch.setattr(chat_api, "STREAM_RELAY_IDLE_TIMEOUT_SECONDS", 0.0)
+    monkeypatch.setattr(chat_api, "_ensure_request_tenant", lambda *_args: None)
+    monkeypatch.setattr(chat_api, "ensure_tenant", lambda *_args: None)
+    monkeypatch.setattr(
+        chat_api,
+        "_ensure_chat_session_available",
+        lambda *_args: db.get(ChatSession, session_row.id),
+    )
+    request = ChatTurnRequest(
+        tenant_id="tenant_demo",
+        session_id=session_row.id,
+        message="stream 超时",
+        client_turn_id="client_chat_stream_timeout",
+    )
+    monkeypatch.setattr(chat_api, "_bind_request_to_session_agent", lambda *_args: request)
+    monkeypatch.setattr(chat_api, "_existing_turn_replay_in_snapshot", lambda *_args: None)
+    monkeypatch.setattr(chat_api.threading, "Thread", _Thread)
+
+    response = chat_api.chat_stream(request, current_user=user, db=db)
+
+    async def consume() -> list[str]:
+        """消费 Starlette 将同步 relay 包装后的异步 SSE 迭代器。"""
+
+        return [frame async for frame in response.body_iterator]
+
+    try:
+        frames = asyncio.run(consume())
+        event_names = [frame.split("event: ", 1)[1].split("\n", 1)[0] for frame in frames]
+        assert event_names == ["user_message_received", "stream_cancelled"]
+        with Session(test_engine) as verify_db:
+            cancelled = verify_db.exec(
+                select(AgentEvent).where(
+                    AgentEvent.session_id == session_row.id,
+                    AgentEvent.event_type == "stream_cancelled",
+                )
+            ).all()
+            assert len(cancelled) == 1
+            assert cancelled[0].payload_json["turn_id"] == "msg_chat_stream_timeout"
+    finally:
+        clear_chat_turn_cancelled(session_row.id, "client_chat_stream_timeout")
+        clear_chat_turn_cancelled(session_row.id, "msg_chat_stream_timeout")
+
+
+def test_chat_stream_relay_does_not_cancel_active_dynamic_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """活动 Dynamic Execution 超过 relay 空闲窗口时，SSE 必须等待其真实终态。"""
+
+    db = _test_db()
+    session_row = ChatSession(
+        id="session_active_dynamic_relay",
+        tenant_id="tenant_demo",
+        user_id="user_demo",
+        agent_id="agent_demo",
+    )
+    turn_id = "msg_active_dynamic_relay"
+    instance = SopInstance(
+        id="execution_active_dynamic_relay",
+        tenant_id="tenant_demo",
+        session_id=session_row.id,
+        kind="dynamic_task",
+        active_slot_key="dynamic:active-relay",
+        initiator_user_id="user_demo",
+        agent_id="agent_demo",
+        goal_snapshot_json={"goal": "长时间互联网研究"},
+        current_plan_revision_id="plan_active_dynamic_relay",
+        current_plan_checksum="a" * 64,
+        capability_snapshot_json={"capabilities": []},
+        status="running",
+        source_ref=turn_id,
+    )
+    db.add_all(
+        [
+            session_row,
+            instance,
+            Message(
+                id=turn_id,
+                tenant_id="tenant_demo",
+                session_id=session_row.id,
+                role="user",
+                content="长时间互联网研究",
+            ),
+            AgentEvent(
+                id="evt_active_dynamic_relay_received",
+                tenant_id="tenant_demo",
+                session_id=session_row.id,
+                event_type="user_message_received",
+                payload_json={
+                    "message_id": turn_id,
+                    "turn_id": turn_id,
+                    "client_turn_id": turn_id,
+                    "message": "长时间互联网研究",
+                },
+            ),
+        ]
+    )
+    db.commit()
+    test_engine = db.get_bind()
+    user = User(
+        id="user_demo",
+        tenant_id="tenant_demo",
+        username="demo",
+        password_hash="hashed",
+    )
+
+    class _Thread:
+        """不启动业务 worker，只让测试中的持久 Execution 模拟仍在运行。"""
+
+        started = 0
+
+        def __init__(self, *, target, daemon: bool) -> None:
+            """保存线程参数，验证 relay 不依赖 worker 线程对象判断活动 Execution。"""
+
+            self.target = target
+            self.daemon = daemon
+
+        def start(self) -> None:
+            """保持 worker 未结束，交由测试线程提交 Dynamic Execution 终态。"""
+
+            type(self).started += 1
+
+    active_lookup_calls: list[tuple[str, str, set[str], bool]] = []
+    original_active_lookup = chat_api._active_dynamic_execution_for_turn
+    complete_written = False
+
+    def record_active_lookup(
+        lookup_db: Session,
+        tenant_id: str,
+        session_id: str,
+        turn_ids: set[str],
+    ) -> SopInstance | None:
+        """记录活动 Execution 关联，并在首次命中后提交模拟成功终态。"""
+
+        nonlocal complete_written
+        result = original_active_lookup(lookup_db, tenant_id, session_id, turn_ids)
+        active_lookup_calls.append((tenant_id, session_id, set(turn_ids), result is not None))
+        if result is not None and not complete_written:
+            with Session(test_engine) as worker_db:
+                worker_db.add(
+                    AgentEvent(
+                        id="evt_active_dynamic_relay_complete",
+                        tenant_id="tenant_demo",
+                        session_id=session_row.id,
+                        event_type="complete",
+                        payload_json={"turn_id": turn_id, "client_turn_id": turn_id},
+                    )
+                )
+                worker_db.commit()
+            complete_written = True
+        return result
+
+    monkeypatch.setattr(chat_api, "engine", test_engine)
+    monkeypatch.setattr(chat_api, "STREAM_RELAY_POLL_SECONDS", 0.001)
+    monkeypatch.setattr(chat_api, "STREAM_RELAY_IDLE_TIMEOUT_SECONDS", 0.0)
+    monkeypatch.setattr(chat_api, "_ensure_request_tenant", lambda *_args: None)
+    monkeypatch.setattr(chat_api, "ensure_tenant", lambda *_args: None)
+    monkeypatch.setattr(chat_api, "_active_dynamic_execution_for_turn", record_active_lookup)
+    monkeypatch.setattr(
+        chat_api,
+        "_ensure_chat_session_available",
+        lambda *_args: db.get(ChatSession, session_row.id),
+    )
+    bound_requests: list[ChatTurnRequest] = []
+
+    def bind_request(*_args: object) -> ChatTurnRequest:
+        """返回测试 Turn，并记录中继前置阶段绑定的会话身份。"""
+
+        bound_requests.append(request)
+        return request
+
+    monkeypatch.setattr(chat_api, "_bind_request_to_session_agent", bind_request)
+    monkeypatch.setattr(chat_api, "_existing_turn_replay_in_snapshot", lambda *_args: None)
+    monkeypatch.setattr(chat_api.threading, "Thread", _Thread)
+    request = ChatTurnRequest(
+        tenant_id="tenant_demo",
+        session_id=session_row.id,
+        agent_id="agent_demo",
+        user_id="user_demo",
+        message="长时间互联网研究",
+        client_turn_id=turn_id,
+    )
+
+    response = chat_api.chat_stream(request, current_user=user, db=db)
+
+    async def consume() -> list[str]:
+        """消费活动 Execution 越过 relay 空闲窗口后产生的 SSE 帧。"""
+
+        return [frame async for frame in response.body_iterator]
+
+    frames = asyncio.run(consume())
+    event_names = [frame.split("event: ", 1)[1].split("\n", 1)[0] for frame in frames]
+
+    assert active_lookup_calls == [("tenant_demo", session_row.id, {turn_id}, True)]
+    assert complete_written
+    assert bound_requests and bound_requests[0].session_id == session_row.id
+    assert "heartbeat" in event_names
+    assert "complete" in event_names
+    assert "stream_cancelled" not in event_names
+    with Session(test_engine) as verify_db:
+        assert _active_dynamic_execution_for_turn(
+            verify_db,
+            "tenant_demo",
+            session_row.id,
+            {turn_id},
+        ) is not None
+
+
+def test_chat_stream_waits_for_terminal_event_after_worker_done(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """worker 已结束但终态事件尚未可见时，中继必须等待持久事实而不是提前关闭。"""
+
+    db = _test_db()
+    session_row = ChatSession(
+        id="session_worker_settle_relay",
+        tenant_id="tenant_demo",
+        user_id="user_demo",
+        agent_id="agent_demo",
+    )
+    turn_id = "msg_worker_settle_relay"
+    db.add_all(
+        [
+            session_row,
+            Message(
+                id=turn_id,
+                tenant_id="tenant_demo",
+                session_id=session_row.id,
+                role="user",
+                content="等待持久终态",
+            ),
+            AgentEvent(
+                id="evt_worker_settle_relay_received",
+                tenant_id="tenant_demo",
+                session_id=session_row.id,
+                event_type="user_message_received",
+                payload_json={
+                    "message_id": turn_id,
+                    "turn_id": turn_id,
+                    "client_turn_id": turn_id,
+                    "message": "等待持久终态",
+                },
+            ),
+        ]
+    )
+    db.commit()
+    test_engine = db.get_bind()
+    user = User(
+        id="user_demo",
+        tenant_id="tenant_demo",
+        username="demo",
+        password_hash="hashed",
+    )
+    complete_written = Event()
+    publishers: list[Thread] = []
+
+    def publish_complete() -> None:
+        """在 worker 结束后稍晚提交唯一 complete 事实，模拟事务可见性间隙。"""
+
+        sleep(0.05)
+        with Session(test_engine) as worker_db:
+            worker_db.add(
+                AgentEvent(
+                    id="evt_worker_settle_relay_complete",
+                    tenant_id="tenant_demo",
+                    session_id=session_row.id,
+                    event_type="complete",
+                    payload_json={"turn_id": turn_id, "client_turn_id": turn_id},
+                )
+            )
+            worker_db.commit()
+        complete_written.set()
+
+    def delayed_terminal_stream(
+        _loop: AgentLoop,
+        _request: ChatTurnRequest,
+    ) -> Iterator[dict[str, object]]:
+        """让 chat worker 先挂起并结束，再异步补齐持久 complete 事件。"""
+
+        with Session(test_engine) as worker_db:
+            worker_db.add(
+                AgentEvent(
+                    id="evt_worker_settle_relay_waiting",
+                    tenant_id="tenant_demo",
+                    session_id=session_row.id,
+                    event_type="turn_waiting",
+                    payload_json={"turn_id": turn_id, "client_turn_id": turn_id},
+                )
+            )
+            worker_db.commit()
+        publisher = Thread(target=publish_complete)
+        publisher.start()
+        publishers.append(publisher)
+        yield {
+            "event": "user_message_received",
+            "data": {"sessionId": session_row.id, "message_id": turn_id, "turn_id": turn_id},
+        }
+        yield {
+            "event": "turn_waiting",
+            "data": {"sessionId": session_row.id, "turn_id": turn_id},
+        }
+
+    class _Thread:
+        """让业务 worker 使用真实线程，同时避免测试改变全局线程启动语义。"""
+
+        def __init__(self, *, target, daemon: bool) -> None:
+            """保存生产线程参数并交给原生线程类执行。"""
+
+            self.thread = Thread(target=target, daemon=daemon)
+
+        def start(self) -> None:
+            """启动真实 chat worker。"""
+
+            self.thread.start()
+
+    request = ChatTurnRequest(
+        tenant_id="tenant_demo",
+        session_id=session_row.id,
+        agent_id="agent_demo",
+        user_id="user_demo",
+        message="等待持久终态",
+        client_turn_id=turn_id,
+    )
+    monkeypatch.setattr(chat_api, "engine", test_engine)
+    monkeypatch.setattr(chat_api, "STREAM_RELAY_POLL_SECONDS", 0.001)
+    monkeypatch.setattr(chat_api, "STREAM_RELAY_IDLE_TIMEOUT_SECONDS", 0.0)
+    monkeypatch.setattr(chat_api, "STREAM_RELAY_WORKER_SETTLE_SECONDS", 1.0)
+    monkeypatch.setattr(AgentLoop, "handle_turn_stream", delayed_terminal_stream)
+    monkeypatch.setattr(chat_api, "_ensure_request_tenant", lambda *_args: None)
+    monkeypatch.setattr(chat_api, "ensure_tenant", lambda *_args: None)
+    monkeypatch.setattr(
+        chat_api,
+        "_ensure_chat_session_available",
+        lambda *_args: session_row,
+    )
+    monkeypatch.setattr(chat_api, "_bind_request_to_session_agent", lambda *_args: request)
+    monkeypatch.setattr(chat_api, "_existing_turn_replay_in_snapshot", lambda *_args: None)
+    monkeypatch.setattr(chat_api, "_schedule_session_title_summary", lambda *_args: None)
+    monkeypatch.setattr(chat_api.threading, "Thread", _Thread)
+
+    response = chat_api.chat_stream(request, current_user=user, db=db)
+
+    async def consume() -> list[str]:
+        """消费 worker 完成后延迟提交终态的 SSE 中继。"""
+
+        return [frame async for frame in response.body_iterator]
+
+    frames = asyncio.run(consume())
+    for publisher in publishers:
+        publisher.join(timeout=1)
+    event_names = [frame.split("event: ", 1)[1].split("\n", 1)[0] for frame in frames]
+
+    assert complete_written.is_set()
+    assert "complete" in event_names
+    assert "stream_cancelled" not in event_names
+
+
+def test_chat_stream_waits_for_dynamic_execution_after_worker_delegation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """worker 只完成持久 Execution 委派时，中继必须继续等待 Execution 的终态。"""
+
+    db = _test_db()
+    session_row = ChatSession(
+        id="session_dynamic_delegation_relay",
+        tenant_id="tenant_demo",
+        user_id="user_demo",
+        agent_id="agent_demo",
+    )
+    turn_id = "msg_dynamic_delegation_relay"
+    instance = SopInstance(
+        id="execution_dynamic_delegation_relay",
+        tenant_id="tenant_demo",
+        session_id=session_row.id,
+        kind="dynamic_task",
+        active_slot_key="dynamic:delegation-relay",
+        initiator_user_id="user_demo",
+        agent_id="agent_demo",
+        goal_snapshot_json={"goal": "等待后台动态任务完成"},
+        current_plan_revision_id="plan_dynamic_delegation_relay",
+        current_plan_checksum="b" * 64,
+        capability_snapshot_json={"capabilities": []},
+        status="running",
+        source_ref=turn_id,
+    )
+    db.add_all(
+        [
+            session_row,
+            instance,
+            Message(
+                id=turn_id,
+                tenant_id="tenant_demo",
+                session_id=session_row.id,
+                role="user",
+                content="等待后台动态任务完成",
+            ),
+            AgentEvent(
+                id="evt_dynamic_delegation_relay_received",
+                tenant_id="tenant_demo",
+                session_id=session_row.id,
+                event_type="user_message_received",
+                payload_json={
+                    "message_id": turn_id,
+                    "turn_id": turn_id,
+                    "client_turn_id": turn_id,
+                    "message": "等待后台动态任务完成",
+                },
+            ),
+        ]
+    )
+    db.commit()
+    test_engine = db.get_bind()
+    user = User(
+        id="user_demo",
+        tenant_id="tenant_demo",
+        username="demo",
+        password_hash="hashed",
+    )
+    complete_written = Event()
+    worker_finished = Event()
+    publishers: list[Thread] = []
+
+    def publish_dynamic_complete() -> None:
+        """模拟委派 worker 结束后，后台 Runtime 延迟提交成功终态。"""
+
+        sleep(0.05)
+        with Session(test_engine) as worker_db:
+            stored_instance = worker_db.get(SopInstance, instance.id)
+            assert stored_instance is not None
+            stored_instance.status = "succeeded"
+            stored_instance.active_slot_key = None
+            worker_db.add(
+                AgentEvent(
+                    id="evt_dynamic_delegation_relay_complete",
+                    tenant_id="tenant_demo",
+                    session_id=session_row.id,
+                    event_type="complete",
+                    payload_json={"turn_id": turn_id, "client_turn_id": turn_id},
+                )
+            )
+            worker_db.commit()
+        complete_written.set()
+
+    def delegated_stream(
+        _loop: AgentLoop,
+        _request: ChatTurnRequest,
+    ) -> Iterator[dict[str, object]]:
+        """让聊天 worker 写入委派/等待事实后自然结束，后台线程再补齐 complete。"""
+
+        with Session(test_engine) as worker_db:
+            for event_type, payload in (
+                (
+                    "dynamic_task_delegated",
+                    {"turn_id": turn_id, "client_turn_id": turn_id},
+                ),
+                (
+                    "stream_status",
+                    {
+                        "turn_id": turn_id,
+                        "client_turn_id": turn_id,
+                        "phase": "dynamic_execution",
+                    },
+                ),
+                (
+                    "turn_waiting",
+                    {"turn_id": turn_id, "client_turn_id": turn_id},
+                ),
+            ):
+                worker_db.add(
+                    AgentEvent(
+                        id=f"evt_dynamic_delegation_relay_{event_type}",
+                        tenant_id="tenant_demo",
+                        session_id=session_row.id,
+                        event_type=event_type,
+                        payload_json=payload,
+                    )
+                )
+            worker_db.commit()
+        publisher = Thread(target=publish_dynamic_complete)
+        publisher.start()
+        publishers.append(publisher)
+        yield {
+            "event": "user_message_received",
+            "data": {"sessionId": session_row.id, "message_id": turn_id, "turn_id": turn_id},
+        }
+        yield {
+            "event": "dynamic_task_delegated",
+            "data": {"sessionId": session_row.id, "turn_id": turn_id},
+        }
+        yield {
+            "event": "turn_waiting",
+            "data": {"sessionId": session_row.id, "turn_id": turn_id},
+        }
+        worker_finished.set()
+
+    class _Thread:
+        """使用真实线程运行聊天 worker，以覆盖 worker_done 后的委派状态。"""
+
+        def __init__(self, *, target, daemon: bool) -> None:
+            """保存生产线程参数并交给原生线程类执行。"""
+
+            self.thread = Thread(target=target, daemon=daemon)
+
+        def start(self) -> None:
+            """启动真实聊天 worker，使其自然结束并触发 worker_done。"""
+
+            self.thread.start()
+
+    request = ChatTurnRequest(
+        tenant_id="tenant_demo",
+        session_id=session_row.id,
+        agent_id="agent_demo",
+        user_id="user_demo",
+        message="等待后台动态任务完成",
+        client_turn_id=turn_id,
+    )
+    monkeypatch.setattr(chat_api, "engine", test_engine)
+    monkeypatch.setattr(chat_api, "STREAM_RELAY_POLL_SECONDS", 0.001)
+    monkeypatch.setattr(chat_api, "STREAM_RELAY_IDLE_TIMEOUT_SECONDS", 0.0)
+    monkeypatch.setattr(chat_api, "STREAM_RELAY_WORKER_SETTLE_SECONDS", 0.1)
+    monkeypatch.setattr(AgentLoop, "handle_turn_stream", delegated_stream)
+    monkeypatch.setattr(chat_api, "_ensure_request_tenant", lambda *_args: None)
+    monkeypatch.setattr(chat_api, "ensure_tenant", lambda *_args: None)
+    monkeypatch.setattr(
+        chat_api,
+        "_ensure_chat_session_available",
+        lambda *_args: session_row,
+    )
+    monkeypatch.setattr(chat_api, "_bind_request_to_session_agent", lambda *_args: request)
+    monkeypatch.setattr(chat_api, "_existing_turn_replay_in_snapshot", lambda *_args: None)
+    monkeypatch.setattr(chat_api, "_schedule_session_title_summary", lambda *_args: None)
+    monkeypatch.setattr(chat_api.threading, "Thread", _Thread)
+
+    response = chat_api.chat_stream(request, current_user=user, db=db)
+
+    async def consume() -> list[str]:
+        """消费委派 worker 结束后仍由后台 Execution 驱动的 SSE 中继。"""
+
+        return [frame async for frame in response.body_iterator]
+
+    frames = asyncio.run(consume())
+    for publisher in publishers:
+        publisher.join(timeout=1)
+    event_names = [frame.split("event: ", 1)[1].split("\n", 1)[0] for frame in frames]
+
+    assert worker_finished.is_set()
+    assert complete_written.is_set()
+    assert "complete" in event_names
+    assert "stream_cancelled" not in event_names
+    with Session(test_engine) as verify_db:
+        stored_instance = verify_db.get(SopInstance, instance.id)
+        assert stored_instance is not None
+        assert stored_instance.status == "succeeded"
+
+
+def test_chat_stream_timeout_cancels_real_agent_loop_worker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """真实 chat_stream worker 超时后应停止 AgentLoop，且不再写入迟到正文。"""
+
+    test_engine = create_engine(
+        f"sqlite:///{tmp_path / 'real-chat-timeout.db'}",
+        connect_args={"check_same_thread": False, "timeout": 10},
+        poolclass=NullPool,
+    )
+    SQLModel.metadata.create_all(test_engine)
+    db = Session(test_engine)
+    tenant = Tenant(id="tenant_real_timeout", name="Real timeout")
+    user = User(
+        id="user_real_timeout",
+        tenant_id=tenant.id,
+        username="real-timeout",
+        password_hash="hashed",
+    )
+    agent = AgentProfile(
+        id="agent_real_timeout",
+        tenant_id=tenant.id,
+        name="真实超时测试员工",
+        owner_user_id=user.id,
+    )
+    db.add_all([tenant, user, agent])
+    db.commit()
+    started = Event()
+
+    def blocked_model(
+        _loop: AgentLoop,
+        request: ChatTurnRequest,
+        _agent_id: str | None = None,
+        _role: str = "default",
+    ) -> None:
+        """模拟真实模型解析阶段持续运行，并只在 Turn 取消后返回。"""
+
+        started.set()
+        while not is_chat_turn_cancelled(
+            str(request.session_id or ""),
+            str(request.client_turn_id or ""),
+        ):
+            sleep(0.001)
+        return None
+
+    monkeypatch.setattr(chat_api, "engine", test_engine)
+    monkeypatch.setattr(agent_loop_module, "engine", test_engine)
+    monkeypatch.setattr(AgentLoop, "_get_request_model", blocked_model)
+    monkeypatch.setattr(chat_api, "STREAM_RELAY_POLL_SECONDS", 0.001)
+    monkeypatch.setattr(chat_api, "STREAM_RELAY_IDLE_TIMEOUT_SECONDS", 0.2)
+    request = ChatTurnRequest(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        user_id=user.id,
+        message="验证真实 worker 超时",
+        client_turn_id="client_real_timeout",
+    )
+
+    response = chat_api.chat_stream(request, current_user=user, db=db)
+
+    async def consume() -> list[str]:
+        """消费真实路由创建的异步 SSE 适配器。"""
+
+        return [frame async for frame in response.body_iterator]
+
+    frames = asyncio.run(consume())
+    event_names = [frame.split("event: ", 1)[1].split("\n", 1)[0] for frame in frames]
+    assert started.is_set()
+    assert event_names[-1] == "stream_cancelled"
+    assert "complete" not in event_names
+    assert "error_occurred" not in event_names
+
+    with Session(test_engine) as verify_db:
+        session_row = verify_db.exec(
+            select(ChatSession).where(
+                ChatSession.tenant_id == tenant.id,
+                ChatSession.user_id == user.id,
+            )
+        ).one()
+        for _ in range(100):
+            verify_db.expire_all()
+            turn_events = verify_db.exec(
+                select(AgentEvent)
+                .where(
+                    AgentEvent.tenant_id == tenant.id,
+                    AgentEvent.session_id == session_row.id,
+                )
+                .order_by(AgentEvent.created_at, AgentEvent.id)
+            ).all()
+            event_types = [row.event_type for row in turn_events]
+            if "assistant_message_created" in event_types:
+                break
+            sleep(0.005)
+        assert event_types.count("stream_cancelled") == 1
+        terminal_index = event_types.index("stream_cancelled")
+        assert all(
+            event_type not in {"complete", "error_occurred", "stream_delta", "tool_result"}
+            for event_type in event_types[terminal_index + 1 :]
+        )
+
+    clear_chat_turn_cancelled(session_row.id, "client_real_timeout")
+    clear_chat_turn_cancelled(session_row.id, "")
+    clear_unbound_chat_turn_cancelled("client_real_timeout")
+    db.close()
+    test_engine.dispose()
+
+
+def test_unbound_cancel_is_observed_when_worker_has_not_created_turn() -> None:
+    """会话尚未建立时的 relay 取消可被后续 Turn token 接管。"""
+
+    turn_id = "client_unbound_cancel"
+    clear_unbound_chat_turn_cancelled(turn_id)
+    token = TurnCancellationToken(
+        session_id="session_created_later",
+        server_turn_id="server_turn_later",
+        client_turn_id=turn_id,
+    )
+    cancel_unbound_chat_turn(turn_id)
+    try:
+        assert is_unbound_chat_turn_cancelled(turn_id)
+        assert token.is_cancelled()
+    finally:
+        clear_unbound_chat_turn_cancelled(turn_id)
+    assert not is_unbound_chat_turn_cancelled(turn_id)
+
+
+def test_chat_stream_timeout_registers_pending_cancel_before_user_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """新会话 worker 尚未写入用户事件时，relay 也要返回终态并登记取消。"""
+
+    db = _test_db()
+    tenant = Tenant(id="tenant_pending_timeout", name="Pending timeout")
+    user = User(
+        id="user_pending_timeout",
+        tenant_id=tenant.id,
+        username="pending-timeout",
+        password_hash="hashed",
+    )
+    agent = AgentProfile(
+        id="agent_pending_timeout",
+        tenant_id=tenant.id,
+        name="预备取消测试员工",
+        owner_user_id=user.id,
+    )
+    db.add_all([tenant, user, agent])
+    db.commit()
+
+    class _Thread:
+        """保持新会话 worker 未 ready，以覆盖 relay 的预登记分支。"""
+
+        def __init__(self, *, target, daemon: bool) -> None:
+            """保存线程参数但不执行目标。"""
+
+            self.target = target
+            self.daemon = daemon
+
+        def start(self) -> None:
+            """保持 worker 未启动，交由中继超时收敛。"""
+
+    monkeypatch.setattr(chat_api.threading, "Thread", _Thread)
+    monkeypatch.setattr(chat_api, "STREAM_RELAY_IDLE_TIMEOUT_SECONDS", 0.0)
+    monkeypatch.setattr(chat_api, "_existing_turn_replay_in_snapshot", lambda *_args: None)
+    request = ChatTurnRequest(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        user_id=user.id,
+        message="worker 尚未 ready",
+        client_turn_id="client_pending_timeout",
+    )
+
+    response = chat_api.chat_stream(request, current_user=user, db=db)
+
+    async def consume() -> list[str]:
+        """消费没有 worker 事件时由 relay 产生的终态帧。"""
+
+        return [frame async for frame in response.body_iterator]
+
+    try:
+        frames = asyncio.run(consume())
+        assert [frame.split("event: ", 1)[1].split("\n", 1)[0] for frame in frames] == [
+            "stream_cancelled"
+        ]
+        assert is_unbound_chat_turn_cancelled("client_pending_timeout")
+    finally:
+        clear_unbound_chat_turn_cancelled("client_pending_timeout")
+        db.close()
 
 
 def test_stream_end_only_replay_stays_open_until_business_terminal(
@@ -424,6 +1325,298 @@ def test_event_log_binds_all_execution_events_to_current_turn() -> None:
             "user_message_id": "msg_user",
             "client_turn_id": "client_turn",
         }
+
+
+def test_event_log_rejects_late_turn_events_after_terminal() -> None:
+    """Turn 终态提交后，模型、工具和正文事件不得再次写入事件账本。"""
+
+    with _test_db() as db:
+        db.add(
+            ChatSession(
+                id="session_turn_fence",
+                tenant_id="tenant_demo",
+                user_id="user_demo",
+            )
+        )
+        db.commit()
+        events = EventLog(db)
+        events.bind_turn("msg_turn_fence", "client_turn_fence")
+        events.record(
+            "tenant_demo",
+            "session_turn_fence",
+            "stream_delta",
+            {"content": "正文"},
+        )
+        events.record(
+            "tenant_demo",
+            "session_turn_fence",
+            "complete",
+            {"reply": "正文"},
+        )
+        db.commit()
+
+        with pytest.raises(TurnEventFenceClosed):
+            events.record(
+                "tenant_demo",
+                "session_turn_fence",
+                "stream_delta",
+                {"content": "迟到正文"},
+            )
+        with pytest.raises(TurnEventFenceClosed):
+            events.record(
+                "tenant_demo",
+                "session_turn_fence",
+                "tool_result",
+                {"content": "迟到工具结果"},
+            )
+
+        events.record(
+            "tenant_demo",
+            "session_turn_fence",
+            "async_job_enqueued",
+            {"feature": "memory", "job_name": "memory.capture_turn", "job_id": "job_fence"},
+        )
+        db.commit()
+
+        with pytest.raises(TurnEventFenceClosed):
+            events.record(
+                "tenant_demo",
+                "session_turn_fence",
+                "async_job_enqueued",
+                {"feature": "other", "job_name": "other.job", "job_id": "job_late"},
+            )
+
+
+def test_cancelled_turn_ignores_late_relay_terminal_without_duplicate_terminal() -> None:
+    """取消先提交、relay 后到达时只保留一个终态并拒绝迟到正文。"""
+
+    with _test_db() as db:
+        session_id = "session_scheduled_relay_race"
+        message_id = "msg_scheduled_relay_race"
+        client_turn_id = "client_scheduled_relay_race"
+        db.add(ChatSession(id=session_id, tenant_id="tenant_demo", user_id="user_demo"))
+        db.add(
+            Message(
+                id=message_id,
+                tenant_id="tenant_demo",
+                session_id=session_id,
+                role="user",
+                content="调度任务交错取消",
+            )
+        )
+        db.add(
+            AgentEvent(
+                tenant_id="tenant_demo",
+                session_id=session_id,
+                event_type="user_message_received",
+                payload_json={
+                    "message_id": message_id,
+                    "turn_id": message_id,
+                    "client_turn_id": client_turn_id,
+                },
+            )
+        )
+        db.commit()
+
+        assert _persist_chat_turn_cancelled(
+            db,
+            "tenant_demo",
+            db.get(ChatSession, session_id),  # type: ignore[arg-type]
+            client_turn_id,
+            "user_demo",
+        )
+        db.commit()
+
+        with pytest.raises(TurnEventFenceClosed):
+            _persist_relay_only_event(
+                db,
+                "tenant_demo",
+                session_id,
+                "stream_delta",
+                {
+                    "turn_id": message_id,
+                    "client_turn_id": client_turn_id,
+                    "content": "取消后的迟到正文",
+                },
+            )
+
+        _persist_relay_only_event(
+            db,
+            "tenant_demo",
+            session_id,
+            "complete",
+            {
+                "turn_id": message_id,
+                "client_turn_id": client_turn_id,
+                "reply": "不应覆盖取消结果",
+            },
+        )
+        terminal_events = db.exec(
+            select(AgentEvent).where(
+                AgentEvent.tenant_id == "tenant_demo",
+                AgentEvent.session_id == session_id,
+                AgentEvent.event_type.in_(TURN_TERMINAL_EVENT_TYPES),
+            )
+        ).all()
+        assert [event.event_type for event in terminal_events] == ["stream_cancelled"]
+
+
+def test_event_log_rejects_unmarked_assistant_after_error_terminal() -> None:
+    """错误终态之后只允许带取消/中断标记的闭合消息，拒绝迟到动态结果。"""
+
+    with _test_db() as db:
+        db.add(
+            ChatSession(
+                id="session_error_fence",
+                tenant_id="tenant_demo",
+                user_id="user_demo",
+            )
+        )
+        db.commit()
+        events = EventLog(db)
+        events.bind_turn("msg_error_fence", "client_error_fence")
+        events.record(
+            "tenant_demo",
+            "session_error_fence",
+            "error_occurred",
+            {"code": "TEST_ERROR"},
+        )
+        db.commit()
+
+        with pytest.raises(TurnEventFenceClosed):
+            events.record(
+                "tenant_demo",
+                "session_error_fence",
+                "assistant_message_created",
+                {"reply": "迟到动态结果", "execution_id": "execution_late"},
+            )
+
+
+@pytest.mark.parametrize("terminal_event", ("complete", "error_occurred", "stream_interrupted"))
+def test_cancel_does_not_append_after_any_existing_turn_terminal(terminal_event: str) -> None:
+    """取消 API 面对成功、错误或中断终态时不得追加第二个 stream_cancelled。"""
+
+    with _test_db() as db:
+        session_id = f"session_cancel_after_{terminal_event}"
+        message_id = f"msg_cancel_after_{terminal_event}"
+        client_turn_id = f"client_cancel_after_{terminal_event}"
+        db.add(ChatSession(id=session_id, tenant_id="tenant_demo", user_id="user_demo"))
+        db.add(
+            Message(
+                id=message_id,
+                tenant_id="tenant_demo",
+                session_id=session_id,
+                role="user",
+                content="终态后停止",
+            )
+        )
+        db.add(
+            AgentEvent(
+                tenant_id="tenant_demo",
+                session_id=session_id,
+                event_type="user_message_received",
+                payload_json={
+                    "message_id": message_id,
+                    "client_turn_id": client_turn_id,
+                },
+            )
+        )
+        db.add(
+            AgentEvent(
+                tenant_id="tenant_demo",
+                session_id=session_id,
+                event_type=terminal_event,
+                payload_json={
+                    "turn_id": message_id,
+                    "user_message_id": message_id,
+                    "client_turn_id": client_turn_id,
+                    "status": "interrupted" if terminal_event == "stream_interrupted" else None,
+                },
+            )
+        )
+        db.commit()
+        session_row = db.get(ChatSession, session_id)
+        assert session_row is not None
+
+        assert not _persist_chat_turn_cancelled(
+            db,
+            "tenant_demo",
+            session_row,
+            client_turn_id,
+            "user_demo",
+        )
+        db.commit()
+        assert not db.exec(
+            select(AgentEvent).where(
+                AgentEvent.tenant_id == "tenant_demo",
+                AgentEvent.session_id == session_id,
+                AgentEvent.event_type == "stream_cancelled",
+            )
+        ).first()
+
+
+def test_stream_failure_emits_error_terminal_after_complete_reply_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """错误回复先完成正文与 assistant 投影，再以 error_occurred 作为唯一终态。"""
+
+    with _test_db() as db:
+        tenant = Tenant(id="tenant_stream_failure", name="Stream failure")
+        user = User(
+            id="user_stream_failure",
+            tenant_id=tenant.id,
+            username="stream-failure",
+            password_hash="hashed",
+        )
+        agent = AgentProfile(
+            id="agent_stream_failure",
+            tenant_id=tenant.id,
+            name="错误流测试员工",
+            owner_user_id=user.id,
+        )
+        session_row = ChatSession(
+            id="session_stream_failure",
+            tenant_id=tenant.id,
+            user_id=user.id,
+            agent_id=agent.id,
+        )
+        db.add_all([tenant, user, agent, session_row])
+        db.commit()
+
+        loop = AgentLoop(db)
+        monkeypatch.setattr(loop, "_get_request_model", lambda *_args, **_kwargs: None)
+        request = ChatTurnRequest(
+            tenant_id=tenant.id,
+            user_id=user.id,
+            agent_id=agent.id,
+            session_id=session_row.id,
+            client_turn_id="client_stream_failure",
+            message="触发配置错误",
+        )
+
+        stream_events = list(loop.handle_turn_stream(request))
+        event_names = [str(item["event"]) for item in stream_events]
+
+        assert event_names[-1] == "error_occurred"
+        assert event_names.index("stream_end") < event_names.index("error_occurred")
+        assert event_names.index("stream_delta") < event_names.index("error_occurred")
+        persisted_types = [
+            row.event_type
+            for row in db.exec(
+                select(AgentEvent)
+                .where(
+                    AgentEvent.tenant_id == tenant.id,
+                    AgentEvent.session_id == session_row.id,
+                )
+                .order_by(AgentEvent.created_at, AgentEvent.id)
+            ).all()
+        ]
+        assert "error_occurred" in persisted_types
+        error_index = persisted_types.index("error_occurred")
+        assert all(
+            event_type not in {"stream_delta", "stream_end"}
+            for event_type in persisted_types[error_index + 1 :]
+        )
 
 
 def test_session_spans_endpoint_returns_internal_spans_without_relaying_them() -> None:
@@ -1160,16 +2353,53 @@ def test_turn_trace_cancel_event_closes_running_status_for_refresh() -> None:
         AgentEvent(
             tenant_id="tenant_demo",
             session_id="session_cancelled",
+            event_type="stream_status",
+            payload_json={
+                "turn_id": "msg_user",
+                "user_message_id": "msg_user",
+                "phase": "tool",
+                "tool_name": "web_search",
+                "tool_call_id": "call_cancelled_read",
+            },
+            created_at=started_at + timedelta(milliseconds=200),
+        ),
+        AgentEvent(
+            tenant_id="tenant_demo",
+            session_id="session_cancelled",
             event_type="stream_cancelled",
             payload_json={"turn_id": "msg_user", "user_message_id": "msg_user"},
             created_at=started_at + timedelta(milliseconds=300),
+        ),
+        AgentEvent(
+            tenant_id="tenant_demo",
+            session_id="session_cancelled",
+            event_type="stream_status",
+            payload_json={
+                "turn_id": "msg_user",
+                "user_message_id": "msg_user",
+                "phase": "tool",
+                "tool_name": "web_search",
+                "tool_call_id": "call_cancelled_read",
+            },
+            created_at=started_at + timedelta(milliseconds=400),
         ),
     ]
 
     traces = _build_turn_traces(messages, events, {})
 
     assert traces[0]["completed_at"] == (started_at + timedelta(milliseconds=300)).isoformat()
-    assert all(line["state"] != "running" for line in traces[0]["lines"])
+    assert any(
+        line["kind"] == "decision"
+        and line["text"] == "判断意图"
+        and line["state"] == "completed"
+        for line in traces[0]["lines"]
+    )
+    assert any(
+        line["kind"] == "tool"
+        and line["text"] == "正在调用 web_search"
+        and line["state"] == "running"
+        for line in traces[0]["lines"]
+    )
     assert any(
         line["id"] == "generation_stopped"
         and line["text"] == "用户已停止生成"
@@ -1389,6 +2619,147 @@ def test_cancel_endpoint_rejects_unknown_turn_alias_before_user_event_is_visible
         .order_by(Message.created_at)
     ).all()
     assert [message.role for message in messages] == []
+
+
+def test_dynamic_waiting_assistant_projection_does_not_close_turn_or_block_cancel() -> None:
+    """动态等待消息只是业务投影，不能阻止用户随后取消同一聊天 Turn。"""
+
+    db = _test_db()
+    session_row = ChatSession(
+        id="session_waiting_projection",
+        tenant_id="tenant_demo",
+        user_id="user_demo",
+    )
+    user_message = Message(
+        id="msg_waiting_projection",
+        tenant_id="tenant_demo",
+        session_id=session_row.id,
+        role="user",
+        content="等待态取消测试",
+    )
+    db.add_all(
+        [
+            session_row,
+            user_message,
+            AgentEvent(
+                tenant_id="tenant_demo",
+                session_id=session_row.id,
+                event_type="user_message_received",
+                payload_json={
+                    "message_id": user_message.id,
+                    "turn_id": user_message.id,
+                    "client_turn_id": "client_waiting_projection",
+                },
+            ),
+            AgentEvent(
+                tenant_id="tenant_demo",
+                session_id=session_row.id,
+                event_type="assistant_message_created",
+                payload_json={
+                    "message_id": "waiting-assistant",
+                    "assistant_message_id": "waiting-assistant",
+                    "execution_id": "execution_waiting_projection",
+                    "execution_status": "waiting",
+                    "turn_id": user_message.id,
+                    "user_message_id": user_message.id,
+                    "client_turn_id": "client_waiting_projection",
+                },
+            ),
+        ]
+    )
+    db.commit()
+
+    assert not _turn_has_terminal_event(
+        db,
+        "tenant_demo",
+        session_row.id,
+        user_message.id,
+        "client_waiting_projection",
+    )
+    assert _persist_chat_turn_cancelled(
+        db,
+        "tenant_demo",
+        session_row,
+        "client_waiting_projection",
+        "user_demo",
+    )
+    db.commit()
+    terminal_events = db.exec(
+        select(AgentEvent).where(
+            AgentEvent.tenant_id == "tenant_demo",
+            AgentEvent.session_id == session_row.id,
+            AgentEvent.event_type == "stream_cancelled",
+        )
+    ).all()
+    assert len(terminal_events) == 1
+
+
+def test_turn_trace_waiting_projection_closes_only_on_canonical_terminal() -> None:
+    """Trace 对动态等待投影保持开放，收到 complete 后才标记成功闭合。"""
+
+    started_at = datetime(2026, 7, 8, 10, 0, 0)
+    messages = [
+        Message(
+            id="msg_trace_waiting",
+            tenant_id="tenant_demo",
+            session_id="session_trace_waiting",
+            role="user",
+            content="等待结果",
+            created_at=started_at,
+        )
+    ]
+    waiting_event = AgentEvent(
+        tenant_id="tenant_demo",
+        session_id="session_trace_waiting",
+        event_type="assistant_message_created",
+        payload_json={
+            "message_id": "msg_waiting_assistant",
+            "user_message_id": "msg_trace_waiting",
+            "turn_id": "msg_trace_waiting",
+            "execution_status": "waiting",
+        },
+        created_at=started_at + timedelta(seconds=1),
+    )
+    events = [
+        AgentEvent(
+            tenant_id="tenant_demo",
+            session_id="session_trace_waiting",
+            event_type="user_message_received",
+            payload_json={"message_id": "msg_trace_waiting", "message": "等待结果"},
+            created_at=started_at,
+        ),
+        waiting_event,
+        AgentEvent(
+            tenant_id="tenant_demo",
+            session_id="session_trace_waiting",
+            event_type="user_message_received",
+            payload_json={"message_id": "msg_trace_resume", "message": "补充信息"},
+            created_at=started_at + timedelta(seconds=1, microseconds=1),
+        ),
+    ]
+
+    waiting_trace = _build_turn_traces(messages, events, {})[0]
+    assert waiting_trace["completed_at"] is None
+
+    completed_trace = _build_turn_traces(
+        messages,
+        [
+            *events,
+            AgentEvent(
+                tenant_id="tenant_demo",
+                session_id="session_trace_waiting",
+                event_type="complete",
+                payload_json={
+                    "user_message_id": "msg_trace_waiting",
+                    "turn_id": "msg_trace_waiting",
+                    "status": "completed",
+                },
+                created_at=started_at + timedelta(seconds=2),
+            ),
+        ],
+        {},
+    )[0]
+    assert completed_trace["completed_at"] == (started_at + timedelta(seconds=2)).isoformat()
 
 
 def test_chat_cancel_bridges_to_active_dynamic_execution() -> None:

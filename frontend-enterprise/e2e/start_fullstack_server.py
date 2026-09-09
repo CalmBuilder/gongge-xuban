@@ -1,14 +1,15 @@
 """
-@Time       : 2026/08/28 13:20
+@Time       : 2026/09/03 13:20
 @Author     : zhanglp8181
 @File       : start_fullstack_server.py
 @CallChain  : Playwright fullstack 配置 → 临时 SQLite → FastAPI 单端口应用
-@Description: 启动隔离真实全栈服务，并准备登录、流程、动态任务、Artifact 和分页浏览器数据。
+@Description: 启动隔离真实全栈服务，并准备登录、流程、动态任务、垂直能力和分页浏览器数据。
 """
 
 from __future__ import annotations
 
 import base64
+from collections.abc import Mapping
 import hashlib
 import json
 import math
@@ -25,6 +26,7 @@ FRONTEND_DIR = Path(__file__).resolve().parents[1]
 BACKEND_DIR = FRONTEND_DIR.parent / "backend"
 E2E_PORT = int(os.environ.get("FULLSTACK_E2E_PORT", "5148"))
 E2E_SECRET = "fullstack-e2e-isolated-secret-at-least-32-bytes"
+PUBLIC_TRANSCRIBE_FIXTURE_URL = "https://www.youtube.com/watch?v=e2e-transcribe-public"
 # 管理端模型容量与单个 Dynamic/回答阶段预算是两层契约。真实回归必须接受
 # 管理端配置的高容量模型，但运行阶段仍由 backend/app/llm/output_policy.py
 # 和 DynamicBudgetProfile 限制实际请求，避免把模型容量直接变成无限消费。
@@ -271,6 +273,8 @@ def configure_environment(database_path: Path) -> None:
         # 未监听的 ::1，导致正向 disposable 回归被误判为 unknown。
         "TOOL_BASE_URL": f"http://127.0.0.1:{E2E_PORT}",
         "PUBLIC_MOCK_API_KEY": "fullstack-e2e-public-mock-key",
+        # 设置页回归只验证浏览器提交到平台密钥 API 的链路，不让隔离环境回退到本机真实密钥。
+        "VERTICAL_ABILITY_JINA_API_KEY": "",
         # Skill A/B 只替换供应商响应，不应借测试变量把普通动态执行重新关掉。
         # 这样同一套隔离服务仍能验证 Skill、附件和 DynamicTask 的组合契约。
         "DYNAMIC_TASK_EXECUTION_ENABLED": "true",
@@ -3489,6 +3493,257 @@ def install_schedule_llm_override() -> None:
 
                 return [loaded_ref_by_base[name] for name in names]
             goal = str(user_payload.get("goal") or "")
+            if "TRANSCRIBE-PUBLIC-E2E" in goal:
+                capability_ref = next(
+                    (
+                        str(item.get("name") or "")
+                        for item in user_payload.get("capabilities", [])
+                        if isinstance(item, dict)
+                        and str(item.get("name") or "") == "intelligence.media_transcribe"
+                    ),
+                    "",
+                )
+                if not capability_ref:
+                    raise RuntimeError("Whisper planner missed frozen transcription capability")
+                return {
+                    "goal": goal,
+                    "success_criteria": user_payload.get("success_criteria", []),
+                    "constraints": [
+                        "只下载固定公开 YouTube 视频音频并通过已配置的 Groq Whisper 转写；不使用登录态或执行写入"
+                    ],
+                    "assumptions": [],
+                    "steps": [
+                        {
+                            "draft_id": "media_transcribe",
+                            "title": "转写公开 YouTube 视频音频",
+                            "kind": "tool.read",
+                            "required": True,
+                            "depends_on": [],
+                            "capability_refs": [capability_ref],
+                            "guidance_skill_refs": ["vertical_ability:web-intelligence"],
+                            "expected_output_schema": {
+                                "transcript_non_empty": True,
+                                "provider_required": True,
+                                "result_state_required": True,
+                            },
+                        },
+                        {
+                            "draft_id": "answer",
+                            "title": "形成公开视频转写情报报告",
+                            "kind": "answer",
+                            "required": True,
+                            "depends_on": ["media_transcribe"],
+                            "capability_refs": [],
+                            "guidance_skill_refs": ["vertical_ability:web-intelligence"],
+                            "expected_output_schema": {},
+                        },
+                    ],
+                    "expected_artifacts": [],
+                }
+            if "BILIBILI-PUBLIC-E2E" in goal:
+                capability_ref = next(
+                    (
+                        str(item.get("name") or "")
+                        for item in user_payload.get("capabilities", [])
+                        if isinstance(item, dict)
+                        and str(item.get("name") or "") == "intelligence.bilibili_video"
+                    ),
+                    "",
+                )
+                if not capability_ref:
+                    raise RuntimeError("Bilibili public planner missed frozen video capability")
+                return {
+                    "goal": goal,
+                    "success_criteria": user_payload.get("success_criteria", []),
+                    "constraints": [
+                        "只读取固定公开 B站视频详情；不读取登录态、不调用字幕或写入操作"
+                    ],
+                    "assumptions": [],
+                    "steps": [
+                        {
+                            "draft_id": "bilibili_video",
+                            "title": "读取公开 B站视频详情",
+                            "kind": "tool.read",
+                            "required": True,
+                            "depends_on": [],
+                            "capability_refs": [capability_ref],
+                            "guidance_skill_refs": ["vertical_ability:web-intelligence"],
+                            "expected_output_schema": {
+                                "video_url_required": True,
+                                "provider_required": True,
+                            },
+                        },
+                        {
+                            "draft_id": "answer",
+                            "title": "形成 B站公开视频情报报告",
+                            "kind": "answer",
+                            "required": True,
+                            "depends_on": ["bilibili_video"],
+                            "capability_refs": [],
+                            "guidance_skill_refs": ["vertical_ability:web-intelligence"],
+                            "expected_output_schema": {},
+                        },
+                    ],
+                    "expected_artifacts": [],
+                }
+            if "BILIBILI-SEARCH-E2E" in goal:
+                capability_ref = next(
+                    (
+                        str(item.get("name") or "")
+                        for item in user_payload.get("capabilities", [])
+                        if isinstance(item, dict)
+                        and str(item.get("name") or "") == "intelligence.bilibili_search"
+                    ),
+                    "",
+                )
+                if not capability_ref:
+                    raise RuntimeError("Bilibili search planner missed frozen search capability")
+                return {
+                    "goal": goal,
+                    "success_criteria": user_payload.get("success_criteria", []),
+                    "constraints": [
+                        "只搜索固定公开 B站视频结果；不读取登录态、不调用字幕或写入操作"
+                    ],
+                    "assumptions": [],
+                    "steps": [
+                        {
+                            "draft_id": "bilibili_search",
+                            "title": "搜索公开 B站视频",
+                            "kind": "tool.read",
+                            "required": True,
+                            "depends_on": [],
+                            "capability_refs": [capability_ref],
+                            "guidance_skill_refs": ["vertical_ability:web-intelligence"],
+                            "expected_output_schema": {
+                                "videos_count_required": True,
+                                "result_state_required": True,
+                            },
+                        },
+                        {
+                            "draft_id": "answer",
+                            "title": "形成 B站视频搜索情报报告",
+                            "kind": "answer",
+                            "required": True,
+                            "depends_on": ["bilibili_search"],
+                            "capability_refs": [],
+                            "guidance_skill_refs": ["vertical_ability:web-intelligence"],
+                            "expected_output_schema": {},
+                        },
+                    ],
+                    "expected_artifacts": [],
+                }
+            if "YOUTUBE-PUBLIC-E2E" in goal:
+                capability_ref = next(
+                    (
+                        str(item.get("name") or "")
+                        for item in user_payload.get("capabilities", [])
+                        if isinstance(item, dict)
+                        and str(item.get("name") or "") == "intelligence.youtube_video"
+                    ),
+                    "",
+                )
+                if not capability_ref:
+                    raise RuntimeError("YouTube public planner missed frozen video capability")
+                return {
+                    "goal": goal,
+                    "success_criteria": user_payload.get("success_criteria", []),
+                    "constraints": [
+                        "只读取固定公开 YouTube 视频及字幕；不下载媒体、不执行写入或登录"
+                    ],
+                    "assumptions": [],
+                    "steps": [
+                        {
+                            "draft_id": "youtube_video",
+                            "title": "读取公开 YouTube 视频元数据与字幕",
+                            "kind": "tool.read",
+                            "required": True,
+                            "depends_on": [],
+                            "capability_refs": [capability_ref],
+                            "guidance_skill_refs": ["vertical_ability:web-intelligence"],
+                            "expected_output_schema": {
+                                "subtitle_result_state_required": True,
+                                "subtitle_content_non_empty": True,
+                            },
+                        },
+                        {
+                            "draft_id": "answer",
+                            "title": "形成 YouTube 教程情报报告",
+                            "kind": "answer",
+                            "required": True,
+                            "depends_on": ["youtube_video"],
+                            "capability_refs": [],
+                            "guidance_skill_refs": ["vertical_ability:web-intelligence"],
+                            "expected_output_schema": {},
+                        },
+                    ],
+                    "expected_artifacts": [],
+                }
+            if "GITHUB-PUBLIC-E2E" in goal:
+                capability_ref = next(
+                    (
+                        str(item.get("name") or "")
+                        for item in user_payload.get("capabilities", [])
+                        if isinstance(item, dict)
+                        and str(item.get("name") or "") == "intelligence.github_repo"
+                    ),
+                    "",
+                )
+                if not capability_ref:
+                    raise RuntimeError("GitHub public planner missed frozen repository capability")
+                return {
+                    "goal": goal,
+                    "success_criteria": user_payload.get("success_criteria", []),
+                    "constraints": [
+                        "只读取固定公开 GitHub 仓库和 Issue；不执行写入、登录或权限变更"
+                    ],
+                    "assumptions": [],
+                    "steps": [
+                        {
+                            "draft_id": "github_repo",
+                            "title": "读取公开 GitHub 仓库与 Issue",
+                            "kind": "tool.read",
+                            "required": True,
+                            "depends_on": [],
+                            "capability_refs": [capability_ref],
+                            "guidance_skill_refs": ["vertical_ability:web-intelligence"],
+                            "expected_output_schema": {
+                                "issues_count_required": True,
+                                "issues_result_state_required": True,
+                            },
+                        },
+                        {
+                            "draft_id": "answer",
+                            "title": "形成 GitHub 公开仓库情报报告",
+                            "kind": "answer",
+                            "required": True,
+                            "depends_on": ["github_repo"],
+                            "capability_refs": [],
+                            "guidance_skill_refs": ["vertical_ability:web-intelligence"],
+                            "expected_output_schema": {},
+                        },
+                    ],
+                    "expected_artifacts": [],
+                }
+            if "VERTICAL-ABILITY-E2E" in goal:
+                return {
+                    "goal": goal,
+                    "success_criteria": user_payload.get("success_criteria", []),
+                    "constraints": ["只验证能力包选择、快照和报告契约，不访问外部 Provider"],
+                    "assumptions": [],
+                    "steps": [
+                        {
+                            "draft_id": "answer",
+                            "title": "形成能力包验收报告",
+                            "kind": "answer",
+                            "required": True,
+                            "depends_on": [],
+                            "capability_refs": [],
+                            "guidance_skill_refs": ["vertical_ability:web-intelligence"],
+                            "expected_output_schema": {},
+                        }
+                    ],
+                    "expected_artifacts": [],
+                }
             if "只回复查村情相关的问题" in goal:
                 return {
                     "goal": goal,
@@ -4629,6 +4884,590 @@ def install_schedule_llm_override() -> None:
                 )
                 or (step_title.startswith("确认 ") and "阶段产物" in step_title)
             )
+            if "TRANSCRIBE-PUBLIC-E2E" in str(user_payload):
+                client._last_completed_response_metadata = {
+                    "response_id": f"e2e-transcribe-public-{step_kind}",
+                    "finish_reason": "stop",
+                    "usage": {"input_tokens": 18, "output_tokens": 30},
+                }
+                if step_kind == "tool.read":
+                    capability_refs = (
+                        current_step.get("capability_refs", [])
+                        if isinstance(current_step, dict)
+                        else []
+                    )
+                    capability_ref = (
+                        str(capability_refs[0])
+                        if isinstance(capability_refs, list) and capability_refs
+                        else ""
+                    )
+                    if capability_ref != "intelligence.media_transcribe":
+                        raise RuntimeError("Whisper action missed frozen transcription capability")
+                    return {
+                        "action_kind": "call_tool",
+                        "arguments": {
+                            "url": PUBLIC_TRANSCRIBE_FIXTURE_URL,
+                            "provider": "groq",
+                        },
+                        "capability_ref": capability_ref,
+                        "expected_output_schema": {},
+                        "rationale": "通过 Groq Whisper 转写公开视频音频并保留来源、Provider 和结果状态",
+                    }
+                if step_kind == "answer":
+                    execution_view = user_payload.get("provider_execution_view", {})
+                    execution_context = (
+                        execution_view.get("execution_context", {})
+                        if isinstance(execution_view, dict)
+                        else {}
+                    )
+                    completed = [
+                        str(item.get("step_key") or "")
+                        for item in execution_context.get("completed_steps", [])
+                        if isinstance(item, dict) and item.get("step_key")
+                    ]
+                    criteria = [
+                        str(item.get("id") or "")
+                        for item in execution_context.get("success_criteria", [])
+                        if isinstance(item, dict) and item.get("id")
+                    ]
+                    guidance_requirements: list[dict[str, object]] = []
+                    if isinstance(execution_view, dict):
+                        for message in execution_view.get("messages", []):
+                            content = message.get("content") if isinstance(message, dict) else None
+                            requirements = (
+                                content.get("guidance_requirements")
+                                if isinstance(content, dict)
+                                else None
+                            )
+                            if isinstance(requirements, list):
+                                guidance_requirements.extend(
+                                    item for item in requirements if isinstance(item, dict)
+                                )
+                    guidance_applications = [
+                        {
+                            "skill_use_id": str(item.get("skill_use_id") or ""),
+                            "items": [
+                                {
+                                    "requirement_id": str(item.get("requirement_id") or ""),
+                                    "principle": str(item.get("principle") or ""),
+                                    "application": "按全网情报员的转写来源与结果契约整理公开视频证据。",
+                                    "evidence_excerpt": (
+                                        "已通过 Groq Whisper 返回非空转写，并在报告中披露来源、Provider 和结果状态。"
+                                    ),
+                                }
+                            ],
+                        }
+                        for item in guidance_requirements
+                        if str(item.get("disposition") or "apply") == "apply"
+                    ]
+                    return {
+                        "action_kind": "answer",
+                        "arguments": {
+                            "markdown": (
+                                "## 结论摘要\n"
+                                "TRANSCRIBE-PUBLIC-E2E：已通过统一 DynamicTaskAgent 使用 Groq Whisper 完成公开视频转写。\n\n"
+                                "## 关键事实\n"
+                                "转写结果状态为 success_with_data，正文包含：E2E transcription line one / E2E transcription line two。\n\n"
+                                "## 来源与证据\n"
+                                f"视频：{PUBLIC_TRANSCRIBE_FIXTURE_URL}\n"
+                                "Provider：Groq Whisper。\n\n"
+                                "## 冲突/缺口\n"
+                                "本次验证公开 YouTube 音频转写、来源和统一结果契约，不包含登录态或写入操作。\n\n"
+                                "## 后续建议\n"
+                                "继续使用公开音频样本验证转写质量。"
+                            ),
+                            "criterion_evidence": {
+                                criterion: completed for criterion in criteria
+                            },
+                            "pending_questions": [],
+                            "claims": [],
+                            "guidance_applications": guidance_applications,
+                        },
+                        "capability_ref": None,
+                        "expected_output_schema": {},
+                        "rationale": "依据 Groq Whisper 结构化转写回执形成可追溯终态",
+                    }
+            if "BILIBILI-PUBLIC-E2E" in str(user_payload):
+                client._last_completed_response_metadata = {
+                    "response_id": f"e2e-bilibili-public-{step_kind}",
+                    "finish_reason": "stop",
+                    "usage": {"input_tokens": 18, "output_tokens": 28},
+                }
+                if step_kind == "tool.read":
+                    capability_refs = (
+                        current_step.get("capability_refs", [])
+                        if isinstance(current_step, dict)
+                        else []
+                    )
+                    capability_ref = (
+                        str(capability_refs[0])
+                        if isinstance(capability_refs, list) and capability_refs
+                        else ""
+                    )
+                    if capability_ref != "intelligence.bilibili_video":
+                        raise RuntimeError("Bilibili public action missed frozen video capability")
+                    return {
+                        "action_kind": "call_tool",
+                        "arguments": {"video": "BV1xx411c7mD"},
+                        "capability_ref": capability_ref,
+                        "expected_output_schema": {},
+                        "rationale": "读取公开 B站视频详情并保留标题、作者、统计和来源",
+                    }
+                if step_kind == "answer":
+                    execution_view = user_payload.get("provider_execution_view", {})
+                    execution_context = (
+                        execution_view.get("execution_context", {})
+                        if isinstance(execution_view, dict)
+                        else {}
+                    )
+                    completed = [
+                        str(item.get("step_key") or "")
+                        for item in execution_context.get("completed_steps", [])
+                        if isinstance(item, dict) and item.get("step_key")
+                    ]
+                    criteria = [
+                        str(item.get("id") or "")
+                        for item in execution_context.get("success_criteria", [])
+                        if isinstance(item, dict) and item.get("id")
+                    ]
+                    guidance_requirements: list[dict[str, object]] = []
+                    if isinstance(execution_view, dict):
+                        for message in execution_view.get("messages", []):
+                            content = message.get("content") if isinstance(message, dict) else None
+                            requirements = (
+                                content.get("guidance_requirements")
+                                if isinstance(content, dict)
+                                else None
+                            )
+                            if isinstance(requirements, list):
+                                guidance_requirements.extend(
+                                    item for item in requirements if isinstance(item, dict)
+                                )
+                    guidance_applications = [
+                        {
+                            "skill_use_id": str(item.get("skill_use_id") or ""),
+                            "items": [
+                                {
+                                    "requirement_id": str(item.get("requirement_id") or ""),
+                                    "principle": str(item.get("principle") or ""),
+                                    "application": "按全网情报员的来源与结果契约整理 B站公开视频证据。",
+                                    "evidence_excerpt": (
+                                        "已读取 B站公共 API，并在报告中披露视频来源和公开详情。"
+                                    ),
+                                }
+                            ],
+                        }
+                        for item in guidance_requirements
+                        if str(item.get("disposition") or "apply") == "apply"
+                    ]
+                    return {
+                        "action_kind": "answer",
+                        "arguments": {
+                            "markdown": (
+                                "## 结论摘要\n"
+                                "BILIBILI-PUBLIC-E2E：已通过统一 DynamicTaskAgent 读取公开 B站视频详情。\n\n"
+                                "## 关键事实\n"
+                                "B站公共 API 返回了公开视频标题、作者、统计和分 P 信息，未使用登录态。\n\n"
+                                "## 来源与证据\n"
+                                "视频：https://www.bilibili.com/video/BV1xx411c7mD\n"
+                                "Provider：Bilibili public API。\n\n"
+                                "## 冲突/缺口\n"
+                                "本次只验证公开视频详情读取，不包含字幕、登录态或写入操作。\n\n"
+                                "## 后续建议\n"
+                                "需要字幕时继续调用字幕或转写能力。"
+                            ),
+                            "criterion_evidence": {
+                                criterion: completed for criterion in criteria
+                            },
+                            "pending_questions": [],
+                            "claims": [],
+                            "guidance_applications": guidance_applications,
+                        },
+                        "capability_ref": None,
+                        "expected_output_schema": {},
+                        "rationale": "依据 B站公共 API 的结构化视频详情回执形成可追溯终态",
+                    }
+            if "BILIBILI-SEARCH-E2E" in str(user_payload):
+                client._last_completed_response_metadata = {
+                    "response_id": f"e2e-bilibili-search-{step_kind}",
+                    "finish_reason": "stop",
+                    "usage": {"input_tokens": 18, "output_tokens": 28},
+                }
+                if step_kind == "tool.read":
+                    capability_refs = (
+                        current_step.get("capability_refs", [])
+                        if isinstance(current_step, dict)
+                        else []
+                    )
+                    capability_ref = (
+                        str(capability_refs[0])
+                        if isinstance(capability_refs, list) and capability_refs
+                        else ""
+                    )
+                    if capability_ref != "intelligence.bilibili_search":
+                        raise RuntimeError("Bilibili search action missed frozen search capability")
+                    return {
+                        "action_kind": "call_tool",
+                        "arguments": {"query": "Python教程", "num_results": 3},
+                        "capability_ref": capability_ref,
+                        "expected_output_schema": {},
+                        "rationale": "搜索公开 B站视频并保留数量、结果状态和来源 URL",
+                    }
+                if step_kind == "answer":
+                    execution_view = user_payload.get("provider_execution_view", {})
+                    execution_context = (
+                        execution_view.get("execution_context", {})
+                        if isinstance(execution_view, dict)
+                        else {}
+                    )
+                    completed = [
+                        str(item.get("step_key") or "")
+                        for item in execution_context.get("completed_steps", [])
+                        if isinstance(item, dict) and item.get("step_key")
+                    ]
+                    criteria = [
+                        str(item.get("id") or "")
+                        for item in execution_context.get("success_criteria", [])
+                        if isinstance(item, dict) and item.get("id")
+                    ]
+                    guidance_requirements: list[dict[str, object]] = []
+                    if isinstance(execution_view, dict):
+                        for message in execution_view.get("messages", []):
+                            content = message.get("content") if isinstance(message, dict) else None
+                            requirements = (
+                                content.get("guidance_requirements")
+                                if isinstance(content, dict)
+                                else None
+                            )
+                            if isinstance(requirements, list):
+                                guidance_requirements.extend(
+                                    item for item in requirements if isinstance(item, dict)
+                                )
+                    guidance_applications = [
+                        {
+                            "skill_use_id": str(item.get("skill_use_id") or ""),
+                            "items": [
+                                {
+                                    "requirement_id": str(item.get("requirement_id") or ""),
+                                    "principle": str(item.get("principle") or ""),
+                                    "application": "按全网情报员的来源与结果契约整理 B站搜索证据。",
+                                    "evidence_excerpt": (
+                                        "已读取 B站公共搜索 API，并在报告中披露数量、结果状态和来源。"
+                                    ),
+                                }
+                            ],
+                        }
+                        for item in guidance_requirements
+                        if str(item.get("disposition") or "apply") == "apply"
+                    ]
+                    return {
+                        "action_kind": "answer",
+                        "arguments": {
+                            "markdown": (
+                                "## 结论摘要\n"
+                                "BILIBILI-SEARCH-E2E：已通过统一 DynamicTaskAgent 搜索公开 B站视频。\n\n"
+                                "## 关键事实\n"
+                                "搜索词：Python教程。B站公共搜索 API 返回 1 条视频结果，结果状态为 success_with_data，未使用登录态。\n\n"
+                                "## 来源与证据\n"
+                                "视频：https://www.bilibili.com/video/BV1xx411c7mD\n"
+                                "Provider：Bilibili public search API。\n\n"
+                                "## 冲突/缺口\n"
+                                "本次只验证公开视频搜索，不包含字幕、登录态或写入操作。\n\n"
+                                "## 后续建议\n"
+                                "对候选视频继续读取详情或字幕。"
+                            ),
+                            "criterion_evidence": {
+                                criterion: completed for criterion in criteria
+                            },
+                            "pending_questions": [],
+                            "claims": [],
+                            "guidance_applications": guidance_applications,
+                        },
+                        "capability_ref": None,
+                        "expected_output_schema": {},
+                        "rationale": "依据 B站公共搜索 API 的结构化回执形成可追溯终态",
+                    }
+            if "GITHUB-PUBLIC-E2E" in str(user_payload):
+                client._last_completed_response_metadata = {
+                    "response_id": f"e2e-github-public-{step_kind}",
+                    "finish_reason": "stop",
+                    "usage": {"input_tokens": 18, "output_tokens": 28},
+                }
+                if step_kind == "tool.read":
+                    capability_refs = (
+                        current_step.get("capability_refs", [])
+                        if isinstance(current_step, dict)
+                        else []
+                    )
+                    capability_ref = (
+                        str(capability_refs[0])
+                        if isinstance(capability_refs, list) and capability_refs
+                        else ""
+                    )
+                    if capability_ref != "intelligence.github_repo":
+                        raise RuntimeError("GitHub public action missed frozen repository capability")
+                    return {
+                        "action_kind": "call_tool",
+                        "arguments": {
+                            "repository": "octocat/Hello-World",
+                            "issue_limit": 3,
+                        },
+                        "capability_ref": capability_ref,
+                        "expected_output_schema": {},
+                        "rationale": "读取公开 GitHub 仓库摘要和 Issue，并由适配器过滤 Pull Request",
+                    }
+                if step_kind == "answer":
+                    execution_view = user_payload.get("provider_execution_view", {})
+                    execution_context = (
+                        execution_view.get("execution_context", {})
+                        if isinstance(execution_view, dict)
+                        else {}
+                    )
+                    completed = [
+                        str(item.get("step_key") or "")
+                        for item in execution_context.get("completed_steps", [])
+                        if isinstance(item, dict) and item.get("step_key")
+                    ]
+                    criteria = [
+                        str(item.get("id") or "")
+                        for item in execution_context.get("success_criteria", [])
+                        if isinstance(item, dict) and item.get("id")
+                    ]
+                    guidance_requirements: list[dict[str, object]] = []
+                    if isinstance(execution_view, dict):
+                        for message in execution_view.get("messages", []):
+                            content = message.get("content") if isinstance(message, dict) else None
+                            requirements = (
+                                content.get("guidance_requirements")
+                                if isinstance(content, dict)
+                                else None
+                            )
+                            if isinstance(requirements, list):
+                                guidance_requirements.extend(
+                                    item for item in requirements if isinstance(item, dict)
+                                )
+                    guidance_applications = [
+                        {
+                            "skill_use_id": str(item.get("skill_use_id") or ""),
+                            "items": [
+                                {
+                                    "requirement_id": str(item.get("requirement_id") or ""),
+                                    "principle": str(item.get("principle") or ""),
+                                    "application": "按全网情报员的来源与结果契约整理 GitHub 公开仓库证据。",
+                                    "evidence_excerpt": (
+                                        "已读取 GitHub 公共 REST API，并在报告中披露仓库与 Issue 来源。"
+                                    ),
+                                }
+                            ],
+                        }
+                        for item in guidance_requirements
+                        if str(item.get("disposition") or "apply") == "apply"
+                    ]
+                    return {
+                        "action_kind": "answer",
+                        "arguments": {
+                            "markdown": (
+                                "## 结论摘要\n"
+                                "GITHUB-PUBLIC-E2E：已通过统一 DynamicTaskAgent 读取公开仓库。\n\n"
+                                "## 关键事实\n"
+                                "GitHub public REST API 返回了 octocat/Hello-World 仓库摘要和 1 个 Issue；"
+                                "接口回执中的 Pull Request 已被适配器过滤。\n\n"
+                                "## 来源与证据\n"
+                                "仓库：https://github.com/octocat/Hello-World\n"
+                                "Issue #1：https://github.com/octocat/Hello-World/issues/1\n"
+                                "Provider：GitHub public REST API。\n\n"
+                                "## 冲突/缺口\n"
+                                "本次只验证公开仓库与 Issue 读取，不包含私有仓库、写入操作或用户登录态。\n\n"
+                                "## 后续建议\n"
+                                "需要完整讨论时继续读取 Issue 评论和 Release 信息。"
+                            ),
+                            "criterion_evidence": {
+                                criterion: completed for criterion in criteria
+                            },
+                            "pending_questions": [],
+                            "claims": [],
+                            "guidance_applications": guidance_applications,
+                        },
+                        "capability_ref": None,
+                        "expected_output_schema": {},
+                        "rationale": "依据 GitHub 公共 REST API 的结构化仓库与 Issue 回执形成可追溯终态",
+                    }
+            if "YOUTUBE-PUBLIC-E2E" in str(user_payload):
+                client._last_completed_response_metadata = {
+                    "response_id": f"e2e-youtube-public-{step_kind}",
+                    "finish_reason": "stop",
+                    "usage": {"input_tokens": 18, "output_tokens": 30},
+                }
+                if step_kind == "tool.read":
+                    capability_refs = (
+                        current_step.get("capability_refs", [])
+                        if isinstance(current_step, dict)
+                        else []
+                    )
+                    capability_ref = (
+                        str(capability_refs[0])
+                        if isinstance(capability_refs, list) and capability_refs
+                        else ""
+                    )
+                    if capability_ref != "intelligence.youtube_video":
+                        raise RuntimeError("YouTube public action missed frozen video capability")
+                    return {
+                        "action_kind": "call_tool",
+                        "arguments": {
+                            "url": "https://www.youtube.com/watch?v=e2e-youtube-public",
+                            "subtitle_languages": ["en"],
+                        },
+                        "capability_ref": capability_ref,
+                        "expected_output_schema": {},
+                        "rationale": "读取公开视频元数据和非空字幕，并保留可引用来源",
+                    }
+                if step_kind == "answer":
+                    execution_view = user_payload.get("provider_execution_view", {})
+                    execution_context = (
+                        execution_view.get("execution_context", {})
+                        if isinstance(execution_view, dict)
+                        else {}
+                    )
+                    completed = [
+                        str(item.get("step_key") or "")
+                        for item in execution_context.get("completed_steps", [])
+                        if isinstance(item, dict) and item.get("step_key")
+                    ]
+                    criteria = [
+                        str(item.get("id") or "")
+                        for item in execution_context.get("success_criteria", [])
+                        if isinstance(item, dict) and item.get("id")
+                    ]
+                    guidance_requirements: list[dict[str, object]] = []
+                    if isinstance(execution_view, dict):
+                        for message in execution_view.get("messages", []):
+                            content = message.get("content") if isinstance(message, dict) else None
+                            requirements = (
+                                content.get("guidance_requirements")
+                                if isinstance(content, dict)
+                                else None
+                            )
+                            if isinstance(requirements, list):
+                                guidance_requirements.extend(
+                                    item for item in requirements if isinstance(item, dict)
+                                )
+                    guidance_applications = [
+                        {
+                            "skill_use_id": str(item.get("skill_use_id") or ""),
+                            "items": [
+                                {
+                                    "requirement_id": str(item.get("requirement_id") or ""),
+                                    "principle": str(item.get("principle") or ""),
+                                    "application": "按全网情报员的视频字幕与来源契约整理 YouTube 公开证据。",
+                                    "evidence_excerpt": (
+                                        "已读取 YouTube 公开视频字幕，并在报告中披露视频来源和字幕状态。"
+                                    ),
+                                }
+                            ],
+                        }
+                        for item in guidance_requirements
+                        if str(item.get("disposition") or "apply") == "apply"
+                    ]
+                    return {
+                        "action_kind": "answer",
+                        "arguments": {
+                            "markdown": (
+                                "## 结论摘要\n"
+                                "YOUTUBE-PUBLIC-E2E：已通过统一 DynamicTaskAgent 读取公开视频字幕。\n\n"
+                                "## 关键事实\n"
+                                "公开视频元数据读取成功，字幕结果状态为 success_with_data；"
+                                "字幕正文包含：E2E subtitle line one / E2E subtitle line two。\n\n"
+                                "## 来源与证据\n"
+                                "视频：https://www.youtube.com/watch?v=e2e-youtube-public\n"
+                                "Provider：yt-dlp YouTube Runtime。\n\n"
+                                "## 冲突/缺口\n"
+                                "本次只验证公开视频元数据和字幕读取，不包含媒体下载、登录态或写入操作。\n\n"
+                                "## 后续建议\n"
+                                "需要完整视频内容时再评估转写兜底。"
+                            ),
+                            "criterion_evidence": {
+                                criterion: completed for criterion in criteria
+                            },
+                            "pending_questions": [],
+                            "claims": [],
+                            "guidance_applications": guidance_applications,
+                        },
+                        "capability_ref": None,
+                        "expected_output_schema": {},
+                        "rationale": "依据 YouTube 公共视频和非空字幕回执形成可追溯终态",
+                    }
+            if "VERTICAL-ABILITY-E2E" in str(user_payload) and step_kind == "answer":
+                execution_view = user_payload.get("provider_execution_view", {})
+                execution_context = (
+                    execution_view.get("execution_context", {})
+                    if isinstance(execution_view, dict)
+                    else {}
+                )
+                criteria = [
+                    str(item.get("id") or "")
+                    for item in execution_context.get("success_criteria", [])
+                    if isinstance(item, dict) and item.get("id")
+                ]
+                requirements: list[dict[str, object]] = []
+                for message in (
+                    execution_view.get("messages", [])
+                    if isinstance(execution_view, dict)
+                    else []
+                ):
+                    content = message.get("content") if isinstance(message, dict) else None
+                    raw_requirements = (
+                        content.get("guidance_requirements")
+                        if isinstance(content, dict)
+                        else None
+                    )
+                    if isinstance(raw_requirements, list):
+                        requirements.extend(
+                            item for item in raw_requirements if isinstance(item, dict)
+                        )
+                evidence_excerpt = "VERTICAL-ABILITY-E2E：已按能力包输出契约完成报告。"
+                guidance_applications = [
+                    {
+                        "skill_use_id": str(item.get("skill_use_id") or ""),
+                        "items": [
+                            {
+                                "requirement_id": str(item.get("requirement_id") or ""),
+                                "principle": str(item.get("principle") or ""),
+                                "application": "按全网情报员能力包完成结构化报告并保留可追溯边界。",
+                                "evidence_excerpt": evidence_excerpt,
+                            }
+                        ],
+                    }
+                    for item in requirements
+                    if str(item.get("disposition") or "apply") == "apply"
+                ]
+                client._last_completed_response_metadata = {
+                    "response_id": "e2e-vertical-ability-answer",
+                    "finish_reason": "stop",
+                    "usage": {"input_tokens": 16, "output_tokens": 24},
+                }
+                return {
+                    "action_kind": "answer",
+                    "arguments": {
+                        "markdown": (
+                            "## 结论摘要\nVERTICAL-ABILITY-E2E：能力包已进入统一动态执行。\n\n"
+                            "## 关键事实\n本次执行冻结了全网情报员能力包版本和组合身份。\n\n"
+                            "## 来源与证据\n本次为不访问外部 Provider 的契约验收。\n\n"
+                            "## 冲突/缺口\n无外部来源回执，未宣称完成互联网检索。\n\n"
+                            "## 后续建议\n配置公共 Provider 后再进行实网研究验收。\n\n"
+                            f"{evidence_excerpt}"
+                        ),
+                        "criterion_evidence": {
+                            criterion: [str(current_step.get("step_key") or "answer")]
+                            for criterion in criteria
+                        },
+                        "pending_questions": [],
+                        "claims": [],
+                        "guidance_applications": guidance_applications,
+                    },
+                    "capability_ref": None,
+                    "expected_output_schema": {},
+                    "rationale": "验证能力包通过统一 DynamicTaskAgent 形成带输出契约的结果",
+                }
             if "只回复查村情相关的问题" in str(user_payload) and step_kind == "answer":
                 execution_view = user_payload.get("provider_execution_view", {})
                 execution_context = (
@@ -6642,6 +7481,244 @@ def seed_connection_browser_fixtures() -> None:
         assert json.dumps(attention.payload_json).find("xoxb-") == -1
 
 
+def install_vertical_ability_provider_fixture() -> None:
+    """为浏览器回归注册 GitHub、B站、YouTube 和 Whisper fixture，并让正式适配器走确定性链路。"""
+
+    from fastapi.responses import JSONResponse
+
+    from app.vertical_abilities import adapters
+    from single_port_app import app
+
+    adapters._GITHUB_API_BASE_URL = f"http://127.0.0.1:{E2E_PORT}/__e2e/github"
+    adapters._BILIBILI_API_BASE_URL = f"http://127.0.0.1:{E2E_PORT}/__e2e/bilibili"
+    youtube_fixture_url = "https://www.youtube.com/watch?v=e2e-youtube-public"
+
+    def validate_youtube_url(url: str, _settings: object, _resolver: object) -> None:
+        """只为测试专用 YouTube 来源跳过公网解析，不改变其他 URL 安全校验。"""
+
+        if url != youtube_fixture_url:
+            raise ValueError("unexpected YouTube fixture URL")
+
+    def read_youtube_video(_url: str, **_kwargs: object) -> dict[str, object]:
+        """返回包含非空字幕的公开视频 fixture，覆盖真实适配器归一化路径。"""
+
+        return {
+            "info": {
+                "id": "e2e-youtube-public",
+                "title": "E2E YouTube public tutorial",
+                "webpage_url": youtube_fixture_url,
+                "uploader": "E2E Public Channel",
+                "duration": 120,
+                "upload_date": "20260903",
+            },
+            "subtitle_content": "E2E subtitle line one\nE2E subtitle line two",
+            "subtitle_language": "en",
+            "subtitle_result_state": "success_with_data",
+        }
+
+    adapters._validate_youtube_url = validate_youtube_url
+    adapters.read_youtube_video = read_youtube_video
+
+    def transcribe_media(
+        source_url: str,
+        *,
+        provider: str,
+        provider_credentials: Mapping[str, str],
+        settings: object,
+        resolver: object,
+        is_cancelled: object = None,
+        allow_provider_fallback: bool = False,
+    ) -> dict[str, object]:
+        """返回固定非空 Whisper 回执，保留正式 Executor 的凭据和适配器边界。"""
+
+        del settings, resolver, is_cancelled, allow_provider_fallback
+        if (
+            source_url != PUBLIC_TRANSCRIBE_FIXTURE_URL
+            or provider != "groq"
+            or not str(provider_credentials.get("groq") or "").strip()
+        ):
+            raise RuntimeError("unexpected public transcription fixture request")
+        return {
+            "source_url": source_url,
+            "transcript": "E2E transcription line one\nE2E transcription line two",
+            "provider": "Groq Whisper",
+            "provider_id": "groq",
+            "chunks_count": 1,
+            "result_state": "success_with_data",
+            "truncated": False,
+            "retrieved_at": "2026-09-03T00:00:00+00:00",
+        }
+
+    adapters.transcribe_public_media = transcribe_media
+
+    def repository(owner: str, repo: str) -> JSONResponse:
+        """返回浏览器 GitHub 场景使用的公开仓库摘要。"""
+
+        if (owner, repo) != ("octocat", "Hello-World"):
+            return JSONResponse({"message": "Not Found"}, status_code=404)
+        return JSONResponse(
+            {
+                "name": "Hello-World",
+                "full_name": "octocat/Hello-World",
+                "html_url": "https://github.com/octocat/Hello-World",
+                "description": "A deterministic public repository fixture.",
+                "owner": {"login": "octocat"},
+                "language": "Python",
+                "default_branch": "main",
+                "stargazers_count": 42,
+                "forks_count": 7,
+                "open_issues_count": 1,
+                "license": {"spdx_id": "MIT"},
+                "topics": ["agents", "runtime"],
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-09-03T00:00:00Z",
+            }
+        )
+
+    def issues(owner: str, repo: str) -> JSONResponse:
+        """返回一个真实 Issue 和一个 Pull Request 混合的公开接口回执。"""
+
+        if (owner, repo) != ("octocat", "Hello-World"):
+            return JSONResponse({"message": "Not Found"}, status_code=404)
+        return JSONResponse(
+            [
+                {
+                    "number": 1,
+                    "title": "Document the runtime integration",
+                    "html_url": "https://github.com/octocat/Hello-World/issues/1",
+                    "state": "open",
+                    "user": {"login": "octocat"},
+                    "comments": 3,
+                    "labels": [{"name": "documentation"}],
+                    "created_at": "2026-09-01T00:00:00Z",
+                    "updated_at": "2026-09-03T00:00:00Z",
+                },
+                {
+                    "number": 2,
+                    "title": "A pull request is not an Issue",
+                    "pull_request": {"url": "https://api.github.com/repos/octocat/Hello-World/pulls/2"},
+                },
+            ]
+        )
+
+    def search_repositories(query: str = "", per_page: int = 5, page: int = 1) -> JSONResponse:
+        """返回固定仓库搜索结果，确保搜索适配器也有浏览器 fixture 入口。"""
+
+        del per_page, page
+        if not query:
+            return JSONResponse({"total_count": 0, "items": []})
+        return JSONResponse(
+            {
+                "total_count": 1,
+                "items": [
+                    {
+                        "full_name": "octocat/Hello-World",
+                        "html_url": "https://github.com/octocat/Hello-World",
+                        "description": f"Public repository fixture for {query}.",
+                        "created_at": "2026-01-01T00:00:00Z",
+                    }
+                ],
+            }
+        )
+
+    def bilibili_search(keyword: str = "", page: int = 1) -> JSONResponse:
+        """返回固定 B站视频搜索结果，覆盖正式 JSON 归一化路径。"""
+
+        del page
+        if not keyword:
+            return JSONResponse({"code": 0, "message": "0", "data": {"result": []}})
+        return JSONResponse(
+            {
+                "code": 0,
+                "message": "0",
+                "data": {
+                    "result": [
+                        {
+                            "result_type": "video",
+                            "data": [
+                                {
+                                    "bvid": "BV1xx411c7mD",
+                                    "aid": 2,
+                                    "title": f"B站公开教程：{keyword}",
+                                    "author": "E2E B站公开 UP 主",
+                                    "description": "Deterministic public video fixture.",
+                                    "duration": "10:20",
+                                    "pubdate": 1_704_067_200,
+                                    "play": 120,
+                                    "like": 12,
+                                    "review": 3,
+                                }
+                            ],
+                        }
+                    ]
+                },
+            }
+        )
+
+    def bilibili_view(bvid: str = "", aid: int | None = None) -> JSONResponse:
+        """返回固定 B站公开视频详情，保持真实详情适配器的字段形状。"""
+
+        if bvid != "BV1xx411c7mD" and aid != 2:
+            return JSONResponse({"code": -404, "message": "视频不存在", "data": None})
+        return JSONResponse(
+            {
+                "code": 0,
+                "message": "0",
+                "data": {
+                    "bvid": "BV1xx411c7mD",
+                    "aid": 2,
+                    "title": "E2E B站公开教程",
+                    "desc": "Deterministic public video detail fixture.",
+                    "duration": 620,
+                    "pubdate": 1_704_067_200,
+                    "owner": {"mid": 2, "name": "E2E B站公开 UP 主"},
+                    "stat": {
+                        "view": 120,
+                        "like": 12,
+                        "reply": 3,
+                        "danmaku": 9,
+                        "favorite": 6,
+                    },
+                    "pages": [
+                        {"page": 1, "part": "公开教程第一 P", "duration": 620, "cid": 62131}
+                    ],
+                    "subtitle": {"allow_submit": False},
+                },
+            }
+        )
+
+    app.add_api_route(
+        "/__e2e/github/repos/{owner}/{repo}",
+        repository,
+        methods=["GET"],
+        include_in_schema=False,
+    )
+    app.add_api_route(
+        "/__e2e/github/repos/{owner}/{repo}/issues",
+        issues,
+        methods=["GET"],
+        include_in_schema=False,
+    )
+    app.add_api_route(
+        "/__e2e/github/search/repositories",
+        search_repositories,
+        methods=["GET"],
+        include_in_schema=False,
+    )
+    app.add_api_route(
+        "/__e2e/bilibili/x/web-interface/search/all/v2",
+        bilibili_search,
+        methods=["GET"],
+        include_in_schema=False,
+    )
+    app.add_api_route(
+        "/__e2e/bilibili/x/web-interface/view",
+        bilibili_view,
+        methods=["GET"],
+        include_in_schema=False,
+    )
+
+
 def install_connection_service_override() -> None:
     """仅为隔离全栈进程注入可预测 Slack 边界，生产应用和租户请求均不能选择该地址。"""
 
@@ -7171,6 +8248,7 @@ def main() -> None:
     import uvicorn
     from single_port_app import app
 
+    install_vertical_ability_provider_fixture()
     uvicorn.run(app, host="127.0.0.1", port=E2E_PORT, log_level="warning")
 
 

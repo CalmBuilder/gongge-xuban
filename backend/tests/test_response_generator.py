@@ -265,6 +265,38 @@ def test_failed_tool_result_returns_explicit_failure_without_model_call(monkeypa
     assert reply == "工具调用失败：order.query（HTTP_ERROR）：工具返回异常状态码：502。请检查工具配置、调用参数或外部服务状态后重试。"
 
 
+def test_missing_vertical_ability_credential_guides_user_to_admin_settings(monkeypatch):
+    """缺少 Jina 密钥时应明确提醒用户联系管理员进入能力包配置页。"""
+
+    def forbidden_generate_text(self, system_prompt, payload):  # noqa: ANN001
+        raise AssertionError("credential guidance should not rely on model generation")
+
+    monkeypatch.setattr(LLMClient, "generate_text", forbidden_generate_text)
+
+    reply = ResponseGenerator().generate(
+        message="查一下这个网页",
+        session=ChatSession(id="session_test", tenant_id="tenant_demo"),
+        skill=None,
+        router_decision=RouterDecision(decision="continue_active"),
+        step_result=StepAgentResult(),
+        tool_result=ToolResult(
+            tool_name="intelligence.web_read",
+            success=False,
+            error=ToolError(
+                code="VERTICAL_ABILITY_CREDENTIAL_NOT_CONFIGURED",
+                message="全网情报员需要先配置 Jina API Key。",
+            ),
+        ),
+        model_config=None,  # type: ignore[arg-type]
+    )
+
+    assert reply == (
+        "工具调用失败：intelligence.web_read（VERTICAL_ABILITY_CREDENTIAL_NOT_CONFIGURED）："
+        "全网情报员需要先配置 Jina API Key。请联系管理员前往“能力包配置”页面，"
+        "在 Jina Reader 卡片中配置 Jina API Key 后重试。"
+    )
+
+
 def test_failed_tool_result_with_authoritative_attachment_calls_response_model(monkeypatch):
     """附件事实存在时工具失败不能掩盖附件回答，回复阶段仍须调用模型。"""
 

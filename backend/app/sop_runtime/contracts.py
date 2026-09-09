@@ -68,6 +68,23 @@ class OperationStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+TERMINAL_OPERATION_STATUSES = frozenset(
+    {
+        OperationStatus.SUCCEEDED.value,
+        OperationStatus.FAILED.value,
+        OperationStatus.CANCELLED.value,
+    }
+)
+"""操作终态；由 OperationStatus 推导，避免活动状态集合漏掉新增状态。"""
+
+NONTERMINAL_OPERATION_STATUSES = frozenset(
+    status.value
+    for status in OperationStatus
+    if status.value not in TERMINAL_OPERATION_STATUSES
+)
+"""操作非终态集合，统一覆盖 prepared、running、retry_wait 和 unknown。"""
+
+
 class DeliveryStatus(StrEnum):
     """领域事件投递状态。"""
 

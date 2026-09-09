@@ -284,7 +284,7 @@ def normalize_plan_draft(
     guidance_sources_by_name: Mapping[str, tuple[Mapping[str, str], ...]] | None = None,
     guidance_selection_modes_by_name: Mapping[str, str] | None = None,
 ) -> NormalizedPlan:
-    """为草案生成稳定服务端 step key，并以服务端预算覆盖任何模型暗示。"""
+    """为草案生成稳定服务端 step key，并以服务端安全边界覆盖模型暗示；token 字段仅兼容快照和观测。"""
 
     if (
         max_steps < 1

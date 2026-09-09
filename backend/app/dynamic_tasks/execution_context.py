@@ -3,7 +3,7 @@
 @Author     : zhanglp8181
 @File       : execution_context.py
 @CallChain  : DynamicTaskAgent resume/planning → database projection → provider execution view
-@Description: 从权威执行表机械生成不受对话语义压缩覆盖的动态任务上下文。
+@Description: 从权威执行表投影动态任务上下文，显式披露模型侧裁剪且不污染原始回执。
 """
 
 from __future__ import annotations
@@ -261,7 +261,7 @@ def project_result_for_model(value: object, schema: Mapping[str, Any]) -> object
 
 
 def _model_visible_explore_output(output: object) -> dict[str, object] | None:
-    """只把探索压缩报告与证据引用回注父上下文，排除中间工具大结果。"""
+    """只回注探索报告与证据引用，报告再次裁剪时明确说明而不冒充完整内容。"""
 
     if not isinstance(output, dict):
         return None
@@ -271,7 +271,7 @@ def _model_visible_explore_output(output: object) -> dict[str, object] | None:
     if not isinstance(report, str) or not isinstance(evidence, list):
         return None
     return {
-        "report": report[:_MAX_RESULT_STRING_CHARS],
+        "report": _clip_result_text(report),
         "evidence": [
             {
                 "operation_id": str(item.get("operation_id") or "")[:512],
@@ -287,8 +287,42 @@ def _model_visible_explore_output(output: object) -> dict[str, object] | None:
     }
 
 
+def _clip_result_text(value: str) -> str:
+    """在既有字符预算内保留正文前缀及裁剪说明，不把模型可见部分称为全文。"""
+
+    if len(value) <= _MAX_RESULT_STRING_CHARS:
+        return value
+    notice = (
+        f"\n[模型上下文已截断：原始字段共 {len(value)} 字符，"
+        "仅展示开头内容；不得视为全文。]"
+    )
+    return value[:_MAX_RESULT_STRING_CHARS - len(notice)] + notice
+
+
+def _mark_projected_truncation(
+    original: dict[str, Any], projected: dict[str, object],
+) -> dict[str, object]:
+    """只更新合同已经允许的相邻截断标记，不新增字段或修改原始 Provider 回执。"""
+
+    any_clipped = False
+    for key in projected:
+        item = original.get(key)
+        clipped = (
+            isinstance(item, str) and len(item) > _MAX_RESULT_STRING_CHARS
+        ) or (isinstance(item, list) and len(item) > _MAX_RESULT_ITEMS)
+        flag = f"{key}_truncated"
+        any_clipped = any_clipped or clipped
+        if clipped and isinstance(projected.get(flag), bool):
+            projected[flag] = True
+    if any_clipped:
+        for flag in ("truncated", "partial"):
+            if isinstance(projected.get(flag), bool):
+                projected[flag] = True
+    return projected
+
+
 def _project_result_by_schema(value: object, schema: dict[str, Any], *, depth: int) -> object:
-    """递归投影显式 JSON Schema；开放对象仍过滤凭据名、私有侧带并施加体积边界。"""
+    """按显式合同过滤凭据与侧带；有界裁剪必须披露，不能沿用失真的完整正文标记。"""
 
     if depth >= _MAX_RESULT_DEPTH:
         return "[result depth clipped]"
@@ -308,46 +342,58 @@ def _project_result_by_schema(value: object, schema: dict[str, Any], *, depth: i
                     projected[str(key)] = _project_result_by_schema(
                         value[key], child_schema, depth=depth + 1
                     )
-        if schema.get("additionalProperties") is True:
+        # Agent-Reach 的若干公开结果使用 ``{"type": "object"}`` 表示
+        # 供应商返回的开放对象，没有可枚举的 properties。旧逻辑会把这类
+        # repository 等真实对象投影成空对象，导致 answer 阶段误报“无数据”。
+        # 只对未声明 properties 且未显式禁止附加字段的开放对象放行有界脱敏
+        # 投影；显式 properties schema 仍保持原有白名单语义。
+        open_object = properties is None and "additionalProperties" not in schema
+        if schema.get("additionalProperties") is True or open_object:
             for key, item in list(value.items())[:_MAX_RESULT_ITEMS]:
                 normalized = str(key).lower()
                 if key in projected or str(key).startswith("_") or normalized in _SENSITIVE_RESULT_KEYS:
                     continue
                 projected[str(key)] = _sanitize_unstructured_result(item, depth=depth + 1)
-        return projected
+        return _mark_projected_truncation(value, projected)
     if schema_type == "array" and isinstance(value, list):
         item_schema = schema.get("items")
         if not isinstance(item_schema, dict):
-            return []
+            # 未声明 items 的数组仍是一个有意义的开放集合；逐项走同一
+            # 深度、数量和敏感字段裁剪，不能因为 schema 不够细就静默清空。
+            return [
+                _sanitize_unstructured_result(item, depth=depth + 1)
+                for item in value[:_MAX_RESULT_ITEMS]
+            ]
         return [
             _project_result_by_schema(item, item_schema, depth=depth + 1)
             for item in value[:_MAX_RESULT_ITEMS]
         ]
     if isinstance(value, str):
-        return value[:_MAX_RESULT_STRING_CHARS]
+        return _clip_result_text(value)
     if value is None or isinstance(value, (bool, int, float)):
         return value
-    return str(value)[:_MAX_RESULT_STRING_CHARS]
+    return _clip_result_text(str(value))
 
 
 def _sanitize_unstructured_result(value: object, *, depth: int) -> object:
-    """裁剪显式开放 schema 下的结构化值，并阻止常见凭据字段进入模型上下文。"""
+    """脱敏开放合同并显式披露正文裁剪，保留原始回执且不扩大模型预算。"""
 
     if depth >= _MAX_RESULT_DEPTH:
         return "[result depth clipped]"
     if isinstance(value, dict):
-        return {
+        projected = {
             str(key): _sanitize_unstructured_result(item, depth=depth + 1)
             for key, item in list(value.items())[:_MAX_RESULT_ITEMS]
             if not str(key).startswith("_") and str(key).lower() not in _SENSITIVE_RESULT_KEYS
         }
+        return _mark_projected_truncation(value, projected)
     if isinstance(value, list):
         return [
             _sanitize_unstructured_result(item, depth=depth + 1)
             for item in value[:_MAX_RESULT_ITEMS]
         ]
     if isinstance(value, str):
-        return value[:_MAX_RESULT_STRING_CHARS]
+        return _clip_result_text(value)
     if value is None or isinstance(value, (bool, int, float)):
         return value
-    return str(value)[:_MAX_RESULT_STRING_CHARS]
+    return _clip_result_text(str(value))

@@ -125,4 +125,24 @@ describe('MessageBubble actions', () => {
     expect(screen.queryByRole('button', { name: '编辑' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '重试' })).not.toBeInTheDocument();
   });
+
+  it('renders a structured intelligence header only for report-shaped answers', () => {
+    const chat = createChat();
+    const zh = (...codePoints: number[]) => String.fromCodePoint(...codePoints);
+    const content = [
+      `## ${zh(32467, 35770, 25688, 35201)}`,
+      `${zh(32467, 35770, 20869, 23481)}${zh(12290)}`,
+      `## ${zh(20851, 38190, 20107, 23454)}`,
+      `- ${zh(20107, 23454)}${zh(19968)}`,
+      `## ${zh(26469, 28304, 19982, 35777, 25454)}`,
+      '1. https://example.com/source',
+    ].join('\n');
+
+    renderWithProvider(chat, { ...assistantMessage, content }, renderState({ visibleContent: content }));
+
+    expect(screen.getByText('情报简报')).toBeInTheDocument();
+    expect(screen.getByText('多来源证据整理')).toBeInTheDocument();
+    expect(screen.getByText('结构化报告')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'https://example.com/source' })).toHaveAttribute('target', '_blank');
+  });
 });

@@ -20,9 +20,9 @@ vi.mock('@/components/ui/app-toast', () => ({
   },
 }));
 
-function createChat(startNewSession: () => void): UseChatSession {
+function createChat(startNewSession: () => void, inputValue = ''): UseChatSession {
   return {
-    input: '',
+    input: inputValue,
     setInput: vi.fn(),
     composerAttachments: [],
     composerDragActive: false,
@@ -38,6 +38,27 @@ function createChat(startNewSession: () => void): UseChatSession {
     selectedGeneralSkillIds: [],
     selectSessionGeneralSkill: vi.fn().mockResolvedValue(undefined),
     clearSelectedGeneralSkill: vi.fn(),
+    verticalAbilities: [{
+      id: 'web-intelligence',
+      name: '全网情报员',
+      category: '互联网情报',
+      icon_key: 'globe',
+      description: '公开网页调研',
+      platform_tags: ['网页', 'RSS/Atom', 'GitHub', 'YouTube'],
+      version: '1.3.0',
+      checksum: 'checksum',
+      capabilities: [],
+      output_contract: {},
+      external_data_notice: '公开信息',
+      health: { status: 'ready', message: '可用' },
+    }],
+    verticalAbilityCatalogLoading: false,
+    verticalAbilityCatalogError: false,
+    selectedVerticalAbilityIds: [],
+    selectVerticalAbility: vi.fn(),
+    clearSelectedVerticalAbility: vi.fn(),
+    verticalAbilityReadinessById: {},
+    checkVerticalAbilityReadiness: vi.fn().mockResolvedValue(null),
     generalSkillInstallOpen: false,
     setGeneralSkillInstallOpen: vi.fn(),
     generalSkillInstallIntents: [],
@@ -97,5 +118,56 @@ describe('Composer new-session action', () => {
     fireEvent.click(newSessionButton);
 
     expect(startNewSession).toHaveBeenCalledTimes(1);
+  });
+
+  it('opens the data-driven vertical ability menu and selects a package', async () => {
+    const chat = createChat(vi.fn());
+
+    render(
+      <I18nProvider>
+        <Composer chat={chat} />
+      </I18nProvider>,
+    );
+
+    const trigger = screen.getByRole('button', { name: '选择垂直能力包' });
+    fireEvent.pointerDown(trigger, { button: 0 });
+    const ability = await screen.findByRole('menuitemcheckbox', { name: /全网情报员/ });
+    fireEvent.click(ability);
+
+    expect(chat.selectVerticalAbility).toHaveBeenCalledWith('web-intelligence');
+  });
+
+  it('keeps the package selected and reopens the configuration prompt on send after dismissal', async () => {
+    const readiness = {
+      ability_id: 'web-intelligence',
+      configured: false,
+      provider: 'jina',
+      provider_name: 'Jina Reader',
+      credential_label: 'Jina API Key',
+      message: 'Jina API Key 尚未配置，请联系管理员前往“能力包配置”页面配置。',
+    };
+    const chat = createChat(vi.fn(), '查一下这个网页');
+    chat.selectedVerticalAbilityIds = ['web-intelligence'];
+    chat.selectVerticalAbility = vi.fn().mockResolvedValue(readiness);
+
+    render(
+      <I18nProvider>
+        <Composer chat={chat} />
+      </I18nProvider>,
+    );
+
+    fireEvent.pointerDown(screen.getByRole('button', { name: '选择垂直能力包' }), { button: 0 });
+    const ability = await screen.findByRole('menuitemcheckbox', { name: /全网情报员/ });
+    fireEvent.click(ability);
+    await screen.findByRole('dialog');
+    expect(screen.getByText(readiness.message)).toBeVisible();
+
+    fireEvent.click(screen.getByRole('button', { name: '关闭提示' }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(screen.getByText('Jina Reader待配置')).toBeVisible();
+
+    fireEvent.submit(screen.getByRole('textbox', { name: '输入消息，按 Enter 发送...' }).closest('form') as HTMLFormElement);
+    expect(await screen.findByRole('dialog')).toBeVisible();
+    expect(chat.send).not.toHaveBeenCalled();
   });
 });

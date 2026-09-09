@@ -57,6 +57,8 @@ export type TurnTrace = {
   lines: TraceLine[];
   startedAt: number;
   completedAt?: number;
+  /** 仅前端内存标记：聊天取消已确认，但工具效果仍需独立回执。 */
+  closedByCancellation?: boolean;
 };
 
 export type ComposerAttachment = ChatAttachmentRead & {

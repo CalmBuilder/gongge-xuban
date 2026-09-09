@@ -69,6 +69,7 @@ class ExecutionCommandRead(BaseModel):
     result_plan_revision_id: str | None
     issued_at: str
     consumed_at: str | None
+    updated_at: str
 
 
 class ExecutionArtifactSummary(BaseModel):
@@ -151,6 +152,15 @@ class ExecutionOperationSummary(BaseModel):
     status: str
 
 
+class ExecutionVerticalAbilitySummary(BaseModel):
+    """返回执行时冻结的垂直能力身份，供执行卡和浏览器验收展示。"""
+
+    id: str
+    name: str
+    version: str
+    checksum: str
+
+
 class ExecutionRead(BaseModel):
     """返回执行卡可直接使用、无需由聊天消息推导的权威状态。"""
 
@@ -176,6 +186,7 @@ class ExecutionRead(BaseModel):
     budget: dict[str, object]
     usage: dict[str, object]
     pending_attention_count: int
+    latest_command: ExecutionCommandRead | None
     parallel_waves: list[ParallelReadWaveSummary]
     input_resources: list[ExecutionInputResourceSummary]
     input_dispatches: list[ExecutionInputDispatchSummary]
@@ -183,6 +194,7 @@ class ExecutionRead(BaseModel):
     artifacts: list[ExecutionArtifactSummary]
     renderer_jobs: list[ExecutionRendererJobSummary]
     operations: list[ExecutionOperationSummary]
+    vertical_abilities: list[ExecutionVerticalAbilitySummary]
     input_binding_count: int
 
 
@@ -414,6 +426,14 @@ def _execution_read(db: Session, instance: SopInstance, current_user: User) -> E
             )
         ).all()
     )
+    latest_command = db.exec(
+        select(ExecutionCommand)
+        .where(
+            ExecutionCommand.tenant_id == instance.tenant_id,
+            ExecutionCommand.execution_id == instance.id,
+        )
+        .order_by(ExecutionCommand.issued_at.desc(), ExecutionCommand.id.desc())
+    ).first()
     parallel_batches = list(
         db.exec(
             select(DynamicReadDispatchBatch)
@@ -612,6 +632,18 @@ def _execution_read(db: Session, instance: SopInstance, current_user: User) -> E
         )
         for row in operation_rows
     ]
+    vertical_abilities = [
+        ExecutionVerticalAbilitySummary(
+            id=str(item.get("id") or ""),
+            name=str(item.get("name") or ""),
+            version=str(item.get("version") or ""),
+            checksum=str(item.get("checksum") or ""),
+        )
+        for item in (instance.capability_snapshot_json or {}).get("vertical_abilities", [])
+        if isinstance(item, dict)
+        and str(item.get("id") or "").strip()
+        and str(item.get("checksum") or "").strip()
+    ]
     input_binding_count = len(
         db.exec(
             select(MessageInputBindingLink.id).where(
@@ -650,6 +682,7 @@ def _execution_read(db: Session, instance: SopInstance, current_user: User) -> E
         budget=dict(instance.budget_snapshot_json or plan.get("budget") or {}),
         usage=dict((instance.context_json or {}).get("dynamic_budget_usage") or {}),
         pending_attention_count=pending_attention_count,
+        latest_command=_command_read(latest_command) if latest_command is not None else None,
         parallel_waves=parallel_waves,
         input_resources=input_resources,
         input_dispatches=input_dispatches,
@@ -657,6 +690,7 @@ def _execution_read(db: Session, instance: SopInstance, current_user: User) -> E
         artifacts=artifacts,
         renderer_jobs=renderer_jobs,
         operations=operations,
+        vertical_abilities=vertical_abilities,
         input_binding_count=input_binding_count,
     )
 
@@ -674,6 +708,7 @@ def _command_read(command: ExecutionCommand) -> ExecutionCommandRead:
         result_plan_revision_id=command.result_plan_revision_id,
         issued_at=command.issued_at.isoformat(),
         consumed_at=command.consumed_at.isoformat() if command.consumed_at else None,
+        updated_at=command.updated_at.isoformat(),
     )
 
 

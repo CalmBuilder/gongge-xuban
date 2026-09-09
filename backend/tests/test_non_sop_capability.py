@@ -3,7 +3,7 @@
 @Author     : zhanglp8181
 @File       : test_non_sop_capability.py
 @CallChain  : pytest → NonSopCapabilityRouter → GeneralSkill/动态任务 shadow 决策
-@Description: 验证 A 批非 SOP 兼容分流、失效降级和脱敏审计契约。
+@Description: 验证非 SOP 兼容分流、失效降级、动态聊天取消传播和脱敏审计契约。
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.core.agent_loop import AgentLoop
+from app.core.cancellation import TurnCancellationRequested
 from app.core.non_sop_capability import (
     LlmDynamicTaskShadowSelector,
     NonSopCapabilityDecision,
@@ -1543,6 +1544,59 @@ def test_dynamic_execution_error_is_failed_before_error_propagates(monkeypatch) 
         ("fail", "DYNAMIC_KNOWLEDGE_NOT_FROZEN"),
     ]
     assert any(args[2] == "dynamic_task_execution_failed" for args in recorded_events)
+
+
+def test_dynamic_cancellation_exception_is_not_recorded_as_execution_failure() -> None:
+    """探索或下层读取抛出的同一个取消异常必须直接传给聊天流，不能写失败事件。"""
+
+    interruption = TurnCancellationRequested("测试读取已取消")
+    failed_executions: list[dict[str, object]] = []
+    events: list[tuple] = []
+
+    def cancel_run(**_kwargs):
+        """模拟 Runtime 已结算取消后抛出的真实取消异常。"""
+
+        raise interruption
+
+    loop = object.__new__(AgentLoop)
+    session = ChatSession(id="cancel_session", tenant_id="tenant_demo", user_id="user_demo")
+    loop.db = SimpleNamespace(commit=lambda: None, get=lambda *_args: session)
+    loop.events = SimpleNamespace(record=lambda *args: events.append(args))
+    runtime = SimpleNamespace(
+        run_until_blocked_or_complete=cancel_run,
+        fail_execution=lambda **kwargs: failed_executions.append(kwargs),
+    )
+    with pytest.raises(TurnCancellationRequested) as caught:
+        loop._run_dynamic_execution(
+            dynamic_agent=runtime,
+            instance=SimpleNamespace(id="cancel_execution", status="cancelled"),
+            model_config=SimpleNamespace(id="fixture_model"),
+            request=ChatTurnRequest(
+                tenant_id="tenant_demo", user_id="user_demo", message="研究公开资料",
+            ),
+            chat_session=session,
+            user_message_id="cancel_message",
+        )
+
+    assert caught.value is interruption
+    assert failed_executions == []
+    assert not any(event[2] == "dynamic_task_execution_failed" for event in events)
+
+
+@pytest.mark.parametrize("status", ["cancelled", "failed", "timed_out"])
+def test_dynamic_terminal_outcome_preserves_cancellation_semantics(status: str) -> None:
+    """只把真实 cancelled 回执交给既有取消协议，不把失败或超时误报为用户取消。"""
+
+    loop = object.__new__(AgentLoop)
+    expected_exception = TurnCancellationRequested if status == "cancelled" else DynamicTaskAgentError
+    with pytest.raises(expected_exception) as caught:
+        loop._dynamic_task_response(
+            chat_session=ChatSession(id="cancel_session", tenant_id="tenant_demo"),
+            outcome=DynamicRunOutcome(status=status, execution_id="cancel_execution"),
+            user_message_id="cancel_message",
+        )
+    if status != "cancelled":
+        assert caught.value.code == "DYNAMIC_TASK_DID_NOT_CLOSE"
 
 
 def test_low_confidence_dynamic_shadow_degrades_to_answer() -> None:

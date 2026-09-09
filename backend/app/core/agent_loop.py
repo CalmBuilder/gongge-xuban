@@ -1,9 +1,9 @@
 """
-@Time       : 2026/08/28 13:20
+@Time       : 2026/09/05
 @Author     : zhanglp8181
 @File       : agent_loop.py
 @CallChain  : Chat API → AgentLoop → Router/Runtime/Tool/ResponseGenerator → Message/Event
-@Description: 编排聊天执行循环，并持久化回复、工具、知识任务、会话状态与审计事件。
+@Description: 编排聊天执行循环，沿统一协议传播取消，并持久化回复、工具、知识与审计事件。
 """
 
 from __future__ import annotations
@@ -38,6 +38,8 @@ from app.core.cancellation import (
     TurnCancellationRequested,
     TurnCancellationToken,
     clear_chat_turn_cancelled,
+    clear_unbound_chat_turn_cancelled,
+    is_unbound_chat_turn_cancelled,
     raise_if_cancelled,
 )
 from app.core.conversation_context import ConversationContextSettings, build_conversation_context
@@ -116,6 +118,12 @@ from app.llm import LLMClient, LLMError
 from app.llm.client import LLMStreamCancelled
 from app.llm.stage_protocol import stage_payload, unified_system_prompt
 from app.observability.spans import llm_operation
+from app.observability.event_log import TurnEventFenceClosed
+from app.observability.turn_event_query import (
+    normalize_turn_identity,
+    partial_turn_events,
+    primary_turn_identity,
+)
 from app.memory.jobs import enqueue_memory_capture
 from app.memory.service import MemoryService, memory_read
 from app.observability import EventLog
@@ -124,6 +132,7 @@ from app.session.attachments import (
     message_images_from_metadata,
 )
 from app.session.helpers import public_session
+from app.session.input_bindings import InputBindingError
 from app.session.session_schema import (
     ChatTurnRequest,
     ChatTurnResponse,
@@ -137,6 +146,7 @@ from app.sop_runtime.execution_control import ExecutionControlService, canonical
 from app.sop_runtime.scheduler import RuntimeAction
 from app.tools import ToolExecutor
 from app.tools.tool_schema import ToolCall, ToolError, ToolResult
+from app.vertical_abilities.resolver import VerticalAbilityResolver, VerticalAbilityResolution
 
 
 logger = logging.getLogger(__name__)
@@ -275,10 +285,21 @@ def _node_as_step(node: dict[str, Any]) -> dict[str, Any]:
 
 
 class AgentLoopPreconditionError(Exception):
-    def __init__(self, code: str, message: str):
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        user_message_id: str | None = None,
+        client_turn_id: str | None = None,
+    ):
+        """保存前置失败及其可用的 Turn 身份，保证错误响应仍可进入同一账本。"""
+
         super().__init__(message)
         self.code = code
         self.message = message
+        self.user_message_id = user_message_id
+        self.client_turn_id = client_turn_id
 
 
 @dataclass
@@ -362,6 +383,72 @@ class AgentLoop:
             data.setdefault("user_message_id", user_message_id)
             data.setdefault("turn_id", user_message_id)
         return data
+
+    @staticmethod
+    def _is_chat_dynamic_waiting_response(
+        request: ChatTurnRequest,
+        response: ChatTurnResponse,
+    ) -> bool:
+        """判断动态任务是否只是聊天 Turn 的等待投影，而非最终成功响应。"""
+
+        router_reason = response.router_decision.reason if response.router_decision else ""
+        return (
+            request.channel != "wecom"
+            and response.step_result is not None
+            and response.step_result.is_step_completed is False
+            and router_reason.startswith("DynamicTaskAgent")
+        )
+
+    def _record_sync_turn_boundary(
+        self,
+        request: ChatTurnRequest,
+        chat_session: ChatSession,
+        *,
+        payload: dict[str, object],
+        user_message_id: str | None,
+        waiting: bool = False,
+    ) -> None:
+        """为同步 Turn 写入唯一成功终态或可继续恢复的等待事实。"""
+
+        if not user_message_id:
+            return
+        events = getattr(self, "events", None)
+        if events is None:
+            return
+        event_payload = self._turn_payload(payload, user_message_id)
+        if request.client_turn_id:
+            event_payload.setdefault("client_turn_id", request.client_turn_id)
+        if waiting:
+            try:
+                events.record(
+                    request.tenant_id,
+                    chat_session.id,
+                    "turn_waiting",
+                    {"status": "waiting", **event_payload},
+                )
+            except TurnEventFenceClosed:
+                # 终态竞争时，另一个执行者已经完成或取消了本轮；等待投影不应
+                # 把这个正常并发结果重新包装成 Agent Loop 错误。
+                return
+            self.db.commit()
+            return
+        record_terminal_once = getattr(events, "record_terminal_once", None)
+        if callable(record_terminal_once):
+            record_terminal_once(
+                request.tenant_id,
+                chat_session.id,
+                "complete",
+                {"status": "completed", **event_payload},
+            )
+        else:
+            # 轻量测试替身或历史调用方没有幂等扩展时仍保持原有事件写接口。
+            events.record(
+                request.tenant_id,
+                chat_session.id,
+                "complete",
+                {"status": "completed", **event_payload},
+            )
+        self.db.commit()
 
     def _hydrate_router_decision_from_context(
         self,
@@ -510,10 +597,21 @@ class AgentLoop:
         chat_session: ChatSession | None = None
         memory_model_config: ModelConfig | None = None
         prepared_user_message_id: str | None = None
+        error_event_payload: dict[str, object] | None = None
         try:
             prepared = self._prepare_turn(request)
             prepared_user_message_id = prepared.user_message_id
             if prepared.general_response:
+                self._record_sync_turn_boundary(
+                    request,
+                    prepared.chat_session,
+                    payload=prepared.general_response.model_dump(mode="json"),
+                    user_message_id=prepared.user_message_id,
+                    waiting=self._is_chat_dynamic_waiting_response(
+                        request,
+                        prepared.general_response,
+                    ),
+                )
                 return prepared.general_response
             chat_session = prepared.chat_session
             memory_model_config = prepared.model_config
@@ -663,42 +761,34 @@ class AgentLoop:
 
         except AgentLoopPreconditionError as exc:
             chat_session = chat_session or self._get_or_create_session(request)
-            return self._finish_with_error(chat_session, exc.code, exc.message)
+            prepared_user_message_id = prepared_user_message_id or exc.user_message_id
+            return self._finish_with_error(
+                chat_session,
+                exc.code,
+                exc.message,
+                user_message_id=prepared_user_message_id,
+                client_turn_id=exc.client_turn_id or request.client_turn_id,
+            )
         except DynamicTaskAgentError as exc:
             error_code = exc.code
             error_message = dynamic_task_failure_message(error_code) or str(exc)
             chat_session = chat_session or self._get_or_create_session(request)
-            self.events.record(
-                request.tenant_id,
-                chat_session.id,
-                "error_occurred",
-                {"code": error_code, "message": error_message},
-            )
+            error_event_payload = {"code": error_code, "message": error_message}
             reply = format_runtime_failure_reply(
-                "DynamicTaskAgent 未执行",
+                "DynamicTaskAgent 未完成",
                 error_message,
                 error_code,
                 dynamic_task_failure_suggestion(error_code),
             )
         except LLMError as exc:
             chat_session = chat_session or self._get_or_create_session(request)
-            self.events.record(
-                request.tenant_id,
-                chat_session.id,
-                "error_occurred",
-                {"code": "LLM_ERROR", "message": str(exc)},
-            )
+            error_event_payload = {"code": "LLM_ERROR", "message": str(exc)}
             reply = format_runtime_failure_reply(
                 "模型调用失败", exc, "LLM_ERROR", model_failure_suggestion(exc)
             )
         except Exception as exc:
             chat_session = chat_session or self._get_or_create_session(request)
-            self.events.record(
-                request.tenant_id,
-                chat_session.id,
-                "error_occurred",
-                {"code": "AGENT_LOOP_ERROR", "message": str(exc)},
-            )
+            error_event_payload = {"code": "AGENT_LOOP_ERROR", "message": str(exc)}
             reply = format_runtime_failure_reply(
                 "Agent Loop 出错",
                 exc,
@@ -715,7 +805,36 @@ class AgentLoop:
             step_result,
             request.message,
             user_message_id=prepared_user_message_id,
+            client_turn_id=request.client_turn_id,
         )
+        if error_event_payload is not None:
+            self.events.record(
+                request.tenant_id,
+                chat_session.id,
+                "error_occurred",
+                self._turn_payload(error_event_payload, prepared_user_message_id),
+            )
+        else:
+            self._record_sync_turn_boundary(
+                request,
+                chat_session,
+                payload={
+                    "reply": reply,
+                    "router_decision": (
+                        router_decision.model_dump(mode="json")
+                        if router_decision is not None
+                        else None
+                    ),
+                    "step_result": step_result.model_dump(mode="json"),
+                    "tool_result": (
+                        tool_result.model_dump(mode="json")
+                        if tool_result is not None
+                        else None
+                    ),
+                    "session_state": public_session(chat_session).model_dump(mode="json"),
+                },
+                user_message_id=prepared_user_message_id,
+            )
         self.db.commit()
         self.db.refresh(chat_session)
         if memory_model_config:
@@ -889,6 +1008,7 @@ class AgentLoop:
             step_result,
             request.message,
             user_message_id=user_message_id,
+            client_turn_id=request.client_turn_id,
         )
         self.db.commit()
         self.db.refresh(chat_session)
@@ -921,8 +1041,9 @@ class AgentLoop:
         conversation_context: dict[str, object],
         user_message_id: str | None,
         is_cancelled: Callable[[], bool] | None = None,
+        streaming: bool = False,
     ) -> ChatTurnResponse:
-        """在回复模型运行前确定性加载指导型 revision，并用 Use 账本闭合本轮。"""
+        """加载指导型 revision 并生成回复；流式调用方可延后最终提交到 canonical complete。"""
 
         if not request.user_id or not chat_session.agent_id or not user_message_id:
             return self._general_skill_load_rejected_response(
@@ -1035,6 +1156,7 @@ class AgentLoop:
                 step_result,
                 request.message,
                 user_message_id=user_message_id,
+                client_turn_id=request.client_turn_id,
             )
         except Exception:
             self.db.rollback()
@@ -1069,9 +1191,21 @@ class AgentLoop:
                     user_message_id,
                 ),
             )
-        self.db.commit()
-        self.db.refresh(chat_session)
-        self._enqueue_memory_capture(request, chat_session, step_result, None, model_config)
+        if streaming:
+            # 流式指导分支由调用方在同一事务中补写 canonical complete；此处只把
+            # assistant、Skill 使用记录和记忆任务留在当前事务，避免终态后再提交。
+            self._enqueue_memory_capture(
+                request,
+                chat_session,
+                step_result,
+                None,
+                model_config,
+                commit=False,
+            )
+        else:
+            self.db.commit()
+            self.db.refresh(chat_session)
+            self._enqueue_memory_capture(request, chat_session, step_result, None, model_config)
         return ChatTurnResponse(
             reply=reply,
             session_id=chat_session.id,
@@ -1118,6 +1252,7 @@ class AgentLoop:
             step_result,
             request.message,
             user_message_id=user_message_id,
+            client_turn_id=request.client_turn_id,
         )
         self.db.commit()
         self.db.refresh(chat_session)
@@ -1155,6 +1290,7 @@ class AgentLoop:
             step_result,
             request.message,
             user_message_id=user_message_id,
+            client_turn_id=request.client_turn_id,
         )
         self.db.commit()
         self.db.refresh(chat_session)
@@ -1389,6 +1525,15 @@ class AgentLoop:
         ):
             if is_cancelled and is_cancelled():
                 return
+            # 该分支的正文已经由指导 Runtime 一次性生成；先投影阶段状态，
+            # 再让同步方法原子写入 assistant 与 complete，避免终态后继续发流事件。
+            yield self._stream_status(
+                chat_session,
+                "responding",
+                "正在依据已审核 Skill 生成回复",
+                {"skill_id": skill.id, "execution_mode": "planning_guidance"},
+                user_message_id=user_message_id,
+            )
             response = self._answer_with_loaded_general_skill(
                 request=request,
                 chat_session=chat_session,
@@ -1401,31 +1546,18 @@ class AgentLoop:
                 conversation_context=conversation_context or {},
                 user_message_id=user_message_id,
                 is_cancelled=is_cancelled,
+                streaming=True,
             )
-            yield self._stream_status(
+            # 这一步既覆盖成功结果，也覆盖指导上下文缺失等已提交的拒绝响应；
+            # 若成功分支已有 complete，record_terminal_once 会保持幂等。
+            self._record_sync_turn_boundary(
+                request,
                 chat_session,
-                "responding",
-                "正在依据已审核 Skill 生成回复",
-                {"skill_id": skill.id, "execution_mode": "planning_guidance"},
+                payload=response.model_dump(mode="json"),
                 user_message_id=user_message_id,
             )
-            for chunk in self.response_generator.chunk_text(response.reply):
-                if is_cancelled and is_cancelled():
-                    raise LLMStreamCancelled("general Skill reply delivery cancelled")
-                yield self._stream_event(
-                    "stream_delta",
-                    chat_session,
-                    self._turn_payload({"content": chunk}, user_message_id),
-                )
-                self._pace_stream()
-            yield self._stream_event(
-                "stream_end", chat_session, self._turn_payload({}, user_message_id)
-            )
-            yield self._stream_event(
-                "complete",
-                chat_session,
-                self._turn_payload(response.model_dump(mode="json"), user_message_id),
-            )
+            # complete 已持久化；聊天 relay 从账本读取最终正文，当前生成器不能
+            # 在成功终态后重复投影普通 stream 事件。
             return
         yield self._stream_status(
             chat_session,
@@ -1588,19 +1720,20 @@ class AgentLoop:
             step_result,
             request.message,
             user_message_id=user_message_id,
+            client_turn_id=request.client_turn_id,
         )
-        self.db.commit()
-        self.db.refresh(chat_session)
         replacement = self._stream_final_reply_replacement(
             chat_session,
             streamed_reply,
             reply,
             user_message_id,
+            commit=False,
         )
-        if replacement is not None:
-            yield replacement
-        yield self._stream_event(
-            "stream_end", chat_session, self._turn_payload({}, user_message_id)
+        stream_end = self._stream_event(
+            "stream_end",
+            chat_session,
+            self._turn_payload({}, user_message_id),
+            commit=False,
         )
         self._enqueue_memory_capture(
             request,
@@ -1608,6 +1741,7 @@ class AgentLoop:
             step_result,
             tool_result,
             model_config,
+            commit=False,
         )
         result = ChatTurnResponse(
             reply=reply,
@@ -1617,11 +1751,16 @@ class AgentLoop:
             tool_result=tool_result,
             session_state=public_session(chat_session),
         )
-        yield self._stream_event(
+        complete = self._stream_event(
             "complete",
             chat_session,
             self._turn_payload(result.model_dump(mode="json"), user_message_id),
+            terminal_once=True,
         )
+        if replacement is not None:
+            yield replacement
+        yield stream_end
+        yield complete
 
     def _stream_continue_pending_after_completion(
         self,
@@ -2058,6 +2197,7 @@ class AgentLoop:
                 final_step_result,
                 final_source_message,
                 user_message_id=user_message_id,
+                client_turn_id=request.client_turn_id,
             )
             turn_finalized = True
             finalized_turn_reply = finalized_reply
@@ -2102,8 +2242,6 @@ class AgentLoop:
             error_message = message if message is not None else str(error)
             reply = format_runtime_failure_reply(title, error_message, code, suggestion)
             payload = exception_payload(code, error_message)
-            self.events.record(request.tenant_id, target_session.id, "error_occurred", payload)
-            self.db.commit()
             yield self._stream_status(
                 target_session,
                 "error",
@@ -2111,7 +2249,6 @@ class AgentLoop:
                 {"code": code, "message": error_message},
                 user_message_id=user_message_id,
             )
-            yield self._stream_event("error_occurred", target_session, payload)
             for chunk in self.response_generator.chunk_text(reply):
                 yield self._stream_event(
                     "stream_delta",
@@ -2121,19 +2258,26 @@ class AgentLoop:
                 self._pace_stream()
             streamed_reply = reply
             reply = finalize_turn_once(target_session, reply, step_result, request.message)
-            self.db.commit()
-            self.db.refresh(target_session)
             replacement = self._stream_final_reply_replacement(
                 target_session,
                 streamed_reply,
                 reply,
                 user_message_id,
+                commit=False,
             )
+            stream_end = self._stream_event(
+                "stream_end",
+                target_session,
+                self._turn_payload({}, user_message_id),
+                commit=False,
+            )
+            # error_occurred 是本轮唯一业务终态，必须最后写入；否则 relay 会在
+            # 错误事件处提前结束，遗漏完整错误正文和 assistant_message_created。
+            error_event = self._stream_event("error_occurred", target_session, payload)
             if replacement is not None:
                 yield replacement
-            yield self._stream_event(
-                "stream_end", target_session, self._turn_payload({}, user_message_id)
-            )
+            yield stream_end
+            yield error_event
 
         try:
             chat_session = self._get_or_create_session(request)
@@ -2152,7 +2296,6 @@ class AgentLoop:
                 request.message,
                 metadata=self._user_message_metadata(request),
             )
-            self._bind_user_message_inputs(request, chat_session, user_message)
             user_message_id = user_message.id
             cancel_probe_state: dict[str, float | bool] = {
                 "checked_at": 0.0,
@@ -2212,6 +2355,9 @@ class AgentLoop:
                     "user_id": request.user_id,
                 },
             )
+            self.db.commit()
+            self.db.refresh(chat_session)
+            self.db.refresh(user_message)
             yield self._stream_event(
                 "user_message_received",
                 chat_session,
@@ -2226,12 +2372,40 @@ class AgentLoop:
                     user_message.id,
                 ),
             )
+            try:
+                self._bind_user_message_inputs(request, chat_session, user_message)
+            except InputBindingError as exc:
+                raise AgentLoopPreconditionError(
+                    exc.code,
+                    str(exc),
+                    user_message_id=user_message.id,
+                    client_turn_id=request.client_turn_id,
+                ) from exc
             self.db.commit()
             self.db.refresh(chat_session)
             self.db.refresh(user_message)
-            model_config = self._get_request_model(request, chat_session.agent_id)
+            if is_unbound_chat_turn_cancelled(str(request.client_turn_id or "").strip()):
+                # relay 在会话/用户事件尚未 ready 时可能已经超时；现在已有稳定
+                # server turn 后立即把预登记取消转换为持久终态，不进入模型或工具阶段。
+                if mark_current_turn_cancelled():
+                    clear_unbound_chat_turn_cancelled(str(request.client_turn_id or "").strip())
+                    return
+            try:
+                model_config = self._get_request_model(request, chat_session.agent_id)
+            except AgentLoopPreconditionError as exc:
+                raise AgentLoopPreconditionError(
+                    exc.code,
+                    exc.message,
+                    user_message_id=user_message.id,
+                    client_turn_id=request.client_turn_id,
+                ) from exc
             if not model_config:
-                raise AgentLoopPreconditionError("missing_model_config", "没有默认模型配置。")
+                raise AgentLoopPreconditionError(
+                    "missing_model_config",
+                    "没有默认模型配置。",
+                    user_message_id=user_message.id,
+                    client_turn_id=request.client_turn_id,
+                )
             memory_model_config = model_config
             skills = self._list_published_skills(request.tenant_id, chat_session.agent_id)
             tools = self._tools_with_general_skills(
@@ -2305,10 +2479,19 @@ class AgentLoop:
                 )
                 self._raise_if_active_turn_cancelled()
                 if dynamic_response is not None:
+                    dynamic_waiting = self._is_chat_dynamic_waiting_response(
+                        request,
+                        dynamic_response,
+                    )
+                    if not dynamic_waiting:
+                        # DynamicTaskAgent 成功时已在 complete_with_result_proposal
+                        # 中把最终消息与 canonical complete 原子提交；relay 会从
+                        # 账本读取该结果，不能在终态后再次追加普通流事件。
+                        return
                     yield self._stream_status(
                         chat_session,
-                        "completed",
-                        "动态任务已完成",
+                        "waiting" if dynamic_waiting else "completed",
+                        "动态任务已暂停，等待继续" if dynamic_waiting else "动态任务已完成",
                         {"execution_mode": "dynamic_task"},
                         user_message_id,
                     )
@@ -2325,11 +2508,12 @@ class AgentLoop:
                         self._turn_payload({}, user_message_id),
                     )
                     yield self._stream_event(
-                        "complete",
+                        "turn_waiting" if dynamic_waiting else "complete",
                         chat_session,
                         self._turn_payload(
                             dynamic_response.model_dump(mode="json"), user_message_id
                         ),
+                        terminal_once=not dynamic_waiting,
                     )
                     return
                 capability = (
@@ -2424,18 +2608,18 @@ class AgentLoop:
                     return
                 streamed_reply = reply
                 reply = finalize_turn_once(chat_session, reply, step_result, request.message)
-                self.db.commit()
-                self.db.refresh(chat_session)
                 replacement = self._stream_final_reply_replacement(
                     chat_session,
                     streamed_reply,
                     reply,
                     user_message_id,
+                    commit=False,
                 )
-                if replacement is not None:
-                    yield replacement
-                yield self._stream_event(
-                    "stream_end", chat_session, self._turn_payload({}, user_message_id)
+                stream_end = self._stream_event(
+                    "stream_end",
+                    chat_session,
+                    self._turn_payload({}, user_message_id),
+                    commit=False,
                 )
                 result = ChatTurnResponse(
                     reply=reply,
@@ -2444,11 +2628,16 @@ class AgentLoop:
                     step_result=step_result,
                     session_state=public_session(chat_session),
                 )
-                yield self._stream_event(
+                complete = self._stream_event(
                     "complete",
                     chat_session,
                     self._turn_payload(result.model_dump(mode="json"), user_message_id),
+                    terminal_once=True,
                 )
+                if replacement is not None:
+                    yield replacement
+                yield stream_end
+                yield complete
                 return
             self._finish_stale_completed_skill(request.tenant_id, chat_session, skills)
             conversation_context = self._conversation_context(chat_session, model_config=model_config)
@@ -2499,10 +2688,18 @@ class AgentLoop:
                 )
                 self._raise_if_active_turn_cancelled()
                 if dynamic_response is not None:
+                    dynamic_waiting = self._is_chat_dynamic_waiting_response(
+                        request,
+                        dynamic_response,
+                    )
+                    if not dynamic_waiting:
+                        # 成功结果已经由 DynamicTaskAgent 原子闭合；这里仅保留
+                        # waiting 投影，避免终态后的迟到 stream 事件触发栅栏。
+                        return
                     yield self._stream_status(
                         chat_session,
-                        "completed",
-                        "动态任务已完成",
+                        "waiting" if dynamic_waiting else "completed",
+                        "动态任务已暂停，等待继续" if dynamic_waiting else "动态任务已完成",
                         {"execution_mode": "dynamic_task"},
                         user_message_id,
                     )
@@ -2517,11 +2714,12 @@ class AgentLoop:
                         "stream_end", chat_session, self._turn_payload({}, user_message_id)
                     )
                     yield self._stream_event(
-                        "complete",
+                        "turn_waiting" if dynamic_waiting else "complete",
                         chat_session,
                         self._turn_payload(
                             dynamic_response.model_dump(mode="json"), user_message_id
                         ),
+                        terminal_once=not dynamic_waiting,
                     )
                     return
 
@@ -2598,10 +2796,18 @@ class AgentLoop:
                 )
                 self._raise_if_active_turn_cancelled()
                 if dynamic_response is not None:
+                    dynamic_waiting = self._is_chat_dynamic_waiting_response(
+                        request,
+                        dynamic_response,
+                    )
+                    if not dynamic_waiting:
+                        # 成功结果已经由 DynamicTaskAgent 原子闭合；relay 直接读取
+                        # 已提交的 complete，不再写第二套流式终态。
+                        return
                     yield self._stream_status(
                         chat_session,
-                        "completed",
-                        "动态任务已完成",
+                        "waiting" if dynamic_waiting else "completed",
+                        "动态任务已暂停，等待继续" if dynamic_waiting else "动态任务已完成",
                         {"execution_mode": "dynamic_task"},
                         user_message_id,
                     )
@@ -2616,11 +2822,12 @@ class AgentLoop:
                         "stream_end", chat_session, self._turn_payload({}, user_message_id)
                     )
                     yield self._stream_event(
-                        "complete",
+                        "turn_waiting" if dynamic_waiting else "complete",
                         chat_session,
                         self._turn_payload(
                             dynamic_response.model_dump(mode="json"), user_message_id
                         ),
+                        terminal_once=not dynamic_waiting,
                     )
                     return
                 capability = (
@@ -2724,18 +2931,18 @@ class AgentLoop:
                     self._pace_stream()
                 streamed_reply = reply
                 reply = finalize_turn_once(chat_session, reply, step_result, request.message)
-                self.db.commit()
-                self.db.refresh(chat_session)
                 replacement = self._stream_final_reply_replacement(
                     chat_session,
                     streamed_reply,
                     reply,
                     user_message_id,
+                    commit=False,
                 )
-                if replacement is not None:
-                    yield replacement
-                yield self._stream_event(
-                    "stream_end", chat_session, self._turn_payload({}, user_message_id)
+                stream_end = self._stream_event(
+                    "stream_end",
+                    chat_session,
+                    self._turn_payload({}, user_message_id),
+                    commit=False,
                 )
                 result = ChatTurnResponse(
                     reply=reply,
@@ -2745,11 +2952,16 @@ class AgentLoop:
                     tool_result=tool_result,
                     session_state=public_session(chat_session),
                 )
-                yield self._stream_event(
+                complete = self._stream_event(
                     "complete",
                     chat_session,
                     self._turn_payload(result.model_dump(mode="json"), user_message_id),
+                    terminal_once=True,
                 )
+                if replacement is not None:
+                    yield replacement
+                yield stream_end
+                yield complete
                 return
             yield self._stream_event(
                 "skill_state",
@@ -3062,6 +3274,11 @@ class AgentLoop:
         except LLMStreamCancelled:
             record_current_turn_cancelled(request.client_turn_id)
             return
+        except TurnEventFenceClosed:
+            # 取消、错误或成功终态已由另一个事务闭合；当前 worker 的迟到事件
+            # 不再转换成第二个错误/取消事实。
+            self.db.rollback()
+            return
         except AgentLoopPreconditionError as exc:
             yield from stream_failure_response(
                 "系统配置错误",
@@ -3104,19 +3321,18 @@ class AgentLoop:
                 return
             streamed_reply = reply
             reply = finalize_turn_once(chat_session, reply, step_result, request.message)
-            self.db.commit()
-            turn_commit_completed = True
-            self.db.refresh(chat_session)
             replacement = self._stream_final_reply_replacement(
                 chat_session,
                 streamed_reply,
                 reply,
                 user_message_id,
+                commit=False,
             )
-            if replacement is not None:
-                yield replacement
-            yield self._stream_event(
-                "stream_end", chat_session, self._turn_payload({}, user_message_id)
+            stream_end = self._stream_event(
+                "stream_end",
+                chat_session,
+                self._turn_payload({}, user_message_id),
+                commit=False,
             )
             if memory_model_config:
                 self._enqueue_memory_capture(
@@ -3125,6 +3341,7 @@ class AgentLoop:
                     step_result,
                     tool_result,
                     memory_model_config,
+                    commit=False,
                 )
             result = ChatTurnResponse(
                 reply=reply,
@@ -3134,11 +3351,21 @@ class AgentLoop:
                 tool_result=tool_result,
                 session_state=public_session(chat_session),
             )
-            yield self._stream_event(
+            complete = self._stream_event(
                 "complete",
                 chat_session,
                 self._turn_payload(result.model_dump(mode="json"), user_message_id),
+                terminal_once=True,
             )
+            turn_commit_completed = True
+            if replacement is not None:
+                yield replacement
+            yield stream_end
+            yield complete
+        except TurnEventFenceClosed:
+            # 终态竞争只需要放弃当前迟到投影，不能再次进入错误回复分支。
+            self.db.rollback()
+            return
         except Exception as exc:
             if not turn_commit_completed:
                 turn_finalized = False
@@ -3180,8 +3407,16 @@ class AgentLoop:
         kind: str,
         chat_session: ChatSession,
         payload: dict[str, object],
+        *,
+        terminal_once: bool = False,
+        commit: bool = True,
     ) -> dict[str, object]:
-        """投影单个 SSE 事件，并以持久取消事实阻断迟到正文与序号回退。"""
+        """投影单个 SSE 事件，并以持久取消事实阻断迟到正文与序号回退。
+
+        ``terminal_once`` 只用于已经由领域 Runtime 可能提前写入的成功终态；已有
+        ``complete`` 时允许幂等投影，但若错误/取消/中断先胜出则立即停止成功帧。
+        ``commit=False`` 供最终消息、stream_end 与终态在同一个短事务中提交。
+        """
 
         persisted_stream_events = {
             "agent_loop_completed",
@@ -3196,6 +3431,9 @@ class AgentLoop:
             "stream_replace",
             "stream_end",
             "tool_result",
+            "error_occurred",
+            "complete",
+            "turn_waiting",
         }
         if kind in persisted_stream_events and (
             payload.get("turn_id") or payload.get("user_message_id")
@@ -3265,8 +3503,33 @@ class AgentLoop:
         if kind in persisted_stream_events and (
             payload.get("turn_id") or payload.get("user_message_id")
         ):
-            self.events.record(chat_session.tenant_id, chat_session.id, kind, payload)
-            self.db.commit()
+            record_terminal_once = getattr(self.events, "record_terminal_once", None)
+            if terminal_once and kind == "complete" and callable(record_terminal_once):
+                terminal_written = record_terminal_once(
+                    chat_session.tenant_id,
+                    chat_session.id,
+                    kind,
+                    payload,
+                )
+                if not terminal_written:
+                    terminal_types_reader = getattr(self.events, "terminal_event_types", None)
+                    existing_terminal_types = (
+                        terminal_types_reader(
+                            chat_session.tenant_id,
+                            chat_session.id,
+                            payload,
+                        )
+                        if callable(terminal_types_reader)
+                        else set()
+                    )
+                    if existing_terminal_types != {"complete"}:
+                        raise TurnEventFenceClosed(
+                            "a non-success terminal already won this streamed Turn"
+                        )
+            else:
+                self.events.record(chat_session.tenant_id, chat_session.id, kind, payload)
+            if commit:
+                self.db.commit()
         data = {
             "kind": kind,
             "sessionId": chat_session.id,
@@ -3282,6 +3545,8 @@ class AgentLoop:
         streamed_reply: str,
         finalized_reply: str,
         user_message_id: str | None,
+        *,
+        commit: bool = True,
     ) -> dict[str, object] | None:
         """当持久化规范化改变文本时，发送一次最终替换事件统一客户端内容。"""
 
@@ -3294,6 +3559,7 @@ class AgentLoop:
                 {"content": finalized_reply},
                 user_message_id,
             ),
+            commit=commit,
         )
 
     def _pace_stream(self) -> None:
@@ -3317,7 +3583,6 @@ class AgentLoop:
             request.message,
             metadata=self._user_message_metadata(request),
         )
-        self._bind_user_message_inputs(request, chat_session, user_message)
         bind_event_turn = getattr(self.events, "bind_turn", None)
         if callable(bind_event_turn):
             bind_event_turn(user_message.id, request.client_turn_id)
@@ -3333,8 +3598,25 @@ class AgentLoop:
                 "user_id": request.user_id,
             },
         )
+        try:
+            self._bind_user_message_inputs(request, chat_session, user_message)
+        except InputBindingError as exc:
+            raise AgentLoopPreconditionError(
+                exc.code,
+                str(exc),
+                user_message_id=user_message.id,
+                client_turn_id=request.client_turn_id,
+            ) from exc
 
-        model_config = self._get_request_model(request, chat_session.agent_id)
+        try:
+            model_config = self._get_request_model(request, chat_session.agent_id)
+        except AgentLoopPreconditionError as exc:
+            raise AgentLoopPreconditionError(
+                exc.code,
+                exc.message,
+                user_message_id=user_message.id,
+                client_turn_id=request.client_turn_id,
+            ) from exc
         skills = self._list_published_skills(request.tenant_id, chat_session.agent_id)
         tools = self._tools_with_general_skills(
             request.tenant_id,
@@ -3342,7 +3624,12 @@ class AgentLoop:
             chat_session.agent_id,
         )
         if not model_config:
-            raise AgentLoopPreconditionError("missing_model_config", "没有默认模型配置。")
+            raise AgentLoopPreconditionError(
+                "missing_model_config",
+                "没有默认模型配置。",
+                user_message_id=user_message.id,
+                client_turn_id=request.client_turn_id,
+            )
         self._drop_unavailable_skill_state(request.tenant_id, chat_session, skills)
         memory_context = [
             memory_read(row)
@@ -8180,7 +8467,7 @@ class AgentLoop:
         """判断对话页选择的 DynamicTaskAgent 是否可以接管本轮新任务。"""
 
         return (
-            request.execution_engine == "dynamic_task"
+            (request.execution_engine == "dynamic_task" or bool(request.ability_ids))
             and not cls._has_active_sop_state(chat_session)
         )
 
@@ -8197,14 +8484,32 @@ class AgentLoop:
         """按自动路由、明确请求或页面选择委托 DynamicTaskAgent 完整执行。"""
 
         if (
-            request.execution_engine == "dynamic_task"
+            (request.execution_engine == "dynamic_task" or bool(request.ability_ids))
             and self._has_active_sop_state(chat_session)
         ):
             # 对话页选择只影响新的非 SOP 任务；活动 SOP 的游标、等待项和
             # 人机协作状态必须由正式 Runtime 继续，禁止并行创建 Dynamic Execution。
             return None
         decision = route.effective_decision
-        if self._dynamic_task_engine_can_override_sop(request, chat_session):
+        vertical_ability_resolution: VerticalAbilityResolution | None = None
+        if request.ability_ids:
+            try:
+                vertical_ability_resolution = VerticalAbilityResolver().resolve(
+                    request.ability_ids,
+                    tenant_id=request.tenant_id,
+                    agent_id=chat_session.agent_id or request.agent_id or "",
+                )
+            except KeyError as exc:
+                raise DynamicTaskAgentError("VERTICAL_ABILITY_NOT_AVAILABLE") from exc
+            decision = NonSopCapabilityDecision(
+                mode="dynamic_task",
+                goal=request.message.strip(),
+                success_criteria=["按所选垂直能力包完成检索、核验并形成可追溯结果"],
+                requires_durable_execution=True,
+                confidence=1.0,
+                reason="用户在对话页选择了平台内置垂直能力包。",
+            )
+        if request.execution_engine == "dynamic_task" and not request.ability_ids:
             decision = NonSopCapabilityDecision(
                 mode="dynamic_task",
                 goal=request.message.strip(),
@@ -8311,7 +8616,23 @@ class AgentLoop:
             if requires_dynamic_contract:
                 raise DynamicTaskAgentError(denial_code)
             return None
-        dynamic_agent = DynamicTaskAgent(self.db)
+        cancellation = self._active_turn_cancel_callback()
+        dynamic_agent = (
+            DynamicTaskAgent(self.db, is_cancelled=cancellation)
+            if cancellation is not None
+            else DynamicTaskAgent(self.db)
+        )
+        bind_dynamic_turn = getattr(dynamic_agent, "bind_turn", None)
+        if callable(bind_dynamic_turn):
+            bind_dynamic_turn(user_message_id, request.client_turn_id)
+        else:
+            legacy_bind_dynamic_turn = getattr(
+                getattr(dynamic_agent, "events", None),
+                "bind_turn",
+                None,
+            )
+            if callable(legacy_bind_dynamic_turn):
+                legacy_bind_dynamic_turn(user_message_id, request.client_turn_id)
         quota_limits = getattr(self, "_dynamic_task_quota_limits", None)
         dynamic_agent.quota_limits = quota_limits
         source_kind, source_ref = self._dynamic_task_source(
@@ -8356,25 +8677,30 @@ class AgentLoop:
                 worker_id=f"chat-resume:{user_message_id}",
             )
             if resumed_outcome is not None:
-                self.events.record(
-                    request.tenant_id,
-                    chat_session.id,
-                    "dynamic_task_resumed",
-                    self._turn_payload(
-                        {
-                            "execution_id": resumed_outcome.execution_id,
-                            "execution_created": False,
-                            "execution_status": resumed_outcome.status,
-                            "requested_execution_engine": request.execution_engine,
-                        },
-                        user_message_id,
-                    ),
-                )
-                self.db.commit()
+                if resumed_outcome.status != "succeeded":
+                    # 成功恢复已经由 DynamicTaskAgent 原子写入 complete；其后
+                    # 不能再追加普通审计事件。等待/取消/失败仍需保留恢复投影，
+                    # 供聊天回放识别本轮确实接管了既有 Execution。
+                    self.events.record(
+                        request.tenant_id,
+                        chat_session.id,
+                        "dynamic_task_resumed",
+                        self._turn_payload(
+                            {
+                                "execution_id": resumed_outcome.execution_id,
+                                "execution_created": False,
+                                "execution_status": resumed_outcome.status,
+                                "requested_execution_engine": request.execution_engine,
+                            },
+                            user_message_id,
+                        ),
+                    )
+                    self.db.commit()
                 return self._dynamic_task_response(
                     chat_session=chat_session,
                     outcome=resumed_outcome,
                     user_message_id=user_message_id,
+                    client_turn_id=request.client_turn_id,
                 )
         if source_kind == "chat":
             active_lookup = getattr(getattr(dynamic_agent, "store", None), "active_instance", None)
@@ -8416,6 +8742,7 @@ class AgentLoop:
                         blocking_step_key=blocking_step_key,
                     ),
                     user_message_id=user_message_id,
+                    client_turn_id=request.client_turn_id,
                 )
         continue_chat_turn = getattr(dynamic_agent, "continue_chat_turn", None)
         if source_kind == "chat" and callable(continue_chat_turn):
@@ -8450,6 +8777,7 @@ class AgentLoop:
                         if request.channel == "web"
                         else ()
                     ),
+                    vertical_ability_resolution=vertical_ability_resolution,
                     memory_context=memory_context,
                     conversation_context=conversation_context,
                 )
@@ -8513,6 +8841,7 @@ class AgentLoop:
                     chat_session=chat_session,
                     outcome=outcome,
                     user_message_id=user_message_id,
+                    client_turn_id=request.client_turn_id,
                 )
         try:
             instance, created = dynamic_agent.start_task(
@@ -8545,6 +8874,7 @@ class AgentLoop:
                     if request.channel == "web"
                     else ()
                 ),
+                vertical_ability_resolution=vertical_ability_resolution,
                 memory_context=memory_context,
                 conversation_context=conversation_context,
             )
@@ -8596,6 +8926,7 @@ class AgentLoop:
                 execution_id=instance.id,
                 blocking_step_key="scheduled_start",
                 user_message_id=user_message_id,
+                client_turn_id=request.client_turn_id,
             )
             self.events.record(
                 request.tenant_id,
@@ -8655,6 +8986,7 @@ class AgentLoop:
             chat_session=chat_session,
             outcome=outcome,
             user_message_id=user_message_id,
+            client_turn_id=request.client_turn_id,
         )
 
     def _run_dynamic_execution(
@@ -8667,7 +8999,7 @@ class AgentLoop:
         chat_session: ChatSession,
         user_message_id: str,
     ) -> DynamicRunOutcome:
-        """运行已创建或已续接的 Dynamic Execution，并统一处理容量与失败收敛。"""
+        """运行动态任务并收敛容量与失败；真实取消原样交给外层聊天取消协议。"""
 
         try:
             self.events.record(
@@ -8691,6 +9023,10 @@ class AgentLoop:
                 actor_user_id=request.user_id,
                 user_message_id=user_message_id,
             )
+        except TurnCancellationRequested:
+            # Runtime 已取消在途 Operation；外层负责幂等记录 stream_cancelled 和部分回复。
+            # 不能再调用 fail_execution 或记录 dynamic_task_execution_failed。
+            raise
         except DynamicTaskQuotaError as exc:
             control = ExecutionControlService(self.db, dynamic_agent.store)
             signal = control.enqueue_signal(
@@ -8892,6 +9228,7 @@ class AgentLoop:
         execution_id: str,
         blocking_step_key: str,
         user_message_id: str,
+        client_turn_id: str | None = None,
     ) -> Message:
         """幂等投影动态任务等待状态，使聊天回放与 Attention 恢复指向同一 Execution。"""
 
@@ -8914,19 +9251,22 @@ class AgentLoop:
                 return message
 
         content = self._dynamic_waiting_content(blocking_step_key)
+        message_metadata: dict[str, object] = {
+            "message_kind": "dynamic_task_status",
+            "execution_id": execution_id,
+            "execution_status": "waiting",
+            "blocking_step_key": blocking_step_key,
+            "turn_id": user_message_id,
+            "user_message_id": user_message_id,
+        }
+        if client_turn_id:
+            message_metadata["client_turn_id"] = client_turn_id
         message = self._append_message(
             chat_session.tenant_id,
             chat_session.id,
             "assistant",
             content,
-            metadata={
-                "message_kind": "dynamic_task_status",
-                "execution_id": execution_id,
-                "execution_status": "waiting",
-                "blocking_step_key": blocking_step_key,
-                "turn_id": user_message_id,
-                "user_message_id": user_message_id,
-            },
+            metadata=message_metadata,
         )
         self.db.flush()
         chat_session.status = "active"
@@ -8946,6 +9286,7 @@ class AgentLoop:
                 "blocking_step_key": blocking_step_key,
                 "turn_id": user_message_id,
                 "user_message_id": user_message_id,
+                "client_turn_id": client_turn_id,
             },
         )
         return message
@@ -8956,15 +9297,19 @@ class AgentLoop:
         chat_session: ChatSession,
         outcome: DynamicRunOutcome,
         user_message_id: str,
+        client_turn_id: str | None = None,
     ) -> ChatTurnResponse:
-        """将动态任务的等待或完成结果投影为统一聊天响应。"""
+        """投影等待与完成结果；将已落账的取消终态交回既有 Turn 取消协议。"""
 
-        if outcome.status == "waiting" and outcome.blocking_step_key:
+        if outcome.status == "cancelled":
+            raise TurnCancellationRequested("当前动态任务已取消。")
+        if outcome.status in {"waiting", "blocked"} and outcome.blocking_step_key:
             waiting_message = self._persist_dynamic_waiting_message(
                 chat_session=chat_session,
                 execution_id=outcome.execution_id,
                 blocking_step_key=outcome.blocking_step_key,
                 user_message_id=user_message_id,
+                client_turn_id=client_turn_id,
             )
             self.db.commit()
             self.db.refresh(chat_session)
@@ -9588,25 +9933,16 @@ class AgentLoop:
     def _persisted_turn_delta_parts(
         self, tenant_id: str, session_id: str, turn_id: str
     ) -> list[str]:
-        """按持久顺序返回指定 Turn 已发送的正文 chunk，忽略其他 Turn 和空块。"""
+        """按持久顺序查询并返回指定 Turn 的正文 chunk，忽略其他 Turn 和空块。"""
 
-        events = self.db.exec(
-            select(AgentEvent)
-            .where(
-                AgentEvent.tenant_id == tenant_id,
-                AgentEvent.session_id == session_id,
-                AgentEvent.event_type == "stream_delta",
-            )
-            .order_by(AgentEvent.created_at, AgentEvent.id)
-        ).all()
+        normalized_turn_id = normalize_turn_identity(turn_id)
+        events = partial_turn_events(self.db, tenant_id, session_id, normalized_turn_id)
         parts: list[str] = []
         for event in events:
             payload = event.payload_json or {}
-            event_turn_id = str(
-                payload.get("turn_id") or payload.get("user_message_id") or ""
-            ).strip()
+            event_turn_id = primary_turn_identity(event)
             content = str(payload.get("content") or "")
-            if event_turn_id == turn_id and content:
+            if event_turn_id == normalized_turn_id and content:
                 parts.append(content)
         return parts
 
@@ -9629,6 +9965,8 @@ class AgentLoop:
             metadata["forced_general_skill_id"] = request.forced_general_skill_id
         if request.forced_general_skill_ids:
             metadata["forced_general_skill_ids"] = list(request.forced_general_skill_ids)
+        if request.ability_ids:
+            metadata["ability_ids"] = list(dict.fromkeys(request.ability_ids))
         if request.attachments:
             metadata["attachments"] = [item.model_dump(mode="json") for item in request.attachments]
         return metadata
@@ -9842,7 +10180,11 @@ class AgentLoop:
         step_result: StepAgentResult,
         tool_result: ToolResult | None,
         model_config: ModelConfig,
+        *,
+        commit: bool = True,
     ) -> list[dict[str, object]]:
+        """登记记忆捕获异步任务；流式终态可将事件留在同一最终事务中提交。"""
+
         try:
             job = enqueue_memory_capture(
                 request,
@@ -9865,25 +10207,43 @@ class AgentLoop:
             "async_job_enqueued",
             {"job_id": job.id, "job_name": job.name, "feature": "memory"},
         )
-        self.db.commit()
+        if commit:
+            self.db.commit()
         return [{"job_id": job.id, "job_name": job.name}]
 
     def _finish_with_error(
-        self, chat_session: ChatSession, code: str, message: str
+        self,
+        chat_session: ChatSession,
+        code: str,
+        message: str,
+        *,
+        user_message_id: str | None = None,
+        client_turn_id: str | None = None,
     ) -> ChatTurnResponse:
+        """持久化前置错误及其最终回复，并保留已建立的 Turn 身份。"""
+
         reply = format_runtime_failure_reply(
             "系统配置错误",
             message,
             code,
             "请在管理端补齐配置后重试。",
         )
+        reply = self._finalize_turn(
+            chat_session,
+            chat_session.tenant_id,
+            reply,
+            user_message_id=user_message_id,
+            client_turn_id=client_turn_id,
+        )
         self.events.record(
             chat_session.tenant_id,
             chat_session.id,
             "error_occurred",
-            {"code": code, "message": message},
+            self._turn_payload(
+                {"code": code, "message": message, "client_turn_id": client_turn_id},
+                user_message_id,
+            ),
         )
-        reply = self._finalize_turn(chat_session, chat_session.tenant_id, reply)
         self.db.commit()
         self.db.refresh(chat_session)
         return ChatTurnResponse(
@@ -9900,6 +10260,7 @@ class AgentLoop:
         step_result: StepAgentResult | None = None,
         source_message: str | None = None,
         user_message_id: str | None = None,
+        client_turn_id: str | None = None,
     ) -> str:
         """规范化并持久化唯一最终回复，返回消息与事件实际使用的文本。"""
 
@@ -9938,6 +10299,9 @@ class AgentLoop:
         if user_message_id:
             assistant_metadata.setdefault("user_message_id", user_message_id)
             assistant_metadata.setdefault("turn_id", user_message_id)
+        normalized_client_turn_id = (client_turn_id or "").strip()
+        if normalized_client_turn_id:
+            assistant_metadata.setdefault("client_turn_id", normalized_client_turn_id)
         assistant_message = self._append_message(
             tenant_id,
             chat_session.id,
@@ -9953,6 +10317,8 @@ class AgentLoop:
         if user_message_id:
             event_payload["user_message_id"] = user_message_id
             event_payload["turn_id"] = user_message_id
+        if normalized_client_turn_id:
+            event_payload["client_turn_id"] = normalized_client_turn_id
         if assistant_metadata.get("knowledge_citations"):
             event_payload["knowledge_citations"] = assistant_metadata["knowledge_citations"]
         for metadata_key in (

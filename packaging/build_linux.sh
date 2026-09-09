@@ -21,6 +21,7 @@ fi
 
 TOOLCHAIN="$REPO/packaging/toolchain"
 NODE_VERSION="${NODE_VERSION:-20.19.5}"
+YOUTUBE_NODE_VERSION="${YOUTUBE_NODE_VERSION:-22.14.0}"
 NODE_HOME="$TOOLCHAIN/node-v${NODE_VERSION}-linux-x64"
 NODE_TARBALL="$TOOLCHAIN/node-v${NODE_VERSION}-linux-x64.tar.xz"
 mkdir -p "$TOOLCHAIN"
@@ -108,6 +109,9 @@ rm -rf packaging/out packaging/build
 )
 rm -rf packaging/out/gongge-xuban/runtime
 cp -a "$RUNTIME_DL_ROOT/python" packaging/out/gongge-xuban/runtime
+python3 packaging/fetch_youtube_js_runtime.py \
+  packaging/out/gongge-xuban/runtime/youtube-js/node \
+  --version "$YOUTUBE_NODE_VERSION"
 
 echo "==> [6/8] Building Debian package"
 STAGE="packaging/out/deb"

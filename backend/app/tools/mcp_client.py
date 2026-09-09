@@ -1,9 +1,9 @@
 """
-@Time       : 2026/08/28 11:00
+@Time       : 2026/09/05 18:31
 @Author     : zhanglp8181
 @File       : mcp_client.py
 @CallChain  : Tool API/Agent Loop → MCP Client → builtin/stdio/HTTP/SSE Server
-@Description: 统一 MCP 传输、出网目标校验、JSON-RPC 会话和可取消资源关闭边界。
+@Description: 统一 MCP 传输、出网校验、可取消会话及显式选择的混合回执保真边界。
 """
 
 from __future__ import annotations
@@ -77,12 +77,16 @@ def execute_mcp_tool(
     tool_name: str | None = None,
     allowed_hosts: Iterable[str] | None = None,
     is_cancelled: Callable[[], bool] | None = None,
+    resolver: object | None = None,
+    *,
+    preserve_mixed_content: bool = False,
 ) -> Any:
     """连接 MCP server 并调用单个工具。
 
     config 是「server 连接配置」（transport/url/command/headers 等）。
     tool_name 若显式传入则优先使用，否则回退到 config 里的 tool 字段
     （兼容历史「一个 config 一个 tool」的形态）。
+    preserve_mixed_content 仅供能解析协议对象的调用方启用；普通工具保持原返回类型。
     """
     normalized = dict(config or {})
     transport = normalize_transport(normalized)
@@ -98,16 +102,28 @@ def execute_mcp_tool(
             raise MCPClientError(str(exc)) from exc
     if transport == "stdio":
         return _StdioSession(
-            normalized, timeout_seconds, allowed_hosts=allowed_hosts, is_cancelled=is_cancelled
-        ).call_tool(name, arguments)
+            normalized,
+            timeout_seconds,
+            allowed_hosts=allowed_hosts,
+            is_cancelled=is_cancelled,
+            resolver=resolver,
+        ).call_tool(name, arguments, preserve_mixed_content=preserve_mixed_content)
     if transport in {"http", "streamable_http"}:
         return _HttpSession(
-            normalized, timeout_seconds, allowed_hosts=allowed_hosts, is_cancelled=is_cancelled
-        ).call_tool(name, arguments)
+            normalized,
+            timeout_seconds,
+            allowed_hosts=allowed_hosts,
+            is_cancelled=is_cancelled,
+            resolver=resolver,
+        ).call_tool(name, arguments, preserve_mixed_content=preserve_mixed_content)
     if transport == "sse":
         return _SseSession(
-            normalized, timeout_seconds, allowed_hosts=allowed_hosts, is_cancelled=is_cancelled
-        ).call_tool(name, arguments)
+            normalized,
+            timeout_seconds,
+            allowed_hosts=allowed_hosts,
+            is_cancelled=is_cancelled,
+            resolver=resolver,
+        ).call_tool(name, arguments, preserve_mixed_content=preserve_mixed_content)
     raise MCPClientError(f"不支持的 MCP transport：{transport or '<empty>'}")
 
 
@@ -116,6 +132,7 @@ def list_mcp_tools(
     timeout_seconds: float = 10,
     allowed_hosts: Iterable[str] | None = None,
     is_cancelled: Callable[[], bool] | None = None,
+    resolver: object | None = None,
 ) -> list[dict[str, Any]]:
     """连接 MCP server 并通过 tools/list 发现工具列表。
 
@@ -133,15 +150,27 @@ def list_mcp_tools(
             raise MCPClientError(str(exc)) from exc
     elif transport == "stdio":
         raw = _StdioSession(
-            normalized, timeout_seconds, allowed_hosts=allowed_hosts, is_cancelled=is_cancelled
+            normalized,
+            timeout_seconds,
+            allowed_hosts=allowed_hosts,
+            is_cancelled=is_cancelled,
+            resolver=resolver,
         ).list_tools()
     elif transport in {"http", "streamable_http"}:
         raw = _HttpSession(
-            normalized, timeout_seconds, allowed_hosts=allowed_hosts, is_cancelled=is_cancelled
+            normalized,
+            timeout_seconds,
+            allowed_hosts=allowed_hosts,
+            is_cancelled=is_cancelled,
+            resolver=resolver,
         ).list_tools()
     elif transport == "sse":
         raw = _SseSession(
-            normalized, timeout_seconds, allowed_hosts=allowed_hosts, is_cancelled=is_cancelled
+            normalized,
+            timeout_seconds,
+            allowed_hosts=allowed_hosts,
+            is_cancelled=is_cancelled,
+            resolver=resolver,
         ).list_tools()
     else:
         raise MCPClientError(f"不支持的 MCP transport：{transport or '<empty>'}")
@@ -185,13 +214,23 @@ class _MCPSession:
         *,
         allowed_hosts: Iterable[str] | None = None,
         is_cancelled: Callable[[], bool] | None = None,
+        resolver: object | None = None,
     ) -> None:
         self.config = config
         self.timeout_seconds = timeout_seconds
         self.allowed_hosts = tuple(allowed_hosts or ())
         self.is_cancelled = is_cancelled
+        self.resolver = resolver
 
-    def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+    def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        preserve_mixed_content: bool = False,
+    ) -> Any:
+        """调用工具并按调用方选择提取回执，保持错误与取消的既有优先级。"""
+
         raise_if_cancelled(self.is_cancelled)
         with self:
             self._initialize()
@@ -199,7 +238,7 @@ class _MCPSession:
                 "tools/call",
                 {"name": name, "arguments": arguments},
             )
-            return _extract_tool_result(result)
+            return _extract_tool_result(result, preserve_mixed_content=preserve_mixed_content)
 
     def list_tools(self) -> list[dict[str, Any]]:
         """分页读取完整工具目录，并对恶意或损坏的 cursor 响应快速失败。"""
@@ -278,12 +317,14 @@ class _StdioSession(_MCPSession):
         *,
         allowed_hosts: Iterable[str] | None = None,
         is_cancelled: Callable[[], bool] | None = None,
+        resolver: object | None = None,
     ) -> None:
         super().__init__(
             config,
             timeout_seconds,
             allowed_hosts=allowed_hosts,
             is_cancelled=is_cancelled,
+            resolver=resolver,
         )
         self._proc: subprocess.Popen[str] | None = None
         self._next_id = 0
@@ -364,12 +405,14 @@ class _HttpSession(_MCPSession):
         *,
         allowed_hosts: Iterable[str] | None = None,
         is_cancelled: Callable[[], bool] | None = None,
+        resolver: object | None = None,
     ) -> None:
         super().__init__(
             config,
             timeout_seconds,
             allowed_hosts=allowed_hosts,
             is_cancelled=is_cancelled,
+            resolver=resolver,
         )
         self._client: httpx.Client | None = None
         self._next_id = 0
@@ -460,7 +503,11 @@ class _HttpSession(_MCPSession):
         """校验并固定当前 HTTP MCP JSON-RPC 请求的目标地址。"""
 
         try:
-            return prepare_outbound_request(url, allowed_hosts=self.allowed_hosts)
+            return prepare_outbound_request(
+                url,
+                allowed_hosts=self.allowed_hosts,
+                resolver=self.resolver,
+            )
         except OutboundTargetError as exc:
             raise MCPClientError(str(exc)) from exc
 
@@ -503,12 +550,14 @@ class _SseSession(_MCPSession):
         *,
         allowed_hosts: Iterable[str] | None = None,
         is_cancelled: Callable[[], bool] | None = None,
+        resolver: object | None = None,
     ) -> None:
         super().__init__(
             config,
             timeout_seconds,
             allowed_hosts=allowed_hosts,
             is_cancelled=is_cancelled,
+            resolver=resolver,
         )
         self._client: httpx.Client | None = None
         self._stream_ctx: Any = None
@@ -657,7 +706,11 @@ class _SseSession(_MCPSession):
         """校验并固定 SSE 建连或消息 POST 的动态端点。"""
 
         try:
-            return prepare_outbound_request(url, allowed_hosts=self.allowed_hosts)
+            return prepare_outbound_request(
+                url,
+                allowed_hosts=self.allowed_hosts,
+                resolver=self.resolver,
+            )
         except OutboundTargetError as exc:
             raise MCPClientError(str(exc)) from exc
 
@@ -771,11 +824,22 @@ def _raise_json_rpc_error(payload: dict[str, Any]) -> None:
     raise MCPClientError(message)
 
 
-def _extract_tool_result(result: Any) -> Any:
+def _extract_tool_result(result: Any, *, preserve_mixed_content: bool = False) -> Any:
+    """默认提取结构化结果；显式启用时仅保留含非空文本的混合协议对象。"""
+
     if not isinstance(result, dict):
         return result
     if result.get("isError"):
         raise MCPClientError(_content_text(result.get("content")) or "MCP tool returned isError=true。")
+    # 结构化对象的零值、布尔值和空集合可能是合法业务结果，不能通用地猜测它是否
+    # 有效。由明确支持混合回执的调用方选择保留两个载荷，其他工具仍优先结构化结果。
+    structured = result.get("structuredContent")
+    if structured is None:
+        structured = result.get("structured_content")
+    if structured is not None:
+        if preserve_mixed_content and _content_text(result.get("content")).strip():
+            return result
+        return structured
     content = result.get("content")
     if not isinstance(content, list):
         return result

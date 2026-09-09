@@ -15,7 +15,7 @@ import threading
 import time
 import traceback
 from collections.abc import Callable, Iterator
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
@@ -30,7 +30,12 @@ from app.agents.branching import model_for_agent
 from app.agents.session_snapshot import anchor_chat_session
 from app.core import AgentLoop
 from app.config import get_settings
-from app.core.cancellation import cancel_chat_turn
+from app.core.cancellation import (
+    cancel_chat_turn,
+    cancel_unbound_chat_turn,
+    clear_chat_turn_cancelled,
+    clear_unbound_chat_turn_cancelled,
+)
 from app.db import engine, get_session
 from app.db.models import (
     AgentEvent,
@@ -69,6 +74,20 @@ from app.observability.spans import (
     reset_span_sink,
     set_span_sink,
 )
+from app.observability.event_log import (
+    EventLog,
+    TURN_TERMINAL_EVENT_TYPES,
+    TurnEventFenceClosed,
+    ensure_turn_event_open,
+)
+from app.observability.turn_event_query import (
+    all_turn_events,
+    event_turn_ids,
+    latest_received_event,
+    session_high_watermark,
+    TURN_EVENT_SPAN_TYPES,
+    turn_events_after_cursor,
+)
 from app.security.auth import get_current_user
 from app.security.permissions import can_use_agent_in_chat, is_admin_user
 from app.security.tenant import ensure_tenant
@@ -106,7 +125,11 @@ INTERRUPTED_ASSISTANT_REPLY = "本次响应中断，请重试发送。"
 STREAM_REPLY_CHUNK_SIZE = 96
 STREAM_RELAY_POLL_SECONDS = 0.08
 STREAM_RELAY_HEARTBEAT_SECONDS = 5.0
+# 这是没有活动 Dynamic Execution 时的传输层失联保护，不是 DynamicTaskAgent
+# 的执行时长或累计 token 预算。活动 Execution 的生命周期由其自身 Runtime 收敛。
 STREAM_RELAY_IDLE_TIMEOUT_SECONDS = 660.0
+# worker 已结束后仅等待其最后一个持久事件提交可见；这不是任务执行超时，也不写取消事实。
+STREAM_RELAY_WORKER_SETTLE_SECONDS = 5.0
 STREAM_INTERRUPTED_TRACEBACK_CHAR_LIMIT = 6000
 MAX_CHAT_ATTACHMENT_BYTES = 12 * 1024 * 1024
 MAX_CHAT_ATTACHMENTS = 8
@@ -140,14 +163,10 @@ SESSION_EVENT_TERMINAL_TYPES = {
     "stream_cancelled",
     "stream_interrupted",
 }
-SPAN_EVENT_TYPES = {
-    "llm_call_started",
-    "llm_call_finished",
-    "llm_call_failed",
-    "knowledge_span_started",
-    "knowledge_span_finished",
-    "knowledge_span_failed",
-}
+# assistant_message_created 既可能是等待态的业务投影，也可能是取消/中断后的闭合
+# 消息；它本身不能关闭聊天 Turn，真正的生命周期终态只能来自四类终态事件。
+CHAT_TURN_TERMINAL_EVENT_TYPES = TURN_TERMINAL_EVENT_TYPES
+SPAN_EVENT_TYPES = TURN_EVENT_SPAN_TYPES
 
 
 class AttachmentUploadBindingRequest(BaseModel):
@@ -375,6 +394,8 @@ def _user_message_metadata(request: ChatTurnRequest) -> dict[str, object]:
         metadata["forced_general_skill_id"] = request.forced_general_skill_id
     if request.forced_general_skill_ids:
         metadata["forced_general_skill_ids"] = request.forced_general_skill_ids
+    if request.ability_ids:
+        metadata["ability_ids"] = list(dict.fromkeys(request.ability_ids))
     if request.attachments:
         metadata["attachments"] = [item.model_dump(mode="json") for item in request.attachments]
     return metadata
@@ -798,7 +819,11 @@ def _maybe_handle_scheduled_task_request(
     db: Session,
     request: ChatTurnRequest,
     chat_session: ChatSession,
+    *,
+    include_complete: bool = True,
 ) -> tuple[ChatTurnResponse, ScheduledTaskDraftRead] | None:
+    """持久化定时任务草案，并按同步或流式调用方选择是否写入 Turn 终态。"""
+
     if request.interaction_mode != "scheduled_task" or not request.agent_id:
         return None
     draft = detect_scheduled_task_draft(
@@ -885,6 +910,7 @@ def _maybe_handle_scheduled_task_request(
             "scheduled_task_draft": draft_payload,
             "user_message_id": user_message.id,
             "turn_id": user_message.id,
+            "client_turn_id": request.client_turn_id,
         },
         created_at=assistant_time,
     )
@@ -894,7 +920,12 @@ def _maybe_handle_scheduled_task_request(
             tenant_id=request.tenant_id,
             session_id=chat_session.id,
             event_type="scheduled_task_draft_created",
-            payload_json={**draft_payload, "user_message_id": user_message.id, "turn_id": user_message.id},
+            payload_json={
+                **draft_payload,
+                "user_message_id": user_message.id,
+                "turn_id": user_message.id,
+                "client_turn_id": request.client_turn_id,
+            },
             created_at=event_time,
         )
     )
@@ -908,6 +939,7 @@ def _maybe_handle_scheduled_task_request(
                 "assistant_message_id": assistant_message.id,
                 "user_message_id": user_message.id,
                 "turn_id": user_message.id,
+                "client_turn_id": request.client_turn_id,
                 "reply": reply,
                 "scheduled_task_draft": draft_payload,
             },
@@ -924,6 +956,20 @@ def _maybe_handle_scheduled_task_request(
             created_at=state_time,
         )
     )
+    if include_complete:
+        EventLog(db).record_terminal_once(
+            request.tenant_id,
+            chat_session.id,
+            "complete",
+            {
+                **draft_payload,
+                "reply": reply,
+                "status": "completed",
+                "user_message_id": user_message.id,
+                "turn_id": user_message.id,
+                "client_turn_id": request.client_turn_id,
+            },
+        )
     db.commit()
     db.refresh(chat_session)
     response = ChatTurnResponse(
@@ -1617,6 +1663,35 @@ def chat_turn(
     return response
 
 
+def _ensure_stream_client_turn_id(request: ChatTurnRequest) -> ChatTurnRequest:
+    """为缺少客户端关联号的流式请求生成服务端唯一 Turn 别名。"""
+
+    if request.client_turn_id and request.client_turn_id.strip():
+        return request
+    return request.model_copy(update={"client_turn_id": new_id("server_turn")})
+
+
+def _create_stream_chat_session(
+    db: Session,
+    request: ChatTurnRequest,
+    current_user: User,
+) -> tuple[ChatTurnRequest, ChatSession]:
+    """为新流式 Turn 预先建立可取消会话，避免 worker 尚未 ready 时无持久目标。"""
+
+    agent = _ensure_chat_agent_available(db, request.tenant_id, request.agent_id, current_user)
+    chat_session = ChatSession(
+        id=new_id("session"),
+        tenant_id=request.tenant_id,
+        user_id=current_user.id,
+        agent_id=agent.id,
+    )
+    anchor_chat_session(db, chat_session, agent, origin="direct")
+    db.add(chat_session)
+    db.commit()
+    db.refresh(chat_session)
+    return request.model_copy(update={"session_id": chat_session.id, "agent_id": agent.id}), chat_session
+
+
 @router.post("/stream")
 def chat_stream(
     request: ChatTurnRequest,
@@ -1625,15 +1700,20 @@ def chat_stream(
 ) -> StreamingResponse:
     _ensure_request_tenant(request.tenant_id, current_user)
     request = request.model_copy(update={"user_id": current_user.id})
+    request = _ensure_stream_client_turn_id(request)
     ensure_tenant(db, request.tenant_id)
+    new_session_requested = not bool(request.session_id)
     if request.session_id:
         chat_session = _ensure_chat_session_available(db, request.tenant_id, current_user.id, request.session_id)
         request = _bind_request_to_session_agent(db, request, chat_session, current_user)
     else:
-        _ensure_chat_agent_available(db, request.tenant_id, request.agent_id, current_user)
+        request, chat_session = _create_stream_chat_session(db, request, current_user)
+    # 会话绑定可能返回一个新的请求对象；在所有前置规范化完成后再次确保
+    # client_turn_id 存在，避免公共 API 省略该字段时退回整会话事件扫描。
+    request = _ensure_stream_client_turn_id(request)
     if not request.message.strip() and not request.attachments:
         raise HTTPException(status_code=400, detail="Message cannot be empty")
-    replay = _existing_turn_replay(db, request)
+    replay = _existing_turn_replay_in_snapshot(db, request)
     # 流式响应会在返回后继续使用独立 worker_db。预检阶段的 Agent 可用性查询
     # 采用了行锁，必须在交接 worker 前提交，不能让请求级依赖会话把这把锁
     # 持有到 SSE 结束，否则 worker 会等待自己持有的锁并最终触发 1205。
@@ -1655,7 +1735,9 @@ def chat_stream(
     worker_done = threading.Event()
     source_session_id = {"value": request.session_id or ""}
     worker_terminal = {"seen": False}
+    worker_parked = {"seen": False}
     initial_cursor = _latest_event_cursor(db, request.tenant_id, request.session_id) if request.session_id else None
+    span_turn_id = {"value": ""}
 
     def set_source_session(session_id: str) -> None:
         if not session_id:
@@ -1672,8 +1754,6 @@ def chat_stream(
         title_summary_request: tuple[str, str, str, str | None] | None = None
         try:
             with Session(engine) as worker_db:
-                span_turn_id = {"value": ""}
-
                 def persist_span(event_type: str, payload: dict[str, object]) -> None:
                     """MySQL用独立短事务；SQLite延迟到Turn结束同连接落Span，避免自锁。"""
 
@@ -1728,7 +1808,12 @@ def chat_stream(
                             "stream_status",
                             {"phase": "scheduled_task_parse", "text": "解析执行计划"},
                         )
-                    scheduled_response = _maybe_handle_scheduled_task_request(worker_db, request, chat_session)
+                    scheduled_response = _maybe_handle_scheduled_task_request(
+                        worker_db,
+                        request,
+                        chat_session,
+                        include_complete=False,
+                    )
                     if scheduled_response:
                         response, draft = scheduled_response
                         set_source_session(response.session_id)
@@ -1801,8 +1886,13 @@ def chat_stream(
                     if event_name == "session_created" and item_session_id:
                         _persist_relay_only_event(worker_db, request.tenant_id, item_session_id, event_name, data)
                     elif event_name == "complete" and item_session_id:
-                        _persist_relay_only_event(worker_db, request.tenant_id, item_session_id, event_name, data)
+                        # AgentLoop 已经在同一 worker 事务中持久化唯一 complete；
+                        # relay 只负责读取，避免重复终态事件。
                         worker_terminal["seen"] = True
+                    elif event_name == "turn_waiting" and item_session_id:
+                        # 聊天动态任务把本轮挂起到持久 Execution；不能因生成器自然
+                        # 返回而补写 stream_interrupted，后续恢复结果仍属于原 Turn。
+                        worker_parked["seen"] = True
                     elif event_name in {"stream_cancelled", "stream_interrupted", "error", "error_occurred"}:
                         worker_terminal["seen"] = True
                     if item["event"] == "user_message_received":
@@ -1863,6 +1953,11 @@ def chat_stream(
             # 当前流的提交窗口重叠。
             if title_summary_request:
                 _schedule_session_title_summary(*title_summary_request)
+        except TurnEventFenceClosed:
+            # 取消或其他终态已经由另一个事务闭合；迟到的 relay-only 事件不应再
+            # 触发第二个 interrupted 终态。
+            worker_terminal["seen"] = True
+            set_source_session(source_session_id["value"] or request.session_id or "")
         except Exception as exc:
             logger.exception("chat stream worker failed")
             session_id = source_session_id["value"] or request.session_id or ""
@@ -1910,8 +2005,14 @@ def chat_stream(
         finally:
             if span_sink_token is not None:
                 reset_span_sink(span_sink_token)
+            for turn_id in (
+                str(request.client_turn_id or "").strip(),
+                str(span_turn_id["value"] or "").strip(),
+            ):
+                clear_chat_turn_cancelled(source_session_id["value"] or request.session_id or "", turn_id)
+            clear_unbound_chat_turn_cancelled(str(request.client_turn_id or "").strip())
             session_id = source_session_id["value"] or request.session_id or ""
-            if session_id and not worker_terminal["seen"]:
+            if session_id and not worker_terminal["seen"] and not worker_parked["seen"]:
                 with Session(engine) as final_db:
                     chat_session = final_db.get(ChatSession, session_id)
                     if chat_session:
@@ -1935,41 +2036,189 @@ def chat_stream(
         deadline = time.monotonic() + STREAM_RELAY_IDLE_TIMEOUT_SECONDS
         last_heartbeat_at = time.monotonic()
         terminal_sent = False
+        emitted_event_ids: set[str] = set()
+        relay_target_seen = False
+        relay_overlap_since: datetime | None = None
+        worker_settle_deadline: float | None = None
+        worker_done_dynamic_execution_checked = False
+        worker_done_dynamic_execution: SopInstance | None = None
         while True:
             session_id = source_session_id["value"]
             emitted = False
+            relay_turn_ids: set[str] = set()
             if session_id:
                 with Session(engine) as relay_db:
-                    rows = _events_after_cursor(relay_db, request.tenant_id, session_id, initial_cursor)
+                    relay_turn_ids = {
+                        value
+                        for value in (
+                            str(request.client_turn_id or "").strip(),
+                            str(span_turn_id["value"] or "").strip(),
+                        )
+                        if value
+                    }
+                    if new_session_requested and initial_cursor is None and not relay_target_seen:
+                        # 新建会话首个事件没有 Turn 身份，先完成会话引导事件的交接。
+                        rows = _events_after_cursor(
+                            relay_db,
+                            request.tenant_id,
+                            session_id,
+                            initial_cursor,
+                        )
+                    elif relay_turn_ids:
+                        rows = turn_events_after_cursor(
+                            relay_db,
+                            request.tenant_id,
+                            session_id,
+                            relay_turn_ids,
+                            initial_cursor if relay_target_seen else None,
+                            include_same_timestamp=True,
+                            overlap_since=relay_overlap_since,
+                            exclude_event_ids=emitted_event_ids,
+                        )
+                    else:
+                        # 没有 client/server Turn 身份时保留兼容路径；有身份的正常
+                        # 请求已经在上一个分支进入目标 SQL 条件。
+                        rows = _events_after_cursor(
+                            relay_db,
+                            request.tenant_id,
+                            session_id,
+                            initial_cursor,
+                        )
                 for row in rows:
+                    if row.id in emitted_event_ids:
+                        continue
+                    emitted_event_ids.add(row.id)
+                    if relay_turn_ids and event_turn_ids(row) & relay_turn_ids:
+                        relay_target_seen = True
+                        if relay_overlap_since is None or row.created_at < relay_overlap_since:
+                            relay_overlap_since = row.created_at
                     event_name, data = _relay_event_payload(row)
-                    initial_cursor = (row.created_at, row.id)
+                    next_cursor = (row.created_at, row.id)
+                    if initial_cursor is None or next_cursor > initial_cursor:
+                        initial_cursor = next_cursor
                     emitted = True
+                    if event_name == "complete":
+                        # DynamicTaskAgent 成功时结果与 canonical complete 已在领域
+                        # 事务中落账，AgentLoop 可能不再向 relay 产出内存 complete
+                        # 帧；标题摘要应以同一持久终态为触发条件，不能依赖某个
+                        # 进程内生成器恰好发出事件。
+                        _schedule_session_title_summary(
+                            request.tenant_id,
+                            request.user_id,
+                            session_id,
+                            request.agent_id,
+                        )
                     yield _sse(event_name, data, row.id)
                     if event_name in STREAM_RELAY_TERMINAL_EVENTS:
                         terminal_sent = True
+                        break
+                if terminal_sent:
+                    return
                 if emitted:
                     deadline = time.monotonic() + STREAM_RELAY_IDLE_TIMEOUT_SECONDS
                     last_heartbeat_at = time.monotonic()
-            if terminal_sent and worker_done.is_set() and not emitted:
-                return
-            if worker_done.is_set() and not emitted:
-                return
+                    if not worker_done.is_set():
+                        worker_settle_deadline = None
+            if worker_done.is_set():
+                if not worker_done_dynamic_execution_checked:
+                    worker_done_dynamic_execution_checked = True
+                    if session_id and relay_turn_ids:
+                        with Session(engine) as execution_db:
+                            worker_done_dynamic_execution = _active_dynamic_execution_for_turn(
+                                execution_db,
+                                request.tenant_id,
+                                session_id,
+                                relay_turn_ids,
+                            )
+                if worker_done_dynamic_execution is not None:
+                    # chat worker 可能只负责创建/委派持久 Dynamic Execution，线程虽已
+                    # 结束，真正的 Runtime 仍在后台运行。此时不能进入收敛窗口，更不能
+                    # 把 worker_done 当成任务完成；继续保持 relay 心跳并等待 Execution
+                    # 自己写入 complete/failed/cancelled 终态。
+                    worker_settle_deadline = None
+                else:
+                    # 没有后台 Dynamic Execution 时，worker 的最后一个普通事件可能仍
+                    # 在另一个事务中提交；这里只等待其可见，不产生任何取消事实。
+                    if worker_settle_deadline is None:
+                        worker_settle_deadline = time.monotonic() + STREAM_RELAY_WORKER_SETTLE_SECONDS
+                    if time.monotonic() > worker_settle_deadline:
+                        return
+                    time.sleep(STREAM_RELAY_POLL_SECONDS)
+                    continue
             if time.monotonic() > deadline:
                 if session_id:
-                    with Session(engine) as timeout_db:
-                        chat_session = timeout_db.get(ChatSession, session_id)
-                        if chat_session:
-                            _persist_chat_turn_interrupted(
-                                timeout_db,
+                    active_dynamic_execution = None
+                    if relay_turn_ids:
+                        with Session(engine) as execution_db:
+                            active_dynamic_execution = _active_dynamic_execution_for_turn(
+                                execution_db,
                                 request.tenant_id,
-                                chat_session,
-                                request.client_turn_id or "",
-                                "stream relay timed out waiting for terminal event",
+                                session_id,
+                                relay_turn_ids,
                             )
-                            timeout_db.commit()
-                    continue
-                return
+                    if active_dynamic_execution is not None:
+                        # DynamicTaskAgent 正在执行真实任务时，relay 不能把“暂时没有
+                        # 新聊天事件”解释为用户取消。继续投影心跳，等待 Execution
+                        # 自己完成、失败、等待或被用户显式取消；这也覆盖 chat worker
+                        # 已经结束、但持久 Execution 尚未结束的委派模式。
+                        worker_done_dynamic_execution = active_dynamic_execution
+                        deadline = time.monotonic() + STREAM_RELAY_IDLE_TIMEOUT_SECONDS
+                        last_heartbeat_at = time.monotonic() - STREAM_RELAY_HEARTBEAT_SECONDS
+                    elif worker_done.is_set():
+                        # Execution 已不再活动但终态事件尚未读到：回到短暂的持久事件
+                        # 收敛窗口；窗口结束只关闭 relay，不写 stream_cancelled。
+                        worker_done_dynamic_execution = None
+                        worker_settle_deadline = worker_settle_deadline or (
+                            time.monotonic() + STREAM_RELAY_WORKER_SETTLE_SECONDS
+                        )
+                        if time.monotonic() > worker_settle_deadline:
+                            return
+                        time.sleep(STREAM_RELAY_POLL_SECONDS)
+                        continue
+                    else:
+                        timeout_event: tuple[str, str, dict[str, object]] | None = None
+                        with Session(engine) as timeout_db:
+                            chat_session = timeout_db.get(ChatSession, session_id)
+                            if chat_session:
+                                timeout_event = _persist_stream_relay_timeout(
+                                    timeout_db,
+                                    request.tenant_id,
+                                    chat_session,
+                                    request.client_turn_id or span_turn_id["value"] or "",
+                                    request.user_id or current_user.id,
+                                )
+                        if timeout_event:
+                            event_id, event_name, data = timeout_event
+                            if event_id not in emitted_event_ids:
+                                emitted_event_ids.add(event_id)
+                                yield _sse(event_name, data, event_id)
+                        else:
+                            # worker 还没有写入 user_message_received 时，持久取消无法
+                            # 解析 server turn；先登记无会话取消，worker 建立 Turn 后
+                            # 会把它转换为正常 stream_cancelled 账本事实。
+                            cancel_unbound_chat_turn(request.client_turn_id or "")
+                            yield _sse(
+                                "stream_cancelled",
+                                {
+                                    "phase": "cancelled",
+                                    "text": "已停止生成",
+                                    "client_turn_id": request.client_turn_id or None,
+                                    "sessionId": session_id,
+                                },
+                            )
+                        return
+                else:
+                    cancel_unbound_chat_turn(request.client_turn_id or "")
+                    yield _sse(
+                        "stream_cancelled",
+                        {
+                            "phase": "cancelled",
+                            "text": "已停止生成",
+                            "client_turn_id": request.client_turn_id or None,
+                            "sessionId": session_id,
+                        },
+                    )
+                    return
             now = time.monotonic()
             if now - last_heartbeat_at >= STREAM_RELAY_HEARTBEAT_SECONDS:
                 last_heartbeat_at = now
@@ -2059,6 +2308,83 @@ def _cancel_active_dynamic_execution(
     return True
 
 
+def _active_dynamic_execution_for_turn(
+    db: Session,
+    tenant_id: str,
+    session_id: str,
+    turn_ids: set[str],
+) -> SopInstance | None:
+    """查找仍由当前聊天 Turn 驱动的活动 Dynamic Execution，不改变其状态。"""
+
+    normalized_turn_ids = {value.strip() for value in turn_ids if value and value.strip()}
+    if not normalized_turn_ids:
+        return None
+    return db.exec(
+        select(SopInstance)
+        .where(
+            SopInstance.tenant_id == tenant_id,
+            SopInstance.session_id == session_id,
+            SopInstance.kind == "dynamic_task",
+            SopInstance.source_kind == "chat",
+            SopInstance.source_ref.in_(normalized_turn_ids),
+            SopInstance.status.in_(("created", "running", "waiting")),
+        )
+        .order_by(SopInstance.created_at.desc(), SopInstance.id.desc())
+    ).first()
+
+
+def _persist_stream_relay_timeout(
+    db: Session,
+    tenant_id: str,
+    chat_session: ChatSession,
+    requested_turn_id: str,
+    actor_user_id: str,
+) -> tuple[str, str, dict[str, object]] | None:
+    """把中继超时转换为统一取消终态并通知正在运行的 worker 停止写入。"""
+
+    normalized_turn_id = requested_turn_id.strip()
+    if not normalized_turn_id:
+        return None
+    cancel_chat_turn(chat_session.id, normalized_turn_id)
+    if not _persist_chat_turn_cancelled(db, tenant_id, chat_session, normalized_turn_id):
+        db.rollback()
+        return None
+    message_id, client_turn_id = _resolve_turn_ids_from_events(
+        db, tenant_id, chat_session.id, normalized_turn_id
+    )
+    if message_id:
+        try:
+            _cancel_active_dynamic_execution(db, chat_session, message_id, actor_user_id)
+        except HTTPException as exc:
+            # 取消账本必须先闭合；动态 Execution 控制冲突由其自身状态机继续收敛，
+            # 不能让流式超时再次把 SSE 线程卡在异常路径。
+            logger.warning(
+                "stream relay timeout could not cancel dynamic execution: %s",
+                exc.detail,
+            )
+    db.commit()
+    for turn_id in (message_id, client_turn_id):
+        cancel_chat_turn(chat_session.id, turn_id)
+    event = db.exec(
+        select(AgentEvent)
+        .where(
+            AgentEvent.tenant_id == tenant_id,
+            AgentEvent.session_id == chat_session.id,
+            AgentEvent.event_type == "stream_cancelled",
+        )
+        .order_by(AgentEvent.created_at.desc(), AgentEvent.id.desc())
+    ).all()
+    target_ids = {value for value in (message_id, client_turn_id) if value}
+    event = next(
+        (candidate for candidate in event if event_turn_ids(candidate) & target_ids),
+        None,
+    )
+    if event is None:
+        return None
+    event_name, data = _relay_event_payload(event)
+    return event.id, event_name, data
+
+
 def _persist_chat_turn_cancelled(
     db: Session,
     tenant_id: str,
@@ -2096,7 +2422,7 @@ def _persist_chat_turn_cancelled(
     if client_turn_id:
         turn_ids.add(client_turn_id)
     for event in events:
-        if event.event_type not in {"assistant_message_created", "stream_cancelled"}:
+        if event.event_type not in CHAT_TURN_TERMINAL_EVENT_TYPES:
             continue
         payload = event.payload_json or {}
         event_turn_ids = {
@@ -2408,13 +2734,7 @@ def _turn_has_terminal_event(
         .order_by(AgentEvent.created_at)
     ).all()
     for event in events:
-        if event.event_type not in {
-            "assistant_message_created",
-            "complete",
-            "error_occurred",
-            "stream_cancelled",
-            "stream_interrupted",
-        }:
+        if event.event_type not in CHAT_TURN_TERMINAL_EVENT_TYPES:
             continue
         payload = event.payload_json or {}
         event_turn_ids = {
@@ -2504,14 +2824,20 @@ def _persist_relay_only_event(
     event_type: str,
     payload: dict[str, object],
 ) -> None:
-    db.add(
-        AgentEvent(
-            tenant_id=tenant_id,
-            session_id=session_id,
-            event_type=event_type,
-            payload_json=payload,
+    """只追加需要由 chat relay 负责投影的事件，并遵守 Turn 终态栅栏。"""
+
+    if event_type in TURN_TERMINAL_EVENT_TYPES:
+        EventLog(db).record_terminal_once(tenant_id, session_id, event_type, payload)
+    else:
+        ensure_turn_event_open(db, tenant_id, session_id, event_type, payload)
+        db.add(
+            AgentEvent(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                event_type=event_type,
+                payload_json=payload,
+            )
         )
-    )
     db.commit()
 
 
@@ -2522,6 +2848,7 @@ def _persist_deferred_span_events(
     """在SQLite业务Turn完成后用同一连接批量落观测Span，避免自锁等待和事实丢失。"""
 
     for tenant_id, session_id, event_type, payload in rows:
+        ensure_turn_event_open(db, tenant_id, session_id, event_type, payload)
         db.add(
             AgentEvent(
                 tenant_id=tenant_id,
@@ -2569,31 +2896,44 @@ def _events_after_cursor(
 
 
 def _latest_event_cursor(db: Session, tenant_id: str, session_id: str) -> tuple[object, str] | None:
-    row = db.exec(
-        select(AgentEvent)
-        .where(AgentEvent.tenant_id == tenant_id, AgentEvent.session_id == session_id)
-        .order_by(AgentEvent.created_at.desc(), AgentEvent.id.desc())
-        .limit(1)
-    ).first()
-    if not row:
-        return None
-    return row.created_at, row.id
+    """返回会话最新事件的稳定排序键，不物化事件正文。"""
+
+    return session_high_watermark(db, tenant_id, session_id)
 
 
 def _event_turn_ids(row: AgentEvent) -> set[str]:
     """提取事件可能携带的服务端与客户端 turn 标识，忽略空值。"""
 
-    payload = row.payload_json or {}
-    return {
-        value
-        for value in (
-            str(payload.get("turn_id") or "").strip(),
-            str(payload.get("user_message_id") or "").strip(),
-            str(payload.get("message_id") or "").strip(),
-            str(payload.get("client_turn_id") or "").strip(),
-        )
-        if value
-    }
+    return event_turn_ids(row)
+
+
+def _existing_turn_replay_in_snapshot(
+    db: Session,
+    request: ChatTurnRequest,
+) -> tuple[str, list[AgentEvent], tuple[object, str] | None, bool] | None:
+    """在独立短读快照中执行 replay，避免复用请求级事务和延迟加载事件。"""
+
+    if not request.session_id or not request.client_turn_id:
+        return _existing_turn_replay(db, request)
+    bind = db.get_bind()
+    connection = bind.connect()
+    if connection.dialect.name == "mysql":
+        connection = connection.execution_options(isolation_level="REPEATABLE READ")
+    try:
+        with connection.begin():
+            if connection.dialect.name == "sqlite":
+                # pysqlite 的 legacy transaction mode 不会因纯 SELECT 真正启动
+                # DBAPI 事务；显式 BEGIN 才能让 H 与后续目标查询共享同一 WAL 快照。
+                connection.exec_driver_sql("BEGIN")
+            with Session(bind=connection, expire_on_commit=False) as read_db:
+                replay = _existing_turn_replay(read_db, request)
+                if replay is not None:
+                    # SSE 生成器在读事务结束后才消费这些 ORM 对象；先让所有字段
+                    # 完整加载并脱离短连接，避免 detached/expired 属性访问异常。
+                    read_db.expunge_all()
+                return replay
+    finally:
+        connection.close()
 
 
 def _existing_turn_replay(
@@ -2606,20 +2946,15 @@ def _existing_turn_replay(
     client_turn_id = str(request.client_turn_id or "").strip()
     if not session_id or not client_turn_id:
         return None
-    all_rows = db.exec(
-        select(AgentEvent)
-        .where(AgentEvent.tenant_id == request.tenant_id, AgentEvent.session_id == session_id)
-        .order_by(AgentEvent.created_at, AgentEvent.id)
-    ).all()
-    received = next(
-        (
-            row
-            for row in reversed(all_rows)
-            if row.event_type == "user_message_received"
-            and str((row.payload_json or {}).get("client_turn_id") or "").strip()
-            == client_turn_id
-        ),
-        None,
+    high_watermark = session_high_watermark(db, request.tenant_id, session_id)
+    if high_watermark is None:
+        return None
+    received = latest_received_event(
+        db,
+        request.tenant_id,
+        session_id,
+        client_turn_id,
+        high_watermark,
     )
     if received is None:
         return None
@@ -2646,10 +2981,15 @@ def _existing_turn_replay(
         or str(payload.get("user_id") or request.user_id) != str(request.user_id or "")
         or str(payload.get("channel") or "web") != request.channel
         or str(metadata.get("execution_engine") or "auto") != request.execution_engine
+        or str(metadata.get("model_config_id") or "")
+        != str(request.model_config_id or "")
+        or str(metadata.get("interaction_mode") or "normal") != request.interaction_mode
         or str(metadata.get("forced_general_skill_id") or "")
         != str(request.forced_general_skill_id or "")
         or list(metadata.get("forced_general_skill_ids") or [])
         != request.forced_general_skill_ids
+        or list(metadata.get("ability_ids") or [])
+        != list(dict.fromkeys(request.ability_ids))
         or persisted_attachments != expected_attachments
     ):
         raise HTTPException(
@@ -2657,18 +2997,19 @@ def _existing_turn_replay(
             detail="client_turn_id already belongs to a different request",
         )
     turn_ids = {message_id, client_turn_id}
-    rows = [
-        row
-        for row in all_rows
-        if row.event_type not in SPAN_EVENT_TYPES and bool(_event_turn_ids(row) & turn_ids)
-    ]
+    rows = all_turn_events(
+        db,
+        request.tenant_id,
+        session_id,
+        turn_ids,
+        high_watermark,
+    )
     terminal = any(
         STREAM_RELAY_EVENT_ALIASES.get(row.event_type, row.event_type)
         in STREAM_RELAY_TERMINAL_EVENTS
         for row in rows
     )
-    cursor = (all_rows[-1].created_at, all_rows[-1].id) if all_rows else None
-    return message_id, rows, cursor, terminal
+    return message_id, rows, high_watermark, terminal
 
 
 def _stream_existing_turn(
@@ -2682,26 +3023,44 @@ def _stream_existing_turn(
     """重放既有 turn；仍运行时只挂接事件账本，绝不启动第二个 Agent worker。"""
 
     turn_ids = {message_id, str(request.client_turn_id or "").strip()}
+    emitted_event_ids = {row.id for row in initial_rows}
+    initial_terminal_found = False
     for row in initial_rows:
         event_name, data = _relay_event_payload(row)
         yield _sse(event_name, data, row.id)
-    if terminal:
+        if event_name in STREAM_RELAY_TERMINAL_EVENTS:
+            initial_terminal_found = True
+            break
+    if terminal or initial_terminal_found:
         return
     cursor = initial_cursor
+    relay_overlap_since: datetime | None = min(
+        (row.created_at for row in initial_rows),
+        default=None,
+    )
     deadline = time.monotonic() + STREAM_RELAY_IDLE_TIMEOUT_SECONDS
     while True:
         emitted = False
         with Session(engine) as relay_db:
-            scanned = _events_after_cursor(
+            scanned = turn_events_after_cursor(
                 relay_db,
                 request.tenant_id,
                 str(request.session_id or ""),
+                turn_ids,
                 cursor,
+                include_same_timestamp=True,
+                overlap_since=relay_overlap_since,
+                exclude_event_ids=emitted_event_ids,
             )
         for row in scanned:
-            cursor = (row.created_at, row.id)
-            if not (_event_turn_ids(row) & turn_ids):
+            if row.id in emitted_event_ids:
                 continue
+            emitted_event_ids.add(row.id)
+            if relay_overlap_since is None or row.created_at < relay_overlap_since:
+                relay_overlap_since = row.created_at
+            next_cursor = (row.created_at, row.id)
+            if cursor is None or next_cursor > cursor:
+                cursor = next_cursor
             event_name, data = _relay_event_payload(row)
             emitted = True
             yield _sse(event_name, data, row.id)
@@ -2710,7 +3069,18 @@ def _stream_existing_turn(
         if emitted:
             deadline = time.monotonic() + STREAM_RELAY_IDLE_TIMEOUT_SECONDS
         if time.monotonic() > deadline:
-            return
+            with Session(engine) as execution_db:
+                active_dynamic_execution = _active_dynamic_execution_for_turn(
+                    execution_db,
+                    request.tenant_id,
+                    str(request.session_id or ""),
+                    turn_ids,
+                )
+            if active_dynamic_execution is None:
+                return
+            # 重连只追踪原 Turn；活动 Execution 的 Runtime/Provider 终态决定何时
+            # 结束，不能因重连中继自己的空闲窗口而提前丢弃这条追踪。
+            deadline = time.monotonic() + STREAM_RELAY_IDLE_TIMEOUT_SECONDS
         time.sleep(STREAM_RELAY_POLL_SECONDS)
 
 
@@ -3663,6 +4033,8 @@ def _build_turn_traces(
     events: list[AgentEvent],
     skill_names: dict[str, str],
 ) -> list[dict]:
+    """按 Turn 身份聚合聊天事件，并让取消事实不覆盖仍未确认的工具状态。"""
+
     if not events:
         return []
 
@@ -3687,6 +4059,7 @@ def _build_turn_traces(
                 "started_at": event.created_at.isoformat(),
                 "completed_at": None,
                 "lines": [],
+                "_waiting_projection": False,
             }
             traces.append(current)
             traces_by_turn_id[turn_id] = current
@@ -3704,37 +4077,89 @@ def _build_turn_traces(
             if target_skill_id:
                 skill_hints_by_turn_id[target_turn_id] = target_skill_id
 
+        if event.event_type == "stream_cancelled":
+            # 聊天生成已停止不等于工具调用已经得到独立终态回执；这个内部标记只
+            # 存在于本次聚合，最终不会泄露到 API 响应或持久化数据。
+            current["_closed_by_cancellation"] = True
+
         skill_hint = skill_hints_by_turn_id.get(target_turn_id)
         trace_was_completed = bool(current.get("completed_at"))
         lines = _event_trace_lines(event, skill_names, skill_hint)
         for line in lines:
-            if trace_was_completed and line.get("state") == "running":
+            preserve_running_tool = (
+                current.get("_closed_by_cancellation") is True
+                and line.get("kind") == "tool"
+            )
+            if trace_was_completed and line.get("state") == "running" and not preserve_running_tool:
                 line = {**line, "state": "completed"}
             _upsert_trace_line(current["lines"], line)
         event_context = _skill_context_from_event(event, skill_hint=skill_hint)
         if event_context and event_context.get("skill_id"):
             skill_hints_by_turn_id[target_turn_id] = event_context["skill_id"]
-        if event.event_type == "assistant_message_created":
+        if event.event_type == "complete":
+            # assistant_message_created 是消息投影，不是 Turn 终态；等待中的
+            # DynamicTask 投影尤其不能提前关闭 trace。只有规范 complete 才能
+            # 在成功路径闭合当前 Turn。
+            current["_waiting_projection"] = False
             if not current.get("completed_at"):
                 current["completed_at"] = event.created_at.isoformat()
-            _complete_trace_lines(current["lines"])
+            _complete_trace_lines(
+                current["lines"],
+                preserve_running_tools=current.get("_closed_by_cancellation") is True,
+            )
+            if active_turn_id == target_turn_id:
+                active_turn_id = None
+        elif event.event_type == "assistant_message_created":
+            assistant_status = str(
+                payload.get("status") or payload.get("execution_status") or ""
+            ).strip().lower()
+            message_kind = str(payload.get("message_kind") or "").strip().lower()
+            if assistant_status in {"waiting", "blocked"} or message_kind == "dynamic_task_status":
+                current["_waiting_projection"] = True
+                continue
+            # 兼容历史同步/草案出口：这些出口曾只有 assistant 投影而没有
+            # complete 事件。新生产者仍会追加 canonical complete；显式 waiting
+            # 投影则永远保留为开放 Turn，等待取消或恢复结果闭合。
+            current["_waiting_projection"] = False
+            if not current.get("completed_at"):
+                current["completed_at"] = event.created_at.isoformat()
+            _complete_trace_lines(
+                current["lines"],
+                preserve_running_tools=(
+                    current.get("_closed_by_cancellation") is True
+                    or assistant_status == "cancelled"
+                ),
+            )
             if active_turn_id == target_turn_id:
                 active_turn_id = None
         elif event.event_type in {"stream_cancelled", "stream_interrupted", "error_occurred"}:
+            current["_waiting_projection"] = False
             if not current.get("completed_at"):
                 current["completed_at"] = event.created_at.isoformat()
-            _finish_trace_if_needed(current, event.created_at)
+            _finish_trace_if_needed(
+                current,
+                event.created_at,
+                preserve_running_tools=event.event_type == "stream_cancelled",
+            )
             if active_turn_id == target_turn_id:
                 active_turn_id = None
 
     fallback_time = events[-1].created_at if events else None
     open_turn_id = active_turn_id
     for current in traces:
+        if current.get("_waiting_projection") is True and not current.get("completed_at"):
+            continue
         if open_turn_id and current.get("turn_id") == open_turn_id and not current.get("completed_at"):
             continue
-        _finish_trace_if_needed(current, fallback_time)
+        _finish_trace_if_needed(
+            current,
+            fallback_time,
+            preserve_running_tools=current.get("_closed_by_cancellation") is True,
+        )
 
     for trace in traces:
+        trace.pop("_closed_by_cancellation", None)
+        trace.pop("_waiting_projection", None)
         trace.pop("_user_message_content", None)
     return _with_scheduled_draft_message_traces(traces, messages)
 
@@ -4336,17 +4761,33 @@ def _upsert_trace_line(lines: list[dict], line: dict) -> None:
     lines.append(line)
 
 
-def _complete_trace_lines(lines: list[dict]) -> None:
+def _complete_trace_lines(lines: list[dict], *, preserve_running_tools: bool = False) -> None:
+    """把普通运行行收口；取消事件下保留没有独立回执的工具行。"""
+
     for line in lines:
-        if line.get("state") == "running":
+        if (
+            line.get("state") == "running"
+            and not (preserve_running_tools and line.get("kind") == "tool")
+        ):
             line["state"] = "completed"
     thinking = next((line for line in lines if line.get("id") == "thinking"), None)
-    if thinking:
+    if thinking and not (
+        preserve_running_tools
+        and thinking.get("kind") == "tool"
+        and thinking.get("state") == "running"
+    ):
         thinking["text"] = "已完成思考"
         thinking["state"] = "completed"
 
 
-def _finish_trace_if_needed(trace: dict, fallback_time) -> None:
+def _finish_trace_if_needed(
+    trace: dict,
+    fallback_time,
+    *,
+    preserve_running_tools: bool = False,
+) -> None:
+    """补齐 trace 终止时间，并按事件语义保留尚未独立结算的工具行。"""
+
     if not trace.get("completed_at") and fallback_time:
         trace["completed_at"] = fallback_time.isoformat()
-    _complete_trace_lines(trace["lines"])
+    _complete_trace_lines(trace["lines"], preserve_running_tools=preserve_running_tools)

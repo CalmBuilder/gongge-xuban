@@ -24,6 +24,7 @@ from app.db.models import (
     GeneralSkillDependency,
     GeneralSkillRevision,
     GeneralSkillUse,
+    Message,
     ModelConfig,
     SopInstance,
     SopOperation,
@@ -37,6 +38,7 @@ from app.general_skills.runtime import (
     GeneralSkillRuntimeService,
     LoadedGeneralSkill,
 )
+from app.general_skills.schema import GeneralSkillSelection
 from app.session.session_schema import ChatTurnRequest, RouterDecision
 from app.security.encryption import encrypt_secret
 from app.sop_runtime.execution_store import (
@@ -892,6 +894,96 @@ def test_agent_loop_forced_guidance_loads_before_reply_without_running_package_c
     use = db.exec(select(GeneralSkillUse)).one()
     assert use.status == "completed"
     assert use.selection_mode == "forced"
+
+
+def test_stream_planning_guidance_commits_canonical_complete_after_reply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """流式指导回复只由账本提交一次 complete，不能在终态后追加流事件。"""
+
+    db, owner, agent, chat, skill, _, _ = _context(invocation_policy="user_only")
+    settings = get_settings()
+    monkeypatch.setattr(settings, "general_skill_resolver_v2_enabled", True)
+    monkeypatch.setattr(settings, "general_skill_dynamic_guidance_enabled", True)
+
+    class ResponseStub:
+        """让测试只关注指导分支的持久化边界，不依赖真实模型。"""
+
+        def generate(self, *_args, **_kwargs):
+            """返回固定正文，模拟指导上下文已经进入回复阶段。"""
+
+            return "流式指导已完成。"
+
+    loop = AgentLoop(db)
+    loop.response_generator = ResponseStub()
+    loop._enqueue_memory_capture = lambda *_args, **_kwargs: None
+    request = ChatTurnRequest(
+        tenant_id=owner.tenant_id,
+        session_id=chat.id,
+        agent_id=agent.id,
+        user_id=owner.id,
+        message="请用指导方案回答",
+        client_turn_id="client_stream_guidance",
+        forced_general_skill_id=skill.id,
+    )
+    selection = GeneralSkillSelection(
+        use_general_skill=True,
+        selected_slug=skill.slug,
+        confidence=1.0,
+        reason="结构化强制 Skill",
+    )
+
+    projected_events = list(
+        loop._stream_general_skill_response(
+            request,
+            chat,
+            ModelConfig(
+                id="model_stream_guidance",
+                tenant_id=owner.tenant_id,
+                name="Stream Guidance Model",
+                api_key_encrypted="unused",
+                model="test-model",
+            ),
+            (skill, selection),
+            RouterDecision(decision="answer_only"),
+            [],
+            {},
+            None,
+            "turn_stream_guidance",
+            None,
+        )
+    )
+
+    assert [item["event"] for item in projected_events] == [
+        "status",
+        "general_skill_trace",
+        "status",
+        "general_skill_state",
+        "status",
+    ]
+    assert not {item["event"] for item in projected_events} & {
+        "stream_delta",
+        "stream_end",
+        "complete",
+    }
+    complete_events = db.exec(
+        select(AgentEvent).where(
+            AgentEvent.tenant_id == owner.tenant_id,
+            AgentEvent.session_id == chat.id,
+            AgentEvent.event_type == "complete",
+        )
+    ).all()
+    assistant_messages = db.exec(
+        select(Message).where(
+            Message.tenant_id == owner.tenant_id,
+            Message.session_id == chat.id,
+            Message.role == "assistant",
+        )
+    ).all()
+    assert len(complete_events) == 1
+    assert len(assistant_messages) == 1
+    assert complete_events[0].payload_json["client_turn_id"] == request.client_turn_id
+    assert assistant_messages[0].content == "流式指导已完成。"
 
 
 def test_agent_loop_failed_guidance_reply_settles_loaded_use(

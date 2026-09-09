@@ -361,6 +361,35 @@ def test_execution_card_preserves_completed_step_across_plan_revision(db: Sessio
     assert card.steps[1]["status"] == "pending"
 
 
+def test_execution_card_restores_latest_command_after_reentry(db: Session) -> None:
+    """重新进入执行卡时恢复最新取消命令，避免把待对账操作再次展示为可重复取消。"""
+
+    owner, _, instance = _seed_execution(db, suffix="latest_command")
+    assert owner is not None
+    db.add(
+        ExecutionCommand(
+            tenant_id=instance.tenant_id,
+            execution_id=instance.id,
+            command_id="cancel_latest",
+            command_type="cancel",
+            actor_user_id=owner.id,
+            expected_execution_revision=instance.revision,
+            payload_json={"reason": "user_requested"},
+            payload_checksum="a" * 64,
+            status="applied",
+            result_json={"cancelled": False, "execution_status": "running"},
+        )
+    )
+    db.commit()
+
+    card = get_execution(instance.id, instance.tenant_id, owner, db)
+
+    assert card.latest_command is not None
+    assert card.latest_command.command_id == "cancel_latest"
+    assert card.latest_command.status == "applied"
+    assert card.latest_command.result == {"cancelled": False, "execution_status": "running"}
+
+
 def test_steer_stays_pending_and_idempotency_conflict_is_rejected(
     db: Session,
     monkeypatch: pytest.MonkeyPatch,

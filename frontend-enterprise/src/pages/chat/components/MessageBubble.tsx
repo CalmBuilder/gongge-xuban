@@ -19,6 +19,7 @@ import {
   CHAT_ATTACHMENT_IMG_CLASS,
   CHAT_ATTACHMENT_LIST_CLASS,
   CHAT_ATTACHMENT_META_CLASS,
+  CHAT_BUBBLE_REPORT_CLASS,
   CHAT_ATTACHMENT_NAME_CLASS,
   CHAT_CITATION_CHIP_CLASS,
   CHAT_CITATION_HEADING_CLASS,
@@ -36,6 +37,13 @@ import {
   CHAT_MESSAGE_ITEM_CLASS,
   CHAT_MESSAGE_MODE_CHIP_CLASS,
   CHAT_PLAIN_ANSWER_CLASS,
+  CHAT_REPORT_HEADER_BADGE_CLASS,
+  CHAT_REPORT_HEADER_CLASS,
+  CHAT_REPORT_HEADER_COPY_CLASS,
+  CHAT_REPORT_HEADER_ICON_CLASS,
+  CHAT_REPORT_HEADER_IDENTITY_CLASS,
+  CHAT_REPORT_HEADER_KICKER_CLASS,
+  CHAT_REPORT_HEADER_TITLE_CLASS,
   CHAT_QUEUED_MESSAGE_ITEM_CLASS,
   CHAT_QUEUED_STATUS_CLASS,
   CHAT_QUEUED_STATUS_ROW_CLASS,
@@ -47,6 +55,7 @@ import {
   attachmentTypeLabel,
   canRateMessage,
   citationDisplayTitle,
+  isIntelligenceReport,
 } from '../chatHelpers';
 import type { TraceLine } from '../chatTypes';
 import type { UseChatSession } from '../useChatSession';
@@ -112,6 +121,7 @@ export default function MessageBubble({ chat, item, render }: MessageBubbleProps
   const showEdit = canCopy && item.role === 'user' && canEdit && !queuedMessage && !currentSessionRunning;
   const showRetry = canCopy && item.role === 'assistant' && canRetry && !currentSessionRunning;
   const showFeedback = canRateMessage(item);
+  const intelligenceReport = isIntelligenceReport(item, visibleContent);
 
   async function copyVisibleMessage() {
     /** 只复制页面实际展示的已完成消息，不复制执行轨迹或隐藏 metadata。 */
@@ -128,8 +138,25 @@ export default function MessageBubble({ chat, item, render }: MessageBubbleProps
     <div className={cn(CHAT_MESSAGE_ITEM_CLASS, queuedMessage && CHAT_QUEUED_MESSAGE_ITEM_CLASS)}>
       <div className={chatRowClass(item.role)}>
         <div
-          className={chatBubbleClass(item.role, item.isError)}
+          className={cn(
+            chatBubbleClass(item.role, item.isError),
+            intelligenceReport && CHAT_BUBBLE_REPORT_CLASS,
+          )}
         >
+          {intelligenceReport && (
+            <div className={CHAT_REPORT_HEADER_CLASS} aria-label={t('情报简报')}>
+              <div className={CHAT_REPORT_HEADER_IDENTITY_CLASS}>
+                <span className={CHAT_REPORT_HEADER_ICON_CLASS} aria-hidden="true">
+                  <ProductIcon name="globe" size={16} />
+                </span>
+                <span className={CHAT_REPORT_HEADER_COPY_CLASS}>
+                  <span className={CHAT_REPORT_HEADER_KICKER_CLASS}>{t('多来源证据整理')}</span>
+                  <span className={CHAT_REPORT_HEADER_TITLE_CLASS}>{t('情报简报')}</span>
+                </span>
+              </div>
+              <span className={CHAT_REPORT_HEADER_BADGE_CLASS}>{t('结构化报告')}</span>
+            </div>
+          )}
           {statusOnly ? (
             <div className="gg-type-control text-[#858b9c]">{visibleContent}</div>
           ) : showInlineTrace && summary ? (
@@ -145,7 +172,10 @@ export default function MessageBubble({ chat, item, render }: MessageBubbleProps
           {!statusOnly && visibleContent ? (
             item.role === 'assistant' ? (
               <div data-i18n-ignore>
-                <MarkdownMessage content={visibleContent} />
+                <MarkdownMessage
+                  content={visibleContent}
+                  variant={intelligenceReport ? 'intelligence' : 'default'}
+                />
               </div>
             ) : (
               <div className={CHAT_PLAIN_ANSWER_CLASS}>

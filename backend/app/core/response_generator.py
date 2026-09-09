@@ -32,6 +32,9 @@ PROMPT_PATH = paths.resource_dir() / "app" / "llm" / "prompts" / "response_gener
 FALLBACK_REPLY = "抱歉，我暂时无法处理这个问题。您可以换个说法，或者我可以帮您转人工。"
 MODEL_FAILURE_SUGGESTION = "请检查模型配置、API Key、网络或模型服务状态后重试。"
 TOOL_FAILURE_SUGGESTION = "请检查工具配置、调用参数或外部服务状态后重试。"
+VERTICAL_ABILITY_CREDENTIAL_SUGGESTION = (
+    "请联系管理员前往“能力包配置”页面，在 Jina Reader 卡片中配置 Jina API Key 后重试。"
+)
 RUNTIME_CONTROL_FALLBACK = "流程已被系统规则终止，请查看执行记录或联系管理员。"
 DYNAMIC_TASK_ROLLOUT_GUIDANCE = (
     "DynamicTaskAgent 当前被服务端普通动态总开关拒绝；普通能力不需要在前端勾选，"
@@ -110,6 +113,14 @@ def model_failure_suggestion(detail: object) -> str:
     return MODEL_FAILURE_SUGGESTION
 
 
+def tool_failure_suggestion(code: str | None) -> str:
+    """为工具失败选择可执行提示，缺少平台凭据时引导管理员补齐配置。"""
+
+    if code == "VERTICAL_ABILITY_CREDENTIAL_NOT_CONFIGURED":
+        return VERTICAL_ABILITY_CREDENTIAL_SUGGESTION
+    return TOOL_FAILURE_SUGGESTION
+
+
 def tool_failure_reply(tool_result: ToolResult) -> str:
     error = tool_result.error
     code = error.code if error else None
@@ -118,7 +129,7 @@ def tool_failure_reply(tool_result: ToolResult) -> str:
         f"工具调用失败：{tool_result.tool_name}",
         detail,
         code,
-        TOOL_FAILURE_SUGGESTION,
+        tool_failure_suggestion(code),
     )
 
 

@@ -63,6 +63,7 @@ import BuiltinSkillCatalogPage from "./pages/BuiltinSkillCatalogPage";
 import KnowledgeManagePage, { KnowledgeAddPage } from "./pages/KnowledgePage";
 import LoginPage from "./pages/LoginPage";
 import ModelsPage from "./pages/ModelsPage";
+import VerticalAbilitySettingsPage from "./pages/VerticalAbilitySettingsPage";
 import OpenPlatformPage from "./pages/OpenPlatformPage";
 import PersonaPage from "./pages/PersonaPage";
 import SkillsPage from "./pages/SkillsPage";
@@ -194,6 +195,8 @@ function Shell({
       ? "/enterprise/dashboard"
       : location.pathname.startsWith(EnterpriseRoute.GeneralSkillCatalog)
         ? EnterpriseRoute.GeneralSkillCatalog
+      : location.pathname.startsWith(EnterpriseRoute.VerticalAbilitySettings)
+        ? EnterpriseRoute.VerticalAbilitySettings
       : isAdmin && isExpertTemplateManagementRoute
         ? EnterpriseRoute.ExpertTemplateManagement
       : location.pathname.startsWith("/enterprise/platform")
@@ -820,6 +823,30 @@ function Shell({
                 element={
                   isAdmin ? (
                     <ModelsPage currentUser={auth.user} onLogout={onLogout} />
+                  ) : (
+                    <Navigate to={EnterpriseRoute.Gallery} replace />
+                  )
+                }
+              />
+              <Route
+                path="/enterprise/vertical-abilities/settings"
+                element={<Navigate to={EnterpriseRoute.VerticalAbilitySettings} replace />}
+              />
+              <Route
+                path={`${EnterpriseRoute.VerticalAbilitySettings}/:abilityId`}
+                element={
+                  isAdmin ? (
+                    <VerticalAbilitySettingsPage currentUser={auth.user} onLogout={onLogout} />
+                  ) : (
+                    <Navigate to={EnterpriseRoute.Gallery} replace />
+                  )
+                }
+              />
+              <Route
+                path={EnterpriseRoute.VerticalAbilitySettings}
+                element={
+                  isAdmin ? (
+                    <VerticalAbilitySettingsPage currentUser={auth.user} onLogout={onLogout} />
                   ) : (
                     <Navigate to={EnterpriseRoute.Gallery} replace />
                   )

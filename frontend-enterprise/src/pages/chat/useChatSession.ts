@@ -51,6 +51,8 @@ import type {
   SessionGeneralSkillCatalogRead,
   TurnTraceRead,
   UIConfigRead,
+  VerticalAbilityCatalogRead,
+  VerticalAbilityReadinessRead,
 } from '@/types';
 
 import {
@@ -154,6 +156,10 @@ const MISSING_MODEL_CONFIG_PATTERN = /missing_model_config|missing model config|
 const MODEL_CONFIGS_UPDATED_EVENT = 'gongge-enterprise-model-configs-updated';
 const EXECUTION_ENGINE_STORAGE_PREFIX = 'gongge-chat-execution-engine';
 
+function localCancellationKey(sessionId: string, turnId: string): string {
+  return `${sessionId}\u0000${turnId}`;
+}
+
 function executionEngineStorageKey(tenantId: string, userId: string): string {
   return `${EXECUTION_ENGINE_STORAGE_PREFIX}:${tenantId || 'default'}:${userId || 'anonymous'}`;
 }
@@ -213,6 +219,7 @@ function queuedTurnPreview(turn: PreparedChatTurn): ChatMessage {
       ...(turn.attachments.length ? { attachments: turn.attachments } : {}),
       ...(turn.interactionMode === 'scheduled_task' ? { interaction_mode: 'scheduled_task' } : {}),
       ...(turn.executionEngine === 'dynamic_task' ? { execution_engine: 'dynamic_task' } : {}),
+      ...(turn.abilityIds?.length ? { ability_ids: turn.abilityIds } : {}),
     },
     created_at: turn.createdAt,
   };
@@ -385,6 +392,13 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
   const [generalSkillCatalogError, setGeneralSkillCatalogError] = useState(false);
   const [selectedGeneralSkillIds, setSelectedGeneralSkillIds] = useState<string[]>([]);
   const selectedGeneralSkillId = selectedGeneralSkillIds[0] || '';
+  const [verticalAbilities, setVerticalAbilities] = useState<VerticalAbilityCatalogRead['items']>([]);
+  const [verticalAbilityCatalogLoading, setVerticalAbilityCatalogLoading] = useState(Boolean(auth));
+  const [verticalAbilityCatalogError, setVerticalAbilityCatalogError] = useState(false);
+  const [selectedVerticalAbilityIds, setSelectedVerticalAbilityIds] = useState<string[]>([]);
+  const [verticalAbilityReadinessById, setVerticalAbilityReadinessById] = useState<
+    Record<string, VerticalAbilityReadinessRead>
+  >({});
   const [lastTurn, setLastTurn] = useState<ChatTurnResponse | null>(null);
   const [renameSession, setRenameSession] = useState<ChatSession | null>(null);
   const [renameTitle, setRenameTitle] = useState('');
@@ -438,7 +452,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
   const storeRef = useRef(new Map<string, SessionSlot>());
   const streamRef = useRef(new Map<string, StreamSlot>());
   const turnTraceRef = useRef(new Map<string, TurnTrace>());
-  const locallyCancelledSessionIdsRef = useRef(new Set<string>());
+  const locallyCancelledTurnKeysRef = useRef(new Set<string>());
   const scheduledEventIdsRef = useRef(new Set<string>());
   const knownSessionIdsRef = useRef(new Set<string>());
   const optimisticSessionIdsRef = useRef(new Set<string>());
@@ -593,6 +607,41 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
   const displayedAgent = invalidDraftAgentId || draftAgentLoading ? null : (sessionAgent || draftAgent || defaultAgent);
   const displayedProfile = displayedAgent ? employeeProfile(displayedAgent) : null;
   useEffect(() => {
+    if (!auth) {
+      setVerticalAbilities([]);
+      setSelectedVerticalAbilityIds([]);
+      setVerticalAbilityReadinessById({});
+      setVerticalAbilityCatalogLoading(false);
+      setVerticalAbilityCatalogError(false);
+      return;
+    }
+    let cancelled = false;
+    setVerticalAbilityCatalogLoading(true);
+    setVerticalAbilityCatalogError(false);
+    void api.get<VerticalAbilityCatalogRead>('/api/chat/abilities')
+      .then((catalog) => {
+        if (cancelled) return;
+        setVerticalAbilities(catalog.items);
+        setSelectedVerticalAbilityIds((current) => current.filter((abilityId) => (
+          catalog.items.some((item) => item.id === abilityId)
+        )));
+      })
+      .catch((error) => {
+        if (cancelled || isAuthError(error)) return;
+        setVerticalAbilities([]);
+        setSelectedVerticalAbilityIds([]);
+        setVerticalAbilityReadinessById({});
+        setVerticalAbilityCatalogError(true);
+      })
+      .finally(() => {
+        if (!cancelled) setVerticalAbilityCatalogLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [auth]);
+
+  useEffect(() => {
     if (!auth || !sessionId || !displayedAgent?.id || isDraftConversationKey(sessionId)) {
       setSessionGeneralSkills([]);
       setSelectedGeneralSkillIds([]);
@@ -671,6 +720,45 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     setExecutionEngine(value);
     window.localStorage.setItem(executionEngineStorageKey(tenantId, userId), value);
   }, [tenantId, userId]);
+
+  const checkVerticalAbilityReadiness = useCallback(async (
+    abilityId: string,
+  ): Promise<VerticalAbilityReadinessRead | null> => {
+    try {
+      const readiness = await api.get<VerticalAbilityReadinessRead>(
+        `/api/chat/abilities/${encodeURIComponent(abilityId)}/readiness`,
+      );
+      setVerticalAbilityReadinessById((current) => ({ ...current, [abilityId]: readiness }));
+      return readiness;
+    } catch (error) {
+      if (!isAuthError(error)) {
+        notify.info(t('能力包已选中，但暂时无法确认外部服务配置；发送时将由服务端再次校验。'));
+      }
+      return null;
+    }
+  }, [t]);
+
+  const selectVerticalAbility = useCallback(async (
+    abilityId: string,
+  ): Promise<VerticalAbilityReadinessRead | null> => {
+    if (!verticalAbilities.some((item) => item.id === abilityId)) return null;
+    const alreadySelected = selectedVerticalAbilityIds.includes(abilityId);
+    setSelectedVerticalAbilityIds((current) => (
+      current.includes(abilityId)
+        ? current.filter((value) => value !== abilityId)
+        : [...current, abilityId]
+    ));
+    changeExecutionEngine('dynamic_task');
+    if (alreadySelected) return null;
+    return checkVerticalAbilityReadiness(abilityId);
+  }, [changeExecutionEngine, checkVerticalAbilityReadiness, selectedVerticalAbilityIds, verticalAbilities]);
+
+  const clearSelectedVerticalAbility = useCallback(
+    (abilityId?: string) => setSelectedVerticalAbilityIds((current) => (
+      abilityId ? current.filter((value) => value !== abilityId) : []
+    )),
+    [],
+  );
 
   const refreshGeneralSkillInstallIntents = useCallback(async () => {
     if (!sessionId) return;
@@ -1005,7 +1093,10 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     }
     storeRef.current.delete(id);
     streamRef.current.delete(id);
-    locallyCancelledSessionIdsRef.current.delete(id);
+    const sessionPrefix = localCancellationKey(id, '');
+    locallyCancelledTurnKeysRef.current.forEach((key) => {
+      if (key.startsWith(sessionPrefix)) locallyCancelledTurnKeysRef.current.delete(key);
+    });
     setSessions((current) => current.filter((item) => item.id !== id));
     setScheduledDrafts((current) => {
       if (!current[id]) return current;
@@ -1044,7 +1135,12 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
 
   const upsertTraceLine = useCallback((turnId: string, line: TraceLine) => {
     const trace = getTurnTrace(turnId);
-    const nextLine = trace.completedAt && line.state === 'running'
+    const keepRunningToolAfterCancellation = (
+      trace.closedByCancellation === true
+      && line.kind === 'tool'
+      && line.state === 'running'
+    );
+    const nextLine = trace.completedAt && line.state === 'running' && !keepRunningToolAfterCancellation
       ? { ...line, state: 'completed' as const }
       : line;
     const index = trace.lines.findIndex((item) => item.id === line.id);
@@ -1057,12 +1153,17 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     notifyTrace();
   }, [getTurnTrace, notifyTrace]);
 
-  const finishTrace = useCallback((turnId: string, failed = false) => {
+  const finishTrace = useCallback((turnId: string, failed = false, preserveRunningTools = false) => {
     const trace = getTurnTrace(turnId);
     trace.completedAt = Date.now();
+    trace.closedByCancellation = preserveRunningTools || trace.closedByCancellation;
     trace.lines = trace.lines.map((line) => ({
       ...line,
-      state: failed && line.state === 'running' ? 'failed' : line.state === 'running' ? 'completed' : line.state,
+      state: failed && line.state === 'running' && !(trace.closedByCancellation && line.kind === 'tool')
+        ? 'failed'
+        : line.state === 'running' && !(trace.closedByCancellation && line.kind === 'tool')
+          ? 'completed'
+          : line.state,
     }));
     notifyTrace();
   }, [getTurnTrace, notifyTrace]);
@@ -1169,6 +1270,10 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     if (stream.cancelledTurnId === turnId) {
       stream.cancelledTurnId = serverMessageId;
       changed = true;
+    }
+    const localTurnKey = localCancellationKey(id, turnId);
+    if (locallyCancelledTurnKeysRef.current.delete(localTurnKey)) {
+      locallyCancelledTurnKeysRef.current.add(localCancellationKey(id, serverMessageId));
     }
     setRunningTurn((current) => (
       current?.sessionId === id && current.turnId === turnId
@@ -1329,6 +1434,11 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
         markChatServiceAvailable();
         const slot = getSlot(id);
         slot.serverMessages = attachTurnIdsToServerMessages(rows, slot.realtimeMessages);
+        rows.forEach((messageItem) => {
+          if (messageItem.role !== 'assistant') return;
+          const turnId = effectiveMessageTurnId(messageItem);
+          if (turnId) locallyCancelledTurnKeysRef.current.delete(localCancellationKey(id, turnId));
+        });
         const stream = getStreamSlot(id);
         if (stream.loading) {
           const hasCompletedAssistant = stream.turnId ? hasAssistantMessageForTurn(slot, stream.turnId) : false;
@@ -1358,11 +1468,15 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
         markChatServiceAvailable();
         const slot = getSlot(id);
         const stream = getStreamSlot(id);
-        const locallyCancelled = locallyCancelledSessionIdsRef.current.has(id);
         let recoveredRunningTurnId = '';
         let storeChanged = false;
         let streamChanged = false;
+        const authoritativeTurnIds = new Set<string>();
         rows.forEach((row) => {
+          if (row.completed_at) authoritativeTurnIds.add(row.turn_id);
+          const locallyCancelled = locallyCancelledTurnKeysRef.current.has(
+            localCancellationKey(id, row.turn_id),
+          );
           const hasFinalAssistant = hasAssistantMessageForTurn(slot, row.turn_id);
           const hasAssistantCarrier = hasAssistantCarrierForTurn(slot, row.turn_id);
           const traceLines = row.lines.map((line) => ({
@@ -1382,6 +1496,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
             lines: traceLines,
             startedAt: parseMessageTime(row.started_at) || Date.now(),
             completedAt: row.completed_at ? parseMessageTime(row.completed_at) : undefined,
+            closedByCancellation: traceLines.some((line) => line.id === 'generation_stopped'),
           });
           const activeStreamTurn = stream.loading && stream.turnId === row.turn_id;
           const recoverableRunningTrace = (
@@ -1398,7 +1513,8 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
             )
           );
           const staleOpenTrace = (
-            !mergedTrace.completedAt
+            !locallyCancelled
+            && !mergedTrace.completedAt
             && mergedTrace.lines.length > 0
             && !recoverableRunningTrace
             && !hasAssistantCarrier
@@ -1422,11 +1538,18 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
             }
           }
         });
+        authoritativeTurnIds.forEach((turnId) => {
+          locallyCancelledTurnKeysRef.current.delete(localCancellationKey(id, turnId));
+          if (stream.turnId === turnId && stream.loading) {
+            clearStreamSlot(id, true);
+            streamChanged = true;
+          }
+        });
         if (
           !recoveredRunningTurnId
-          && !locallyCancelled
           && stream.loading
           && stream.turnId
+          && !locallyCancelledTurnKeysRef.current.has(localCancellationKey(id, stream.turnId))
           && !hasAssistantMessageForTurn(slot, stream.turnId)
         ) {
           const activeTrace = turnTraceRef.current.get(stream.turnId);
@@ -1475,7 +1598,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
         markChatServiceUnavailable(error);
         notifyRequestError('trace', error, '轨迹加载失败');
       });
-  }, [getSlot, getStreamSlot, handleMissingSession, markChatServiceAvailable, markChatServiceUnavailable, notifyRequestError, notifyStore, notifyStream, notifyTrace, tenantId]);
+  }, [clearStreamSlot, getSlot, getStreamSlot, handleMissingSession, markChatServiceAvailable, markChatServiceUnavailable, notifyRequestError, notifyStore, notifyStream, notifyTrace, tenantId]);
 
   const stopTerminalTurnSync = useCallback((sessionIdToStop: string, turnIdToStop: string) => {
     const key = `${sessionIdToStop}:${turnIdToStop}`;
@@ -1943,9 +2066,11 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       runningTurn?.sessionId === activeConversationId ? runningTurn.turnId : null
     );
     const controller = stream.abortController;
-    locallyCancelledSessionIdsRef.current.add(activeConversationId);
+    const cancelledTurnKey = cancelledTurnId
+      ? localCancellationKey(activeConversationId, cancelledTurnId)
+      : null;
+    if (cancelledTurnKey) locallyCancelledTurnKeysRef.current.add(cancelledTurnKey);
     const releaseLocalCancellation = () => {
-      locallyCancelledSessionIdsRef.current.delete(activeConversationId);
       if (isDraftConversationKey(activeConversationId)) return;
       void loadMessages(activeConversationId);
       void loadTraces(activeConversationId);
@@ -1964,7 +2089,6 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
         text: '用户已停止生成',
         state: 'completed',
       });
-      finishTrace(cancelledTurnId);
     }
     clearStreamSlot(activeConversationId, false);
     if (cancelledTurnId) {
@@ -1984,13 +2108,12 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       });
       void Promise.race([cancelRequest, cancelDeadline]).then(abortAfterCancel, abortAfterCancel);
     }
-    void cancelRequest.finally(() => {
-      window.setTimeout(releaseLocalCancellation, 180);
-    });
+    // 本地取消标记保持到 loadMessages/loadTraces 看到服务端终态；180ms 只触发
+    // 一次对账读取，不能在服务端仍 running 时提前删除标记并重新显示假运行/完成。
+    window.setTimeout(releaseLocalCancellation, 180);
   }, [
     activeConversationId,
     clearStreamSlot,
-    finishTrace,
     getSlot,
     getStreamSlot,
     loadMessages,
@@ -2369,7 +2492,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     }
     if (item.event === 'stream_cancelled') {
       const cancelledStreamTurnId = eventStream.turnId || traceTurnId;
-      finishTrace(traceTurnId);
+      finishTrace(traceTurnId, false, true);
       if (!shouldTouchStream) {
         window.setTimeout(() => {
           loadMessages(eventSessionId);
@@ -2544,8 +2667,12 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
   const eventTime = useCallback((event: ChatSessionEventRead) => parseMessageTime(event.created_at) || 0, []);
 
   const hydrateRunningSessionFromEvents = useCallback((id: string, events: ChatSessionEventRead[]) => {
-    if (locallyCancelledSessionIdsRef.current.has(id)) return false;
-    const traceEvents = events.filter((event) => Boolean(eventTraceTurnId(event)));
+    const traceEvents = events.filter((event) => {
+      const turnId = eventTraceTurnId(event);
+      return Boolean(turnId) && !locallyCancelledTurnKeysRef.current.has(
+        localCancellationKey(id, turnId),
+      );
+    });
     if (!traceEvents.length) return false;
     const slot = getSlot(id);
     if (slot.serverMessages.length === 0) return false;
@@ -2645,12 +2772,22 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
   ]);
 
   const pollScheduledSessionEvents = useCallback((id: string) => {
-    if (locallyCancelledSessionIdsRef.current.has(id)) return Promise.resolve();
     return api
       .get<ChatSessionEventRead[]>(`/api/chat/sessions/${id}/events?tenant_id=${tenantId}`)
       .then((events) => {
         markChatServiceAvailable();
-        const traceEvents = events.filter((event) => Boolean(eventTraceTurnId(event)));
+        events.forEach((event) => {
+          const turnId = eventTraceTurnId(event);
+          if (turnId && isTerminalSessionEvent(event, isTerminalEvent)) {
+            locallyCancelledTurnKeysRef.current.delete(localCancellationKey(id, turnId));
+          }
+        });
+        const traceEvents = events.filter((event) => {
+          const turnId = eventTraceTurnId(event);
+          return Boolean(turnId) && !locallyCancelledTurnKeysRef.current.has(
+            localCancellationKey(id, turnId),
+          );
+        });
         if (!traceEvents.length) return;
         hydrateRunningSessionFromEvents(id, traceEvents);
         const slot = getSlot(id);
@@ -3044,7 +3181,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     const stream = getStreamSlot(currentConversationId);
     let liveConversationId = currentConversationId;
     let createdSessionId = '';
-    locallyCancelledSessionIdsRef.current.delete(currentConversationId);
+    locallyCancelledTurnKeysRef.current.delete(localCancellationKey(currentConversationId, turnId));
     if (options.queued) {
       removeQueuedTurnPreview(prepared);
     }
@@ -3163,9 +3300,9 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
         streamRef.current.set(nextSessionId, draftStream);
         streamRef.current.delete(previousId);
       }
-      if (locallyCancelledSessionIdsRef.current.has(previousId)) {
-        locallyCancelledSessionIdsRef.current.delete(previousId);
-        locallyCancelledSessionIdsRef.current.add(nextSessionId);
+      const previousTurnKey = localCancellationKey(previousId, turnId);
+      if (locallyCancelledTurnKeysRef.current.delete(previousTurnKey)) {
+        locallyCancelledTurnKeysRef.current.add(localCancellationKey(nextSessionId, turnId));
       }
       if (queuedTurnsRef.current.some((item) => item.conversationId === previousId)) {
         queuedTurnsRef.current = queuedTurnsRef.current.map((item) => (
@@ -3264,6 +3401,9 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       if (prepared.forcedGeneralSkillIds?.length) {
         requestBody.forced_general_skill_ids = prepared.forcedGeneralSkillIds;
       }
+      if (prepared.abilityIds?.length) {
+        requestBody.ability_ids = prepared.abilityIds;
+      }
       armStreamWatchdog();
       await streamChatTurn(requestBody, (item) => {
         if (!controller.signal.aborted) {
@@ -3271,9 +3411,9 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
         }
         if (item.event === 'session_created') {
           createdSessionId = String(item.data.newSessionId || item.data.sessionId || '');
-          if (startedAsDraftConversation && createdSessionId) {
-            promoteDraftConversation(createdSessionId);
-          }
+          // 草稿提升会切换路由并重建 ChatPage；在 SSE 仍由当前 Hook 持有时提前
+          // 导航会让实时响应失去拥有者，随后只能依赖持久事件恢复。先保存真实
+          // 会话身份，等业务终态到达后再提升；网络中断时仍由 relay recovery 提前提升。
           return;
         }
         const eventSessionId = startedAsDraftConversation
@@ -3297,10 +3437,10 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
           markStreamTerminal();
           const result = item.data as unknown as ChatTurnResponse;
           const completedSessionId = result.session_id || createdSessionId || String(item.data.sessionId || '');
-          handleStreamEvent(item, String(item.data.sessionId || liveConversationId), turnId);
           if (startedAsDraftConversation && completedSessionId) {
             promoteDraftConversation(completedSessionId);
           }
+          handleStreamEvent(item, liveConversationId, turnId);
           return;
         }
         if (
@@ -3452,6 +3592,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       modelConfigId: selectedModelConfig?.id,
       forcedGeneralSkillId: selectedGeneralSkillId || undefined,
       forcedGeneralSkillIds: selectedGeneralSkillIds.length ? selectedGeneralSkillIds : undefined,
+      abilityIds: selectedVerticalAbilityIds.length ? selectedVerticalAbilityIds : undefined,
       createdAt: new Date().toISOString(),
     };
     if (!isOverrideTurn) {
@@ -3495,6 +3636,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     selectedModelConfig?.id,
     selectedGeneralSkillId,
     selectedGeneralSkillIds,
+    selectedVerticalAbilityIds,
     sessionId,
     sessions,
     sessionsLoading,
@@ -3506,6 +3648,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     setInput(item.content);
     setComposerIntent(null);
     setSelectedGeneralSkillIds([]);
+    setSelectedVerticalAbilityIds([]);
     const editableAttachments: ComposerAttachment[] = messageAttachments(item)
       .filter((attachment) => Boolean(attachment.resource_id && attachment.resource_version))
       .map((attachment) => ({
@@ -3642,6 +3785,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     setComposerAttachments([]);
     setComposerIntent(null);
     setSelectedGeneralSkillIds([]);
+    setSelectedVerticalAbilityIds([]);
     setActiveCitation(null);
     navigate(`${CHAT_BASE_PATH}/draft/${encodeURIComponent(agentId)}`);
   }, [displayedAgent?.id, navigate, selectedAgentId]);
@@ -3720,6 +3864,14 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     selectedGeneralSkillIds,
     selectSessionGeneralSkill,
     clearSelectedGeneralSkill,
+    verticalAbilities,
+    verticalAbilityCatalogLoading,
+    verticalAbilityCatalogError,
+    selectedVerticalAbilityIds,
+    selectVerticalAbility,
+    clearSelectedVerticalAbility,
+    verticalAbilityReadinessById,
+    checkVerticalAbilityReadiness,
     generalSkillInstallOpen,
     setGeneralSkillInstallOpen,
     generalSkillInstallIntents,

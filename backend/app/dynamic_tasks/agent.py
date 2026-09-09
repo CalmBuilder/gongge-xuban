@@ -20,10 +20,13 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Callable, Iterator, Protocol
+from urllib.parse import urlsplit
 
 from pydantic import ValidationError
+from sqlalchemy import update
 from sqlmodel import Session, select
 
+from app.cancellation import TurnCancellationRequested, raise_if_cancelled
 from app.connectors.service import ConnectionError, ConnectionService
 from app.connectors.runtime import ConnectorRuntimeService
 from app.db.models import (
@@ -34,7 +37,6 @@ from app.db.models import (
     ExecutionPlanRevision,
     ExecutionSignal,
     GeneralSkillUse,
-    AgentEvent,
     ChatSession,
     ConnectionProfile,
     ConnectorThreadBinding,
@@ -119,6 +121,7 @@ from app.knowledge.service import KnowledgeService
 from app.llm.client import LLMClient
 from app.config import get_settings
 from app.observability.spans import llm_operation
+from app.observability.event_log import EventLog, TurnEventFenceClosed, ensure_turn_event_open
 from app.organization.governance import has_governance_permission
 from app.organization.permissions import user_permission_codes
 from app.security.permissions import can_use_agent_in_chat
@@ -142,8 +145,13 @@ from app.sop_runtime.execution_store import (
     SopExecutionStore,
 )
 from app.sop_runtime.contracts import IdempotencyPolicy, IdempotencyScope
-from app.tools.tool_executor import ToolExecutor
 from app.tools.tool_schema import ToolCall, ToolError, ToolResult
+from app.vertical_abilities.executor import VerticalAbilityToolExecutor
+from app.vertical_abilities.resolver import (
+    VERTICAL_GUIDANCE_ID_PREFIX,
+    VerticalAbilityResolution,
+    VerticalAbilityResolver,
+)
 
 
 def _bounded_failure_diagnostics(details: object) -> dict[str, object] | None:
@@ -160,6 +168,7 @@ def _bounded_failure_diagnostics(details: object) -> dict[str, object] | None:
         "attachment_evidence_errors",
         "computation_evidence_errors",
         "guidance_application_errors",
+        "vertical_ability_errors",
         "visual_evidence_errors",
         "formula_evidence_errors",
         "security_errors",
@@ -180,6 +189,422 @@ def _bounded_failure_diagnostics(details: object) -> dict[str, object] | None:
         else:
             diagnostics[key] = str(value)[:512]
     return diagnostics or None
+
+
+def _validate_read_action_arguments(
+    arguments: Mapping[str, object],
+    capability_view: Mapping[str, object],
+) -> None:
+    """按冻结 read 能力的输入 schema 在外发前拒绝缺字段和明显错形参数。"""
+
+    input_schema = capability_view.get("input_schema")
+    if not isinstance(input_schema, Mapping):
+        return
+    if input_schema.get("type") == "object" and not isinstance(arguments, Mapping):
+        raise ValueError("read 动作 arguments 必须为对象")
+    properties = input_schema.get("properties")
+    properties = properties if isinstance(properties, Mapping) else {}
+    required = input_schema.get("required")
+    if isinstance(required, list):
+        missing = [
+            str(name)
+            for name in required
+            if not isinstance(name, str)
+            or name not in arguments
+            or (
+                isinstance(properties.get(name), Mapping)
+                and properties[name].get("type") == "string"
+                and not str(arguments.get(name) or "").strip()
+            )
+        ]
+        if missing:
+            raise ValueError(f"read 动作缺少必填参数: {', '.join(missing[:8])}")
+    if input_schema.get("additionalProperties") is False:
+        unknown = sorted(str(name) for name in set(arguments) - set(properties))
+        if unknown:
+            raise ValueError(f"read 动作包含未声明参数: {', '.join(unknown[:8])}")
+    for name, value in arguments.items():
+        field_schema = properties.get(name)
+        if not isinstance(field_schema, Mapping):
+            continue
+        field_type = field_schema.get("type")
+        if field_type == "string" and not isinstance(value, str):
+            raise ValueError(f"read 动作参数类型无效: {name}")
+        if field_type == "integer" and (isinstance(value, bool) or not isinstance(value, int)):
+            raise ValueError(f"read 动作参数类型无效: {name}")
+        if field_type == "array" and not isinstance(value, list):
+            raise ValueError(f"read 动作参数类型无效: {name}")
+        if field_type == "object" and not isinstance(value, Mapping):
+            raise ValueError(f"read 动作参数类型无效: {name}")
+        if field_schema.get("format") == "uri":
+            try:
+                parsed = urlsplit(str(value))
+            except ValueError as exc:
+                raise ValueError(f"read 动作 URL 参数无效: {name}") from exc
+            if not parsed.scheme or not parsed.netloc:
+                raise ValueError(f"read 动作 URL 参数无效: {name}")
+
+
+def _research_url_key(value: object) -> str | None:
+    """生成研究来源 URL 的可比键，忽略锚点和末尾斜杠但保留查询语义。"""
+
+    try:
+        parsed = urlsplit(str(value or "").strip())
+    except ValueError:
+        return None
+    if parsed.scheme.casefold() not in {"http", "https"} or not parsed.netloc:
+        return None
+    path = parsed.path.rstrip("/") or "/"
+    query = f"?{parsed.query}" if parsed.query else ""
+    return f"{parsed.scheme.casefold()}://{parsed.netloc.casefold()}{path}{query}"
+
+
+def _is_vertical_discovery_capability(name: str) -> bool:
+    """识别垂直能力中的搜索操作，避免把普通读取误当成发现回执。"""
+
+    leaf = name.strip().casefold().replace("-", "_").rsplit(".", 1)[-1]
+    return leaf == "search" or leaf.endswith("_search")
+
+
+_PUBLIC_DETAIL_FALLBACK_OPERATIONS = frozenset(
+    {
+        "intelligence.github_issue",
+        "intelligence.github_pr",
+        "intelligence.github_releases",
+    }
+)
+
+
+def _public_detail_fallback_urls(
+    operation_name: str,
+    values: Sequence[str],
+) -> tuple[str, ...]:
+    """只保留与失败 GitHub 详情类型一致的已回证公开页面 URL。"""
+
+    if operation_name not in _PUBLIC_DETAIL_FALLBACK_OPERATIONS:
+        return ()
+    urls: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        key = _research_url_key(value)
+        if key is None or key in seen:
+            continue
+        parsed = urlsplit(value)
+        if parsed.netloc.casefold() != "github.com":
+            continue
+        path = parsed.path.rstrip("/")
+        if operation_name == "intelligence.github_issue":
+            matched = re.fullmatch(r"/[^/]+/[^/]+/issues/[1-9][0-9]*", path)
+        elif operation_name == "intelligence.github_pr":
+            matched = re.fullmatch(r"/[^/]+/[^/]+/pull/[1-9][0-9]*", path)
+        else:
+            matched = re.fullmatch(r"/[^/]+/[^/]+/releases(?:/tag/[^/]+)?", path)
+        if not matched:
+            continue
+        seen.add(key)
+        urls.append(value.strip())
+        if len(urls) >= 8:
+            break
+    return tuple(urls)
+
+
+def _build_public_read_fallback_plan(
+    plan: NormalizedPlan,
+    *,
+    failed_steps: Sequence[tuple[PlanStep, str, Sequence[str]]],
+    completed_step_keys: Sequence[str] = (),
+    recovery_number: int,
+) -> tuple[NormalizedPlan, dict[str, dict[str, object]]] | None:
+    """为可回证的 GitHub 详情失败建立新步骤分支，保持历史 step identity 不变。"""
+
+    if not failed_steps or recovery_number < 1:
+        return None
+    steps_by_key = {step.step_key: step for step in plan.steps}
+    failed_by_key: dict[str, tuple[PlanStep, str, tuple[str, ...]]] = {}
+    for step, operation_name, urls in failed_steps:
+        candidates = _public_detail_fallback_urls(operation_name, urls)
+        if step.step_key not in steps_by_key or not candidates:
+            return None
+        failed_by_key[step.step_key] = (step, operation_name, candidates)
+    if len(failed_by_key) != len(failed_steps):
+        return None
+
+    replaced_keys = set(failed_by_key)
+    changed = True
+    while changed:
+        changed = False
+        for step in plan.steps:
+            if step.step_key in replaced_keys:
+                continue
+            if set(step.depends_on) & replaced_keys:
+                replaced_keys.add(step.step_key)
+                changed = True
+    if replaced_keys & set(completed_step_keys):
+        return None
+
+    existing_keys = set(steps_by_key)
+    key_map: dict[str, str] = {}
+    for step in plan.steps:
+        if step.step_key not in replaced_keys:
+            continue
+        suffix = f"__web_read_recovery_{recovery_number}"
+        base = step.step_key[: max(1, 128 - len(suffix))]
+        candidate = f"{base}{suffix}"
+        if candidate in existing_keys or candidate in key_map.values():
+            return None
+        key_map[step.step_key] = candidate
+
+    metadata: dict[str, dict[str, object]] = {}
+    rewritten_steps: list[PlanStep] = []
+    for step in plan.steps:
+        if step.step_key not in replaced_keys:
+            rewritten_steps.append(step)
+            continue
+        dependencies = tuple(key_map.get(dependency, dependency) for dependency in step.depends_on)
+        failed = failed_by_key.get(step.step_key)
+        if failed is not None:
+            _, operation_name, urls = failed
+            rewritten_steps.append(
+                step.model_copy(
+                    update={
+                        "step_key": key_map[step.step_key],
+                        "title": f"{step.title}（公开页面回退）",
+                        "capability_refs": ("intelligence.web_read",),
+                        "depends_on": dependencies,
+                    }
+                )
+            )
+            metadata[step.step_key] = {
+                "fallback_step_key": key_map[step.step_key],
+                "operation_name": operation_name,
+                "urls": urls,
+            }
+            continue
+        rewritten_steps.append(
+            step.model_copy(
+                update={
+                    "step_key": key_map[step.step_key],
+                    "depends_on": dependencies,
+                }
+            )
+        )
+    return plan.model_copy(update={"steps": tuple(rewritten_steps)}), metadata
+
+
+def _build_public_read_gap_plan(
+    plan: NormalizedPlan,
+    *,
+    failed_steps: Sequence[tuple[PlanStep, str]],
+    completed_step_keys: Sequence[str] = (),
+    recovery_number: int,
+) -> tuple[NormalizedPlan, dict[str, dict[str, object]]] | None:
+    """为无可替代页面的 GitHub 关联读取保留失败事实并继续形成缺口报告。"""
+
+    if not failed_steps or recovery_number < 1:
+        return None
+    steps_by_key = {step.step_key: step for step in plan.steps}
+    failed_by_key: dict[str, tuple[PlanStep, str]] = {}
+    for step, operation_name in failed_steps:
+        if (
+            step.step_key not in steps_by_key
+            or operation_name not in _PUBLIC_DETAIL_FALLBACK_OPERATIONS
+        ):
+            return None
+        failed_by_key[step.step_key] = (step, operation_name)
+    if len(failed_by_key) != len(failed_steps):
+        return None
+    blocked_keys = set(failed_by_key)
+    changed = True
+    while changed:
+        changed = False
+        for step in plan.steps:
+            if step.step_key in blocked_keys:
+                continue
+            if set(step.depends_on) & blocked_keys:
+                blocked_keys.add(step.step_key)
+                changed = True
+    if blocked_keys & set(completed_step_keys):
+        return None
+    answer_steps = [
+        step for step in plan.steps
+        if step.kind == "answer" and step.step_key in blocked_keys
+    ]
+    if len(answer_steps) != 1:
+        return None
+
+    existing_keys = set(steps_by_key)
+    key_map: dict[str, str] = {}
+    suffix = f"__gap_recovery_{recovery_number}"
+    for step in answer_steps:
+        base = step.step_key[: max(1, 128 - len(suffix))]
+        candidate = f"{base}{suffix}"
+        if candidate in existing_keys or candidate in key_map.values():
+            return None
+        key_map[step.step_key] = candidate
+
+    metadata: dict[str, dict[str, object]] = {}
+    rewritten_steps: list[PlanStep] = []
+    for step in plan.steps:
+        if step.step_key in blocked_keys and step.kind != "answer":
+            continue
+        dependencies = tuple(
+            key_map.get(dependency, dependency)
+            for dependency in step.depends_on
+            if dependency not in blocked_keys
+        )
+        if step.step_key in key_map:
+            rewritten_steps.append(
+                step.model_copy(
+                    update={
+                        "step_key": key_map[step.step_key],
+                        "title": f"{step.title}（保留关联来源缺口）",
+                        "depends_on": dependencies,
+                    }
+                )
+            )
+            continue
+        rewritten_steps.append(step.model_copy(update={"depends_on": dependencies}))
+    gap_step_keys = tuple(key_map[step.step_key] for step in answer_steps)
+    for step, operation_name in failed_by_key.values():
+        metadata[step.step_key] = {
+            "gap_step_keys": gap_step_keys,
+            "operation_name": operation_name,
+        }
+    return plan.model_copy(update={"steps": tuple(rewritten_steps)}), metadata
+
+
+def _parallel_read_source_selection_allowed(
+    step: PlanStep,
+    *,
+    web_read_selected: bool,
+) -> bool:
+    """限制同一并发波次最多一个 web_read，避免来源唯一性被模型提案竞态破坏。"""
+
+    return not (
+        web_read_selected
+        and step.capability_refs == ("intelligence.web_read",)
+    )
+
+
+def _vertical_discovery_source_urls(
+    completed_steps: Sequence[Mapping[str, object]],
+    plan: NormalizedPlan,
+) -> tuple[str, ...]:
+    """从搜索或 GitHub 仓库回执提取可供 web_read 下钻的候选 URL。"""
+
+    steps_by_key = {step.step_key: step for step in plan.steps}
+    urls: list[str] = []
+    seen: set[str] = set()
+    for completed in completed_steps:
+        step = steps_by_key.get(str(completed.get("step_key") or ""))
+        if step is None or step.kind != "tool.read" or len(step.capability_refs) != 1:
+            continue
+        capability = step.capability_refs[0]
+        if not capability.startswith("intelligence."):
+            continue
+        model_output = completed.get("model_output")
+        if not isinstance(model_output, Mapping):
+            continue
+        candidates: list[object] = []
+        if _is_vertical_discovery_capability(capability):
+            results = model_output.get("results")
+            if isinstance(results, list):
+                candidates.extend(results)
+        elif capability == "intelligence.github_repo":
+            issues = model_output.get("issues")
+            if isinstance(issues, list):
+                candidates.extend(issues)
+            repository = model_output.get("repository")
+            if isinstance(repository, Mapping):
+                candidates.append(repository)
+        for result in candidates:
+            if not isinstance(result, Mapping):
+                continue
+            url = str(result.get("url") or "").strip()
+            key = _research_url_key(url)
+            if key is None or key in seen:
+                continue
+            seen.add(key)
+            urls.append(url)
+            if len(urls) >= 32:
+                return tuple(urls)
+    return tuple(urls)
+
+
+def _vertical_completed_read_urls(
+    completed_steps: Sequence[Mapping[str, object]],
+    plan: NormalizedPlan,
+) -> tuple[str, ...]:
+    """从已完成的 web_read 回执提取来源，避免多来源研究重复读取同一 URL。"""
+
+    steps_by_key = {step.step_key: step for step in plan.steps}
+    urls: list[str] = []
+    seen: set[str] = set()
+    for completed in completed_steps:
+        step = steps_by_key.get(str(completed.get("step_key") or ""))
+        if step is None or step.capability_refs != ("intelligence.web_read",):
+            continue
+        model_output = completed.get("model_output")
+        url = model_output.get("url") if isinstance(model_output, Mapping) else None
+        key = _research_url_key(url)
+        if key is None or key in seen:
+            continue
+        seen.add(key)
+        urls.append(str(url).strip())
+    return tuple(urls)
+
+
+def _goal_source_urls(goal: str) -> set[str]:
+    """提取用户明确给出的公开 URL，允许其绕过搜索结果直接阅读。"""
+
+    explicit: set[str] = set()
+    for raw_url in re.findall(r"https?://[^\s<>\]\[(){}]+", goal, flags=re.IGNORECASE):
+        key = _research_url_key(raw_url.rstrip(".,;:!?，。；：！？、》」』"))
+        if key is not None:
+            explicit.add(key)
+    return explicit
+
+
+def _validate_vertical_read_source(
+    arguments: Mapping[str, object],
+    *,
+    step: PlanStep,
+    plan: NormalizedPlan,
+    completed_steps: Sequence[Mapping[str, object]],
+    goal: str,
+    already_read_urls: Sequence[str] = (),
+) -> None:
+    """要求全网 web_read 优先从当前搜索回执下钻，同时保留用户直给 URL 的入口。"""
+
+    if step.kind != "tool.read" or step.capability_refs != ("intelligence.web_read",):
+        return
+    discovery_urls = {
+        key
+        for url in _vertical_discovery_source_urls(completed_steps, plan)
+        if (key := _research_url_key(url)) is not None
+    }
+    requested = _research_url_key(arguments.get("url"))
+    previous_reads = {
+        key
+        for url in (
+            *_vertical_completed_read_urls(completed_steps, plan),
+            *already_read_urls,
+        )
+        if (key := _research_url_key(url)) is not None
+    }
+    if requested in previous_reads:
+        raise ValueError(
+            "全网情报员的多来源研究不能重复读取同一 URL；请从已完成搜索回执选择另一个来源。"
+        )
+    if not discovery_urls:
+        return
+    if requested in discovery_urls or requested in _goal_source_urls(goal):
+        return
+    raise ValueError(
+        "全网情报员的 web_read URL 必须来自已完成 intelligence.web_search 的 results[].url、"
+        "已完成 intelligence.github_repo 的 issues[].url/repository.url，或来自用户明确提供的 URL；"
+        "请从当前发现回执选择原文来源，不能使用模型记忆中新造的地址。"
+    )
 
 
 _PARALLEL_READ_EXECUTOR = ThreadPoolExecutor(
@@ -222,6 +647,10 @@ _DYNAMIC_INPUT_MAX_DISCLOSED_CHARS_PER_RESOURCE = 48_000
 _DYNAMIC_INPUT_MAX_MATCH_WINDOWS = 24
 _DYNAMIC_INPUT_CONTEXT_LINES = 4
 _DYNAMIC_INPUT_EDGE_CHARS = 2_000
+_MODEL_CONTEXT_CLIP_PATTERN = re.compile(
+    r"\[模型上下文已截断：原始字段共 (?P<char_count>\d+) 字符，"
+    r"仅展示开头内容；不得视为全文。\]"
+)
 _DYNAMIC_INPUT_SIGNAL_PATTERN = re.compile(
     r"(?:\b(?:error|exception|traceback|fatal|warn(?:ing)?|failed|failure|"
     r"timeout|oom|denied|rejected|rollback|recovered|recovery|started|completed)\b|"
@@ -470,6 +899,7 @@ class DynamicToolExecutor(Protocol):
         execution_org_unit_id: str | None = None,
         remote_idempotency_key: str | None = None,
         execution_id: str | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> ToolResult:
         """执行已经过服务端验证和再授权的现有 ToolCall。"""
 
@@ -493,13 +923,22 @@ class DynamicTaskAgent:
         explore_proposer: ReadOnlyExploreProposer | None = None,
         explore_enabled: bool | None = None,
         parallel_tool_executor_factory: Callable[[Session], DynamicToolExecutor] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
+        turn_id: str | None = None,
+        client_turn_id: str | None = None,
     ) -> None:
-        """绑定统一事务、能力目录和既有工具执行器，禁止创建第二套 Runtime。"""
+        """绑定统一事务、事件账本和既有工具执行器，禁止创建第二套 Runtime。"""
 
         self.db = db
+        self._cancel_callback = is_cancelled
+        self.events = EventLog(db)
+        self._turn_id: str | None = None
+        self._client_turn_id: str | None = None
+        if turn_id or client_turn_id:
+            self.bind_turn(turn_id or "", client_turn_id)
         self.store = SopExecutionStore(db)
         self.catalog = catalog or DynamicCapabilityCatalog(db)
-        self.tool_executor = tool_executor or ToolExecutor(db)
+        self.tool_executor = tool_executor or VerticalAbilityToolExecutor(db)
         self.planner = planner
         self.action_proposer = action_proposer
         self.visual_reviewer = visual_reviewer
@@ -508,12 +947,108 @@ class DynamicTaskAgent:
         self.artifact_service = artifact_service or ArtifactService(db)
         self.connection_service = connection_service or ConnectionService(db)
         self.explore_proposer = explore_proposer
-        self.parallel_tool_executor_factory = parallel_tool_executor_factory or ToolExecutor
+        self.parallel_tool_executor_factory = (
+            parallel_tool_executor_factory or VerticalAbilityToolExecutor
+        )
         self.quota_limits: DynamicTaskQuotaLimits | None = None
         self.explore_enabled = (
             getattr(get_settings(), "dynamic_task_explore_enabled", False)
             if explore_enabled is None
             else explore_enabled
+        )
+
+    def bind_turn(self, turn_id: str, client_turn_id: str | None = None) -> None:
+        """为恢复执行绑定已验证的聊天 Turn，使后台结果回到原始消息账本。"""
+
+        self._turn_id = str(turn_id or "").strip() or None
+        self._client_turn_id = str(client_turn_id or "").strip() or None
+        self.events.bind_turn(turn_id, client_turn_id)
+
+    def _execution_cancel_probe(
+        self, instance: SopInstance, *, cancellation_only: bool = False,
+        include_callback: bool = True,
+    ) -> Callable[[], bool]:
+        """用独立短事务探测中断；发布边界只认取消，不能把普通失败当成用户取消。"""
+
+        engine = self.db.get_bind()
+        tenant_id, execution_id = instance.tenant_id, instance.id
+        callback = self._cancel_callback if include_callback else None
+        memory_database = (
+            engine.dialect.name == "sqlite"
+            and getattr(getattr(engine, "url", None), "database", None) in {None, "", ":memory:"}
+        )
+
+        def cancelled() -> bool:
+            """每次结束读事务，避免 MySQL 重复读快照吞掉跨 worker 的取消请求。"""
+
+            if not cancellation_only and callback is not None and callback():
+                return True
+            query = select(SopInstance.status, SopInstance.cancellation_requested_at).where(
+                SopInstance.id == execution_id, SopInstance.tenant_id == tenant_id,
+            )
+            if memory_database:
+                # 内存 SQLite 只有同一连接，新 Session.close 会回滚外层事务，不能伪造独立读。
+                with self.db.no_autoflush:
+                    row = self.db.exec(query).first()
+            else:
+                with Session(engine) as probe_db:
+                    row = probe_db.exec(query).first()
+            if cancellation_only:
+                if row is not None and row[0] == "succeeded":
+                    return False
+                return bool(
+                    (row is not None and (row[0] == "cancelled" or row[1] is not None))
+                    or (callback is not None and callback())
+                )
+            return row is None or row[0] in {"cancelled", "failed", "timed_out"} or row[1] is not None
+
+        return cancelled
+
+    @contextmanager
+    def _cancellation_boundary(self, instance: SopInstance, *, worker_id: str) -> Iterator[None]:
+        """模型/发布阶段取消回滚未提交产物；仅按权威取消事实转换取消导致的并发冲突。"""
+
+        try:
+            raise_if_cancelled(self._execution_cancel_probe(instance, cancellation_only=True))
+            yield
+        except (TurnCancellationRequested, SopExecutionConflictError) as exc:
+            if isinstance(exc, SopExecutionConflictError) and not self._execution_cancel_probe(
+                instance, cancellation_only=True, include_callback=False,
+            )():
+                raise
+            self.db.rollback()
+            self.db.refresh(instance)
+            persisted_cancel = (
+                instance.status == "cancelled" or instance.cancellation_requested_at is not None
+            )
+            if not isinstance(exc, TurnCancellationRequested) and not persisted_cancel:
+                raise
+            if instance.status in {"created", "running", "waiting"} and not persisted_cancel:
+                # rollback 会恢复此前提交的活动租约；不能用普通 claim 抢回它。
+                # 独立 Store 复用正式取消抢占协议，并兼容外层仍持有旧 token 的调用方。
+                cancellation_store = SopExecutionStore(self.db)
+                with cancellation_store.owned_for_cancellation(instance, worker_id=worker_id):
+                    cancellation_store.request_cancellation(
+                        instance, actor_user_id=instance.initiator_user_id,
+                        reason="用户在模型生成或报告发布前取消任务。",
+                    )
+                self.db.commit()
+            if isinstance(exc, TurnCancellationRequested):
+                raise
+            raise TurnCancellationRequested("当前研究任务已取消。") from exc
+
+    def _settle_read_cancellation(self, instance: SopInstance, actor_user_id: str) -> ToolResult:
+        """在已有 Execution 租约内取消未完成读取，阻断迟到结果覆盖取消事实。"""
+
+        self.db.refresh(instance)
+        if instance.status in {"created", "running", "waiting"}:
+            self.store.request_cancellation(
+                instance, actor_user_id=actor_user_id, reason="用户取消当前研究任务。",
+            )
+            self.db.commit()
+        return ToolResult(
+            tool_name="dynamic_task", success=False,
+            error=ToolError(code="DYNAMIC_EXECUTION_CANCELLED", message="当前研究任务已取消。"),
         )
 
     def _acquire_tool_quota(
@@ -572,7 +1107,7 @@ class DynamicTaskAgent:
             if step.kind != "tool.read":
                 raise DynamicTaskAgentError("DYNAMIC_NEXT_STEP_NOT_READ")
             capabilities = dict(verified_model.capability_snapshot_json or {})
-            completed_response = self._propose_action(
+            completed_response = self._propose_read_action(
                 instance=instance,
                 step=step,
                 model_config=verified_model,
@@ -590,6 +1125,61 @@ class DynamicTaskAgent:
                 organization_unit_id=organization_unit_id,
             )
             return step, result
+
+    def _propose_read_action(
+        self,
+        *,
+        instance: SopInstance,
+        step: PlanStep,
+        model_config: ModelConfig,
+        worker_id: str,
+        reserved_read_urls: Sequence[str] = (),
+    ) -> CompletedProviderProposal:
+        """为纯读步骤执行一次有界动作修复，并避免同一研究波次重复读取来源。"""
+
+        try:
+            return self._propose_action(
+                instance=instance,
+                step=step,
+                model_config=model_config,
+                worker_id=worker_id,
+                reserved_read_urls=reserved_read_urls,
+            )
+        except SopExecutionConflictError:
+            raise
+        except (ValidationError, ValueError) as exc:
+            if step.kind != "tool.read" or len(step.capability_refs) != 1:
+                raise DynamicTaskAgentError(
+                    "DYNAMIC_ACTION_PROPOSAL_INVALID",
+                    details={"error": str(exc)[:1000]},
+                ) from exc
+            capability_ref = step.capability_refs[0]
+            try:
+                return self._propose_action(
+                    instance=instance,
+                    step=step,
+                    model_config=model_config,
+                    worker_id=worker_id,
+                    reserved_read_urls=reserved_read_urls,
+                    repair_feedback={
+                        "code": "DYNAMIC_ACTION_PROPOSAL_INVALID",
+                        "error": str(exc)[:1000],
+                        "instruction": (
+                            "只返回完整 RuntimeActionProposal。当前是 tool.read 步骤，"
+                            "action_kind 必须为 call_tool，capability_ref 必须逐字返回冻结的唯一能力 "
+                            f"{capability_ref}，arguments 必须是该能力 schema 要求的对象，"
+                            "rationale 必须为非空字符串；禁止返回 wait_input、wait_attention、"
+                            "answer 或 complete，也不得省略或携带其他 capability_ref。"
+                        ),
+                    },
+                )
+            except SopExecutionConflictError:
+                raise
+            except (ValidationError, ValueError) as repair_exc:
+                raise DynamicTaskAgentError(
+                    "DYNAMIC_ACTION_PROPOSAL_INVALID",
+                    details={"error": str(repair_exc)[:1000]},
+                ) from repair_exc
 
     def advance_ready_parallel_reads(
         self,
@@ -627,11 +1217,42 @@ class DynamicTaskAgent:
                 and step.step_key not in completed
                 and set(step.depends_on) <= completed
             ]
+            active_steps: dict[str, SopOperation] = {}
+            for ready_step in ready:
+                existing_node = self._step(instance, ready_step.step_key)
+                if existing_node is None:
+                    continue
+                existing_operation = self._active_read_operation(existing_node)
+                if existing_operation is None:
+                    continue
+                if existing_operation.status == "retry_wait":
+                    raise DynamicTaskAgentError("DYNAMIC_READ_OPERATION_RETRY_WAIT")
+                if existing_operation.status == "unknown":
+                    raise DynamicTaskAgentError(
+                        "DYNAMIC_READ_OPERATION_RECONCILIATION_REQUIRED"
+                    )
+                active_steps[ready_step.step_key] = existing_operation
             candidates: list[tuple[PlanStep, CapabilitySnapshot]] = []
             key_counts: dict[str, int] = {}
+            web_read_selected = False
             for step in ready:
+                if step.step_key in active_steps:
+                    # 已有 prepared/running Operation 由单步恢复入口复用，不能再创建并行副本。
+                    continue
                 if len(candidates) >= limit or len(step.capability_refs) != 1:
                     break
+                if not _parallel_read_source_selection_allowed(
+                    step,
+                    web_read_selected=web_read_selected,
+                ):
+                    # web_read 的来源 URL 由同一 Execution 的发现回执唯一分配。两个
+                    # 同层步骤若同时向模型索取 URL，第二个提案可能在第一条尚未提交
+                    # 前重复选择同一来源；这不是 Provider 并发失败，改为让下一轮
+                    # 在第一条回执持久化后再提议第二条，仍保留不同能力之间的并发。
+                    if web_read_selected:
+                        continue
+                if step.capability_refs == ("intelligence.web_read",):
+                    web_read_selected = True
                 snapshot = self._frozen_read_snapshot(instance, step.capability_refs[0])
                 contract = snapshot.contract
                 key = str(contract.get("concurrency_key") or "")
@@ -663,21 +1284,29 @@ class DynamicTaskAgent:
             proposed: list[
                 tuple[PlanStep, CapabilitySnapshot, CompletedProviderProposal]
             ] = []
+            reserved_read_urls: list[str] = []
             for step, snapshot in candidates:
+                completed_response = self._propose_read_action(
+                    instance=instance,
+                    step=step,
+                    model_config=verified_model,
+                    worker_id=worker_id,
+                    reserved_read_urls=tuple(reserved_read_urls),
+                )
                 proposed.append(
                     (
                         step,
                         snapshot,
-                        self._propose_action(
-                            instance=instance,
-                            step=step,
-                            model_config=verified_model,
-                            worker_id=worker_id,
-                        ),
+                        completed_response,
                     )
                 )
+                if step.capability_refs == ("intelligence.web_read",):
+                    proposed_url = completed_response.proposal.arguments.get("url")
+                    if _research_url_key(proposed_url) is not None:
+                        reserved_read_urls.append(str(proposed_url).strip())
             prepared: list[tuple[PlanStep, SopNodeExecution, SopOperation, CapabilitySnapshot]] = []
-            dispatch: list[tuple[DynamicReadDispatchItem, dict[str, object]]] = []
+            # 只把不可变标量快照交给后台线程，不能把仍绑定主 Session 的 ORM 实例带出事务。
+            dispatch: list[tuple[str, str, str, dict[str, object]]] = []
             with self.db.begin_nested():
                 for step, snapshot, completed_response in proposed:
                     proposal = completed_response.proposal
@@ -770,7 +1399,14 @@ class DynamicTaskAgent:
                         status="dispatched",
                     )
                     self.db.add(item)
-                    dispatch.append((item, dict(operation.request_json or {})))
+                    dispatch.append(
+                        (
+                            str(item.id),
+                            str(operation.id),
+                            str(instance.id),
+                            dict(operation.request_json or {}),
+                        )
+                    )
                 self.db.flush()
             self.db.commit()
         self.db.commit()
@@ -778,15 +1414,15 @@ class DynamicTaskAgent:
         self.db.rollback()
         inbox_write_lock = threading.Lock()
 
-        def execute_one(entry: tuple[DynamicReadDispatchItem, dict[str, object]]) -> None:
+        def execute_one(entry: tuple[str, str, str, dict[str, object]]) -> None:
             """在独立 Session 中二次授权并 append-once 写入脱敏 inbox。"""
 
-            item, arguments = entry
+            item_id, operation_id, execution_id, arguments = entry
             started_at = utc_now()
             with Session(engine, expire_on_commit=False) as io_db:
-                io_item = io_db.get(DynamicReadDispatchItem, item.id)
-                operation = io_db.get(SopOperation, item.operation_id)
-                io_instance = io_db.get(SopInstance, item.execution_id)
+                io_item = io_db.get(DynamicReadDispatchItem, item_id)
+                operation = io_db.get(SopOperation, operation_id)
+                io_instance = io_db.get(SopInstance, execution_id)
                 if io_item is None or operation is None or io_instance is None:
                     raise DynamicTaskAgentError("DYNAMIC_PARALLEL_DISPATCH_CONTEXT_INVALID")
                 try:
@@ -798,6 +1434,9 @@ class DynamicTaskAgent:
                         actor_user_id=actor_user_id,
                         organization_unit_id=organization_unit_id,
                     )
+                    cancellation = DynamicTaskAgent(
+                        io_db, is_cancelled=self._cancel_callback,
+                    )._execution_cancel_probe(io_instance)
                     result = self.parallel_tool_executor_factory(io_db).execute(
                         io_instance.tenant_id,
                         ToolCall(name=operation.operation_name, arguments=arguments),
@@ -805,6 +1444,13 @@ class DynamicTaskAgent:
                         actor_user_id=actor_user_id,
                         execution_org_unit_id=organization_unit_id,
                         execution_id=io_instance.id,
+                        is_cancelled=cancellation,
+                    )
+                    raise_if_cancelled(cancellation)
+                except TurnCancellationRequested:
+                    result = ToolResult(
+                        tool_name=operation.operation_name, success=False,
+                        error=ToolError(code="DYNAMIC_EXECUTION_CANCELLED", message="并行读取已取消。"),
                     )
                 except (CapabilityAccessDenied, DynamicTaskAgentError) as exc:
                     result = ToolResult(
@@ -817,14 +1463,17 @@ class DynamicTaskAgent:
                     )
                 token = io_item.dispatch_token
                 tenant_id = io_instance.tenant_id
+                operation_name = operation.operation_name
                 io_db.rollback()
                 with inbox_write_lock:
                     with Session(engine, expire_on_commit=False) as inbox_db:
-                        inbox_item = inbox_db.get(DynamicReadDispatchItem, item.id)
-                        if inbox_item is None or inbox_item.status != "dispatched":
+                        inbox_item = inbox_db.get(DynamicReadDispatchItem, item_id)
+                        if inbox_item is None:
                             raise DynamicTaskAgentError(
                                 "DYNAMIC_PARALLEL_DISPATCH_CONTEXT_INVALID"
                             )
+                        if not self._claim_parallel_inbox_write(inbox_db, inbox_item):
+                            return
                         existing = inbox_db.exec(
                             select(DynamicReadDispatchResult).where(
                                 DynamicReadDispatchResult.tenant_id == tenant_id,
@@ -832,8 +1481,13 @@ class DynamicTaskAgent:
                             )
                         ).first()
                         if existing is None:
+                            inbox_instance = inbox_db.get(SopInstance, execution_id)
+                            if inbox_instance is None:
+                                raise DynamicTaskAgentError(
+                                    "DYNAMIC_PARALLEL_DISPATCH_CONTEXT_INVALID"
+                                )
                             snapshot = DynamicTaskAgent(inbox_db)._frozen_read_snapshot(
-                                io_instance, operation.operation_name
+                                inbox_instance, operation_name
                             )
                             output_schema = (
                                 snapshot.model_view.get("output_schema")
@@ -860,21 +1514,21 @@ class DynamicTaskAgent:
                                     finished_at=utc_now(),
                                 )
                             )
-                        inbox_item.status = "result_ready"
-                        inbox_item.updated_at = utc_now()
-                        inbox_db.add(inbox_item)
                         inbox_db.commit()
 
         futures = [_PARALLEL_READ_EXECUTOR.submit(execute_one, entry) for entry in dispatch]
-        timeout_seconds = self._stage_timeout_seconds(
-            instance, "max_parallel_read_seconds"
-        )
+        # read_timeout_seconds 已在提交波次前基于冻结预算计算；此处不能再次读取
+        # rollback 后已过期的 instance，否则真实 MySQL Session 可能在连接 provisioning
+        # 期间触发并发访问错误，遮蔽本应进入结果 inbox 的 Provider 超时。
+        timeout_seconds = read_timeout_seconds
         done, not_done = wait(futures, timeout=timeout_seconds)
-        for future, (item, _arguments) in zip(futures, dispatch, strict=True):
+        for future, (item_id, _operation_id, _execution_id, _arguments) in zip(
+            futures, dispatch, strict=True
+        ):
             if future in not_done:
                 self._append_parallel_dispatch_failure(
                     engine,
-                    item,
+                    item_id,
                     code="DYNAMIC_PARALLEL_DISPATCH_TIMEOUT",
                     message="parallel read exceeded dispatch deadline",
                 )
@@ -884,20 +1538,22 @@ class DynamicTaskAgent:
             except BaseException as exc:
                 self._append_parallel_dispatch_failure(
                     engine,
-                    item,
+                    item_id,
                     code="DYNAMIC_PARALLEL_WORKER_FAILED",
                     message=type(exc).__name__,
                 )
         results: list[tuple[PlanStep, ToolResult]] = []
         self.db.rollback()
         self.db.refresh(instance)
+        if instance.status in {"created", "running", "waiting"} and self._execution_cancel_probe(instance)():
+            with self.store.owned(instance, worker_id=worker_id):
+                self._settle_read_cancellation(instance, actor_user_id)
         if instance.status in {"cancelled", "failed", "timed_out"}:
-            for item, _arguments in dispatch:
-                persisted = self.db.get(DynamicReadDispatchItem, item.id)
-                if persisted is not None and persisted.status == "result_ready":
-                    persisted.status = "discarded"
-                    persisted.updated_at = utc_now()
-                    self.db.add(persisted)
+            # I/O worker 用独立事务写入 inbox，不能用当前 Session 缓存的 dispatched 状态结算。
+            for item_id, _operation_id, _execution_id, _arguments in dispatch:
+                item = self.db.get(DynamicReadDispatchItem, item_id)
+                if item is not None:
+                    self.store.discard_parallel_read_item(item)
             persisted_batch = self.db.get(DynamicReadDispatchBatch, batch.id)
             if persisted_batch is not None:
                 persisted_batch.status = (
@@ -914,6 +1570,22 @@ class DynamicTaskAgent:
                 self.db.add(batch)
                 self.db.commit()
                 raise DynamicTaskAgentError("DYNAMIC_PARALLEL_PLAN_REVISION_CONFLICT")
+            for _step, _node, operation, _snapshot in prepared:
+                self.db.refresh(operation)
+                if operation.status == "retry_wait":
+                    batch.status = "dispatched"
+                    batch.updated_at = utc_now()
+                    self.db.add(batch)
+                    self.db.commit()
+                    raise DynamicTaskAgentError("DYNAMIC_READ_OPERATION_RETRY_WAIT")
+                if operation.status == "unknown":
+                    batch.status = "dispatched"
+                    batch.updated_at = utc_now()
+                    self.db.add(batch)
+                    self.db.commit()
+                    raise DynamicTaskAgentError(
+                        "DYNAMIC_READ_OPERATION_RECONCILIATION_REQUIRED"
+                    )
             for step, node, operation, _snapshot in prepared:
                 item = self.db.exec(
                     select(DynamicReadDispatchItem).where(
@@ -934,8 +1606,7 @@ class DynamicTaskAgent:
                     or operation.capability_checksum != item.capability_checksum
                     or operation.request_fingerprint != item.request_fingerprint
                 ):
-                    item.status = "discarded"
-                    self.db.add(item)
+                    self.store.discard_parallel_read_item(item)
                     continue
                 succeeded = inbox.status == "succeeded"
                 self.store.finish_operation(
@@ -969,18 +1640,35 @@ class DynamicTaskAgent:
         return tuple(results)
 
     @staticmethod
+    def _claim_parallel_inbox_write(db: Session, item: DynamicReadDispatchItem) -> bool:
+        """按派发身份原子占用一次回执写入，与调用方的 inbox 插入同事务，拒绝迟到覆盖。"""
+
+        changed = db.exec(update(DynamicReadDispatchItem).where(
+            DynamicReadDispatchItem.id == item.id,
+            DynamicReadDispatchItem.tenant_id == item.tenant_id,
+            DynamicReadDispatchItem.execution_id == item.execution_id,
+            DynamicReadDispatchItem.batch_id == item.batch_id,
+            DynamicReadDispatchItem.dispatch_token == item.dispatch_token,
+            DynamicReadDispatchItem.status == "dispatched",
+        ).values(status="result_ready", updated_at=utc_now())
+            .execution_options(synchronize_session=False))
+        return changed.rowcount == 1
+
+    @staticmethod
     def _append_parallel_dispatch_failure(
         engine,
-        item: DynamicReadDispatchItem,
+        item_id: str,
         *,
         code: str,
         message: str,
     ) -> None:
-        """把 I/O worker 异常幂等收进结果 inbox，避免协调器留下 running 孤儿。"""
+        """把 I/O 异常与派发项 CAS 同事务收进 inbox，迟到失败不得复活已丢弃或已结算结果。"""
 
         with Session(engine, expire_on_commit=False) as failure_db:
-            persisted = failure_db.get(DynamicReadDispatchItem, item.id)
-            if persisted is None or persisted.status not in {"dispatched", "result_ready"}:
+            persisted = failure_db.get(DynamicReadDispatchItem, item_id)
+            if persisted is None or not DynamicTaskAgent._claim_parallel_inbox_write(
+                failure_db, persisted,
+            ):
                 return
             existing = failure_db.exec(
                 select(DynamicReadDispatchResult).where(
@@ -1000,9 +1688,6 @@ class DynamicTaskAgent:
                         finished_at=now,
                     )
                 )
-            persisted.status = "result_ready"
-            persisted.updated_at = utc_now()
-            failure_db.add(persisted)
             failure_db.commit()
 
     def run_until_blocked_or_complete(
@@ -1022,11 +1707,14 @@ class DynamicTaskAgent:
         instance = self.db.get(SopInstance, execution_id)
         if instance is None or instance.kind != "dynamic_task":
             raise DynamicTaskAgentError("DYNAMIC_EXECUTION_NOT_FOUND")
+        user_message_id = user_message_id or self._turn_id
         plan = self._current_plan(instance)
         max_steps = int(plan.budget.get("max_steps", len(plan.steps)))
         if max_steps < 1 or max_steps > 100:
             raise DynamicTaskAgentError("DYNAMIC_BUDGET_INVALID")
-        for _iteration in range(max_steps + 1):
+        remaining_transitions = max_steps + 1
+        while remaining_transitions > 0:
+            remaining_transitions -= 1
             self.db.refresh(instance)
             if resume_signal_id is not None and instance.status in {
                 "succeeded",
@@ -1060,17 +1748,59 @@ class DynamicTaskAgent:
                 self.db.commit()
                 return DynamicRunOutcome(instance.status, instance.id)
             if instance.status == "succeeded":
-                message = self.db.exec(
+                candidate_messages = self.db.exec(
                     select(Message)
                     .where(
                         Message.tenant_id == instance.tenant_id,
                         Message.session_id == instance.session_id,
                     )
                     .order_by(Message.created_at.desc(), Message.id.desc())
-                ).first()
+                ).all()
+                message = next(
+                    (
+                        candidate
+                        for candidate in candidate_messages
+                        if (
+                            isinstance(candidate.metadata_json, dict)
+                            and (
+                                str(candidate.metadata_json.get("execution_id") or "")
+                                == instance.id
+                                or (
+                                    instance.current_result_id is not None
+                                    and str(candidate.metadata_json.get("result_id") or "")
+                                    == instance.current_result_id
+                                )
+                            )
+                        )
+                    ),
+                    None,
+                )
                 return DynamicRunOutcome("succeeded", instance.id, message=message)
             self._assert_runtime_budget(instance)
             plan = self._current_plan(instance)
+            failed_step = self.db.exec(
+                select(SopNodeExecution)
+                .where(
+                    SopNodeExecution.tenant_id == instance.tenant_id,
+                    SopNodeExecution.instance_id == instance.id,
+                    SopNodeExecution.plan_revision_id == instance.current_plan_revision_id,
+                    SopNodeExecution.status == "failed",
+                )
+                .order_by(SopNodeExecution.created_at, SopNodeExecution.id)
+            ).first()
+            if failed_step is not None:
+                if self._recover_failed_public_read(instance, failed_step, worker_id=worker_id):
+                    recovery = instance.context_json["public_read_recoveries"][-1]
+                    # 修订控制轮次与失败读取不是新增业务步骤；外呼/时长预算仍照常扣减。
+                    remaining_transitions += 1 + len(recovery["failed_steps"])
+                    continue
+                error_code = self._failed_step_error_code(failed_step)
+                self.fail_execution(
+                    execution_id=instance.id,
+                    worker_id=worker_id,
+                    error_code=error_code,
+                )
+                raise DynamicTaskAgentError(error_code)
             completed_keys = self._completed_step_keys(instance)
             step = next(
                 (
@@ -1259,6 +1989,8 @@ class DynamicTaskAgent:
                             worker_id=worker_id,
                             repair_feedback=repair_feedback,
                         )
+                    except SopExecutionConflictError:
+                        raise
                     except (ValidationError, ValueError) as exc:
                         # answer 提案也必须沿用工具/知识动作的有界 repair 语义。
                         # 真实模型可能把 expected_output_schema 返回为 null 或漏掉
@@ -1349,6 +2081,11 @@ class DynamicTaskAgent:
                                 "必须在正文写出可检查完成/验收标准，命令类标准保留稳定命令和退出码，不能只写已完成。"
                                 "若含 guidance_changed_behavior_test_coverage_required，必须逐项列出改动行为对应的测试/检查，"
                                 "并明确写出‘所有改动行为均有测试覆盖’或等价的可核验边界；没有真实回执时写成待执行清单。"
+                                "若 vertical_ability_errors 含 missing_section，必须按能力包 output_contract 补齐‘结论摘要’、"
+                                "‘关键事实’、‘来源与证据’、‘冲突/缺口’等缺失章节；若含 source_url_not_disclosed，"
+                                "必须把对应成功数据源返回的完整 URL 原样写入‘来源与证据’，不能用域名、标题或搜索摘要替代。"
+                                "若含 result_quality，必须保证集合字段、count 与 result_state 一致；若含"
+                                " no_results_not_disclosed，必须明确写出对应 Provider 返回 0 条/无结果，不能把空数组描述成已找到事实。"
                                 "若 visual_evidence_errors 非空，必须依据已成功的 input.visual_review"
                                 " Operation 逐字披露其 observations/conflicts 中的事实；纯图片只能说明"
                                 "视觉观察结果，不得把尺寸、OCR状态或模型元数据写成业务事实。若存在"
@@ -1534,6 +2271,12 @@ class DynamicTaskAgent:
                             or "DYNAMIC_EXPLORE_TOOL_FAILED"
                         ),
                     )
+                retry_wait = next(
+                    (item for item in operations if item.status == "retry_wait"),
+                    None,
+                )
+                if retry_wait is not None:
+                    raise DynamicTaskAgentError("DYNAMIC_EXPLORE_OPERATION_RETRY_WAIT")
                 pending = next(
                     (item for item in operations if item.status in {"prepared", "running"}),
                     None,
@@ -1720,6 +2463,10 @@ class DynamicTaskAgent:
     ) -> None:
         """逐次重授权并串行派发一个可安全重试的纯读探索 Operation。"""
 
+        if operation.status == "retry_wait":
+            raise DynamicTaskAgentError("DYNAMIC_EXPLORE_OPERATION_RETRY_WAIT")
+        if operation.status == "unknown":
+            raise DynamicTaskAgentError("DYNAMIC_EXPLORE_OPERATION_RECONCILIATION_REQUIRED")
         try:
             self.catalog.reauthorize_tool(
                 snapshot,
@@ -1743,14 +2490,21 @@ class DynamicTaskAgent:
         elif operation.status != "running":
             return
         self.db.commit()
-        result = self.tool_executor.execute(
-            instance.tenant_id,
-            ToolCall(name=operation.operation_name, arguments=dict(operation.request_json or {})),
-            agent_id=instance.agent_id,
-            actor_user_id=actor_user_id,
-            execution_org_unit_id=organization_unit_id,
-            execution_id=instance.id,
-        )
+        cancellation = self._execution_cancel_probe(instance)
+        try:
+            result = self.tool_executor.execute(
+                instance.tenant_id,
+                ToolCall(name=operation.operation_name, arguments=dict(operation.request_json or {})),
+                agent_id=instance.agent_id,
+                actor_user_id=actor_user_id,
+                execution_org_unit_id=organization_unit_id,
+                execution_id=instance.id,
+                is_cancelled=cancellation,
+            )
+            raise_if_cancelled(cancellation)
+        except TurnCancellationRequested:
+            self._settle_read_cancellation(instance, actor_user_id)
+            raise
         self.store.finish_operation(
             operation,
             succeeded=result.success,
@@ -1892,6 +2646,8 @@ class DynamicTaskAgent:
                     model_config=model_config,
                     worker_id=worker_id,
                 )
+            except SopExecutionConflictError:
+                raise
             except (ValidationError, ValueError) as exc:
                 # Provider 的结构化动作偶尔会漏掉 action_kind/arguments。按方案的
                 # 有界 repair 语义重试一次；不能把缺字段默认为可执行动作，也不能
@@ -1913,6 +2669,8 @@ class DynamicTaskAgent:
                             ),
                         },
                     )
+                except SopExecutionConflictError:
+                    raise
                 except (ValidationError, ValueError) as repair_exc:
                     raise DynamicTaskAgentError(
                         "DYNAMIC_ACTION_PROPOSAL_INVALID",
@@ -2210,6 +2968,7 @@ class DynamicTaskAgent:
         knowledge_capability: dict[str, object] | None = None,
         forced_general_skill_id: str | None = None,
         forced_general_skill_ids: Sequence[str] = (),
+        vertical_ability_resolution: VerticalAbilityResolution | None = None,
         memory_context: Sequence[Mapping[str, object]] = (),
         conversation_context: Mapping[str, object] | None = None,
     ) -> tuple[SopInstance, bool] | None:
@@ -2238,6 +2997,25 @@ class DynamicTaskAgent:
         )
         if existing is not None:
             return existing, False
+        effective_vertical_resolution = vertical_ability_resolution
+        inherited_ids = tuple(
+            str(value).strip()
+            for value in (previous.context_json or {}).get("vertical_ability_ids", ())
+            if str(value).strip()
+        )
+        if inherited_ids and (
+            effective_vertical_resolution is None
+            or set(effective_vertical_resolution.ability_ids) == set(inherited_ids)
+        ):
+            try:
+                effective_vertical_resolution = VerticalAbilityResolver().restore(
+                    previous.capability_snapshot_json or {},
+                    checksum=previous.capability_checksum or "",
+                    tenant_id=tenant_id,
+                    agent_id=agent_id,
+                )
+            except (KeyError, ValueError) as exc:
+                raise DynamicTaskAgentError("VERTICAL_ABILITY_NOT_AVAILABLE") from exc
         parent_snapshot = dict(previous.goal_snapshot_json or {})
         inherited_criteria = self._success_criteria_projection(
             parent_snapshot.get("success_criteria")
@@ -2301,6 +3079,7 @@ class DynamicTaskAgent:
             knowledge_capability=knowledge_capability,
             forced_general_skill_id=forced_general_skill_id,
             forced_general_skill_ids=forced_general_skill_ids,
+            vertical_ability_resolution=effective_vertical_resolution,
             memory_context=memory_context,
             conversation_context=conversation_context,
             continuation_of_execution_id=previous.id,
@@ -2450,6 +3229,8 @@ class DynamicTaskAgent:
                     )
                 ).first()
                 if operation is not None:
+                    if operation.status == "retry_wait":
+                        raise DynamicTaskAgentError("DYNAMIC_WRITE_OPERATION_RETRY_WAIT")
                     attention = self.db.exec(
                         select(SopWorkItem)
                         .where(
@@ -2480,6 +3261,8 @@ class DynamicTaskAgent:
                     model_config=model_config,
                     worker_id=worker_id,
                 )
+            except SopExecutionConflictError:
+                raise
             except (ValidationError, ValueError) as exc:
                 # 知识动作同样必须满足完整RuntimeActionProposal。按方案只允许
                 # 一次带新因果指纹的repair，不能把缺失action_kind默认为可执行动作。
@@ -2499,6 +3282,8 @@ class DynamicTaskAgent:
                             ),
                         },
                     )
+                except SopExecutionConflictError:
+                    raise
                 except (ValidationError, ValueError) as repair_exc:
                     raise DynamicTaskAgentError(
                         "DYNAMIC_ACTION_PROPOSAL_INVALID",
@@ -2687,6 +3472,8 @@ class DynamicTaskAgent:
                     )
                     .order_by(SopWorkItem.created_at.desc())
                 ).first()
+                if operation is not None and operation.status == "retry_wait":
+                    raise DynamicTaskAgentError("DYNAMIC_LOCAL_OPERATION_RETRY_WAIT")
                 if operation is not None and operation.status in {"prepared", "running"}:
                     if attention is None:
                         raise DynamicTaskAgentError("DYNAMIC_LOCAL_APPROVAL_MISSING")
@@ -3129,6 +3916,12 @@ class DynamicTaskAgent:
             or operation.authorization_source_type != "standing_rule"
         ):
             raise DynamicTaskAgentError("DYNAMIC_STANDING_DISPATCH_OPERATION_INVALID")
+        if operation.status == "retry_wait":
+            raise DynamicTaskAgentError("DYNAMIC_STANDING_DISPATCH_OPERATION_RETRY_WAIT")
+        if operation.status == "unknown":
+            raise DynamicTaskAgentError(
+                "DYNAMIC_STANDING_DISPATCH_OPERATION_RECONCILIATION_REQUIRED"
+            )
         if operation.status == "running" and step.status == "running":
             return self._park_unknown_write(
                 instance=instance,
@@ -3237,6 +4030,12 @@ class DynamicTaskAgent:
                 or operation.node_execution_id != step.id
             ):
                 raise DynamicTaskAgentError("DYNAMIC_TOOL_APPROVAL_OPERATION_INVALID")
+            if operation.status == "retry_wait":
+                raise DynamicTaskAgentError("DYNAMIC_TOOL_APPROVAL_OPERATION_RETRY_WAIT")
+            if operation.status == "unknown":
+                raise DynamicTaskAgentError(
+                    "DYNAMIC_TOOL_APPROVAL_OPERATION_RECONCILIATION_REQUIRED"
+                )
             if (
                 operation.status == "running"
                 and step.status == "running"
@@ -3483,6 +4282,12 @@ class DynamicTaskAgent:
                 or operation.effect_kind not in {"local_write", "execute", "destructive"}
             ):
                 raise DynamicTaskAgentError("DYNAMIC_TOOL_APPROVAL_OPERATION_INVALID")
+            if operation.status == "retry_wait":
+                raise DynamicTaskAgentError("DYNAMIC_LOCAL_APPROVAL_OPERATION_RETRY_WAIT")
+            if operation.status == "unknown":
+                raise DynamicTaskAgentError(
+                    "DYNAMIC_LOCAL_APPROVAL_OPERATION_RECONCILIATION_REQUIRED"
+                )
             if operation.effect_kind == "destructive":
                 if not settings.dynamic_task_high_risk_destructive_allows(
                     instance.tenant_id,
@@ -3864,19 +4669,17 @@ class DynamicTaskAgent:
             use.completed_at = now
             use.updated_at = now
             self.db.add(use)
-            self.db.add(
-                AgentEvent(
-                    tenant_id=instance.tenant_id,
-                    session_id=instance.session_id,
-                    event_type="skill_countermanded",
-                    payload_json={
-                        "skill_use_id": use.id,
-                        "skill_id": use.skill_id,
-                        "execution_id": instance.id,
-                        "operation_id": operation.id,
-                        "reason": use.invalidation_reason,
-                    },
-                )
+            self.events.record(
+                instance.tenant_id,
+                instance.session_id,
+                "skill_countermanded",
+                {
+                    "skill_use_id": use.id,
+                    "skill_id": use.skill_id,
+                    "execution_id": instance.id,
+                    "operation_id": operation.id,
+                    "reason": use.invalidation_reason,
+                },
             )
 
     def resume_write_reconciliation_signal(
@@ -4670,20 +5473,18 @@ class DynamicTaskAgent:
                         capability_snapshot=snapshot,
                     )
                     for row in loaded:
-                        self.db.add(
-                            AgentEvent(
-                                tenant_id=instance.tenant_id,
-                                session_id=instance.session_id,
-                                event_type="skill_loaded",
-                                payload_json={
-                                    "skill_use_id": row.use_id,
-                                    "skill_id": row.skill_id,
-                                    "revision_id": row.revision_id,
-                                    "selection_mode": row.selection_mode,
-                                    "consumer": "dynamic_task_replan",
-                                    "plan_revision_id": revision.id,
-                                },
-                            )
+                        self.events.record(
+                            instance.tenant_id,
+                            instance.session_id,
+                            "skill_loaded",
+                            {
+                                "skill_use_id": row.use_id,
+                                "skill_id": row.skill_id,
+                                "revision_id": row.revision_id,
+                                "selection_mode": row.selection_mode,
+                                "consumer": "dynamic_task_replan",
+                                "plan_revision_id": revision.id,
+                            },
                         )
                     self._settle_execution_command(
                         instance,
@@ -4815,10 +5616,16 @@ class DynamicTaskAgent:
             select(SopOperation).where(
                 SopOperation.tenant_id == instance.tenant_id,
                 SopOperation.instance_id == instance.id,
-                SopOperation.status.in_(("running", "unknown")),
+                SopOperation.status.in_(("running", "retry_wait", "unknown")),
             )
         ).first()
         if dispatched is not None:
+            if dispatched.status == "retry_wait":
+                raise DynamicTaskAgentError("DYNAMIC_STEER_OPERATION_RETRY_WAIT")
+            if dispatched.status == "unknown":
+                raise DynamicTaskAgentError(
+                    "DYNAMIC_STEER_OPERATION_RECONCILIATION_REQUIRED"
+                )
             raise DynamicTaskAgentError("DYNAMIC_STEER_OPERATION_UNSETTLED")
         attention = self.db.exec(
             select(SopWorkItem).where(
@@ -5075,6 +5882,8 @@ class DynamicTaskAgent:
                     model_config=model_config,
                     worker_id=worker_id,
                 )
+            except SopExecutionConflictError:
+                raise
             except (ValidationError, ValueError) as exc:
                 # 知识检索也必须遵循统一的结构化动作契约。真实模型偶尔会省略
                 # action_kind 等必填字段；按方案只允许一次带新因果指纹的 repair，
@@ -5097,6 +5906,8 @@ class DynamicTaskAgent:
                             ),
                         },
                     )
+                except SopExecutionConflictError:
+                    raise
                 except (ValidationError, ValueError) as repair_exc:
                     raise DynamicTaskAgentError(
                         "DYNAMIC_ACTION_PROPOSAL_INVALID",
@@ -5142,6 +5953,12 @@ class DynamicTaskAgent:
                     )
                     self.db.commit()
                     raise DynamicTaskAgentError(exc.authorization_code) from exc
+            elif operation.status == "retry_wait":
+                raise DynamicTaskAgentError("DYNAMIC_KNOWLEDGE_OPERATION_RETRY_WAIT")
+            elif operation.status == "unknown":
+                raise DynamicTaskAgentError(
+                    "DYNAMIC_KNOWLEDGE_OPERATION_RECONCILIATION_REQUIRED"
+                )
             elif operation.status != "running":
                 raise DynamicTaskAgentError("DYNAMIC_KNOWLEDGE_OPERATION_NOT_RETRYABLE")
             self._consume_call_budget(instance, "tool_calls")
@@ -5198,6 +6015,7 @@ class DynamicTaskAgent:
         knowledge_capability: dict[str, object] | None = None,
         forced_general_skill_id: str | None = None,
         forced_general_skill_ids: Sequence[str] = (),
+        vertical_ability_resolution: VerticalAbilityResolution | None = None,
         memory_context: Sequence[Mapping[str, object]] = (),
         conversation_context: Mapping[str, object] | None = None,
         continuation_of_execution_id: str | None = None,
@@ -5266,6 +6084,16 @@ class DynamicTaskAgent:
             )
 
         verified_model = self.catalog.require_dynamic_model(tenant_id, model_config.id)
+        vertical_capabilities = list(
+            vertical_ability_resolution.capabilities
+            if vertical_ability_resolution is not None
+            else ()
+        )
+        vertical_guidance = list(
+            vertical_ability_resolution.loaded_guidance
+            if vertical_ability_resolution is not None
+            else ()
+        )
         actor_tool_loader = getattr(self.catalog, "list_actor_tools", None)
         actor_tools = (
             actor_tool_loader(tenant_id, agent_id, initiator_user_id)
@@ -5273,6 +6101,7 @@ class DynamicTaskAgent:
             else []
         )
         capabilities = [
+            *vertical_capabilities,
             *self.catalog.list_tools(tenant_id, agent_id),
             *actor_tools,
             *self.catalog.list_connector_reads(tenant_id, agent_id, initiator_user_id),
@@ -5378,6 +6207,21 @@ class DynamicTaskAgent:
                 and isinstance(frozen_model, dict)
                 and frozen_model.get("model_config_id") == verified_model.id
                 and frozen_model.get("checksum") == verified_model.capability_checksum
+                and tuple(
+                    sorted(
+                        str(value)
+                        for value in (existing.context_json or {}).get(
+                            "vertical_ability_ids", []
+                        )
+                    )
+                )
+                == tuple(
+                    sorted(
+                        vertical_ability_resolution.ability_ids
+                        if vertical_ability_resolution is not None
+                        else ()
+                    )
+                )
                 and frozen_resource_identities
                 == {(item.id, item.version) for item in resources}
                 and tuple(
@@ -5457,13 +6301,15 @@ class DynamicTaskAgent:
             }
             for loaded in runtime.apply_shared_resource_budget(tuple(preview_rows))
         ]
+        loaded_guidance = [*vertical_guidance, *loaded_guidance]
         planning_inputs = tuple(
             self._planning_input_projection(resource) for resource in resources
         )
         budget_profile = select_dynamic_budget(
             goal=goal.strip(),
             resources=planning_inputs,
-            guidance_count=len(selected_guidance),
+            guidance_count=len(selected_guidance) + len(vertical_guidance),
+            vertical_ability_count=len(vertical_guidance),
         )
         if self.planner is None:
             planner = DynamicTaskPlanner(
@@ -5561,21 +6407,19 @@ class DynamicTaskAgent:
                     continue
                 loaded_use_id_set.add(loaded.use_id)
                 loaded_guidance_rows.append(loaded)
-                self.db.add(
-                    AgentEvent(
-                        tenant_id=tenant_id,
-                        session_id=session_id,
-                        event_type="skill_loaded",
-                        payload_json={
-                            "turn_id": source_ref or f"dynamic:{session_id}",
-                            "user_message_id": source_ref or None,
-                            "skill_use_id": loaded.use_id,
-                            "skill_id": loaded.skill_id,
-                            "revision_id": loaded.revision_id,
-                            "selection_mode": loaded.selection_mode,
-                            "consumer": "dynamic_task",
-                        },
-                    )
+                self.events.record(
+                    tenant_id,
+                    session_id,
+                    "skill_loaded",
+                    {
+                        "turn_id": source_ref or f"dynamic:{session_id}",
+                        "user_message_id": source_ref or None,
+                        "skill_use_id": loaded.use_id,
+                        "skill_id": loaded.skill_id,
+                        "revision_id": loaded.revision_id,
+                        "selection_mode": loaded.selection_mode,
+                        "consumer": "dynamic_task",
+                    },
                 )
         if preview_rows:
             actual_by_revision = {
@@ -5613,6 +6457,11 @@ class DynamicTaskAgent:
             )
         loaded_use_ids = [row.use_id for row in loaded_guidance_rows]
         snapshot = {
+            **(
+                dict(vertical_ability_resolution.snapshot)
+                if vertical_ability_resolution is not None
+                else {}
+            ),
             "tools": [
                 item.model_dump(mode="json")
                 for item in capabilities
@@ -5652,6 +6501,16 @@ class DynamicTaskAgent:
             context={
                 "conversation_context": [dict(item) for item in conversation_projection],
                 "dynamic_chat_continuation": continuation_metadata,
+                "vertical_ability_ids": list(
+                    vertical_ability_resolution.ability_ids
+                    if vertical_ability_resolution is not None
+                    else ()
+                ),
+                "vertical_ability_composition_checksum": (
+                    vertical_ability_resolution.snapshot.get("composition_checksum")
+                    if vertical_ability_resolution is not None
+                    else None
+                ),
             },
             enforce_agent_lifecycle=True,
         )
@@ -5845,6 +6704,8 @@ class DynamicTaskAgent:
             step_definition = self._step_definition(instance, step_key)
             step = self._step(instance, step_key)
             if step is not None:
+                if step.status in {"failed", "cancelled", "timed_out"}:
+                    raise DynamicTaskAgentError(self._failed_step_error_code(step))
                 completed = self._completed_operation(
                     step,
                     operation_name=capability_ref,
@@ -5861,35 +6722,50 @@ class DynamicTaskAgent:
                     title=str(step_definition.get("title") or step_key),
                     required=bool(step_definition.get("required", True)),
                 )
-            action_record, _ = self.store.record_action_proposal(
-                instance,
-                step,
-                provider=provider,
-                model=model,
-                model_capability_snapshot=model_capabilities,
-                completed_response=completed_response,
-            )
-            operation, _ = self.store.prepare_operation_from_proposal(
-                instance,
-                step,
-                action_record,
-                operation_name=capability_ref,
-                request=proposal.arguments,
-                effect_kind="read",
-                caused_by_skill_use_ids=tuple(
-                    str(value)
-                    for value in step_definition.get("guidance_skill_use_ids", ())
-                    if str(value).strip()
-                ),
-                capability_snapshot=snapshot.model_dump(
-                    mode="json", exclude={"checksum", "agent_id"}
-                ),
-                capability_snapshot_checksum=snapshot.checksum,
-            )
+            operation = self._active_read_operation(step)
+            if operation is not None:
+                if operation.operation_name != capability_ref:
+                    raise DynamicTaskAgentError("DYNAMIC_READ_OPERATION_CAPABILITY_CONFLICT")
+                if operation.status == "retry_wait":
+                    raise DynamicTaskAgentError("DYNAMIC_READ_OPERATION_RETRY_WAIT")
+                if operation.status == "unknown":
+                    raise DynamicTaskAgentError(
+                        "DYNAMIC_READ_OPERATION_RECONCILIATION_REQUIRED"
+                    )
+            else:
+                action_record, _ = self.store.record_action_proposal(
+                    instance,
+                    step,
+                    provider=provider,
+                    model=model,
+                    model_capability_snapshot=model_capabilities,
+                    completed_response=completed_response,
+                )
+                operation, _ = self.store.prepare_operation_from_proposal(
+                    instance,
+                    step,
+                    action_record,
+                    operation_name=capability_ref,
+                    request=proposal.arguments,
+                    effect_kind="read",
+                    caused_by_skill_use_ids=tuple(
+                        str(value)
+                        for value in step_definition.get("guidance_skill_use_ids", ())
+                        if str(value).strip()
+                    ),
+                    capability_snapshot=snapshot.model_dump(
+                        mode="json", exclude={"checksum", "agent_id"}
+                    ),
+                    capability_snapshot_checksum=snapshot.checksum,
+                )
             if operation.status == "succeeded":
                 if step.status == "running":
                     self.store.complete_node(instance, step, output=operation.result_json)
                 return self._operation_result(operation)
+            if operation.status == "retry_wait":
+                raise DynamicTaskAgentError("DYNAMIC_READ_OPERATION_RETRY_WAIT")
+            if operation.status == "unknown":
+                raise DynamicTaskAgentError("DYNAMIC_READ_OPERATION_RECONCILIATION_REQUIRED")
             if operation.status not in {"prepared", "running"}:
                 raise DynamicTaskAgentError("DYNAMIC_READ_OPERATION_NOT_RETRYABLE")
             if snapshot.capability_type == "connector":
@@ -5911,14 +6787,20 @@ class DynamicTaskAgent:
                 self.store.start_operation(operation)
             self._consume_call_budget(instance, "tool_calls")
             self.db.commit()
-            result = self.tool_executor.execute(
-                instance.tenant_id,
-                ToolCall(name=capability_ref, arguments=dict(proposal.arguments)),
-                agent_id=instance.agent_id,
-                actor_user_id=actor_user_id,
-                execution_org_unit_id=organization_unit_id,
-                execution_id=instance.id,
-            )
+            cancellation = self._execution_cancel_probe(instance)
+            try:
+                result = self.tool_executor.execute(
+                    instance.tenant_id,
+                    ToolCall(name=capability_ref, arguments=dict(proposal.arguments)),
+                    agent_id=instance.agent_id,
+                    actor_user_id=actor_user_id,
+                    execution_org_unit_id=organization_unit_id,
+                    execution_id=instance.id,
+                    is_cancelled=cancellation,
+                )
+                raise_if_cancelled(cancellation)
+            except TurnCancellationRequested:
+                return self._settle_read_cancellation(instance, actor_user_id)
             self.store.finish_operation(
                 operation,
                 succeeded=result.success,
@@ -5935,6 +6817,259 @@ class DynamicTaskAgent:
                 )
             self.db.commit()
             return result
+
+    def _recover_failed_public_read(
+        self, instance: SopInstance, failed: SopNodeExecution, *, worker_id: str,
+    ) -> bool:
+        """只为全部可恢复的纯读失败集合追加有界修订，不连带重派缺授权等失败。"""
+
+        if self._recoverable_public_read_operation(instance, failed) is None:
+            return False
+        with self.store.owned(instance, worker_id=worker_id):
+            self.db.refresh(instance)
+            if instance.status != "running" or failed.plan_revision_id != instance.current_plan_revision_id:
+                return False
+            history = list((instance.context_json or {}).get("public_read_recoveries") or [])
+            if len(history) >= 2:
+                return False
+            failed_nodes = self.db.exec(select(SopNodeExecution).where(
+                SopNodeExecution.tenant_id == instance.tenant_id,
+                SopNodeExecution.instance_id == instance.id,
+                SopNodeExecution.plan_revision_id == instance.current_plan_revision_id,
+                SopNodeExecution.status == "failed",
+            ).order_by(SopNodeExecution.created_at, SopNodeExecution.id)).all()
+            if not failed_nodes:
+                return False
+            plan = self._current_plan(instance)
+            steps_by_key = {step.step_key: step for step in plan.steps}
+            fallback_inputs: list[tuple[PlanStep, str, tuple[str, ...]]] = []
+            for node in failed_nodes:
+                operation = self._recoverable_public_read_operation(instance, node)
+                if operation is None:
+                    return False
+                step = steps_by_key.get(node.step_key)
+                if step is None:
+                    return False
+                fallback_inputs.append(
+                    (
+                        step,
+                        operation.operation_name,
+                        self._public_read_recovery_source_urls(
+                            instance,
+                            operation_name=operation.operation_name,
+                        ),
+                    )
+                )
+            fallback_result = _build_public_read_fallback_plan(
+                plan,
+                failed_steps=fallback_inputs,
+                completed_step_keys=tuple(self._completed_step_keys(instance)),
+                recovery_number=len(history) + 1,
+            )
+            gap_result = None
+            if fallback_result is None:
+                specialized_failures = tuple(
+                    item
+                    for item in fallback_inputs
+                    if item[1] in _PUBLIC_DETAIL_FALLBACK_OPERATIONS
+                )
+                if specialized_failures:
+                    # GitHub 专用详情没有公开详情候选时只能进入显式缺口分支；
+                    # 混入普通读取则拒绝本轮修订，避免把专用失败隐式重派。
+                    if len(specialized_failures) != len(fallback_inputs):
+                        return False
+                    gap_inputs = tuple(
+                        (step, operation_name)
+                        for step, operation_name, _ in fallback_inputs
+                    )
+                    gap_result = _build_public_read_gap_plan(
+                        plan,
+                        failed_steps=gap_inputs,
+                        completed_step_keys=tuple(self._completed_step_keys(instance)),
+                        recovery_number=len(history) + 1,
+                    )
+                    if gap_result is None:
+                        return False
+            recovery_metadata = (
+                fallback_result[1]
+                if fallback_result is not None
+                else gap_result[1]
+                if gap_result is not None
+                else {}
+            )
+            recovered_steps = []
+            instructions = []
+            for node in failed_nodes:
+                operation = self._recoverable_public_read_operation(instance, node)
+                if operation is None:
+                    return False
+                error_code = self._failed_step_error_code(node)
+                source = str((operation.request_json or {}).get("url") or "")[:2048]
+                recovered_steps.append({
+                    "failed_operation_id": operation.id, "failed_step_key": node.step_key,
+                    "error_code": error_code,
+                })
+                recovery = recovery_metadata.get(node.step_key)
+                if fallback_result is not None:
+                    if recovery is None:
+                        return False
+                    fallback_step_key = str(recovery["fallback_step_key"])
+                    fallback_urls = tuple(str(url) for url in recovery["urls"])
+                    recovered_steps[-1].update(
+                        {
+                            "fallback_step_key": fallback_step_key,
+                            "fallback_capability": "intelligence.web_read",
+                            "fallback_urls": fallback_urls,
+                        }
+                    )
+                    instructions.append(
+                        f"步骤 {node.step_key} 的操作 {operation.operation_name} 失败，错误码 {error_code}；"
+                        f"原来源数据={json.dumps(source, ensure_ascii=False)}。系统已把该步骤替换为"
+                        f" {fallback_step_key}，只能调用 intelligence.web_read，并且只能从已成功回执的"
+                        f"公开详情 URL 中选择一个：{json.dumps(fallback_urls, ensure_ascii=False)}；"
+                        "不得再次调用原失败的 GitHub 专用详情能力。"
+                    )
+                    continue
+                if recovery is None:
+                    instructions.append(
+                        f"步骤 {node.step_key} 的操作 {operation.operation_name} 失败，错误码 {error_code}；"
+                        f"原来源数据={json.dumps(source, ensure_ascii=False)}。系统保留原失败账本，"
+                        "已建立新的公开读取计划修订；后续必须选择不同的可用公开来源，不能重复提交相同失败来源，"
+                        "无法取得正文时必须在报告中明确说明缺口。"
+                    )
+                    continue
+                gap_step_keys = tuple(str(key) for key in recovery["gap_step_keys"])
+                recovered_steps[-1].update(
+                    {
+                        "gap_step_keys": gap_step_keys,
+                        "gap_continuation": True,
+                    }
+                )
+                instructions.append(
+                    f"步骤 {node.step_key} 的操作 {operation.operation_name} 失败，错误码 {error_code}；"
+                    f"原来源数据={json.dumps(source, ensure_ascii=False)}。没有已成功回证的同类公开详情 URL，"
+                    f"系统已移除该失败关联分支并继续到 {json.dumps(gap_step_keys, ensure_ascii=False)}；"
+                    "不得再次调用原失败的 GitHub 专用详情能力，必须保留失败事实并在报告中明确披露证据缺口，"
+                    "不能把摘要或模型记忆写成已读取的 Issue/PR/Release 原文。"
+                )
+            instruction = (
+                f"公开读取恢复 {len(history) + 1}：" + " ".join(instructions)
+                + "保留原失败与已取得的证据，优先从发现结果选择其他可用来源完成同一步研究，"
+                "不重复失败URL或依赖搜索摘要冒充正文。若错误码表示资源类型不匹配，"
+                "必须按错误回执改用正确的详情能力，不得把同一编号再次提交给错误能力。"
+                "原用户明确指定的对象不能被替代来源"
+                "伪装成已读取；不能完成时如实说明缺口。"
+            )
+            revised_base = (
+                fallback_result[0]
+                if fallback_result is not None
+                else gap_result[0]
+                if gap_result is not None
+                else plan
+            )
+            revised = revised_base.model_copy(
+                update={"constraints": (*revised_base.constraints, instruction)}
+            )
+            revision, created = self.store.append_plan_revision(
+                instance, plan=revised, reason=PlanReason.TOOL_UNAVAILABLE,
+                capability_snapshot=dict(instance.capability_snapshot_json or {}),
+            )
+            if created:
+                history.append({
+                    **recovered_steps[0], "revision_id": revision.id, "failed_steps": recovered_steps,
+                })
+                instance.context_json = {**(instance.context_json or {}), "public_read_recoveries": history}
+                self.db.add(instance)
+                self.db.commit()
+            return created
+
+    def _public_read_recovery_source_urls(
+        self,
+        instance: SopInstance,
+        *,
+        operation_name: str,
+    ) -> tuple[str, ...]:
+        """从本次 Execution 已成功的公开回执提取指定 GitHub 详情的回退页面。"""
+
+        if operation_name not in _PUBLIC_DETAIL_FALLBACK_OPERATIONS:
+            return ()
+        operations = self.db.exec(
+            select(SopOperation).where(
+                SopOperation.tenant_id == instance.tenant_id,
+                SopOperation.instance_id == instance.id,
+                SopOperation.status == "succeeded",
+                SopOperation.effect_kind == "read",
+            )
+        ).all()
+        urls: list[str] = []
+        seen: set[str] = set()
+        for operation in operations:
+            if not str(operation.operation_name).startswith("intelligence."):
+                continue
+            data = (operation.result_json or {}).get("data")
+            candidates: list[str] = []
+            _collect_vertical_source_urls(data, candidates, set())
+            for url in _public_detail_fallback_urls(operation_name, candidates):
+                key = _research_url_key(url)
+                if key is None or key in seen:
+                    continue
+                seen.add(key)
+                urls.append(url)
+                if len(urls) >= 8:
+                    return tuple(urls)
+        return tuple(urls)
+
+    def _recoverable_public_read_operation(
+        self, instance: SopInstance, failed: SopNodeExecution,
+    ) -> SopOperation | None:
+        """核对当前修订失败节点及纯读 Operation，安全拒绝和凭据缺失不能自动恢复。"""
+
+        if (
+            failed.status != "failed" or failed.step_kind != "tool.read"
+            or failed.plan_revision_id != instance.current_plan_revision_id
+            or failed.tenant_id != instance.tenant_id or failed.instance_id != instance.id
+        ):
+            return None
+        error_code = self._failed_step_error_code(failed)
+        if error_code not in {
+            "VERTICAL_ABILITY_PROVIDER_TIMEOUT", "VERTICAL_ABILITY_PROVIDER_UNAVAILABLE",
+            "VERTICAL_ABILITY_PROVIDER_RATE_LIMITED", "VERTICAL_ABILITY_PROVIDER_HTTP_ERROR",
+            "VERTICAL_ABILITY_PROVIDER_RESPONSE_INVALID", "VERTICAL_ABILITY_PROVIDER_BLOCKED",
+            "VERTICAL_ABILITY_ANTIBOT_PAGE", "VERTICAL_ABILITY_RESOURCE_KIND_MISMATCH",
+        }:
+            return None
+        operation = self.db.exec(select(SopOperation).where(
+            SopOperation.tenant_id == instance.tenant_id,
+            SopOperation.instance_id == instance.id,
+            SopOperation.node_execution_id == failed.id,
+            SopOperation.status == "failed", SopOperation.effect_kind == "read",
+        ).order_by(SopOperation.created_at.desc(), SopOperation.id.desc())).first()
+        if operation is None:
+            return None
+        snapshot = self._frozen_read_snapshot(instance, operation.operation_name)
+        if not isinstance(snapshot.audit_view.get("vertical_ability"), Mapping):
+            return None
+        return operation
+
+    def _failed_step_error_code(self, step: SopNodeExecution) -> str:
+        """读取已失败步骤的首个稳定错误码，避免重复写入终态节点。"""
+
+        operation = self.db.exec(
+            select(SopOperation)
+            .where(
+                SopOperation.tenant_id == step.tenant_id,
+                SopOperation.node_execution_id == step.id,
+                SopOperation.status == "failed",
+            )
+            .order_by(SopOperation.created_at, SopOperation.id)
+        ).first()
+        operation_error = operation.error_json if operation is not None else {}
+        if isinstance(operation_error, dict) and str(operation_error.get("code") or "").strip():
+            return str(operation_error["code"])[:128]
+        node_error = step.error_json or {}
+        if isinstance(node_error, dict) and str(node_error.get("code") or "").strip():
+            return str(node_error["code"])[:128]
+        return "DYNAMIC_READ_OPERATION_FAILED"
 
     def resume_reauth_signal(
         self,
@@ -5994,10 +7129,17 @@ class DynamicTaskAgent:
                 operation is None
                 or operation.instance_id != instance.id
                 or operation.node_execution_id != (step.id if step else None)
-                or operation.status not in {"prepared", "running"}
                 or step is None
                 or step.status != "waiting"
             ):
+                raise DynamicTaskAgentError("DYNAMIC_REAUTH_OPERATION_INVALID")
+            if operation.status == "retry_wait":
+                raise DynamicTaskAgentError("DYNAMIC_REAUTH_OPERATION_RETRY_WAIT")
+            if operation.status == "unknown":
+                raise DynamicTaskAgentError(
+                    "DYNAMIC_REAUTH_OPERATION_RECONCILIATION_REQUIRED"
+                )
+            if operation.status not in {"prepared", "running"}:
                 raise DynamicTaskAgentError("DYNAMIC_REAUTH_OPERATION_INVALID")
             snapshot = self._frozen_read_snapshot(instance, operation.operation_name)
             if snapshot.capability_type != "connector" or snapshot.capability_id != profile.id:
@@ -6069,6 +7211,12 @@ class DynamicTaskAgent:
             operation_id = str(signal.payload_json.get("operation_id") or "")
             operation = self.db.get(SopOperation, operation_id)
             step = self.db.get(SopNodeExecution, operation.node_execution_id) if operation else None
+            if operation is not None and operation.status == "retry_wait":
+                raise DynamicTaskAgentError("DYNAMIC_CONNECTOR_TIMER_OPERATION_RETRY_WAIT")
+            if operation is not None and operation.status == "unknown":
+                raise DynamicTaskAgentError(
+                    "DYNAMIC_CONNECTOR_TIMER_OPERATION_RECONCILIATION_REQUIRED"
+                )
             if (
                 operation is None
                 or operation.instance_id != instance.id
@@ -6243,6 +7391,12 @@ class DynamicTaskAgent:
     ) -> ToolResult:
         """通过冻结 profile 身份和实时绑定执行 provider 读，reauth 时保留原 Operation。"""
 
+        if operation.status == "retry_wait":
+            raise DynamicTaskAgentError("DYNAMIC_CONNECTOR_OPERATION_RETRY_WAIT")
+        if operation.status == "unknown":
+            raise DynamicTaskAgentError("DYNAMIC_CONNECTOR_OPERATION_RECONCILIATION_REQUIRED")
+        if operation.status not in {"prepared", "running"}:
+            raise DynamicTaskAgentError("DYNAMIC_CONNECTOR_OPERATION_INVALID")
         provider = str(snapshot.contract.get("provider") or "")
         if provider not in {"slack", "wecom"}:
             raise DynamicTaskAgentError("DYNAMIC_CONNECTOR_PROVIDER_UNSUPPORTED")
@@ -6607,8 +7761,15 @@ class DynamicTaskAgent:
                 candidate_result.markdown != candidate_markdown_before_redaction
             )
             candidate_verification["guidance_pruning_applied"] = guidance_pruning_applied
+            vertical_ability_errors = self._vertical_ability_result_errors(
+                instance,
+                candidate_result,
+            )
+            candidate_verification["vertical_ability_errors"] = vertical_ability_errors
             candidate_verification["passed"] = (
-                candidate_verification.get("passed") is True and not security_errors
+                candidate_verification.get("passed") is True
+                and not security_errors
+                and not vertical_ability_errors
             )
             if candidate_verification.get("passed") is not True:
                 rejected_error = DynamicTaskAgentError(
@@ -6616,7 +7777,10 @@ class DynamicTaskAgent:
                     details=candidate_verification,
                 )
         if rejected_error is not None:
-            with self.store.owned(instance, worker_id=worker_id), self.db.begin_nested():
+            with (
+                self._cancellation_boundary(instance, worker_id=worker_id),
+                self.store.owned(instance, worker_id=worker_id), self.db.begin_nested(),
+            ):
                 if (
                     expected_plan_revision_id is not None
                     and instance.current_plan_revision_id != expected_plan_revision_id
@@ -6664,7 +7828,10 @@ class DynamicTaskAgent:
                 )
             self.db.commit()
             raise rejected_error
-        with self.store.owned(instance, worker_id=worker_id), self.db.begin_nested():
+        with (
+            self._cancellation_boundary(instance, worker_id=worker_id),
+            self.store.owned(instance, worker_id=worker_id), self.db.begin_nested(),
+        ):
             if (
                 expected_plan_revision_id is not None
                 and instance.current_plan_revision_id != expected_plan_revision_id
@@ -6773,6 +7940,8 @@ class DynamicTaskAgent:
             verification["visual_evidence_errors"] = visual_evidence_errors
             verification["formula_evidence_errors"] = formula_evidence_errors
             verification["security_errors"] = security_errors
+            vertical_ability_errors = self._vertical_ability_result_errors(instance, result)
+            verification["vertical_ability_errors"] = vertical_ability_errors
             verification["security_redaction_applied"] = (
                 result.markdown != result_markdown_before_redaction
             )
@@ -6782,6 +7951,7 @@ class DynamicTaskAgent:
                 and not visual_evidence_errors
                 and not formula_evidence_errors
                 and not security_errors
+                and not vertical_ability_errors
             )
             if verification.get("passed") is not True:
                 proposal.status = "superseded"
@@ -6797,6 +7967,23 @@ class DynamicTaskAgent:
                     "DYNAMIC_RESULT_VERIFICATION_FAILED",
                     details=verification,
                 )
+            raise_if_cancelled(self._execution_cancel_probe(instance, cancellation_only=True))
+            if user_message_id:
+                try:
+                    ensure_turn_event_open(
+                        self.db,
+                        instance.tenant_id,
+                        instance.session_id,
+                        "assistant_message_created",
+                        {
+                            "turn_id": user_message_id,
+                            "user_message_id": user_message_id,
+                        },
+                    )
+                except TurnEventFenceClosed as exc:
+                    raise TurnCancellationRequested(
+                        "当前聊天 Turn 已达到终态，放弃发布迟到的动态任务结果。"
+                    ) from exc
             control = ExecutionControlService(self.db, self.store)
             result_row, publication, _ = control.freeze_result(
                 instance,
@@ -6854,6 +8041,8 @@ class DynamicTaskAgent:
                         "turn_id": user_message_id,
                     }
                 )
+            if self._client_turn_id:
+                message_metadata["client_turn_id"] = self._client_turn_id
             message = Message(
                 tenant_id=instance.tenant_id,
                 session_id=instance.session_id,
@@ -6889,13 +8078,13 @@ class DynamicTaskAgent:
                         "turn_id": user_message_id,
                     }
                 )
-            self.db.add(
-                AgentEvent(
-                    tenant_id=instance.tenant_id,
-                    session_id=instance.session_id,
-                    event_type="assistant_message_created",
-                    payload_json=assistant_event_payload,
-                )
+            if self._client_turn_id:
+                assistant_event_payload["client_turn_id"] = self._client_turn_id
+            self.events.record(
+                instance.tenant_id,
+                instance.session_id,
+                "assistant_message_created",
+                assistant_event_payload,
             )
             control.append_execution_event(
                 instance,
@@ -6923,6 +8112,7 @@ class DynamicTaskAgent:
                     signal,
                     worker_id=signal_worker_id or worker_id,
                 )
+            raise_if_cancelled(self._cancel_callback)
             if external_publication is None:
                 self.store.complete_instance(instance)
                 GeneralSkillRuntimeService(self.db).settle_execution_uses(
@@ -6933,6 +8123,22 @@ class DynamicTaskAgent:
                         "message_id": message.id,
                     },
                 )
+                effective_turn_id = str(user_message_id or self._turn_id or "").strip()
+                if instance.source_kind == "chat" and effective_turn_id:
+                    self.events.record_terminal_once(
+                        instance.tenant_id,
+                        instance.session_id,
+                        "complete",
+                        {
+                            "status": "completed",
+                            "execution_id": instance.id,
+                            "message_id": message.id,
+                            "assistant_message_id": message.id,
+                            "reply": message.content,
+                            "turn_id": effective_turn_id,
+                            "user_message_id": effective_turn_id,
+                        },
+                    )
             else:
                 self.store.wait_for_publication(instance)
         self.db.commit()
@@ -7420,6 +8626,85 @@ class DynamicTaskAgent:
                 required[step.step_key] = values_by_path
         return required
 
+    def _vertical_ability_result_errors(
+        self,
+        instance: SopInstance,
+        result: DynamicTaskResult,
+    ) -> list[str]:
+        """校验内置能力包的结果结构、集合质量和成功来源 URL 回证。"""
+
+        frozen = instance.capability_snapshot_json or {}
+        raw_contracts = frozen.get("vertical_output_contracts")
+        required_sections: list[str] = []
+        if isinstance(raw_contracts, list):
+            for raw_contract in raw_contracts:
+                if not isinstance(raw_contract, Mapping):
+                    continue
+                contract = raw_contract.get("contract")
+                if not isinstance(contract, Mapping):
+                    continue
+                sections = contract.get("required_sections")
+                if not isinstance(sections, list):
+                    continue
+                for section in sections:
+                    normalized = str(section or "").strip()
+                    if normalized and normalized not in required_sections:
+                        required_sections.append(normalized)
+        markdown = result.markdown
+        errors = [
+            f"missing_section:{section}"
+            for section in required_sections
+            if section not in markdown
+        ]
+        errors.extend(self._vertical_ability_result_quality_errors(instance))
+        for url in _successful_vertical_source_urls(self.db, instance):
+            if not _markdown_contains_exact_source_url(markdown, url):
+                errors.append(f"source_url_not_disclosed:{url[:512]}")
+        for operation_name in _successful_vertical_no_results(self.db, instance):
+            if not _markdown_discloses_no_results(markdown):
+                errors.append(f"no_results_not_disclosed:{operation_name}")
+        return errors[:32]
+
+    def _vertical_ability_result_quality_errors(self, instance: SopInstance) -> list[str]:
+        """校验列表型垂直能力回执的集合、数量和空结果状态相互一致。"""
+
+        errors: list[str] = []
+        for operation_name, quality, data in _successful_vertical_result_quality_records(
+            self.db,
+            instance,
+        ):
+            collection_found, collection = _mapping_path_value(
+                data,
+                str(quality.get("collection_path") or ""),
+            )
+            count_found, count = _mapping_path_value(
+                data,
+                str(quality.get("count_path") or "count"),
+            )
+            state_found, state = _mapping_path_value(
+                data,
+                str(quality.get("state_path") or "result_state"),
+            )
+            if not collection_found or not isinstance(collection, list):
+                errors.append(f"result_quality:{operation_name}:collection_invalid")
+            if not count_found or isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                errors.append(f"result_quality:{operation_name}:count_invalid")
+            if not state_found or not isinstance(state, str) or not state.strip():
+                errors.append(f"result_quality:{operation_name}:state_invalid")
+            if isinstance(collection, list) and isinstance(count, int) and not isinstance(count, bool):
+                if count != len(collection):
+                    errors.append(f"result_quality:{operation_name}:count_mismatch")
+            if isinstance(collection, list) and isinstance(state, str):
+                expected_state = (
+                    str(quality.get("non_empty_state") or "success_with_data")
+                    if collection
+                    else str(quality.get("empty_state") or "no_results")
+                )
+                if state != expected_state:
+                    suffix = "non_empty_state_invalid" if collection else "empty_state_invalid"
+                    errors.append(f"result_quality:{operation_name}:{suffix}")
+        return errors[:32]
+
     def _attachment_evidence_catalog(
         self,
         instance: SopInstance,
@@ -7755,11 +9040,15 @@ class DynamicTaskAgent:
         model_config: ModelConfig,
         worker_id: str,
         repair_feedback: Mapping[str, object] | None = None,
+        reserved_read_urls: Sequence[str] = (),
     ) -> CompletedProviderProposal:
         """从机械事实生成单步提案，并仅在终态校验失败后携带有界修复事实。"""
 
         verified_model = self.catalog.require_dynamic_model(instance.tenant_id, model_config.id)
-        with self.store.owned(instance, worker_id=worker_id) as lease:
+        with (
+            self._cancellation_boundary(instance, worker_id=worker_id),
+            self.store.owned(instance, worker_id=worker_id) as lease,
+        ):
             self._assert_runtime_budget(instance)
             skill_guidance = self._step_guidance(instance, step)
             plan = self._current_plan(instance)
@@ -7876,6 +9165,36 @@ class DynamicTaskAgent:
                 if repair_feedback is None
                 else "请依据 result_repair_feedback 修复同一最终动作。"
             )
+            if step.kind == "tool.read" and step.capability_refs == ("intelligence.web_read",):
+                discovery_urls = _vertical_discovery_source_urls(
+                    projection.completed_steps,
+                    plan,
+                )
+                if discovery_urls:
+                    completed_read_urls = _vertical_completed_read_urls(
+                        projection.completed_steps,
+                        plan,
+                    )
+                    reserved_urls = tuple(
+                        dict.fromkeys(
+                            url.strip()
+                            for url in (*completed_read_urls, *reserved_read_urls)
+                            if url.strip()
+                        )
+                    )
+                    action_instruction += (
+                        " 当前已有公开发现回执；本次 web_read 必须从"
+                        " completed_steps.model_output 中已有的 results[].url、issues[].url 或"
+                        " repository.url 原样选择候选来源，不能使用模型记忆中新造的 URL。只有"
+                        "用户在目标中明确提供的 URL 可以直接读取。"
+                        "候选来源数量："
+                        f"{len(discovery_urls)}。"
+                    )
+                    if reserved_urls:
+                        action_instruction += (
+                            " 已经读取或本波次已保留的 URL 不能再次选择，请使用另一个候选来源。"
+                            f"已占用来源数量：{len(reserved_urls)}。"
+                        )
             if _repair_feedback_has_guidance_error(
                 repair_feedback,
                 "guidance_changed_behavior_test_coverage_required",
@@ -7894,6 +9213,7 @@ class DynamicTaskAgent:
                     "上一轮已经提交的 guidance_applications/items；除非验证器明确指出该项身份、"
                     "来源或证据无效，不得在修复同一动作时删除它们。"
                 )
+            step_capability_views = self._step_capability_model_views(instance, step)
             view = build_provider_execution_view(
                 execution_context=projection.model_dump(mode="json"),
                 canonical_messages=[
@@ -7908,10 +9228,7 @@ class DynamicTaskAgent:
                         "role": "user",
                         "content": {
                             "instruction": action_instruction,
-                            "current_capabilities": self._step_capability_model_views(
-                                instance,
-                                step,
-                            ),
+                            "current_capabilities": step_capability_views,
                             "result_repair_feedback": dict(repair_feedback or {}),
                             "input_resources": input_resources,
                         },
@@ -7920,15 +9237,18 @@ class DynamicTaskAgent:
                 model_capabilities=capabilities,
                 native_input_parts=proposal_native_parts,
             )
+            cancellation = self._execution_cancel_probe(instance, cancellation_only=True)
             proposer = self.action_proposer or DynamicActionProposer(
                 LLMClient(
                     verified_model,
                     timeout_seconds=self._stage_timeout_seconds(
                         instance, "max_model_call_seconds"
                     ),
-                )
+                ),
+                is_cancelled=cancellation,
             )
             try:
+                raise_if_cancelled(cancellation)
                 with self._model_lease_heartbeat(lease):
                     operation_name = (
                         "dynamic_task.answer"
@@ -7945,6 +9265,24 @@ class DynamicTaskAgent:
                     )
                     with llm_operation(operation_name):
                         completed = proposer.propose(view=view, step=step)
+                    if step.kind == "tool.read":
+                        if len(step_capability_views) != 1:
+                            raise ValueError("read 步骤必须只有一个当前能力视图")
+                        _validate_read_action_arguments(
+                            completed.proposal.arguments,
+                            step_capability_views[0],
+                        )
+                        _validate_vertical_read_source(
+                            completed.proposal.arguments,
+                            step=step,
+                            plan=plan,
+                            completed_steps=projection.completed_steps,
+                            goal=str((instance.goal_snapshot_json or {}).get("goal") or ""),
+                            already_read_urls=reserved_read_urls,
+                        )
+            except SopExecutionConflictError:
+                # 租约/并发冲突不是模型 schema 错误，不结算成已收到完整 Provider 回执。
+                raise
             except (ValidationError, ValueError):
                 # Provider 已经返回了完整响应时，本地动作 schema/信封校验失败不代表
                 # 网络回执未知。先结算这次只读输入披露，再由上层执行一次有界动作修复；
@@ -7982,11 +9320,86 @@ class DynamicTaskAgent:
                 completed,
                 repair_feedback=repair_feedback,
             )
+            # 并行只读波次由独立 I/O Session 结算；在当前 MySQL REPEATABLE READ
+            # 事务中查询来源前先开启新快照，避免看不到已经成功提交的 Operation，进而
+            # 让来源 URL 回证和可点击补全静默失效。这里没有模型/工具外呼，只提交当前
+            # 动作前已经完成的确定性输入回执。
+            self.db.commit()
+            self.db.refresh(instance)
+            source_refs = _successful_vertical_source_refs(self.db, instance)
+            source_operation_names: dict[str, str] = {}
+            for operation_name, source_url in source_refs:
+                labels = [
+                    item
+                    for item in source_operation_names.get(source_url, "").split("、")
+                    if item
+                ]
+                if operation_name not in labels:
+                    labels.append(operation_name)
+                source_operation_names[source_url] = "、".join(labels)
+            completed = _ensure_vertical_source_url_disclosures(
+                completed,
+                repair_feedback=repair_feedback,
+                source_urls=tuple(dict.fromkeys(url for _, url in source_refs)),
+                source_operation_names=source_operation_names,
+            )
+            projection_limitations = _successful_vertical_projection_limitations(
+                self.db,
+                instance,
+                completed_steps=projection.completed_steps,
+                plan=plan,
+            )
+            completed = _ensure_vertical_projection_limit_disclosures(
+                completed,
+                limitations=projection_limitations,
+            )
+            result_limitations = _successful_vertical_result_limitations(
+                self.db,
+                instance,
+            )
+            completed = _ensure_vertical_result_limit_disclosures(
+                completed,
+                limitations=result_limitations,
+            )
+            vertical_capability_names = {
+                str(name).strip()
+                for name in (instance.capability_snapshot_json or {}).get(
+                    "vertical_capability_names",
+                    [],
+                )
+                if str(name).strip()
+            }
+            vertical_step_keys = {
+                plan_step.step_key
+                for plan_step in plan.steps
+                if any(
+                    capability_ref in vertical_capability_names
+                    for capability_ref in plan_step.capability_refs
+                )
+            }
+            completed = _ensure_vertical_required_result_evidence_disclosures(
+                completed,
+                required_evidence_by_step=self._required_result_evidence(instance, plan),
+                vertical_step_keys=vertical_step_keys,
+            )
+            completed = _ensure_vertical_result_quality_disclosures(
+                completed,
+                repair_feedback=repair_feedback,
+                no_result_operations=_successful_vertical_no_results(self.db, instance),
+                no_result_operation_records=_successful_vertical_no_result_records(
+                    self.db, instance
+                ),
+            )
+            completed = _ensure_vertical_failed_operation_disclosures(
+                completed,
+                failed_operations=_vertical_failed_operation_records(self.db, instance),
+            )
             if dispatch_group is not None:
                 gateway.settle_delivered(dispatch_group)
             self.db.refresh(instance)
             self._record_model_usage(instance, completed.usage)
             self.db.commit()
+            raise_if_cancelled(cancellation)
             return completed
 
     def _ensure_attachment_formula_checks(
@@ -8061,6 +9474,10 @@ class DynamicTaskAgent:
             if not isinstance(checks, list):
                 raise DynamicTaskAgentError("DYNAMIC_INPUT_FORMULA_RECEIPT_INVALID")
             return [dict(item) for item in checks if isinstance(item, Mapping)]
+        if operation.status == "retry_wait":
+            raise DynamicTaskAgentError("DYNAMIC_INPUT_FORMULA_RETRY_WAIT")
+        if operation.status == "unknown":
+            raise DynamicTaskAgentError("DYNAMIC_INPUT_FORMULA_RECONCILIATION_REQUIRED")
         if not created or operation.status != "prepared":
             raise DynamicTaskAgentError("DYNAMIC_INPUT_FORMULA_UNSETTLED")
         self.store.start_operation(operation)
@@ -8221,6 +9638,10 @@ class DynamicTaskAgent:
             if not isinstance(data, Mapping):
                 raise DynamicTaskAgentError("DYNAMIC_INPUT_VISUAL_EVIDENCE_INVALID")
             return AttachmentVisualReview.model_validate(data)
+        if operation.status == "retry_wait":
+            raise DynamicTaskAgentError("DYNAMIC_INPUT_VISUAL_EVIDENCE_RETRY_WAIT")
+        if operation.status == "unknown":
+            raise DynamicTaskAgentError("DYNAMIC_INPUT_VISUAL_EVIDENCE_RECONCILIATION_REQUIRED")
         if not created or operation.status != "prepared":
             raise DynamicTaskAgentError("DYNAMIC_INPUT_VISUAL_EVIDENCE_UNSETTLED")
         self.store.start_operation(operation)
@@ -8393,15 +9814,30 @@ class DynamicTaskAgent:
         )
         if not planned_use_ids:
             return []
+        vertical_use_ids = {
+            use_id
+            for use_id in planned_use_ids
+            if use_id.startswith(VERTICAL_GUIDANCE_ID_PREFIX)
+        }
+        regular_use_ids = tuple(
+            use_id for use_id in planned_use_ids if use_id not in vertical_use_ids
+        )
+        vertical_blocks = self._vertical_step_guidance(
+            instance,
+            step,
+            vertical_use_ids,
+        )
+        if not regular_use_ids:
+            return vertical_blocks
         actor = self.db.get(User, instance.initiator_user_id)
         execution_uses = self.db.exec(
             select(GeneralSkillUse).where(
                 GeneralSkillUse.tenant_id == instance.tenant_id,
                 GeneralSkillUse.execution_id == instance.id,
-                GeneralSkillUse.id.in_(planned_use_ids),
+                GeneralSkillUse.id.in_(regular_use_ids),
             )
         ).all()
-        if {use.id for use in execution_uses} != set(planned_use_ids):
+        if {use.id for use in execution_uses} != set(regular_use_ids):
             raise DynamicTaskAgentError("GENERAL_SKILL_COUNTERMANDED")
         if actor is None or actor.tenant_id != instance.tenant_id:
             raise DynamicTaskAgentError("DYNAMIC_SKILL_ACTOR_NOT_FOUND")
@@ -8425,11 +9861,66 @@ class DynamicTaskAgent:
                 )
             )
             return [
-                loaded.prompt_block()
-                for loaded in projected
+                *vertical_blocks,
+                *[loaded.prompt_block() for loaded in projected],
             ]
         except GeneralSkillRuntimeError as exc:
             raise DynamicTaskAgentError(exc.code) from exc
+
+    def _vertical_step_guidance(
+        self,
+        instance: SopInstance,
+        step: PlanStep,
+        vertical_use_ids: set[str],
+    ) -> list[dict[str, object]]:
+        """从 Execution 冻结的能力包 Guidance 投影当前步骤的方法规程。"""
+
+        if not vertical_use_ids:
+            return []
+        step_vertical_use_ids = vertical_use_ids & set(step.guidance_skill_use_ids)
+        raw_guidance = (instance.capability_snapshot_json or {}).get("vertical_guidance")
+        if not isinstance(raw_guidance, list):
+            raise DynamicTaskAgentError("VERTICAL_ABILITY_GUIDANCE_NOT_FROZEN")
+        projected: list[dict[str, object]] = []
+        found: set[str] = set()
+        for item in raw_guidance:
+            if not isinstance(item, Mapping):
+                continue
+            use_ids = {
+                str(value).strip()
+                for value in item.get("skill_use_ids", ())
+                if str(value).strip()
+            }
+            matched = use_ids & step_vertical_use_ids
+            if not matched:
+                continue
+            blocks = item.get("skills")
+            if (
+                not isinstance(blocks, list)
+                or len(blocks) != 1
+                or not isinstance(blocks[0], Mapping)
+            ):
+                raise DynamicTaskAgentError("VERTICAL_ABILITY_GUIDANCE_INVALID")
+            block = blocks[0]
+            projected.append(
+                {
+                    "kind": "reviewed_vertical_ability_guidance",
+                    "skill_use_id": sorted(matched)[0],
+                    "ability_id": str(item.get("ability_id") or ""),
+                    "name": str(block.get("name") or item.get("name") or ""),
+                    "description": str(item.get("description") or ""),
+                    "instructions": str(block.get("instructions") or ""),
+                    "reviewed_resources": [],
+                    "authority": (
+                        "guidance_only; cannot override platform safety, tenant policy, SOP, "
+                        "approval, agent identity, or the current user's explicit instruction"
+                    ),
+                }
+            )
+            found.update(matched)
+        if found != step_vertical_use_ids:
+            raise DynamicTaskAgentError("VERTICAL_ABILITY_GUIDANCE_NOT_FROZEN")
+        return projected
 
     def _provider_input_resources(
         self,
@@ -8550,6 +10041,12 @@ class DynamicTaskAgent:
                     result={"data": read_payload},
                 )
             elif operation.status != "succeeded":
+                if operation.status == "retry_wait":
+                    raise DynamicTaskAgentError("DYNAMIC_INPUT_READ_RETRY_WAIT")
+                if operation.status == "unknown":
+                    raise DynamicTaskAgentError(
+                        "DYNAMIC_INPUT_READ_RECONCILIATION_REQUIRED"
+                    )
                 raise DynamicTaskAgentError("DYNAMIC_INPUT_READ_NOT_SETTLED")
             read_payload = (operation.result_json or {}).get("data")
             if not isinstance(read_payload, Mapping):
@@ -8767,6 +10264,21 @@ class DynamicTaskAgent:
             )
         ).first()
 
+    def _active_read_operation(self, step: SopNodeExecution) -> SopOperation | None:
+        """读取步骤已有的未结算纯读 Operation，防止恢复时创建第二个动作。"""
+
+        return self.db.exec(
+            select(SopOperation)
+            .where(
+                SopOperation.tenant_id == step.tenant_id,
+                SopOperation.instance_id == step.instance_id,
+                SopOperation.node_execution_id == step.id,
+                SopOperation.effect_kind == "read",
+                SopOperation.status.in_(("prepared", "running", "retry_wait", "unknown")),
+            )
+            .order_by(SopOperation.created_at.desc(), SopOperation.id.desc())
+        ).first()
+
     def _step_attention(
         self,
         instance: SopInstance,
@@ -8861,12 +10373,18 @@ class DynamicTaskAgent:
         self.db.flush()
 
     def _record_model_usage(self, instance: SopInstance, reported: dict[str, object]) -> None:
-        """累计 provider 返回的 token 事实，并在本次响应越界时持久记录后拒绝继续执行。"""
+        """累计 Provider 返回的 token 事实，将平台预算仅作为观测值而非失败门禁。
+
+        `max_input_tokens`、`max_output_tokens` 和 `max_total_tokens` 是历史上用于
+        防止运行失控的估算阈值，但它们不是 Provider 的真实配额。能力包可能需要
+        多轮检索、原文阅读和报告生成，不能因为平台估算阈值先于 Provider 返回错误
+        就中断用户任务；真正的 Provider 错误、取消和墙钟超时仍由各自的执行路径处理。
+        """
 
         context = dict(instance.context_json or {})
         usage = dict(context.get("dynamic_budget_usage") or {})
         limits = instance.budget_snapshot_json or {}
-        exceeded = False
+        exceeded: list[str] = []
         for counter, limit_key in (
             ("input_tokens", "max_input_tokens"),
             ("output_tokens", "max_output_tokens"),
@@ -8876,14 +10394,20 @@ class DynamicTaskAgent:
             increment = int(value) if isinstance(value, int) and value >= 0 else 0
             usage[counter] = int(usage.get(counter, 0)) + increment
             limit = int(limits.get(limit_key, 1_000_000))
-            exceeded = exceeded or limit < 1 or usage[counter] > limit
+            if limit < 1 or usage[counter] > limit:
+                exceeded.append(counter)
         context["dynamic_budget_usage"] = usage
+        if exceeded:
+            # 保留可审计的超量事实，供管理端观测和后续成本策略使用；不能把它
+            # 转换成平台自定义的 token 超量错误终止当前 Execution。
+            context["dynamic_budget_observations"] = {
+                **dict(context.get("dynamic_budget_observations") or {}),
+                "token_budget_mode": "provider_authoritative",
+                "last_exceeded_counters": exceeded,
+            }
         instance.context_json = context
         self.db.add(instance)
         self.db.flush()
-        if exceeded:
-            self.db.commit()
-            raise DynamicTaskAgentError("DYNAMIC_TOKEN_BUDGET_EXCEEDED")
 
     @staticmethod
     def _operation_result(operation: SopOperation) -> ToolResult:
@@ -8898,7 +10422,7 @@ class DynamicTaskAgent:
 
 
 def _planner_budget_kwargs(budget: Mapping[str, object]) -> dict[str, int]:
-    """从冻结计划投影 planner 总量预算，旧计划缺字段时使用历史上限。"""
+    """从冻结计划投影 planner 安全字段；旧 token 字段仅保留兼容和 Provider 用量观测语义。"""
 
     defaults = {
         "max_steps": 10,
@@ -8994,6 +10518,455 @@ def _mapping_path_value(source: Mapping[str, object], path: str) -> tuple[bool, 
             return False, None
         current = current[part]
     return True, current
+
+
+def _single_line_text(value: object, *, limit: int) -> str:
+    """把回执标识压成有限长度单行文本，避免运行时回证破坏报告结构。"""
+
+    if value is None:
+        return ""
+    return " ".join(str(value).split())[:limit]
+
+
+def _successful_vertical_result_quality_records(
+    db: Session,
+    instance: SopInstance,
+) -> tuple[tuple[str, Mapping[str, object], Mapping[str, object] | None], ...]:
+    """读取成功垂直操作冻结的结果质量契约和回执，不信任模型自报数量。"""
+
+    frozen = instance.capability_snapshot_json or {}
+    raw_tools = frozen.get("tools")
+    tools_by_name = {
+        str(raw.get("name") or ""): raw
+        for raw in raw_tools
+        if isinstance(raw, Mapping) and str(raw.get("name") or "").strip()
+    } if isinstance(raw_tools, list) else {}
+    operations = db.exec(
+        select(SopOperation).where(
+            SopOperation.tenant_id == instance.tenant_id,
+            SopOperation.instance_id == instance.id,
+            SopOperation.status == "succeeded",
+        )
+    ).all()
+    records: list[tuple[str, Mapping[str, object], Mapping[str, object] | None]] = []
+    for operation in operations:
+        raw_tool = tools_by_name.get(operation.operation_name)
+        if raw_tool is None:
+            raw_tool = operation.capability_snapshot_json
+        if not isinstance(raw_tool, Mapping):
+            continue
+        audit_view = raw_tool.get("audit_view")
+        if not isinstance(audit_view, Mapping) or not isinstance(
+            audit_view.get("vertical_ability"), Mapping
+        ):
+            continue
+        raw_contract = raw_tool.get("contract")
+        quality = raw_contract.get("result_quality") if isinstance(raw_contract, Mapping) else None
+        if not isinstance(quality, Mapping):
+            continue
+        raw_result = operation.result_json or {}
+        data = raw_result.get("data") if isinstance(raw_result, Mapping) else None
+        records.append(
+            (
+                operation.operation_name,
+                quality,
+                data if isinstance(data, Mapping) else None,
+            )
+        )
+    return tuple(records)
+
+
+def _successful_vertical_no_results(
+    db: Session,
+    instance: SopInstance,
+) -> tuple[str, ...]:
+    """返回成功回执中明确为空集合的垂直操作名称，供最终报告披露缺口。"""
+
+    operation_names: list[str] = []
+    for operation_name, quality, data in _successful_vertical_result_quality_records(db, instance):
+        if data is None:
+            continue
+        found, collection = _mapping_path_value(
+            data,
+            str(quality.get("collection_path") or ""),
+        )
+        if found and isinstance(collection, list) and not collection:
+            operation_names.append(operation_name)
+    return tuple(operation_names)
+
+
+def _successful_vertical_no_result_records(
+    db: Session,
+    instance: SopInstance,
+) -> tuple[tuple[str, str, str], ...]:
+    """提取成功空集合的垂直 Operation 标识，供最终报告逐项绑定空结果事实。"""
+
+    records: list[tuple[str, str, str]] = []
+    for operation in db.exec(
+        select(SopOperation).where(
+            SopOperation.tenant_id == instance.tenant_id,
+            SopOperation.instance_id == instance.id,
+            SopOperation.status == "succeeded",
+        )
+    ).all():
+        audit_view = (operation.capability_snapshot_json or {}).get("audit_view", {})
+        if not isinstance(audit_view, Mapping) or not isinstance(
+            audit_view.get("vertical_ability"), Mapping
+        ):
+            continue
+        contract = (operation.capability_snapshot_json or {}).get("contract")
+        quality = contract.get("result_quality") if isinstance(contract, Mapping) else None
+        data = (operation.result_json or {}).get("data")
+        if not isinstance(quality, Mapping) or not isinstance(data, Mapping):
+            continue
+        found, collection = _mapping_path_value(
+            data,
+            str(quality.get("collection_path") or ""),
+        )
+        if not found or not isinstance(collection, list) or collection:
+            continue
+        request = operation.request_json if isinstance(operation.request_json, Mapping) else {}
+        identifier = ""
+        for field in ("url", "repository_url", "repository", "query"):
+            value = request.get(field)
+            if isinstance(value, str) and value.strip():
+                identifier = f"{field}={_single_line_text(value, limit=512)}"
+                break
+        if not identifier:
+            identifier = f"operation_id={operation.id}"
+        records.append((operation.operation_name, f"operation_id={operation.id}", identifier))
+    return tuple(records[:64])
+
+
+def _vertical_failed_operation_records(
+    db: Session,
+    instance: SopInstance,
+) -> tuple[tuple[str, str, str, str], ...]:
+    """提取当前执行中失败垂直 Operation 的工具名、请求标识、状态和错误码。"""
+
+    operations = db.exec(
+        select(SopOperation).where(
+            SopOperation.tenant_id == instance.tenant_id,
+            SopOperation.instance_id == instance.id,
+        )
+    ).all()
+    records: list[tuple[str, str, str, str]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    terminal_failures = {"failed", "unknown", "cancelled"}
+    for operation in operations:
+        if operation.status not in terminal_failures:
+            continue
+        audit_view = (operation.capability_snapshot_json or {}).get("audit_view", {})
+        if not isinstance(audit_view, Mapping) or not isinstance(
+            audit_view.get("vertical_ability"), Mapping
+        ):
+            continue
+        request = operation.request_json if isinstance(operation.request_json, Mapping) else {}
+        identifier = ""
+        for field in ("url", "repository_url", "repository", "query"):
+            value = request.get(field)
+            if isinstance(value, str) and value.strip():
+                identifier = f"{field}={_single_line_text(value, limit=512)}"
+                break
+        if not identifier:
+            identifier = f"operation_id={operation.id}"
+        error = operation.error_json if isinstance(operation.error_json, Mapping) else {}
+        code = _single_line_text(error.get("code"), limit=256) or f"status={operation.status}"
+        record = (operation.operation_name, identifier, operation.status, code)
+        if record not in seen:
+            seen.add(record)
+            records.append(record)
+    return tuple(records[:64])
+
+
+def _markdown_discloses_no_results(markdown: str) -> bool:
+    """判断最终正文是否明确告知用户某个公开渠道没有检索到结果。"""
+
+    normalized = markdown.casefold()
+    return any(
+        marker in normalized
+        for marker in ("no_results", "无结果", "没有结果", "暂无结果", "未找到", "没有找到")
+    ) or re.search(r"(?<![\d.])0\s*条", normalized) is not None
+
+
+def _successful_vertical_source_urls(
+    db: Session,
+    instance: SopInstance,
+) -> tuple[str, ...]:
+    """从成功的内置能力回执提取可供最终报告引用的来源 URL。"""
+
+    return tuple(dict.fromkeys(url for _, url in _successful_vertical_source_refs(db, instance)))
+
+
+def _successful_vertical_source_refs(
+    db: Session,
+    instance: SopInstance,
+) -> tuple[tuple[str, str], ...]:
+    """提取成功垂直 Operation 与其来源 URL 的绑定，供报告回证逐项标注。"""
+
+    operations = db.exec(
+        select(SopOperation).where(
+            SopOperation.tenant_id == instance.tenant_id,
+            SopOperation.instance_id == instance.id,
+            SopOperation.status == "succeeded",
+        )
+    ).all()
+    refs: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for operation in operations:
+        marker = (operation.capability_snapshot_json or {}).get("audit_view", {})
+        if not isinstance(marker, Mapping) or not isinstance(
+            marker.get("vertical_ability"), Mapping
+        ):
+            continue
+        data = (operation.result_json or {}).get("data")
+        operation_urls: list[str] = []
+        _collect_vertical_source_urls(data, operation_urls, set())
+        for source_url in operation_urls:
+            ref = (operation.operation_name, source_url)
+            if ref in seen:
+                continue
+            seen.add(ref)
+            refs.append(ref)
+            if len(refs) >= 64:
+                break
+        if len(refs) >= 64:
+            break
+    return tuple(refs[:64])
+
+
+def _model_context_clip_notices(value: object) -> tuple[str, ...]:
+    """从模型可见投影中提取精确的上下文裁剪事实，不把普通正文误判为受限结果。"""
+
+    notices: list[str] = []
+    seen: set[str] = set()
+
+    def visit(item: object) -> None:
+        if isinstance(item, str):
+            for match in _MODEL_CONTEXT_CLIP_PATTERN.finditer(item):
+                notice = (
+                    f"模型上下文已截断：原始字段共 {match.group('char_count')} 字符，"
+                    "仅展示开头内容；不得视为全文。"
+                )
+                if notice not in seen:
+                    seen.add(notice)
+                    notices.append(notice)
+            return
+        if isinstance(item, Mapping):
+            for child in item.values():
+                visit(child)
+            return
+        if isinstance(item, (list, tuple)):
+            for child in item:
+                visit(child)
+
+    visit(value)
+    return tuple(notices[:8])
+
+
+def _successful_vertical_projection_limitations(
+    db: Session,
+    instance: SopInstance,
+    *,
+    completed_steps: Sequence[Mapping[str, object]],
+    plan: NormalizedPlan,
+) -> tuple[tuple[str, str, str], ...]:
+    """把模型侧裁剪绑定到成功垂直 Operation 和请求标识，供最终答案逐项披露。"""
+
+    steps_by_key = {step.step_key: step for step in plan.steps}
+    operations_by_node: dict[str, list[SopOperation]] = {}
+    operations = db.exec(
+        select(SopOperation).where(
+            SopOperation.tenant_id == instance.tenant_id,
+            SopOperation.instance_id == instance.id,
+            SopOperation.status == "succeeded",
+        )
+    ).all()
+    for operation in operations:
+        audit_view = (operation.capability_snapshot_json or {}).get("audit_view", {})
+        if not isinstance(audit_view, Mapping) or not isinstance(
+            audit_view.get("vertical_ability"), Mapping
+        ):
+            continue
+        operations_by_node.setdefault(operation.node_execution_id, []).append(operation)
+
+    limitations: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for completed in completed_steps:
+        step = steps_by_key.get(str(completed.get("step_key") or ""))
+        if step is None or step.kind != "tool.read":
+            continue
+        output_ref = completed.get("output_ref")
+        node_execution_id = (
+            str(output_ref.get("node_execution_id") or "")
+            if isinstance(output_ref, Mapping)
+            else ""
+        )
+        if not node_execution_id:
+            continue
+        notices = _model_context_clip_notices(completed.get("model_output"))
+        if not notices:
+            continue
+        for operation in operations_by_node.get(node_execution_id, ()):
+            request = operation.request_json if isinstance(operation.request_json, Mapping) else {}
+            request_url = request.get("url")
+            request_url = (
+                str(request_url).strip()
+                if isinstance(request_url, str) and request_url.strip()
+                else ""
+            )
+            source_urls: list[str] = []
+            _collect_vertical_source_urls(
+                (operation.result_json or {}).get("data"),
+                source_urls,
+                set(),
+            )
+            identifiers: list[str] = []
+            if request_url:
+                identifiers.append(f"请求 URL：{request_url}")
+            for source_url in source_urls[:4]:
+                if source_url != request_url:
+                    identifiers.append(f"实际来源：{source_url}")
+            for field in ("query", "repository", "repository_url"):
+                value = request.get(field)
+                if isinstance(value, str) and value.strip():
+                    identifiers.append(f"{field}：{' '.join(value.split())[:512]}")
+                    break
+            identifier = "；".join(identifiers) or f"Operation：{operation.id}"
+            for notice in notices:
+                item = (operation.operation_name, identifier, notice)
+                if item not in seen:
+                    seen.add(item)
+                    limitations.append(item)
+                if len(limitations) >= 64:
+                    return tuple(limitations)
+    return tuple(limitations)
+
+
+def _successful_vertical_result_limitations(
+    db: Session,
+    instance: SopInstance,
+) -> tuple[tuple[str, str, str], ...]:
+    """提取成功垂直回执中的部分/截断和子资源错误事实，绑定到 Operation。"""
+
+    operations = db.exec(
+        select(SopOperation).where(
+            SopOperation.tenant_id == instance.tenant_id,
+            SopOperation.instance_id == instance.id,
+            SopOperation.status == "succeeded",
+        )
+    ).all()
+    limitations: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for operation in operations:
+        audit_view = (operation.capability_snapshot_json or {}).get("audit_view", {})
+        if not isinstance(audit_view, Mapping) or not isinstance(
+            audit_view.get("vertical_ability"), Mapping
+        ):
+            continue
+        raw_result = operation.result_json or {}
+        data = raw_result.get("data") if isinstance(raw_result, Mapping) else None
+        if not isinstance(data, Mapping):
+            continue
+        truncated_paths: list[str] = []
+        subresource_errors: list[str] = []
+
+        def visit(value: object, path: str) -> None:
+            if isinstance(value, Mapping):
+                for key, child in value.items():
+                    field = f"{path}.{key}" if path else str(key)
+                    if child is True and (
+                        str(key) in {"partial", "truncated"}
+                        or str(key).endswith("_truncated")
+                    ):
+                        truncated_paths.append(field)
+                    if str(key) == "subresource_errors" and isinstance(child, list):
+                        for error in child:
+                            if not isinstance(error, Mapping):
+                                continue
+                            details: list[str] = []
+                            for error_key in ("resource", "code", "status_code", "url"):
+                                error_value = error.get(error_key)
+                                if error_value not in (None, ""):
+                                    details.append(
+                                        f"{error_key}={_single_line_text(error_value, limit=512)}"
+                                    )
+                            subresource_errors.append(", ".join(details) or "未提供详情")
+                        continue
+                    visit(child, field)
+            elif isinstance(value, (list, tuple)):
+                for index, child in enumerate(value):
+                    visit(child, f"{path}[{index}]")
+
+        visit(data, "data")
+        if not truncated_paths and not subresource_errors:
+            continue
+        details: list[str] = []
+        if truncated_paths:
+            details.append(
+                "部分/截断字段=" + ", ".join(truncated_paths[:16])
+            )
+        if subresource_errors:
+            details.append(
+                "子资源错误=" + "；".join(subresource_errors[:8])
+            )
+        notice = (
+            "；".join(details)
+            + "；以上回执只覆盖已返回的部分内容，不能视为完整读取。"
+        )
+        item = (
+            operation.operation_name,
+            f"operation_id={operation.id}",
+            notice,
+        )
+        if item not in seen:
+            seen.add(item)
+            limitations.append(item)
+        if len(limitations) >= 64:
+            break
+    return tuple(limitations)
+
+
+def _collect_vertical_source_urls(
+    value: object,
+    urls: list[str],
+    seen: set[str],
+) -> None:
+    """只读取回执中明确命名为 URL/link 的字段，避免把正文中的任意链接当成引用。"""
+
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            normalized_key = str(key).casefold()
+            if normalized_key in {"url", "link", "href", "source_url", "canonical_url"}:
+                if isinstance(item, str):
+                    candidate = item.strip().rstrip(".,;:)]}>")
+                    if re.match(r"^https?://[^\s<>]+$", candidate) and candidate not in seen:
+                        seen.add(candidate)
+                        urls.append(candidate)
+                        if len(urls) >= 64:
+                            return
+                continue
+            _collect_vertical_source_urls(item, urls, seen)
+            if len(urls) >= 64:
+                return
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _collect_vertical_source_urls(item, urls, seen)
+            if len(urls) >= 64:
+                return
+
+
+def _markdown_contains_exact_source_url(markdown: str, url: str) -> bool:
+    """判断正文是否包含完整 URL，避免较长畸形 URL 以合法 URL 前缀蒙混过关。"""
+
+    normalized_url = str(url or "").strip()
+    if not normalized_url:
+        return False
+    url_continuation = r"[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]"
+    return re.search(
+        rf"{re.escape(normalized_url)}(?!{url_continuation})",
+        str(markdown or ""),
+    ) is not None
 
 
 def _plan_has_required_knowledge_ancestor(plan: NormalizedPlan) -> bool:
@@ -10070,6 +12043,333 @@ def _ensure_claim_repair_hint_disclosures(
         f"{markdown}\n\n附件 Claim 回证（沿用上一轮已提交原文）：\n"
         + "\n".join(f"- {item}" for item in additions)
     )
+    normalized_proposal = completed.proposal.model_copy(update={"arguments": normalized_arguments})
+    return completed.model_copy(update={"proposal": normalized_proposal})
+
+
+def _ensure_vertical_source_url_disclosures(
+    completed: CompletedProviderProposal,
+    *,
+    repair_feedback: Mapping[str, object] | None,
+    source_urls: Sequence[str],
+    source_operation_names: Mapping[str, str] | None = None,
+) -> CompletedProviderProposal:
+    """在垂直能力结果交付或修复轮原样补入成功 Operation 的权威来源 URL。
+
+    URL 来自已成功且带垂直能力快照的 Operation 回执，不接受模型新造的地址，
+    也不改变 Claim、事实值或工具结果。补入后仍由同一结果验证器检查章节、证据
+    和安全边界；即使模型首轮漏写 URL，也不必为纯机械回证再消耗一次慢模型调用。
+    每一轮 answer 都从当前 Execution 的成功回执重建完整来源集合；修复轮不能只
+    依赖模型是否复述上一轮的运行时补全，否则模型修复其他错误时可能丢失已经确认
+    的来源。来源集合由运行时有界截取，不能由模型新增。
+
+    ``source_operation_names`` 只用于给已经取得的 URL 加上 Operation 名称，解决
+    同一结果中有多个 ``web_read`` 时，截断/失败说明无法绑定到具体回执的问题；它
+    不会创建新的来源，也不会改变 Provider 返回内容。
+    """
+
+    if completed.proposal.action_kind not in {ActionKind.ANSWER, ActionKind.COMPLETE}:
+        return completed
+    missing_urls = {url.strip() for url in source_urls if url.strip()}
+    if not missing_urls:
+        return completed
+    arguments = completed.proposal.arguments
+    markdown = str(arguments.get("markdown") or "")
+    if not markdown.strip():
+        return completed
+    additions: list[str] = []
+    for raw_url in source_urls:
+        url = raw_url.strip()
+        if not url or url not in missing_urls:
+            continue
+        operation_label = str((source_operation_names or {}).get(url) or "").strip()
+        if operation_label:
+            labels = tuple(
+                label.strip()
+                for label in re.split(r"[、,]", operation_label)
+                if label.strip()
+            )
+            labeled_url_present = any(
+                _markdown_contains_exact_source_url(line, url)
+                and all(label in line for label in labels)
+                for line in markdown.splitlines()
+            )
+        else:
+            labeled_url_present = _markdown_contains_exact_source_url(markdown, url)
+        if not labeled_url_present:
+            additions.append(
+                f"{operation_label + '：' if operation_label else ''}{url}"
+            )
+    if not additions:
+        return completed
+    if "## 来源与证据" in markdown:
+        prefix = "\n\n系统回证来源（成功工具回执，运行时补全）：\n"
+        source_heading = re.search(r"(?m)^#{1,6}\s+[^\n]*来源与证据[^\n]*\n", markdown)
+        insertion = source_heading.end() if source_heading else len(markdown)
+        if source_heading:
+            source_tail = markdown[source_heading.end():]
+            next_heading = re.search(r"(?m)^#{1,6}\s+", source_tail)
+            insertion = (
+                source_heading.end() + next_heading.start()
+                if next_heading else len(markdown)
+            )
+    else:
+        prefix = "\n\n## 来源与证据\n"
+        next_heading = re.search(r"\n#{1,6}\s+[^\n]*后续建议[^\n]*", markdown)
+        insertion = next_heading.start() if next_heading else len(markdown)
+    normalized_arguments = dict(arguments)
+    block = prefix + "\n".join(f"- {url}" for url in additions[:64]) + "\n"
+    normalized_arguments["markdown"] = (
+        f"{markdown[:insertion]}{block}{markdown[insertion:]}"
+    )
+    normalized_proposal = completed.proposal.model_copy(update={"arguments": normalized_arguments})
+    return completed.model_copy(update={"proposal": normalized_proposal})
+
+
+def _ensure_vertical_projection_limit_disclosures(
+    completed: CompletedProviderProposal,
+    *,
+    limitations: Sequence[tuple[str, str, str]],
+) -> CompletedProviderProposal:
+    """在最终报告中逐项披露模型上下文裁剪，禁止片段回执被表述为全文。"""
+
+    if completed.proposal.action_kind not in {ActionKind.ANSWER, ActionKind.COMPLETE}:
+        return completed
+    arguments = completed.proposal.arguments
+    markdown = str(arguments.get("markdown") or "")
+    if not markdown.strip() or not limitations:
+        return completed
+    additions: list[str] = []
+    lines = markdown.splitlines()
+    for operation_name, identifier, notice in limitations:
+        if any(
+            operation_name in line
+            and identifier in line
+            and ("截断" in line or "裁剪" in line)
+            for line in lines
+        ):
+            continue
+        additions.append(f"- {operation_name}（{identifier}）：{notice}")
+    if not additions:
+        return completed
+    block = "\n\n系统回证限制（模型上下文投影）：\n" + "\n".join(additions[:64])
+    if "\n## 后续建议" in markdown:
+        markdown = markdown.replace("\n## 后续建议", f"{block}\n## 后续建议", 1)
+    else:
+        markdown = f"{markdown}{block}"
+    normalized_arguments = dict(arguments)
+    normalized_arguments["markdown"] = markdown
+    normalized_proposal = completed.proposal.model_copy(update={"arguments": normalized_arguments})
+    return completed.model_copy(update={"proposal": normalized_proposal})
+
+
+def _ensure_vertical_result_limit_disclosures(
+    completed: CompletedProviderProposal,
+    *,
+    limitations: Sequence[tuple[str, str, str]],
+) -> CompletedProviderProposal:
+    """在最终报告中逐项披露 Provider 回执标记的部分结果或子资源错误。"""
+
+    if completed.proposal.action_kind not in {ActionKind.ANSWER, ActionKind.COMPLETE}:
+        return completed
+    if not limitations:
+        return completed
+    arguments = completed.proposal.arguments
+    markdown = str(arguments.get("markdown") or "")
+    if not markdown.strip():
+        return completed
+    additions: list[str] = []
+    lines = markdown.splitlines()
+    for operation_name, identifier, notice in limitations:
+        if any(
+            operation_name in line
+            and identifier in line
+            and ("截断" in line or "部分" in line or "子资源错误" in line)
+            for line in lines
+        ):
+            continue
+        additions.append(f"- {operation_name}（{identifier}）：{notice}")
+    if not additions:
+        return completed
+    block = "\n\n系统回证限制（Provider 结构化回执）：\n" + "\n".join(additions[:64])
+    if "\n## 后续建议" in markdown:
+        markdown = markdown.replace("\n## 后续建议", f"{block}\n## 后续建议", 1)
+    else:
+        markdown = f"{markdown}{block}"
+    normalized_arguments = dict(arguments)
+    normalized_arguments["markdown"] = markdown
+    normalized_proposal = completed.proposal.model_copy(update={"arguments": normalized_arguments})
+    return completed.model_copy(update={"proposal": normalized_proposal})
+
+
+def _ensure_vertical_required_result_evidence_disclosures(
+    completed: CompletedProviderProposal,
+    *,
+    required_evidence_by_step: Mapping[str, Mapping[str, object]],
+    vertical_step_keys: set[str],
+) -> CompletedProviderProposal:
+    """把成功垂直 Operation 的关键标量回证补入来源段，避免模型漏写导致假失败。
+
+    这些值来自当前 Execution 已成功 Operation 的能力契约，不接受模型新造字段；只处理
+    标量 query/provider/url 等回证，复杂结构仍由结果验证器和能力专属质量门禁处理。
+    补入内容明确标注为运行时回证，既保留审计可追溯性，也不把失败或空集合提升为成功事实。
+    """
+
+    if completed.proposal.action_kind not in {ActionKind.ANSWER, ActionKind.COMPLETE}:
+        return completed
+    if not required_evidence_by_step or not vertical_step_keys:
+        return completed
+    arguments = completed.proposal.arguments
+    markdown = str(arguments.get("markdown") or "")
+    if not markdown.strip():
+        return completed
+    normalized_markdown = " ".join(markdown.casefold().split())
+    additions: list[str] = []
+    for step_key, values in required_evidence_by_step.items():
+        if step_key not in vertical_step_keys:
+            continue
+        for path, value in values.items():
+            if isinstance(value, bool):
+                rendered = "true" if value else "false"
+            elif value is None:
+                rendered = "未配置"
+            elif isinstance(value, (str, int, float)):
+                rendered = " ".join(str(value).split())[:2000]
+            else:
+                continue
+            if not rendered:
+                continue
+            normalized_value = rendered.casefold()
+            if normalized_value in normalized_markdown:
+                continue
+            additions.append(f"- {step_key}.{path}：{rendered}")
+            normalized_markdown = f"{normalized_markdown} {normalized_value}"
+    if not additions:
+        return completed
+    if "## 来源与证据" in markdown:
+        prefix = "\n\n系统回证字段（成功垂直工具结果，运行时补全）：\n"
+    else:
+        prefix = "\n\n## 来源与证据\n系统回证字段（成功垂直工具结果，运行时补全）：\n"
+    normalized_arguments = dict(arguments)
+    normalized_arguments["markdown"] = f"{markdown}{prefix}" + "\n".join(additions[:64])
+    normalized_proposal = completed.proposal.model_copy(update={"arguments": normalized_arguments})
+    return completed.model_copy(update={"proposal": normalized_proposal})
+
+
+def _ensure_vertical_result_quality_disclosures(
+    completed: CompletedProviderProposal,
+    *,
+    repair_feedback: Mapping[str, object] | None,
+    no_result_operations: Sequence[str],
+    no_result_operation_records: Sequence[tuple[str, str, str]] = (),
+) -> CompletedProviderProposal:
+    """把权威空集合回执绑定到最终报告，不把空数组包装成成功事实。"""
+
+    if completed.proposal.action_kind not in {ActionKind.ANSWER, ActionKind.COMPLETE}:
+        return completed
+    arguments = completed.proposal.arguments
+    markdown = str(arguments.get("markdown") or "")
+    if not markdown.strip():
+        return completed
+    operation_records = tuple(no_result_operation_records)
+    if repair_feedback is not None:
+        verification = repair_feedback.get("verification")
+        errors = (
+            verification.get("vertical_ability_errors")
+            if isinstance(verification, Mapping)
+            else None
+        )
+        if isinstance(errors, Sequence) and not isinstance(errors, (str, bytes)):
+            errored_operations = {
+                str(error).split(":", 1)[1].strip()
+                for error in errors
+                if str(error).startswith("no_results_not_disclosed:")
+                and ":" in str(error)
+            }
+            operation_records = tuple(
+                (*record,)
+                for record in operation_records
+                if record[0] in errored_operations
+            ) or operation_records
+            operation_names = [
+                operation_name
+                for operation_name in no_result_operations
+                if operation_name in errored_operations
+                and operation_name not in {record[0] for record in operation_records}
+            ]
+        else:
+            operation_names = []
+    else:
+        operation_names = []
+    if not operation_records and not operation_names:
+        return completed
+    lines = markdown.splitlines()
+    additions: list[str] = []
+    for operation_name, operation_id, identifier in operation_records:
+        if any(
+            operation_name in line
+            and operation_id in line
+            and ("no_results" in line or re.search(r"(?<![\d.])0\s*条", line))
+            for line in lines
+        ):
+            continue
+        additions.append(
+            f"- {operation_name}（{operation_id}，{identifier}，result_state=no_results，count=0）："
+            "Provider 返回 0 条，未取得该渠道结果。"
+        )
+    for operation_name in operation_names:
+        if any(operation_name in line and ("no_results" in line or "0 条" in line) for line in lines):
+            continue
+        additions.append(f"- {operation_name}：Provider 返回 0 条，结果状态为 `no_results`。")
+    if not additions:
+        return completed
+    if "## 冲突/缺口" in markdown:
+        prefix = "\n\n系统回证渠道状态：\n"
+    else:
+        prefix = "\n\n## 冲突/缺口\n"
+    normalized_arguments = dict(arguments)
+    normalized_arguments["markdown"] = f"{markdown}{prefix}" + "\n".join(additions[:64])
+    normalized_proposal = completed.proposal.model_copy(update={"arguments": normalized_arguments})
+    return completed.model_copy(update={"proposal": normalized_proposal})
+
+
+def _ensure_vertical_failed_operation_disclosures(
+    completed: CompletedProviderProposal,
+    *,
+    failed_operations: Sequence[tuple[str, str, str, str]],
+) -> CompletedProviderProposal:
+    """在最终报告中绑定失败垂直 Operation 的请求标识、状态和真实错误码。"""
+
+    if completed.proposal.action_kind not in {ActionKind.ANSWER, ActionKind.COMPLETE}:
+        return completed
+    if not failed_operations:
+        return completed
+    arguments = completed.proposal.arguments
+    markdown = str(arguments.get("markdown") or "")
+    if not markdown.strip():
+        return completed
+    lines = markdown.splitlines()
+    additions: list[str] = []
+    for operation_name, identifier, status, code in failed_operations:
+        if any(
+            operation_name in line and identifier in line and code in line
+            for line in lines
+        ):
+            continue
+        additions.append(
+            f"- {operation_name}（{identifier}，status={status}，code={code}）："
+            "未取得可用结果，已作为来源缺口披露。"
+        )
+    if not additions:
+        return completed
+    block = "\n\n系统回证失败 Operation（实际执行回执）：\n" + "\n".join(additions[:64]) + "\n"
+    heading = re.search(r"\n#{1,6}\s+[^\n]*后续建议[^\n]*", markdown)
+    if heading:
+        markdown = f"{markdown[:heading.start()]}{block}{markdown[heading.start():]}"
+    else:
+        markdown = f"{markdown}{block}"
+    normalized_arguments = dict(arguments)
+    normalized_arguments["markdown"] = markdown
     normalized_proposal = completed.proposal.model_copy(update={"arguments": normalized_arguments})
     return completed.model_copy(update={"proposal": normalized_proposal})
 

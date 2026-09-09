@@ -34,12 +34,20 @@ from app.db.models import (
     SopWorkItemCommandReceipt,
     utc_now,
 )
-from app.sop_runtime.contracts import NodeExecutionStatus, SopInstanceStatus, WorkItemStatus
+from app.sop_runtime.contracts import (
+    NONTERMINAL_OPERATION_STATUSES,
+    NodeExecutionStatus,
+    OperationStatus,
+    SopInstanceStatus,
+    WorkItemStatus,
+)
 from app.sop_runtime.execution_store import SopExecutionConflictError, SopExecutionStore
 
 
 ACTIVE_ATTENTION_STATUSES = (WorkItemStatus.OFFERED.value, WorkItemStatus.CLAIMED.value)
-ACTIVE_OPERATION_STATUSES = ("prepared", "running", "unknown")
+ACTIVE_OPERATION_STATUSES = tuple(
+    status.value for status in OperationStatus if status.value in NONTERMINAL_OPERATION_STATUSES
+)
 ACTIVE_COMMAND_STATUSES = ("pending", "claimed")
 TERMINAL_SIGNAL_STATUSES = ("consumed", "dead_letter", "discarded")
 

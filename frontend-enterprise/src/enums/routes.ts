@@ -27,4 +27,5 @@ export enum EnterpriseRoute {
   ManagementAudit = '/enterprise/management-audit',
   Models = '/enterprise/models',
   Connections = '/enterprise/connections',
+  VerticalAbilitySettings = '/enterprise/vertical-abilities',
 }

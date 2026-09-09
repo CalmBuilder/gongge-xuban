@@ -1,13 +1,14 @@
 """
-@Time       : 2026/08/04 02:58
+@Time       : 2026/09/05 19:01
 @Author     : zhanglp8181
 @File       : action_proposer.py
 @CallChain  : DynamicTaskAgent → ProviderExecutionView → LLMClient → CompletedProviderProposal
-@Description: 将完整 provider JSON 响应验证为当前计划步骤唯一可持久化的动作提案。
+@Description: 透传可选取消回调，并将完整 provider JSON 验证为当前步骤唯一可持久化的动作提案。
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any, Protocol
 
 from app.dynamic_tasks.planning import (
@@ -27,17 +28,25 @@ class CompletedJsonClient(Protocol):
         self,
         system_prompt: str,
         user_payload: dict[str, Any],
+        *,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        """返回完整响应；流式半包不得实现该接口。"""
+        """支持可选取消回调并返回完整响应；流式半包不得实现该接口。"""
 
 
 class DynamicActionProposer:
     """每次只为当前步骤生成一个受计划范围约束的完整动作。"""
 
-    def __init__(self, client: CompletedJsonClient) -> None:
-        """绑定已经通过 dynamic-v1 preflight 的 provider 客户端。"""
+    def __init__(
+        self,
+        client: CompletedJsonClient,
+        *,
+        is_cancelled: Callable[[], bool] | None = None,
+    ) -> None:
+        """绑定已通过 preflight 的客户端及可选取消探针，不包装或替换回调身份。"""
 
         self.client = client
+        self.is_cancelled = is_cancelled
 
     def propose(
         self,
@@ -45,7 +54,7 @@ class DynamicActionProposer:
         view: ProviderExecutionView,
         step: PlanStep,
     ) -> CompletedProviderProposal:
-        """验证动作类别与能力引用均属于当前冻结步骤。"""
+        """透传非空取消回调，原样传播取消异常，再校验动作与当前冻结步骤的归属。"""
 
         raw, metadata = self.client.generate_json_with_metadata(
             _action_system_prompt(step=step, view=view),
@@ -55,6 +64,7 @@ class DynamicActionProposer:
                 "output_contract": _action_output_contract(step, view=view),
                 PROVIDER_CONTENT_PARTS_KEY: list(view.native_input_parts),
             },
+            **({"is_cancelled": self.is_cancelled} if self.is_cancelled is not None else {}),
         )
         raw = _normalize_action_envelope(raw, step=step)
         raw = _normalize_answer_arguments(
@@ -174,9 +184,14 @@ def _normalize_answer_arguments(
     step: PlanStep,
     view: ProviderExecutionView,
 ) -> dict[str, Any]:
-    """收回 answer 字段，并将视觉事实的无歧义展示后缀还原为权威 fact_key。"""
+    """收回 answer 字段，并将视觉事实的无歧义展示后缀还原为权威 fact_key。
 
-    if step.kind != "answer" or raw.get("action_kind") not in {"answer", "complete"}:
+    结果修复轮的 provider 偶尔只返回最终结果对象，省略动作类别。只有当前
+    步骤本身是 answer 且对象含有受控结果字段时，才能把它归一化为 answer；
+    其它步骤和未知字段仍由严格 RuntimeActionProposal 拒绝。
+    """
+
+    if step.kind != "answer":
         return raw
     movable = {
         "markdown",
@@ -187,6 +202,20 @@ def _normalize_answer_arguments(
     }
     present = movable.intersection(raw)
     arguments = raw.get("arguments")
+    if "action_kind" not in raw:
+        argument_fields = (
+            set(arguments).intersection(movable)
+            if isinstance(arguments, dict)
+            else set()
+        )
+        if present or argument_fields:
+            normalized = dict(raw)
+            normalized["action_kind"] = "answer"
+            raw = normalized
+        else:
+            return raw
+    if raw.get("action_kind") not in {"answer", "complete"}:
+        return raw
     # 真实 provider 偶尔把完整 answer 字段全部放在动作顶层并省略
     # ``arguments``。只在已有合法 answer action_kind 且至少有一个受控结果
     # 字段时创建空 arguments，随后仍由 RuntimeActionProposal/结果验证器检查
@@ -245,6 +274,19 @@ def _canonicalize_criterion_evidence(
     也不会凭空创建步骤或改变完成状态。
     """
 
+    if isinstance(evidence, list):
+        criterion_ids = [
+            str(item.get("id") or "").strip()
+            for item in view.execution_context.get("success_criteria", [])
+            if isinstance(item, dict) and str(item.get("id") or "").strip()
+        ]
+        # 单一成功标准时，部分 provider 会把该标准下的步骤证据直接作为数组返回。
+        # 只有在元素全为字符串且上下文确实只有一个标准时才收回为规范对象；多标准、
+        # 混合元素继续交给严格 schema/verifier 拒绝，避免猜错证据归属。
+        if len(criterion_ids) == 1 and all(isinstance(item, str) for item in evidence):
+            evidence = {criterion_ids[0]: evidence}
+        else:
+            return evidence
     if not isinstance(evidence, dict):
         return evidence
     completed_steps = view.execution_context.get("completed_steps", [])
@@ -677,6 +719,20 @@ def _action_output_contract(
     """按冻结计划事实补充精确形态，避免模型自创结果、证据引用或信封。"""
 
     contract: dict[str, object] = dict(_ACTION_OUTPUT_CONTRACT)
+    if step.kind in {"tool.read", "tool.write", "tool.execute", "tool.destructive"}:
+        contract["action_kind"] = (
+            "必须为 call_tool；当前步骤是工具动作，禁止返回 query_knowledge、answer、"
+            "complete、wait_input 或 wait_attention"
+        )
+    elif step.kind == "knowledge":
+        contract["action_kind"] = (
+            "必须为 query_knowledge；当前步骤是知识检索动作，禁止返回 call_tool、answer、"
+            "complete、wait_input 或 wait_attention"
+        )
+    elif step.kind == "clarification":
+        contract["action_kind"] = "必须为 wait_input 或 wait_attention"
+    elif step.kind == "answer":
+        contract["action_kind"] = "必须为 answer 或 complete"
     if step.kind in {"tool.read", "tool.write", "tool.execute", "tool.destructive", "knowledge"}:
         if len(step.capability_refs) != 1:
             raise ValueError("能力步骤必须且只能冻结一个 capability_ref。")

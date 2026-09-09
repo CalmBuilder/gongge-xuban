@@ -539,6 +539,44 @@ export type SessionGeneralSkillCatalogRead = {
   }>;
 };
 
+export type VerticalAbilityCapabilityRead = {
+  name: string;
+  description: string;
+  input_schema: Record<string, unknown>;
+  output_schema: Record<string, unknown>;
+};
+
+export type VerticalAbilityRead = {
+  id: string;
+  name: string;
+  category: string;
+  icon_key: string;
+  description: string;
+  platform_tags: string[];
+  version: string;
+  checksum: string;
+  capabilities: VerticalAbilityCapabilityRead[];
+  output_contract: Record<string, unknown>;
+  external_data_notice: string;
+  health: {
+    status: 'ready' | 'degraded';
+    message: string;
+  };
+};
+
+export type VerticalAbilityCatalogRead = {
+  items: VerticalAbilityRead[];
+};
+
+export type VerticalAbilityReadinessRead = {
+  ability_id: string;
+  configured: boolean;
+  provider?: string | null;
+  provider_name?: string | null;
+  credential_label?: string | null;
+  message: string;
+};
+
 export type GeneralSkillRunResponse = {
   skill_slug: string;
   execution_trace: Array<Record<string, unknown>>;

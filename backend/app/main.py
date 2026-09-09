@@ -55,6 +55,10 @@ from app.api import (
     tools,
     traces,
     ui_config,
+    vertical_abilities,
+    vertical_ability_connections,
+    browser_relay,
+    vertical_ability_settings,
     wecom_callbacks,
     work_items,
 )
@@ -161,6 +165,11 @@ def health() -> dict[str, str]:
 
 
 app.include_router(chat.router)
+app.include_router(vertical_abilities.router)
+app.include_router(vertical_ability_connections.router)
+app.include_router(browser_relay.user_router)
+app.include_router(browser_relay.relay_router)
+app.include_router(vertical_ability_settings.router)
 app.include_router(connection_profiles.router)
 app.include_router(dynamic_task_operations.router)
 app.include_router(wecom_callbacks.router)

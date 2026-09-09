@@ -3784,6 +3784,207 @@ class ModelConfig(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=utc_now)
 
 
+class PlatformSecret(SQLModel, table=True):
+    """保存平台级 Provider 密钥密文及其当前健康状态，不按租户复制凭据。"""
+
+    __tablename__ = "platform_secrets"
+    __table_args__ = (
+        UniqueConstraint(
+            "scope_key",
+            "provider",
+            "secret_kind",
+            name="uq_platform_secret_identity",
+        ),
+        CheckConstraint("scope_key = 'platform'", name="ck_platform_secret_scope"),
+        CheckConstraint("revision >= 1", name="ck_platform_secret_revision"),
+        CheckConstraint(
+            "status IN ('active', 'revoked')",
+            name="ck_platform_secret_status",
+        ),
+        CheckConstraint(
+            "health_status IN ('unverified', 'healthy', 'degraded', 'unhealthy')",
+            name="ck_platform_secret_health",
+        ),
+        Index(
+            "ix_platform_secrets_provider_status",
+            "provider",
+            "status",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("platformsecret"), primary_key=True)
+    scope_key: IdentifierString = Field(default="platform", index=True)
+    provider: LabelString = Field(index=True)
+    secret_kind: LabelString = Field(index=True)
+    encrypted_value: LongTextString
+    revision: int = Field(default=1, ge=1)
+    status: LabelString = Field(default="active", index=True)
+    health_status: LabelString = Field(default="unverified", index=True)
+    health_error_code: OptionalLabelString = None
+    last_checked_at: datetime | None = None
+    last_healthy_at: datetime | None = None
+    created_by_user_id: OptionalIdentifierString = None
+    updated_by_user_id: OptionalIdentifierString = None
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class VerticalAbilityConnection(SQLModel, table=True):
+    """保存用户主动绑定的网站连接密文，连接身份按租户和用户隔离。"""
+
+    __tablename__ = "vertical_ability_connections"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "user_id",
+            "platform_id",
+            "account_label",
+            name="uq_vertical_ability_connection_account",
+        ),
+        CheckConstraint(
+            "auth_method IN ('api_token', 'cookie', 'browser_session', 'oauth')",
+            name="ck_vertical_ability_connection_auth_method",
+        ),
+        CheckConstraint(
+            "transport IN ('local_loopback', 'browser_relay')",
+            name="ck_vertical_ability_connection_transport",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'connected', 'needs_reauth', 'revoked')",
+            name="ck_vertical_ability_connection_status",
+        ),
+        CheckConstraint(
+            "health_status IN ('unverified', 'healthy', 'degraded', 'unhealthy')",
+            name="ck_vertical_ability_connection_health",
+        ),
+        CheckConstraint(
+            "revision >= 1",
+            name="ck_vertical_ability_connection_revision",
+        ),
+        Index(
+            "ix_vertical_ability_connections_tenant_user",
+            "tenant_id",
+            "user_id",
+        ),
+        Index(
+            "ix_vertical_ability_connections_platform_status",
+            "platform_id",
+            "status",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("vaconnection"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    user_id: IdentifierString = Field(index=True)
+    platform_id: LabelString = Field(index=True)
+    account_label: NameString = Field(default="默认账号")
+    account_identity: OptionalNameString = None
+    auth_method: LabelString = Field(index=True)
+    transport: LabelString = Field(default="local_loopback", index=True)
+    encrypted_credentials_json: LongTextString
+    revision: int = Field(default=1, ge=1)
+    status: LabelString = Field(default="pending", index=True)
+    health_status: LabelString = Field(default="unverified", index=True)
+    health_error_code: OptionalLabelString = None
+    last_checked_at: datetime | None = None
+    last_healthy_at: datetime | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class VerticalAbilityBrowserRelaySession(SQLModel, table=True):
+    """保存用户授权的本机或远程设备配对，不把服务端在线浏览器当作所有用户的会话。"""
+
+    __tablename__ = "vertical_ability_browser_relay_sessions"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'connected', 'disconnected', 'revoked', 'expired')",
+            name="ck_vertical_ability_browser_relay_session_status",
+        ),
+        CheckConstraint(
+            "transport IN ('local_loopback', 'browser_relay')",
+            name="ck_vertical_ability_browser_relay_session_transport",
+        ),
+        CheckConstraint(
+            "expected_revision >= 0",
+            name="ck_vertical_ability_browser_relay_session_revision",
+        ),
+        Index(
+            "ix_vertical_ability_browser_relay_session_owner",
+            "tenant_id",
+            "user_id",
+            "platform_id",
+        ),
+        Index(
+            "ix_vertical_ability_browser_relay_session_status_seen",
+            "status",
+            "last_seen_at",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("varelay"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    user_id: IdentifierString = Field(index=True)
+    platform_id: LabelString = Field(index=True)
+    account_label: NameString = Field(default="默认账号")
+    expected_revision: int = Field(default=0, ge=0)
+    token_hash: LabelString = Field(index=True)
+    transport: LabelString = Field(default="browser_relay", index=True)
+    status: LabelString = Field(default="pending", index=True)
+    connection_id: OptionalIdentifierString = Field(default=None, index=True)
+    expires_at: datetime | None = None
+    last_seen_at: datetime | None = None
+    connected_at: datetime | None = None
+    disconnected_at: datetime | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class VerticalAbilityBrowserRelayCommand(SQLModel, table=True):
+    """保存服务端发往宿主机的单次固定平台命令及其有界回执。"""
+
+    __tablename__ = "vertical_ability_browser_relay_commands"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('queued', 'leased', 'succeeded', 'failed', 'cancelled', 'expired')",
+            name="ck_vertical_ability_browser_relay_command_status",
+        ),
+        CheckConstraint(
+            "command_limit IS NULL OR (command_limit >= 1 AND command_limit <= 50)",
+            name="ck_vertical_ability_browser_relay_command_limit",
+        ),
+        Index(
+            "ix_vertical_ability_browser_relay_command_session_status",
+            "relay_session_id",
+            "status",
+            "created_at",
+        ),
+        Index(
+            "ix_vertical_ability_browser_relay_command_deadline",
+            "status",
+            "deadline_at",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("varelaycmd"), primary_key=True)
+    relay_session_id: IdentifierString = Field(index=True)
+    tenant_id: IdentifierString = Field(index=True)
+    user_id: IdentifierString = Field(index=True)
+    platform_id: LabelString = Field(index=True)
+    action: LabelString
+    arguments_json: LongTextString
+    command_limit: int | None = Field(default=None)
+    status: LabelString = Field(default="queued", index=True)
+    lease_token_hash: OptionalLabelString = None
+    lease_expires_at: datetime | None = None
+    deadline_at: datetime
+    result_json: OptionalLongTextString = None
+    error_code: OptionalLabelString = None
+    error_message: OptionalPlainTextString = None
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
 class PersonaConfig(SQLModel, table=True):
     __tablename__ = "persona_configs"
 
@@ -4771,7 +4972,7 @@ class AgentEvent(SQLModel, table=True):
     )
     payload_checksum: OptionalVersionString = Field(default=None, index=True)
     payload_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
-    created_at: datetime = Field(default_factory=utc_now)
+    created_at: datetime = Field(default_factory=utc_now, sa_type=PRECISE_DATETIME)
 
 
 class MemoryRecord(SQLModel, table=True):

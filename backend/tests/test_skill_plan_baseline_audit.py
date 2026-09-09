@@ -37,6 +37,7 @@ from app.db.models import (
     Tenant,
     User,
 )
+from app.dynamic_tasks.agent import DynamicTaskAgent
 from app.general_skills.eligibility import EffectiveGeneralSkillResolver
 from app.general_skills.runner import GENERAL_SKILL_PLAN_OUTPUT, GeneralSkillRunner
 from app.sop_runtime.coordinator import DeterministicSopCoordinator
@@ -280,7 +281,9 @@ def test_runtime_role_confirms_sop_and_dynamic_task_are_disjoint_execution_contr
     assert not DeterministicSopCoordinator.is_enabled(ordinary_skill)
 
     dynamic_route_source = inspect.getsource(AgentLoop._try_handle_dynamic_task)
-    assert "DynamicTaskAgent(self.db)" in dynamic_route_source
+    assert "DynamicTaskAgent(" in dynamic_route_source
+    assert "self.db" in dynamic_route_source
+    assert "is_cancelled=cancellation" in dynamic_route_source
     assert "if decision.mode != \"dynamic_task\"" in dynamic_route_source
     assert callable(AgentLoop._answer_with_loaded_general_skill)
 
@@ -292,6 +295,16 @@ def test_runtime_role_confirms_dynamic_requests_do_not_relabel_the_agent() -> No
         "请通过持久、可恢复的分析任务完成合同风险诊断"
     )
     assert not AgentLoop._explicit_dynamic_task_requested("请解释 DynamicTaskAgent 是什么")
+
+
+def test_dynamic_runtime_uses_shared_event_log_for_turn_terminal_fence() -> None:
+    """验证动态运行时的事件出口受统一 Turn 终态栅栏保护，不能绕过 EventLog 直写。"""
+
+    dynamic_source = inspect.getsource(DynamicTaskAgent)
+    assert "self.events = EventLog(db)" in dynamic_source
+    assert "ensure_turn_event_open(" in dynamic_source
+    assert "self.events.record(" in dynamic_source
+    assert "AgentEvent(" not in dynamic_source
 
 
 # Skill/权限角色：两种治理形态共用 agent_id + user + binding + revision 资格链。
