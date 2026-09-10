@@ -65,7 +65,7 @@ class ReadOnlyExploreProposer:
     """以独立临时上下文逐轮提出纯读调用或最终证据报告。"""
 
     def __init__(self, client: ExploreJsonClient) -> None:
-        """绑定已通过 dynamic-v1 preflight 的模型客户端。"""
+        """绑定实际 provider 客户端，探索能力由调用结果决定而不是由预检门禁决定。"""
 
         self.client = client
 

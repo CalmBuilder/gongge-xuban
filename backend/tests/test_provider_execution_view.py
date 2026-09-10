@@ -31,7 +31,7 @@ def _context() -> dict[str, object]:
 
 
 def _capabilities(**updates: object) -> dict[str, object]:
-    """返回已通过 B0.3 preflight 的最小 provider 能力快照。"""
+    """返回可选 provider 能力提示，缺失或不完整不应阻断动态请求。"""
 
     values: dict[str, object] = {
         "protocol_version": "dynamic-v1",
@@ -141,15 +141,16 @@ def test_view_fills_declared_interrupted_actions_before_steering() -> None:
     assert view.messages[2].content == {"error": "action_interrupted"}
 
 
-def test_view_requires_verified_protocol_and_does_not_infer_pdf_support() -> None:
-    """验证模型切换只能依据冻结 preflight，不能从模型名称猜测协议或 PDF 能力。"""
+def test_view_does_not_block_when_provider_capability_hints_are_missing() -> None:
+    """验证 Provider view 不用能力预检拦截请求，真实 provider 错误仍由调用边界返回。"""
 
-    with pytest.raises(ProviderExecutionViewError, match="preflight"):
-        build_provider_execution_view(
-            execution_context=_context(),
-            canonical_messages=[{"role": "user", "content": "继续"}],
-            model_capabilities=_capabilities(tool_calling=False, model="looks-capable"),
-        )
+    view = build_provider_execution_view(
+        execution_context=_context(),
+        canonical_messages=[{"role": "user", "content": "继续"}],
+        model_capabilities={},
+    )
+
+    assert [message.role for message in view.messages] == ["system", "user"]
 
 
 def test_view_rejects_duplicate_action_identity_and_unfinished_tail() -> None:

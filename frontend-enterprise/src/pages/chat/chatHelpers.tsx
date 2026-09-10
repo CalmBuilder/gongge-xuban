@@ -1288,22 +1288,13 @@ export function reflectionTraceDetail(data: Record<string, unknown>): string | u
 }
 
 function dynamicTaskFailureGuidance(code: string): string | undefined {
-  /** 把动态任务基础门禁转换为用户可执行的说明，避免只展示内部错误码。 */
+  /** 把动态任务运行条件转换为用户可执行的说明，避免只展示内部错误码。 */
 
   if (code === 'DYNAMIC_TASK_ROLLOUT_DENIED') {
     return '这个动态任务还没有启动。普通用户不用申请 DynamicTaskAgent 权限，请管理员检查服务配置。';
   }
   if (code === 'DYNAMIC_TASK_QUOTA_NOT_CONFIGURED') {
     return '这个动态任务正在排队，因为现在同时运行的任务太多，请稍后再试。';
-  }
-  if (code === 'MODEL_PREFLIGHT_REQUIRED') {
-    return '这个模型会聊天，但系统还没有检查它能不能完成动态任务，请管理员在模型配置页面点“动态能力验证”，再试一次。';
-  }
-  if (code === 'MODEL_CAPABILITY_MISSING') {
-    return '这个模型会聊天，但不会按动态任务需要的方式使用工具，请管理员换一个支持动态任务的模型。';
-  }
-  if (code === 'MODEL_CAPABILITY_SNAPSHOT_INVALID') {
-    return '模型设置刚刚改过，系统手里的旧检查结果不能用了，请管理员重新点“动态能力验证”，再试一次。';
   }
   if (code === 'VERTICAL_ABILITY_NOT_AVAILABLE' || code === 'VERTICAL_ABILITY_REVISION_CHANGED') {
     return '你选的能力包刚刚变了，系统暂时找不到它，请重新打开能力包，再选一次。';

@@ -42,15 +42,6 @@ DYNAMIC_TASK_ROLLOUT_GUIDANCE = (
 DYNAMIC_TASK_QUOTA_GUIDANCE = (
     "这个动态任务正在排队，因为现在同时运行的任务太多；请稍后再试。"
 )
-DYNAMIC_MODEL_PREFLIGHT_GUIDANCE = (
-    "这个模型会聊天，但系统还没有检查它能不能完成动态任务；请管理员在模型配置页面点“动态能力验证”，再试一次。"
-)
-DYNAMIC_MODEL_CAPABILITY_GUIDANCE = (
-    "这个模型会聊天，但不会按动态任务需要的方式使用工具；请管理员换一个支持动态任务的模型。"
-)
-DYNAMIC_MODEL_SNAPSHOT_GUIDANCE = (
-    "模型设置刚刚改过，系统手里的旧检查结果不能用了；请管理员重新点“动态能力验证”，再试一次。"
-)
 DYNAMIC_VERTICAL_ABILITY_GUIDANCE = (
     "你选的能力包刚刚变了，系统暂时找不到它；请重新打开能力包，再选一次。"
 )
@@ -104,14 +95,11 @@ def format_runtime_failure_reply(
 
 
 def dynamic_task_failure_message(code: str) -> str | None:
-    """为动态任务基础门禁返回不暴露内部实现的可行动错误说明。"""
+    """为动态任务运行条件返回不暴露内部实现的可行动错误说明。"""
 
     messages = {
         "DYNAMIC_TASK_ROLLOUT_DENIED": DYNAMIC_TASK_ROLLOUT_GUIDANCE,
         "DYNAMIC_TASK_QUOTA_NOT_CONFIGURED": DYNAMIC_TASK_QUOTA_GUIDANCE,
-        "MODEL_PREFLIGHT_REQUIRED": DYNAMIC_MODEL_PREFLIGHT_GUIDANCE,
-        "MODEL_CAPABILITY_MISSING": DYNAMIC_MODEL_CAPABILITY_GUIDANCE,
-        "MODEL_CAPABILITY_SNAPSHOT_INVALID": DYNAMIC_MODEL_SNAPSHOT_GUIDANCE,
         "VERTICAL_ABILITY_NOT_AVAILABLE": DYNAMIC_VERTICAL_ABILITY_GUIDANCE,
         "VERTICAL_ABILITY_REVISION_CHANGED": DYNAMIC_VERTICAL_ABILITY_GUIDANCE,
         "MODEL_NOT_AVAILABLE": "系统找不到当前模型；请管理员检查模型配置后再试。",
@@ -141,9 +129,6 @@ def dynamic_task_failure_suggestion(code: str) -> str:
     if code == "DYNAMIC_TASK_QUOTA_NOT_CONFIGURED":
         return "请稍后再试；这不是你的权限或模型余额出了问题。"
     if code in {
-        "MODEL_PREFLIGHT_REQUIRED",
-        "MODEL_CAPABILITY_MISSING",
-        "MODEL_CAPABILITY_SNAPSHOT_INVALID",
         "VERTICAL_ABILITY_NOT_AVAILABLE",
         "VERTICAL_ABILITY_REVISION_CHANGED",
     }:

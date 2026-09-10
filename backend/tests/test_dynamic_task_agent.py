@@ -271,7 +271,7 @@ class _StartCatalog(_Catalog):
         self.snapshot = snapshot
 
     def require_dynamic_model(self, tenant_id: str, model_config_id: str) -> ModelConfig:
-        """返回测试中已通过 preflight 的同租户模型。"""
+        """返回测试中的同租户模型，不模拟任何模型能力预检门禁。"""
 
         assert tenant_id == self.model.tenant_id
         assert model_config_id == self.model.id
@@ -5466,7 +5466,7 @@ def test_formula_priority_does_not_relabel_same_cell_from_another_sheet() -> Non
 def test_image_and_pdf_use_reviewed_elements_and_never_expose_locator(
     tmp_path,
 ) -> None:
-    """验证图片/PDF固定结构不依赖模型原生文件能力且不泄露locator。"""
+    """验证图片/PDF不因能力预检被拦截，仍使用固定结构证据且不泄露locator。"""
 
     engine = create_engine("sqlite://", poolclass=StaticPool)
     SQLModel.metadata.create_all(engine)
@@ -5495,16 +5495,14 @@ def test_image_and_pdf_use_reviewed_elements_and_never_expose_locator(
             capability_checksum=capability_checksum(vision_capabilities),
             preflight_status="ready",
         )
-        plain_capabilities = _model_capabilities()
         plain_model = ModelConfig(
             id="model_plain",
             tenant_id="tenant_demo",
             name="文本动态模型",
             api_key_encrypted="encrypted",
             model="model-plain",
-            capability_snapshot_json=plain_capabilities,
-            capability_checksum=capability_checksum(plain_capabilities),
-            preflight_status="ready",
+            capability_snapshot_json={},
+            preflight_status="unverified",
         )
         db.add(user)
         db.add(profile)
@@ -5631,13 +5629,15 @@ def test_image_and_pdf_use_reviewed_elements_and_never_expose_locator(
         assert visual_operations[0].status == "succeeded"
 
         executor = _Executor()
-        proposer = _RunProposer()
+        plain_visual_reviewer = _NativeMediaVisualReviewer()
+        proposer = _NativeMediaRunProposer()
         plain_agent = DynamicTaskAgent(
             db,
             catalog=_StartCatalog(plain_model, _snapshot()),
             tool_executor=executor,
             planner=_Planner(),
             action_proposer=proposer,
+            visual_reviewer=plain_visual_reviewer,
             resource_service=resource_service,
         )
         plain_instance, _ = plain_agent.start_task(
@@ -5651,18 +5651,16 @@ def test_image_and_pdf_use_reviewed_elements_and_never_expose_locator(
                 source_ref=plain_message.id,
                 input_resource_ids=(resource.id, pdf_resource.id),
             )
-        with pytest.raises(
-            DynamicTaskAgentError,
-            match="DYNAMIC_INPUT_(VISION|PDF_VISUAL)_UNAVAILABLE",
-        ):
-            plain_agent.run_until_blocked_or_complete(
-                execution_id=plain_instance.id,
-                model_config=plain_model,
-                worker_id="worker_plain_image",
-                actor_user_id=user.id,
-            )
-        assert proposer.calls == 0
-        assert executor.calls == 0
+        outcome = plain_agent.run_until_blocked_or_complete(
+            execution_id=plain_instance.id,
+            model_config=plain_model,
+            worker_id="worker_plain_image",
+            actor_user_id=user.id,
+        )
+        assert outcome.status == "succeeded"
+        assert plain_visual_reviewer.calls == 1
+        assert proposer.calls == 2
+        assert executor.calls == 1
 
 
 def test_visual_conflict_must_be_disclosed_before_result_can_pass() -> None:

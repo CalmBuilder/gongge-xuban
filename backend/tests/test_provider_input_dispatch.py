@@ -396,7 +396,8 @@ def test_dynamic_egress_policy_and_slice_must_match_frozen_facts() -> None:
             provider="openai_compatible",
             api_key_encrypted="encrypted",
             model="test-model",
-            preflight_status="ready",
+            capability_snapshot_json={},
+            preflight_status="unverified",
             enabled=True,
         )
         instance = SopInstance(
@@ -525,7 +526,8 @@ def test_dynamic_execution_dispatch_uses_snapshot_acl_and_causation() -> None:
             provider="openai_compatible",
             api_key_encrypted="encrypted",
             model="test-model",
-            preflight_status="ready",
+            capability_snapshot_json={},
+            preflight_status="unverified",
             enabled=True,
         )
         instance = SopInstance(

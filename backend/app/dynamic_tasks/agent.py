@@ -75,6 +75,8 @@ from app.dynamic_tasks.capability_catalog import (
     CapabilitySnapshot,
     DynamicCapabilityCatalog,
     capability_checksum,
+    dynamic_model_snapshot_checksum,
+    dynamic_model_snapshot_matches,
 )
 from app.dynamic_tasks.planner_service import DynamicTaskPlanner
 from app.general_skills.runtime import (
@@ -105,10 +107,7 @@ from app.dynamic_tasks.planning import (
     canonical_checksum,
 )
 from app.dynamic_tasks.quotas import DynamicTaskQuotaLimits, DynamicTaskQuotaService
-from app.dynamic_tasks.provider_view import (
-    build_provider_execution_view,
-    require_dynamic_preflight,
-)
+from app.dynamic_tasks.provider_view import build_provider_execution_view
 from app.dynamic_tasks.result_verifier import EvidenceRef, DynamicTaskResult, verify_dynamic_result
 from app.dynamic_tasks.standing_approvals import (
     StandingApprovalMatch,
@@ -1084,11 +1083,7 @@ class DynamicTaskAgent:
             raise DynamicTaskAgentError("DYNAMIC_EXECUTION_NOT_FOUND")
         verified_model = self.catalog.require_dynamic_model(instance.tenant_id, model_config.id)
         frozen_model = (instance.capability_snapshot_json or {}).get("model", {})
-        if (
-            not isinstance(frozen_model, dict)
-            or frozen_model.get("model_config_id") != verified_model.id
-            or frozen_model.get("checksum") != verified_model.capability_checksum
-        ):
+        if not dynamic_model_snapshot_matches(frozen_model, verified_model):
             raise DynamicTaskAgentError("DYNAMIC_MODEL_SNAPSHOT_CHANGED")
         with self.store.owned(instance, worker_id=worker_id):
             plan = self._current_plan(instance)
@@ -2203,11 +2198,7 @@ class DynamicTaskAgent:
             raise DynamicTaskAgentError("DYNAMIC_EXPLORE_DISABLED")
         verified_model = self.catalog.require_dynamic_model(instance.tenant_id, model_config.id)
         frozen_model = (instance.capability_snapshot_json or {}).get("model", {})
-        if (
-            not isinstance(frozen_model, dict)
-            or frozen_model.get("model_config_id") != verified_model.id
-            or frozen_model.get("checksum") != verified_model.capability_checksum
-        ):
+        if not dynamic_model_snapshot_matches(frozen_model, verified_model):
             raise DynamicTaskAgentError("DYNAMIC_MODEL_SNAPSHOT_CHANGED")
         capabilities = dict(verified_model.capability_snapshot_json or {})
         with self.store.owned(instance, worker_id=worker_id, ttl_seconds=180) as lease:
@@ -6020,7 +6011,7 @@ class DynamicTaskAgent:
         conversation_context: Mapping[str, object] | None = None,
         continuation_of_execution_id: str | None = None,
     ) -> tuple[SopInstance, bool]:
-        """经模型 preflight、实时能力目录和有界规划创建或复用统一动态 Execution。
+        """经模型存在性、实时能力目录和有界规划创建或复用统一动态 Execution。
 
         当提供 continuation_of_execution_id 时，当前输入属于同一聊天 DynamicTask
         会话的后续 turn；父 Execution 只读继承其任务身份，不会被重新打开或覆盖。
@@ -6204,9 +6195,7 @@ class DynamicTaskAgent:
                 and (existing.goal_snapshot_json or {}).get("goal") == goal.strip()
                 and (existing.goal_snapshot_json or {}).get("success_criteria")
                 == requested_criteria
-                and isinstance(frozen_model, dict)
-                and frozen_model.get("model_config_id") == verified_model.id
-                and frozen_model.get("checksum") == verified_model.capability_checksum
+                and dynamic_model_snapshot_matches(frozen_model, verified_model)
                 and tuple(
                     sorted(
                         str(value)
@@ -6485,7 +6474,7 @@ class DynamicTaskAgent:
             "model": {
                 "model_config_id": verified_model.id,
                 "capabilities": dict(verified_model.capability_snapshot_json or {}),
-                "checksum": verified_model.capability_checksum,
+                "checksum": dynamic_model_snapshot_checksum(verified_model),
             },
         }
         instance, _revision = self.store.start_dynamic_instance(
@@ -6690,7 +6679,6 @@ class DynamicTaskAgent:
         instance = self.db.get(SopInstance, execution_id)
         if instance is None or instance.kind != "dynamic_task":
             raise DynamicTaskAgentError("DYNAMIC_EXECUTION_NOT_FOUND")
-        require_dynamic_preflight(model_capabilities)
         proposal = completed_response.proposal
         if proposal.action_kind.value != "call_tool":
             raise DynamicTaskAgentError("DYNAMIC_READ_ACTION_REQUIRED")
@@ -7646,7 +7634,6 @@ class DynamicTaskAgent:
         instance = self.db.get(SopInstance, execution_id)
         if instance is None or instance.kind != "dynamic_task":
             raise DynamicTaskAgentError("DYNAMIC_EXECUTION_NOT_FOUND")
-        require_dynamic_preflight(model_capabilities)
         if completed_response.proposal.action_kind.value not in {"answer", "complete"}:
             raise DynamicTaskAgentError("DYNAMIC_RESULT_ACTION_REQUIRED")
         plan = self._current_plan(instance)
@@ -9069,7 +9056,6 @@ class DynamicTaskAgent:
             input_resources, native_input_parts, input_slices = self._provider_input_resources(
                 instance,
                 step=step,
-                model_capabilities=capabilities,
             )
             formula_checks = self._ensure_attachment_formula_checks(
                 instance=instance,
@@ -9927,13 +9913,12 @@ class DynamicTaskAgent:
         instance: SopInstance,
         *,
         step: PlanStep,
-        model_capabilities: dict[str, object],
     ) -> tuple[
         list[dict[str, object]],
         list[dict[str, object]],
         list[tuple[str, str]],
     ]:
-        """实时重查冻结Extraction并按Element有界投影，禁止恢复全文件base64/全文注入。"""
+        """实时重查冻结Extraction并按Element有界投影，原生输入能力交给provider实际判断。"""
 
         snapshots = self.db.exec(
             select(InputResourceSnapshot)
@@ -10092,8 +10077,6 @@ class DynamicTaskAgent:
             projected.append(item)
             native_content_checksum: str | None = None
             if snapshot.mime_type in {"image/jpeg", "image/png", "image/webp"}:
-                if model_capabilities.get("vision") is not True:
-                    raise DynamicTaskAgentError("DYNAMIC_INPUT_VISION_UNAVAILABLE")
                 sanitized_image = sanitize_image_bytes_for_provider(data)
                 native_parts.append(
                     {
@@ -10113,8 +10096,6 @@ class DynamicTaskAgent:
                 step.expected_output_schema.get("dual_evidence_required") is True
                 or self._pdf_visual_review_required(element_payloads)
             ):
-                if model_capabilities.get("pdf_input") is not True:
-                    raise DynamicTaskAgentError("DYNAMIC_INPUT_PDF_VISUAL_UNAVAILABLE")
                 native_parts.append(
                     {
                         "type": "file",

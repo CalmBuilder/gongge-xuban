@@ -43,7 +43,7 @@ class DynamicActionProposer:
         *,
         is_cancelled: Callable[[], bool] | None = None,
     ) -> None:
-        """绑定已通过 preflight 的客户端及可选取消探针，不包装或替换回调身份。"""
+        """绑定实际 provider 客户端及可选取消探针，不预判模型能力或替换回调身份。"""
 
         self.client = client
         self.is_cancelled = is_cancelled

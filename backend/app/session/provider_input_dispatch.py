@@ -443,7 +443,6 @@ class ProviderInputDispatchGateway:
             or model is None
             or model.tenant_id != receipt.tenant_id
             or not model.enabled
-            or model.preflight_status != "ready"
         ):
             raise InputBindingError("ATTACHMENT_EGRESS_POLICY_DENIED")
         from app.dynamic_tasks.capability_catalog import capability_checksum

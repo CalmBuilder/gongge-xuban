@@ -94,7 +94,7 @@ class AttachmentVisualReviewer:
     """将冻结结构切片与原生附件交给同一模型的隔离视觉复核阶段。"""
 
     def __init__(self, client: VisualReviewJsonClient) -> None:
-        """绑定已经通过vision/pdf_input预检的模型客户端。"""
+        """绑定执行视觉复核的模型客户端，能力是否支持由实际 provider 调用返回。"""
 
         self.client = client
 

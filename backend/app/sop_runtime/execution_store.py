@@ -913,8 +913,6 @@ class SopExecutionStore:
         if not provider.strip() or len(provider) > 64 or not model.strip() or len(model) > 191:
             raise SopExecutionConflictError("动作提案的 provider/model 身份无效。")
         capability_payload = dict(model_capability_snapshot)
-        if not capability_payload:
-            raise SopExecutionConflictError("动作提案必须冻结模型能力快照。")
         normalized = completed_response.proposal.model_dump(mode="json")
         identity = {
             "execution_id": instance.id,

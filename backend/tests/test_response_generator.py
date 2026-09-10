@@ -12,7 +12,6 @@ from app.core.response_generator import (
     PROMPT_PATH,
     ResponseGenerator,
     dynamic_task_failure_message,
-    dynamic_task_failure_suggestion,
 )
 from app.db.models import ChatSession, Skill
 from app.llm.client import LLMClient, LLMError
@@ -20,22 +19,26 @@ from app.session.session_schema import RouterDecision, StepAgentResult
 from app.tools.tool_schema import ToolError, ToolResult
 
 
+def test_model_unavailability_is_child_readable() -> None:
+    """模型不存在或已停用时必须用简单话说明原因，不把内部异常名当成用户解释。"""
+
+    message = dynamic_task_failure_message("MODEL_NOT_AVAILABLE")
+
+    assert message == "系统找不到当前模型；请管理员检查模型配置后再试。"
+
+
 @pytest.mark.parametrize(
-    ("code", "expected"),
+    "code",
     [
-        ("MODEL_PREFLIGHT_REQUIRED", "这个模型会聊天"),
-        ("MODEL_CAPABILITY_MISSING", "不会按动态任务需要的方式使用工具"),
-        ("MODEL_CAPABILITY_SNAPSHOT_INVALID", "旧检查结果不能用了"),
+        "MODEL_PREFLIGHT_REQUIRED",
+        "MODEL_CAPABILITY_MISSING",
+        "MODEL_CAPABILITY_SNAPSHOT_INVALID",
     ],
 )
-def test_dynamic_model_failure_is_child_readable(code: str, expected: str) -> None:
-    """动态模型失败必须用简单话说明原因，不把内部异常名当成用户解释。"""
+def test_removed_model_preflight_codes_have_no_special_guidance(code: str) -> None:
+    """已移除的模型预检错误不得继续向用户暗示必须先点预检按钮。"""
 
-    message = dynamic_task_failure_message(code)
-
-    assert message is not None
-    assert expected in message
-    assert dynamic_task_failure_suggestion(code) == "按上方说明处理后重试。"
+    assert dynamic_task_failure_message(code) is None
 
 
 def test_capability_failure_explains_that_it_is_not_a_user_permission_error() -> None:

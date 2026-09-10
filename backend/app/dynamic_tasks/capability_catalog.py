@@ -345,6 +345,37 @@ def capability_checksum(value: object) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def dynamic_model_snapshot_checksum(model: ModelConfig) -> str:
+    """只按动态任务实际路由身份生成模型快照摘要，不把预检结果当作可用门槛。"""
+
+    return capability_checksum(
+        {
+            "provider": str(getattr(model, "provider", "") or ""),
+            "model": str(getattr(model, "model", "") or ""),
+            "base_url": str(getattr(model, "base_url", "") or ""),
+        }
+    )
+
+
+def dynamic_model_snapshot_matches(
+    snapshot: object,
+    model: ModelConfig,
+) -> bool:
+    """判断活动 Execution 仍指向同一模型，兼容旧版预检摘要但不读取预检状态。"""
+
+    if not isinstance(snapshot, Mapping) or snapshot.get("model_config_id") != model.id:
+        return False
+    stored_checksum = snapshot.get("checksum")
+    if stored_checksum == dynamic_model_snapshot_checksum(model):
+        return True
+    # 兼容升级前已创建且使用 capability_checksum 的活动 Execution；新任务不会再
+    # 写入这个预检摘要，预检状态变化也不会影响新任务的运行资格。
+    legacy_checksum = getattr(model, "capability_checksum", None)
+    if legacy_checksum is not None and stored_checksum == legacy_checksum:
+        return True
+    return stored_checksum is None and legacy_checksum is None
+
+
 def _tool_contract_payload(contract: ToolReliabilityContract) -> dict[str, Any]:
     """序列化发布契约，并在默认关闭时保持既有 checksum 向后兼容。"""
 
@@ -1139,20 +1170,11 @@ class DynamicCapabilityCatalog:
         )
 
     def require_dynamic_model(self, tenant_id: str, model_config_id: str) -> ModelConfig:
-        """在创建动态 Execution 前检查模型已启用且通过必需能力预检。"""
+        """在动态 Execution 边界确认模型存在、属于当前租户且处于启用状态。"""
 
         model = self.db.get(ModelConfig, model_config_id)
         if model is None or model.tenant_id != tenant_id or not model.enabled:
             raise CapabilityAccessDenied("MODEL_NOT_AVAILABLE")
-        if getattr(model, "preflight_status", "unverified") != "ready":
-            raise CapabilityAccessDenied("MODEL_PREFLIGHT_REQUIRED")
-        facts = getattr(model, "capability_snapshot_json", None) or {}
-        required = ("sdk_available", "credentials_verified", "tool_calling", "structured_output")
-        if not all(facts.get(name) is True for name in required):
-            raise CapabilityAccessDenied("MODEL_CAPABILITY_MISSING")
-        checksum = capability_checksum(facts)
-        if checksum != getattr(model, "capability_checksum", None):
-            raise CapabilityAccessDenied("MODEL_CAPABILITY_SNAPSHOT_INVALID")
         return model
 
     def reauthorize_general_skill(self, snapshot: CapabilitySnapshot) -> GeneralSkill:

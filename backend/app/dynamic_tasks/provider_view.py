@@ -60,9 +60,8 @@ def build_provider_execution_view(
     interrupted_action_ids: Set[str] | None = None,
     native_input_parts: Sequence[Mapping[str, object]] = (),
 ) -> ProviderExecutionView:
-    """验证 canonical 历史并生成 provider view，压缩仅替换对话而不替换执行事实。"""
+    """验证 canonical 历史并生成 provider view，不预判模型能力或替代 provider 报错。"""
 
-    require_dynamic_preflight(model_capabilities)
     context = dict(execution_context)
     if _contains_sensitive_key(context):
         raise ProviderExecutionViewError("ExecutionContextProjection 含禁止的敏感 sidecar。")
@@ -167,20 +166,6 @@ def _normalize_messages(
         else:
             raise ProviderExecutionViewError("provider history 尾部存在未闭合 action call。")
     return tuple(normalized)
-
-
-def require_dynamic_preflight(capabilities: Mapping[str, object]) -> None:
-    """只接受已验证的 dynamic-v1 必需能力，不按 provider 或模型名称推断。"""
-
-    required = (
-        capabilities.get("protocol_version") == "dynamic-v1"
-        and capabilities.get("sdk_available") is True
-        and capabilities.get("credentials_verified") is True
-        and capabilities.get("structured_output") is True
-        and capabilities.get("tool_calling") is True
-    )
-    if not required:
-        raise ProviderExecutionViewError("模型 dynamic preflight 未通过或已经失效。")
 
 
 def _safe_content(value: object) -> str | dict[str, Any]:

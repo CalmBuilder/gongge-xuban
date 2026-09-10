@@ -21,6 +21,8 @@ from app.dynamic_tasks.capability_catalog import (
     DynamicCapabilityCatalog,
     ToolReliabilityContract,
     capability_checksum,
+    dynamic_model_snapshot_checksum,
+    dynamic_model_snapshot_matches,
     project_tool_capability,
 )
 from app.general_skills.schema import GeneralSkillImportRequest
@@ -343,8 +345,8 @@ def test_destructive_contract_target_checksum_is_required_for_published_gray() -
         )
 
 
-def test_dynamic_model_requires_successful_capability_preflight() -> None:
-    """验证未验证或缺少 tool/structured-output 能力的模型不能创建动态执行。"""
+def test_dynamic_model_requires_only_enabled_tenant_owned_model() -> None:
+    """验证动态模型不需要预检即可使用，只拒绝不存在、跨租户或停用模型。"""
 
     engine = create_engine("sqlite://")
     SQLModel.metadata.create_all(engine)
@@ -361,10 +363,8 @@ def test_dynamic_model_requires_successful_capability_preflight() -> None:
         db.commit()
         catalog = DynamicCapabilityCatalog(db)
 
-        with pytest.raises(CapabilityAccessDenied, match="MODEL_PREFLIGHT_REQUIRED"):
-            catalog.require_dynamic_model("tenant_a", model.id)
+        assert catalog.require_dynamic_model("tenant_a", model.id) is model
 
-        model.preflight_status = "ready"
         model.capability_snapshot_json = {
             "tool_calling": True,
             "structured_output": False,
@@ -373,17 +373,52 @@ def test_dynamic_model_requires_successful_capability_preflight() -> None:
         }
         db.add(model)
         db.commit()
-        with pytest.raises(CapabilityAccessDenied, match="MODEL_CAPABILITY_MISSING"):
+        assert catalog.require_dynamic_model("tenant_a", model.id) is model
+
+        model.enabled = False
+        db.add(model)
+        db.commit()
+        with pytest.raises(CapabilityAccessDenied, match="MODEL_NOT_AVAILABLE"):
             catalog.require_dynamic_model("tenant_a", model.id)
+
+        with pytest.raises(CapabilityAccessDenied, match="MODEL_NOT_AVAILABLE"):
+            catalog.require_dynamic_model("tenant_other", model.id)
 
 
 def test_capability_access_denied_preserves_stable_domain_code() -> None:
     """能力拒绝异常必须向 Agent Loop、Signal 和 Execution 暴露同一个领域错误码。"""
 
-    error = CapabilityAccessDenied("MODEL_PREFLIGHT_REQUIRED")
+    error = CapabilityAccessDenied("MODEL_NOT_AVAILABLE")
 
-    assert error.code == "MODEL_PREFLIGHT_REQUIRED"
-    assert str(error) == "MODEL_PREFLIGHT_REQUIRED"
+    assert error.code == "MODEL_NOT_AVAILABLE"
+    assert str(error) == "MODEL_NOT_AVAILABLE"
+
+
+def test_dynamic_model_snapshot_ignores_preflight_state_but_tracks_route_identity() -> None:
+    """验证模型快照不因预检状态变化而失效，但会识别实际Provider路由被替换。"""
+
+    model = ModelConfig(
+        id="model_snapshot",
+        tenant_id="tenant_a",
+        name="Model Snapshot",
+        provider="openai_compatible",
+        base_url="https://provider.example/v1",
+        api_key_encrypted="encrypted",
+        model="model-a",
+        capability_snapshot_json={"tool_calling": False},
+        preflight_status="unverified",
+    )
+    checksum = dynamic_model_snapshot_checksum(model)
+    snapshot = {"model_config_id": model.id, "checksum": checksum}
+
+    model.preflight_status = "failed"
+    model.capability_snapshot_json = {"structured_output": True}
+    assert dynamic_model_snapshot_checksum(model) == checksum
+    assert dynamic_model_snapshot_matches(snapshot, model) is True
+
+    model.model = "model-b"
+    assert dynamic_model_snapshot_checksum(model) != checksum
+    assert dynamic_model_snapshot_matches(snapshot, model) is False
 
 
 def test_planning_guidance_requires_explicit_publish_and_binding_reauthorization() -> None:

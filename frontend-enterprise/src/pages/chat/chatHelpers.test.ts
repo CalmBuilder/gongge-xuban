@@ -185,14 +185,14 @@ describe('chat runtime error rendering', () => {
     expect(line.detail).toContain('同时运行的任务太多');
   });
 
-  it('explains when ordinary chat works but the selected model lacks dynamic capabilities', () => {
+  it('does not expose the removed model preflight as a user requirement', () => {
     const line = streamErrorTraceLine(
       { code: 'MODEL_PREFLIGHT_REQUIRED' },
       'error_occurred',
     );
 
-    expect(line.text).toBe('DynamicTaskAgent 未执行');
-    expect(line.detail).toContain('这个模型会聊天');
+    expect(line.text).toBe('执行失败 MODEL_PREFLIGHT_REQUIRED');
+    expect(line.detail).not.toContain('动态能力验证');
   });
 
   it('explains capability denial without telling the user they lack permission', () => {
