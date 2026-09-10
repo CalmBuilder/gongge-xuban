@@ -8,11 +8,44 @@
 
 import pytest
 
-from app.core.response_generator import PROMPT_PATH, ResponseGenerator
+from app.core.response_generator import (
+    PROMPT_PATH,
+    ResponseGenerator,
+    dynamic_task_failure_message,
+    dynamic_task_failure_suggestion,
+)
 from app.db.models import ChatSession, Skill
 from app.llm.client import LLMClient, LLMError
 from app.session.session_schema import RouterDecision, StepAgentResult
 from app.tools.tool_schema import ToolError, ToolResult
+
+
+@pytest.mark.parametrize(
+    ("code", "expected"),
+    [
+        ("MODEL_PREFLIGHT_REQUIRED", "这个模型会聊天"),
+        ("MODEL_CAPABILITY_MISSING", "不会按动态任务需要的方式使用工具"),
+        ("MODEL_CAPABILITY_SNAPSHOT_INVALID", "旧检查结果不能用了"),
+    ],
+)
+def test_dynamic_model_failure_is_child_readable(code: str, expected: str) -> None:
+    """动态模型失败必须用简单话说明原因，不把内部异常名当成用户解释。"""
+
+    message = dynamic_task_failure_message(code)
+
+    assert message is not None
+    assert expected in message
+    assert dynamic_task_failure_suggestion(code) == "按上方说明处理后重试。"
+
+
+def test_capability_failure_explains_that_it_is_not_a_user_permission_error() -> None:
+    """能力目录暂不可用时，用户应看到工具未准备好而不是权限被拒绝。"""
+
+    message = dynamic_task_failure_message("CAPABILITY_BINDING_REVOKED")
+
+    assert message is not None
+    assert "不是你没有权限" in message
+    assert "工具现在还没有准备好" in message
 
 
 def test_response_payload_has_single_source_for_each_business_fact() -> None:

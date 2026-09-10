@@ -377,6 +377,15 @@ def test_dynamic_model_requires_successful_capability_preflight() -> None:
             catalog.require_dynamic_model("tenant_a", model.id)
 
 
+def test_capability_access_denied_preserves_stable_domain_code() -> None:
+    """能力拒绝异常必须向 Agent Loop、Signal 和 Execution 暴露同一个领域错误码。"""
+
+    error = CapabilityAccessDenied("MODEL_PREFLIGHT_REQUIRED")
+
+    assert error.code == "MODEL_PREFLIGHT_REQUIRED"
+    assert str(error) == "MODEL_PREFLIGHT_REQUIRED"
+
+
 def test_planning_guidance_requires_explicit_publish_and_binding_reauthorization() -> None:
     """验证规划指南导入后先保持 draft，发布后可冻结，撤销绑定立即失效。"""
 

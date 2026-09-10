@@ -215,7 +215,7 @@ def test_windows_second_launch_reuses_primary_instance(monkeypatch) -> None:
 
     opened = []
     focused = []
-    monkeypatch.setattr(desktop_launcher, "_use_windows_taskbar_app", lambda: True)
+    monkeypatch.setattr(desktop_launcher, "_use_windows_instance_guard", lambda: True)
     monkeypatch.setattr(desktop_launcher, "_acquire_windows_instance_mutex", lambda: False)
     monkeypatch.setattr(
         desktop_launcher,
@@ -249,7 +249,7 @@ def test_windows_browser_open_is_at_most_once_when_no_existing_window(monkeypatc
 
 
 def test_windows_browser_open_focuses_existing_window_without_opening_tab(monkeypatch) -> None:
-    """已有共格浏览器窗口时，任务栏或 Alt+Tab 唤起不得再打开新标签页。"""
+    """已有共格浏览器窗口时，重复启动不得再打开新标签页。"""
 
     opened = []
     monkeypatch.setattr(desktop_launcher, "_focus_existing_browser_window", lambda: True)
@@ -308,38 +308,85 @@ def test_preload_server_app_imports_reference_on_calling_thread(monkeypatch) -> 
     assert cfg["app"] is app
 
 
-def test_windows_taskbar_app_only_used_for_frozen_windows(monkeypatch) -> None:
+def test_windows_instance_guard_only_used_for_frozen_windows(monkeypatch) -> None:
+    """Windows 冻结版只启用单实例和浏览器复用协议，不创建第二个原生界面。"""
+
     monkeypatch.delenv("GONGGE_XUBAN_HEADLESS", raising=False)
     monkeypatch.setattr(desktop_launcher.sys, "platform", "win32")
     monkeypatch.delattr(desktop_launcher.sys, "frozen", raising=False)
-    assert desktop_launcher._use_windows_taskbar_app() is False
+    assert desktop_launcher._use_windows_instance_guard() is False
 
     monkeypatch.setattr(desktop_launcher.sys, "frozen", True, raising=False)
-    assert desktop_launcher._use_windows_taskbar_app() is True
+    assert desktop_launcher._use_windows_instance_guard() is True
 
 
-def test_windows_taskbar_app_disabled_in_headless_mode(monkeypatch) -> None:
+def test_windows_instance_guard_disabled_in_headless_mode(monkeypatch) -> None:
     monkeypatch.setattr(desktop_launcher.sys, "platform", "win32")
     monkeypatch.setattr(desktop_launcher.sys, "frozen", True, raising=False)
     monkeypatch.setenv("GONGGE_XUBAN_HEADLESS", "1")
-    assert desktop_launcher._use_windows_taskbar_app() is False
+    assert desktop_launcher._use_windows_instance_guard() is False
 
 
-def test_windows_taskbar_app_ignores_unrecognized_headless_variable(monkeypatch) -> None:
+def test_windows_instance_guard_ignores_unrecognized_headless_variable(monkeypatch) -> None:
     monkeypatch.setattr(desktop_launcher.sys, "platform", "win32")
     monkeypatch.setattr(desktop_launcher.sys, "frozen", True, raising=False)
     monkeypatch.delenv("GONGGE_XUBAN_HEADLESS", raising=False)
     foreign_prefix = "".join(("STAFF", "DECK"))
     monkeypatch.setenv(f"{foreign_prefix}_HEADLESS", "1")
 
-    assert desktop_launcher._use_windows_taskbar_app() is True
+    assert desktop_launcher._use_windows_instance_guard() is True
 
 
-def test_windows_restore_command_detection() -> None:
-    assert desktop_launcher._is_windows_restore_command(0x0112, 0xF120) is True
-    assert desktop_launcher._is_windows_restore_command(0x0112, 0xF122) is True
-    assert desktop_launcher._is_windows_restore_command(0x0112, 0xF020) is False
-    assert desktop_launcher._is_windows_restore_command(0x0002, 0xF120) is False
+def test_frozen_windows_launcher_uses_browser_as_the_only_ui(monkeypatch) -> None:
+    """冻结版 Windows 启动时应直接常驻服务并打开浏览器，不创建原生空白窗口。"""
+
+    events: list[object] = []
+
+    class ImmediateThread:
+        """让启动线程在测试中同步执行，稳定验证浏览器唤起分支。"""
+
+        def __init__(self, *, target, args=(), daemon=False):
+            """保存线程目标；daemon 参数只用于兼容生产调用。"""
+
+            self.target = target
+            self.args = args
+            self.daemon = daemon
+
+        def start(self) -> None:
+            """立即执行目标，避免测试依赖真实线程调度。"""
+
+            self.target(*self.args)
+
+    monkeypatch.setattr(desktop_launcher.sys, "platform", "win32")
+    monkeypatch.setattr(desktop_launcher.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(desktop_launcher, "_use_windows_instance_guard", lambda: True)
+    monkeypatch.setattr(desktop_launcher, "_acquire_windows_instance_mutex", lambda: True)
+    monkeypatch.setattr(desktop_launcher, "_find_existing_app_url", lambda *_args: None)
+    monkeypatch.setattr(desktop_launcher, "build_server_config", lambda: {
+        "app": "single_port_app:app",
+        "host": "127.0.0.1",
+        "port": 5137,
+    })
+    monkeypatch.setattr(desktop_launcher, "apply_runtime_env", lambda _cfg: None)
+    monkeypatch.setattr(desktop_launcher, "preload_server_app", lambda _cfg: None)
+    monkeypatch.setattr(desktop_launcher, "_redirect_logs_when_frozen", lambda: None)
+    monkeypatch.setattr(desktop_launcher, "_log_startup_phase", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        desktop_launcher,
+        "_open_windows_browser_when_ready",
+        lambda url: events.append(("browser", url)),
+    )
+    monkeypatch.setattr(desktop_launcher, "_serve", lambda cfg: events.append(("server", cfg)))
+    monkeypatch.setattr(desktop_launcher.threading, "Thread", ImmediateThread)
+
+    assert desktop_launcher.main([]) == 0
+    assert events == [
+        ("browser", "http://127.0.0.1:5137"),
+        (
+            "server",
+            {"app": "single_port_app:app", "host": "127.0.0.1", "port": 5137},
+        ),
+    ]
 
 
 def test_frozen_server_disables_api_access_logging(monkeypatch) -> None:

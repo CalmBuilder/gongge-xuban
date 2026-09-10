@@ -171,7 +171,7 @@ describe('chat runtime error rendering', () => {
     );
 
     expect(line.text).toBe('DynamicTaskAgent 未执行');
-    expect(line.detail).toContain('普通能力不需要在前端勾选');
+    expect(line.detail).toContain('普通用户不用申请 DynamicTaskAgent 权限');
     expect(line.detail).toContain('DYNAMIC_TASK_ROLLOUT_DENIED');
   });
 
@@ -182,7 +182,28 @@ describe('chat runtime error rendering', () => {
     );
 
     expect(line.text).toBe('DynamicTaskAgent 未执行');
-    expect(line.detail).toContain('tenant、Agent、用户和工具');
+    expect(line.detail).toContain('同时运行的任务太多');
+  });
+
+  it('explains when ordinary chat works but the selected model lacks dynamic capabilities', () => {
+    const line = streamErrorTraceLine(
+      { code: 'MODEL_PREFLIGHT_REQUIRED' },
+      'error_occurred',
+    );
+
+    expect(line.text).toBe('DynamicTaskAgent 未执行');
+    expect(line.detail).toContain('这个模型会聊天');
+  });
+
+  it('explains capability denial without telling the user they lack permission', () => {
+    const line = streamErrorTraceLine(
+      { code: 'CAPABILITY_BINDING_REVOKED' },
+      'error_occurred',
+    );
+
+    expect(line.text).toBe('DynamicTaskAgent 未执行');
+    expect(line.detail).toContain('不是你没有权限');
+    expect(line.detail).toContain('工具现在还没有准备好');
   });
 });
 

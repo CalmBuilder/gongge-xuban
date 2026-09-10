@@ -3,7 +3,9 @@ import { expect, it } from 'vitest';
 import {
   CHAT_BUBBLE_USER_CLASS,
   CHAT_COMPOSER_AVATAR_CLASS,
+  CHAT_COMPOSER_CONTEXT_ROW_CLASS,
   CHAT_COMPOSER_FORM_CLASS,
+  CHAT_COMPOSER_STAGE_CLASS,
   CHAT_COMPOSER_SEND_BTN_CLASS,
   CHAT_EMPTY_CARD_CLASS,
   CHAT_EMPTY_CLASS,
@@ -26,6 +28,12 @@ it('keeps the empty conversation profile readable and responsive', () => {
   expect(CHAT_EMPTY_GREETING_CARD_CLASS).toContain('grid-cols-[132px_minmax(0,1fr)]');
   expect(CHAT_EMPTY_TITLE_CLASS).toContain('wrap-anywhere');
   expect(CHAT_EMPTY_CARD_CLASS).toContain('max-[700px]:grid-cols-1');
+});
+
+it('keeps composer controls intact when a vertical ability is selected', () => {
+  expect(CHAT_COMPOSER_STAGE_CLASS).toContain('max-w-[920px]');
+  expect(CHAT_COMPOSER_CONTEXT_ROW_CLASS).toContain('flex-wrap');
+  expect(CHAT_COMPOSER_CONTEXT_ROW_CLASS).toContain('max-[720px]:w-full');
 });
 
 it('visually anchors the employee avatar to the composer', () => {

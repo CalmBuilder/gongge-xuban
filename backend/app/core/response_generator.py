@@ -37,11 +37,25 @@ VERTICAL_ABILITY_CREDENTIAL_SUGGESTION = (
 )
 RUNTIME_CONTROL_FALLBACK = "流程已被系统规则终止，请查看执行记录或联系管理员。"
 DYNAMIC_TASK_ROLLOUT_GUIDANCE = (
-    "DynamicTaskAgent 当前被服务端普通动态总开关拒绝；普通能力不需要在前端勾选，"
-    "请管理员检查 DYNAMIC_TASK_EXECUTION_ENABLED 和运行时容量配置。"
+    "这个动态任务还没有启动。普通用户不用申请 DynamicTaskAgent 权限；请管理员检查服务配置。"
 )
 DYNAMIC_TASK_QUOTA_GUIDANCE = (
-    "DynamicTaskAgent 的运行时容量尚未配置；请管理员为 tenant、Agent、用户和工具配置大于 0 的运行槽位。"
+    "这个动态任务正在排队，因为现在同时运行的任务太多；请稍后再试。"
+)
+DYNAMIC_MODEL_PREFLIGHT_GUIDANCE = (
+    "这个模型会聊天，但系统还没有检查它能不能完成动态任务；请管理员在模型配置页面点“动态能力验证”，再试一次。"
+)
+DYNAMIC_MODEL_CAPABILITY_GUIDANCE = (
+    "这个模型会聊天，但不会按动态任务需要的方式使用工具；请管理员换一个支持动态任务的模型。"
+)
+DYNAMIC_MODEL_SNAPSHOT_GUIDANCE = (
+    "模型设置刚刚改过，系统手里的旧检查结果不能用了；请管理员重新点“动态能力验证”，再试一次。"
+)
+DYNAMIC_VERTICAL_ABILITY_GUIDANCE = (
+    "你选的能力包刚刚变了，系统暂时找不到它；请重新打开能力包，再选一次。"
+)
+DYNAMIC_CAPABILITY_NOT_READY_GUIDANCE = (
+    "这次任务还没有开始，因为要用的工具现在还没有准备好；不是你没有权限，请重新选择能力包后再试。"
 )
 GUIDANCE_APPLICATION_CONTRACT = {
     "version": "guidance-application-checkpoint-v1",
@@ -92,20 +106,48 @@ def format_runtime_failure_reply(
 def dynamic_task_failure_message(code: str) -> str | None:
     """为动态任务基础门禁返回不暴露内部实现的可行动错误说明。"""
 
-    if code == "DYNAMIC_TASK_ROLLOUT_DENIED":
-        return DYNAMIC_TASK_ROLLOUT_GUIDANCE
-    if code == "DYNAMIC_TASK_QUOTA_NOT_CONFIGURED":
-        return DYNAMIC_TASK_QUOTA_GUIDANCE
-    return None
+    messages = {
+        "DYNAMIC_TASK_ROLLOUT_DENIED": DYNAMIC_TASK_ROLLOUT_GUIDANCE,
+        "DYNAMIC_TASK_QUOTA_NOT_CONFIGURED": DYNAMIC_TASK_QUOTA_GUIDANCE,
+        "MODEL_PREFLIGHT_REQUIRED": DYNAMIC_MODEL_PREFLIGHT_GUIDANCE,
+        "MODEL_CAPABILITY_MISSING": DYNAMIC_MODEL_CAPABILITY_GUIDANCE,
+        "MODEL_CAPABILITY_SNAPSHOT_INVALID": DYNAMIC_MODEL_SNAPSHOT_GUIDANCE,
+        "VERTICAL_ABILITY_NOT_AVAILABLE": DYNAMIC_VERTICAL_ABILITY_GUIDANCE,
+        "VERTICAL_ABILITY_REVISION_CHANGED": DYNAMIC_VERTICAL_ABILITY_GUIDANCE,
+        "MODEL_NOT_AVAILABLE": "系统找不到当前模型；请管理员检查模型配置后再试。",
+        "CAPABILITY_ACCESS_DENIED": DYNAMIC_CAPABILITY_NOT_READY_GUIDANCE,
+        "CAPABILITY_NOT_AVAILABLE": DYNAMIC_CAPABILITY_NOT_READY_GUIDANCE,
+        "CAPABILITY_NOT_FOUND": DYNAMIC_CAPABILITY_NOT_READY_GUIDANCE,
+        "CAPABILITY_DISABLED": DYNAMIC_CAPABILITY_NOT_READY_GUIDANCE,
+        "CAPABILITY_BINDING_REVOKED": DYNAMIC_CAPABILITY_NOT_READY_GUIDANCE,
+        "CAPABILITY_CONTRACT_REVOKED": DYNAMIC_CAPABILITY_NOT_READY_GUIDANCE,
+        "CAPABILITY_REVISION_CHANGED": DYNAMIC_CAPABILITY_NOT_READY_GUIDANCE,
+        "CAPABILITY_PUBLISHED_CHECKSUM_INVALID": DYNAMIC_CAPABILITY_NOT_READY_GUIDANCE,
+        "GENERAL_SKILL_NOT_AVAILABLE": DYNAMIC_CAPABILITY_NOT_READY_GUIDANCE,
+        "GENERAL_SKILL_NOT_FOUND": DYNAMIC_CAPABILITY_NOT_READY_GUIDANCE,
+        "GENERAL_SKILL_DISABLED": DYNAMIC_CAPABILITY_NOT_READY_GUIDANCE,
+        "GENERAL_SKILL_BINDING_REVOKED": DYNAMIC_CAPABILITY_NOT_READY_GUIDANCE,
+        "GENERAL_SKILL_PUBLICATION_INVALID": DYNAMIC_CAPABILITY_NOT_READY_GUIDANCE,
+        "GENERAL_SKILL_REVISION_CHANGED": DYNAMIC_CAPABILITY_NOT_READY_GUIDANCE,
+    }
+    return messages.get(code)
 
 
 def dynamic_task_failure_suggestion(code: str) -> str:
     """为动态任务失败选择与总开关或运行容量对应的用户提示。"""
 
     if code == "DYNAMIC_TASK_ROLLOUT_DENIED":
-        return "开启服务端普通动态能力后重试；无需重复选择 DynamicTaskAgent。"
+        return "请管理员检查服务配置后重试；不用重复选择 DynamicTaskAgent。"
     if code == "DYNAMIC_TASK_QUOTA_NOT_CONFIGURED":
-        return "补齐运行时容量后重试；这不是模型余额或外部日志本身导致的错误。"
+        return "请稍后再试；这不是你的权限或模型余额出了问题。"
+    if code in {
+        "MODEL_PREFLIGHT_REQUIRED",
+        "MODEL_CAPABILITY_MISSING",
+        "MODEL_CAPABILITY_SNAPSHOT_INVALID",
+        "VERTICAL_ABILITY_NOT_AVAILABLE",
+        "VERTICAL_ABILITY_REVISION_CHANGED",
+    }:
+        return "按上方说明处理后重试。"
     return "请查看执行记录或服务日志定位具体原因后重试。"
 
 

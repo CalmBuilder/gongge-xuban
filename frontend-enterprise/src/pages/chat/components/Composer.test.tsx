@@ -170,4 +170,18 @@ describe('Composer new-session action', () => {
     expect(await screen.findByRole('dialog')).toBeVisible();
     expect(chat.send).not.toHaveBeenCalled();
   });
+
+  it('shows the selected package in the selector without rendering a duplicate removable chip', () => {
+    const chat = createChat(vi.fn());
+    chat.selectedVerticalAbilityIds = ['web-intelligence'];
+
+    render(
+      <I18nProvider>
+        <Composer chat={chat} />
+      </I18nProvider>,
+    );
+
+    expect(screen.getByText('能力包：全网情报员')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '取消能力包 全网情报员' })).not.toBeInTheDocument();
+  });
 });

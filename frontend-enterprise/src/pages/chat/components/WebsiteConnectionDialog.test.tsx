@@ -19,6 +19,7 @@ const catalog: VerticalAbilityConnectionCatalog = {
     platform_id: 'xiaohongshu', platform_name: '小红书', description: '读取笔记和评论',
     capability_ids: ['intelligence.xiaohongshu_read'], auth_methods: ['browser_session'],
     auth_method_labels: { browser_session: '浏览器会话' }, fields_by_method: {},
+    setup_url: 'https://www.xiaohongshu.com', setup_link_label: '打开小红书',
     browser_transports: [
       { transport: 'local_loopback', label: '本机连接', description: '浏览器与后端在同机' },
       { transport: 'browser_relay', label: '宿主机连接', description: '后端在远端' },
@@ -42,6 +43,7 @@ describe('用户确认浏览器设备', () => {
     client.get.mockImplementation(async (path: string) => path.includes('/pairings/') ? pairing : catalog);
     client.post.mockResolvedValue(pairing);
     render(<I18nProvider><WebsiteConnectionDialog open onOpenChange={vi.fn()} highlightPlatformId="xiaohongshu" /></I18nProvider>);
+    expect(await screen.findByRole('link', { name: '打开小红书' })).toBeVisible();
     await user.click(await screen.findByRole('radio', {
       name: transport === 'local_loopback' ? /本机连接/ : /宿主机连接/,
     }));
@@ -54,7 +56,15 @@ describe('用户确认浏览器设备', () => {
       },
     ));
     expect(await screen.findByText('fixture-only-pairing-token')).toBeVisible();
-    expect(screen.getByText(/browser-relay-connector.exe/)).toBeVisible();
+    expect(screen.getByText('Windows（安装包）')).toBeVisible();
+    expect(screen.getByText('Linux（Python）')).toBeVisible();
+    expect(screen.getByRole('button', { name: '复制Windows（安装包）命令' })).toBeVisible();
+    expect(screen.getByRole('button', { name: '复制Linux（Python）命令' })).toBeVisible();
+    const expectedServerUrl = transport === 'local_loopback'
+      ? 'http://127.0.0.1:5137'
+      : 'http://<VM或服务器地址>:5137';
+    expect(screen.getAllByText((content) => content.includes(`--server-url "${expectedServerUrl}"`)).length).toBeGreaterThan(0);
+    expect(screen.getByText(/python3 backend\/browser_relay_connector.py/)).toBeVisible();
     expect(JSON.stringify(localStorage)).not.toContain('fixture-only-pairing-token');
     expect(screen.queryByLabelText('密码')).not.toBeInTheDocument();
     const otherMode = transport === 'local_loopback' ? /宿主机连接/ : /本机连接/;

@@ -75,7 +75,14 @@ logger = logging.getLogger(__name__)
 
 
 class CapabilityAccessDenied(RuntimeError):
-    """表示动态能力在解析或执行前再授权时被确定性拒绝。"""
+    """表示动态能力当前还不能使用，不等同于登录用户没有 DynamicTaskAgent 权限。"""
+
+    def __init__(self, code: str) -> None:
+        """保存稳定领域错误码，让聊天、Signal 和 Execution 共享同一拒绝原因。"""
+
+        normalized_code = str(code or "").strip() or "CAPABILITY_ACCESS_DENIED"
+        super().__init__(normalized_code)
+        self.code = normalized_code
 
 
 class IdempotencyContract(BaseModel):

@@ -46,6 +46,7 @@ import {
   CHAT_COMPOSER_STAGE_CLASS,
   CHAT_COMPOSER_STOP_BTN_CLASS,
   CHAT_COMPOSER_TEXTAREA_CLASS,
+  CHAT_COMPOSER_TOOLBAR_CLASS,
   CHAT_INPUT_SHELL_CLASS,
   CHAT_MENU_CONTENT_CLASS,
   CHAT_MENU_ITEM_CLASS,
@@ -83,7 +84,6 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
     verticalAbilityCatalogError,
     selectedVerticalAbilityIds,
     selectVerticalAbility,
-    clearSelectedVerticalAbility,
     verticalAbilityReadinessById,
     checkVerticalAbilityReadiness,
     generalSkillInstallOpen,
@@ -468,7 +468,7 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
             }}
           />
 
-          <div className={cn('flex items-center justify-between gap-[10px]', !composerActive && 'opacity-95')}>
+          <div className={cn(CHAT_COMPOSER_TOOLBAR_CLASS, !composerActive && 'opacity-95')}>
             <div className={CHAT_COMPOSER_CONTEXT_ROW_CLASS}>
               <DropdownMenu open={composerPlusOpen} onOpenChange={setComposerPlusOpen}>
                 <DropdownMenuTrigger asChild>
@@ -668,19 +668,6 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
                 >
                   <ProductIcon name="close" size={10} />
                   <span>{selectedSkill.name}</span>
-                </button>
-              ))}
-              {selectedVerticalAbilities.map((ability) => (
-                <button
-                  key={ability.id}
-                  type="button"
-                  className={CHAT_COMPOSER_INTENT_CHIP_CLASS}
-                  onClick={() => clearSelectedVerticalAbility(ability.id)}
-                  aria-label={t('取消能力包 {1}', { 1: ability.name })}
-                  title={t('取消当前对话的能力包选择')}
-                >
-                  <ProductIcon name="close" size={10} />
-                  <span>{ability.name}</span>
                 </button>
               ))}
               {activeVerticalAbilityWarnings.map((warning) => (

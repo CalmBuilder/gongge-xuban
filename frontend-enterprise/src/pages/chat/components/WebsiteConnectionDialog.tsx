@@ -236,12 +236,7 @@ export default function WebsiteConnectionDialog({
   const handleCopyPairingToken = async () => {
     const token = relayPairing?.pairing_token;
     if (!token) return;
-    try {
-      await navigator.clipboard.writeText(token);
-      notify.success('配对令牌已复制');
-    } catch {
-      notify.warning('浏览器未允许复制，请手动选择令牌');
-    }
+    await copyText(token, '配对令牌已复制');
   };
 
   const handleVerify = async () => {
@@ -356,7 +351,7 @@ export default function WebsiteConnectionDialog({
                       rel="noreferrer"
                       className="mt-[10px] inline-flex w-fit items-center gap-[5px] gg-type-meta font-medium text-[var(--gg-interaction)] underline underline-offset-2 hover:text-[var(--gg-cobalt)]"
                     >
-                      打开 {activePlatform.setup_link_label}
+                      {activePlatform.setup_link_label}
                       <ProductIcon name="arrow" size={13} />
                     </a>
                   ) : null}
@@ -456,12 +451,31 @@ export default function WebsiteConnectionDialog({
                               <UIButton type="button" variant="outline" onClick={() => void handleCopyPairingToken()} disabled={busy} className="shrink-0 bg-white px-[10px]">复制</UIButton>
                             </div>
                           ) : null}
+                          <div className="grid gap-[9px] rounded-[10px] border border-[#dfe6f5] bg-[#fbfcff] p-[11px]">
+                            <div>
+                              <p className="gg-type-control font-semibold text-[var(--gg-text-primary)]">启动设备连接器</p>
+                              <p className="mt-[3px] gg-type-caption text-[var(--gg-text-muted)]">
+                                连接器是命令行程序，不要直接双击后关闭窗口。请在对应系统的终端执行一条命令，输入上面的令牌后保持终端运行。
+                              </p>
+                              <p className="mt-[3px] gg-type-caption text-[#7b5b1a]">
+                                {browserTransport === 'browser_relay'
+                                  ? '这是远程部署：把命令中的服务地址换成 VM 的实际地址，不能使用 127.0.0.1。'
+                                  : '这是本机部署：连接器、浏览器和平台服务在同一台设备，服务地址使用 127.0.0.1。'}
+                              </p>
+                            </div>
+                            <RelayCommandBlock
+                              label="Windows（安装包）"
+                              hint="在共格·序伴安装目录打开 PowerShell；连接器和 OpenCLI 已随安装包提供。"
+                              command={relayConnectorCommand(browserTransport, 'windows')}
+                            />
+                            <RelayCommandBlock
+                              label="Linux（Python）"
+                              hint="在项目根目录执行；需要已安装 Python 3 和 OpenCLI。"
+                              command={relayConnectorCommand(browserTransport, 'linux')}
+                            />
+                          </div>
                           <p className="gg-type-caption text-[#7b5b1a]">
-                            {browserTransport === 'browser_relay' ? '在浏览器所在宿主机运行安装包中的' : '在部署本平台且已登录浏览器的同一设备运行安装包中的'}{' '}
-                            <code>browser-relay-connector.exe</code>
-                            {browserTransport === 'browser_relay'
-                              ? '，填入服务地址和此令牌；浏览器扩展仍需手动安装并保持登录。'
-                              : '，服务地址填写 http://127.0.0.1:5137（端口以实际部署为准）并输入此令牌；浏览器扩展仍需手动安装。这一步用于确认设备授权，不会使用其他用户的浏览器。'}
+                            浏览器扩展仍需手动安装并保持登录；上方命令执行后，连接状态变为“已连接”即可使用这台设备的浏览器会话。
                           </p>
                           <Badge className="w-fit rounded-full border border-[#ead7a8] bg-white px-[8px] gg-type-caption text-[#7b5b1a]">{relayPairing.status === 'connected' ? '已连接' : relayPairing.status === 'disconnected' ? '连接器离线' : '等待连接器'}</Badge>
                         </div>
@@ -597,6 +611,39 @@ function ConnectionField({
   );
 }
 
+function RelayCommandBlock({
+  label,
+  hint,
+  command,
+}: {
+  label: string;
+  hint: string;
+  command: string;
+}) {
+  /** 展示一个可复制的跨平台 Relay 启动命令，令牌只从终端输入。 */
+
+  return (
+    <div className="grid gap-[7px] rounded-[9px] border border-[var(--gg-line)] bg-white p-[9px]">
+      <div className="flex items-start justify-between gap-[8px]">
+        <div className="min-w-0">
+          <p className="gg-type-control font-semibold text-[var(--gg-text-primary)]">{label}</p>
+          <p className="mt-[2px] gg-type-caption text-[var(--gg-text-muted)]">{hint}</p>
+        </div>
+        <UIButton
+          type="button"
+          variant="outline"
+          onClick={() => void copyText(command, `${label}命令已复制`)}
+          className="shrink-0 bg-white px-[9px]"
+          aria-label={`复制${label}命令`}
+        >
+          复制命令
+        </UIButton>
+      </div>
+      <pre className="overflow-x-auto whitespace-pre-wrap break-all rounded-[8px] bg-[#f5f7fc] px-[9px] py-[8px] font-mono text-[11px] leading-[1.55] text-[#303746]"><code>{command}</code></pre>
+    </div>
+  );
+}
+
 function compactCredentials(values: Record<string, string>): Record<string, string> {
   /** 清除空字段，避免把空字符串当成一份新的平台凭据保存。 */
 
@@ -626,6 +673,41 @@ function transportLabel(transport: VerticalAbilityConnectionTransport): string {
   /** 将稳定传输键转换为连接详情中的简短用户文案。 */
 
   return transport === 'browser_relay' ? '宿主机 Relay' : '本机连接';
+}
+
+function relayConnectorCommand(
+  transport: VerticalAbilityConnectionTransport,
+  platform: 'windows' | 'linux',
+): string {
+  /** 生成页面展示的本机/远程 Relay 命令，不把真实配对令牌落入页面静态文本。 */
+
+  const serverUrl = transport === 'local_loopback'
+    ? 'http://127.0.0.1:5137'
+    : 'http://<VM或服务器地址>:5137';
+  if (platform === 'windows') {
+    return [
+      '$token = Read-Host "粘贴页面中的配对令牌"',
+      `.\\browser-relay-connector.exe --server-url "${serverUrl}" --pairing-token $token --opencli-path ".\\runtime\\opencli\\opencli.exe"`,
+    ].join('\n');
+  }
+  return [
+    'read -r -s -p "粘贴页面中的配对令牌: " PAIRING_TOKEN; echo',
+    'python3 backend/browser_relay_connector.py \\',
+    `  --server-url "${serverUrl}" \\`,
+    '  --pairing-token "$PAIRING_TOKEN" \\',
+    '  --opencli-path "$(command -v opencli)"',
+  ].join('\n');
+}
+
+async function copyText(value: string, successMessage: string): Promise<void> {
+  /** 统一处理令牌和命令的复制反馈，复制失败时允许用户手动选择文本。 */
+
+  try {
+    await navigator.clipboard.writeText(value);
+    notify.success(successMessage);
+  } catch {
+    notify.warning('浏览器未允许复制，请手动选择文本');
+  }
 }
 
 function displayError(error: unknown, fallback: string): string {

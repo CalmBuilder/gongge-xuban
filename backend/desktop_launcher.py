@@ -327,7 +327,7 @@ def _acquire_macos_instance_lock() -> bool:
 def _acquire_windows_instance_mutex() -> bool:
     """以 Windows 命名互斥锁保证同一用户会话只运行一个桌面服务实例。"""
 
-    if not _use_windows_taskbar_app():
+    if not _use_windows_instance_guard():
         return True
 
     import ctypes
@@ -388,7 +388,9 @@ def _use_macos_dock_app() -> bool:
     return sys.platform == "darwin" and getattr(sys, "frozen", False)
 
 
-def _use_windows_taskbar_app() -> bool:
+def _use_windows_instance_guard() -> bool:
+    """判断冻结版 Windows 是否需要启用单实例和浏览器复用协议。"""
+
     if headless_enabled():
         return False
     return sys.platform == "win32" and getattr(sys, "frozen", False)
@@ -396,12 +398,6 @@ def _use_windows_taskbar_app() -> bool:
 
 def _env_flag(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _is_windows_restore_command(message: int, wparam: int) -> bool:
-    wm_syscommand = 0x0112
-    sc_restore = 0xF120
-    return message == wm_syscommand and (wparam & 0xFFF0) == sc_restore
 
 
 def _serve(cfg: dict) -> None:
@@ -588,170 +584,6 @@ def _run_macos_dock_app(cfg: dict, url: str) -> int:
     return 0
 
 
-def _run_windows_taskbar_app(cfg: dict, url: str) -> int:
-    """Run the server behind a native window so the product owns a taskbar icon."""
-    import ctypes
-    from ctypes import wintypes
-
-    user32 = ctypes.WinDLL("user32", use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
-
-    WM_DESTROY = 0x0002
-    WM_SETICON = 0x0080
-    ICON_SMALL = 0
-    ICON_BIG = 1
-    WS_OVERLAPPEDWINDOW = 0x00CF0000
-    WS_EX_APPWINDOW = 0x00040000
-    SW_SHOWMINIMIZED = 2
-    SW_SHOWMINNOACTIVE = 7
-    CW_USEDEFAULT = -2147483648
-    COLOR_WINDOW = 5
-
-    WNDPROC = ctypes.WINFUNCTYPE(
-        wintypes.LPARAM,
-        wintypes.HWND,
-        wintypes.UINT,
-        wintypes.WPARAM,
-        wintypes.LPARAM,
-    )
-
-    class WNDCLASSW(ctypes.Structure):
-        _fields_ = [
-            ("style", wintypes.UINT),
-            ("lpfnWndProc", WNDPROC),
-            ("cbClsExtra", ctypes.c_int),
-            ("cbWndExtra", ctypes.c_int),
-            ("hInstance", wintypes.HINSTANCE),
-            ("hIcon", wintypes.HICON),
-            ("hCursor", wintypes.HANDLE),
-            ("hbrBackground", wintypes.HBRUSH),
-            ("lpszMenuName", wintypes.LPCWSTR),
-            ("lpszClassName", wintypes.LPCWSTR),
-        ]
-
-    kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
-    kernel32.GetModuleHandleW.restype = wintypes.HINSTANCE
-    shell32.SetCurrentProcessExplicitAppUserModelID.argtypes = [wintypes.LPCWSTR]
-    shell32.SetCurrentProcessExplicitAppUserModelID.restype = ctypes.c_long
-    shell32.ExtractIconExW.argtypes = [
-        wintypes.LPCWSTR,
-        ctypes.c_int,
-        ctypes.POINTER(wintypes.HICON),
-        ctypes.POINTER(wintypes.HICON),
-        wintypes.UINT,
-    ]
-    shell32.ExtractIconExW.restype = wintypes.UINT
-    user32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
-    user32.RegisterClassW.restype = wintypes.ATOM
-    user32.CreateWindowExW.argtypes = [
-        wintypes.DWORD,
-        wintypes.LPCWSTR,
-        wintypes.LPCWSTR,
-        wintypes.DWORD,
-        ctypes.c_int,
-        ctypes.c_int,
-        ctypes.c_int,
-        ctypes.c_int,
-        wintypes.HWND,
-        wintypes.HMENU,
-        wintypes.HINSTANCE,
-        wintypes.LPVOID,
-    ]
-    user32.CreateWindowExW.restype = wintypes.HWND
-    user32.DefWindowProcW.argtypes = [
-        wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
-    ]
-    user32.DefWindowProcW.restype = wintypes.LPARAM
-    user32.SendMessageW.argtypes = [
-        wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
-    ]
-    user32.SendMessageW.restype = wintypes.LPARAM
-    user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
-    user32.ShowWindow.restype = wintypes.BOOL
-    user32.UpdateWindow.argtypes = [wintypes.HWND]
-    user32.UpdateWindow.restype = wintypes.BOOL
-    user32.DestroyWindow.argtypes = [wintypes.HWND]
-    user32.DestroyWindow.restype = wintypes.BOOL
-    user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT]
-    user32.GetMessageW.restype = wintypes.BOOL
-
-    shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
-    large_icon = wintypes.HICON()
-    small_icon = wintypes.HICON()
-    shell32.ExtractIconExW(sys.executable, 0, ctypes.byref(large_icon), ctypes.byref(small_icon), 1)
-
-    @WNDPROC
-    def window_proc(hwnd, message, wparam, lparam):
-        if _is_windows_restore_command(message, wparam):
-            print(f"Taskbar or Alt+Tab activated; focusing {APP_NAME} in the system default browser.")
-            _open_windows_browser_once(url + "/chat/")
-            user32.ShowWindow(hwnd, SW_SHOWMINNOACTIVE)
-            return 0
-        if message == WM_DESTROY:
-            user32.PostQuitMessage(0)
-            return 0
-        return user32.DefWindowProcW(hwnd, message, wparam, lparam)
-
-    instance = kernel32.GetModuleHandleW(None)
-    class_name = "GonggeXubanDesktopWindow"
-    window_class = WNDCLASSW()
-    window_class.lpfnWndProc = window_proc
-    window_class.hInstance = instance
-    window_class.hIcon = large_icon
-    window_class.hCursor = user32.LoadCursorW(None, 32512)
-    window_class.hbrBackground = COLOR_WINDOW + 1
-    window_class.lpszClassName = class_name
-    if not user32.RegisterClassW(ctypes.byref(window_class)):
-        error = ctypes.get_last_error()
-        if error != 1410:  # ERROR_CLASS_ALREADY_EXISTS
-            raise ctypes.WinError(error)
-
-    hwnd = user32.CreateWindowExW(
-        WS_EX_APPWINDOW,
-        class_name,
-        APP_NAME,
-        WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT,
-        CW_USEDEFAULT,
-        430,
-        190,
-        None,
-        None,
-        instance,
-        None,
-    )
-    if not hwnd:
-        raise ctypes.WinError(ctypes.get_last_error())
-
-    if large_icon:
-        user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, ctypes.cast(large_icon, ctypes.c_void_p).value)
-    if small_icon:
-        user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, ctypes.cast(small_icon, ctypes.c_void_p).value)
-
-    print(
-        f"Windows shell ready: hwnd={hwnd}, "
-        f"large_icon={ctypes.cast(large_icon, ctypes.c_void_p).value or 0}, "
-        f"small_icon={ctypes.cast(small_icon, ctypes.c_void_p).value or 0}"
-    )
-
-    threading.Thread(target=_serve, args=(cfg,), daemon=True).start()
-    threading.Thread(target=_open_windows_browser_when_ready, args=(url,), daemon=True).start()
-    user32.ShowWindow(hwnd, SW_SHOWMINIMIZED)
-    user32.UpdateWindow(hwnd)
-
-    message = wintypes.MSG()
-    while user32.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:
-        user32.TranslateMessage(ctypes.byref(message))
-        user32.DispatchMessageW(ctypes.byref(message))
-
-    if large_icon:
-        user32.DestroyIcon(large_icon)
-    if small_icon:
-        user32.DestroyIcon(small_icon)
-    return 0
-
-
 def main(argv: list[str] | None = None) -> int:
     """按CLI模式运行受限parser或启动桌面单端口服务。"""
 
@@ -768,7 +600,7 @@ def main(argv: list[str] | None = None) -> int:
     _log_startup_phase("logging_ready", startup_started_at)
 
     host = desktop_env_value("HOST", "127.0.0.1")
-    if _use_windows_taskbar_app() and not _acquire_windows_instance_mutex():
+    if _use_windows_instance_guard() and not _acquire_windows_instance_mutex():
         _log_startup_phase("existing_instance_detected", startup_started_at)
         existing_url = _wait_for_existing_app_url(host)
         if existing_url:
@@ -778,15 +610,15 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{APP_NAME} 已有实例正在启动，当前实例退出。")
         return 0
 
-    if _use_windows_taskbar_app():
+    if _use_windows_instance_guard():
         _log_startup_phase("instance_lock_acquired", startup_started_at)
     # Windows 冻结版只确认固定候选端口（默认 5137/59137），开发态和 macOS
     # 继续使用可配置的完整端口范围。
-    existing_ports = _port_candidates() if _use_windows_taskbar_app() else None
+    existing_ports = _port_candidates() if _use_windows_instance_guard() else None
     existing_url = _find_existing_app_url(host, existing_ports)
     if existing_url:
         print(f"{APP_NAME} 已在运行：{existing_url}/chat/")
-        if _use_windows_taskbar_app():
+        if _use_windows_instance_guard():
             _open_windows_browser_once(existing_url + "/chat/")
         else:
             _open_browser(existing_url + "/chat/")
@@ -812,10 +644,10 @@ def main(argv: list[str] | None = None) -> int:
     if _use_macos_dock_app():
         return _run_macos_dock_app(cfg, url)
 
-    if _use_windows_taskbar_app():
-        return _run_windows_taskbar_app(cfg, url)
-
-    if not headless_enabled():
+    if _use_windows_instance_guard():
+        print(f"{APP_NAME} 启动中，就绪后将打开：{url}/chat/")
+        threading.Thread(target=_open_windows_browser_when_ready, args=(url,), daemon=True).start()
+    elif not headless_enabled():
         print(f"{APP_NAME} 启动中，就绪后将打开：{url}/chat/")
         threading.Thread(target=_open_browser_when_ready, args=(url,), daemon=True).start()
     else:

@@ -23,6 +23,7 @@ from app.core.non_sop_capability import (
 )
 from app.db.models import ChatSession, GeneralSkill, Skill
 from app.dynamic_tasks.agent import DynamicRunOutcome, DynamicTaskAgentError
+from app.dynamic_tasks.capability_catalog import CapabilityAccessDenied
 from app.dynamic_tasks.quotas import DynamicTaskQuotaError
 from app.general_skills.schema import GeneralSkillSelection
 from app.session.session_schema import ChatAttachmentRef, ChatTurnRequest, RouterDecision
@@ -547,6 +548,65 @@ def test_agent_loop_delegates_effective_dynamic_route_without_copying_loop(monke
     assert response is not None
     assert response.reply == "# 风险简报"
     assert calls == ["init", "start", "run"]
+
+
+def test_agent_loop_preserves_capability_denial_code_when_delegation_fails(monkeypatch) -> None:
+    """动态能力拒绝从委派边界抛出时不得退化成异常类型名。"""
+
+    route = _route(
+        NonSopCapabilityRouter(
+            shadow_enabled=False,
+            execution_enabled=True,
+            shadow_selector=_ShadowSelector(
+                NonSopCapabilityDecision(
+                    mode="dynamic_task",
+                    goal="生成风险简报",
+                    success_criteria=["覆盖合同证据"],
+                    confidence=0.95,
+                )
+            ),
+        ),
+        _GeneralSelector(GeneralSkillSelection()),
+    )
+
+    class _DeniedAgent:
+        """在动态委派阶段模拟模型能力预检拒绝。"""
+
+        def __init__(self, _db) -> None:
+            """兼容生产构造签名。"""
+
+        def start_task(self, **_kwargs):
+            """抛出带稳定领域码的能力拒绝。"""
+
+            raise CapabilityAccessDenied("MODEL_PREFLIGHT_REQUIRED")
+
+    monkeypatch.setattr("app.core.agent_loop.DynamicTaskAgent", _DeniedAgent)
+    loop = object.__new__(AgentLoop)
+    loop.db = SimpleNamespace(commit=lambda: None)
+    loop.events = SimpleNamespace(record=lambda *_args, **_kwargs: None)
+    loop._knowledge_capability_payload = lambda *_args: {"available": False}
+    loop._fail_unbound_dynamic_skill_uses = lambda **_kwargs: None
+    session = ChatSession(
+        id="session_dynamic_denied",
+        tenant_id="tenant_demo",
+        agent_id="agent_demo",
+    )
+
+    with pytest.raises(DynamicTaskAgentError) as caught:
+        loop._try_handle_dynamic_task(
+            ChatTurnRequest(
+                tenant_id="tenant_demo",
+                user_id="user_demo",
+                agent_id="agent_demo",
+                message="生成风险简报",
+            ),
+            session,
+            SimpleNamespace(id="model_1"),
+            route,
+            "message_denied",
+        )
+
+    assert caught.value.code == "MODEL_PREFLIGHT_REQUIRED"
 
 
 def test_agent_loop_continues_terminal_dynamic_chat_turn(monkeypatch) -> None:

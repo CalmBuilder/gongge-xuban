@@ -1291,10 +1291,30 @@ function dynamicTaskFailureGuidance(code: string): string | undefined {
   /** 把动态任务基础门禁转换为用户可执行的说明，避免只展示内部错误码。 */
 
   if (code === 'DYNAMIC_TASK_ROLLOUT_DENIED') {
-    return 'DynamicTaskAgent 当前被服务端普通动态总开关拒绝；普通能力不需要在前端勾选，请管理员检查运行配置。';
+    return '这个动态任务还没有启动。普通用户不用申请 DynamicTaskAgent 权限，请管理员检查服务配置。';
   }
   if (code === 'DYNAMIC_TASK_QUOTA_NOT_CONFIGURED') {
-    return 'DynamicTaskAgent 的运行时容量尚未配置，请管理员检查 tenant、Agent、用户和工具的运行槽位。';
+    return '这个动态任务正在排队，因为现在同时运行的任务太多，请稍后再试。';
+  }
+  if (code === 'MODEL_PREFLIGHT_REQUIRED') {
+    return '这个模型会聊天，但系统还没有检查它能不能完成动态任务，请管理员在模型配置页面点“动态能力验证”，再试一次。';
+  }
+  if (code === 'MODEL_CAPABILITY_MISSING') {
+    return '这个模型会聊天，但不会按动态任务需要的方式使用工具，请管理员换一个支持动态任务的模型。';
+  }
+  if (code === 'MODEL_CAPABILITY_SNAPSHOT_INVALID') {
+    return '模型设置刚刚改过，系统手里的旧检查结果不能用了，请管理员重新点“动态能力验证”，再试一次。';
+  }
+  if (code === 'VERTICAL_ABILITY_NOT_AVAILABLE' || code === 'VERTICAL_ABILITY_REVISION_CHANGED') {
+    return '你选的能力包刚刚变了，系统暂时找不到它，请重新打开能力包，再选一次。';
+  }
+  if (
+    code === 'MODEL_NOT_AVAILABLE'
+    || code === 'CAPABILITY_ACCESS_DENIED'
+    || code.startsWith('CAPABILITY_')
+    || code.startsWith('GENERAL_SKILL_')
+  ) {
+    return '这次任务还没有开始，因为要用的工具现在还没有准备好；不是你没有权限，请重新选择能力包后再试。';
   }
   return undefined;
 }
@@ -1302,7 +1322,11 @@ function dynamicTaskFailureGuidance(code: string): string | undefined {
 function streamErrorText(data: Record<string, unknown>, eventName: string): string {
   const code = typeof data.code === 'string' ? data.code.trim() : '';
   if (code === 'LLM_ERROR') return '模型调用失败';
-  if (code === 'DYNAMIC_TASK_ROLLOUT_DENIED' || code === 'DYNAMIC_TASK_QUOTA_NOT_CONFIGURED') {
+  if (
+    code === 'DYNAMIC_TASK_ROLLOUT_DENIED'
+    || code === 'DYNAMIC_TASK_QUOTA_NOT_CONFIGURED'
+    || dynamicTaskFailureGuidance(code)
+  ) {
     return 'DynamicTaskAgent 未执行';
   }
   if (eventName === 'stream_interrupted') return '响应生成中断';
