@@ -17,6 +17,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 
+from app.vertical_abilities.browser_runtime import BrowserRuntimeError, normalize_opencli_profile
 from app.vertical_abilities.platform_runtime import PlatformRuntimeError, run_opencli_raw
 
 
@@ -46,6 +47,7 @@ class BrowserRelayConnector:
         server_url: str,
         pairing_token: str,
         opencli_path: str | None = None,
+        opencli_profile: str | None = None,
         poll_seconds: float = CONNECTOR_DEFAULT_POLL_SECONDS,
         once: bool = False,
     ) -> None:
@@ -76,6 +78,10 @@ class BrowserRelayConnector:
         self.server_url = parsed.geturl()
         self.pairing_token = token
         self.opencli_path = str(opencli_path).strip() if opencli_path else None
+        try:
+            self.opencli_profile = normalize_opencli_profile(opencli_profile)
+        except BrowserRuntimeError as exc:
+            raise BrowserRelayConnectorError(exc.code, exc.message, terminal=True) from exc
         self.poll_seconds = interval
         self.once = once
 
@@ -160,6 +166,7 @@ class BrowserRelayConnector:
                 limit=limit,
                 settings=settings,
                 executable_path=self.opencli_path,
+                opencli_profile=self.opencli_profile,
             )
             return {
                 "success": True,
@@ -276,6 +283,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--server-url", required=True, help="共格·序伴服务地址")
     parser.add_argument("--pairing-token", required=True, help="连接中心一次显示的 Relay 配对令牌")
     parser.add_argument("--opencli-path", default=None, help="可选的 OpenCLI 固定可执行路径")
+    parser.add_argument(
+        "--opencli-profile",
+        default=None,
+        help="多浏览器 Profile 时指定已登录目标网站的 Profile ID 或别名",
+    )
     parser.add_argument("--poll-seconds", type=float, default=CONNECTOR_DEFAULT_POLL_SECONDS)
     parser.add_argument("--once", action="store_true", help="只轮询一条命令，供诊断和测试使用")
     args = parser.parse_args(argv)
@@ -284,6 +296,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             server_url=args.server_url,
             pairing_token=args.pairing_token,
             opencli_path=args.opencli_path,
+            opencli_profile=args.opencli_profile,
             poll_seconds=args.poll_seconds,
             once=args.once,
         )

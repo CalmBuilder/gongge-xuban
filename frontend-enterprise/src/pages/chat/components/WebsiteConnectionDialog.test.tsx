@@ -60,11 +60,14 @@ describe('用户确认浏览器设备', () => {
     expect(screen.getByText('Linux（Python）')).toBeVisible();
     expect(screen.getByRole('button', { name: '复制Windows（安装包）命令' })).toBeVisible();
     expect(screen.getByRole('button', { name: '复制Linux（Python）命令' })).toBeVisible();
+    expect(screen.getAllByRole('button', { name: '复制多 Profile 兜底命令' })).toHaveLength(2);
     const expectedServerUrl = transport === 'local_loopback'
       ? 'http://127.0.0.1:5137'
       : 'http://<VM或服务器地址>:5137';
     expect(screen.getAllByText((content) => content.includes(`--server-url "${expectedServerUrl}"`)).length).toBeGreaterThan(0);
-    expect(screen.getByText(/python3 backend\/browser_relay_connector.py/)).toBeVisible();
+    expect(screen.getAllByText(/python3 backend\/browser_relay_connector.py/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/--opencli-profile/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/\$opencliProfile/).length).toBeGreaterThan(0);
     expect(JSON.stringify(localStorage)).not.toContain('fixture-only-pairing-token');
     expect(screen.queryByLabelText('密码')).not.toBeInTheDocument();
     const otherMode = transport === 'local_loopback' ? /宿主机连接/ : /本机连接/;

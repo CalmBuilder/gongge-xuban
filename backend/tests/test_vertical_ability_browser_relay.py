@@ -188,6 +188,7 @@ def test_host_connector_executes_only_the_server_fixed_opencli_action(monkeypatc
         server_url="https://relay.example.test",
         pairing_token="one-time-token",
         opencli_path="C:/Program Files/Gongge-Xuban/runtime/opencli/opencli.exe",
+        opencli_profile="9etrfpdg",
         once=True,
     )
     result = connector._execute_command(
@@ -207,3 +208,4 @@ def test_host_connector_executes_only_the_server_fixed_opencli_action(monkeypatc
     assert captured["args"] == ("xiaohongshu", "search", ["python"])
     assert captured["kwargs"]["credentials"] == {"session_reference": "opencli:xiaohongshu"}
     assert captured["kwargs"]["executable_path"].endswith("opencli.exe")
+    assert captured["kwargs"]["opencli_profile"] == "9etrfpdg"

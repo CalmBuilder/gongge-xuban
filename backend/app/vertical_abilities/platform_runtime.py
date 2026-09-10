@@ -25,6 +25,7 @@ import yaml
 from app.cancellation import TurnCancellationRequested, raise_if_cancelled
 from app.vertical_abilities.browser_runtime import (
     BrowserRuntimeError,
+    normalize_opencli_profile,
     require_opencli_browser_bridge,
 )
 
@@ -113,8 +114,9 @@ def run_opencli_raw(
     settings: object | None = None,
     is_cancelled: Callable[[], bool] | None = None,
     executable_path: str | None = None,
+    opencli_profile: str | None = None,
 ) -> bytes:
-    """仅供用户显式启动的宿主机连接器执行固定平台命令，不作为服务端用户授权入口。"""
+    """仅供用户显式启动的宿主机连接器执行固定平台命令，并固定到目标浏览器 Profile。"""
 
     normalized_platform, normalized_action, action_spec = _validated_opencli_action(
         platform_id,
@@ -127,7 +129,14 @@ def run_opencli_raw(
             "该网站操作需要先连接已登录的浏览器会话。",
         )
     try:
-        require_opencli_browser_bridge(normalized_platform)
+        selected_profile = normalize_opencli_profile(opencli_profile)
+        if selected_profile is None:
+            require_opencli_browser_bridge(normalized_platform)
+        else:
+            require_opencli_browser_bridge(
+                normalized_platform,
+                opencli_profile=selected_profile,
+            )
     except BrowserRuntimeError as exc:
         raise PlatformRuntimeError(exc.code, exc.message) from exc
     values = _validate_positional_args(positional_args)
@@ -136,12 +145,10 @@ def run_opencli_raw(
         if executable_path is None
         else _find_executable("opencli", "OpenCLI", explicit_path=executable_path)
     )
-    command = [
-        str(executable),
-        normalized_platform,
-        *action_spec,
-        *values,
-    ]
+    command = [str(executable)]
+    if selected_profile is not None:
+        command.extend(("--profile", selected_profile))
+    command.extend((normalized_platform, *action_spec, *values))
     if limit is not None:
         bounded_limit = _bounded_limit(limit)
         if normalized_platform == "twitter":

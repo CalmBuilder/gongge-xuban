@@ -467,15 +467,21 @@ export default function WebsiteConnectionDialog({
                               label="Windows（安装包）"
                               hint="在共格·序伴安装目录打开 PowerShell；连接器和 OpenCLI 已随安装包提供。"
                               command={relayConnectorCommand(browserTransport, 'windows')}
+                              fallbackLabel="多 Profile 兜底"
+                              fallbackHint="如果 profile list 显示多个已连接 Profile，先选择已登录目标网站的 ID，再启动连接器。"
+                              fallbackCommand={relayConnectorProfileFallbackCommand(browserTransport, 'windows')}
                             />
                             <RelayCommandBlock
                               label="Linux（Python）"
                               hint="在项目根目录执行；需要已安装 Python 3 和 OpenCLI。"
                               command={relayConnectorCommand(browserTransport, 'linux')}
+                              fallbackLabel="多 Profile 兜底"
+                              fallbackHint="如果 profile list 显示多个已连接 Profile，先选择已登录目标网站的 ID，再启动连接器。"
+                              fallbackCommand={relayConnectorProfileFallbackCommand(browserTransport, 'linux')}
                             />
                           </div>
                           <p className="gg-type-caption text-[#7b5b1a]">
-                            浏览器扩展仍需手动安装并保持登录；上方命令执行后，连接状态变为“已连接”即可使用这台设备的浏览器会话。
+                            浏览器扩展仍需手动安装并保持登录；“已连接”表示设备 Relay 已配对。若 OpenCLI 检测到多个 Profile，请使用上面的兜底命令明确选择目标账号。
                           </p>
                           <Badge className="w-fit rounded-full border border-[#ead7a8] bg-white px-[8px] gg-type-caption text-[#7b5b1a]">{relayPairing.status === 'connected' ? '已连接' : relayPairing.status === 'disconnected' ? '连接器离线' : '等待连接器'}</Badge>
                         </div>
@@ -615,12 +621,18 @@ function RelayCommandBlock({
   label,
   hint,
   command,
+  fallbackLabel,
+  fallbackHint,
+  fallbackCommand,
 }: {
   label: string;
   hint: string;
   command: string;
+  fallbackLabel?: string;
+  fallbackHint?: string;
+  fallbackCommand?: string;
 }) {
-  /** 展示一个可复制的跨平台 Relay 启动命令，令牌只从终端输入。 */
+  /** 展示跨平台 Relay 启动命令和多 Profile 兜底命令，令牌只从终端输入。 */
 
   return (
     <div className="grid gap-[7px] rounded-[9px] border border-[var(--gg-line)] bg-white p-[9px]">
@@ -640,6 +652,26 @@ function RelayCommandBlock({
         </UIButton>
       </div>
       <pre className="overflow-x-auto whitespace-pre-wrap break-all rounded-[8px] bg-[#f5f7fc] px-[9px] py-[8px] font-mono text-[11px] leading-[1.55] text-[#303746]"><code>{command}</code></pre>
+      {fallbackCommand ? (
+        <div className="grid gap-[7px] border-t border-[var(--gg-line)] pt-[9px]">
+          <div className="flex items-start justify-between gap-[8px]">
+            <div className="min-w-0">
+              <p className="gg-type-control font-semibold text-[var(--gg-text-primary)]">{fallbackLabel || '兜底命令'}</p>
+              <p className="mt-[2px] gg-type-caption text-[var(--gg-text-muted)]">{fallbackHint || '出现多个浏览器 Profile 时使用。'}</p>
+            </div>
+            <UIButton
+              type="button"
+              variant="outline"
+              onClick={() => void copyText(fallbackCommand, `${fallbackLabel || '兜底'}命令已复制`)}
+              className="shrink-0 bg-white px-[9px]"
+              aria-label={`复制${fallbackLabel || '兜底'}命令`}
+            >
+              复制命令
+            </UIButton>
+          </div>
+          <pre className="overflow-x-auto whitespace-pre-wrap break-all rounded-[8px] bg-[#f5f7fc] px-[9px] py-[8px] font-mono text-[11px] leading-[1.55] text-[#303746]"><code>{fallbackCommand}</code></pre>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -696,6 +728,43 @@ function relayConnectorCommand(
     `  --server-url "${serverUrl}" \\`,
     '  --pairing-token "$PAIRING_TOKEN" \\',
     '  --opencli-path "$(command -v opencli)"',
+  ].join('\n');
+}
+
+function relayConnectorProfileFallbackCommand(
+  transport: VerticalAbilityConnectionTransport,
+  platform: 'windows' | 'linux',
+): string {
+  /** 生成多 Profile 时的显式选择命令，避免连接器猜错用户的登录账号。 */
+
+  const serverUrl = transport === 'local_loopback'
+    ? 'http://127.0.0.1:5137'
+    : 'http://<VM或服务器地址>:5137';
+  if (platform === 'windows') {
+    return [
+      '$opencli = ".\\runtime\\opencli\\opencli.exe"',
+      'if (-not (Test-Path -LiteralPath $opencli)) { throw "找不到安装包内的 OpenCLI：$opencli" }',
+      '& $opencli profile list',
+      '$opencliProfile = Read-Host "输入已登录目标网站的 Profile ID"',
+      '$token = Read-Host "粘贴页面中的配对令牌"',
+      '& ".\\browser-relay-connector.exe" `',
+      `  --server-url "${serverUrl}" \``,
+      '  --pairing-token $token \`',
+      '  --opencli-path $opencli \`',
+      '  --opencli-profile $opencliProfile',
+    ].join('\n');
+  }
+  return [
+    'OPENCLI_PATH="$(command -v opencli || true)"',
+    'if [ -z "$OPENCLI_PATH" ]; then echo "找不到 opencli，请先安装 OpenCLI" >&2; exit 1; fi',
+    '"$OPENCLI_PATH" profile list',
+    'read -r -p "输入已登录目标网站的 Profile ID: " OPENCLI_PROFILE',
+    'read -r -s -p "粘贴页面中的配对令牌: " PAIRING_TOKEN; echo',
+    'python3 backend/browser_relay_connector.py \\',
+    `  --server-url "${serverUrl}" \\,`,
+    '  --pairing-token "$PAIRING_TOKEN" \\',
+    '  --opencli-path "$OPENCLI_PATH" \\',
+    '  --opencli-profile "$OPENCLI_PROFILE"',
   ].join('\n');
 }
 

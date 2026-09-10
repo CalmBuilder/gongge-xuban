@@ -55,6 +55,51 @@ def test_host_opencli_uses_fixed_command_and_returns_raw_output(
     assert "environment" not in captured["kwargs"]
 
 
+def test_host_opencli_places_explicit_profile_before_platform_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """宿主机连接器指定 Profile 后必须使用 OpenCLI 全局参数位置，不能把账号参数当平台参数。"""
+
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        platform_runtime,
+        "require_opencli_browser_bridge",
+        lambda _platform, **_kwargs: None,
+    )
+    monkeypatch.setattr(platform_runtime, "_find_executable", lambda *_args: "/usr/bin/opencli")
+
+    def fake_run(command: list[str], **kwargs: object) -> bytes:
+        """捕获包含 Profile 的固定命令。"""
+
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return b"items:\n  - title: profile result\n"
+
+    monkeypatch.setattr(platform_runtime, "_run_command", fake_run)
+    result = platform_runtime.run_opencli_raw(
+        "xiaohongshu",
+        "search",
+        ["热门新闻"],
+        credentials={"session_reference": "opencli:xiaohongshu"},
+        limit=1,
+        opencli_profile="9etrfpdg",
+    )
+
+    assert result == b"items:\n  - title: profile result\n"
+    assert captured["command"] == [
+        "/usr/bin/opencli",
+        "--profile",
+        "9etrfpdg",
+        "xiaohongshu",
+        "search",
+        "热门新闻",
+        "--limit",
+        "1",
+        "-f",
+        "yaml",
+    ]
+
+
 def test_server_cannot_treat_global_opencli_reference_as_user_authorization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
