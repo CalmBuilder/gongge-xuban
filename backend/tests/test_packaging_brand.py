@@ -237,7 +237,6 @@ def test_windows_package_carries_browser_relay_and_fixed_opencli_runtime() -> No
         "browser-relay-connector.exe",
         "opencli-shim.spec",
         "runtime\\opencli\\opencli.exe",
-        "runtime\\opencli\\node.exe",
         "fetch_opencli_runtime.py",
         "OPENCLI_VERSION",
     ):
@@ -245,9 +244,10 @@ def test_windows_package_carries_browser_relay_and_fixed_opencli_runtime() -> No
     for marker in (
         "browser-relay-connector.exe",
         "runtime\\opencli\\opencli.exe",
-        "runtime\\opencli\\node.exe",
+        "runtime\\youtube-js\\node.exe",
         "node_modules\\@jackwener\\opencli\\dist\\src\\main.js",
         "Bundled browser Relay connector help probe",
+        "Bundled OpenCLI shared-Node probe",
     ):
         assert marker in smoke_windows
     assert 'Source: "..\\out\\gongge-xuban\\*"' in installer
@@ -258,7 +258,28 @@ def test_windows_package_carries_browser_relay_and_fixed_opencli_runtime() -> No
     )
     assert '"runtime" / "opencli"' in platform_runtime
     assert "shutil.which(name)" in platform_runtime
-    assert "node.exe" in launcher and "node_modules" in launcher
+    assert "youtube-js" in launcher and "node.exe" in launcher and "node_modules" in launcher
+    assert "runtime\\youtube-js\\node.exe" in build_windows
+    assert "runtime\\opencli\\node.exe" not in build_windows
+
+
+def test_opencli_launcher_reuses_shared_node_and_keeps_legacy_layout(tmp_path: Path) -> None:
+    """OpenCLI 新包复用 YouTube Node，旧版同目录 Node 仍可继续启动。"""
+
+    import opencli_launcher
+
+    runtime = tmp_path / "runtime"
+    opencli_root = runtime / "opencli"
+    shared_node = runtime / "youtube-js" / ("node.exe" if opencli_launcher.sys.platform == "win32" else "node")
+    shared_node.parent.mkdir(parents=True)
+    shared_node.write_bytes(b"node")
+
+    assert opencli_launcher._resolve_node_path(opencli_root) == shared_node
+
+    legacy_node = opencli_root / shared_node.name
+    legacy_node.parent.mkdir(parents=True)
+    legacy_node.write_bytes(b"legacy-node")
+    assert opencli_launcher._resolve_node_path(opencli_root) == legacy_node
 
 
 def test_opencli_fetch_resolves_windows_npm_launcher(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -398,8 +398,7 @@ Assert-NativeCommandSucceeded "YouTube Node.js runtime download"
 & $BUILD_PY.Command @($BUILD_PY.PrefixArgs) packaging\fetch_opencli_runtime.py `
   packaging\out\gongge-xuban\runtime\opencli --version $opencliVersion
 Assert-NativeCommandSucceeded "OpenCLI Node.js package installation"
-Copy-Item -LiteralPath "packaging\out\gongge-xuban\runtime\youtube-js\node.exe" `
-  -Destination "packaging\out\gongge-xuban\runtime\opencli\node.exe" -Force
+Write-Host "OpenCLI reuses runtime\youtube-js\node.exe; no duplicate Node.js binary is copied."
 Copy-Item -LiteralPath "packaging\assets\opencli-wrapper.cmd" `
   -Destination "packaging\out\gongge-xuban\runtime\opencli\opencli.cmd" -Force
 Push-Location backend

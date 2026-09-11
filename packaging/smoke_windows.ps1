@@ -242,13 +242,39 @@ try {
     throw "Bundled browser Relay connector was not found: $relayConnector"
   }
   $opencliNode = Join-Path $installDirectory "runtime\opencli\node.exe"
+  if (Test-Path -LiteralPath $opencliNode -PathType Leaf) {
+    throw "OpenCLI runtime contains a duplicate Node.js binary: $opencliNode"
+  }
   $opencliExecutable = Join-Path $installDirectory "runtime\opencli\opencli.exe"
   $opencliWrapper = Join-Path $installDirectory "runtime\opencli\opencli.cmd"
   $opencliEntry = Join-Path $installDirectory "runtime\opencli\node_modules\@jackwener\opencli\dist\src\main.js"
-  foreach ($requiredPath in @($opencliNode, $opencliExecutable, $opencliWrapper, $opencliEntry)) {
+  foreach ($requiredPath in @($youtubeNode, $opencliExecutable, $opencliWrapper, $opencliEntry)) {
     if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
       throw "Bundled OpenCLI runtime file was not found: $requiredPath"
     }
+  }
+
+  $opencliHelpStdoutPath = Join-Path $tempRoot "opencli.stdout.log"
+  $opencliHelpStderrPath = Join-Path $tempRoot "opencli.stderr.log"
+  $opencliHelpProcess = Start-Process -FilePath $opencliExecutable `
+    -ArgumentList @("--help") `
+    -Wait -PassThru `
+    -RedirectStandardOutput $opencliHelpStdoutPath `
+    -RedirectStandardError $opencliHelpStderrPath
+  $opencliHelpExitCode = $opencliHelpProcess.ExitCode
+  $opencliHelpOutput = @(
+    if (Test-Path -LiteralPath $opencliHelpStdoutPath) {
+      Get-Content -LiteralPath $opencliHelpStdoutPath -Raw
+    }
+    if (Test-Path -LiteralPath $opencliHelpStderrPath) {
+      Get-Content -LiteralPath $opencliHelpStderrPath -Raw
+    }
+  ) -join "`n"
+  if ($opencliHelpExitCode -ne 0) {
+    throw "Bundled OpenCLI shared-Node probe failed with exit code $opencliHelpExitCode. Full output: $opencliHelpOutput Diagnostics: $tempRoot"
+  }
+  if ($opencliHelpOutput -notmatch "OpenCLI|opencli") {
+    throw "Bundled OpenCLI shared-Node help output was not recognized. Diagnostics: $tempRoot"
   }
   $connectorHelpStdoutPath = Join-Path $tempRoot "browser-relay-connector.stdout.log"
   $connectorHelpStderrPath = Join-Path $tempRoot "browser-relay-connector.stderr.log"

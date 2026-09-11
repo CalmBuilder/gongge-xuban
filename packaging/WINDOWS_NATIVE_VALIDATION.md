@@ -45,6 +45,8 @@ PyInstaller 的 `--clean` 生成并校验 PE machine=`0x8664` 的 x64 可执行�
 
 - Inno Setup 安装器可静默安装，且安装目录含 `gongge-xuban.exe`；
 - 安装包内置 `runtime\python.exe` 能导入 PDF、Office、图片解析依赖；
+- 安装包内置的 `runtime\youtube-js\node.exe` 同时供 YouTube 和 OpenCLI 使用，
+  `runtime\opencli` 目录不应再出现第二份 Node.js；`opencli.exe --help` 能通过共享运行时启动；
 - 安装包内置的实际 exe、dll、pyd、node payload 均通过 PE x64（AMD64）架构检查；
   pip/distlib 与 setuptools 中仅用于生成入口脚本的多架构模板会明确记录为跳过，不能
   把这些模板误判成应用运行时；
