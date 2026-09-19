@@ -20,13 +20,15 @@ from app.core.non_sop_capability import (
     NonSopCapabilityDecision,
     NonSopCapabilityRouteResult,
     NonSopCapabilityRouter,
+    PROMPT_PATH,
 )
 from app.db.models import ChatSession, GeneralSkill, Skill
 from app.dynamic_tasks.agent import DynamicRunOutcome, DynamicTaskAgentError
 from app.dynamic_tasks.capability_catalog import CapabilityAccessDenied
-from app.dynamic_tasks.quotas import DynamicTaskQuotaError
+from app.dynamic_tasks.quotas import DynamicTaskQuotaError, DynamicTaskQuotaLimits
 from app.general_skills.schema import GeneralSkillSelection
 from app.session.session_schema import ChatAttachmentRef, ChatTurnRequest, RouterDecision
+from app.vertical_abilities.catalog import VerticalAbilityCatalog
 
 
 class _GeneralSelector:
@@ -65,6 +67,18 @@ class _ShadowSelector:
         return self.decision
 
 
+def test_non_sop_prompt_binds_continuation_to_current_user_message() -> None:
+    """路由提示必须把无关新问题与已完成任务的自动续接明确区分。"""
+
+    prompt = PROMPT_PATH.read_text(encoding="utf-8")
+
+    assert "当前用户消息是本轮唯一的任务边界" in prompt
+    assert "只有当前用户明确要求“继续/补充/修改上一任务”" in prompt
+    assert "不得因为会话中" in prompt
+    assert "存在已完成任务就续接" in prompt
+    assert "不要在路由理由或最终回答中输出内部 Execution、Operation" in prompt
+
+
 def test_empty_skill_and_knowledge_catalog_enters_primary_selector() -> None:
     """无 Skill 且无知识候选时跳过旧 Skill 选择器，但仍进入动态主路由。"""
 
@@ -98,6 +112,47 @@ def test_empty_skill_and_knowledge_catalog_enters_primary_selector() -> None:
     assert result.primary_decision is not None
     assert result.primary_decision.mode == "dynamic_task"
     assert result.effective_decision.mode == "dynamic_task"
+
+
+def test_dynamic_router_receives_public_vertical_ability_summary() -> None:
+    """路由器只能看到数据驱动的公开能力摘要，不提前消费完整执行契约。"""
+
+    captured: dict[str, object] = {}
+
+    summary = VerticalAbilityCatalog().public_summaries(["web-intelligence"])
+    assert len(summary) == 1
+    assert summary[0]["id"] == "web-intelligence"
+    assert "guidance" not in summary[0]
+    assert "tools" not in summary[0]
+
+    class _CapturingSelector:
+        """捕获动态选择器的 conversation_context 位置参数。"""
+
+        def decide(self, *_args: object, **_kwargs: object) -> NonSopCapabilityDecision:
+            """把主路由上下文留给断言。"""
+
+            captured["conversation_context"] = _args[3]
+            return NonSopCapabilityDecision(mode="answer", confidence=1.0)
+
+    router = NonSopCapabilityRouter(
+        shadow_enabled=False,
+        execution_enabled=True,
+        primary_selector=_CapturingSelector(),
+    )
+    router.decide(
+        message="你能做什么？",
+        general_skills=[],
+        model_config=SimpleNamespace(),
+        general_skill_selector=_GeneralSelector(GeneralSkillSelection()),
+        conversation_context={"messages": []},
+        memory_context=None,
+        knowledge_capability={"available": False},
+        vertical_ability_summaries=summary,
+    )
+
+    selector_context = captured["conversation_context"]
+    assert isinstance(selector_context, dict)
+    assert selector_context["vertical_ability_summaries"] == summary
 
 
 def test_shadow_selector_receives_skill_tool_requirements(monkeypatch) -> None:
@@ -621,6 +676,7 @@ def test_agent_loop_continues_terminal_dynamic_chat_turn(monkeypatch) -> None:
                     mode="dynamic_task",
                     goal="分析同一份日志",
                     success_criteria=["形成可校验结论"],
+                    execution_intent="continue",
                     confidence=0.95,
                 )
             ),
@@ -711,6 +767,85 @@ def test_agent_loop_continues_terminal_dynamic_chat_turn(monkeypatch) -> None:
     assert len(continued_events) == 1
     assert continued_events[0][3]["execution_id"] == "execution_child"
     assert continued_events[0][3]["parent_execution_id"] == "execution_parent"
+
+
+def test_agent_loop_does_not_continue_without_structured_continue_intent(monkeypatch) -> None:
+    """普通动态新问题即使存在历史消息，也必须创建新轮次而不是盲目续接。"""
+
+    route = _route(
+        NonSopCapabilityRouter(
+            shadow_enabled=False,
+            execution_enabled=True,
+            shadow_selector=_ShadowSelector(
+                NonSopCapabilityDecision(
+                    mode="dynamic_task",
+                    goal="分析新的数据集",
+                    success_criteria=["形成新的结论"],
+                    confidence=0.95,
+                )
+            ),
+        ),
+        _GeneralSelector(GeneralSkillSelection()),
+    )
+    calls: list[str] = []
+
+    class _DynamicAgent:
+        """模拟新任务路径并拒绝任何未授权的续接调用。"""
+
+        def __init__(self, _db) -> None:
+            """记录统一 Runtime 初始化。"""
+
+            calls.append("init")
+
+        def continue_chat_turn(self, **_kwargs):
+            """未声明 continue 时不应进入此方法。"""
+
+            pytest.fail("没有 execution_intent 时不应续接历史 Execution")
+
+        def start_task(self, **_kwargs):
+            """创建当前消息对应的新 Execution。"""
+
+            calls.append("start")
+            return SimpleNamespace(id="execution_new", status="running"), True
+
+        def run_until_blocked_or_complete(self, **_kwargs):
+            """返回当前新任务的成功结果。"""
+
+            calls.append("run")
+            return DynamicRunOutcome(
+                status="succeeded",
+                execution_id="execution_new",
+                message=SimpleNamespace(content="新的动态任务结果"),
+            )
+
+    monkeypatch.setattr("app.core.agent_loop.DynamicTaskAgent", _DynamicAgent)
+    loop = _minimal_dynamic_entry_loop()
+    response = loop._try_handle_dynamic_task(
+        ChatTurnRequest(
+            tenant_id="tenant_demo",
+            user_id="user_demo",
+            agent_id="agent_demo",
+            message="请分析另一组完全不同的数据",
+        ),
+        ChatSession(
+            id="session_new_dynamic_turn",
+            tenant_id="tenant_demo",
+            agent_id="agent_demo",
+        ),
+        SimpleNamespace(id="model_1"),
+        route,
+        "message_new_dynamic_turn",
+        conversation_context={
+            "messages": [
+                {"role": "assistant", "content": "上一任务结论"},
+                {"role": "user", "content": "请分析另一组完全不同的数据"},
+            ]
+        },
+    )
+
+    assert response is not None
+    assert response.reply == "新的动态任务结果"
+    assert calls == ["init", "start", "run"]
 
 
 def test_explicit_dynamic_request_cannot_be_downgraded_by_forced_general_skill(
@@ -1155,8 +1290,111 @@ def test_dynamic_waiting_projection_distinguishes_automatic_and_human_recovery()
     assert "待我处理" in clarification
 
 
-def test_agent_loop_optional_dynamic_rollout_denial_can_fall_back(monkeypatch) -> None:
-    """非持久、非显式组合的动态建议未命中灰度时可以保留旧普通回答。"""
+def _install_successful_dynamic_agent(
+    monkeypatch,
+    calls: list[str],
+    captured: dict[str, object] | None = None,
+    reply: str = "动态任务已完成",
+) -> None:
+    """安装一个完成动态入口的替身，用于证明路由不再受 rollout 或容量配置门禁阻断。"""
+
+    class _DynamicAgent:
+        """模拟共享 DynamicTaskAgent 的创建与运行边界。"""
+
+        def __init__(self, _db) -> None:
+            """记录统一 Runtime 被初始化。"""
+
+            calls.append("init")
+
+        def start_task(self, **kwargs):
+            """记录新 Execution 的输入并返回可运行实例。"""
+
+            calls.append("start")
+            if captured is not None:
+                captured.update(kwargs)
+            return SimpleNamespace(id="execution_gate_regression", status="running"), True
+
+        def run_until_blocked_or_complete(self, **_kwargs):
+            """返回成功结果，证明请求已经穿过动态入口。"""
+
+            calls.append("run")
+            return DynamicRunOutcome(
+                status="succeeded",
+                execution_id="execution_gate_regression",
+                message=SimpleNamespace(content=reply),
+            )
+
+    monkeypatch.setattr("app.core.agent_loop.DynamicTaskAgent", _DynamicAgent)
+
+
+def _minimal_dynamic_entry_loop() -> AgentLoop:
+    """构造只覆盖动态入口响应投影所需依赖的测试 Loop。"""
+
+    loop = object.__new__(AgentLoop)
+    loop.db = SimpleNamespace(
+        refresh=lambda _row: None,
+        commit=lambda: None,
+        begin_nested=lambda: nullcontext(),
+    )
+    loop.events = SimpleNamespace(record=lambda *_args, **_kwargs: None)
+    loop._knowledge_capability_payload = lambda *_args: {"available": False}
+    return loop
+
+
+def test_selected_ability_answer_does_not_load_dynamic_runtime(monkeypatch) -> None:
+    """能力包普通介绍只消费公开摘要，不能提前解析完整协议或创建共享 Runtime。"""
+
+    class _ForbiddenResolver:
+        """拒绝普通回答阶段加载能力执行快照。"""
+
+        def __init__(self, *_args, **_kwargs) -> None:
+            """普通回答若构造完整 Resolver 则测试失败。"""
+
+            pytest.fail("普通能力包回答不应提前构造完整 VerticalAbilityResolver")
+
+    class _ForbiddenAgent:
+        """拒绝普通回答阶段创建 DynamicTaskAgent。"""
+
+        def __init__(self, *_args, **_kwargs) -> None:
+            """普通回答若创建共享 Runtime 则测试失败。"""
+
+            pytest.fail("能力包普通回答不应提前创建 DynamicTaskAgent")
+
+    monkeypatch.setattr("app.core.agent_loop.VerticalAbilityResolver", _ForbiddenResolver)
+    monkeypatch.setattr("app.core.agent_loop.DynamicTaskAgent", _ForbiddenAgent)
+    loop = _minimal_dynamic_entry_loop()
+    response = loop._try_handle_dynamic_task(
+        ChatTurnRequest(
+            tenant_id="tenant_demo",
+            user_id="user_demo",
+            agent_id="agent_demo",
+            ability_ids=["web-intelligence"],
+            message="这个能力包能做什么？",
+        ),
+        ChatSession(
+            id="session_ability_description",
+            tenant_id="tenant_demo",
+            agent_id="agent_demo",
+        ),
+        SimpleNamespace(id="model_1"),
+        _route(
+            NonSopCapabilityRouter(
+                shadow_enabled=False,
+                execution_enabled=True,
+                primary_selector=_ShadowSelector(
+                    NonSopCapabilityDecision(mode="answer", confidence=1.0)
+                ),
+            ),
+            _GeneralSelector(GeneralSkillSelection()),
+        ),
+        "message_ability_description",
+    )
+
+    assert response is None
+
+
+def test_agent_loop_does_not_use_rollout_gate_for_dynamic_execution(monkeypatch) -> None:
+    """普通动态提案必须进入共享 Runtime，不能被历史 rollout 回调伪装成普通回答。"""
 
     route = _route(
         NonSopCapabilityRouter(
@@ -1173,15 +1411,12 @@ def test_agent_loop_optional_dynamic_rollout_denial_can_fall_back(monkeypatch) -
         ),
         _GeneralSelector(GeneralSkillSelection()),
     )
-    monkeypatch.setattr(
-        "app.core.agent_loop.DynamicTaskAgent",
-        lambda _db: pytest.fail("灰度拒绝前不得初始化 DynamicTaskAgent"),
+    calls: list[str] = []
+    _install_successful_dynamic_agent(monkeypatch, calls)
+    loop = _minimal_dynamic_entry_loop()
+    loop._dynamic_task_rollout_allows = lambda *_args: pytest.fail(
+        "动态执行入口不应再查询 rollout gate"
     )
-    recorded: list[tuple] = []
-    loop = object.__new__(AgentLoop)
-    loop.db = SimpleNamespace(commit=lambda: None)
-    loop.events = SimpleNamespace(record=lambda *args, **_kwargs: recorded.append(args))
-    loop._dynamic_task_rollout_allows = lambda _tenant, _agent: False
     session = ChatSession(
         id="session_rollout_denied",
         tenant_id="tenant_demo",
@@ -1201,61 +1436,13 @@ def test_agent_loop_optional_dynamic_rollout_denial_can_fall_back(monkeypatch) -
         "message_rollout_denied",
     )
 
-    assert response is None
-    assert recorded[0][2] == "dynamic_task_rollout_denied"
-    assert recorded[0][3]["reason_code"] == "DYNAMIC_TASK_ROLLOUT_DENIED"
-    assert "生成风险简报" not in str(recorded)
+    assert response is not None
+    assert response.reply == "动态任务已完成"
+    assert calls == ["init", "start", "run"]
 
 
-def test_runtime_capacity_denial_has_stable_capacity_code_without_model_quota_gate() -> None:
-    """运行容量为零时只返回容量错误，不把模型账户配额伪装成产品灰度门禁。"""
-
-    route = _route(
-        NonSopCapabilityRouter(
-            shadow_enabled=False,
-            execution_enabled=True,
-            shadow_selector=_ShadowSelector(
-                NonSopCapabilityDecision(
-                    mode="dynamic_task",
-                    goal="生成风险简报",
-                    success_criteria=["覆盖合同证据"],
-                    requires_durable_execution=True,
-                    confidence=0.95,
-                )
-            ),
-        ),
-        _GeneralSelector(GeneralSkillSelection()),
-    )
-    recorded: list[tuple] = []
-    loop = object.__new__(AgentLoop)
-    loop.db = SimpleNamespace(commit=lambda: None)
-    loop.events = SimpleNamespace(record=lambda *args, **_kwargs: recorded.append(args))
-    loop._dynamic_task_rollout_allows = lambda _tenant, _agent: False
-    loop._dynamic_task_rollout_denial_code = "DYNAMIC_TASK_QUOTA_NOT_CONFIGURED"
-
-    with pytest.raises(DynamicTaskAgentError, match="DYNAMIC_TASK_QUOTA_NOT_CONFIGURED"):
-        loop._try_handle_dynamic_task(
-            ChatTurnRequest(
-                tenant_id="tenant_demo",
-                user_id="user_demo",
-                agent_id="agent_demo",
-                message="生成风险简报",
-            ),
-            ChatSession(
-                id="session_capacity_not_configured",
-                tenant_id="tenant_demo",
-                agent_id="agent_demo",
-            ),
-            SimpleNamespace(id="model_1"),
-            route,
-            "message_capacity_not_configured",
-        )
-
-    assert recorded[0][3]["reason_code"] == "DYNAMIC_TASK_QUOTA_NOT_CONFIGURED"
-
-
-def test_durable_dynamic_rollout_denial_fails_instead_of_fake_answer(monkeypatch) -> None:
-    """要求持久执行的复杂任务未命中灰度时必须失败，不能伪装成普通问答。"""
+def test_unconfigured_runtime_capacity_is_not_dynamic_task_access_gate(monkeypatch) -> None:
+    """容量上限未配置时不能阻止用户进入 DTA，也不能伪装成权限或资格错误。"""
 
     route = _route(
         NonSopCapabilityRouter(
@@ -1273,34 +1460,88 @@ def test_durable_dynamic_rollout_denial_fails_instead_of_fake_answer(monkeypatch
         ),
         _GeneralSelector(GeneralSkillSelection()),
     )
-    loop = object.__new__(AgentLoop)
-    loop.db = SimpleNamespace(commit=lambda: None)
-    loop.events = SimpleNamespace(record=lambda *_args, **_kwargs: None)
-    loop._dynamic_task_rollout_allows = lambda _tenant, _agent: False
+    calls: list[str] = []
+    _install_successful_dynamic_agent(monkeypatch, calls)
+    loop = _minimal_dynamic_entry_loop()
+    loop._dynamic_task_quota_limits = DynamicTaskQuotaLimits()
+    loop._dynamic_task_rollout_allows = lambda *_args: pytest.fail(
+        "容量配置不应退化成 rollout gate"
+    )
 
-    with pytest.raises(DynamicTaskAgentError, match="DYNAMIC_TASK_ROLLOUT_DENIED"):
-        loop._try_handle_dynamic_task(
-            ChatTurnRequest(
-                tenant_id="tenant_demo",
-                user_id="user_demo",
-                agent_id="agent_demo",
-                message="生成风险简报",
+    response = loop._try_handle_dynamic_task(
+        ChatTurnRequest(
+            tenant_id="tenant_demo",
+            user_id="user_demo",
+            agent_id="agent_demo",
+            message="生成风险简报",
+        ),
+        ChatSession(
+            id="session_capacity_not_configured",
+            tenant_id="tenant_demo",
+            agent_id="agent_demo",
+        ),
+        SimpleNamespace(id="model_1"),
+        route,
+        "message_capacity_not_configured",
+    )
+
+    assert response is not None
+    assert response.reply == "动态任务已完成"
+    assert calls == ["init", "start", "run"]
+
+
+def test_durable_dynamic_execution_does_not_use_rollout_gate(monkeypatch) -> None:
+    """要求持久执行的复杂任务必须进入 Runtime，不能被 rollout 回调挡住。"""
+
+    route = _route(
+        NonSopCapabilityRouter(
+            shadow_enabled=False,
+            execution_enabled=True,
+            shadow_selector=_ShadowSelector(
+                NonSopCapabilityDecision(
+                    mode="dynamic_task",
+                    goal="生成风险简报",
+                    success_criteria=["覆盖合同证据"],
+                    requires_durable_execution=True,
+                    confidence=0.95,
+                )
             ),
-            ChatSession(
-                id="session_durable_rollout_denied",
-                tenant_id="tenant_demo",
-                agent_id="agent_demo",
-            ),
-            SimpleNamespace(id="model_1"),
-            route,
-            "message_durable_rollout_denied",
-        )
+        ),
+        _GeneralSelector(GeneralSkillSelection()),
+    )
+    calls: list[str] = []
+    _install_successful_dynamic_agent(monkeypatch, calls)
+    loop = _minimal_dynamic_entry_loop()
+    loop._dynamic_task_rollout_allows = lambda *_args: pytest.fail(
+        "持久动态任务不应再查询 rollout gate"
+    )
+
+    response = loop._try_handle_dynamic_task(
+        ChatTurnRequest(
+            tenant_id="tenant_demo",
+            user_id="user_demo",
+            agent_id="agent_demo",
+            message="生成风险简报",
+        ),
+        ChatSession(
+            id="session_durable_rollout_denied",
+            tenant_id="tenant_demo",
+            agent_id="agent_demo",
+        ),
+        SimpleNamespace(id="model_1"),
+        route,
+        "message_durable_rollout_denied",
+    )
+
+    assert response is not None
+    assert response.reply == "动态任务已完成"
+    assert calls == ["init", "start", "run"]
 
 
-def test_scheduled_dynamic_task_rollout_denial_fails_instead_of_fake_success(
+def test_scheduled_dynamic_task_does_not_use_rollout_gate(
     monkeypatch,
 ) -> None:
-    """调度入口未命中灰度时必须失败，不能降级成无 Execution 的普通回答。"""
+    """调度入口必须保留持久任务合同，不能因为 rollout 回调变成假成功或假失败。"""
 
     route = _route(
         NonSopCapabilityRouter(
@@ -1310,14 +1551,12 @@ def test_scheduled_dynamic_task_rollout_denial_fails_instead_of_fake_success(
         ),
         _GeneralSelector(GeneralSkillSelection()),
     )
-    monkeypatch.setattr(
-        "app.core.agent_loop.DynamicTaskAgent",
-        lambda _db: pytest.fail("灰度拒绝前不得初始化 DynamicTaskAgent"),
+    calls: list[str] = []
+    _install_successful_dynamic_agent(monkeypatch, calls)
+    loop = _minimal_dynamic_entry_loop()
+    loop._dynamic_task_rollout_allows = lambda *_args: pytest.fail(
+        "调度动态任务不应再查询 rollout gate"
     )
-    loop = object.__new__(AgentLoop)
-    loop.db = SimpleNamespace(commit=lambda: None)
-    loop.events = SimpleNamespace(record=lambda *_args, **_kwargs: None)
-    loop._dynamic_task_rollout_allows = lambda _tenant, _agent: False
     loop._forced_general_skill_capability = lambda *_args, **_kwargs: (
         SimpleNamespace(id="skill_a"),
         GeneralSkillSelection(),
@@ -1328,24 +1567,27 @@ def test_scheduled_dynamic_task_rollout_denial_fails_instead_of_fake_success(
         agent_id="agent_demo",
     )
 
-    with pytest.raises(DynamicTaskAgentError, match="DYNAMIC_TASK_ROLLOUT_DENIED"):
-        loop._try_handle_dynamic_task(
-            ChatTurnRequest(
-                tenant_id="tenant_demo",
-                user_id="user_demo",
-                agent_id="agent_demo",
-                interaction_mode="scheduled_task",
-                message="生成定时风险简报",
-            ),
-            session,
-            SimpleNamespace(id="model_1"),
-            route,
-            "message_scheduled_rollout_denied",
-        )
+    response = loop._try_handle_dynamic_task(
+        ChatTurnRequest(
+            tenant_id="tenant_demo",
+            user_id="user_demo",
+            agent_id="agent_demo",
+            interaction_mode="scheduled_task",
+            message="生成定时风险简报",
+        ),
+        session,
+        SimpleNamespace(id="model_1"),
+        route,
+        "message_scheduled_rollout_denied",
+    )
+
+    assert response is not None
+    assert response.reply == "动态任务已完成"
+    assert calls == ["init", "start", "run"]
 
 
-def test_multi_skill_rollout_denial_fails_instead_of_consuming_only_first_skill() -> None:
-    """显式多选依赖动态组合运行时，灰度拒绝时必须失败而不是静默只消费首项。"""
+def test_multi_skill_dynamic_execution_does_not_use_rollout_gate(monkeypatch) -> None:
+    """显式多选 Skill 必须进入组合 Runtime，不能被 rollout 回调阻止或静默降级。"""
 
     route = _route(
         NonSopCapabilityRouter(
@@ -1355,34 +1597,42 @@ def test_multi_skill_rollout_denial_fails_instead_of_consuming_only_first_skill(
         ),
         _GeneralSelector(GeneralSkillSelection()),
     )
-    loop = object.__new__(AgentLoop)
-    loop.db = SimpleNamespace(commit=lambda: None)
-    loop.events = SimpleNamespace(record=lambda *_args, **_kwargs: None)
-    loop._dynamic_task_rollout_allows = lambda _tenant, _agent: False
+    calls: list[str] = []
+    captured: dict[str, object] = {}
+    _install_successful_dynamic_agent(monkeypatch, calls, captured)
+    loop = _minimal_dynamic_entry_loop()
+    loop._dynamic_task_rollout_allows = lambda *_args: pytest.fail(
+        "多 Skill 动态任务不应再查询 rollout gate"
+    )
     loop._forced_general_skill_capability = lambda *_args, **_kwargs: (
         SimpleNamespace(id="skill_a"),
         GeneralSkillSelection(),
     )
 
-    with pytest.raises(DynamicTaskAgentError, match="DYNAMIC_TASK_ROLLOUT_DENIED"):
-        loop._try_handle_dynamic_task(
-            ChatTurnRequest(
-                tenant_id="tenant_demo",
-                user_id="user_demo",
-                agent_id="agent_demo",
-                message="组合使用两个 Skill",
-                forced_general_skill_id="skill_a",
-                forced_general_skill_ids=("skill_a", "skill_b"),
-            ),
-            ChatSession(
-                id="session_multi_skill_rollout_denied",
-                tenant_id="tenant_demo",
-                agent_id="agent_demo",
-            ),
-            SimpleNamespace(id="model_1"),
-            route,
-            "message_multi_skill_rollout_denied",
-        )
+    response = loop._try_handle_dynamic_task(
+        ChatTurnRequest(
+            tenant_id="tenant_demo",
+            user_id="user_demo",
+            agent_id="agent_demo",
+            message="组合使用两个 Skill",
+            forced_general_skill_id="skill_a",
+            forced_general_skill_ids=("skill_a", "skill_b"),
+        ),
+        ChatSession(
+            id="session_multi_skill_rollout_denied",
+            tenant_id="tenant_demo",
+            agent_id="agent_demo",
+        ),
+        SimpleNamespace(id="model_1"),
+        route,
+        "message_multi_skill_rollout_denied",
+    )
+
+    assert response is not None
+    assert response.reply == "动态任务已完成"
+    assert captured["forced_general_skill_id"] == "skill_a"
+    assert captured["forced_general_skill_ids"] == ("skill_a", "skill_b")
+    assert calls == ["init", "start", "run"]
 
 
 def test_required_knowledge_unavailable_fails_before_dynamic_execution() -> None:

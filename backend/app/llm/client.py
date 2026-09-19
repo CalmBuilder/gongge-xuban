@@ -1695,12 +1695,58 @@ def _json_candidate_variants(text: str) -> tuple[str, ...]:
     no_trailing_commas = _remove_trailing_commas(stripped)
     repaired_strings = _repair_json_string_content(stripped)
     repaired_strings_no_trailing = _remove_trailing_commas(repaired_strings)
-    return (
+    candidates = [
         stripped,
         no_trailing_commas,
         repaired_strings,
         repaired_strings_no_trailing,
-    )
+    ]
+    for candidate in tuple(candidates):
+        closed = _close_truncated_json(candidate)
+        if closed is not None:
+            candidates.append(closed)
+    return tuple(candidates)
+
+
+def _close_truncated_json(text: str, *, max_missing_delimiters: int = 8) -> str | None:
+    """仅为尾部缺少成对 JSON 定界符的响应生成一个有界闭合候选。
+
+    供应商可能在 ``finish_reason=stop`` 时仍漏掉最外层 ``}``。这里不猜字段、
+    不补字符串内容，只按已出现的对象/数组顺序补齐最多八个闭合符；未闭合字符串、
+    交叉定界符和尾部逗号仍会被 JSON 解析器拒绝，后续的业务契约校验也继续生效。
+    """
+
+    stripped = text.rstrip()
+    if not stripped or stripped[-1] in ",:{[":
+        return None
+
+    opening_for_closing = {
+        "]": "[",
+        "}": "{",
+    }
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    for char in stripped:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "[{":
+            stack.append(char)
+        elif char in "]}":
+            if not stack or stack[-1] != opening_for_closing[char]:
+                return None
+            stack.pop()
+    if in_string or not stack or len(stack) > max_missing_delimiters:
+        return None
+    return stripped + "".join("}" if opening == "{" else "]" for opening in reversed(stack))
 
 
 def _remove_trailing_commas(text: str) -> str:

@@ -137,7 +137,7 @@ describe('Composer new-session action', () => {
     expect(chat.selectVerticalAbility).toHaveBeenCalledWith('web-intelligence');
   });
 
-  it('keeps the package selected and reopens the configuration prompt on send after dismissal', async () => {
+  it('keeps the package selected and still sends after the configuration prompt is dismissed', async () => {
     const readiness = {
       ability_id: 'web-intelligence',
       configured: false,
@@ -167,8 +167,8 @@ describe('Composer new-session action', () => {
     expect(screen.getByText('Jina Reader待配置')).toBeVisible();
 
     fireEvent.submit(screen.getByRole('textbox', { name: '输入消息，按 Enter 发送...' }).closest('form') as HTMLFormElement);
-    expect(await screen.findByRole('dialog')).toBeVisible();
-    expect(chat.send).not.toHaveBeenCalled();
+    await waitFor(() => expect(chat.send).toHaveBeenCalledTimes(1));
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
   });
 
   it('shows the selected package in the selector without rendering a duplicate removable chip', () => {
@@ -183,5 +183,21 @@ describe('Composer new-session action', () => {
 
     expect(screen.getByText('能力包：全网情报员')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '取消能力包 全网情报员' })).not.toBeInTheDocument();
+  });
+
+  it('does not let a selected ability package switch away from the shared DynamicTaskAgent', () => {
+    const chat = createChat(vi.fn());
+    chat.selectedVerticalAbilityIds = ['web-intelligence'];
+    chat.executionEngine = 'dynamic_task';
+
+    render(
+      <I18nProvider>
+        <Composer chat={chat} />
+      </I18nProvider>,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: '选择 DynamicTaskAgent 复杂任务引擎' }));
+
+    expect(chat.setExecutionEngine).not.toHaveBeenCalled();
   });
 });

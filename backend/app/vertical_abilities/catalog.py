@@ -182,6 +182,22 @@ class VerticalAbilityDefinition:
             ),
         )
 
+    def public_summary(self) -> dict[str, object]:
+        """生成供语义路由使用的最小公开摘要，不携带执行或配置细节。"""
+
+        return {
+            "id": self.id,
+            "name": self.name,
+            "category": self.category,
+            "description": self.description,
+            "platform_tags": list(self.platform_tags),
+            "capabilities": [
+                {"name": item.name, "description": item.description}
+                for item in self.capabilities
+            ],
+            "external_data_notice": self.external_data_notice,
+        }
+
 
 def _read_contract(
     *,
@@ -1332,6 +1348,23 @@ class VerticalAbilityCatalog:
         """返回当前项目版本的能力定义只读视图，供 Resolver 编译运行时快照。"""
 
         return self._definitions
+
+    def public_summaries(self, ability_ids: list[str] | tuple[str, ...]) -> list[dict[str, object]]:
+        """按请求顺序生成公开摘要，目录外标识留给执行阶段按原合同校验。"""
+
+        summaries: list[dict[str, object]] = []
+        seen: set[str] = set()
+        for raw_id in ability_ids:
+            normalized = str(raw_id or "").strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            try:
+                definition = self.resolve(normalized)
+            except KeyError:
+                continue
+            summaries.append(definition.public_summary())
+        return summaries
 
     def resolve(self, ability_id: str) -> VerticalAbilityDefinition:
         """按稳定能力包 ID 解析定义，不接受名称或客户端自定义版本。"""

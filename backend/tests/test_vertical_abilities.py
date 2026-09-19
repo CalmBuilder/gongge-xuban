@@ -28,6 +28,7 @@ from app.dynamic_tasks.agent import (
     _ensure_vertical_result_limit_disclosures,
     _ensure_vertical_result_quality_disclosures,
     _ensure_vertical_source_url_disclosures,
+    _normalize_vertical_user_facing_markdown,
     _successful_vertical_result_limitations,
 )
 from app.dynamic_tasks.planning import (
@@ -980,8 +981,8 @@ def test_vertical_source_urls_are_preserved_when_repair_targets_another_error() 
     assert "https://example.com/community" in markdown
 
 
-def test_vertical_source_url_disclosure_binds_existing_url_to_operation() -> None:
-    """已有来源 URL 也要补上 Operation 身份，便于把截断说明绑定到对应回执。"""
+def test_vertical_source_url_disclosure_preserves_existing_url_without_internal_label() -> None:
+    """已有来源 URL 直接作为证据保留，不把内部 Operation 标签插入用户正文。"""
 
     response = CompletedProviderProposal(
         response_id="provider_vertical_source_label",
@@ -1010,11 +1011,12 @@ def test_vertical_source_url_disclosure_binds_existing_url_to_operation() -> Non
     )
 
     markdown = completed.proposal.arguments["markdown"]
-    assert "intelligence.web_read：https://example.com/article" in markdown
+    assert markdown.count("https://example.com/article") == 1
+    assert "intelligence.web_read：https://example.com/article" not in markdown
 
 
-def test_vertical_source_url_disclosure_adds_missing_operation_from_shared_url() -> None:
-    """搜索与读取共用 URL 时，报告必须补齐缺失的 web_read 身份。"""
+def test_vertical_source_url_disclosure_does_not_duplicate_shared_url() -> None:
+    """搜索与读取共用 URL 时，报告只保留一条可核验来源，不重复插入内部身份。"""
 
     response = CompletedProviderProposal(
         response_id="provider_vertical_source_shared",
@@ -1043,7 +1045,40 @@ def test_vertical_source_url_disclosure_adds_missing_operation_from_shared_url()
     )
 
     markdown = completed.proposal.arguments["markdown"]
-    assert "intelligence.web_read、intelligence.web_search：https://example.com/article" in markdown
+    assert markdown.count("https://example.com/article") == 1
+    assert "intelligence.web_read、intelligence.web_search：https://example.com/article" not in markdown
+
+
+def test_vertical_user_markdown_hides_control_labels_and_keeps_evidence_values() -> None:
+    """用户正文隐藏运行时控制标签，但保留 URL、查询、Provider 和结果状态。"""
+
+    markdown = (
+        "## 来源与证据\n"
+        "系统回证来源（成功工具回执，运行时补全）：\n"
+        "- intelligence.web_search、intelligence.web_read：https://example.com/article\n"
+        "系统回证限制（模型上下文投影）：\n"
+        "- intelligence.web_read（operation_id=sopop_1，请求 URL：https://example.com/article）："
+        "模型上下文已截断：原始字段共 1000 字符，仅展示开头内容；不得视为全文。\n"
+        "系统回证字段（成功垂直工具结果，运行时补全）：\n"
+        "- step_search.query：开发者工具\n"
+        "- step_search.provider：Exa via MCP\n"
+        "## 冲突/缺口\n"
+        "系统回证渠道状态：\n"
+        "- intelligence.web_search（operation_id=sopop_2，query=无结果）：Provider 返回 0 条。"
+    )
+
+    normalized = _normalize_vertical_user_facing_markdown(markdown)
+
+    assert "系统回证" not in normalized
+    assert "intelligence.web_" not in normalized
+    assert "step_search" not in normalized
+    assert "operation_id=sopop_1" not in normalized
+    assert "operation_id=sopop_2" not in normalized
+    assert "https://example.com/article" in normalized
+    assert "查询条件：开发者工具" in normalized
+    assert "来源服务：Exa via MCP" in normalized
+    assert "Provider 返回 0 条" in normalized
+    assert "证据完整性说明：" in normalized
 
 
 def test_vertical_source_url_repair_does_not_accept_a_longer_malformed_url_prefix() -> None:

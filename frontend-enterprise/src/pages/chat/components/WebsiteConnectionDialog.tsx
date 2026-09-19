@@ -651,7 +651,7 @@ function RelayCommandBlock({
           复制命令
         </UIButton>
       </div>
-      <pre className="overflow-x-auto whitespace-pre-wrap break-all rounded-[8px] bg-[#f5f7fc] px-[9px] py-[8px] font-mono text-[11px] leading-[1.55] text-[#303746]"><code>{command}</code></pre>
+      <pre className="overflow-x-auto whitespace-pre-wrap break-all rounded-[8px] bg-[#f5f7fc] px-[9px] py-[8px] font-mono gg-type-caption text-[#303746]"><code>{command}</code></pre>
       {fallbackCommand ? (
         <div className="grid gap-[7px] border-t border-[var(--gg-line)] pt-[9px]">
           <div className="flex items-start justify-between gap-[8px]">
@@ -669,7 +669,7 @@ function RelayCommandBlock({
               复制命令
             </UIButton>
           </div>
-          <pre className="overflow-x-auto whitespace-pre-wrap break-all rounded-[8px] bg-[#f5f7fc] px-[9px] py-[8px] font-mono text-[11px] leading-[1.55] text-[#303746]"><code>{fallbackCommand}</code></pre>
+          <pre className="overflow-x-auto whitespace-pre-wrap break-all rounded-[8px] bg-[#f5f7fc] px-[9px] py-[8px] font-mono gg-type-caption text-[#303746]"><code>{fallbackCommand}</code></pre>
         </div>
       ) : null}
     </div>

@@ -154,6 +154,23 @@ describe('structured intelligence report rendering', () => {
     expect(isIntelligenceReport({ role: 'user' }, report)).toBe(false);
   });
 
+  it('uses the result render policy instead of the selected ability id', () => {
+    const ordinaryAnswer = '## 结论摘要\n\n这是普通回答。';
+
+    expect(isIntelligenceReport(
+      { role: 'assistant', metadata: { ability_ids: ['web-intelligence'] } },
+      ordinaryAnswer,
+    )).toBe(false);
+    expect(isIntelligenceReport(
+      { role: 'assistant', metadata: { render_policy: 'intelligence_report' } },
+      ordinaryAnswer,
+    )).toBe(true);
+    expect(isIntelligenceReport(
+      { role: 'assistant', metadata: { render_policy: 'verbatim' } },
+      report,
+    )).toBe(false);
+  });
+
   it('adds semantic evidence and fact list classes while preserving clickable sources', () => {
     render(createElement(MarkdownMessage, { content: report, variant: 'intelligence' }));
 

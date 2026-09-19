@@ -171,13 +171,14 @@ describe('useChatSession vertical ability selection', () => {
       hook.result.current.setInput('Get the latest news');
     });
     expect(hook.result.current.selectedVerticalAbilityIds).toEqual([ability.id]);
+    expect(hook.result.current.executionEngine).toBe('dynamic_task');
 
     await act(async () => {
       await hook.result.current.send();
     });
 
     expect(boundary.stream).toHaveBeenCalledWith(
-      expect.objectContaining({ ability_ids: [ability.id] }),
+      expect.objectContaining({ ability_ids: [ability.id], execution_engine: 'dynamic_task' }),
       expect.any(Function),
       expect.any(AbortSignal),
     );

@@ -146,6 +146,7 @@ from app.sop_runtime.execution_control import ExecutionControlService, canonical
 from app.sop_runtime.scheduler import RuntimeAction
 from app.tools import ToolExecutor
 from app.tools.tool_schema import ToolCall, ToolError, ToolResult
+from app.vertical_abilities.catalog import VerticalAbilityCatalog
 from app.vertical_abilities.resolver import VerticalAbilityResolver, VerticalAbilityResolution
 
 
@@ -350,12 +351,6 @@ class AgentLoop:
                 settings.dynamic_task_router_shadow_timeout_seconds
             ),
             minimum_confidence=settings.dynamic_task_router_shadow_min_confidence,
-        )
-        self._dynamic_task_rollout_allows = settings.dynamic_task_base_execution_allows
-        self._dynamic_task_rollout_denial_code = (
-            "DYNAMIC_TASK_QUOTA_NOT_CONFIGURED"
-            if not settings.dynamic_task_runtime_capacity_limits_configured
-            else "DYNAMIC_TASK_ROLLOUT_DENIED"
         )
         self._dynamic_task_quota_limits = quota_limits_from_settings(settings)
         self.general_skill_runner = GeneralSkillRunner()
@@ -2458,6 +2453,7 @@ class AgentLoop:
                     memory_context,
                     user_id=request.user_id,
                     user_message_id=user_message_id,
+                    vertical_ability_ids=request.ability_ids,
                     forced_general_skill_id=(
                         request.forced_general_skill_id if request.channel == "web" else None
                     ),
@@ -2650,7 +2646,7 @@ class AgentLoop:
                     user_message_id=user_message_id,
                 )
 
-            if self._dynamic_task_engine_can_override_sop(request, chat_session):
+            if self._should_route_non_sop_capability(request, chat_session):
                 yield self._stream_status(
                     chat_session,
                     "routing",
@@ -2667,6 +2663,7 @@ class AgentLoop:
                     memory_context,
                     user_id=request.user_id,
                     user_message_id=user_message_id,
+                    vertical_ability_ids=request.ability_ids,
                     forced_general_skill_id=(
                         request.forced_general_skill_id if request.channel == "web" else None
                     ),
@@ -2775,6 +2772,7 @@ class AgentLoop:
                     memory_context,
                     user_id=request.user_id,
                     user_message_id=user_message_id,
+                    vertical_ability_ids=request.ability_ids,
                     forced_general_skill_id=(
                         request.forced_general_skill_id if request.channel == "web" else None
                     ),
@@ -3664,6 +3662,7 @@ class AgentLoop:
                 memory_context,
                 user_id=request.user_id,
                 user_message_id=user_message.id,
+                vertical_ability_ids=request.ability_ids,
                 forced_general_skill_id=(
                     request.forced_general_skill_id if request.channel == "web" else None
                 ),
@@ -3746,7 +3745,7 @@ class AgentLoop:
         if self._context_compacted_now(conversation_context):
             status("preparing", {"compacted_now": True})
 
-        if self._dynamic_task_engine_can_override_sop(request, chat_session):
+        if self._should_route_non_sop_capability(request, chat_session):
             status("routing", {"execution_engine": "dynamic_task"})
             capability_route = self._decide_non_sop_capability(
                 request.message,
@@ -3757,6 +3756,7 @@ class AgentLoop:
                 memory_context,
                 user_id=request.user_id,
                 user_message_id=user_message.id,
+                vertical_ability_ids=request.ability_ids,
                 forced_general_skill_id=(
                     request.forced_general_skill_id if request.channel == "web" else None
                 ),
@@ -3825,6 +3825,7 @@ class AgentLoop:
                 memory_context,
                 user_id=request.user_id,
                 user_message_id=user_message.id,
+                vertical_ability_ids=request.ability_ids,
                 forced_general_skill_id=(
                     request.forced_general_skill_id if request.channel == "web" else None
                 ),
@@ -8283,6 +8284,7 @@ class AgentLoop:
         *,
         user_id: str | None = None,
         user_message_id: str | None = None,
+        vertical_ability_ids: Sequence[str] = (),
         is_cancelled: Callable[[], bool] | None = None,
     ) -> tuple[GeneralSkill | None, GeneralSkillSelection]:
         """统一非 SOP 权威选择与可选 shadow，并返回当前有效 Skill 选择。"""
@@ -8296,9 +8298,18 @@ class AgentLoop:
             memory_context,
             user_id=user_id,
             user_message_id=user_message_id,
+            vertical_ability_ids=vertical_ability_ids,
             is_cancelled=is_cancelled,
         )
         return route.selected_general_skill, route.general_selection
+
+    @staticmethod
+    def _public_vertical_ability_summaries(
+        ability_ids: Sequence[str],
+    ) -> list[dict[str, object]]:
+        """把已选能力包投影成路由可见的公开摘要，不提前加载完整执行契约。"""
+
+        return VerticalAbilityCatalog().public_summaries(tuple(ability_ids))
 
     def _decide_non_sop_capability(
         self,
@@ -8312,6 +8323,7 @@ class AgentLoop:
         user_id: str | None = None,
         user_message_id: str | None = None,
         forced_general_skill_id: str | None = None,
+        vertical_ability_ids: Sequence[str] = (),
         is_cancelled: Callable[[], bool] | None = None,
     ) -> NonSopCapabilityRouteResult:
         """返回正交的 Skill 与执行模式决策，供 B1 委托且保持旧 tuple 兼容。"""
@@ -8380,6 +8392,11 @@ class AgentLoop:
         commit = getattr(db, "commit", None)
         if callable(commit):
             commit()
+        vertical_ability_summaries = self._public_vertical_ability_summaries(
+            vertical_ability_ids
+        )
+        if isinstance(conversation_context, dict):
+            conversation_context["vertical_ability_summaries"] = vertical_ability_summaries
         route = self.non_sop_capability_router.decide(
             message=message,
             general_skills=general_skills,
@@ -8389,6 +8406,7 @@ class AgentLoop:
             memory_context=memory_context,
             knowledge_capability=knowledge_capability,
             forced_general_skill=forced_general_skill,
+            vertical_ability_summaries=vertical_ability_summaries,
             is_cancelled=is_cancelled,
         )
         raise_if_cancelled(is_cancelled)
@@ -8464,7 +8482,20 @@ class AgentLoop:
         request: ChatTurnRequest,
         chat_session: ChatSession,
     ) -> bool:
-        """判断对话页选择的 DynamicTaskAgent 是否可以接管本轮新任务。"""
+        """判断显式 DynamicTaskAgent 是否可以越过普通路由接管本轮新任务。"""
+
+        return (
+            request.execution_engine == "dynamic_task"
+            and not cls._has_active_sop_state(chat_session)
+        )
+
+    @classmethod
+    def _should_route_non_sop_capability(
+        cls,
+        request: ChatTurnRequest,
+        chat_session: ChatSession,
+    ) -> bool:
+        """判断本轮是否需要先经过非 SOP 路由，能力任务仍由共享 DTA 执行。"""
 
         return (
             (request.execution_engine == "dynamic_task" or bool(request.ability_ids))
@@ -8483,33 +8514,13 @@ class AgentLoop:
     ) -> ChatTurnResponse | None:
         """按自动路由、明确请求或页面选择委托 DynamicTaskAgent 完整执行。"""
 
-        if (
-            (request.execution_engine == "dynamic_task" or bool(request.ability_ids))
-            and self._has_active_sop_state(chat_session)
-        ):
+        if self._has_active_sop_state(chat_session):
             # 对话页选择只影响新的非 SOP 任务；活动 SOP 的游标、等待项和
             # 人机协作状态必须由正式 Runtime 继续，禁止并行创建 Dynamic Execution。
             return None
         decision = route.effective_decision
         vertical_ability_resolution: VerticalAbilityResolution | None = None
-        if request.ability_ids:
-            try:
-                vertical_ability_resolution = VerticalAbilityResolver().resolve(
-                    request.ability_ids,
-                    tenant_id=request.tenant_id,
-                    agent_id=chat_session.agent_id or request.agent_id or "",
-                )
-            except KeyError as exc:
-                raise DynamicTaskAgentError("VERTICAL_ABILITY_NOT_AVAILABLE") from exc
-            decision = NonSopCapabilityDecision(
-                mode="dynamic_task",
-                goal=request.message.strip(),
-                success_criteria=["按所选垂直能力包完成检索、核验并形成可追溯结果"],
-                requires_durable_execution=True,
-                confidence=1.0,
-                reason="用户在对话页选择了平台内置垂直能力包。",
-            )
-        if request.execution_engine == "dynamic_task" and not request.ability_ids:
+        if request.execution_engine == "dynamic_task":
             decision = NonSopCapabilityDecision(
                 mode="dynamic_task",
                 goal=request.message.strip(),
@@ -8564,6 +8575,15 @@ class AgentLoop:
             )
         if decision.mode != "dynamic_task":
             return None
+        if request.ability_ids:
+            try:
+                vertical_ability_resolution = VerticalAbilityResolver().resolve(
+                    request.ability_ids,
+                    tenant_id=request.tenant_id,
+                    agent_id=chat_session.agent_id or request.agent_id or "",
+                )
+            except KeyError as exc:
+                raise DynamicTaskAgentError("VERTICAL_ABILITY_NOT_AVAILABLE") from exc
         if not chat_session.agent_id or not request.user_id:
             return None
         stable_session_id = chat_session.id
@@ -8576,46 +8596,6 @@ class AgentLoop:
             )
             if forced_skill is None:
                 return None
-        rollout_check = getattr(self, "_dynamic_task_rollout_allows", None)
-        rollout_allowed = (
-            bool(rollout_check(request.tenant_id, chat_session.agent_id))
-            if callable(rollout_check)
-            else True
-        )
-        if not rollout_allowed:
-            denial_code = getattr(
-                self,
-                "_dynamic_task_rollout_denial_code",
-                "DYNAMIC_TASK_ROLLOUT_DENIED",
-            )
-            self.events.record(
-                request.tenant_id,
-                chat_session.id,
-                "dynamic_task_rollout_denied",
-                self._turn_payload(
-                    {
-                        "reason_code": denial_code,
-                        "agent_id": chat_session.agent_id,
-                        "source_kind": request.interaction_mode,
-                    },
-                    user_message_id,
-                ),
-            )
-            # 流式异常处理会先回滚当前 Turn，再写入可见错误；先提交这条门禁事实，
-            # 才能保留“为何没有进入 DynamicTaskAgent”的审计事件，而不是只留下通用错误。
-            self.db.commit()
-            requires_dynamic_contract = (
-                request.interaction_mode == "scheduled_task"
-                or decision.requires_durable_execution
-                or len(tuple(dict.fromkeys(request.forced_general_skill_ids))) > 1
-                or (
-                    route.general_selection is not None
-                    and route.general_selection.knowledge_mode == "required"
-                )
-            )
-            if requires_dynamic_contract:
-                raise DynamicTaskAgentError(denial_code)
-            return None
         cancellation = self._active_turn_cancel_callback()
         dynamic_agent = (
             DynamicTaskAgent(self.db, is_cancelled=cancellation)
@@ -8653,8 +8633,14 @@ class AgentLoop:
         # selector/planner 外呼；先提交这些事实，禁止请求级 Session 把 SQLite 写锁带入
         # 长模型等待。Execution/Plan/Use 仍由 start_task 在规划返回后以短事务创建。
         self.db.commit()
+        execution_intent = str(decision.execution_intent or "none")
+        can_continue_chat_turn = execution_intent in {"continue", "steer"}
         resume_chat_clarification = getattr(dynamic_agent, "resume_chat_clarification", None)
-        if source_kind == "chat" and callable(resume_chat_clarification):
+        if (
+            source_kind == "chat"
+            and can_continue_chat_turn
+            and callable(resume_chat_clarification)
+        ):
             resumed_outcome = resume_chat_clarification(
                 tenant_id=request.tenant_id,
                 session_id=stable_session_id,
@@ -8745,7 +8731,7 @@ class AgentLoop:
                     client_turn_id=request.client_turn_id,
                 )
         continue_chat_turn = getattr(dynamic_agent, "continue_chat_turn", None)
-        if source_kind == "chat" and callable(continue_chat_turn):
+        if source_kind == "chat" and can_continue_chat_turn and callable(continue_chat_turn):
             continued: tuple[SopInstance, bool] | None = None
             try:
                 continued = continue_chat_turn(
@@ -8780,12 +8766,8 @@ class AgentLoop:
                     vertical_ability_resolution=vertical_ability_resolution,
                     memory_context=memory_context,
                     conversation_context=conversation_context,
+                    execution_intent=execution_intent,
                 )
-                if continued is not None and continued[1] and quota_limits is not None:
-                    DynamicTaskQuotaService(self.db).acquire_execution(
-                        continued[0],
-                        limits=quota_limits,
-                    )
             except Exception as exc:
                 failure_code = str(getattr(exc, "code", "") or type(exc).__name__)
                 self._fail_unbound_dynamic_skill_uses(
@@ -8836,6 +8818,7 @@ class AgentLoop:
                     request=request,
                     chat_session=chat_session,
                     user_message_id=user_message_id,
+                    acquire_quota=created,
                 )
                 return self._dynamic_task_response(
                     chat_session=chat_session,
@@ -8878,11 +8861,6 @@ class AgentLoop:
                 memory_context=memory_context,
                 conversation_context=conversation_context,
             )
-            if created and quota_limits is not None:
-                DynamicTaskQuotaService(self.db).acquire_execution(
-                    instance,
-                    limits=quota_limits,
-                )
         except Exception as exc:
             failure_code = str(getattr(exc, "code", "") or type(exc).__name__)
             diagnostic = str(exc)[:500] if isinstance(exc, DynamicTaskPlannerError) else ""
@@ -8981,6 +8959,7 @@ class AgentLoop:
             request=request,
             chat_session=chat_session,
             user_message_id=user_message_id,
+            acquire_quota=created,
         )
         return self._dynamic_task_response(
             chat_session=chat_session,
@@ -8998,10 +8977,20 @@ class AgentLoop:
         request: ChatTurnRequest,
         chat_session: ChatSession,
         user_message_id: str,
+        acquire_quota: bool = True,
     ) -> DynamicRunOutcome:
         """运行动态任务并收敛容量与失败；真实取消原样交给外层聊天取消协议。"""
 
         try:
+            quota_limits = getattr(dynamic_agent, "quota_limits", None)
+            if acquire_quota and quota_limits is not None and quota_limits.configured:
+                # 容量竞争属于运行时背压；在执行入口取得租约，失败时由下方统一
+                # 转成持久 capacity_retry，不把正常 DTA 伪装成访问或资格拒绝。
+                DynamicTaskQuotaService(self.db).acquire_execution(
+                    instance,
+                    limits=quota_limits,
+                )
+                self.db.commit()
             self.events.record(
                 request.tenant_id,
                 chat_session.id,

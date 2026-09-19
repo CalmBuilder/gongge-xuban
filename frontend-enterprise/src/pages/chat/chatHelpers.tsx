@@ -64,7 +64,6 @@ const EXTERNAL_LINK_REL = 'noopener noreferrer';
 
 export type MarkdownMessageVariant = 'default' | 'intelligence';
 
-const INTELLIGENCE_ABILITY_IDS = new Set(['web-intelligence']);
 const INTELLIGENCE_REPORT_SECTION_PATTERNS = {
   summary: /^(?:结论摘要|执行摘要|研究摘要|executive summary|summary)$/iu,
   evidence: /(?:来源与证据|证据来源|研究来源|sources?|evidence)/iu,
@@ -80,16 +79,14 @@ function markdownHeadingTexts(content: string): string[] {
     .filter(Boolean);
 }
 
-function metadataAbilityIds(item: Pick<ChatMessage, 'metadata'>): string[] {
-  const values = item.metadata?.ability_ids;
-  if (!Array.isArray(values)) return [];
-  return values.filter((value): value is string => typeof value === 'string');
-}
-
 /** 判断回答是否具备可视化情报报告的稳定结构，避免把普通问答强行套成报告卡片。 */
 export function isIntelligenceReport(item: Pick<ChatMessage, 'role' | 'metadata'>, content: string): boolean {
   if (item.role !== 'assistant') return false;
-  if (metadataAbilityIds(item).some((value) => INTELLIGENCE_ABILITY_IDS.has(value))) return true;
+  const renderPolicy = item.metadata?.render_policy;
+  if (renderPolicy === 'intelligence_report') return true;
+  // 服务端对新消息会写入权威 render_policy；只有缺少该字段的历史消息才
+  // 允许用完整章节结构兼容旧数据，能力包 ID 不能作为展示开关。
+  if (typeof renderPolicy === 'string' && renderPolicy.length > 0) return false;
 
   const headings = markdownHeadingTexts(content);
   const hasSummary = headings.some((heading) => INTELLIGENCE_REPORT_SECTION_PATTERNS.summary.test(heading));

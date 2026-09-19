@@ -206,6 +206,9 @@ class LlmDynamicTaskSelector:
                     if skill.status == "published"
                 ],
                 "knowledge_capability": knowledge_capability,
+                "vertical_ability_summaries": selector_context.get(
+                    "vertical_ability_summaries", []
+                ),
             },
             output_contract=NON_SOP_CAPABILITY_OUTPUT,
         )
@@ -294,6 +297,7 @@ class NonSopCapabilityRouter:
         memory_context: list[dict[str, object]] | None,
         knowledge_capability: dict[str, object],
         forced_general_skill: GeneralSkill | None = None,
+        vertical_ability_summaries: list[dict[str, object]] | None = None,
         is_cancelled: Callable[[], bool] | None = None,
     ) -> NonSopCapabilityRouteResult:
         """分别决定 Skill 与执行模式；结构化强制 Skill 不再短路动态任务判断。"""
@@ -301,6 +305,9 @@ class NonSopCapabilityRouter:
         raise_if_cancelled(is_cancelled)
         selector_context = compact_conversation_context(conversation_context)
         selector_context["knowledge_capability"] = knowledge_capability
+        selector_context["vertical_ability_summaries"] = copy.deepcopy(
+            vertical_ability_summaries or []
+        )
         # 没有任何已发布通用 Skill 且成员/Agent 知识交集为空时，选择器没有可消费
         # 的候选，也没有需要判断的知识；跳过一次完整远程调用，避免在 Dynamic
         # shadow/规划前白白消耗 600 秒模型阶段预算。只要存在 Skill 或知识，仍走

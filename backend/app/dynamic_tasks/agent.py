@@ -650,6 +650,15 @@ _MODEL_CONTEXT_CLIP_PATTERN = re.compile(
     r"\[模型上下文已截断：原始字段共 (?P<char_count>\d+) 字符，"
     r"仅展示开头内容；不得视为全文。\]"
 )
+_VERTICAL_OPERATION_LINE_PATTERN = re.compile(
+    r"^(?P<prefix>\s*[-*]\s*)"
+    r"intelligence\.[A-Za-z0-9_.-]+(?:、intelligence\.[A-Za-z0-9_.-]+)*"
+    r"(?:（(?P<details>[^）\n]*)）)?[：:]\s*(?P<rest>.*)$"
+)
+_VERTICAL_STEP_EVIDENCE_LINE_PATTERN = re.compile(
+    r"^(?P<prefix>\s*[-*]\s*)step_[A-Za-z0-9_-]+\.(?P<field>[A-Za-z0-9_.-]+)"
+    r"[：:]\s*(?P<rest>.*)$"
+)
 _DYNAMIC_INPUT_SIGNAL_PATTERN = re.compile(
     r"(?:\b(?:error|exception|traceback|fatal|warn(?:ing)?|failed|failure|"
     r"timeout|oom|denied|rejected|rollback|recovered|recovery|started|completed)\b|"
@@ -1974,7 +1983,10 @@ class DynamicTaskAgent:
                     return discovered
                 repair_feedback: dict[str, object] | None = None
                 message: Message | None = None
-                for result_attempt in range(2):
+                # 普通结果错误保持首轮+一次修复；若第二轮只剩能力包要求的缺失章节，
+                # 允许一次定向补章，避免 provider 偶发漏掉一个固定标题就丢弃已完成的
+                # 互联网读取。该边界不放宽验证，也不延长工具/副作用执行。
+                for result_attempt in range(3):
                     expected_plan_revision_id = instance.current_plan_revision_id
                     try:
                         completed = self._propose_action(
@@ -2027,7 +2039,13 @@ class DynamicTaskAgent:
                         break
                     except DynamicTaskAgentError as exc:
                         if (
-                            result_attempt > 0
+                            result_attempt >= 2
+                            or (
+                                result_attempt > 0
+                                and not _result_verification_allows_missing_section_retry(
+                                    exc.details
+                                )
+                            )
                             or exc.code
                             not in {
                                 "DYNAMIC_RESULT_SCHEMA_INVALID",
@@ -2962,14 +2980,18 @@ class DynamicTaskAgent:
         vertical_ability_resolution: VerticalAbilityResolution | None = None,
         memory_context: Sequence[Mapping[str, object]] = (),
         conversation_context: Mapping[str, object] | None = None,
+        execution_intent: str = "continue",
     ) -> tuple[SopInstance, bool] | None:
         """把终态后的聊天输入接回同一 DynamicTask 会话链。
 
-        终态 Execution 的结果、计划和权限快照保持不可变；本方法创建带有父执行
-        lineage 的下一轮 Execution，并把同一聊天会话的有界历史传给 planner/runtime。
-        这对应 OpenWorker 的“session 持有连续上下文、turn 负责推进”的语义。
+        终态 Execution 的结果、计划和权限快照保持不可变；本方法只接受已经由
+        AgentLoop 判定为 continue/steer 的意图，随后创建带有父执行 lineage 的下一轮
+        Execution，并把同一聊天会话的有界历史传给 planner/runtime。这对应 OpenWorker
+        的“session 持有连续上下文、turn 负责推进”的语义。
         """
 
+        if execution_intent not in {"continue", "steer"}:
+            return None
         previous = self.store.latest_dynamic_instance(
             tenant_id,
             session_id,
@@ -7692,6 +7714,7 @@ class DynamicTaskAgent:
                     (instance.goal_snapshot_json or {}).get("goal") or ""
                 ),
             )
+            candidate_result = _normalize_vertical_user_facing_result(candidate_result)
             completed_response = completed_response.model_copy(
                 update={
                     "proposal": completed_response.proposal.model_copy(
@@ -7887,6 +7910,7 @@ class DynamicTaskAgent:
                     (instance.goal_snapshot_json or {}).get("goal") or ""
                 ),
             )
+            result = _normalize_vertical_user_facing_result(result)
             completed_keys = self._completed_step_keys(instance)
             verification = verify_dynamic_result(
                 result,
@@ -8021,6 +8045,9 @@ class DynamicTaskAgent:
                 "result_checksum": result_row.checksum,
                 "artifact_ids": [item.id for item in artifacts],
             }
+            render_policy = self._render_policy_for_verified_result(instance, verification)
+            if render_policy is not None:
+                message_metadata["render_policy"] = render_policy
             if user_message_id:
                 message_metadata.update(
                     {
@@ -8058,6 +8085,8 @@ class DynamicTaskAgent:
                 "result_id": result_row.id,
                 "artifact_ids": [item.id for item in artifacts],
             }
+            if render_policy is not None:
+                assistant_event_payload["render_policy"] = render_policy
             if user_message_id:
                 assistant_event_payload.update(
                     {
@@ -8651,6 +8680,33 @@ class DynamicTaskAgent:
             if not _markdown_discloses_no_results(markdown):
                 errors.append(f"no_results_not_disclosed:{operation_name}")
         return errors[:32]
+
+    @staticmethod
+    def _render_policy_for_verified_result(
+        instance: SopInstance,
+        verification: Mapping[str, object],
+    ) -> str | None:
+        """只为已验证的 research_report.v1 结果生成前端展示策略。"""
+
+        if verification.get("passed") is not True:
+            return None
+        if verification.get("vertical_ability_errors"):
+            return None
+        raw_contracts = (instance.capability_snapshot_json or {}).get(
+            "vertical_output_contracts"
+        )
+        if not isinstance(raw_contracts, list):
+            return None
+        for raw_contract in raw_contracts:
+            if not isinstance(raw_contract, Mapping):
+                continue
+            contract = raw_contract.get("contract")
+            if (
+                isinstance(contract, Mapping)
+                and contract.get("contract_id") == "research_report.v1"
+            ):
+                return "intelligence_report"
+        return None
 
     def _vertical_ability_result_quality_errors(self, instance: SopInstance) -> list[str]:
         """校验列表型垂直能力回执的集合、数量和空结果状态相互一致。"""
@@ -10950,6 +11006,107 @@ def _markdown_contains_exact_source_url(markdown: str, url: str) -> bool:
     ) is not None
 
 
+def _normalize_vertical_user_facing_markdown(
+    markdown: str,
+    *,
+    protected_fragments: Sequence[str] = (),
+) -> str:
+    """把运行时内部回证标签收敛为用户可读正文，同时保留权威证据值。
+
+    OpenWorker 将 transcript/display/source 分层，Pi 也把 response 与运行时事件分开；
+    DynamicTaskAgent 的最终 Markdown 不能把同一套控制面字段直接展示给用户。这里仅整理
+    已知的内部行前缀和标题，不删除 URL、查询条件、Provider、时间、错误码或结果状态。
+    ``protected_fragments`` 用于保护结果验证器要求逐字出现的 Guidance/Claim 原文，避免
+    展示层整理反过来破坏证据契约。Execution、Operation 和完整回证仍保留在数据库事件与
+    结果验证记录中，而不是依赖这段用户正文承担审计职责。
+    """
+
+    raw_markdown = str(markdown or "")
+    if not raw_markdown.strip():
+        return raw_markdown
+    protected = tuple(
+        " ".join(str(fragment).casefold().split())
+        for fragment in protected_fragments
+        if str(fragment).strip()
+    )
+    heading_replacements = {
+        "系统回证来源（成功工具回执，运行时补全）：": "来源补充：",
+        "系统回证限制（模型上下文投影）：": "证据完整性说明：",
+        "系统回证限制（Provider 结构化回执）：": "证据完整性说明：",
+        "系统回证字段（成功垂直工具结果，运行时补全）：": "证据补充：",
+        "系统回证渠道状态：": "来源状态：",
+        "系统回证失败 Operation（实际执行回执）：": "来源缺口：",
+    }
+    normalized_lines: list[str] = []
+    changed = False
+    for raw_line in raw_markdown.splitlines():
+        normalized_line = raw_line
+        compact_line = " ".join(raw_line.casefold().split())
+        if not any(fragment in compact_line for fragment in protected):
+            for source_heading, user_heading in heading_replacements.items():
+                if source_heading in normalized_line:
+                    normalized_line = normalized_line.replace(source_heading, user_heading)
+                    break
+            operation_match = _VERTICAL_OPERATION_LINE_PATTERN.match(normalized_line)
+            if operation_match:
+                details = str(operation_match.group("details") or "").strip()
+                # operation_id 是账本主键，只在事件/结果中有审计意义，不展示给用户；
+                # 请求 URL、query、status 和 code 等可帮助用户理解来源与缺口的事实保留。
+                details = re.sub(
+                    r"(?:^|[，,；;])\s*operation_id=[^，,；;）)]*",
+                    "",
+                    details,
+                ).strip(" ，,；;")
+                if details:
+                    normalized_line = (
+                        f"{operation_match.group('prefix')}来源（{details}）："
+                        f"{operation_match.group('rest')}"
+                    )
+                else:
+                    normalized_line = (
+                        f"{operation_match.group('prefix')}"
+                        f"{operation_match.group('rest')}"
+                    )
+            else:
+                evidence_match = _VERTICAL_STEP_EVIDENCE_LINE_PATTERN.match(normalized_line)
+                if evidence_match:
+                    field = evidence_match.group("field")
+                    field_label = {
+                        "query": "查询条件",
+                        "provider": "来源服务",
+                        "url": "来源 URL",
+                        "link": "来源 URL",
+                    }.get(field, f"证据字段（{field}）")
+                    normalized_line = (
+                        f"{evidence_match.group('prefix')}{field_label}："
+                        f"{evidence_match.group('rest')}"
+                    )
+            if normalized_line != raw_line:
+                changed = True
+        normalized_lines.append(normalized_line)
+    if not changed:
+        return raw_markdown
+    return "\n".join(normalized_lines)
+
+
+def _normalize_vertical_user_facing_result(result: DynamicTaskResult) -> DynamicTaskResult:
+    """整理结果 Markdown 的内部标签，但不改动结果字段、Claim 或来源事实。"""
+
+    protected_fragments = [
+        item.evidence_excerpt
+        for application in result.guidance_applications
+        for item in application.items
+    ]
+    protected_fragments.extend(claim.text for claim in result.claims)
+    markdown = _normalize_vertical_user_facing_markdown(
+        result.markdown,
+        protected_fragments=protected_fragments,
+    )
+    if markdown == result.markdown:
+        return result
+    return result.model_copy(update={"markdown": markdown})
+
+
 def _plan_has_required_knowledge_ancestor(plan: NormalizedPlan) -> bool:
     """确认至少一个必需知识步骤位于最终 answer 的依赖祖先链。"""
 
@@ -11014,6 +11171,45 @@ def _result_claim_repair_hints(
         if len(hints) >= 4:
             break
     return hints
+
+
+def _result_verification_allows_missing_section_retry(
+    details: Mapping[str, object] | None,
+) -> bool:
+    """只为纯缺失必需章节的结果验证错误开放一次额外答案修复轮。
+
+    章节标题是能力包的固定输出结构，补齐它不需要重新执行工具，也不会改变已冻结
+    的事实。若错误同时包含安全、证据、来源或其他语义问题，继续沿用原有的两轮边界，
+    避免把额外模型调用变成绕过验证的通道。
+    """
+
+    if not isinstance(details, Mapping):
+        return False
+    raw_errors = details.get("vertical_ability_errors")
+    if not isinstance(raw_errors, Sequence) or isinstance(raw_errors, (str, bytes)):
+        return False
+    errors = [str(error).strip() for error in raw_errors if str(error).strip()]
+    if not errors or not all(error.startswith("missing_section:") for error in errors):
+        return False
+
+    # 结果验证对象同时包含成功标准、证据、安全和能力包错误。只要出现任何
+    # 未知或非空错误字段，就继续沿用原有修复上限；不能因为 vertical 错误恰好
+    # 是 missing_section，就把安全/证据/来源问题一起带过验证。
+    benign_keys = {
+        "passed",
+        "criterion_ids",
+        "completed_step_keys",
+        "vertical_ability_errors",
+        "security_redaction_applied",
+        "guidance_pruning_applied",
+    }
+    for key, value in details.items():
+        if key in benign_keys:
+            continue
+        if value is None or value is False or value == "" or value == [] or value == {}:
+            continue
+        return False
+    return True
 
 
 def _guidance_repair_hints(arguments: Mapping[str, object]) -> list[dict[str, object]]:
@@ -12044,9 +12240,9 @@ def _ensure_vertical_source_url_disclosures(
     依赖模型是否复述上一轮的运行时补全，否则模型修复其他错误时可能丢失已经确认
     的来源。来源集合由运行时有界截取，不能由模型新增。
 
-    ``source_operation_names`` 只用于给已经取得的 URL 加上 Operation 名称，解决
-    同一结果中有多个 ``web_read`` 时，截断/失败说明无法绑定到具体回执的问题；它
-    不会创建新的来源，也不会改变 Provider 返回内容。
+    ``source_operation_names`` 只用于让缺失 URL 在中间提案中可追溯；如果模型已经
+    原样披露了权威 URL，运行时不再插入一条重复来源。最终发布前由统一展示归一化边界
+    收回 Operation 标签，保留 URL 本身，避免把运行时内部衔接信息混入用户正文。
     """
 
     if completed.proposal.action_kind not in {ActionKind.ANSWER, ActionKind.COMPLETE}:
@@ -12064,20 +12260,7 @@ def _ensure_vertical_source_url_disclosures(
         if not url or url not in missing_urls:
             continue
         operation_label = str((source_operation_names or {}).get(url) or "").strip()
-        if operation_label:
-            labels = tuple(
-                label.strip()
-                for label in re.split(r"[、,]", operation_label)
-                if label.strip()
-            )
-            labeled_url_present = any(
-                _markdown_contains_exact_source_url(line, url)
-                and all(label in line for label in labels)
-                for line in markdown.splitlines()
-            )
-        else:
-            labeled_url_present = _markdown_contains_exact_source_url(markdown, url)
-        if not labeled_url_present:
+        if not _markdown_contains_exact_source_url(markdown, url):
             additions.append(
                 f"{operation_label + '：' if operation_label else ''}{url}"
             )

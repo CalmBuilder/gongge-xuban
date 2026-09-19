@@ -216,9 +216,12 @@ function operationDisclosure(markdown, operation, operations) {
   const sameName = operations.filter((item) => item.operation_name === operation.operation_name).length;
   const identifiers = [operation.request?.url, operation.request?.query, operation.request?.repository]
     .filter((item) => typeof item === 'string' && item.length >= 4);
-  return markdown.split(/\r?\n/).filter((line) => line.includes(operation.operation_id)
-    || (line.includes(operation.operation_name)
-      && (sameName === 1 || identifiers.some((value) => line.includes(value))))).join('\n');
+  return markdown.split(/\r?\n/).filter((line) => {
+    const hasIdentifier = identifiers.some((value) => line.includes(value));
+    return line.includes(operation.operation_id)
+      || hasIdentifier
+      || (line.includes(operation.operation_name) && sameName === 1);
+  }).join('\n');
 }
 
 /** 递归保留 Provider/模型投影的明确限制事实；false 标志和普通描述不生成限制。 */

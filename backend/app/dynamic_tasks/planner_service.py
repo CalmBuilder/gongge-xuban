@@ -258,11 +258,14 @@ class DynamicTaskPlanner:
             loaded_guidance=loaded_guidance,
         )
         last_error: ValueError | ValidationError | None = None
-        for attempt in range(3):
+        # 三轮常规计划收敛之外，研究深度错误允许一次额外的定向修复；
+        # 只有该错误能进入第四轮，其他语义错误仍在原有边界内停止。
+        for attempt in range(4):
             with llm_operation("dynamic_task.plan"):
                 raw = _normalize_model_display_fields(
                     self.client.generate_json(_PLANNER_SYSTEM_PROMPT, repair_payload)
                 )
+            raw = _strip_planner_contract_echo_fields(raw)
             loaded_skill_contract = [
                 {"skill_ref": name}
                 for name in guidance_use_ids_by_name
@@ -451,15 +454,15 @@ class DynamicTaskPlanner:
                 return plan
             except (ValidationError, ValueError) as exc:
                 last_error = exc
-                if attempt == 1 and _is_planner_contract_echo(raw):
+                if 0 < attempt < 3 and _is_planner_contract_echo(raw):
                     # provider 偶尔会把宿主的 output_contract 原样回显为结果对象，
-                    # 既没有 steps 又带有 schema 之外的顶层字段。仅对此确定形状
-                    # 再给一次“只返回草案”的有界修复；不把缺失步骤猜成能力调用，
-                    # 最终仍由 DynamicPlanDraft、能力、依赖和 Guidance 校验收紧。
+                    # 既没有 steps 又带有 schema 之外的顶层字段。只要仍处于本轮
+                    # 有界修复窗口，就再次要求“只返回草案”；不把缺失步骤猜成能力
+                    # 调用，最终仍由 DynamicPlanDraft、能力、依赖和 Guidance 校验收紧。
                     repair_payload = {
                         **payload,
                         "repair": {
-                            "attempt": 2,
+                            "attempt": attempt + 1,
                             "failure_code": "DYNAMIC_PLAN_SEMANTIC_INVALID",
                             "failure_message": str(exc)[:1000],
                             "instruction": (
@@ -470,6 +473,24 @@ class DynamicTaskPlanner:
                                 "不要新增未经列出的能力、权限、工具或澄清；若任务只需分析/文档，使用一个 answer。"
                                 "loaded_guidance 非空时仍须按候选填写 guidance_requirements，并在 answer 的"
                                 "guidance_skill_refs 逐字引用已加载 Skill 名称；服务端会继续校验所有身份、依赖、预算和来源。"
+                            ),
+                        },
+                    }
+                    continue
+                if attempt < 3 and _is_research_depth_validation_error(exc):
+                    repair_payload = {
+                        **payload,
+                        "repair": {
+                            "attempt": attempt + 1,
+                            "failure_code": "DYNAMIC_RESEARCH_DEPTH_INVALID",
+                            "failure_message": str(exc)[:1000],
+                            "instruction": (
+                                "上一轮研究计划没有满足已加载能力包的研究深度契约。"
+                                + research_depth_repair_instruction
+                                + "本轮必须把每个独立原文/详情来源规划为单独的 tool.read 步骤，"
+                                "每个步骤只能逐字引用一个已冻结的实际读取能力；最终 answer 必须"
+                                "直接或间接依赖全部读取步骤。不要把搜索摘要、多个来源名称或来源列表"
+                                "塞进一个步骤来规避数量要求，也不要新增输入中不存在的能力、权限或副作用。"
                             ),
                         },
                     }
@@ -1340,6 +1361,28 @@ def _is_planner_contract_echo(raw: Mapping[str, object]) -> bool:
     return not isinstance(raw.get("steps"), list) and isinstance(
         raw.get("output_contract"), Mapping
     ) and "steps" in raw["output_contract"]
+
+
+def _is_research_depth_validation_error(error: BaseException) -> bool:
+    """识别可交给下一轮受限规划修复的研究深度契约错误。"""
+
+    return "研究深度计划缺少至少" in str(error)
+
+
+def _strip_planner_contract_echo_fields(raw: Mapping[str, object]) -> dict[str, object]:
+    """在真实 steps 已存在时移除模型回显的宿主 output_contract 字段。
+
+    顶层真实 steps 是计划草案的必要身份；此时 output_contract 无论完整还是被
+    provider 截断成部分字段，都只是输入 schema 的宿主回显，不属于结果契约。缺失
+    顶层 steps 的纯回显继续交给严格模型校验与有界 repair 处理，不把宽松解析变成
+    能力、权限或计划语义的旁路。
+    """
+
+    normalized = dict(raw)
+    output_contract = normalized.get("output_contract")
+    if isinstance(normalized.get("steps"), list) and isinstance(output_contract, Mapping):
+        normalized.pop("output_contract", None)
+    return normalized
 
 
 def _planner_capability_view(snapshot: CapabilitySnapshot) -> dict[str, object]:

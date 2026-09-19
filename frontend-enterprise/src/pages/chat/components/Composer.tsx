@@ -84,7 +84,6 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
     verticalAbilityCatalogError,
     selectedVerticalAbilityIds,
     selectVerticalAbility,
-    verticalAbilityReadinessById,
     checkVerticalAbilityReadiness,
     generalSkillInstallOpen,
     setGeneralSkillInstallOpen,
@@ -170,7 +169,7 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
   const activeVerticalAbilityWarnings = selectedVerticalAbilities
     .map((item) => verticalAbilityConfigurationWarnings[item.id])
     .filter((item): item is VerticalAbilityReadinessRead => Boolean(item && !item.configured));
-  const dynamicTaskSelected = executionEngine === 'dynamic_task' || selectedVerticalAbilityIds.length > 0;
+  const dynamicTaskSelected = executionEngine === 'dynamic_task';
 
   const handleVerticalAbilitySelect = (abilityId: string) => {
     setVerticalAbilityMenuOpen(false);
@@ -184,31 +183,9 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
     }).catch(() => undefined);
   };
 
-  const handleVerticalAbilitySend = async () => {
-    if (hasSendContent) {
-      const knownMissing = activeVerticalAbilityWarnings[0]
-        || selectedVerticalAbilityIds
-          .map((abilityId) => verticalAbilityReadinessById?.[abilityId])
-          .find((item): item is VerticalAbilityReadinessRead => Boolean(item && !item.configured));
-      if (knownMissing) {
-        setVerticalAbilityConfigurationDialog(knownMissing);
-        return;
-      }
-      const unknownAbilityId = selectedVerticalAbilityIds.find(
-        (abilityId) => !verticalAbilityReadinessById?.[abilityId],
-      );
-      if (unknownAbilityId && checkVerticalAbilityReadiness) {
-        const readiness = await checkVerticalAbilityReadiness(unknownAbilityId);
-        if (readiness && !readiness.configured) {
-          setVerticalAbilityConfigurationWarnings((current) => ({
-            ...current,
-            [readiness.ability_id]: readiness,
-          }));
-          setVerticalAbilityConfigurationDialog(readiness);
-          return;
-        }
-      }
-    }
+  const handleVerticalAbilitySend = () => {
+    // readiness 只负责选择阶段的配置提示；不能在发送前把能力包变成
+    // DynamicTaskAgent 或普通回答的权限门禁。真实依赖由服务端在实际执行阶段校验。
     void send();
   };
 

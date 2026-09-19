@@ -16,6 +16,7 @@ from io import BytesIO
 from pathlib import Path
 import sys
 import time
+from types import SimpleNamespace
 
 import pytest
 from pypdf import PdfWriter
@@ -78,6 +79,7 @@ from app.dynamic_tasks.agent import (
     _plan_has_required_knowledge_ancestor,
     _prioritize_formula_requests,
     _result_claim_repair_hints,
+    _result_verification_allows_missing_section_retry,
     _append_authoritative_claim_disclosures,
     _append_frozen_guidance_disclosures,
     _build_public_read_fallback_plan,
@@ -644,6 +646,38 @@ class _ReadShapeRepairProposer(_Proposer):
         return _response()
 
 
+def test_render_policy_only_marks_verified_research_report() -> None:
+    """展示策略只能由已验证的 research_report.v1 结果产生，不能由能力选择产生。"""
+
+    research_instance = SimpleNamespace(
+        capability_snapshot_json={
+            "vertical_output_contracts": [
+                {"contract": {"contract_id": "research_report.v1"}},
+            ]
+        }
+    )
+    ordinary_instance = SimpleNamespace(
+        capability_snapshot_json={
+            "vertical_output_contracts": [
+                {"contract": {"contract_id": "ordinary_answer.v1"}},
+            ]
+        }
+    )
+
+    assert DynamicTaskAgent._render_policy_for_verified_result(
+        research_instance,
+        {"passed": True, "vertical_ability_errors": []},
+    ) == "intelligence_report"
+    assert DynamicTaskAgent._render_policy_for_verified_result(
+        research_instance,
+        {"passed": False, "vertical_ability_errors": []},
+    ) is None
+    assert DynamicTaskAgent._render_policy_for_verified_result(
+        ordinary_instance,
+        {"passed": True, "vertical_ability_errors": []},
+    ) is None
+
+
 def test_result_claim_repair_hints_replay_only_supported_undisclosed_claims() -> None:
     """修复反馈只回放上轮唯一问题为未披露的短Claim，不鼓励复用无支持内容。"""
 
@@ -678,6 +712,37 @@ def test_result_claim_repair_hints_replay_only_supported_undisclosed_claims() ->
             "normalized_value": "BEGIN IMMEDIATE",
         }
     ]
+
+
+def test_result_repair_allows_extra_round_only_for_missing_sections() -> None:
+    """额外答案修复轮只接受纯缺失章节错误，不扩大验证失败范围。"""
+
+    assert _result_verification_allows_missing_section_retry(
+        {"vertical_ability_errors": ["missing_section:后续建议"]}
+    )
+    assert not _result_verification_allows_missing_section_retry(
+        {
+            "vertical_ability_errors": [
+                "missing_section:后续建议",
+                "source_url_not_disclosed:https://example.com/article",
+            ]
+        }
+    )
+    assert not _result_verification_allows_missing_section_retry(
+        {"vertical_ability_errors": []}
+    )
+    assert not _result_verification_allows_missing_section_retry(
+        {
+            "vertical_ability_errors": ["missing_section:后续建议"],
+            "security_errors": ["untrusted_instruction_echo"],
+        }
+    )
+    assert not _result_verification_allows_missing_section_retry(
+        {
+            "vertical_ability_errors": ["missing_section:后续建议"],
+            "future_verifier_error": ["unexpected"],
+        }
+    )
 
 
 def test_succeeded_dynamic_outcome_returns_message_bound_to_execution() -> None:

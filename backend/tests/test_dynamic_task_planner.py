@@ -394,6 +394,26 @@ class _ContractEchoRepairClient:
         }
 
 
+class _ContractEchoWithRealStepsClient:
+    """模拟 provider 在真实步骤外重复回显宿主 output_contract。"""
+
+    def __init__(self) -> None:
+        """记录一次语义收敛即可完成的调用次数。"""
+
+        self.calls = 0
+
+    def generate_json(self, system_prompt: str, user_payload: dict) -> dict:
+        """返回包含真实 answer 与宿主回显字段的计划，验证宿主侧最小收敛。"""
+
+        self.calls += 1
+        return {
+            "goal": user_payload["goal"],
+            "success_criteria": user_payload["success_criteria"],
+            "output_contract": {"steps": [{"draft_id": "schema", "kind": "answer"}]},
+            "steps": [{"draft_id": "answer", "title": "形成结果", "kind": "answer"}],
+        }
+
+
 def test_planner_has_bounded_shape_repair_for_contract_echo() -> None:
     """契约回显只额外修复一次，成功后仍走完整计划语义校验。"""
 
@@ -407,6 +427,93 @@ def test_planner_has_bounded_shape_repair_for_contract_echo() -> None:
     )
 
     assert client.calls == 3
+    assert [step.kind for step in plan.steps] == ["answer"]
+
+
+class _PersistentContractEchoRepairClient:
+    """模拟 provider 在多轮研究修复后仍回显契约，随后才返回计划。"""
+
+    def __init__(self) -> None:
+        """记录连续回显次数，验证后续轮仍保持有界。"""
+
+        self.calls = 0
+
+    def generate_json(self, system_prompt: str, user_payload: dict) -> dict:
+        """前三次返回回显对象，第四次返回真实 answer 计划。"""
+
+        self.calls += 1
+        if self.calls > 1:
+            assert user_payload["repair"]["attempt"] == self.calls - 1
+        if self.calls < 4:
+            return {
+                "goal": user_payload["goal"],
+                "success_criteria": user_payload["success_criteria"],
+                "output_contract": {"steps": [{"draft_id": "answer", "kind": "answer"}]},
+            }
+        return {
+            "goal": user_payload["goal"],
+            "success_criteria": user_payload["success_criteria"],
+            "steps": [{"draft_id": "answer", "title": "形成结果", "kind": "answer"}],
+        }
+
+
+def test_planner_recovers_contract_echo_after_multiple_repair_rounds() -> None:
+    """契约回显跨越研究修复轮时仍能在总轮次边界内恢复。"""
+
+    client = _PersistentContractEchoRepairClient()
+    plan = DynamicTaskPlanner(client).create_plan(
+        goal="整理分析结论",
+        success_criteria=(
+            SuccessCriterion(id="done", type="assertion", spec={"required": True}),
+        ),
+        capabilities=(),
+    )
+
+    assert client.calls == 4
+    assert [step.kind for step in plan.steps] == ["answer"]
+
+
+def test_planner_strips_host_contract_echo_when_real_steps_are_present() -> None:
+    """真实计划夹带宿主 schema 回显时只移除回显，不绕过其余契约校验。"""
+
+    client = _ContractEchoWithRealStepsClient()
+    plan = DynamicTaskPlanner(client).create_plan(
+        goal="整理分析结论",
+        success_criteria=(
+            SuccessCriterion(id="done", type="assertion", spec={"required": True}),
+        ),
+        capabilities=(),
+    )
+
+    assert client.calls == 1
+    assert [step.kind for step in plan.steps] == ["answer"]
+
+
+class _PartialContractEchoWithRealStepsClient:
+    """模拟 provider 只回显部分 output_contract 字段但已返回真实步骤。"""
+
+    def generate_json(self, system_prompt: str, user_payload: dict) -> dict:
+        """返回带部分宿主字段的完整草案，验证不依赖嵌套 steps 才能收敛。"""
+
+        return {
+            "goal": user_payload["goal"],
+            "success_criteria": user_payload["success_criteria"],
+            "output_contract": {"goal": "provider partial echo", "guidance_requirements": []},
+            "steps": [{"draft_id": "answer", "title": "形成结果", "kind": "answer"}],
+        }
+
+
+def test_planner_strips_partial_host_contract_echo_with_real_steps() -> None:
+    """宿主回显只有部分字段时仍只移除回显并保留完整计划校验。"""
+
+    plan = DynamicTaskPlanner(_PartialContractEchoWithRealStepsClient()).create_plan(
+        goal="整理分析结论",
+        success_criteria=(
+            SuccessCriterion(id="done", type="assertion", spec={"required": True}),
+        ),
+        capabilities=(),
+    )
+
     assert [step.kind for step in plan.steps] == ["answer"]
 
 
@@ -3104,6 +3211,86 @@ def test_planner_repairs_missing_required_knowledge_before_execution_creation() 
 
     assert len(client.payloads) == 2
     assert [step.kind for step in plan.steps] == ["knowledge", "answer"]
+
+
+class _ResearchDepthRepairClient:
+    """模拟研究计划首轮读取不足、下一轮补齐独立原文读取步骤。"""
+
+    def __init__(self) -> None:
+        """记录规划轮次，验证研究深度修复保持有界。"""
+
+        self.calls = 0
+
+    def generate_json(self, system_prompt: str, user_payload: dict) -> dict:
+        """首轮返回一个读取步骤，后续按契约错误返回两个读取步骤。"""
+
+        self.calls += 1
+        if self.calls > 1:
+            assert user_payload["repair"]["failure_code"] == "DYNAMIC_RESEARCH_DEPTH_INVALID"
+            assert "每个独立原文/详情来源" in user_payload["repair"]["instruction"]
+        if self.calls > 3:
+            reads = [
+                {
+                    "draft_id": "web_read",
+                    "title": "读取网页原文",
+                    "kind": "tool.read",
+                    "capability_refs": ["intelligence.web_read"],
+                },
+                {
+                    "draft_id": "rss_read",
+                    "title": "读取 RSS 原文",
+                    "kind": "tool.read",
+                    "capability_refs": ["intelligence.rss_read"],
+                },
+            ]
+        else:
+            reads = [
+                {
+                    "draft_id": "web_read",
+                    "title": "读取网页原文",
+                    "kind": "tool.read",
+                    "capability_refs": ["intelligence.web_read"],
+                }
+            ]
+        return {
+            "goal": user_payload["goal"],
+            "success_criteria": user_payload["success_criteria"],
+            "steps": [
+                *reads,
+                {
+                    "draft_id": "answer",
+                    "title": "形成交叉核验结论",
+                    "kind": "answer",
+                    "depends_on": [item["draft_id"] for item in reads],
+                },
+            ],
+        }
+
+
+def test_planner_retries_research_depth_failure_within_existing_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """研究深度不足时再执行一次已有规划修复，不降低最终读取数量契约。"""
+
+    monkeypatch.setattr(
+        planner_service,
+        "_research_depth_requirement",
+        lambda **_kwargs: (2, True),
+    )
+    client = _ResearchDepthRepairClient()
+    plan = DynamicTaskPlanner(client).create_plan(
+        goal="比较最新 CLI 工具",
+        success_criteria=(
+            SuccessCriterion(id="done", type="assertion", spec={"required": True}),
+        ),
+        capabilities=(
+            _research_capability("intelligence.web_read"),
+            _research_capability("intelligence.rss_read"),
+        ),
+    )
+
+    assert client.calls == 4
+    assert [step.kind for step in plan.steps] == ["tool.read", "tool.read", "answer"]
 
 
 def _research_guidance_contract() -> list[dict[str, object]]:

@@ -7,6 +7,7 @@
 """
 
 import copy
+from json import JSONDecodeError
 from threading import Event, Thread
 from time import monotonic
 
@@ -20,6 +21,7 @@ from app.llm.client import (
     LLMError,
     LLMStreamCancelled,
     _json_repair_output_token_budget,
+    _loads_llm_json,
     _prepare_user_input,
     _request_input_token_budget,
     _request_tokens,
@@ -1790,6 +1792,36 @@ def test_generate_json_retries_invalid_json(monkeypatch):
     assert client.generate_json("prompt", {}) == {"ok": True}
 
 
+def test_generate_json_closes_bounded_missing_delimiters_without_retry(monkeypatch):
+    """供应商漏掉尾部对象/数组闭合符时，仅闭合已知结构且不触发二次外呼。"""
+
+    client = object.__new__(LLMClient)
+    payloads: list[dict[str, object]] = []
+
+    def fake_generate_text(_system_prompt, payload, response_format=None):  # noqa: ANN001, ARG001
+        """返回缺少最外层对象闭合符的最小结构化响应。"""
+
+        payloads.append(payload)
+        return '{"items": [{"id": 1, "value": "ready"}]'
+
+    monkeypatch.setattr(client, "generate_text", fake_generate_text)
+
+    assert client.generate_json("prompt", {}) == {
+        "items": [{"id": 1, "value": "ready"}],
+    }
+    assert len(payloads) == 1
+    assert "_json_repair" not in payloads[0]
+
+
+def test_llm_json_closure_does_not_accept_unfinished_string_or_value() -> None:
+    """尾部缺少字符串或值时不能靠补括号伪造合法 JSON。"""
+
+    with pytest.raises(JSONDecodeError):
+        _loads_llm_json('{"message": "unfinished')
+    with pytest.raises(JSONDecodeError):
+        _loads_llm_json('{"message":')
+
+
 def test_generate_json_retries_share_one_deadline(monkeypatch) -> None:
     """JSON语法修复重试必须共享总deadline，不能每轮重新获得完整模型超时。"""
 
@@ -1938,7 +1970,7 @@ def test_generate_json_repairs_trailing_commas_and_string_newlines(monkeypatch):
 def test_generate_json_allows_multiple_repair_attempts(monkeypatch):
     client = object.__new__(LLMClient)
     payloads = []
-    calls = iter(["not json", '{"reason": "用户称呼为"', '{"ok": true}'])
+    calls = iter(["not json", '{"reason": "用户称呼为', '{"ok": true}'])
 
     def fake_generate_text(_system_prompt, payload):
         payloads.append(payload)

@@ -730,6 +730,9 @@ def test_answer_step_receives_exact_dynamic_result_arguments_contract() -> None:
     assert "默认每个 snapshot 只生成 1 条最小 fact Claim" in client.system_prompt
     assert "路径、数值、版本或稳定标识" in client.system_prompt
     assert "不得用超长正文挤占 JSON 结构闭合所需预算" in client.system_prompt
+    assert "最终 Markdown 只回答当前计划步骤和当前用户目标" in client.system_prompt
+    assert "不得追加“衔接：…”" in client.system_prompt
+    assert "不要把 execution_id、operation_id、step key" in client.system_prompt
     assert "不得只在内部引用 Use" in client.system_prompt
     assert "即使标为“待验证”" in client.system_prompt
     assert "最终答案必须保持 blocked" in client.system_prompt

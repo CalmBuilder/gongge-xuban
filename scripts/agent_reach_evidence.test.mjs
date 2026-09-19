@@ -239,6 +239,18 @@ test('模型投影显式裁剪尾注即使没有相邻标志也必须纳入限�
   assert.ok(result.limitations[0].markers.some((item) => item.kind === 'truncated'));
 });
 
+test('同名读取的来源 URL 可以单独绑定模型裁剪限制', () => {
+  const args = fixture();
+  args.operations[1].result.data.content += '\n[模型上下文已截断：原始字段共 18000 字符，'
+    + '仅展示开头内容；不得视为全文。]';
+  args.executionResult.result.markdown = finalResult(
+    A + '：模型上下文已截断，仅核验已展示的正文片段。\n' + B,
+  ).result.markdown;
+  const result = assertResearchEvidence(args);
+  assert.equal(result.automation, 'passed');
+  assert.equal(result.evidenceCompleteness, 'partial');
+});
+
 test('只有模型裁剪尾注不能充当实际来源正文', () => {
   const args = fixture();
   args.operations[1].result.data.content = '[模型上下文已截断：原始字段共 18000 字符，'

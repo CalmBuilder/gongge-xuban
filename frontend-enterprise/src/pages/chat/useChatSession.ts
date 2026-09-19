@@ -748,6 +748,8 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
         ? current.filter((value) => value !== abilityId)
         : [...current, abilityId]
     ));
+    // 垂直能力包统一由共享 DynamicTaskAgent 执行；这里切换的是本轮执行引擎，
+    // 不是创建能力包专属 Agent，也不构成权限或配置门禁。
     changeExecutionEngine('dynamic_task');
     if (alreadySelected) return null;
     return checkVerticalAbilityReadiness(abilityId);
