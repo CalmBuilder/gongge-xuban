@@ -1,5 +1,5 @@
 """
-@Time       : 2026/08/13
+@Time       : 2026/10/02
 @Author     : zhanglp8181
 @File       : chat.py
 @CallChain  : React/SSE → FastAPI chat API → AgentLoop → 持久事件中继
@@ -14,7 +14,7 @@ import re
 import threading
 import time
 import traceback
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from datetime import datetime, timedelta
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -36,7 +36,13 @@ from app.core.cancellation import (
     clear_chat_turn_cancelled,
     clear_unbound_chat_turn_cancelled,
 )
+from app.core.time_context import (
+    freeze_time_context,
+    normalize_chat_timezone,
+    normalize_persisted_time_context,
+)
 from app.db import engine, get_session
+from app.db.retry import retry_mysql_deadlock_once
 from app.db.models import (
     AgentEvent,
     AgentProfile,
@@ -380,8 +386,16 @@ def human_handoff_read(row: HumanHandoffRequest) -> HumanHandoffRead:
     )
 
 
-def _user_message_metadata(request: ChatTurnRequest) -> dict[str, object]:
+def _user_message_metadata(
+    request: ChatTurnRequest,
+    *,
+    time_context: dict[str, str] | None = None,
+) -> dict[str, object]:
+    """汇总兼容聊天入口的用户元数据，并保留可信输入时间事实。"""
+
     metadata: dict[str, object] = {}
+    if time_context is not None:
+        metadata["time_context"] = dict(time_context)
     if request.client_turn_id:
         metadata["client_turn_id"] = request.client_turn_id
     if request.interaction_mode == "scheduled_task":
@@ -399,6 +413,38 @@ def _user_message_metadata(request: ChatTurnRequest) -> dict[str, object]:
     if request.attachments:
         metadata["attachments"] = [item.model_dump(mode="json") for item in request.attachments]
     return metadata
+
+
+def _latest_user_time_context(
+    db: Session,
+    tenant_id: str,
+    session_id: str,
+    message: str,
+    client_turn_id: str | None = None,
+) -> dict[str, str] | None:
+    """按当前实际用户输入回查已冻结时间，避免调度后置识别重新采样。"""
+
+    rows = db.exec(
+        select(Message)
+        .where(
+            Message.tenant_id == tenant_id,
+            Message.session_id == session_id,
+            Message.role == "user",
+        )
+        .order_by(Message.created_at.desc(), Message.id.desc())
+        .limit(64)
+    ).all()
+    normalized_client_turn_id = str(client_turn_id or "").strip()
+    for row in rows:
+        if row.content != message:
+            continue
+        metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+        if normalized_client_turn_id and str(metadata.get("client_turn_id") or "").strip() != normalized_client_turn_id:
+            continue
+        context = normalize_persisted_time_context(metadata.get("time_context"))
+        if context is not None:
+            return context
+    return None
 
 
 def _schedule_session_title_summary(
@@ -501,7 +547,7 @@ def _summarize_session_title_once(
                             traced_payload.setdefault("turn_id", title_turn_id)
                             traced_payload.setdefault("user_message_id", title_turn_id)
                         with Session(engine) as span_db:
-                            _persist_relay_only_event(
+                            _persist_span_only_event(
                                 span_db,
                                 tenant_id,
                                 session_id,
@@ -821,11 +867,23 @@ def _maybe_handle_scheduled_task_request(
     chat_session: ChatSession,
     *,
     include_complete: bool = True,
+    time_context: Mapping[str, object] | None = None,
 ) -> tuple[ChatTurnResponse, ScheduledTaskDraftRead] | None:
     """持久化定时任务草案，并按同步或流式调用方选择是否写入 Turn 终态。"""
 
     if request.interaction_mode != "scheduled_task" or not request.agent_id:
         return None
+    now = utc_now()
+    persisted_time_context = normalize_persisted_time_context(time_context)
+    if persisted_time_context is None:
+        user_message_id = new_id("msg")
+        persisted_time_context = freeze_time_context(
+            source_input_id=user_message_id,
+            client_timezone=request.client_timezone,
+            anchor_at_utc=now,
+        )
+    else:
+        user_message_id = persisted_time_context["source_input_id"]
     draft = detect_scheduled_task_draft(
         db,
         request.tenant_id,
@@ -834,12 +892,12 @@ def _maybe_handle_scheduled_task_request(
         request.message,
         chat_session.id,
         request.client_timezone,
+        time_context=persisted_time_context,
     )
     if not draft or not draft.should_create:
         return None
 
     reply = _scheduled_task_draft_reply(draft)
-    now = utc_now()
     intent_time = now + timedelta(microseconds=1)
     parse_time = now + timedelta(microseconds=2)
     draft_status_time = now + timedelta(microseconds=3)
@@ -849,11 +907,12 @@ def _maybe_handle_scheduled_task_request(
     chat_session.updated_at = assistant_time
     chat_session.summary = f"最近回复：{reply[:120]}"
     user_message = Message(
+        id=user_message_id,
         tenant_id=request.tenant_id,
         session_id=chat_session.id,
         role="user",
         content=request.message,
-        metadata_json=_user_message_metadata(request),
+        metadata_json=_user_message_metadata(request, time_context=persisted_time_context),
         created_at=now,
     )
     db.add(user_message)
@@ -869,6 +928,7 @@ def _maybe_handle_scheduled_task_request(
                 "message": request.message,
                 "channel": request.channel,
                 "user_id": request.user_id,
+                "time_context": persisted_time_context,
             },
             created_at=now,
         )
@@ -908,6 +968,7 @@ def _maybe_handle_scheduled_task_request(
         content=reply,
         metadata_json={
             "scheduled_task_draft": draft_payload,
+            "time_context": persisted_time_context,
             "user_message_id": user_message.id,
             "turn_id": user_message.id,
             "client_turn_id": request.client_turn_id,
@@ -925,6 +986,7 @@ def _maybe_handle_scheduled_task_request(
                 "user_message_id": user_message.id,
                 "turn_id": user_message.id,
                 "client_turn_id": request.client_turn_id,
+                "time_context": persisted_time_context,
             },
             created_at=event_time,
         )
@@ -942,6 +1004,7 @@ def _maybe_handle_scheduled_task_request(
                 "client_turn_id": request.client_turn_id,
                 "reply": reply,
                 "scheduled_task_draft": draft_payload,
+                "time_context": persisted_time_context,
             },
             created_at=assistant_time,
         )
@@ -968,6 +1031,7 @@ def _maybe_handle_scheduled_task_request(
                 "user_message_id": user_message.id,
                 "turn_id": user_message.id,
                 "client_turn_id": request.client_turn_id,
+                "time_context": persisted_time_context,
             },
         )
     db.commit()
@@ -1046,6 +1110,196 @@ SCHEDULE_TEXT_FORMATTERS: dict[str, Callable[[dict], str]] = {
     "monthly": _format_monthly_schedule,
     "daily": _format_daily_schedule,
 }
+
+
+def _freeze_chat_input_time_context(request: ChatTurnRequest) -> dict[str, str] | None:
+    """为本轮聊天输入一次生成可跨识别、执行和重试复用的时间事实。"""
+
+    if request.interaction_mode != "scheduled_task" or not request.agent_id:
+        return None
+    return freeze_time_context(
+        source_input_id=new_id("msg"),
+        client_timezone=request.client_timezone,
+        anchor_at_utc=utc_now(),
+    )
+
+
+def _handle_turn_with_time_context(
+    loop: AgentLoop,
+    request: ChatTurnRequest,
+    time_context: Mapping[str, object] | None,
+) -> ChatTurnResponse:
+    """把冻结时间传入真实 AgentLoop，并兼容仍采用旧签名的测试/扩展替身。"""
+
+    if time_context is None:
+        return loop.handle_turn(request)
+    try:
+        return loop.handle_turn(request, time_context=time_context)
+    except TypeError as exc:
+        if "time_context" not in str(exc):
+            raise
+        return loop.handle_turn(request)
+
+
+def _handle_stream_with_time_context(
+    loop: AgentLoop,
+    request: ChatTurnRequest,
+    time_context: Mapping[str, object] | None,
+) -> Iterator[dict[str, object]]:
+    """把同一冻结时间传入流式 AgentLoop，并兼容旧流式替身签名。"""
+
+    if time_context is None:
+        return loop.handle_turn_stream(request)
+    try:
+        return loop.handle_turn_stream(request, time_context=time_context)
+    except TypeError as exc:
+        if "time_context" not in str(exc):
+            raise
+        return loop.handle_turn_stream(request)
+
+
+def _replayed_chat_turn_response(
+    db: Session,
+    request: ChatTurnRequest,
+    *,
+    message_id: str,
+    rows: list[AgentEvent],
+) -> ChatTurnResponse:
+    """按目标用户消息恢复同步响应，禁止借用会话中其他 Turn 的最新回复。"""
+
+    chat_session = db.get(ChatSession, request.session_id or "")
+    if chat_session is None:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    target_ids = {message_id, str(request.client_turn_id or "").strip()}
+    terminal_payload: dict[str, object] | None = None
+    for row in reversed(rows):
+        event_name = STREAM_RELAY_EVENT_ALIASES.get(row.event_type, row.event_type)
+        if event_name not in {"complete", "turn_waiting"}:
+            continue
+        if not (_event_turn_ids(row) & target_ids):
+            continue
+        payload = row.payload_json or {}
+        nested_response = payload.get("response")
+        terminal_payload = (
+            dict(nested_response)
+            if isinstance(nested_response, Mapping)
+            else dict(payload)
+        )
+        break
+
+    assistant = _assistant_message_for_replayed_turn(
+        db,
+        request.tenant_id,
+        chat_session.id,
+        message_id,
+        rows,
+        preferred_message_ids=tuple(
+            message_id
+            for message_id in (
+                str(terminal_payload.get("assistant_message_id") or "").strip()
+                if terminal_payload is not None
+                else "",
+                str(terminal_payload.get("message_id") or "").strip()
+                if terminal_payload is not None
+                else "",
+            )
+            if message_id
+        ),
+    )
+    if terminal_payload is None:
+        return _processing_chat_turn_response(chat_session)
+
+    reply = assistant.content if assistant is not None else terminal_payload.get("reply")
+    if not isinstance(reply, str) or not reply:
+        return _processing_chat_turn_response(chat_session)
+    response_payload: dict[str, object] = {
+        "reply": reply,
+        "session_id": chat_session.id,
+        "session_state": terminal_payload.get(
+            "session_state", public_session(chat_session).model_dump(mode="json")
+        ),
+    }
+    for key in ("router_decision", "step_result", "tool_result"):
+        if terminal_payload.get(key) is not None:
+            response_payload[key] = terminal_payload[key]
+    try:
+        return ChatTurnResponse.model_validate(response_payload)
+    except (TypeError, ValueError):
+        # 兼容历史终态中缺少或无法解析结构化阶段字段的记录；正文和会话状态
+        # 仍必须来自当前目标 Turn，不能因结构化投影损坏退回其他消息。
+        return ChatTurnResponse(
+            reply=reply,
+            session_id=chat_session.id,
+            session_state=public_session(chat_session),
+        )
+
+
+def _assistant_message_for_replayed_turn(
+    db: Session,
+    tenant_id: str,
+    session_id: str,
+    message_id: str,
+    rows: list[AgentEvent],
+    *,
+    preferred_message_ids: tuple[str, ...] = (),
+) -> Message | None:
+    """按终态关联或目标 Turn 的最新助手事件解析回复，不使用会话最新值。"""
+
+    assistant_ids: list[str] = []
+    for row in reversed(rows):
+        if row.event_type != "assistant_message_created":
+            continue
+        payload = row.payload_json or {}
+        event_turn_ids = _event_turn_ids(row)
+        if message_id not in event_turn_ids:
+            continue
+        assistant_id = str(
+            payload.get("assistant_message_id") or payload.get("message_id") or ""
+        ).strip()
+        if assistant_id and assistant_id not in assistant_ids:
+            assistant_ids.append(assistant_id)
+
+    ordered_ids = list(dict.fromkeys((*preferred_message_ids, *assistant_ids)))
+    event_assistant_ids = set(assistant_ids)
+    for assistant_id in ordered_ids:
+        assistant = db.get(Message, assistant_id)
+        if assistant is None or assistant.tenant_id != tenant_id:
+            continue
+        if assistant.session_id != session_id or assistant.role != "assistant":
+            continue
+        metadata = assistant.metadata_json if isinstance(assistant.metadata_json, dict) else {}
+        metadata_turn_id = str(
+            metadata.get("user_message_id") or metadata.get("turn_id") or ""
+        ).strip()
+        if assistant_id in event_assistant_ids or metadata_turn_id == message_id:
+            return assistant
+
+    # 兼容早期只写 assistant 消息元数据、未写 assistant_message_created 的历史账本。
+    assistants = db.exec(
+        select(Message).where(
+            Message.tenant_id == tenant_id,
+            Message.session_id == session_id,
+            Message.role == "assistant",
+        )
+        .order_by(Message.created_at.desc(), Message.id.desc())
+    ).all()
+    for assistant in assistants:
+        metadata = assistant.metadata_json if isinstance(assistant.metadata_json, dict) else {}
+        if str(metadata.get("user_message_id") or "").strip() == message_id:
+            return assistant
+        if str(metadata.get("turn_id") or "").strip() == message_id:
+            return assistant
+    return None
+
+
+def _processing_chat_turn_response(chat_session: ChatSession) -> ChatTurnResponse:
+    """为尚未形成目标 Turn 终态的重试返回稳定处理中投影。"""
+
+    return ChatTurnResponse(
+        reply="请求正在处理中，请稍候。",
+        session_id=chat_session.id,
+        session_state=public_session(chat_session),
+    )
 
 
 def _format_scheduled_task_schedule(schedule_type: object, schedule_value: object) -> str:
@@ -1640,15 +1894,48 @@ def chat_turn(
     ensure_tenant(db, request.tenant_id)
     if not request.message.strip() and not request.attachments:
         raise HTTPException(status_code=400, detail="Message cannot be empty")
+    replay = _existing_turn_replay(db, request)
+    if replay is not None:
+        message_id, rows, _cursor, _terminal = replay
+        response = _replayed_chat_turn_response(
+            db,
+            request,
+            message_id=message_id,
+            rows=rows,
+        )
+        _schedule_session_title_summary(
+            request.tenant_id,
+            request.user_id,
+            response.session_id,
+            request.agent_id,
+        )
+        return response
+    scheduled_time_context = _freeze_chat_input_time_context(request)
     if request.session_id:
-        scheduled_response = _maybe_handle_scheduled_task_request(db, request, chat_session)
+        scheduled_response = _maybe_handle_scheduled_task_request(
+            db,
+            request,
+            chat_session,
+            time_context=scheduled_time_context,
+        )
         if scheduled_response:
             response, _draft = scheduled_response
             _schedule_session_title_summary(request.tenant_id, request.user_id, response.session_id, request.agent_id)
             return response
-    response = AgentLoop(db).handle_turn(request)
+    response = _handle_turn_with_time_context(
+        AgentLoop(db),
+        request,
+        scheduled_time_context,
+    )
     _schedule_session_title_summary(request.tenant_id, request.user_id, response.session_id, request.agent_id)
     if request.interaction_mode == "scheduled_task" and request.agent_id:
+        time_context = _latest_user_time_context(
+            db,
+            request.tenant_id,
+            response.session_id,
+            request.message,
+            request.client_turn_id,
+        ) or scheduled_time_context
         draft = detect_scheduled_task_draft(
             db,
             request.tenant_id,
@@ -1657,6 +1944,7 @@ def chat_turn(
             request.message,
             response.session_id,
             request.client_timezone,
+            time_context=time_context,
         )
         if draft and draft.should_create:
             _persist_scheduled_task_draft(db, request.tenant_id, response.session_id, draft)
@@ -1731,6 +2019,7 @@ def chat_stream(
             media_type="text/event-stream",
         )
 
+    scheduled_time_context = _freeze_chat_input_time_context(request)
     relay_ready = threading.Event()
     worker_done = threading.Event()
     source_session_id = {"value": request.session_id or ""}
@@ -1750,7 +2039,7 @@ def chat_stream(
 
     def run_stream_worker() -> None:
         span_sink_token = None
-        deferred_sqlite_spans: list[tuple[str, str, str, dict[str, object]]] = []
+        deferred_span_events: list[tuple[str, str, str, dict[str, object]]] = []
         title_summary_request: tuple[str, str, str, str | None] | None = None
         try:
             with Session(engine) as worker_db:
@@ -1767,22 +2056,13 @@ def chat_stream(
                         event_payload.setdefault("user_message_id", turn_id)
                     if request.client_turn_id:
                         event_payload.setdefault("client_turn_id", request.client_turn_id)
-                    if engine.dialect.name == "sqlite":
-                        deferred_sqlite_spans.append(
-                            (request.tenant_id, session_id, event_type, event_payload)
-                        )
-                        return
-                    try:
-                        with Session(engine) as span_db:
-                            _persist_relay_only_event(
-                                span_db,
-                                request.tenant_id,
-                                session_id,
-                                event_type,
-                                event_payload,
-                            )
-                    except Exception:
-                        logger.exception("chat stream span persistence failed")
+                    # Span 记录引用当前 ChatSession；MySQL 的外键插入会等待业务
+                    # Turn 持有的会话行锁，即使不主动 FOR UPDATE 也可能触发 1205。
+                    # 与 SQLite 一样延迟到同一 worker 事务的业务事实提交后再写，
+                    # 观测不能反过来阻塞或失败业务 Turn。
+                    deferred_span_events.append(
+                        (request.tenant_id, session_id, event_type, event_payload)
+                    )
 
                 span_sink_token = set_span_sink(persist_span)
                 ensure_tenant(worker_db, request.tenant_id)
@@ -1813,6 +2093,7 @@ def chat_stream(
                         request,
                         chat_session,
                         include_complete=False,
+                        time_context=scheduled_time_context,
                     )
                     if scheduled_response:
                         response, draft = scheduled_response
@@ -1877,7 +2158,11 @@ def chat_stream(
                             request.agent_id,
                         )
                         return
-                for item in AgentLoop(worker_db).handle_turn_stream(request):
+                for item in _handle_stream_with_time_context(
+                    AgentLoop(worker_db),
+                    request,
+                    scheduled_time_context,
+                ):
                     event_name = str(item["event"])
                     data = item["data"] if isinstance(item.get("data"), dict) else {}
                     item_session_id = str(data.get("sessionId") or request.session_id or source_session_id["value"] or "")
@@ -1936,6 +2221,13 @@ def chat_stream(
                             request.message,
                             event_source_session_id or None,
                             request.client_timezone,
+                            time_context=_latest_user_time_context(
+                                worker_db,
+                                request.tenant_id,
+                                event_source_session_id,
+                                request.message,
+                                request.client_turn_id,
+                            ) or scheduled_time_context,
                         )
                         if draft and draft.should_create:
                             _persist_scheduled_task_draft(worker_db, request.tenant_id, event_source_session_id, draft)
@@ -1946,8 +2238,8 @@ def chat_stream(
                                 "scheduled_task_draft",
                                 draft.model_dump(mode="json"),
                             )
-                if deferred_sqlite_spans:
-                    _persist_deferred_span_events(worker_db, deferred_sqlite_spans)
+                if deferred_span_events:
+                    _persist_deferred_span_events(worker_db, deferred_span_events)
             # 等主 Turn 的业务事件和 SQLite 观测批量提交、worker session 关闭后，
             # 再启动标题摘要旁路任务；它可能发起模型调用并写标题/Span，不能与
             # 当前流的提交窗口重叠。
@@ -2841,6 +3133,28 @@ def _persist_relay_only_event(
     db.commit()
 
 
+def _persist_span_only_event(
+    db: Session,
+    tenant_id: str,
+    session_id: str,
+    event_type: str,
+    payload: dict[str, object],
+) -> None:
+    """只写观测 Span，不锁业务会话，避免 MySQL 阻塞进行中的 Turn。"""
+
+    if event_type not in SPAN_EVENT_TYPES:
+        raise ValueError(f"event_type is not a span event: {event_type}")
+    db.add(
+        AgentEvent(
+            tenant_id=tenant_id,
+            session_id=session_id,
+            event_type=event_type,
+            payload_json=payload,
+        )
+    )
+    db.commit()
+
+
 def _persist_deferred_span_events(
     db: Session,
     rows: list[tuple[str, str, str, dict[str, object]]],
@@ -2962,6 +3276,12 @@ def _existing_turn_replay(
     message_id = str(payload.get("message_id") or payload.get("user_message_id") or "").strip()
     user_message = db.get(Message, message_id) if message_id else None
     metadata = user_message.metadata_json if user_message is not None else {}
+    persisted_time_context = normalize_persisted_time_context(
+        metadata.get("time_context") if isinstance(metadata, dict) else None
+    )
+    requested_timezone, _timezone_source, _timezone = normalize_chat_timezone(
+        request.client_timezone
+    )
     expected_attachments = [item.model_dump(mode="json") for item in request.attachments]
     persisted_attachments = [
         {
@@ -2991,6 +3311,10 @@ def _existing_turn_replay(
         or list(metadata.get("ability_ids") or [])
         != list(dict.fromkeys(request.ability_ids))
         or persisted_attachments != expected_attachments
+        or (
+            persisted_time_context is not None
+            and persisted_time_context["timezone"] != requested_timezone
+        )
     ):
         raise HTTPException(
             status_code=409,
@@ -3122,6 +3446,21 @@ def list_chat_sessions(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_session),
 ) -> list[ChatSessionRead]:
+    """读取当前用户会话；MySQL 短死锁时回滚并从头重读一次。"""
+
+    return retry_mysql_deadlock_once(
+        db,
+        lambda: _list_chat_sessions_once(tenant_id, current_user, db),
+    )
+
+
+def _list_chat_sessions_once(
+    tenant_id: str,
+    current_user: User,
+    db: Session,
+) -> list[ChatSessionRead]:
+    """完整执行一次会话列表读取和惰性终态清理，供死锁后原样重放。"""
+
     _ensure_request_tenant(tenant_id, current_user)
     ensure_tenant(db, tenant_id)
     rows = db.exec(
@@ -3400,6 +3739,7 @@ def upsert_message_feedback(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_session),
 ) -> dict:
+    """本人评分创建新修订，同事务失效旧分享；模型分析另按独立代数结算。"""
     _ensure_request_tenant(request.tenant_id, current_user)
     message_row = _get_feedback_target_message(db, request.tenant_id, current_user.id, message_id)
     existing = db.exec(
@@ -3411,6 +3751,12 @@ def upsert_message_feedback(
     ).first()
     now = utc_now()
     if existing:
+        from app.feedback.materials import invalidate_materials, lock_feedback
+
+        existing = lock_feedback(db, request.tenant_id, existing.id)
+        invalidate_materials(db, existing.id)
+        existing.revision += 1
+        existing.analysis_generation += 1
         existing.rating = request.rating
         existing.analysis_status = "pending"
         existing.analysis_bucket = None
@@ -3464,6 +3810,7 @@ def delete_message_feedback(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_session),
 ) -> dict:
+    """本人删除评分时同步撤销其待分享/已分享材料，不复活原反馈身份。"""
     _ensure_request_tenant(tenant_id, current_user)
     message_row = _get_feedback_target_message(db, tenant_id, current_user.id, message_id)
     existing = db.exec(
@@ -3474,6 +3821,10 @@ def delete_message_feedback(
         )
     ).first()
     if existing:
+        from app.feedback.materials import invalidate_materials, lock_feedback
+
+        existing = lock_feedback(db, tenant_id, existing.id)
+        invalidate_materials(db, existing.id)
         db.delete(existing)
         _delete_skill_feedback_for_message(db, tenant_id, current_user.id, message_row)
         db.add(
@@ -3664,6 +4015,8 @@ def _cleanup_stale_completed_sessions(
     tenant_id: str,
     rows: list[ChatSession],
 ) -> None:
+    """沿聊天生命周期锁序刷新旧投影，再清理已结束技能，避免覆盖并发前台步骤。"""
+
     candidates = [row for row in rows if row.active_skill_id]
     if not candidates:
         return
@@ -3676,7 +4029,9 @@ def _cleanup_stale_completed_sessions(
         return
     loop = AgentLoop(db)
     changed = False
-    for row in candidates:
+    for row in sorted(candidates, key=lambda item: (item.agent_id or "", item.id)):
+        if not _lock_chat_session_lifecycle(db, tenant_id, row):
+            continue
         before = (
             row.active_skill_id,
             row.active_step_id,
@@ -3703,12 +4058,15 @@ def _upsert_skill_feedback_for_message(
     rating: str,
     now,
 ) -> None:
-    skill_context = _active_skill_context_for_assistant_message(db, tenant_id, message_row)
-    if not skill_context:
+    """新评分只关联可证明的原SOP发布，旧事件猜测统计不作为新来源权威。"""
+    from app.feedback.source import feedback_source
+
+    source = feedback_source(db, message_row)
+    if source.status != "verified" or source.branch != "sop":
         return
-    skill_id = skill_context["skill_id"]
-    skill_version = skill_context.get("skill_version")
-    step_id = skill_context.get("node_id") or skill_context.get("step_id")
+    skill_id = source.skill_id
+    skill_version = source.skill_version
+    step_id = (message_row.metadata_json or {}).get("feedback_source", {}).get("node_id")
     existing = db.exec(
         select(SkillFeedback).where(
             SkillFeedback.tenant_id == tenant_id,

@@ -1,4 +1,4 @@
-import { useCallback, useDeferredValue, useEffect, useMemo, useState } from 'react';
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { User } from 'lucide-react';
 
@@ -135,6 +135,8 @@ export default function AccountsPage({
   onLogout?: () => void;
 } = {}) {
   const [rows, setRows] = useState<EmployeeAccount[]>([]);
+  // 成员搜索、翻页和组织切换会同时触发请求；只允许最后一次响应覆盖当前列表。
+  const memberRequestSequence = useRef(0);
   const [businessRoles, setBusinessRoles] = useState<BusinessRoleOption[]>([]);
   const [memberCategories, setMemberCategories] = useState<MemberCategoryOption[]>([]);
   const [loading, setLoading] = useState(false);
@@ -194,6 +196,7 @@ export default function AccountsPage({
   }, []);
 
   const loadMembers = useCallback(async () => {
+    const requestSequence = ++memberRequestSequence.current;
     setLoading(true);
     const tenantId = getRequestTenantId();
     try {
@@ -208,12 +211,14 @@ export default function AccountsPage({
         query.set('include_descendants', String(includeDescendants));
       }
       const result = await api.get<MemberPage<EmployeeAccount>>(`/api/auth/users/page?${query}`);
+      if (requestSequence !== memberRequestSequence.current) return;
       setRows(result.items);
       setTotal(result.total);
     } catch (error) {
+      if (requestSequence !== memberRequestSequence.current) return;
       notify.error(error instanceof Error ? error.message : '成员列表加载失败');
     } finally {
-      setLoading(false);
+      if (requestSequence === memberRequestSequence.current) setLoading(false);
     }
   }, [deferredSearchText, includeDescendants, page, selectedUnitId]);
 

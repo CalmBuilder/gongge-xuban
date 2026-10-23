@@ -1,5 +1,5 @@
 """
-@Time       : 2026/07/22 17:05
+@Time       : 2026/10/03
 @Author     : zhanglp8181
 @File       : test_clause_modification_sop.py
 @CallChain  : pytest → 条款修改发布定义 → Scheduler/Tool/参考资料终态
@@ -141,7 +141,7 @@ def test_clause_modification_seed_freezes_shared_tool_authorization_and_version(
             select(Skill).where(Skill.skill_id == CLAUSE_MODIFICATION_SKILL_ID)
         ).one()
         version = db.exec(
-            select(SkillVersion).where(
+            select(SkillVersion).where(SkillVersion.tenant_id == "tenant_demo", SkillVersion.scope_agent_id == "",
                 SkillVersion.skill_id == CLAUSE_MODIFICATION_SKILL_ID,
                 SkillVersion.version == CLAUSE_MODIFICATION_DETERMINISTIC_VERSION,
             )

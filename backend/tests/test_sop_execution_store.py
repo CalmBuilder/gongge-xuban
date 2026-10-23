@@ -587,7 +587,7 @@ def test_non_json_values_are_rejected_before_fingerprint(payload) -> None:  # no
 
 
 def test_cancel_prepared_operation_and_reconcile_running_write() -> None:
-    """验证 prepared 零调用取消，running 外部写进入 unknown 并在对账后才取消实例。"""
+    """验证 prepared 零调用取消，未知外部写使实例挂起并在对账后才取消。"""
 
     with _test_session() as db:
         store = SopExecutionStore(db)
@@ -618,7 +618,8 @@ def test_cancel_prepared_operation_and_reconcile_running_write() -> None:
                 reason="用户撤回",
             )
             assert settled is False
-            assert instance.status == "running"
+            assert instance.status == "waiting"
+            assert execution.status == "waiting"
             assert instance.cancellation_disposition == "awaiting_reconciliation"
             assert running.status == "unknown"
             with pytest.raises(SopExecutionConflictError, match="running"):

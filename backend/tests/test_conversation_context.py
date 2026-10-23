@@ -49,6 +49,8 @@ def test_conversation_context_compacts_only_after_budget_is_exceeded() -> None:
 
 
 def test_context_rotates_medium_history_into_long_history_on_next_threshold() -> None:
+    """历史压缩轮换不得把最新 assistant 创建时间冒充为当前输入事实。"""
+
     messages = [
         {
             "id": f"message_{index}",
@@ -99,7 +101,7 @@ def test_context_rotates_medium_history_into_long_history_on_next_threshold() ->
     assert second_state["long_term_summary"].startswith("长期历史信息摘要")
     assert first_state["medium_term_summary"] in summaries[-2][1]
     assert second_state["medium_term_summary"].startswith("近期历史信息摘要")
-    assert second["metadata"]["current_turn_time"] == "2026-07-13T13:15:00"
+    assert second["metadata"]["current_turn_time"] is None
     assert second["metadata"]["estimated_tokens"] <= 700
 
 

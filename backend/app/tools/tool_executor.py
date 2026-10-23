@@ -1,9 +1,9 @@
 """
-@Time       : 2026/08/28 13:20
+@Time       : 2026/10/04
 @Author     : zhanglp8181
 @File       : tool_executor.py
 @CallChain  : Agent Loop/Tool API → ToolExecutor → 授权边界 → HTTP/MCP
-@Description: 在外部调用前执行受控授权，并向 HTTP 写适配器传递 Runtime 冻结的远端幂等键。
+@Description: 外呼前校验授权和可选原Runtime守卫，释放受控HTTP事务并传递冻结远端幂等键。
 """
 
 from __future__ import annotations
@@ -47,6 +47,7 @@ from app.tools.managed_workspace import (
 )
 from app.tools.tool_schema import ToolCall, ToolError, ToolResult
 from app.security.internal_service import INTERNAL_SERVICE_HEADER, internal_service_token
+from app.sop_runtime.external_identity import external_task_callback_token
 
 
 SECRET_PATTERN = re.compile(r"\$\{secret\.([A-Z0-9_]+)\}")
@@ -71,8 +72,9 @@ class ToolExecutor:
         remote_idempotency_key: str | None = None,
         execution_id: str | None = None,
         is_cancelled: Callable[[], bool] | None = None,
+        before_http_dispatch: Callable[[], None] | None = None,
     ) -> ToolResult:
-        """鉴权后执行工具，并仅向 HTTP 非 GET 写请求发送服务端远端幂等键。"""
+        """鉴权后执行；受控HTTP守卫通过后提交事务，用独立工具快照外呼。"""
 
         raise_if_cancelled(is_cancelled)
         if tool_call.name == SKILL_PROPOSAL_TOOL_NAME:
@@ -82,49 +84,19 @@ class ToolExecutor:
                 actor_user_id=actor_user_id,
                 execution_id=execution_id,
             )
-        with self.db.no_autoflush:
-            tool = self.db.exec(
-                select(Tool).where(Tool.tenant_id == tenant_id, Tool.name == tool_call.name)
-            ).first()
-        if not tool:
-            return self._error(tool_call.name, "NOT_FOUND", "工具不存在或未配置。")
-        if not tool.enabled:
-            return self._error(tool.name, "DISABLED", "工具当前未启用。")
-        destructive_error = self._validate_destructive_dispatch(
-            tool,
-            tool_call.arguments,
+        tool, authorization, authorization_error = self._authorize_tool(
+            tenant_id=tenant_id,
+            tool_call=tool_call,
+            active_skill_id=active_skill_id,
+            agent_id=agent_id,
+            actor_user_id=actor_user_id,
+            execution_org_unit_id=execution_org_unit_id,
             remote_idempotency_key=remote_idempotency_key,
         )
-        if destructive_error is not None:
-            return destructive_error
-        if agent_id and tool.id not in {
-            row.id
-            for row in visible_tool_rows(self.db, tenant_id, agent_id, include_inactive=False)
-        }:
-            return self._error(tool.name, "NOT_ALLOWED", "当前员工未启用该工具。")
-        if (
-            active_skill_id
-            and tool.allowed_skills_json
-            and active_skill_id not in tool.allowed_skills_json
-            and not tool.required_permission_code
-        ):
-            return self._error(tool.name, "NOT_ALLOWED", "当前技能不允许调用该工具。")
-
-        authorization: AgentExecutionDecision | None = None
-        if tool.required_permission_code:
-            try:
-                authorization = self.agent_authorizer.authorize(
-                    tenant_id=tenant_id,
-                    agent_id=agent_id,
-                    actor_user_id=actor_user_id,
-                    active_skill_id=active_skill_id,
-                    allowed_skill_ids=list(tool.allowed_skills_json or []),
-                    permission_code=tool.required_permission_code,
-                    authorization_mode=tool.permission_authorization_mode,
-                    organization_unit_id=execution_org_unit_id,
-                )
-            except AgentExecutionDenied as exc:
-                return self._error(tool.name, exc.code, exc.message)
+        if authorization_error is not None:
+            return authorization_error
+        if tool is None:
+            return self._error(tool_call.name, "NOT_FOUND", "工具不存在或未配置。")
 
         if (tool.tool_type or "http") == "mcp":
             result = self._execute_mcp_tool(
@@ -164,6 +136,40 @@ class ToolExecutor:
             return self._error(
                 tool.name, "UNSUPPORTED_TOOL_TYPE", f"不支持的工具类型：{tool.tool_type}"
             )
+
+        if before_http_dispatch is not None:
+            # 复制已读取的工具配置，防止commit过期ORM在网络阶段再次开启读事务。
+            # 回调仍使用原Runtime租约和实时授权；提交后才进入真正HTTP传输。
+            tool = Tool(**tool.model_dump())
+            before_http_dispatch()
+            self.db.commit()
+
+        try:
+            provider_contract = self._provider_task_contract(tool)
+        except ValueError as exc:
+            return self._with_authorization(
+                self._error(tool.name, "PROVIDER_CONTRACT_INVALID", str(exc)),
+                authorization,
+            )
+        if provider_contract is not None:
+            if not remote_idempotency_key:
+                return self._with_authorization(
+                    self._error(
+                        tool.name,
+                        "PROVIDER_IDEMPOTENCY_KEY_MISSING",
+                        "provider_task 外部写缺少持久远端幂等键。",
+                    ),
+                    authorization,
+                )
+            result = self._execute_provider_task(
+                tool,
+                tool_call.arguments,
+                provider_contract,
+                remote_idempotency_key=remote_idempotency_key,
+                is_cancelled=is_cancelled,
+            )
+            raise_if_cancelled(is_cancelled)
+            return self._with_authorization(result, authorization)
 
         tool_url = self._normalize_tool_url(tool.url)
         headers = self._request_headers(
@@ -244,6 +250,248 @@ class ToolExecutor:
             return self._with_authorization(
                 self._error(tool.name, "EXECUTION_ERROR", str(exc)), authorization
             )
+
+    @staticmethod
+    def _provider_task_contract(tool: Tool) -> ToolReliabilityContract | None:
+        """读取已发布的 provider_task 合同；无效发布不得猜测为同步语义。"""
+
+        raw = tool.reliability_contract_json
+        if not isinstance(raw, dict) or not raw:
+            return None
+        if raw.get("async_strategy") != "provider_task":
+            return None
+        try:
+            contract = ToolReliabilityContract.model_validate(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("已发布的 provider_task 合同无效。") from exc
+        return contract
+
+    def _execute_provider_task(
+        self,
+        tool: Tool,
+        arguments: dict[str, Any],
+        contract: ToolReliabilityContract,
+        *,
+        remote_idempotency_key: str,
+        is_cancelled: Callable[[], bool] | None,
+    ) -> ToolResult:
+        """提交一次显式 provider task，并把受理与业务完成翻译为不同 disposition。"""
+
+        tool_url = self._normalize_tool_url(tool.url)
+        headers = self._request_headers(
+            tool_url,
+            self._resolve_headers(tool.headers_json or {}, tool.auth_json or {}),
+        )
+        headers = {
+            key: value
+            for key, value in headers.items()
+            if key.lower() != "idempotency-key"
+        }
+        headers["Idempotency-Key"] = remote_idempotency_key
+        headers["X-Gongge-Xuban-External-Submission-Id"] = remote_idempotency_key
+        headers["X-Gongge-Xuban-External-Task-Token"] = external_task_callback_token(
+            remote_idempotency_key
+        )
+        try:
+            allowed_hosts = allowed_hosts_from_settings(self.settings)
+            with httpx.Client(
+                timeout=self.settings.tool_timeout_seconds,
+                follow_redirects=False,
+            ) as client:
+
+                def request_http() -> httpx.Response:
+                    """校验并固定 provider 提交地址后执行一次网络请求。"""
+
+                    target = prepare_outbound_request(
+                        tool_url,
+                        allowed_hosts=allowed_hosts,
+                    )
+                    return client.request(
+                        tool.method.upper(),
+                        target.request_url,
+                        headers={**headers, **target.headers},
+                        json=arguments,
+                        **({"extensions": target.extensions} if target.extensions else {}),
+                    )
+
+                response = run_cancellable(
+                    request_http,
+                    is_cancelled,
+                    on_cancel=lambda: _best_effort_close_http_client(client),
+                )
+                raise_if_cancelled(is_cancelled)
+                response.raise_for_status()
+                payload = response.json()
+        except httpx.TimeoutException:
+            return self._error(tool.name, "TIMEOUT", "provider task 提交超时。")
+        except OutboundTargetError as exc:
+            return self._error(tool.name, "OUTBOUND_TARGET_BLOCKED", str(exc))
+        except httpx.HTTPStatusError as exc:
+            return self._error(
+                tool.name,
+                "HTTP_ERROR",
+                f"工具返回异常状态码：{exc.response.status_code}",
+            )
+        except TurnCancellationRequested:
+            raise
+        except Exception as exc:
+            return self._error(tool.name, "EXECUTION_ERROR", str(exc))
+
+        if not isinstance(payload, dict):
+            return self._error(tool.name, "PROVIDER_RESPONSE_INVALID", "provider task 回执必须是 JSON 对象。")
+        task_id = self._json_path(payload, contract.task_id_field)
+        raw_status = self._json_path(payload, contract.status_field)
+        mapped_status = contract.status_mapping.get(str(raw_status), raw_status)
+        status = str(mapped_status or ("accepted" if response.status_code == 202 else "completed")).lower()
+        result_value = self._json_path(payload, contract.result_field)
+        data = dict(payload)
+        data.update(
+            {
+                "provider_task_id": str(task_id) if task_id is not None else None,
+                "provider_status": status,
+            }
+        )
+        if result_value is not None:
+            data["result"] = result_value
+        terminal_success = {"completed", "succeeded", "success"}
+        terminal_uncertain = {"failed", "cancelled", "canceled", "expired"}
+        if task_id is None and status not in terminal_success:
+            return ToolResult(
+                tool_name=tool.name,
+                success=False,
+                data=data,
+                disposition="failed",
+                error=ToolError(
+                    code="PROVIDER_TASK_ID_MISSING",
+                    message="provider 已受理异步任务但没有返回任务身份。",
+                ),
+            )
+        if status in terminal_success:
+            return ToolResult(
+                tool_name=tool.name,
+                success=True,
+                data=data,
+                disposition="completed",
+            )
+        if status in terminal_uncertain:
+            return ToolResult(
+                tool_name=tool.name,
+                success=False,
+                data=data,
+                disposition="unknown",
+                error=ToolError(
+                    code="PROVIDER_OUTCOME_REQUIRES_RECONCILIATION",
+                    message="provider 已返回非成功终态，但外部效果仍需对账。",
+                ),
+            )
+        if task_id is None:
+            return self._error(tool.name, "PROVIDER_RESPONSE_INVALID", "provider task 缺少任务身份。")
+        return ToolResult(
+            tool_name=tool.name,
+            success=False,
+            data=data,
+            disposition="accepted",
+            error=ToolError(
+                code="EXTERNAL_TASK_ACCEPTED",
+                message="外部任务已受理，业务结果尚未完成。",
+            ),
+        )
+
+    @staticmethod
+    def _json_path(value: Any, path: str) -> Any:
+        """按发布合同读取点号路径，避免 provider 字段解析依赖可变业务参数。"""
+
+        current = value
+        for part in (item for item in path.split(".") if item):
+            if not isinstance(current, dict):
+                return None
+            current = current.get(part)
+        return current
+
+    def authorize(
+        self,
+        tenant_id: str,
+        tool_call: ToolCall,
+        active_skill_id: str | None = None,
+        agent_id: str | None = None,
+        actor_user_id: str | None = None,
+        execution_org_unit_id: str | None = None,
+        remote_idempotency_key: str | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
+    ) -> ToolResult | None:
+        """只执行真实派发前的当前授权检查，供已持久回执复用前重新核验。"""
+
+        raise_if_cancelled(is_cancelled)
+        if tool_call.name == SKILL_PROPOSAL_TOOL_NAME:
+            return None
+        _tool, _authorization, authorization_error = self._authorize_tool(
+            tenant_id=tenant_id,
+            tool_call=tool_call,
+            active_skill_id=active_skill_id,
+            agent_id=agent_id,
+            actor_user_id=actor_user_id,
+            execution_org_unit_id=execution_org_unit_id,
+            remote_idempotency_key=remote_idempotency_key,
+        )
+        return authorization_error
+
+    def _authorize_tool(
+        self,
+        *,
+        tenant_id: str,
+        tool_call: ToolCall,
+        active_skill_id: str | None,
+        agent_id: str | None,
+        actor_user_id: str | None,
+        execution_org_unit_id: str | None,
+        remote_idempotency_key: str | None,
+    ) -> tuple[Tool | None, AgentExecutionDecision | None, ToolResult | None]:
+        """集中执行工具状态、员工可见性、技能白名单和组织权限检查。"""
+
+        with self.db.no_autoflush:
+            tool = self.db.exec(
+                select(Tool).where(Tool.tenant_id == tenant_id, Tool.name == tool_call.name)
+            ).first()
+        if not tool:
+            return None, None, self._error(tool_call.name, "NOT_FOUND", "工具不存在或未配置。")
+        if not tool.enabled:
+            return tool, None, self._error(tool.name, "DISABLED", "工具当前未启用。")
+        destructive_error = self._validate_destructive_dispatch(
+            tool,
+            tool_call.arguments,
+            remote_idempotency_key=remote_idempotency_key,
+        )
+        if destructive_error is not None:
+            return tool, None, destructive_error
+        if agent_id and tool.id not in {
+            row.id
+            for row in visible_tool_rows(self.db, tenant_id, agent_id, include_inactive=False)
+        }:
+            return tool, None, self._error(tool.name, "NOT_ALLOWED", "当前员工未启用该工具。")
+        if (
+            active_skill_id
+            and tool.allowed_skills_json
+            and active_skill_id not in tool.allowed_skills_json
+            and not tool.required_permission_code
+        ):
+            return tool, None, self._error(tool.name, "NOT_ALLOWED", "当前技能不允许调用该工具。")
+
+        authorization: AgentExecutionDecision | None = None
+        if tool.required_permission_code:
+            try:
+                authorization = self.agent_authorizer.authorize(
+                    tenant_id=tenant_id,
+                    agent_id=agent_id,
+                    actor_user_id=actor_user_id,
+                    active_skill_id=active_skill_id,
+                    allowed_skill_ids=list(tool.allowed_skills_json or []),
+                    permission_code=tool.required_permission_code,
+                    authorization_mode=tool.permission_authorization_mode,
+                    organization_unit_id=execution_org_unit_id,
+                )
+            except AgentExecutionDenied as exc:
+                return tool, None, self._error(tool.name, exc.code, exc.message)
+        return tool, authorization, None
 
     def _execute_managed_workspace(
         self,
@@ -440,7 +688,12 @@ class ToolExecutor:
         try:
             contract = ToolReliabilityContract.model_validate(raw_contract)
         except (TypeError, ValueError):
-            return self._error(tool.name, "DESTRUCTIVE_CONTRACT_INVALID", "破坏性工具契约无效。")
+            error_code = (
+                "PROVIDER_CONTRACT_INVALID"
+                if raw_contract.get("async_strategy") == "provider_task"
+                else "DESTRUCTIVE_CONTRACT_INVALID"
+            )
+            return self._error(tool.name, error_code, "工具可靠性契约无效。")
         if contract.risk_class != "destructive":
             return None
         if not contract.destructive_dynamic_task_enabled:

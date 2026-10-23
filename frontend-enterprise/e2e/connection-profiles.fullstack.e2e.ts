@@ -138,14 +138,19 @@ test('真实 Chromium 配置企业微信入站路由并从安全事件授权用�
   await expect(card).toBeVisible();
   await card.getByRole('button', { name: 'Agent 绑定' }).click();
   const bindingDialog = page.getByRole('dialog', { name: '数字员工绑定' });
-  const actionResponse = page.waitForResponse((response) => (
-    new URL(response.url()).pathname.endsWith('/actions')
-    && response.request().method() === 'POST'
-  ));
-  await bindingDialog.getByRole('switch', { name: 'E2E 数字员工审批后发送' }).click();
-  const action = await actionResponse;
-  expect(action.status()).toBe(200);
-  expect((await action.json()).allowed_actions).toEqual(['wecom.message_send']);
+  const writeSwitch = bindingDialog.getByRole('switch', { name: 'E2E 数字员工审批后发送' });
+  // 启动夹具同时为动态外部写回归准备了该权限；只有未授权时才模拟本页的开启动作。
+  if ((await writeSwitch.getAttribute('aria-checked')) !== 'true') {
+    const actionResponse = page.waitForResponse((response) => (
+      new URL(response.url()).pathname.endsWith('/actions')
+      && response.request().method() === 'POST'
+    ));
+    await writeSwitch.click();
+    const action = await actionResponse;
+    expect(action.status()).toBe(200);
+    expect((await action.json()).allowed_actions).toEqual(['wecom.message_send']);
+  }
+  await expect(writeSwitch).toHaveAttribute('aria-checked', 'true');
   await bindingDialog.getByRole('button', { name: '关闭' }).click();
 
   await card.getByRole('button', { name: '消息接入' }).click();

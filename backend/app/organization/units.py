@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from app.db.models import OrganizationUnit, Tenant, utc_now
@@ -60,8 +61,20 @@ def ensure_organization_foundation(db: Session, tenant_id: str) -> OrganizationU
         root_tenant_id=tenant_id,
         status="active",
     )
-    db.add(root)
-    db.flush()
+    try:
+        with db.begin_nested():
+            db.add(root)
+            db.flush()
+    except IntegrityError:
+        existing = db.exec(
+            select(OrganizationUnit).where(
+                OrganizationUnit.tenant_id == tenant_id,
+                OrganizationUnit.is_root.is_(True),
+            ).with_for_update()
+        ).first()
+        if existing is None:
+            raise
+        return existing
     return root
 
 

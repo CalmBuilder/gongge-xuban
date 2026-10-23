@@ -8,12 +8,15 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 import re
+from types import SimpleNamespace
 
 import pytest
 import app.dynamic_tasks.planner_service as planner_service
 
 from app.dynamic_tasks.capability_catalog import CapabilitySnapshot, capability_checksum
+from app.core.time_context import freeze_time_context
 from app.dynamic_tasks.planner_service import (
     DynamicTaskPlanner,
     DynamicTaskPlannerError,
@@ -31,6 +34,7 @@ from app.dynamic_tasks.planner_service import (
     _validate_clarification_semantics,
     _validate_guidance_step_alignment,
 )
+from app.llm.client import LLMClient
 from app.dynamic_tasks.planning import (
     DynamicPlanDraft,
     NormalizedPlan,
@@ -210,6 +214,63 @@ def test_guidance_selector_discloses_catalog_only_and_rejects_user_only() -> Non
     assert user_only_client.payload is None
 
 
+def test_guidance_selector_actual_sdk_request_contains_time_contract() -> None:
+    """DTA 运行中 selector 的真实 SDK 消息必须携带持久时间合同。"""
+
+    captured: dict[str, object] = {}
+
+    class _Completions:
+        """只捕获兼容 SDK 的 messages，不建立网络连接。"""
+
+        def create(self, **kwargs: object) -> SimpleNamespace:
+            """保存 selector 的 SDK 参数并返回空选择。"""
+
+            captured.update(kwargs)
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content='{"selected_skill_names":[],"reason":"无需指导"}'
+                        )
+                    )
+                ]
+            )
+
+    context = freeze_time_context(
+        source_input_id="execution_selector_sdk",
+        client_timezone="Asia/Shanghai",
+        anchor_at_utc=datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC),
+        timezone_source="scheduled_task",
+    )
+    client = object.__new__(LLMClient)
+    client.client = SimpleNamespace(chat=SimpleNamespace(completions=_Completions()))
+    client.model = "synthetic-selector-time"
+    client.temperature = 0.0
+    client.max_output_tokens = 1024
+    planner = DynamicTaskPlanner(client)
+
+    planner.select_guidance_skills(
+        goal="查询明天安排",
+        success_criteria=(
+            SuccessCriterion(id="done", type="assertion", spec={"required": True}),
+        ),
+        catalog=(_guidance_snapshot(),),
+        time_context=context,
+    )
+    messages_text = str(captured["messages"])
+
+    for field in (
+        "schema_version",
+        "source_input_id",
+        "anchor_at_utc",
+        "timezone",
+        "timezone_source",
+        "local_at",
+    ):
+        assert field in messages_text
+    assert context["source_input_id"] in messages_text
+
+
 def test_planner_collapses_answer_only_sections_into_single_terminal_step() -> None:
     """纯文本章节不创造多个终态，含任何能力步骤的计划仍不适用此修复。"""
 
@@ -224,6 +285,47 @@ def test_planner_collapses_answer_only_sections_into_single_terminal_step() -> N
     assert plan.steps[0].kind == "answer"
     assert plan.steps[0].required is True
     assert plan.steps[0].depends_on == ()
+
+
+def test_planner_repair_payload_keeps_the_frozen_input_time() -> None:
+    """规划首轮失败进入 repair 时，所有模型请求仍复用同一时间事实。"""
+
+    class _RepairClient:
+        """首轮返回非法草案并记录每轮规划 payload。"""
+
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        def generate_json(self, _system_prompt: str, user_payload: dict) -> dict:
+            """记录请求并在修复轮返回最小合法 answer 计划。"""
+
+            self.calls.append(user_payload)
+            if len(self.calls) == 1:
+                return {"goal": "形成结论", "success_criteria": user_payload["success_criteria"]}
+            return {
+                "goal": "形成结论",
+                "success_criteria": user_payload["success_criteria"],
+                "steps": [{"draft_id": "answer", "title": "形成结论", "kind": "answer"}],
+            }
+
+    context = freeze_time_context(
+        source_input_id="message_planner",
+        client_timezone="Asia/Shanghai",
+        anchor_at_utc=datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC),
+    )
+    client = _RepairClient()
+    plan = DynamicTaskPlanner(client).create_plan(
+        goal="形成结论",
+        success_criteria=(
+            SuccessCriterion(id="ready", type="assertion", spec={"required": True}),
+        ),
+        capabilities=(),
+        time_context=context,
+    )
+
+    assert plan.steps[0].kind == "answer"
+    assert len(client.calls) == 2
+    assert all(item["time_context"] == context for item in client.calls)
 
 
 def test_repair_terminal_answer_steps_preserves_required_predecessors() -> None:

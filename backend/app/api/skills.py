@@ -12,13 +12,15 @@ import base64
 import json
 import re
 import zipfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from typing import Annotated, TypeVar
 from io import BytesIO
 from time import sleep
 from xml.etree import ElementTree
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
+from sqlalchemy.exc import SQLAlchemyError
 from sqlmodel import Session, select
 
 from app.agents.branching import (
@@ -31,6 +33,7 @@ from app.agents.branching import (
     is_open_gallery_resource,
     mark_resource_open_gallery,
     project_skill_with_branch,
+    publish_branch_version,
     require_overall_agent,
     rollback_branch,
     update_branch_skill,
@@ -39,19 +42,21 @@ from app.agents.branching import (
     visible_skill_rows,
 )
 from app.async_jobs import enqueue_async_job
+from app.skills.publication import (
+    compile_skill_for_publication as _compile_skill_for_publication,
+    sync_skill_tool_bindings as _sync_skill_tool_bindings,
+    validate_participant_references_for_publication as _validate_participant_references_for_publication,
+    publish_skill_head,
+)
 from app.db import get_session
 from app.db.models import (
     AgentEvent,
     AgentResourceBinding,
     AgentSkillBranchVersion,
-    BusinessRole,
     ModelConfig,
-    OrganizationUnit,
-    PermissionDefinition,
     Skill,
     SkillFeedback,
     SkillVersion,
-    Tool,
     User,
     utc_now,
 )
@@ -64,7 +69,22 @@ from app.security.permissions import (
 )
 from app.security.tenant import ensure_tenant
 from app.skills import SkillDistiller, SkillEditor
-from app.skills.generation_safety import sanitize_generation_schema, sanitize_generation_text
+from app.skills import candidates as feedback_candidates
+from app.skills.candidate_rewrite import (
+    MODEL_FAILURE,
+    PreparedCandidateRewrite,
+    candidate_guard,
+    cancel_candidate_rewrite,
+    prepare_candidate_rewrite,
+    rewrite_candidate,
+    settle_candidate_rewrite,
+)
+from app.skills.candidate_schema import (
+    CandidateActionRequest, CandidateCreateRequest, CandidatePublishReceipt,
+    CandidatePublishRequest, CandidateResetRead, CandidateResetRequest,
+    CandidateSaveRequest, SkillCandidateRead, SkillEditorContextRead,
+)
+from app.skills.edit_context import start_skill_write
 from app.skills.skill_schema import (
     SkillCard,
     SkillCreateRequest,
@@ -79,18 +99,11 @@ from app.skills.skill_schema import (
     SkillUpdateRequest,
 )
 from app.skills.stream_jobs import SkillStreamEvent, SkillStreamJob, stream_jobs
+from app.skills.read import skill_read, stats_for as _stats_for, stats_key as _stats_key
+from app.skills.generation_safety import tool_generation_payload as _tool_generation_payload
 from app.skills.step_ids import skill_card_with_unique_step_ids
 from app.sop_runtime import (
-    DEFAULT_CAPABILITY_REGISTRY,
     CompiledSopDefinition,
-    SopCompilationError,
-    compile_legacy_skill_card,
-)
-from app.sop_runtime.definition import (
-    CollectInputNode,
-    HumanTaskKind,
-    HumanTaskNode,
-    ParticipantScopeResolver,
 )
 from app.sop_runtime.versioning import (
     PublishedVersionConflictError,
@@ -103,188 +116,6 @@ router = APIRouter(
     tags=["enterprise:skills"],
     dependencies=[Depends(get_current_user)],
 )
-
-
-def _compile_skill_for_publication(
-    content: SkillCard | dict[str, object],
-) -> CompiledSopDefinition:
-    """在写入 published 状态前编译定义，并转换为可修复的 HTTP 诊断。"""
-
-    try:
-        compiled_definition = compile_legacy_skill_card(content)
-    except SopCompilationError as exc:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "code": exc.code,
-                "diagnostics": [
-                    diagnostic.model_dump(mode="json") for diagnostic in exc.diagnostics
-                ],
-            },
-        ) from exc
-    execution_mode = (
-        content.execution_mode if isinstance(content, SkillCard) else content.get("execution_mode")
-    )
-    unsupported = DEFAULT_CAPABILITY_REGISTRY.non_executable_nodes(compiled_definition)
-    if execution_mode == "deterministic" and unsupported:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "code": "CAPABILITY_NOT_EXECUTABLE",
-                "nodes": [
-                    {"node_id": node_id, "capability": capability}
-                    for node_id, capability in unsupported
-                ],
-            },
-        )
-    return compiled_definition
-
-
-def _validate_participant_references_for_publication(
-    db: Session,
-    tenant_id: str,
-    compiled_definition: CompiledSopDefinition,
-) -> None:
-    """发布前校验结构化参与角色和动作权限均来自当前有效目录。"""
-
-    referenced_role_codes = {
-        role_code
-        for node in compiled_definition.nodes
-        if isinstance(node, HumanTaskNode)
-        and node.config.kind is HumanTaskKind.STRUCTURED_WORK_ITEM
-        for role_code in node.config.candidate_role_codes
-    }
-    if referenced_role_codes:
-        active_roles = db.exec(
-            select(BusinessRole).where(
-                BusinessRole.tenant_id == tenant_id,
-                BusinessRole.role_code.in_(tuple(sorted(referenced_role_codes))),
-                BusinessRole.role_kind == "business",
-                BusinessRole.status == "active",
-            )
-        ).all()
-        missing_role_codes = sorted(
-            referenced_role_codes - {role.role_code for role in active_roles}
-        )
-        if missing_role_codes:
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "code": "PARTICIPANT_ROLE_NOT_FOUND",
-                    "message": "结构化人工任务引用了不存在或已停用的公司业务角色。",
-                    "role_codes": missing_role_codes,
-                },
-            )
-
-    explicit_org_unit_ids = {
-        node.config.participant_scope_org_unit_id
-        for node in compiled_definition.nodes
-        if isinstance(node, HumanTaskNode)
-        and node.config.kind is HumanTaskKind.STRUCTURED_WORK_ITEM
-        and node.config.participant_scope_resolver is ParticipantScopeResolver.EXPLICIT_ORG
-        and node.config.participant_scope_org_unit_id
-    }
-    if explicit_org_unit_ids:
-        active_org_units = db.exec(
-            select(OrganizationUnit).where(
-                OrganizationUnit.tenant_id == tenant_id,
-                OrganizationUnit.id.in_(tuple(sorted(explicit_org_unit_ids))),
-                OrganizationUnit.status == "active",
-            )
-        ).all()
-        missing_org_unit_ids = sorted(
-            explicit_org_unit_ids - {organization.id for organization in active_org_units}
-        )
-        if missing_org_unit_ids:
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "code": "PARTICIPANT_ORG_NOT_FOUND",
-                    "message": "结构化人工任务引用了不存在、停用或跨租户的组织。",
-                    "org_unit_ids": missing_org_unit_ids,
-                },
-            )
-
-    referenced_permission_codes: set[str] = set()
-    for node in compiled_definition.nodes:
-        if isinstance(node, HumanTaskNode):
-            referenced_permission_codes.update(node.config.action_permissions.values())
-        elif isinstance(node, CollectInputNode):
-            referenced_permission_codes.update(
-                binding.required_override_permission
-                for binding in node.config.input_bindings.values()
-                if binding.required_override_permission
-            )
-    if not referenced_permission_codes:
-        return
-    active_permissions = db.exec(
-        select(PermissionDefinition).where(
-            PermissionDefinition.tenant_id == tenant_id,
-            PermissionDefinition.permission_code.in_(tuple(sorted(referenced_permission_codes))),
-            PermissionDefinition.status == "active",
-        )
-    ).all()
-    missing_permission_codes = sorted(
-        referenced_permission_codes
-        - {permission.permission_code for permission in active_permissions}
-    )
-    if missing_permission_codes:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "code": "ACTION_PERMISSION_NOT_FOUND",
-                "message": "SOP 引用了不存在或已停用的业务权限点。",
-                "permission_codes": missing_permission_codes,
-            },
-        )
-
-
-def skill_read(
-    row: Skill,
-    stats: dict[str, dict[str, float | int]] | None = None,
-    recent_stats: dict[str, dict[str, object]] | None = None,
-) -> SkillRead:
-    all_stats = stats or {}
-    skill_stats = _stats_for(all_stats, row.skill_id, row.version)
-    total_stats = all_stats.get(row.skill_id, {})
-    recent_skill_stats = (recent_stats or {}).get(row.skill_id, {})
-    content, _warnings = skill_card_with_unique_step_ids(SkillCard.model_validate(row.content_json))
-    branch_meta = getattr(row, "agent_branch_meta", {}) or {}
-    return SkillRead(
-        id=row.id,
-        tenant_id=row.tenant_id,
-        skill_id=row.skill_id,
-        version=row.version,
-        name=row.name,
-        business_domain=row.business_domain,
-        description=row.description,
-        content=content,
-        status=row.status,
-        call_count=int(skill_stats.get("call_count", 0)),
-        positive_feedback_count=int(skill_stats.get("positive_feedback_count", 0)),
-        negative_feedback_count=int(skill_stats.get("negative_feedback_count", 0)),
-        positive_rate=float(skill_stats.get("positive_rate", 0.0)),
-        negative_rate=float(skill_stats.get("negative_rate", 0.0)),
-        total_call_count=int(total_stats.get("call_count", 0)),
-        total_positive_feedback_count=int(total_stats.get("positive_feedback_count", 0)),
-        total_negative_feedback_count=int(total_stats.get("negative_feedback_count", 0)),
-        total_positive_rate=float(total_stats.get("positive_rate", 0.0)),
-        total_negative_rate=float(total_stats.get("negative_rate", 0.0)),
-        recent_versions=list(recent_skill_stats.get("recent_versions", [])),
-        recent_call_count=int(recent_skill_stats.get("call_count", 0)),
-        recent_positive_feedback_count=int(recent_skill_stats.get("positive_feedback_count", 0)),
-        recent_negative_feedback_count=int(recent_skill_stats.get("negative_feedback_count", 0)),
-        recent_positive_rate=float(recent_skill_stats.get("positive_rate", 0.0)),
-        recent_negative_rate=float(recent_skill_stats.get("negative_rate", 0.0)),
-        agent_id=branch_meta.get("agent_id"),
-        branch_status=branch_meta.get("status"),
-        branch_sync_state=branch_meta.get("sync_state"),
-        branch_base_version=branch_meta.get("base_version"),
-        branch_head_version=branch_meta.get("head_version"),
-        metadata=dict(branch_meta.get("metadata") or {}),
-        created_at=row.created_at.isoformat(),
-        updated_at=row.updated_at.isoformat(),
-    )
 
 
 def skill_version_read(
@@ -315,12 +146,25 @@ def skill_version_read(
         source_schema_version=row.source_schema_version,
         published_at=row.published_at.isoformat() if row.published_at else None,
         derived_from_version_id=row.derived_from_version_id,
+        runtime_version_id=row.id if row.status == "published" else None,
+        scope_agent_id=row.scope_agent_id,
         created_at=row.created_at.isoformat(),
         updated_at=row.updated_at.isoformat(),
     )
 
 
-def _branch_version_read(row: AgentSkillBranchVersion) -> SkillVersionRead:
+def _branch_version_read(row: AgentSkillBranchVersion, db: Session) -> SkillVersionRead:
+    """管理历史ID保持原含义，真实发布身份必须由同范围且相同正文的快照证明。"""
+
+    publication = db.exec(select(SkillVersion).where(
+        SkillVersion.tenant_id == row.tenant_id,
+        SkillVersion.skill_id == row.skill_id,
+        SkillVersion.scope_agent_id == row.agent_id,
+        SkillVersion.version == row.version,
+        SkillVersion.status == "published",
+    )).first()
+    if publication and publication.content_json != row.content_json:
+        publication = None
     content, _warnings = skill_card_with_unique_step_ids(SkillCard.model_validate(row.content_json))
     return SkillVersionRead(
         id=row.id,
@@ -340,9 +184,86 @@ def _branch_version_read(row: AgentSkillBranchVersion) -> SkillVersionRead:
         agent_id=row.agent_id,
         branch_sync_state=row.sync_state,
         branch_base_version=row.base_version,
+        runtime_version_id=publication.id if publication else None,
+        scope_agent_id=row.agent_id,
+        content_checksum=publication.content_checksum if publication else None,
+        compiled_definition_checksum=publication.compiled_definition_checksum if publication else None,
         created_at=row.created_at.isoformat(),
         updated_at=row.updated_at.isoformat(),
     )
+
+
+CandidateResult = TypeVar("CandidateResult")
+
+
+def _candidate_transaction(db: Session, operation: Callable[[], CandidateResult]) -> CandidateResult:
+    """候选编辑/读取释放短屏障；任何失败回滚全部未提交对象和关联。"""
+    try:
+        result = operation()
+        db.commit()
+        return result
+    except HTTPException:
+        db.rollback()
+        raise
+    except SQLAlchemyError as error:
+        db.rollback()
+        raise HTTPException(409, "FEEDBACK_CANDIDATE_WRITE_CONFLICT") from error
+
+
+@router.post("/feedback-candidates", response_model=SkillCandidateRead)
+def create_feedback_candidate(request: CandidateCreateRequest,
+    db: Session = Depends(get_session), current_user: User = Depends(get_current_user),
+) -> SkillCandidateRead:
+    """有效本人分享进入隔离候选；基础由服务端沿原范围解析。"""
+    return _candidate_transaction(db, lambda: feedback_candidates.create_candidate(db, request, current_user))
+
+
+@router.get("/feedback-candidates/editor-context", response_model=SkillEditorContextRead)
+def get_feedback_editor_context(tenant_id: str = Query(...),
+    db: Session = Depends(get_session), current_user: User = Depends(get_current_user),
+) -> SkillEditorContextRead:
+    """刷新读取当前操作者的唯一编辑关联，不信任缓存候选正文。"""
+    return _candidate_transaction(db, lambda: feedback_candidates.editor_context(db, tenant_id, current_user))
+
+
+@router.get("/feedback-candidates/{candidate_id}", response_model=SkillCandidateRead)
+def get_feedback_candidate(candidate_id: str, tenant_id: str = Query(...),
+    db: Session = Depends(get_session), current_user: User = Depends(get_current_user),
+) -> SkillCandidateRead:
+    """读取时重新核验来源/权限/base，失效正文不返回。"""
+    return _candidate_transaction(db, lambda: feedback_candidates.get_candidate(db, candidate_id, tenant_id, current_user))
+
+
+@router.put("/feedback-candidates/{candidate_id}", response_model=SkillCandidateRead)
+def save_feedback_candidate(candidate_id: str, request: CandidateSaveRequest,
+    db: Session = Depends(get_session), current_user: User = Depends(get_current_user),
+) -> SkillCandidateRead:
+    """人工保存只更新候选，不改原Skill活动头和不可变发布。"""
+    return _candidate_transaction(db, lambda: feedback_candidates.save_candidate(db, candidate_id, request, current_user))
+
+
+@router.post("/feedback-candidates/{candidate_id}/reject", response_model=SkillCandidateRead)
+def reject_feedback_candidate(candidate_id: str, request: CandidateActionRequest,
+    db: Session = Depends(get_session), current_user: User = Depends(get_current_user),
+) -> SkillCandidateRead:
+    """拒绝终止候选生成与确认，保留关联拒绝旧迟到普通保存。"""
+    return _candidate_transaction(db, lambda: feedback_candidates.reject_candidate(db, candidate_id, request, current_user))
+
+
+@router.post("/feedback-candidates/{candidate_id}/reset", response_model=CandidateResetRead)
+def reset_feedback_candidate(candidate_id: str, request: CandidateResetRequest,
+    db: Session = Depends(get_session), current_user: User = Depends(get_current_user),
+) -> CandidateResetRead:
+    """明确重载所选范围原内容并签发新普通身份，撤回不阻安全退出。"""
+    return _candidate_transaction(db, lambda: feedback_candidates.reset_candidate(db, candidate_id, request, current_user))
+
+
+@router.post("/feedback-candidates/{candidate_id}/publish", response_model=CandidatePublishReceipt)
+def publish_feedback_candidate(candidate_id: str, request: CandidatePublishRequest,
+    db: Session = Depends(get_session), current_user: User = Depends(get_current_user),
+) -> CandidatePublishReceipt:
+    """人工确认复用原发布职责和同事务回执，重复同参不生成第二发布。"""
+    return feedback_candidates.publish_candidate(db, candidate_id, request, current_user)
 
 
 @router.get("", response_model=list[SkillRead], dependencies=[Depends(require_agent_scope_viewer)])
@@ -364,9 +285,13 @@ def create_skill(
     agent_id: str | None = None,
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
+    editor_context: Annotated[str | None, Header(alias="X-Skill-Editor-Context")] = None,
 ) -> SkillRead:
     """创建指定租户的 SOP，并在直接发布时执行统一定义编译。"""
+    current_user = start_skill_write(db, request.tenant_id, current_user, agent_id, editor_context)
 
+    if request.feedback_candidate_id is not None:
+        raise HTTPException(409, "FEEDBACK_CANDIDATE_USE_ISOLATED_ENDPOINT")
     ensure_tenant(db, request.tenant_id)
     existing = db.exec(
         select(Skill).where(
@@ -426,7 +351,13 @@ def create_skill(
             binding_status,
             metadata_json=creator_metadata,
         )
-    _upsert_skill_version(db, row, compiled_definition=compiled_definition)
+    _upsert_skill_version(
+        db, project_skill_with_branch(row, branch) if branch else row,
+        compiled_definition=compiled_definition,
+        scope_agent_id=branch.agent_id if branch else "",
+    )
+    if branch and request.status == "published":
+        publish_branch_version(db, row, branch, compiled_definition=compiled_definition)
     db.commit()
     db.refresh(row)
     stats = _skill_stats(db, request.tenant_id)
@@ -456,11 +387,15 @@ def update_skill(
     agent_id: str | None = None,
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
+    editor_context: Annotated[str | None, Header(alias="X-Skill-Editor-Context")] = None,
 ) -> SkillRead:
     """更新整体或 Agent 分支 SOP，并阻止无效定义保持发布状态。"""
 
+    if request.feedback_candidate_id is not None:
+        raise HTTPException(409, "FEEDBACK_CANDIDATE_USE_ISOLATED_ENDPOINT")
     if request.content.skill_id != skill_id:
         raise HTTPException(status_code=400, detail="SOP skill_id cannot be modified")
+    current_user = start_skill_write(db, request.tenant_id, current_user, agent_id, editor_context)
     row = _get_skill(db, request.tenant_id, skill_id, for_update=True)
     normalized_content, _warnings = skill_card_with_unique_step_ids(request.content)
     agent = ensure_agent_scope_manager(db, request.tenant_id, agent_id, current_user)
@@ -530,39 +465,19 @@ def publish_skill(
     agent_id: str | None = None,
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
+    editor_context: Annotated[str | None, Header(alias="X-Skill-Editor-Context")] = None,
 ) -> SkillRead:
     """发布整体或 Agent 分支 SOP，并在变更状态前执行统一定义编译。"""
+    current_user = start_skill_write(db, tenant_id, current_user, agent_id, editor_context)
 
     row = _get_skill(db, tenant_id, skill_id, for_update=True)
     agent = ensure_agent_scope_manager(db, tenant_id, agent_id, current_user)
-    if agent and not agent.is_overall:
-        branch = ensure_agent_skill_branch(db, tenant_id, agent.id, row)
-        compiled_definition = _compile_skill_for_publication(branch.content_json)
-        _validate_participant_references_for_publication(db, tenant_id, compiled_definition)
-        branch.status = "active"
-        branch.updated_at = utc_now()
-        db.add(branch)
-        _sync_skill_tool_bindings(db, tenant_id, row.skill_id, branch.content_json)
-        ensure_private_resource_binding(db, tenant_id, agent.id, "skill", row.id, "active")
-        db.commit()
-        projected = project_skill_with_branch(row, branch, "active")
-        stats = _skill_stats(db, tenant_id)
-        return skill_read(projected, stats, _recent_skill_stats(db, tenant_id, stats))
-    ensure_open_gallery_admin(tenant_id, current_user)
-    compiled_definition = _compile_skill_for_publication(row.content_json)
-    _validate_participant_references_for_publication(db, tenant_id, compiled_definition)
-    row.status = "published"
-    _sync_skill_tool_bindings(db, tenant_id, row.skill_id, row.content_json)
-    mark_resource_open_gallery(row)
-    row.updated_at = utc_now()
-    db.add(row)
-    db.flush()
-    ensure_open_gallery_binding(db, tenant_id, "skill", row.id, "active")
-    _upsert_skill_version(db, row, compiled_definition=compiled_definition)
+    if agent is None or agent.is_overall:
+        ensure_open_gallery_admin(tenant_id, current_user)
+    published = publish_skill_head(db, row, agent)
     db.commit()
-    db.refresh(row)
     stats = _skill_stats(db, tenant_id)
-    return skill_read(row, stats, _recent_skill_stats(db, tenant_id, stats))
+    return skill_read(published, stats, _recent_skill_stats(db, tenant_id, stats))
 
 
 @router.post("/{skill_id}/archive", response_model=SkillRead)
@@ -572,7 +487,9 @@ def archive_skill(
     agent_id: str | None = None,
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
+    editor_context: Annotated[str | None, Header(alias="X-Skill-Editor-Context")] = None,
 ) -> SkillRead:
+    current_user = start_skill_write(db, tenant_id, current_user, agent_id, editor_context)
     row = _get_skill(db, tenant_id, skill_id, for_update=True)
     agent = ensure_agent_scope_manager(db, tenant_id, agent_id, current_user)
     if agent and not agent.is_overall:
@@ -604,7 +521,14 @@ def draft_skill(
     agent_id: str | None = None,
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
+    feedback_candidate_id: str | None = None,
+    editor_context: Annotated[str | None, Header(alias="X-Skill-Editor-Context")] = None,
 ) -> SkillRead:
+    """保留普通下架合同；反馈候选不得借该入口停用原活动版。"""
+    current_user = start_skill_write(db, tenant_id, current_user, agent_id, editor_context)
+
+    if feedback_candidate_id is not None:
+        raise HTTPException(409, "FEEDBACK_CANDIDATE_USE_ISOLATED_ENDPOINT")
     row = _get_skill(db, tenant_id, skill_id, for_update=True)
     agent = ensure_agent_scope_manager(db, tenant_id, agent_id, current_user)
     if agent and not agent.is_overall:
@@ -628,8 +552,10 @@ def delete_skill(
     db: Session = Depends(get_session),
     agent_id: str | None = None,
     current_user: User = Depends(get_current_user),
+    editor_context: Annotated[str | None, Header(alias="X-Skill-Editor-Context")] = None,
 ) -> dict[str, str]:
     """删除或隐藏 SOP 编辑头，但永久保留已发布版本快照供历史实例审计。"""
+    current_user = start_skill_write(db, tenant_id, current_user, agent_id, editor_context)
 
     row = _get_skill(db, tenant_id, skill_id, for_update=True)
     agent = ensure_agent_scope_manager(db, tenant_id, agent_id, current_user)
@@ -706,12 +632,13 @@ def list_skill_versions(
     agent = get_agent(db, tenant_id, agent_id)
     if agent and not agent.is_overall:
         rows = branch_versions(db, tenant_id, agent.id, skill_id)
-        return [_branch_version_read(row) for row in rows]
+        return [_branch_version_read(row, db) for row in rows]
     current_snapshot = db.exec(
         select(SkillVersion).where(
             SkillVersion.tenant_id == tenant_id,
             SkillVersion.skill_id == skill_id,
             SkillVersion.version == row.version,
+            SkillVersion.scope_agent_id == "",
         )
     ).first()
     if not current_snapshot:
@@ -722,7 +649,8 @@ def list_skill_versions(
         db.commit()
     rows = db.exec(
         select(SkillVersion)
-        .where(SkillVersion.tenant_id == tenant_id, SkillVersion.skill_id == skill_id)
+        .where(SkillVersion.tenant_id == tenant_id, SkillVersion.skill_id == skill_id,
+               SkillVersion.scope_agent_id == "")
         .order_by(SkillVersion.created_at.desc())
     ).all()
     stats = _skill_stats(db, tenant_id)
@@ -754,7 +682,7 @@ def get_skill_version(
         )
         if not row:
             raise HTTPException(status_code=404, detail="Skill version not found")
-        return _branch_version_read(row)
+        return _branch_version_read(row, db)
     row = _get_skill_version(db, tenant_id, skill_id, version)
     return skill_version_read(row, _skill_stats(db, tenant_id))
 
@@ -766,7 +694,9 @@ def delete_skill_version(
     tenant_id: str = Query(...),
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
+    editor_context: Annotated[str | None, Header(alias="X-Skill-Editor-Context")] = None,
 ) -> dict[str, str]:
+    current_user = start_skill_write(db, tenant_id, current_user, None, editor_context)
     skill = _get_skill(db, tenant_id, skill_id)
     ensure_open_gallery_admin(tenant_id, current_user)
     row = _get_skill_version(db, tenant_id, skill_id, version)
@@ -787,8 +717,10 @@ def rollback_skill_version(
     db: Session = Depends(get_session),
     agent_id: str | None = None,
     current_user: User = Depends(get_current_user),
+    editor_context: Annotated[str | None, Header(alias="X-Skill-Editor-Context")] = None,
 ) -> SkillRead:
     """从历史内容派生新的发布版本，保留旧快照并记录来源关系。"""
+    current_user = start_skill_write(db, tenant_id, current_user, agent_id, editor_context)
 
     agent = ensure_agent_scope_manager(db, tenant_id, agent_id, current_user)
     if agent and not agent.is_overall:
@@ -883,12 +815,18 @@ def rewrite_skill_stream(
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> StreamingResponse:
+    """原流式改写入口先冻结受管候选；普通入口也不能删除反馈关联旁路。"""
     if request.current_skill.skill_id != skill_id:
         raise HTTPException(
             status_code=400, detail="Path skill_id must match current_skill.skill_id"
         )
-    request = _prepare_skill_generation_request(db, request, current_user, skill_id=skill_id)
-    job_id = _start_rewrite_stream_job(skill_id, request, current_user)
+    if request.feedback_candidate_id:
+        prepared = prepare_candidate_rewrite(db, request, current_user, skill_id)
+        job_id = _start_rewrite_stream_job(skill_id, prepared.request, current_user, prepared)
+    else:
+        request = _prepare_skill_generation_request(db, request, current_user, skill_id=skill_id)
+        db.commit()
+        job_id = _start_rewrite_stream_job(skill_id, request, current_user)
     return StreamingResponse(_stream_skill_job(job_id), media_type="text/event-stream")
 
 
@@ -909,11 +847,18 @@ def create_rewrite_job(
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> dict[str, str]:
+    """原后台任务创建复用同一短准备事务，不在worker重新信任客户端来源。"""
     if request.current_skill.skill_id != skill_id:
         raise HTTPException(
             status_code=400, detail="Path skill_id must match current_skill.skill_id"
         )
+    if request.feedback_candidate_id:
+        prepared = prepare_candidate_rewrite(db, request, current_user, skill_id)
+        return {'job_id': _start_rewrite_stream_job(
+            skill_id, prepared.request, current_user, prepared,
+        )}
     request = _prepare_skill_generation_request(db, request, current_user, skill_id=skill_id)
+    db.commit()
     return {"job_id": _start_rewrite_stream_job(skill_id, request, current_user)}
 
 
@@ -922,6 +867,7 @@ def get_skill_stream_job(
     job_id: str,
     current_user: User = Depends(get_current_user),
 ) -> dict[str, object]:
+    """仅本人原任务元数据；反馈即使曾成功也重新验证当前来源和候选。"""
     job = _owned_stream_job(job_id, current_user)
     return {
         "job_id": job.id,
@@ -940,6 +886,7 @@ def stream_existing_skill_job(
     after_seq: int = Query(0),
     current_user: User = Depends(get_current_user),
 ) -> StreamingResponse:
+    """本人刷新续接先fresh验证，迭代中每个缓存事件再次复核。"""
     _owned_stream_job(job_id, current_user)
     return StreamingResponse(_stream_skill_job(job_id, after_seq), media_type="text/event-stream")
 
@@ -949,8 +896,13 @@ def cancel_skill_stream_job(
     job_id: str,
     current_user: User = Depends(get_current_user),
 ) -> dict[str, str]:
-    _owned_stream_job(job_id, current_user)
+    """本人请求停止原生成；受管任务取消后不能结算晚到响应。"""
+    job = _owned_stream_job(job_id, current_user)
+    if job.feedback_fence is not None:
+        cancel_candidate_rewrite(get_session_engine(), job.feedback_fence)
     stream_jobs.cancel(job_id)
+    if job.feedback_fence is not None:
+        stream_jobs.invalidate_feedback(job_id, 'FEEDBACK_CANDIDATE_GENERATION_CANCELLED')
     stream_jobs.append(job_id, "status", {"text": "已请求停止生成"})
     return {"status": "cancel_requested", "job_id": job_id}
 
@@ -962,13 +914,19 @@ def rewrite_skill(
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> SkillRewriteResponse:
+    """原同步改写；反馈分支先提交冻结事务，再由每次SDK守卫和候选结算承接。"""
     if request.current_skill.skill_id != skill_id:
         raise HTTPException(
             status_code=400, detail="Path skill_id must match current_skill.skill_id"
         )
+    if request.feedback_candidate_id:
+        prepared = prepare_candidate_rewrite(db, request, current_user, skill_id)
+        return rewrite_candidate(db.get_bind(), prepared)
     request = _prepare_skill_generation_request(db, request, current_user, skill_id=skill_id)
     model_config = _get_request_model(db, request.tenant_id, request.model_config_id)
     request = _with_available_tools_for_rewrite(db, request)
+    db.expunge(model_config)
+    db.commit()
     try:
         return SkillEditor().rewrite(request, model_config)
     except LLMError as exc:
@@ -976,10 +934,25 @@ def rewrite_skill(
 
 
 def _owned_stream_job(job_id: str, current_user: User) -> SkillStreamJob:
+    """保留本人/tenant隔离；受管缓存读取不得以历史成功免除当前授权。"""
     job = stream_jobs.get(job_id)
     if not job or job.tenant_id != current_user.tenant_id or job.user_id != current_user.id:
         raise HTTPException(status_code=404, detail="Job not found")
+    _check_feedback_job(job)
     return job
+
+
+def _check_feedback_job(job: SkillStreamJob) -> None:
+    """失效立即清除原缓存，只返回稳定错误，不转发旧模型内容或供应商异常。"""
+    job = stream_jobs.get(job.id) or job
+    if job.feedback_fence is None:
+        return
+    try:
+        candidate_guard(get_session_engine(), job.feedback_fence,
+                        lambda: stream_jobs.is_cancelled(job.id), allow_own_settlement=True)()
+    except HTTPException as error:
+        stream_jobs.invalidate_feedback(job.id, 'FEEDBACK_CANDIDATE_UNAVAILABLE')
+        raise HTTPException(error.status_code, 'FEEDBACK_CANDIDATE_UNAVAILABLE') from error
 
 
 def _start_distill_stream_job(request: SkillDistillRequest, current_user: User) -> str:
@@ -996,18 +969,23 @@ def _start_distill_stream_job(request: SkillDistillRequest, current_user: User) 
 
 
 def _start_rewrite_stream_job(
-    skill_id: str, request: SkillRewriteRequest, current_user: User
+    skill_id: str, request: SkillRewriteRequest, current_user: User,
+    prepared: PreparedCandidateRewrite | None = None,
 ) -> str:
+    """复用原队列；已准备候选只传脱离会话的输入及实际操作者fence。"""
     job = stream_jobs.create("skill.rewrite", request.tenant_id, current_user.id)
+    if prepared is not None:
+        stream_jobs.bind_feedback(job.id, prepared.fence)
     stream_jobs.append(
         job.id, "job_started", {"job_id": job.id, "name": job.name, "skill_id": skill_id}
     )
+    arguments = (job.id, skill_id, request.model_dump(mode='json'))
+    if prepared is not None:
+        arguments = (*arguments, prepared)
     enqueue_async_job(
         "skill.rewrite_stream",
         _run_rewrite_stream_job,
-        job.id,
-        skill_id,
-        request.model_dump(mode="json"),
+        *arguments,
         metadata={"tenant_id": request.tenant_id, "job_id": job.id, "skill_id": skill_id},
     )
     return job.id
@@ -1033,30 +1011,74 @@ def _run_distill_stream_job(job_id: str, request_data: dict[str, object]) -> Non
         stream_jobs.fail(job_id, str(exc))
 
 
-def _run_rewrite_stream_job(job_id: str, skill_id: str, request_data: dict[str, object]) -> None:
+def _run_rewrite_stream_job(
+    job_id: str, skill_id: str, request_data: dict[str, object],
+    prepared: PreparedCandidateRewrite | None = None,
+) -> None:
+    """原worker贯穿实际actor；受管每SDK/事件/结算与缓存均重新校验且无外呼事务。"""
     stream_jobs.start(job_id)
+    if prepared is not None:
+        _run_feedback_rewrite_stream_job(job_id, prepared)
+        return
     try:
         request = SkillRewriteRequest.model_validate(request_data)
         if request.current_skill.skill_id != skill_id:
             raise ValueError("Path skill_id must match current_skill.skill_id")
         with Session(get_session_engine()) as db:
-            request = _prepare_skill_generation_request(db, request, None, skill_id=skill_id)
+            job = stream_jobs.get(job_id)
+            actor = db.get(User, job.user_id) if job else None
+            if actor is None:
+                raise HTTPException(403, 'SKILL_ACTOR_UNAVAILABLE')
+            request = _prepare_skill_generation_request(db, request, actor, skill_id=skill_id)
             model_config = _get_request_model(db, request.tenant_id, request.model_config_id)
             enriched_request = _with_available_tools_for_rewrite(db, request)
-            stream_jobs.append(job_id, "status", {"text": "正在调用模型分析改写要求"})
-            for item in SkillEditor().stream_text(enriched_request, model_config):
-                if stream_jobs.is_cancelled(job_id):
-                    stream_jobs.append(job_id, "status", {"text": "已停止改写"})
-                    stream_jobs.complete(job_id)
-                    return
-                stream_jobs.append(job_id, str(item["event"]), dict(item["data"]))
+            db.expunge(model_config)
+            db.commit()
+        stream_jobs.append(job_id, "status", {"text": "正在调用模型分析改写要求"})
+        for item in SkillEditor().stream_text(enriched_request, model_config):
+            if stream_jobs.is_cancelled(job_id):
+                stream_jobs.append(job_id, "status", {"text": "已停止改写"})
+                stream_jobs.complete(job_id)
+                return
+            stream_jobs.append(job_id, str(item["event"]), dict(item["data"]))
         stream_jobs.complete(job_id)
     except Exception as exc:  # noqa: BLE001 - expose stable job failure to UI.
         stream_jobs.fail(job_id, str(exc))
 
 
+def _run_feedback_rewrite_stream_job(job_id: str, prepared: PreparedCandidateRewrite) -> None:
+    """在现有任务内运行原编辑器；成功只结算候选，失效/取消/失败清除所有正文。"""
+    engine = get_session_engine()
+    fence = prepared.fence
+    guard = candidate_guard(engine, fence, lambda: stream_jobs.is_cancelled(job_id))
+    try:
+        guard()
+        for item in SkillEditor().stream_text(prepared.request, prepared.model, request_guard=guard):
+            guard()
+            if item['event'] == 'complete':
+                response = SkillRewriteResponse.model_validate(item['data'])
+                response, fence = settle_candidate_rewrite(engine, fence, response)
+                stream_jobs.bind_feedback(job_id, fence)
+                guard = candidate_guard(engine, fence, lambda: stream_jobs.is_cancelled(job_id))
+                guard()
+                item = {'event': 'complete', 'data': response.model_dump(mode='json')}
+            stream_jobs.append(job_id, str(item['event']), dict(item['data']))
+        guard()
+        stream_jobs.complete(job_id)
+    except Exception:  # noqa: BLE001 - no raw provider/candidate exception enters cache.
+        stream_jobs.invalidate_feedback(job_id, MODEL_FAILURE)
+
+
 def _stream_skill_job(job_id: str, after_seq: int = 0) -> Iterator[str]:
+    """原SSE帧与序号保持；当前校验先于附着、每个旧缓存事件和完成帧。"""
     last_seq = max(0, after_seq)
+    attached = stream_jobs.get(job_id)
+    if attached:
+        try:
+            _check_feedback_job(attached)
+        except HTTPException:
+            yield _sse('error', {'message': 'FEEDBACK_CANDIDATE_UNAVAILABLE'})
+            return
     yield _sse("job_attached", {"job_id": job_id, "after_seq": after_seq})
     while True:
         job, events = stream_jobs.snapshot(job_id, last_seq)
@@ -1064,9 +1086,19 @@ def _stream_skill_job(job_id: str, after_seq: int = 0) -> Iterator[str]:
             yield _sse("error", {"message": "Job not found"})
             return
         for event in events:
+            try:
+                _check_feedback_job(job)
+            except HTTPException:
+                yield _sse('error', {'message': 'FEEDBACK_CANDIDATE_UNAVAILABLE'})
+                return
             last_seq = event.seq
             yield _sse_event(event, job_id)
         if job.status in {"succeeded", "failed"} and not events:
+            try:
+                _check_feedback_job(job)
+            except HTTPException:
+                yield _sse('error', {'message': 'FEEDBACK_CANDIDATE_UNAVAILABLE'})
+                return
             yield _sse("job_complete", {"job_id": job_id, "status": job.status, "error": job.error})
             return
         sleep(0.15)
@@ -1107,50 +1139,6 @@ def _get_request_model(
     return model_config
 
 
-def _sync_skill_tool_bindings(
-    db: Session,
-    tenant_id: str,
-    skill_id: str,
-    content: dict[str, object],
-) -> None:
-    tool_names: set[str] = set()
-    for key in ("nodes", "steps"):
-        items = content.get(key)
-        if not isinstance(items, list):
-            continue
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            actions = item.get("allowed_actions")
-            if not isinstance(actions, list):
-                continue
-            for action in actions:
-                value = str(action or "").strip()
-                if not value.startswith("call_tool:"):
-                    continue
-                tool_name = value.split(":", 1)[1].strip()
-                if tool_name:
-                    tool_names.add(tool_name)
-    if not tool_names:
-        return
-
-    rows = db.exec(
-        select(Tool).where(
-            Tool.tenant_id == tenant_id,
-            Tool.name.in_(sorted(tool_names)),
-        )
-    ).all()
-    for row in rows:
-        allowed_skills = [
-            str(item) for item in (row.allowed_skills_json or []) if str(item).strip()
-        ]
-        if skill_id in allowed_skills:
-            continue
-        row.allowed_skills_json = [*allowed_skills, skill_id]
-        row.updated_at = utc_now()
-        db.add(row)
-
-
 def _with_available_tools(db: Session, request: SkillDistillRequest) -> SkillDistillRequest:
     """只把服务端确认可见的工具注入 Skill 生成上下文，客户端目录不能扩权。"""
 
@@ -1171,21 +1159,6 @@ def _with_available_tools_for_rewrite(
     return request.model_copy(update={"available_tools": available_tools})
 
 
-def _tool_generation_payload(tool: Tool) -> dict[str, object]:
-    """构造不含端点和示例秘密的工具生成快照，供 distill/rewrite 共同使用。"""
-
-    return {
-        "id": sanitize_generation_text(tool.id),
-        "name": sanitize_generation_text(tool.name),
-        "display_name": sanitize_generation_text(tool.display_name or ""),
-        "description": sanitize_generation_text(tool.description or ""),
-        "bucket": sanitize_generation_text(tool.bucket or "未分桶"),
-        "method": tool.method,
-        "input_schema": sanitize_generation_schema(tool.input_schema or {}),
-        "output_schema": sanitize_generation_schema(tool.output_schema or {}),
-    }
-
-
 def _prepare_skill_generation_request(
     db: Session,
     request: SkillDistillRequest | SkillRewriteRequest,
@@ -1197,6 +1170,8 @@ def _prepare_skill_generation_request(
 
     if current_user is not None:
         ensure_current_user_tenant(request.tenant_id, current_user)
+        current_user = start_skill_write(db, request.tenant_id, current_user,
+                                         request.agent_id, request.editor_context)
     ensure_tenant(db, request.tenant_id)
     agent = get_agent(db, request.tenant_id, request.agent_id)
     if request.agent_id and not agent:
@@ -1217,7 +1192,7 @@ def _prepare_skill_generation_request(
         db, request.tenant_id, skill_id, request.agent_id
     )
     server_skill = SkillCard.model_validate(visible_skill.content_json)
-    return request.model_copy(update={"current_skill": server_skill})
+    return request.model_copy(update={"current_skill": server_skill, 'feedback_materials': []})
 
 
 def _sse(event: object, data: object) -> str:
@@ -1334,16 +1309,6 @@ def _increment_call(
         entry["call_count"] = int(entry["call_count"]) + 1
 
 
-def _stats_key(skill_id: str, version: str) -> str:
-    return f"{skill_id}@{version}"
-
-
-def _stats_for(
-    stats: dict[str, dict[str, float | int]], skill_id: str, version: str
-) -> dict[str, float | int]:
-    return stats.get(_stats_key(skill_id, version), {})
-
-
 def _recent_skill_stats(
     db: Session,
     tenant_id: str,
@@ -1352,7 +1317,7 @@ def _recent_skill_stats(
     recent_versions: dict[str, list[str]] = {}
     version_rows = db.exec(
         select(SkillVersion)
-        .where(SkillVersion.tenant_id == tenant_id)
+        .where(SkillVersion.tenant_id == tenant_id, SkillVersion.scope_agent_id == "")
         .order_by(
             SkillVersion.skill_id.asc(), SkillVersion.created_at.desc(), SkillVersion.version.desc()
         )
@@ -1396,6 +1361,7 @@ def _upsert_skill_version(
     *,
     compiled_definition: CompiledSopDefinition | None = None,
     derived_from_version_id: str | None = None,
+    scope_agent_id: str = "",
 ) -> SkillVersion:
     """在调用方事务内保存版本快照，并把不可变冲突转换为 HTTP 409。"""
 
@@ -1405,6 +1371,7 @@ def _upsert_skill_version(
             row,
             compiled_definition=compiled_definition,
             derived_from_version_id=derived_from_version_id,
+            scope_agent_id=scope_agent_id,
         )
     except PublishedVersionConflictError as exc:
         raise HTTPException(
@@ -1415,6 +1382,11 @@ def _upsert_skill_version(
                 "version": exc.version,
             },
         ) from exc
+    object.__setattr__(row, "publication_identity", {
+        "id": result.version.id if result.version.status == "published" else None,
+        "scope_agent_id": scope_agent_id,
+        "checksum": result.version.compiled_definition_checksum,
+    })
     return result.version
 
 
@@ -1476,6 +1448,7 @@ def _get_skill_version(db: Session, tenant_id: str, skill_id: str, version: str)
             SkillVersion.tenant_id == tenant_id,
             SkillVersion.skill_id == skill_id,
             SkillVersion.version == version,
+            SkillVersion.scope_agent_id == "",
         )
     ).first()
     if not row:

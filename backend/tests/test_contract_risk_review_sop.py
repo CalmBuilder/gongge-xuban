@@ -1,5 +1,5 @@
 """
-@Time       : 2026/07/22 17:28
+@Time       : 2026/10/03
 @Author     : zhanglp8181
 @File       : test_contract_risk_review_sop.py
 @CallChain  : pytest → 合同风险审查发布定义 → 初筛工具/法务人工复核/终态
@@ -165,7 +165,7 @@ def test_contract_review_seed_freezes_tool_roles_and_reviewer_assignment() -> No
 
         skill = db.exec(select(Skill).where(Skill.skill_id == CONTRACT_RISK_REVIEW_SKILL_ID)).one()
         version = db.exec(
-            select(SkillVersion).where(
+            select(SkillVersion).where(SkillVersion.tenant_id == "tenant_demo", SkillVersion.scope_agent_id == "",
                 SkillVersion.skill_id == CONTRACT_RISK_REVIEW_SKILL_ID,
                 SkillVersion.version == CONTRACT_RISK_REVIEW_DETERMINISTIC_VERSION,
             )

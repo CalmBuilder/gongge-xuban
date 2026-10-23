@@ -3,10 +3,17 @@ import { getDateLocale } from '@/i18n';
 const FALLBACK_TIME_ZONE = 'Asia/Shanghai';
 
 export function getClientTimeZone(): string {
+  return getDetectedClientTimeZone() || FALLBACK_TIME_ZONE;
+}
+
+export function getDetectedClientTimeZone(): string | undefined {
   try {
-    return Intl.DateTimeFormat().resolvedOptions().timeZone || FALLBACK_TIME_ZONE;
+    const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone?.trim();
+    if (!timeZone) return undefined;
+    new Intl.DateTimeFormat('en-US', { timeZone }).format();
+    return timeZone;
   } catch {
-    return FALLBACK_TIME_ZONE;
+    return undefined;
   }
 }
 

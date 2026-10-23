@@ -1,5 +1,5 @@
 """
-@Time       : 2026/08/28 13:20
+@Time       : 2026/10/13
 @Author     : zhanglp8181
 @File       : client.py
 @CallChain  : Agent/知识/技能阶段 → LLMClient → OpenAI 兼容 Chat Completions
@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import ast
 import base64
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 import copy
 import hashlib
+import httpx
 import json
 import math
 from queue import Empty, Full, Queue
@@ -24,7 +25,7 @@ from urllib.parse import urlsplit
 
 from openai import OpenAI
 
-from app.cancellation import raise_if_cancelled, run_cancellable
+from app.cancellation import CancellableStageTimeout, raise_if_cancelled, run_cancellable
 from app.config import get_settings
 from app.context_limits import DEFAULT_CONTEXT_TOKEN_BUDGET, MAX_CONTEXT_TOKEN_BUDGET
 from app.db.models import ModelConfig
@@ -34,6 +35,8 @@ from app.llm.stage_protocol import (
     TURN_STAGE_MESSAGES_KEY,
     render_stage_user_message,
 )
+from app.memory.projection import select_memory_projection
+from app.memory.request_projection import MemoryRequestPayload, render_memory_payload
 from app.observability.spans import current_llm_operation, llm_span_attributes, start_llm_call
 from app.security.encryption import decrypt_secret
 
@@ -162,11 +165,63 @@ PROVIDER_TRANSIENT_RETRIES = 2
 PROVIDER_RETRY_BASE_SECONDS = 1.0
 EMPTY_RESPONSE_MESSAGE = "Model returned an empty response"
 DEFAULT_MODEL_API_TIMEOUT_SECONDS = 600.0
+MAX_MODEL_RESPONSE_BODY_BYTES = 8 * 1024 * 1024
 DEFAULT_INPUT_TOKEN_BUDGET = DEFAULT_CONTEXT_TOKEN_BUDGET
 TURN_STAGE_MESSAGE_MARKER = "_agent_turn_message"
 REASONING_TOKEN_ESCALATION_CEILING = 32_768
 OPTIONAL_INPUT_PROBE_MAX_TOKENS = 256
 PROVIDER_CONTENT_PARTS_KEY = "_provider_content_parts"
+
+
+def _bounded_model_response_chunks(
+    chunks: Iterator[bytes], response: httpx.Response, maximum_bytes: int,
+) -> Iterator[bytes]:
+    """逐块限制模型响应正文大小，超限时关闭响应流并用固定错误码失败。"""
+    total_bytes = 0
+    for chunk in chunks:
+        total_bytes += len(chunk)
+        if total_bytes > maximum_bytes:
+            response.close()
+            raise LLMError("MODEL_RESPONSE_BODY_LIMIT_EXCEEDED")
+        yield chunk
+
+
+def _install_model_response_body_limit(response: httpx.Response) -> None:
+    """在OpenAI SDK读取正文前安装原始与解码响应流的字节上限。"""
+    maximum_bytes = MAX_MODEL_RESPONSE_BODY_BYTES
+    if type(maximum_bytes) is not int or maximum_bytes <= 0:
+        response.close()
+        raise LLMError("MODEL_RESPONSE_BODY_LIMIT_CONFIGURATION_INVALID")
+    content_encoding = response.headers.get("content-encoding", "").strip().lower()
+    if content_encoding not in {"", "identity"}:
+        response.close()
+        raise LLMError("MODEL_RESPONSE_ENCODING_UNSUPPORTED")
+    try:
+        content_length = int(response.headers.get("content-length", ""))
+    except ValueError:
+        content_length = 0
+    if content_length > maximum_bytes:
+        response.close()
+        raise LLMError("MODEL_RESPONSE_BODY_LIMIT_EXCEEDED")
+
+    original_iter_raw = response.iter_raw
+
+    def bounded_iter_raw(chunk_size: int | None = None) -> Iterator[bytes]:
+        """限制传输层原始字节，避免无Content-Length的响应无限流入缓冲区。"""
+        yield from _bounded_model_response_chunks(
+            original_iter_raw(chunk_size), response, maximum_bytes,
+        )
+
+    original_iter_bytes = response.iter_bytes
+
+    def bounded_iter_bytes(chunk_size: int | None = None) -> Iterator[bytes]:
+        """再限制解码后正文，避免压缩响应绕过传输层字节上限。"""
+        yield from _bounded_model_response_chunks(
+            original_iter_bytes(chunk_size), response, maximum_bytes,
+        )
+
+    response.iter_raw = bounded_iter_raw
+    response.iter_bytes = bounded_iter_bytes
 
 
 def _escalate_reasoning_token_budget(current_max_tokens: int) -> int:
@@ -245,19 +300,31 @@ class LLMClient:
         model_config: ModelConfig,
         *,
         timeout_seconds: float | None = None,
+        dispatch_observer: Callable[[], None] | None = None,
+        safe_error_code: str | None = None,
     ):
+        """建立模型客户端，并可为持久 worker 观测每次真实 provider 派发。"""
+
+        self.safe_error_code = safe_error_code
         api_key = decrypt_secret(model_config.api_key_encrypted)
         if not api_key:
-            raise LLMError("Model API key is not configured")
+            raise LLMError(safe_error_code or "Model API key is not configured")
         self.timeout_seconds = timeout_seconds if timeout_seconds is not None else (
             get_settings().model_api_timeout_seconds or DEFAULT_MODEL_API_TIMEOUT_SECONDS
         )
         self.base_url = str(model_config.base_url or "")
+        http_client = httpx.Client(
+            timeout=self.timeout_seconds,
+            follow_redirects=True,
+            headers={"accept-encoding": "identity"},
+            event_hooks={"response": [_install_model_response_body_limit]},
+        )
         self.client = OpenAI(
             api_key=api_key,
             base_url=self.base_url,
             timeout=self.timeout_seconds,
             max_retries=0,
+            http_client=http_client,
         )
         self.model = model_config.model
         self.temperature = model_config.temperature
@@ -279,6 +346,19 @@ class LLMClient:
                 self.model,
             )
         )
+        self.dispatch_observer = dispatch_observer
+        # 现预检只验证协议能力，未验证context窗口；未知规格沿既有保守输入上限。
+        self.verified_context_window: int | None = None
+        self.memory_projection_model_identity = {
+            "model_config_id": str(getattr(model_config, "id", "")),
+            "generation": getattr(model_config, "memory_capture_generation", None),
+            "capability_checksum": getattr(model_config, "capability_checksum", None),
+            "endpoint_hash": hashlib.sha256(self.base_url.encode()).hexdigest(),
+            "parameters_hash": hashlib.sha256(json.dumps(
+                {"temperature": self.temperature, "extra_body": self.extra_body},
+                sort_keys=True, ensure_ascii=False,
+            ).encode()).hexdigest(),
+        }
 
     def probe_model_catalog(self) -> list[str]:
         """读取兼容端点模型目录，用于区分认证成功与模型名称配置错误。"""
@@ -333,7 +413,11 @@ class LLMClient:
             user_payload,
             max_output_tokens,
         )
-        context_messages, serialized = _prepare_user_input(user_payload)
+        preliminary_payload = (
+            render_memory_payload(user_payload, ())
+            if isinstance(user_payload, MemoryRequestPayload) else user_payload
+        )
+        context_messages, serialized = _prepare_user_input(preliminary_payload)
         request_messages = _request_messages(system_prompt, context_messages, serialized)
         request_messages = _fit_request_messages(
             request_messages,
@@ -380,6 +464,13 @@ class LLMClient:
             current_max_tokens = max_output_tokens
             for attempt in range(EMPTY_RESPONSE_RETRIES + 1):
                 request["max_tokens"] = current_max_tokens
+                if isinstance(user_payload, MemoryRequestPayload):
+                    request["messages"] = _memory_request_messages(
+                        self, system_prompt, user_payload, current_max_tokens
+                    )
+                    self._last_stage_request_user_content = copy.deepcopy(
+                        request["messages"][-1].get("content")
+                    )
                 span = start_llm_call(
                     model=self.model,
                     endpoint=_endpoint_label(getattr(self, "base_url", "")),
@@ -400,11 +491,19 @@ class LLMClient:
                     with_options = getattr(self.client, "with_options", None)
                     if callable(with_options):
                         request_client = with_options(timeout=max(0.1, remaining))
+                    dispatch_observer = getattr(self, "dispatch_observer", None)
+                    if dispatch_observer is not None:
+                        dispatch_observer()
+                    if (isinstance(user_payload, MemoryRequestPayload)
+                            and user_payload.envelope.eligible() != user_payload.envelope.selected):
+                        request["messages"] = _memory_request_messages(
+                            self, system_prompt, user_payload, current_max_tokens
+                        )
                     completion = request_client.chat.completions.create(
                         **request,
                     )
                 except BaseException as exc:
-                    span.fail(exc, **_completion_span_metrics(None))
+                    span.fail(_safe_call_error(self, exc), **_completion_span_metrics(None))
                     if _is_retryable_provider_error(exc) and attempt < PROVIDER_TRANSIENT_RETRIES:
                         _wait_before_provider_retry(attempt)
                         continue
@@ -450,6 +549,8 @@ class LLMClient:
                 if attempt >= EMPTY_RESPONSE_RETRIES:
                     raise LLMError(_empty_response_detail(self, empty_diagnostics))
         except Exception as exc:
+            if getattr(self, "safe_error_code", None):
+                raise LLMError(self.safe_error_code) from exc
             if isinstance(exc, LLMError):
                 raise
             raise LLMError(_provider_failure_detail(self, exc)) from exc
@@ -465,7 +566,11 @@ class LLMClient:
         max_output_tokens = operation_output_tokens(
             current_llm_operation(), self.max_output_tokens
         )
-        context_messages, serialized = _prepare_user_input(user_payload)
+        preliminary_payload = (
+            render_memory_payload(user_payload, ())
+            if isinstance(user_payload, MemoryRequestPayload) else user_payload
+        )
+        context_messages, serialized = _prepare_user_input(preliminary_payload)
         request_messages = _request_messages(system_prompt, context_messages, serialized)
         request_messages = _fit_request_messages(
             request_messages,
@@ -511,10 +616,22 @@ class LLMClient:
                 try:
                     def create_stream() -> Any:
                         """创建本次 provider 流，供可取消生产线程调用。"""
-
+                        raise_if_cancelled(is_cancelled)
+                        dispatch_observer = getattr(self, "dispatch_observer", None)
+                        if dispatch_observer is not None:
+                            dispatch_observer()
+                        outbound = (
+                            _memory_request_messages(self, system_prompt, user_payload,
+                                                     current_max_tokens)
+                            if isinstance(user_payload, MemoryRequestPayload) else request_messages
+                        )
+                        if isinstance(user_payload, MemoryRequestPayload):
+                            self._last_stage_request_user_content = copy.deepcopy(
+                                outbound[-1].get("content")
+                            )
                         return self.client.chat.completions.create(
                             model=self.model,
-                            messages=request_messages,
+                            messages=outbound,
                             temperature=self.temperature,
                             max_tokens=current_max_tokens,
                             stream=True,
@@ -562,7 +679,7 @@ class LLMClient:
                             yield buffered
                 except BaseException as exc:
                     span.fail(
-                        exc,
+                        _safe_call_error(self, exc),
                         provider_setup_ms=provider_setup_ms,
                         ttft_ms=first_content_ms,
                         output_chars=output_chars,
@@ -629,6 +746,8 @@ class LLMClient:
         except LLMStreamCancelled:
             raise
         except Exception as exc:
+            if getattr(self, "safe_error_code", None):
+                raise LLMError(self.safe_error_code) from exc
             if isinstance(exc, LLMError):
                 raise
             raise LLMError(_provider_failure_detail(self, exc)) from exc
@@ -722,7 +841,7 @@ class LLMClient:
                         "attempt": attempt + 1,
                         "max_attempts": JSON_REPAIR_ATTEMPTS,
                         "previous_output": _preview(text),
-                        "parser_error": str(exc),
+                        "parser_error": "INVALID_MODEL_JSON" if getattr(self, "safe_error_code", None) else str(exc),
                         "instruction": _json_repair_instruction(text, exc),
                     }
         finally:
@@ -730,6 +849,8 @@ class LLMClient:
                 self.__dict__.pop("_json_deadline", None)
             else:
                 self._json_deadline = previous_json_deadline
+        if getattr(self, "safe_error_code", None):
+            raise LLMError(self.safe_error_code) from last_error
         previews = "; ".join(
             f"attempt_{index + 1}_preview={_preview(output)!r}"
             for index, output in enumerate(outputs)
@@ -1008,20 +1129,50 @@ class LLMClient:
         response_format: dict[str, str] | None = None,
         is_cancelled: Callable[[], bool] | None = None,
     ) -> str:
-        """执行 JSON 阶段文本请求，并在取消时关闭 provider 客户端连接。"""
+        """执行 JSON 阶段文本请求，并在撤销或冻结截止时关闭 provider 客户端。"""
 
-        def operation() -> str:
-            """调用现有非流式文本接口，兼容旧的测试替身签名。"""
+        json_deadline = getattr(self, "_json_deadline", None)
+        if isinstance(json_deadline, (int, float)):
+            timeout_seconds = float(json_deadline) - time.monotonic()
+        else:
+            timeout_seconds = float(
+                getattr(self, "timeout_seconds", DEFAULT_MODEL_API_TIMEOUT_SECONDS)
+                or DEFAULT_MODEL_API_TIMEOUT_SECONDS
+            )
+        if timeout_seconds <= 0:
+            raise LLMError("MODEL_CALL_DEADLINE_EXCEEDED")
 
+        def operation() -> tuple[str, Any, Any]:
+            """在隔离的客户端副本中请求文本并返回仅可由准时结果提交的元数据。"""
+
+            worker_client = copy.copy(self)
             if response_format is not None:
-                return self.generate_text(system_prompt, user_payload, response_format)
-            return self.generate_text(system_prompt, user_payload)
+                generated = worker_client.generate_text(
+                    system_prompt,
+                    user_payload,
+                    response_format,
+                )
+            else:
+                generated = worker_client.generate_text(system_prompt, user_payload)
+            return (
+                generated,
+                getattr(worker_client, "_last_stage_request_user_content", None),
+                getattr(worker_client, "_last_completed_response_metadata", None),
+            )
 
-        return run_cancellable(
-            operation,
-            is_cancelled,
-            on_cancel=lambda: _best_effort_close_stream(self.client),
-        )
+        try:
+            generated, request_user_content, response_metadata = run_cancellable(
+                operation,
+                is_cancelled,
+                on_cancel=lambda: _best_effort_close_stream(self.client),
+                timeout_seconds=timeout_seconds,
+                on_timeout=lambda: _best_effort_close_stream(self.client),
+            )
+        except CancellableStageTimeout as exc:
+            raise LLMError("MODEL_CALL_DEADLINE_EXCEEDED") from exc
+        self._last_stage_request_user_content = request_user_content
+        self._last_completed_response_metadata = response_metadata
+        return generated
 
 
 def _completion_message_content(completion: Any) -> str:
@@ -1215,9 +1366,258 @@ def _request_input_token_budget(user_payload: dict[str, Any] | str) -> int:
     return min(token_budget, MAX_CONTEXT_TOKEN_BUDGET)
 
 
-def _fit_request_messages(
-    messages: list[dict[str, Any]], token_budget: int = DEFAULT_INPUT_TOKEN_BUDGET
+def _memory_request_messages(
+    client: LLMClient, system_prompt: str, payload: MemoryRequestPayload, output_tokens: int,
 ) -> list[dict[str, Any]]:
+    """在每次SDK发送前按真实包装重新核预算和披露；修复/重试只减原选择。"""
+    envelope = payload.envelope
+    memory_projection_prompt = (
+        "\n当前用户输入中的新纠正优先于长期记忆；未投影的事实不能当作已知。"
+        "当用户要求提取记忆字段时，按当前问题的字段含义界定值，明确纠正采用本轮新值。"
+        "完整投影包含的其他事实、说明或代码属于上下文，不自动属于所问字段的答案。"
+        "若只问条目‘字段名：原值；附加说明’中的字段值，只输出冒号与分号之间的原值，"
+        "分号后的说明不属于该字段原值，不附带后续说明或代码。"
+        "要求格式关键词时，完整保留格式名称的全部关键词，不缩写、不替换，不复制附加要求。"
+        "用户的格式要求不能充当缺失事实，诸如要求关键词并不提供字段值。"
+        "未知字段逐字段遵守本轮指令：要求不填写的键必须省略；要求未知占位的键只用该占位。"
+        "不把其他字段的未知规则套用到已要求省略的字段，不用输出模板的示例或省略号充当值。"
+    )
+    input_limit = _request_input_token_budget(payload)
+    context_window = getattr(client, "verified_context_window", None)
+    if type(context_window) is int and context_window > 0:
+        input_limit = min(input_limit, max(0, context_window - output_tokens))
+    eligible = envelope.eligible()
+    source_count = len(envelope.candidates if envelope.selected is None else envelope.selected)
+    working_payload = payload
+    envelope.derived_values_revoked |= source_count != len(eligible)
+    if envelope.derived_values_revoked:
+        if isinstance(envelope.revoked_system_prompt, str):
+            system_prompt = envelope.revoked_system_prompt
+    system_prompt += memory_projection_prompt
+    if envelope.derived_values_revoked:
+        system_prompt += (
+            "\n本轮原先选中的部分或全部长期记忆已因授权状态变化失效，并已从模型输入中移除。"
+            "回答本轮请求的记忆字段时，只能依据当前用户输入或仍被授权且实际投影的事实。"
+            "不得从冻结计划、历史步骤结果、先前助手回答、工具或执行视图、未投影信息推断。"
+            "若字段缺少上述可用依据，严格使用当前用户指定的未知占位或按要求省略。"
+        )
+        # 修复输出/同轮模型回声也是已披露来源的派生值；撤销后不再回注它们。
+        working_payload = copy.deepcopy(payload)
+        for field in payload.model_output_fields:
+            working_payload.pop(field, None)
+        repair = working_payload.get("_json_repair")
+        if isinstance(repair, dict):
+            repair.pop("previous_output", None)
+        history = working_payload.get("conversation_context")
+        if isinstance(history, dict):
+            history.pop(TURN_STAGE_MESSAGES_KEY, None)
+            history_messages = history.get("messages")
+            if isinstance(history_messages, list):
+                history["messages"] = [
+                    item for item in history_messages
+                    if isinstance(item, dict) and item.get("role") == "user"
+                ]
+        _scrub_revoked_provider_execution_view(
+            working_payload,
+            envelope.revoked_execution_references,
+        )
+    empty_payload = render_memory_payload(working_payload, ())
+    context, serialized = _prepare_user_input(empty_payload)
+    base_messages = _fit_request_messages(
+        _request_messages(system_prompt, context, serialized), input_limit, protect_current=True,
+    )
+    fixed_context = base_messages[1:-1]
+
+    def render(items: tuple) -> list[dict[str, Any]]:
+        """用相同已合法整形的历史渲染所有重复memory_context位置。"""
+        _, current = _prepare_user_input(render_memory_payload(working_payload, items))
+        return _request_messages(system_prompt, fixed_context, current)
+
+    result = select_memory_projection(
+        eligible, current_input=envelope.current_input, input_limit=input_limit,
+        render_cost=lambda items: _request_tokens(render(items)), policy=envelope.policy,
+    )
+    envelope.selected = result.selected
+    messages = render(result.selected)
+    if _request_tokens(messages) > input_limit:
+        raise LLMError("INPUT_BUDGET_EXCEEDED")
+    audit = result.audit()
+    audit.update(model=getattr(client, "model", ""), output_reserve=output_tokens,
+                 projection_revision=len(envelope.audits) + 1,
+                 source_input_id=envelope.source_input_id,
+                 revoked_count=source_count - len(eligible),
+                 context_capability="verified" if context_window else "conservative_default")
+    audit.update(model_identity=getattr(client, "memory_projection_model_identity", {}),
+                 policy_settings=vars(envelope.policy),
+                 parent_projection_id=envelope.parent_projection_id)
+    audit["projection_id"] = hashlib.sha256(json.dumps(
+        audit, sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+    ).encode()).hexdigest()
+    envelope.parent_projection_id = audit["projection_id"]
+    envelope.audits.append(audit)
+    return messages
+
+
+def _scrub_revoked_provider_execution_view(
+    payload: dict[str, Any],
+    execution_references: Mapping[str, Mapping[str, str]] | None = None,
+) -> None:
+    """撤权后清理DTA派生事实，仅保留结构、用户输入和已证明后继引用。"""
+    current_step = payload.get("current_step")
+    if isinstance(current_step, dict):
+        payload["current_step"] = {
+            key: copy.deepcopy(current_step[key])
+            for key in (
+                "step_key",
+                "kind",
+                "required",
+                "depends_on",
+                "capability_refs",
+                "guidance_skill_use_ids",
+            )
+            if key in current_step
+        }
+    repair_feedback = payload.get("result_repair_feedback")
+    if isinstance(repair_feedback, dict):
+        _scrub_revoked_repair_feedback(repair_feedback)
+    provider_view = payload.get("provider_execution_view")
+    if not isinstance(provider_view, dict):
+        return
+    contexts: list[dict[str, Any]] = []
+    direct_context = provider_view.get("execution_context")
+    if isinstance(direct_context, dict):
+        contexts.append(direct_context)
+    messages = provider_view.get("messages")
+    if isinstance(messages, list):
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if not isinstance(content, dict):
+                continue
+            if isinstance(content.get("instruction"), str):
+                content["instruction"] = (
+                    "仅依据当前用户输入与仍有效的权威上下文完成当前计划步骤。"
+                )
+            message_feedback = content.get("result_repair_feedback")
+            if isinstance(message_feedback, dict):
+                _scrub_revoked_repair_feedback(message_feedback)
+            requirements = content.get("guidance_requirements")
+            if isinstance(requirements, list):
+                content["guidance_requirements"] = [
+                    {
+                        key: copy.deepcopy(item[key])
+                        for key in (
+                            "requirement_id",
+                            "skill_use_id",
+                            "principle",
+                            "disposition",
+                        )
+                        if key in item
+                    }
+                    for item in requirements
+                    if isinstance(item, dict)
+                ]
+            nested_context = content.get("execution_context")
+            if isinstance(nested_context, dict):
+                contexts.append(nested_context)
+    for context in contexts:
+        context["constraints"] = []
+        criteria = context.get("success_criteria")
+        if isinstance(criteria, list):
+            context["success_criteria"] = [
+                {
+                    key: copy.deepcopy(item[key])
+                    for key in ("id", "type")
+                    if key in item
+                }
+                for item in criteria
+                if isinstance(item, dict)
+            ]
+        plan_steps = context.get("plan_steps")
+        clarification_step_keys: set[str] = set()
+        if isinstance(plan_steps, list):
+            clarification_step_keys = {
+                str(item.get("step_key") or "")
+                for item in plan_steps
+                if isinstance(item, dict)
+                and item.get("kind") == "clarification"
+                and isinstance(item.get("step_key"), str)
+            }
+            context["plan_steps"] = [
+                {
+                    key: copy.deepcopy(item[key])
+                    for key in (
+                        "step_key",
+                        "kind",
+                        "required",
+                        "depends_on",
+                        "capability_refs",
+                        "guidance_skill_use_ids",
+                    )
+                    if key in item
+                }
+                for item in plan_steps
+                if isinstance(item, dict)
+            ]
+        pending_action = context.get("pending_action")
+        if isinstance(pending_action, dict):
+            context["pending_action"] = {
+                key: copy.deepcopy(pending_action[key])
+                for key in ("proposal_id", "step_key", "checksum")
+                if key in pending_action
+            }
+        history = context.get("conversation_context")
+        if isinstance(history, list):
+            context["conversation_context"] = [
+                item for item in history
+                if isinstance(item, dict) and item.get("role") == "user"
+            ]
+        completed = context.get("completed_steps")
+        if isinstance(completed, list):
+            for step in completed:
+                if isinstance(step, dict):
+                    step_key = str(step.get("step_key") or "")
+                    model_output = step.get("model_output")
+                    references = (execution_references or {}).get(step_key)
+                    if isinstance(references, Mapping) and references:
+                        step["model_output"] = {
+                            str(name): str(value)
+                            for name, value in references.items()
+                            if isinstance(name, str) and isinstance(value, str)
+                        }
+                    elif (
+                        step_key in clarification_step_keys
+                        and isinstance(model_output, dict)
+                        and model_output.get("source_kind") == "authenticated_user_clarification"
+                        and isinstance(model_output.get("answer"), str)
+                        and model_output["answer"].strip()
+                    ):
+                        # 澄清内容是经原本人 Attention 完成校验的用户输入，不是可被撤权
+                        # 的模型派生回声；保留它才能让同一 Execution 按本人新指令续接。
+                        step["model_output"] = {
+                            "source_kind": "authenticated_user_clarification",
+                            "answer": model_output["answer"],
+                        }
+                    else:
+                        step.pop("model_output", None)
+
+
+def _scrub_revoked_repair_feedback(feedback: dict[str, Any]) -> None:
+    """撤权后只留下稳定机器错误码，避免校验回显再次披露旧事实。"""
+    code = feedback.get("code")
+    if isinstance(code, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{0,127}", code):
+        feedback.clear()
+        feedback["code"] = code
+    else:
+        feedback.clear()
+
+
+def _fit_request_messages(
+    messages: list[dict[str, Any]], token_budget: int = DEFAULT_INPUT_TOKEN_BUDGET,
+    *, protect_current: bool = False,
+) -> list[dict[str, Any]]:
+    """按原合同整形历史；完整事实消费者禁止最后消息字节裁切。"""
     projected = copy.deepcopy(messages)
     while len(projected) > 2 and _request_tokens(projected) > token_budget:
         removable_index = next(
@@ -1250,6 +1650,8 @@ def _fit_request_messages(
     _drop_oldest_turn_stage_exchanges(projected, token_budget)
 
     if projected and _request_tokens(projected) > token_budget:
+        if protect_current:
+            raise LLMError("INPUT_BUDGET_EXCEEDED")
         fixed_tokens = _request_tokens(projected[:-1])
         projected[-1] = _trim_request_message(
             projected[-1], max(1, token_budget - fixed_tokens)
@@ -1548,7 +1950,16 @@ def _wait_before_provider_retry(attempt: int) -> None:
     time.sleep(delay)
 
 
+def _safe_call_error(client: Any, error: BaseException) -> BaseException:
+    """受管反馈外呼只记录稳定错误码；普通客户端保留原诊断合同。"""
+    code = getattr(client, "safe_error_code", None)
+    return LLMError(code) if code else error
+
+
 def _provider_failure_detail(client: Any, exc: Exception) -> str:
+    """普通供应商诊断沿原规则；受管候选不暴露原错误、地址或输出正文。"""
+    if getattr(client, "safe_error_code", None):
+        return client.safe_error_code
     model = _safe_fragment(getattr(client, "model", None), 80) or "unknown"
     endpoint = _endpoint_label(getattr(client, "base_url", None))
     timeout = getattr(client, "timeout_seconds", None)
@@ -2054,6 +2465,9 @@ def _prepare_stage_user_input(
     serialized = render_stage_user_message(
         user_payload, include_turn_header=not turn_stage_messages
     )
+    if (isinstance(user_payload, MemoryRequestPayload) and turn_stage_messages
+            and user_payload[STAGE_PROTOCOL_KEY].get("phase") == "Router"):
+        serialized = "用户记忆：\n" + (user_payload[STAGE_PROTOCOL_KEY].get("memory") or "无") + "\n\n" + serialized
     if not current_images:
         return context_messages, _CurrentStageText(serialized)
     return context_messages, [
@@ -2133,6 +2547,12 @@ def _record_stage_exchange(
     if not content:
         return
     user_content = request_user_content
+    if isinstance(context_payload, MemoryRequestPayload):
+        # 原长期事实只在本次显式模型投影披露；阶段历史不成为新的全量记忆入口。
+        user_content = render_stage_user_message(
+            render_memory_payload(context_payload, ()),
+            include_turn_header=not _project_turn_stage_messages(context),
+        )
     if not _content_text(user_content).strip():
         user_content = render_stage_user_message(
             context_payload,

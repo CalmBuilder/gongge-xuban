@@ -35,8 +35,13 @@ const attributeOriginals = new WeakMap<Element, Map<string, string>>();
 const translationCache = new Map<string, string | null>();
 
 function initialLocale(): AppLocale {
+  /** 禁存储时仍能加载匿名页面；只有实际保存的英文偏好才改变默认中文。 */
   if (typeof window === 'undefined') return 'zh-CN';
-  return window.localStorage.getItem(STORAGE_KEY) === 'en-US' ? 'en-US' : 'zh-CN';
+  try {
+    return window.localStorage.getItem(STORAGE_KEY) === 'en-US' ? 'en-US' : 'zh-CN';
+  } catch {
+    return 'zh-CN';
+  }
 }
 
 let currentLocale: AppLocale = initialLocale();

@@ -1,5 +1,5 @@
 """
-@Time       : 2026/07/27 00:00
+@Time       : 2026/10/03
 @Author     : zhanglp8181
 @File       : test_graph_visual_knowledge_sop.py
 @CallChain  : pytest → 图结构演示 v2 定义/发布 → Scheduler/版本存储
@@ -137,7 +137,7 @@ def test_graph_visual_demo_publishes_new_snapshot_without_overwriting_v1() -> No
 
         versions = db.exec(
             select(SkillVersion)
-            .where(SkillVersion.skill_id == GRAPH_VISUAL_DEMO_SKILL_ID)
+            .where(SkillVersion.tenant_id == "tenant_demo", SkillVersion.scope_agent_id == "", SkillVersion.skill_id == GRAPH_VISUAL_DEMO_SKILL_ID)
             .order_by(SkillVersion.version)
         ).all()
         db.refresh(skill)

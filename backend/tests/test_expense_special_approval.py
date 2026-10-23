@@ -1,5 +1,5 @@
 """
-@Time       : 2026/07/27 22:20
+@Time       : 2026/10/03
 @Author     : zhanglp8181
 @File       : test_expense_special_approval.py
 @CallChain  : pytest → ApprovalRequestService → 顺序工作项决定与通用审批台账
@@ -389,7 +389,7 @@ def test_seed_publishes_v2_roles_tools_and_builtin_create() -> None:
         db.commit()
 
         skill = db.exec(
-            select(SkillVersion).where(
+            select(SkillVersion).where(SkillVersion.tenant_id == "tenant_demo", SkillVersion.scope_agent_id == "",
                 SkillVersion.skill_id == "expense_over_limit_approval",
                 SkillVersion.version == EXPENSE_SPECIAL_APPROVAL_VERSION,
             )
@@ -461,7 +461,7 @@ def test_seed_derives_org_scoped_v21_without_rewriting_v2() -> None:
 
         versions = db.exec(
             select(SkillVersion)
-            .where(SkillVersion.skill_id == "expense_over_limit_approval")
+            .where(SkillVersion.tenant_id == "tenant_demo", SkillVersion.scope_agent_id == "", SkillVersion.skill_id == "expense_over_limit_approval")
             .order_by(SkillVersion.version)
         ).all()
         v2 = next(item for item in versions if item.version == EXPENSE_SPECIAL_APPROVAL_VERSION)
@@ -495,7 +495,7 @@ def test_seed_derives_org_scoped_v21_without_rewriting_v2() -> None:
         seed_demo_data(db)
         db.commit()
         repeated_versions = db.exec(
-            select(SkillVersion).where(
+            select(SkillVersion).where(SkillVersion.tenant_id == "tenant_demo", SkillVersion.scope_agent_id == "",
                 SkillVersion.skill_id == "expense_over_limit_approval"
             )
         ).all()

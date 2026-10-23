@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 from pydantic import ValidationError
 from sqlalchemy.pool import StaticPool
@@ -24,6 +26,7 @@ from app.db.models import (
     Tenant,
     User,
 )
+from app.core.time_context import freeze_time_context
 from app.dynamic_tasks.agent import DynamicTaskAgent, DynamicTaskAgentError
 from app.dynamic_tasks.capability_catalog import (
     CapabilityAccessDenied,
@@ -203,12 +206,18 @@ def test_explore_proposer_only_accepts_declared_read_or_evidenced_report() -> No
         capabilities=(_snapshot(explore_safe=True),),
         observations=(),
         remaining_tool_calls=3,
+        time_context=freeze_time_context(
+            source_input_id="message_explore",
+            client_timezone="Asia/Shanghai",
+            anchor_at_utc=datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC),
+        ),
     )
     assert proposal.proposal.action_kind.value == "call_tool"
     assert call_client.payload is not None
     assert "execution_id" not in str(call_client.payload)
     assert call_client.payload["limits"]["recursion_allowed"] is False
     assert isinstance(call_client.payload["output_contract"]["arguments"], str)
+    assert call_client.payload["time_context"]["source_input_id"] == "message_explore"
 
     bad_client = _ExploreClient(
         {

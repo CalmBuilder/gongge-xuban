@@ -16,6 +16,8 @@ import { Dialog, DialogContent, DialogTitle, UnderlineTabs, type UnderlineTabIte
 import { notify } from '@/components/ui/app-toast';
 import { cn } from '@/lib/utils';
 import { formatDateTime } from '@/lib/enterprise-ui';
+import type { FeedbackPreviewSelection } from '@/types/feedback';
+import FeedbackMaterials, { FeedbackMaterialPreview } from './FeedbackMaterials';
 
 import { api, getRequestTenantId } from '../../api/client';
 import IconCalendar from '../../assets/icons/profile-calendar.svg?react';
@@ -85,6 +87,9 @@ export default function ConversationLogsTab() {
   const [loading, setLoading] = useState(false);
   const [detailLoading, setDetailLoading] = useState(false);
   const [reanalyzingId, setReanalyzingId] = useState<string | null>(null);
+  const [previewSelection, setPreviewSelection] = useState<(FeedbackPreviewSelection & { scopeAgentId: string }) | null>(null);
+  const [materialRefresh, setMaterialRefresh] = useState(0);
+  const detailRequestId = useRef(0);
   const pageRequestId = useRef(0);
   const metadataRequestId = useRef(0);
   const pageAgentId = useRef(agentId);
@@ -150,9 +155,13 @@ export default function ConversationLogsTab() {
 
   useEffect(() => {
     setPage(1);
+    setDetail(null);
+    setPreviewSelection(null);
+    detailRequestId.current += 1;
     void loadMetadata(agentId);
     return () => {
       metadataRequestId.current += 1;
+      detailRequestId.current += 1;
     };
   }, [agentId, loadMetadata]);
 
@@ -183,6 +192,8 @@ export default function ConversationLogsTab() {
   const agentLabel = (row: ConversationLogRow): string => agentLabelFromId(row.agent_id);
 
   const openDetail = async (row: ConversationLogRow) => {
+    const requestId = ++detailRequestId.current;
+    setDetail(null);
     setDetailLoading(true);
     try {
       const [sessionDetail, traces] = await Promise.all([
@@ -201,6 +212,7 @@ export default function ConversationLogsTab() {
           feedbackDetail = null;
         }
       }
+      if (requestId !== detailRequestId.current) return;
       setDetail({
         session: feedbackDetail?.session || sessionDetail.session,
         messages: feedbackDetail?.messages || sessionDetail.messages,
@@ -209,9 +221,10 @@ export default function ConversationLogsTab() {
         traces,
       });
     } catch (error) {
+      if (requestId !== detailRequestId.current) return;
       notify.error(error instanceof Error ? error.message : '加载对话详情失败');
     } finally {
-      setDetailLoading(false);
+      if (requestId === detailRequestId.current) setDetailLoading(false);
     }
   };
 
@@ -434,12 +447,25 @@ export default function ConversationLogsTab() {
         )}
       </section>
 
+      <FeedbackMaterials agentId={agentId} refreshKey={materialRefresh} />
+      <FeedbackMaterialPreview
+        selection={previewSelection?.scopeAgentId === agentId ? previewSelection : null}
+        onClose={() => setPreviewSelection(null)}
+        onChanged={() => setMaterialRefresh((value) => value + 1)}
+      />
+
       <FeedbackDetailDialog
         detail={detail}
         agentLabelFromId={agentLabelFromId}
         onClose={() => setDetail(null)}
         onReanalyze={reanalyzeFeedback}
         reanalyzingId={reanalyzingId}
+        onPreview={(feedbackId) => {
+          const originalAgentId = String(detail?.session.agent_id || '');
+          if (!originalAgentId) return;
+          setPreviewSelection({ feedbackId, targetAgentId: originalAgentId, scopeAgentId: agentId });
+          setDetail(null);
+        }}
       />
     </>
   );
@@ -451,12 +477,14 @@ function FeedbackDetailDialog({
   onClose,
   onReanalyze,
   reanalyzingId,
+  onPreview,
 }: {
   detail: ConversationDetail | null;
   agentLabelFromId: (agentId?: string | null) => string;
   onClose: () => void;
   onReanalyze: (feedbackId: string) => void;
   reanalyzingId: string | null;
+  onPreview: (feedbackId: string) => void;
 }) {
   return (
     <Dialog open={Boolean(detail)} onOpenChange={(open) => !open && onClose()}>
@@ -512,6 +540,8 @@ function FeedbackDetailDialog({
                   trace={trace}
                   onReanalyze={onReanalyze}
                   reanalyzing={Boolean(item.feedback_id && item.feedback_id === reanalyzingId)}
+                  onPreview={onPreview}
+                  canPreview={Boolean(detail.session.agent_id)}
                 />
               ))}
               {detail.messages.length === 0 && detail.traces.length > 0
@@ -536,11 +566,15 @@ function FeedbackMessage({
   trace,
   onReanalyze,
   reanalyzing,
+  onPreview,
+  canPreview,
 }: {
   item: FeedbackMessageRead;
   trace?: TurnTraceRead;
   onReanalyze: (feedbackId: string) => void;
   reanalyzing: boolean;
+  onPreview: (feedbackId: string) => void;
+  canPreview: boolean;
 }) {
   const isUser = item.role === 'user';
   const isAssistant = item.role === 'assistant';
@@ -564,6 +598,11 @@ function FeedbackMessage({
         </div>
         {trace && <FeedbackTraceBlock trace={trace} />}
         <p className="feedback-message-content">{item.content}</p>
+        {isAssistant && item.feedback_id && canPreview ? (
+          <UIButton variant="outline" onClick={() => {
+            if (item.feedback_id) onPreview(item.feedback_id);
+          }}>预览改进材料</UIButton>
+        ) : null}
         {item.feedback_analysis && item.feedback_rating === 'down' && (
           <div className="feedback-analysis-box">
             <div>

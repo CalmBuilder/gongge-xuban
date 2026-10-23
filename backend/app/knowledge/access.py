@@ -218,7 +218,7 @@ def accessible_knowledge_base_versions(
         return {
             knowledge_base_id: version
             for knowledge_base_id, version in versions.items()
-            if knowledge_base_id in allowed_ids
+            if knowledge_base_id in allowed_ids and version.publication_state == "published"
         }
     rows = db.exec(
         select(KnowledgeBase).where(
@@ -228,8 +228,9 @@ def accessible_knowledge_base_versions(
         )
     ).all()
     return {
-        row.id: ensure_knowledge_base_version(db, row)
+        row.id: version
         for row in rows
+        if (version := ensure_knowledge_base_version(db, row)).publication_state == "published"
     }
 
 

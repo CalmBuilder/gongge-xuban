@@ -47,9 +47,10 @@ export function clearEnterpriseAuthSession(): void {
 }
 
 function readStoredSession(key: string): EnterpriseAuthSession | null {
-  const raw = window.localStorage.getItem(key);
-  if (!raw) return null;
+  /** 存储读取被浏览器拒绝或内容损坏时返回匿名身份，保持初始化可用且默认拒绝。 */
   try {
+    const raw = window.localStorage.getItem(key);
+    if (!raw) return null;
     const parsed = JSON.parse(raw) as EnterpriseAuthSession;
     if (!parsed.token || !parsed.user?.id) return null;
     return parsed;

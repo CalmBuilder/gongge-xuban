@@ -26,6 +26,7 @@ from app.api import (
     connection_profiles,
     dynamic_task_operations,
     executions,
+    external_tasks,
     feedback,
     expert_taxonomy,
     general_skills,
@@ -79,6 +80,7 @@ from app.general_skills.worker import (
     start_background_worker as start_general_skill_import_worker,
     stop_background_worker as stop_general_skill_import_worker,
 )
+from app.memory.worker import enable_memory_capture_worker, disable_memory_capture_worker
 from app.public_mock import router as public_mock_router
 from app.security.bounded_request_body import BoundedAttachmentBodyMiddleware
 from app.scheduled_tasks.worker import start_background_worker, stop_background_worker
@@ -107,6 +109,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     )
     with Session(engine) as db:
         seed_demo_data(db)
+    enable_memory_capture_worker()
     LOGGER.info(
         "Application startup phase=demo_data_seeded elapsed_ms=%.0f",
         (time.perf_counter() - started_at) * 1000,
@@ -125,6 +128,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        disable_memory_capture_worker()
         stop_background_worker()
         stop_general_skill_import_worker()
         stop_input_extraction_worker()
@@ -185,6 +189,7 @@ app.include_router(work_items.router)
 app.include_router(attention_items.router)
 app.include_router(artifacts.router)
 app.include_router(executions.router)
+app.include_router(external_tasks.router)
 app.include_router(agents.scope_router)
 app.include_router(agents.enterprise_router)
 app.include_router(expert_taxonomy.router)

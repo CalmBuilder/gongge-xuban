@@ -1,5 +1,5 @@
 """
-@Time       : 2026/07/27 13:45
+@Time       : 2026/10/13
 @Author     : zhanglp8181
 @File       : test_llm_client.py
 @CallChain  : pytest → LLMClient → OpenAI 兼容客户端替身
@@ -133,6 +133,98 @@ def test_llm_client_uses_600_second_timeout(monkeypatch):
         "do_sample": False,
     }
     assert client.thinking_mode == "disabled"
+
+
+def test_model_response_body_limit_rejects_declared_oversize(monkeypatch) -> None:
+    """模型响应声明超出正文上限时应在消费响应流前失败关闭。"""
+    import httpx
+
+    from app.llm import client as llm_client_module
+
+    monkeypatch.setattr(llm_client_module, "MAX_MODEL_RESPONSE_BODY_BYTES", 8, raising=False)
+    response = httpx.Response(
+        200,
+        headers={"content-length": "9"},
+        stream=httpx.ByteStream(b"synthetic"),
+    )
+
+    with pytest.raises(LLMError, match="MODEL_RESPONSE_BODY_LIMIT_EXCEEDED"):
+        llm_client_module._install_model_response_body_limit(response)
+
+    assert response.is_closed
+
+
+def test_model_response_body_limit_rejects_oversized_stream(monkeypatch) -> None:
+    """无Content-Length时也应在SDK读完整正文前按流式字节数拒绝超限。"""
+    import httpx
+
+    from app.llm import client as llm_client_module
+
+    monkeypatch.setattr(llm_client_module, "MAX_MODEL_RESPONSE_BODY_BYTES", 8, raising=False)
+    response = httpx.Response(200, stream=httpx.ByteStream(b"synthetic"))
+    llm_client_module._install_model_response_body_limit(response)
+
+    with pytest.raises(LLMError, match="MODEL_RESPONSE_BODY_LIMIT_EXCEEDED"):
+        response.read()
+
+    assert response.is_closed
+
+
+def test_model_response_body_limit_rejects_compressed_body_before_decode() -> None:
+    """供应商忽略identity请求时必须在HTTPX解压前拒绝压缩正文。"""
+    import httpx
+
+    from app.llm import client as llm_client_module
+
+    response = httpx.Response(
+        200,
+        headers={"content-encoding": "gzip"},
+        stream=httpx.ByteStream(b"synthetic compressed bytes"),
+    )
+
+    with pytest.raises(LLMError, match="MODEL_RESPONSE_ENCODING_UNSUPPORTED"):
+        llm_client_module._install_model_response_body_limit(response)
+
+    assert response.is_closed
+
+
+def test_llm_client_installs_bounded_response_http_client(monkeypatch) -> None:
+    """LLMClient创建的真实SDK客户端必须安装有限模型响应正文的HTTP hook。"""
+    import httpx
+
+    from app.llm import client as llm_client_module
+
+    captured = {}
+    model_config = type(
+        "ModelConfig",
+        (),
+        {
+            "api_key_encrypted": "synthetic-encrypted-key",
+            "base_url": "https://example.test/v1",
+            "model": "synthetic-model",
+            "temperature": 0.0,
+            "max_output_tokens": 32,
+            "extra_body_json": {},
+        },
+    )()
+    monkeypatch.setattr(llm_client_module, "decrypt_secret", lambda _value: "synthetic-key")
+    monkeypatch.setattr(
+        llm_client_module,
+        "OpenAI",
+        lambda **kwargs: captured.update(kwargs) or _FakeOpenAIClient(),
+    )
+
+    LLMClient(model_config, timeout_seconds=30)
+
+    http_client = captured["http_client"]
+    try:
+        assert isinstance(http_client, httpx.Client)
+        assert http_client.event_hooks["response"] == [
+            llm_client_module._install_model_response_body_limit,
+        ]
+        assert http_client.headers["accept-encoding"] == "identity"
+    finally:
+        http_client.close()
 
 
 def test_llm_client_allows_scoped_timeout_override(monkeypatch):
@@ -1829,7 +1921,7 @@ def test_generate_json_retries_share_one_deadline(monkeypatch) -> None:
     client.timeout_seconds = 1.0
     calls = iter(["not json", "still not json"])
     observed_calls: list[str] = []
-    moments = iter([0.0, 0.5, 0.6, 2.0])
+    moments = iter([0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 2.0])
 
     def fake_generate_text(_system_prompt, _payload):
         """返回两次坏JSON，第三次调用前由总deadline拒绝继续外呼。"""
@@ -1843,6 +1935,148 @@ def test_generate_json_retries_share_one_deadline(monkeypatch) -> None:
     with pytest.raises(LLMError, match="MODEL_CALL_DEADLINE_EXCEEDED"):
         client.generate_json("prompt", {})
     assert observed_calls == ["called", "called"]
+
+
+def test_generate_json_rejects_blocked_provider_result_after_deadline(monkeypatch) -> None:
+    """同步provider无视HTTP超时时，冻结JSON墙钟到期也必须拒绝迟到结果。"""
+
+    provider_started = Event()
+    provider_release = Event()
+    provider_finished = Event()
+    close_called = Event()
+    client = object.__new__(LLMClient)
+    client.timeout_seconds = 0.05
+    client._last_stage_request_user_content = "original-request"
+    client._last_completed_response_metadata = {"response_id": "original-response"}
+
+    class BlockingProviderClient:
+        """模拟可关闭但当前请求仍可能迟到的SDK客户端。"""
+
+        def close(self) -> None:
+            """记录截止触发后的最佳努力关闭请求。"""
+
+            close_called.set()
+
+    client.client = BlockingProviderClient()
+
+    def blocked_generate_text(worker_client, *_args, **_kwargs) -> str:
+        """忽略传入超时并阻塞，复现同步SDK越过JSON阶段deadline。"""
+
+        provider_started.set()
+        provider_release.wait(timeout=1.0)
+        worker_client._last_stage_request_user_content = "late-request"
+        worker_client._last_completed_response_metadata = {"response_id": "late-response"}
+        provider_finished.set()
+        return '{"ok": true}'
+
+    monkeypatch.setattr(LLMClient, "generate_text", blocked_generate_text)
+    try:
+        with pytest.raises(LLMError, match="MODEL_CALL_DEADLINE_EXCEEDED"):
+            client.generate_json("prompt", {}, is_cancelled=lambda: False)
+    finally:
+        provider_release.set()
+
+    assert provider_started.is_set()
+    assert close_called.wait(timeout=0.2)
+    assert provider_finished.wait(timeout=0.2)
+    assert client._last_stage_request_user_content == "original-request"
+    assert client._last_completed_response_metadata == {"response_id": "original-response"}
+
+
+def test_generate_json_applies_absolute_deadline_through_openai_sdk() -> None:
+    """真实OpenAI SDK读取持续有数据的HTTP响应时仍受JSON总墙钟期限约束。"""
+
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from json import dumps
+    from time import sleep
+
+    from openai import OpenAI
+
+    request_started = Event()
+    response_finished = Event()
+    response_body = dumps(
+        {
+            "id": "chatcmpl-synthetic-deadline",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "synthetic-model",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": '{"ok": true}'},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        },
+        separators=(",", ":"),
+    ).encode()
+
+    class SlowCompletionHandler(BaseHTTPRequestHandler):
+        """逐块返回有效OpenAI响应，保证单次read不会超时而整体响应会越期。"""
+
+        protocol_version = "HTTP/1.1"
+
+        def do_POST(self) -> None:  # noqa: N802
+            """记录模型请求并以小间隔发送合成响应块。"""
+
+            length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(length)
+            request_started.set()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(response_body)))
+            self.end_headers()
+            try:
+                for offset in range(0, len(response_body), 16):
+                    self.wfile.write(response_body[offset : offset + 16])
+                    self.wfile.flush()
+                    sleep(0.05)
+                response_finished.set()
+            except OSError:
+                # 截止钩子关闭SDK连接后，受控服务会收到正常的客户端断开。
+                return
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            """不把合成HTTP请求细节写入测试输出。"""
+
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), SlowCompletionHandler)
+    server.daemon_threads = True
+    server_thread = Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    client = object.__new__(LLMClient)
+    client.timeout_seconds = 0.8
+    client.client = OpenAI(
+        api_key="synthetic-test-key",
+        base_url=f"http://127.0.0.1:{server.server_port}/v1",
+        timeout=2.0,
+        max_retries=0,
+    )
+    client.base_url = f"http://127.0.0.1:{server.server_port}/v1"
+    client.model = "synthetic-model"
+    client.temperature = 0.0
+    client.max_output_tokens = 32
+    client.extra_body = {}
+    client.thinking_mode = ""
+    client.dispatch_observer = None
+    client.safe_error_code = None
+    started_at = monotonic()
+    planned_response_seconds = ((len(response_body) + 15) // 16) * 0.05
+    try:
+        with pytest.raises(LLMError, match="MODEL_CALL_DEADLINE_EXCEEDED"):
+            client.generate_json("synthetic system", {"task": "deadline"})
+        elapsed = monotonic() - started_at
+        # 整片回归时线程调度可能超过100ms；这里只确认请求已发出，不收紧业务截止期限。
+        assert request_started.wait(timeout=0.5)
+        assert elapsed < planned_response_seconds + 0.25
+        assert not response_finished.is_set()
+    finally:
+        client.client.close()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=1)
 
 
 def test_generate_json_retry_keeps_original_payload(monkeypatch):

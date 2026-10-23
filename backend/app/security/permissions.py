@@ -1,5 +1,5 @@
 """
-@Time       : 2026/08/10 16:25
+@Time       : 2026/10/02
 @Author     : zhanglp8181
 @File       : permissions.py
 @CallChain  : API/Connector Runtime → tenant/Agent permission predicates → allow or reject
@@ -132,8 +132,10 @@ def can_use_agent_in_chat(
     db: Session,
     row: AgentProfile,
     user: User,
+    *,
+    current: bool = False,
 ) -> bool:
-    """统一判断用户能否在交互入口使用 Agent，防止连接器绕过聊天使用关系。"""
+    """统一聊天使用权限；授权提交可要求当前锁读，拒绝已撤销关系的旧RR快照。"""
 
     if (
         row.tenant_id != user.tenant_id
@@ -144,7 +146,8 @@ def can_use_agent_in_chat(
         return False
     adopted_release_id = (row.metadata_json or {}).get("adopted_release_id")
     if isinstance(adopted_release_id, str):
-        release = db.get(PublicationRelease, adopted_release_id)
+        release = db.get(PublicationRelease, adopted_release_id,
+                         populate_existing=current, with_for_update=current)
         if (
             release is None
             or release.tenant_id != row.tenant_id
@@ -156,11 +159,12 @@ def can_use_agent_in_chat(
         return True
     if not agent_is_published(row):
         return False
-    usage = db.exec(
-        select(AgentUsage).where(
+    usage_query = select(AgentUsage).where(
             AgentUsage.tenant_id == row.tenant_id,
             AgentUsage.user_id == user.id,
             AgentUsage.agent_id == row.id,
         )
-    ).first()
+    if current:
+        usage_query = usage_query.with_for_update().execution_options(populate_existing=True)
+    usage = db.exec(usage_query).first()
     return usage is not None

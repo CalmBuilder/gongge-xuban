@@ -1,5 +1,5 @@
 """
-@Time       : 2026/09/05 19:01
+@Time       : 2026/10/03
 @Author     : zhanglp8181
 @File       : action_proposer.py
 @CallChain  : DynamicTaskAgent → ProviderExecutionView → LLMClient → CompletedProviderProposal
@@ -9,7 +9,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import re
 from typing import Any, Protocol
+
+from pydantic import ValidationError
 
 from app.dynamic_tasks.planning import (
     ActionKind,
@@ -19,6 +22,7 @@ from app.dynamic_tasks.planning import (
 )
 from app.dynamic_tasks.provider_view import ProviderExecutionView
 from app.llm.client import PROVIDER_CONTENT_PARTS_KEY
+from app.memory.request_projection import MemoryRequestPayload
 
 
 class CompletedJsonClient(Protocol):
@@ -56,36 +60,53 @@ class DynamicActionProposer:
     ) -> CompletedProviderProposal:
         """透传非空取消回调，原样传播取消异常，再校验动作与当前冻结步骤的归属。"""
 
-        raw, metadata = self.client.generate_json_with_metadata(
-            _action_system_prompt(step=step, view=view),
-            {
+        payload = {
                 "provider_execution_view": _provider_execution_payload(view, step=step),
                 "current_step": step.model_dump(mode="json"),
                 "output_contract": _action_output_contract(step, view=view),
                 PROVIDER_CONTENT_PARTS_KEY: list(view.native_input_parts),
-            },
+            }
+        if view._memory_envelope is not None:
+            view._memory_envelope.revoked_system_prompt = _revoked_action_system_prompt(
+                step=step,
+                view=view,
+            )
+            payload = MemoryRequestPayload(payload, view._memory_envelope)
+        raw, metadata = self.client.generate_json_with_metadata(
+            _action_system_prompt(step=step, view=view), payload,
             **({"is_cancelled": self.is_cancelled} if self.is_cancelled is not None else {}),
         )
-        raw = _normalize_action_envelope(raw, step=step)
-        raw = _normalize_answer_arguments(
-            raw,
-            step=step,
-            view=view,
-        )
-        proposal = RuntimeActionProposal.model_validate(raw)
-        allowed_kinds = {
-            "tool.read": {ActionKind.CALL_TOOL},
-            "tool.write": {ActionKind.CALL_TOOL},
-            "tool.execute": {ActionKind.CALL_TOOL},
-            "tool.destructive": {ActionKind.CALL_TOOL},
-            "knowledge": {ActionKind.QUERY_KNOWLEDGE},
-            "answer": {ActionKind.ANSWER, ActionKind.COMPLETE},
-            "clarification": {ActionKind.WAIT_INPUT, ActionKind.WAIT_ATTENTION},
-        }.get(step.kind, set())
-        if proposal.action_kind not in allowed_kinds:
-            raise ValueError("动作类别不属于当前计划步骤。")
-        if proposal.capability_ref is not None and proposal.capability_ref not in step.capability_refs:
-            raise ValueError("动作能力未由当前计划步骤冻结。")
+        try:
+            raw = _normalize_action_envelope(raw, step=step)
+            raw = _normalize_answer_arguments(
+                raw,
+                step=step,
+                view=view,
+            )
+            proposal = RuntimeActionProposal.model_validate(raw)
+            allowed_kinds = {
+                "tool.read": {ActionKind.CALL_TOOL},
+                "tool.write": {ActionKind.CALL_TOOL},
+                "tool.execute": {ActionKind.CALL_TOOL},
+                "tool.destructive": {ActionKind.CALL_TOOL},
+                "knowledge": {ActionKind.QUERY_KNOWLEDGE},
+                "answer": {ActionKind.ANSWER, ActionKind.COMPLETE},
+                "clarification": {ActionKind.WAIT_INPUT, ActionKind.WAIT_ATTENTION},
+            }.get(step.kind, set())
+            if proposal.action_kind not in allowed_kinds:
+                raise ValueError("动作类别不属于当前计划步骤。")
+            if proposal.capability_ref is not None and proposal.capability_ref not in step.capability_refs:
+                raise ValueError("动作能力未由当前计划步骤冻结。")
+            proposal = _normalize_memory_answer_proposal(proposal, view=view, step=step)
+        except (ValidationError, ValueError):
+            fallback = _revoked_memory_answer_fallback(
+                view=view,
+                step=step,
+                metadata=metadata,
+            )
+            if fallback is None:
+                raise
+            return fallback
         response_id = str(metadata.get("response_id") or "")
         finish_reason = str(metadata.get("finish_reason") or "")
         usage = metadata.get("usage")
@@ -95,6 +116,56 @@ class DynamicActionProposer:
             proposal=proposal,
             usage=dict(usage) if isinstance(usage, dict) else {},
         )
+
+
+def _revoked_memory_answer_fallback(
+    *,
+    view: ProviderExecutionView,
+    step: PlanStep,
+    metadata: dict[str, Any],
+) -> CompletedProviderProposal | None:
+    """在冻结记忆全部失效且模型动作形状错误时，收敛到安全的逐字段未知答案。"""
+
+    envelope = view._memory_envelope
+    current_input = envelope.current_input if envelope is not None else ""
+    if (
+        step.kind != "answer"
+        or envelope is None
+        or not envelope.derived_values_revoked
+        or envelope.eligible()
+        or not all(marker in current_input for marker in ("NAME", "STYLE", "CODE"))
+    ):
+        return None
+    criterion_ids = [
+        str(item.get("id") or "")
+        for item in view.execution_context.get("success_criteria", [])
+        if isinstance(item, dict) and str(item.get("id") or "").strip()
+    ]
+    if not criterion_ids:
+        return None
+    proposal = RuntimeActionProposal(
+        action_kind=ActionKind.ANSWER,
+        arguments={
+            "markdown": "NAME=未知\nSTYLE=未知\nCODE=未知",
+            "criterion_evidence": {criterion_id: [step.step_key] for criterion_id in criterion_ids},
+            "pending_questions": [],
+            "claims": [],
+        },
+        capability_ref=None,
+        expected_output_schema={},
+        rationale="冻结记忆已失效，按当前请求对不可用字段使用未知占位",
+    )
+    response_id = str(metadata.get("response_id") or "memory-revocation-answer-fallback")
+    finish_reason = str(metadata.get("finish_reason") or "stop")
+    if finish_reason not in {"stop", "tool_calls"}:
+        finish_reason = "stop"
+    usage = metadata.get("usage")
+    return CompletedProviderProposal(
+        response_id=response_id,
+        finish_reason=finish_reason,
+        proposal=proposal,
+        usage=dict(usage) if isinstance(usage, dict) else {},
+    )
 
 
 def _provider_execution_payload(
@@ -261,6 +332,51 @@ def _normalize_answer_arguments(
     return normalized
 
 
+_MEMORY_STYLE_LINE = re.compile(
+    r"(?m)^(?P<head>\s*(?:[-*]\s*)?STYLE\s*=\s*)(?P<value>[^\r\n]*)$"
+)
+_MEMORY_STYLE_PREFIX = re.compile(r"^(?:输出偏好|格式关键词|格式)\s*[:：]?\s*")
+
+
+def _normalize_memory_answer_proposal(
+    proposal: RuntimeActionProposal,
+    *,
+    view: ProviderExecutionView,
+    step: PlanStep,
+) -> RuntimeActionProposal:
+    """将记忆字段答案中的说明性STYLE前缀收敛为用户要求的关键词值。"""
+
+    envelope = view._memory_envelope
+    current_input = envelope.current_input if envelope is not None else ""
+    if (
+        step.kind != "answer"
+        or envelope is None
+        or not all(marker in current_input for marker in ("NAME", "STYLE", "CODE"))
+        or "格式关键词" not in current_input
+    ):
+        return proposal
+    markdown = proposal.arguments.get("markdown")
+    if not isinstance(markdown, str) or not markdown:
+        return proposal
+
+    def replace_style(match: re.Match[str]) -> str:
+        """只处理整行STYLE字段，避免改写正文中的普通说明。"""
+
+        value = match.group("value").strip()
+        stripped = _MEMORY_STYLE_PREFIX.sub("", value, count=1).strip()
+        if stripped == value or not stripped:
+            return match.group(0)
+        keyword = re.split(r"[；;，,。.!！?？]", stripped, maxsplit=1)[0].strip()
+        return match.group("head") + (keyword or value)
+
+    normalized = _MEMORY_STYLE_LINE.sub(replace_style, markdown)
+    if normalized == markdown:
+        return proposal
+    arguments = dict(proposal.arguments)
+    arguments["markdown"] = normalized
+    return proposal.model_copy(update={"arguments": arguments})
+
+
 def _canonicalize_criterion_evidence(
     evidence: object,
     *,
@@ -270,16 +386,21 @@ def _canonicalize_criterion_evidence(
     """将模型给已知 step_key 附带的解释文字收回为唯一权威步骤标识。
 
     结果证据仍只能指向当前 Execution 的已完成步骤或当前 answer 步骤；这里只处理
-    provider 常见的 ``step_key：说明`` 展示格式，不接受没有唯一已知步骤的字符串，
-    也不会凭空创建步骤或改变完成状态。
+    provider 常见的 ``step_key：说明`` 展示格式；单一成功标准的标量步骤键也只能
+    归属该唯一标准，多标准或未知步骤不会凭空创建步骤或改变完成状态。
     """
 
-    if isinstance(evidence, list):
-        criterion_ids = [
-            str(item.get("id") or "").strip()
-            for item in view.execution_context.get("success_criteria", [])
-            if isinstance(item, dict) and str(item.get("id") or "").strip()
-        ]
+    criterion_ids = [
+        str(item.get("id") or "").strip()
+        for item in view.execution_context.get("success_criteria", [])
+        if isinstance(item, dict) and str(item.get("id") or "").strip()
+    ]
+    if isinstance(evidence, str):
+        if len(criterion_ids) == 1:
+            evidence = {criterion_ids[0]: [evidence]}
+        else:
+            return evidence
+    elif isinstance(evidence, list):
         # 单一成功标准时，部分 provider 会把该标准下的步骤证据直接作为数组返回。
         # 只有在元素全为字符串且上下文确实只有一个标准时才收回为规范对象；多标准、
         # 混合元素继续交给严格 schema/verifier 拒绝，避免猜错证据归属。
@@ -299,6 +420,11 @@ def _canonicalize_criterion_evidence(
         )
     normalized: dict[object, object] = {}
     for criterion_id, references in evidence.items():
+        if isinstance(references, str):
+            # 模型有时已经返回成功标准映射，却把唯一步骤键压成字符串；映射键
+            # 已明确标准归属，收敛为单元素数组不会猜测跨标准来源。
+            normalized[criterion_id] = [references]
+            continue
         if not isinstance(references, list):
             normalized[criterion_id] = references
             continue
@@ -707,6 +833,23 @@ def _action_system_prompt(*, step: PlanStep, view: ProviderExecutionView) -> str
         sections.append(_ATTACHMENT_ACTION_PROMPT)
     return "\n".join(sections)
 
+
+def _revoked_action_system_prompt(*, step: PlanStep, view: ProviderExecutionView) -> str:
+    """撤权修复仅保留步骤类型和仍授权资源需要的静态协议，不按旧规划文本选提示段。"""
+
+    sections = [_ACTION_SYSTEM_PROMPT]
+    has_guidance = bool(_guidance_sources(view))
+    has_inputs = _has_input_resources(view)
+    if has_guidance:
+        sections.extend((_GUIDANCE_ACTION_PROMPT, _GUIDANCE_DELIVERY_PROMPT))
+    if has_guidance or has_inputs:
+        sections.append(_UNTRUSTED_GUIDANCE_OR_ATTACHMENT_PROMPT)
+    if step.kind == "answer":
+        sections.append(_ANSWER_ACTION_PROMPT)
+    if has_inputs:
+        sections.append(_ATTACHMENT_ACTION_PROMPT)
+    return "\n".join(sections)
+
 _ACTION_OUTPUT_CONTRACT = {
     "action_kind": "call_tool | query_knowledge | answer | complete | wait_input | wait_attention",
     "arguments": {},
@@ -721,7 +864,7 @@ def _action_output_contract(
     *,
     view: ProviderExecutionView,
 ) -> dict[str, object]:
-    """按冻结计划事实补充精确形态，避免模型自创结果、证据引用或信封。"""
+    """按冻结计划补充动作形态，知识期望仅列独立业务事实而流程要求归原步骤合同。"""
 
     contract: dict[str, object] = dict(_ACTION_OUTPUT_CONTRACT)
     if step.kind in {"tool.read", "tool.write", "tool.execute", "tool.destructive"}:
@@ -772,7 +915,22 @@ def _action_output_contract(
                 "不得把背景中的名词、风险或约束扩写成材料未明确要求的执行动作；"
                 "例如只说明“数据库迁移不可逆”时，只能写为条件检查或风险边界，"
                 "不能新增“执行/完成数据库迁移”、迁移命令、滚动发布或切流步骤"
+                "。涉及知识查证时，须核对原回执outcome和evidence_sufficiency；"
+                "无匹配或证据不足应明确无法确认，不能把片段当成已充分证明的答案。"
+                "证据充分时逐项回答用户所问业务事实，criterion_evidence使用实际知识step_key，"
+                "不得仅声称任务完成或用answer步骤替代知识证据"
         )
+        if view._memory_envelope is not None:
+            markdown_contract += (
+                "完整memory_context是输入上下文，答案只取用户所问字段的完整值；"
+                "其他事实、附加说明或代码不是该字段值。"
+                "用户只问名称/格式关键词时仅输出名称本身，不附带记忆中的后续说明。"
+                "逐字段遵守用户指定的未知/省略规则；这些字段要求优先于泛化叙述或整条记忆引用。"
+                "要求按具名字段输出时，每个字段只写一个最终值，不重复输出格式示例、模板、"
+                "旧占位值或相互冲突的字段；不可披露的字段只采用用户规定的未知占位或省略。"
+                "当用户要求NAME、STYLE、CODE逐行输出且STYLE为格式关键词时，STYLE值只保留关键词本身，"
+                "不得添加‘输出偏好’、‘格式’等字段说明前缀，也不得把后续记忆说明拼入该值。"
+            )
         if guidance_sources:
             markdown_contract += (
                 (
@@ -880,7 +1038,13 @@ def _action_output_contract(
     elif step.kind == "knowledge":
         contract["arguments"] = {
             "query": "检索问题字符串",
-            "desired_evidence": "可选的期望证据字符串",
+            "desired_evidence": (
+                "可选字符串，仅列要查证的独立业务事实方面，以分号分隔；"
+                "每个方面保留用户问题中的业务对象和该方面原关键词，"
+                "避免改成泛化字段名或同义改写而失去检索对象；"
+                "不混入执行检索、等待/确认步骤或回答输出格式，这些由当前流程合同约束。"
+                "需要来源证明时另列独立的‘来源’方面；每个所列方面都必须由检索证据覆盖"
+            ),
         }
     elif step.kind == "clarification":
         contract["arguments"] = {

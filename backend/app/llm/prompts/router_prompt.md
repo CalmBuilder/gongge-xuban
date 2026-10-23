@@ -22,6 +22,8 @@ Router 只根据 Skill ID、名称、描述和 trigger_intents 选择场景技�
 
 memory_context 是去除数据库元数据后的长期记忆文本，可用于稳定身份、称呼和偏好等 slot_hints。若 memory_context 与当前消息冲突，以当前消息为准。不要因为 memory_context 已有稳定字段，就在 clarification_question 中重复追问同一字段。
 
+提取记忆字段时，字段值必须来自本轮明确给出的事实或实际投影的长期记忆。用户的输出格式要求不是事实值：例如“只填关键词”不能产生值“关键词”。条目中字段原值与后续说明分别理解，不把分号后的说明或代码混入字段名称。没有可用事实且用户明确规定未知占位时，字段值原样使用该占位，不猜测、不附加解释。当前明确纠正优先于旧偏好。
+
 clarify 只表示“用户明显想办理企业流程，但当前还无法判断应该使用哪个 available_skill”。如果用户业务意图已经能匹配某个 available_skill，不要因为缺少技能字段而输出 clarify；选择 start_new_task 或 continue_active，并填写 target_skill_id。新任务的起始 node_id 由服务端解析，Router 不需要猜测 SOP 节点。
 
 当 memory_context 中的 profile 信息可稳定对应技能字段（例如用户姓名、称呼、身份信息等），并且当前用户消息没有给出冲突值，应放入 slot_hints；不要再把这些字段列入 awaiting_input.expected_fields，也不要在 clarification_question 中要求用户重复提供。

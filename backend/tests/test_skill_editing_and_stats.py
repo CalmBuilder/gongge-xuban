@@ -1,3 +1,10 @@
+"""
+@Time       : 2026/10/03
+@Author     : zhanglp8181
+@File       : test_skill_editing_and_stats.py
+@CallChain  : 原技能/分支回归 → 真实账号授权 → 原管理发布/版本职责
+@Description: 保留原行为断言，为当前短事务授权检查初始化真实登录账号。
+"""
 import json
 from io import BytesIO
 from zipfile import ZipFile
@@ -32,12 +39,30 @@ from app.skills.skill_schema import SkillCard, SkillCreateRequest, SkillDistillR
 from app.security.encryption import encrypt_secret
 
 
-def _admin_user() -> User:
-    return User(id="user_admin", tenant_id="tenant_demo", username="admin", role="admin", password_hash="test")
+def _admin_user(db: Session | None = None) -> User:
+    """初始化真实账号供生产当前授权检查；纯传输替身可只构造登录对象。"""
+    row = User(id="user_admin", tenant_id="tenant_demo", username="admin", role="admin", password_hash="test")
+
+    if db is not None:
+        existing = db.get(User, row.id)
+        if existing is not None:
+            return existing
+        db.add(row)
+        db.flush()
+    return row
 
 
-def _owner_user() -> User:
-    return User(id="user_owner", tenant_id="tenant_demo", username="owner", password_hash="test")
+def _owner_user(db: Session | None = None) -> User:
+    """初始化真实账号供生产当前授权检查；纯传输替身可只构造登录对象。"""
+    row = User(id="user_owner", tenant_id="tenant_demo", username="owner", password_hash="test")
+
+    if db is not None:
+        existing = db.get(User, row.id)
+        if existing is not None:
+            return existing
+        db.add(row)
+        db.flush()
+    return row
 
 
 def test_skill_editor_only_merges_selected_step() -> None:
@@ -265,6 +290,37 @@ def test_skill_editor_applies_patch_response_without_full_draft() -> None:
 
     assert response.draft_skill.response_rules == ["信息不足时追问；工具成功后给出明确结果，不编造事实。"]
     assert response.draft_skill.nodes[0].instruction == current.nodes[0].instruction
+
+
+def test_skill_editor_applies_nested_node_metadata_patch() -> None:
+    """模型以节点元数据的嵌套路径修正工具输入时，应只更新该键并保留其余图。"""
+    current = _skill_card()
+    current.nodes[1].metadata = {"operation_input": {"employee_id": "slots.sponsor_id"}}
+
+    response = SkillEditor()._normalize_response(  # noqa: SLF001
+        {
+            "assistant_message": "已修正查询输入来源。",
+            "patches": [
+                {
+                    "path": "nodes.reply_result.metadata.operation_input.employee_id",
+                    "value": "slots.employee_id",
+                }
+            ],
+        },
+        SkillRewriteRequest(
+            tenant_id="tenant_demo",
+            current_skill=current,
+            instruction="只修正查询节点的employee_id来源",
+            target_path="nodes.reply_result",
+            target_paths=["nodes.reply_result"],
+            target_label="查询节点",
+        ),
+    )
+
+    assert response.draft_skill.nodes[1].metadata == {
+        "operation_input": {"employee_id": "slots.employee_id"}
+    }
+    assert response.draft_skill.nodes[0].model_dump() == current.nodes[0].model_dump()
 
 
 def test_skill_editor_stream_repairs_invalid_json_once(monkeypatch) -> None:
@@ -508,13 +564,13 @@ def test_skill_can_return_to_draft_without_leaving_runtime_list() -> None:
         ensure_open_gallery_binding(db, "tenant_demo", "skill", row.id, "active")
         db.commit()
 
-        drafted = draft_skill(content.skill_id, tenant_id="tenant_demo", db=db, current_user=_admin_user())
+        drafted = draft_skill(content.skill_id, tenant_id="tenant_demo", db=db, current_user=_admin_user(db))
 
         assert drafted.status == "draft"
         assert [item.skill_id for item in list_skills("tenant_demo", db)] == [content.skill_id]
         assert visible_published_skills(db, "tenant_demo") == []
 
-        published = publish_skill(content.skill_id, tenant_id="tenant_demo", db=db, current_user=_admin_user())
+        published = publish_skill(content.skill_id, tenant_id="tenant_demo", db=db, current_user=_admin_user(db))
 
         assert published.status == "published"
         assert [item.skill_id for item in visible_published_skills(db, "tenant_demo")] == [content.skill_id]
@@ -543,7 +599,7 @@ def test_personal_created_skill_uses_agent_owner_as_creator() -> None:
             SkillCreateRequest(tenant_id="tenant_demo", content=_skill_card(), status="published"),
             agent_id=agent.id,
             db=db,
-            current_user=_owner_user(),
+            current_user=_owner_user(db),
         )
         listed = list_skills("tenant_demo", db, agent_id=agent.id)
 
@@ -589,7 +645,7 @@ def test_personal_created_skill_binds_explicit_tools_to_its_skill_id() -> None:
             ),
             agent_id=agent.id,
             db=db,
-            current_user=_owner_user(),
+            current_user=_owner_user(db),
         )
 
         db.refresh(tool)
@@ -809,7 +865,7 @@ def test_rollback_skill_version_restores_content_without_copying_stats() -> None
             "1.0.0",
             "tenant_demo",
             db,
-            current_user=_admin_user(),
+            current_user=_admin_user(db),
         )
         row = db.exec(
             select(Skill).where(
@@ -1551,7 +1607,7 @@ def test_distill_skill_uses_selected_model_config(monkeypatch) -> None:
                 model_config_id="model_selected",
             ),
             db=db,
-            current_user=_admin_user(),
+            current_user=_admin_user(db),
         )
 
     assert captured["model_id"] == "model_selected"

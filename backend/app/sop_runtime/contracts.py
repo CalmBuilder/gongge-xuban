@@ -62,6 +62,7 @@ class OperationStatus(StrEnum):
     PREPARED = "prepared"
     RUNNING = "running"
     RETRY_WAIT = "retry_wait"
+    WAITING_EXTERNAL = "waiting_external"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     UNKNOWN = "unknown"
@@ -82,7 +83,7 @@ NONTERMINAL_OPERATION_STATUSES = frozenset(
     for status in OperationStatus
     if status.value not in TERMINAL_OPERATION_STATUSES
 )
-"""操作非终态集合，统一覆盖 prepared、running、retry_wait 和 unknown。"""
+"""操作非终态集合，统一覆盖活动、外部等待和 unknown。"""
 
 
 class DeliveryStatus(StrEnum):

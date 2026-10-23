@@ -20,9 +20,12 @@ from app.dynamic_tasks.capability_catalog import (
     CapabilityAccessDenied,
     DynamicCapabilityCatalog,
     ToolReliabilityContract,
+    _legacy_tool_snapshot_checksum,
     capability_checksum,
     dynamic_model_snapshot_checksum,
     dynamic_model_snapshot_matches,
+    publish_tool_contract,
+    published_tool_snapshot,
     project_tool_capability,
 )
 from app.general_skills.schema import GeneralSkillImportRequest
@@ -229,6 +232,33 @@ def test_capability_snapshot_is_canonical_and_views_do_not_leak_credentials() ->
     first = capability_checksum({"contract": contract.model_dump(mode="json"), "name": tool.name})
     second = capability_checksum({"name": tool.name, "contract": contract.model_dump(mode="json")})
     assert first == second
+
+
+def test_historical_internal_worker_contract_is_read_and_checksum_verified() -> None:
+    """历史后台策略只在读取时兼容，旧快照仍须通过摘要校验且新投影使用中性名称。"""
+
+    tool = Tool(
+        id="tool_historical_worker",
+        tenant_id="tenant_a",
+        name="historical.lookup",
+        method="GET",
+        url="https://example.invalid",
+    )
+    contract = _contract()
+    publish_tool_contract(tool, contract)
+
+    legacy_payload = dict(tool.reliability_contract_json)
+    legacy_payload["async_strategy"] = "staffdeck_worker"
+    tool.reliability_contract_json = legacy_payload
+    tool.reliability_checksum = _legacy_tool_snapshot_checksum(
+        tool, "agent_a", contract, legacy_payload
+    )
+
+    snapshot = published_tool_snapshot(tool, "agent_a")
+
+    assert snapshot is not None
+    assert snapshot.contract["async_strategy"] == "internal_worker"
+    assert tool.reliability_contract_json["async_strategy"] == "staffdeck_worker"
 
 
 def test_catalog_defaults_legacy_tools_out_and_rechecks_live_access() -> None:

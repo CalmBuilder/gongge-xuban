@@ -206,6 +206,36 @@ it('展示动态澄清问题并读取原执行的权威状态', async () => {
   );
 });
 
+it('同名待办按持久身份打开对应执行', async () => {
+  /** 同标题并存时仍按具体待办身份选中正确执行，避免误批另一条任务。 */
+
+  const duplicate = {
+    ...toolApproval,
+    id: 'attention_write_duplicate',
+    execution_id: 'execution_write_duplicate',
+  };
+  vi.mocked(api.get).mockImplementation(async (path: string) => {
+    if (path.startsWith('/api/executions/')) {
+      return { id: 'execution_write_duplicate', status: 'waiting', revision: 2, effect_state: 'none' };
+    }
+    return { items: [toolApproval, duplicate], total: 2 };
+  });
+  const user = userEvent.setup();
+  const { container } = renderCenter();
+  await waitFor(() => expect(
+    container.querySelector('[data-attention-item-id="attention_write_duplicate"]'),
+  ).not.toBeNull());
+  const button = container.querySelector('[data-attention-item-id="attention_write_duplicate"]');
+  expect(button).not.toBeNull();
+  if (!button) throw new Error('没有渲染目标待办按钮');
+  await user.click(button);
+
+  await waitFor(() => expect(api.get).toHaveBeenCalledWith(
+    '/api/executions/execution_write_duplicate?tenant_id=tenant_demo',
+  ));
+  expect(screen.getByRole('dialog')).toHaveTextContent('批准企业微信消息发送');
+});
+
 it('用事项修订号和唯一命令号提交答案后继续原执行', async () => {
   /** 验证 answer 命令携带 tenant、CAS revision 和用户补充内容。 */
 
@@ -374,6 +404,40 @@ it('受管代码审批展示工作区与精确参数并使用通用操作文案'
       command: 'allow_once',
       expected_revision: 7,
     }),
+  ]);
+  expect(vi.mocked(api.post).mock.calls[0][1]).not.toHaveProperty('arguments');
+});
+
+it('普通HTTP写审批展示冻结工具参数且只提交原批准命令', async () => {
+  /** 空工作区的普通工具必须展示精确参数，批准请求不能重写冻结业务正文。 */
+  const genericApproval = {
+    ...toolApproval,
+    id: 'attention_generic_write',
+    title: '批准配送提交',
+    payload: {
+      operation_name: 'final_f1.submit@revision_1',
+      risk_class: 'external_write',
+      workspace: {},
+      arguments: { product_name: 'ALPHA91', quantity: 3, customer: 'CYGNUS77', due_date: '2026-10-04 09:00' },
+      request_fingerprint: 'd'.repeat(64),
+    },
+  };
+  vi.mocked(api.get).mockImplementation(async (path: string) => path.startsWith('/api/executions/')
+    ? { id: 'execution_1', status: 'waiting', revision: 12, effect_state: 'none' }
+    : { items: [genericApproval], total: 1 });
+  const user = userEvent.setup();
+  renderCenter();
+  await user.click(await screen.findByRole('button', { name: /批准配送提交/ }));
+  const review = screen.getByLabelText('待批准工具操作');
+  for (const field of ['ALPHA91', 'CYGNUS77', '2026-10-04 09:00', 'final_f1.submit@revision_1']) {
+    expect(review).toHaveTextContent(field);
+  }
+  expect(screen.queryByText('目标：当前企业微信会话')).not.toBeInTheDocument();
+  await user.click(screen.getByRole('button', { name: '仅批准本次操作' }));
+  await waitFor(() => expect(api.post).toHaveBeenCalledTimes(1));
+  expect(vi.mocked(api.post).mock.calls[0]).toEqual([
+    '/api/attention-items/attention_generic_write/resolve',
+    expect.objectContaining({ tenant_id: 'tenant_demo', command: 'allow_once', expected_revision: 5 }),
   ]);
   expect(vi.mocked(api.post).mock.calls[0][1]).not.toHaveProperty('arguments');
 });

@@ -1,18 +1,20 @@
 """
-@Time       : 2026/07/28 23:35
+@Time       : 2026/10/11
 @Author     : zhanglp8181
 @File       : test_knowledge_governance.py
 @CallChain  : pytest → Knowledge management API/governance service → SQLite SQLModel
-@Description: 验证知识库默认最小权限、组织范围校验、乐观锁和租户隔离。
+@Description: 验证知识库版本创建原子性、默认最小权限、组织范围校验、乐观锁和租户隔离。
 """
 
 from __future__ import annotations
 
 import pytest
 from fastapi import HTTPException
+from sqlalchemy import event
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
+from app.agents.branching import ensure_knowledge_base_version
 from app.api.knowledge_bases import (
     create_knowledge_base,
     delete_knowledge_base,
@@ -22,6 +24,7 @@ from app.api.knowledge_bases import (
 from app.db.models import (
     KnowledgeBase,
     KnowledgeBaseOrgAccess,
+    KnowledgeBaseVersion,
     ManagementAuditLog,
     OrganizationUnit,
     Tenant,
@@ -57,6 +60,61 @@ def test_create_knowledge_base_defaults_to_current_owner_and_restricted_download
         assert result.download_policy == "restricted"
         assert result.revision == 1
         assert result.organization_access == []
+
+
+def test_create_knowledge_base_commits_initial_version_atomically(tmp_path) -> None:
+    """模拟并发管理读取，确保新知识库首次可见时初始版本已一同提交。"""
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'knowledge-version-commit.db'}",
+        connect_args={"check_same_thread": False, "timeout": 30},
+    )
+    SQLModel.metadata.create_all(engine)
+    version_missing_at_first_visibility: list[bool] = []
+
+    with Session(engine) as db:
+        admin = _seed_tenant(db, "tenant_version_race", "version-race-admin")
+
+        def concurrent_reader(_session) -> None:
+            """在创建事务提交后立即模拟另一个读取者解析其首个版本。"""
+
+            with Session(engine) as observer:
+                row = observer.exec(
+                    select(KnowledgeBase).where(
+                        KnowledgeBase.tenant_id == "tenant_version_race",
+                        KnowledgeBase.name == "竞态知识库",
+                    )
+                ).first()
+                if row is None or version_missing_at_first_visibility:
+                    return
+                version = observer.exec(
+                    select(KnowledgeBaseVersion).where(
+                        KnowledgeBaseVersion.tenant_id == row.tenant_id,
+                        KnowledgeBaseVersion.knowledge_base_id == row.id,
+                        KnowledgeBaseVersion.version == "1.0.0",
+                    )
+                ).first()
+                version_missing_at_first_visibility.append(version is None)
+                if version is None:
+                    ensure_knowledge_base_version(observer, row)
+                    observer.commit()
+
+        event.listen(db, "after_commit", concurrent_reader)
+        try:
+            result = create_knowledge_base(
+                KnowledgeBaseCreateRequest(
+                    tenant_id="tenant_version_race",
+                    name="竞态知识库",
+                ),
+                agent_id=None,
+                db=db,
+                current_user=admin,
+            )
+        finally:
+            event.remove(db, "after_commit", concurrent_reader)
+
+    assert result.version == "1.0.0"
+    assert version_missing_at_first_visibility == [False]
 
 
 def test_update_knowledge_governance_saves_org_roots_and_rejects_stale_revision() -> None:

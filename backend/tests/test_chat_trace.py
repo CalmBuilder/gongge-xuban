@@ -270,6 +270,45 @@ def test_running_client_turn_reattaches_until_original_worker_persists_terminal(
     assert "event: complete" in stream
 
 
+def test_mysql_span_projection_does_not_take_turn_session_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """观测 Span 写入不能重新锁定业务会话，避免 MySQL 阻塞真实 Turn。"""
+
+    db = _test_db()
+    db.add(
+        ChatSession(
+            id="session_span_projection",
+            tenant_id="tenant_demo",
+            user_id="user_demo",
+            agent_id="agent_demo",
+        )
+    )
+    db.commit()
+
+    def fail_if_business_lock_is_requested(*_args: object, **_kwargs: object) -> None:
+        """若 Span 重新走业务 Turn 栅栏，立即让回归失败。"""
+
+        raise AssertionError("span projection must not lock the ChatSession row")
+
+    monkeypatch.setattr(chat_api, "ensure_turn_event_open", fail_if_business_lock_is_requested)
+    chat_api._persist_span_only_event(
+        db,
+        "tenant_demo",
+        "session_span_projection",
+        "knowledge_span_started",
+        {"turn_id": "turn_span_projection", "operation": "knowledge.search"},
+    )
+
+    rows = db.exec(
+        select(AgentEvent).where(
+            AgentEvent.session_id == "session_span_projection",
+            AgentEvent.event_type == "knowledge_span_started",
+        )
+    ).all()
+    assert len(rows) == 1
+
+
 def test_chat_stream_releases_preflight_agent_lock_before_worker_start(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -688,10 +727,17 @@ def test_chat_stream_relay_does_not_cancel_active_dynamic_execution(
 
 def test_chat_stream_waits_for_terminal_event_after_worker_done(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """worker 已结束但终态事件尚未可见时，中继必须等待持久事实而不是提前关闭。"""
 
-    db = _test_db()
+    test_engine = create_engine(
+        f"sqlite:///{tmp_path / 'chat-trace-worker-settle.db'}",
+        connect_args={"check_same_thread": False},
+        poolclass=NullPool,
+    )
+    SQLModel.metadata.create_all(test_engine)
+    db = Session(test_engine)
     session_row = ChatSession(
         id="session_worker_settle_relay",
         tenant_id="tenant_demo",
@@ -724,7 +770,6 @@ def test_chat_stream_waits_for_terminal_event_after_worker_done(
         ]
     )
     db.commit()
-    test_engine = db.get_bind()
     user = User(
         id="user_demo",
         tenant_id="tenant_demo",
@@ -837,10 +882,17 @@ def test_chat_stream_waits_for_terminal_event_after_worker_done(
 
 def test_chat_stream_waits_for_dynamic_execution_after_worker_delegation(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """worker 只完成持久 Execution 委派时，中继必须继续等待 Execution 的终态。"""
 
-    db = _test_db()
+    test_engine = create_engine(
+        f"sqlite:///{tmp_path / 'chat-trace-dynamic-delegation.db'}",
+        connect_args={"check_same_thread": False},
+        poolclass=NullPool,
+    )
+    SQLModel.metadata.create_all(test_engine)
+    db = Session(test_engine)
     session_row = ChatSession(
         id="session_dynamic_delegation_relay",
         tenant_id="tenant_demo",
@@ -889,7 +941,6 @@ def test_chat_stream_waits_for_dynamic_execution_after_worker_delegation(
         ]
     )
     db.commit()
-    test_engine = db.get_bind()
     user = User(
         id="user_demo",
         tenant_id="tenant_demo",

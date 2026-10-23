@@ -1,5 +1,5 @@
 """
-@Time       : 2026/08/28 13:20
+@Time       : 2026/10/01
 @Author     : zhanglp8181
 @File       : router.py
 @CallChain  : AgentLoop → Router → LLMClient → RouterDecision
@@ -25,6 +25,9 @@ from app.llm.stage_protocol import (
     stage_payload,
     unified_system_prompt,
 )
+from app.memory.projection import MemoryCandidate
+from app.memory.request_projection import MemoryRequestEnvelope, MemoryRequestPayload
+from app.memory.service import MemoryService
 from app.observability.spans import llm_operation
 from app.session.session_schema import PendingTask, RouterDecision
 from app.session.slot_policy import strip_router_generated_message_slots
@@ -34,6 +37,10 @@ PROMPT_PATH = paths.resource_dir() / "app" / "llm" / "prompts" / "router_prompt.
 
 
 class Router:
+    def __init__(self, memory_service: MemoryService | None = None) -> None:
+        """生产调用绑定服务端候选读取；独立阶段调用仍兼容已有可信内部输入。"""
+        self.memory_service = memory_service
+
     def decide(
         self,
         message: str,
@@ -59,6 +66,27 @@ class Router:
             },
             output_contract=ROUTER_OUTPUT_SCHEMA,
         )
+        service = self.memory_service
+        candidates = (
+            service.projection_candidates(session.tenant_id, session.user_id,
+                                          agent_id=session.agent_id)
+            if service is not None and session.user_id else tuple(
+                MemoryCandidate(id=f"internal-{index}", key=str(index),
+                                kind=str(item.get("kind") or "fact"),
+                                content=str(item.get("content") or ""))
+                for index, item in enumerate(memory_context or [])
+            )
+        )
+        envelope = MemoryRequestEnvelope(
+            candidates, message,
+            validate=(service.projection_validator(session.tenant_id, session.user_id,
+                                                   agent_id=session.agent_id)
+                      if service is not None and session.user_id else None),
+        )
+        turn_time = payload["_agent_stage"].get("time_context")
+        if isinstance(turn_time, dict):
+            envelope.source_input_id = str(turn_time.get("source_input_id") or "")
+        payload = MemoryRequestPayload(payload, envelope)
         try:
             with llm_operation("router.scene"):
                 generate_kwargs = (
@@ -74,6 +102,9 @@ class Router:
             if isinstance(exc, LLMError):
                 raise
             raise LLMError(f"Router returned invalid JSON schema: {exc}") from exc
+        session.context_state_json = {
+            **(session.context_state_json or {}), "memory_projection_audit": envelope.audits[-8:],
+        }
         return self._normalize_decision(decision, session, available_skills, message)
 
     def _normalize_decision(

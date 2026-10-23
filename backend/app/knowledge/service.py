@@ -1,5 +1,5 @@
 """
-@Time        : 2026/08/28 13:20
+@Time        : 2026/10/03
 @Author      : zhanglp8181
 @File        : service.py
 @CallChain   : Knowledge API / AgentLoop → KnowledgeService → 文档、知识桶与证据片段检索
@@ -15,17 +15,19 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
 from pydantic import ValidationError
-from sqlalchemy import delete
+from sqlalchemy import and_, delete, or_
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from app import paths
 from app.cancellation import TurnCancellationRequested, raise_if_cancelled
 from app.agents.branching import (
+    ensure_knowledge_base_version,
     ensure_open_gallery_binding,
     ensure_private_resource_binding,
     is_open_gallery_resource,
@@ -36,6 +38,7 @@ from app.db.models import (
     AgentResourceBinding,
     KnowledgeBucket,
     KnowledgeBase,
+    KnowledgeBaseVersion,
     KnowledgeChunk,
     KnowledgeConcept,
     KnowledgeDiscoverySuggestion,
@@ -44,6 +47,7 @@ from app.db.models import (
     ModelConfig,
     Skill,
     Tool,
+    new_id,
     utc_now,
 )
 from app.knowledge.parser import KnowledgeParseError, extract_text
@@ -237,11 +241,17 @@ class KnowledgeService:
         self.db = db
 
     def create_ingest_job(self, payload: IngestPayload) -> KnowledgeIngestJob:
+        version_id = payload.knowledge_base_version_id
+        if not version_id:
+            knowledge_base = self.db.get(KnowledgeBase, payload.knowledge_base_id)
+            if knowledge_base:
+                version_id = ensure_knowledge_base_version(self.db, knowledge_base).id
+            else:
+                version_id = _default_knowledge_base_version_id(payload.knowledge_base_id)
         job = KnowledgeIngestJob(
             tenant_id=payload.tenant_id,
             knowledge_base_id=payload.knowledge_base_id,
-            knowledge_base_version_id=payload.knowledge_base_version_id
-            or _default_knowledge_base_version_id(payload.knowledge_base_id),
+            knowledge_base_version_id=version_id,
             filename=payload.filename,
             status="queued",
             stage="queued",
@@ -261,6 +271,10 @@ class KnowledgeService:
         job = self.db.get(KnowledgeIngestJob, job_id)
         if not job or job.tenant_id != tenant_id:
             return None
+        if job.job_kind == "revision":
+            from app.knowledge.revisions import cancel_revision
+
+            return cancel_revision(self.db, job_id)
         if job.status in TERMINAL_INGEST_STATUSES:
             return job
         if job.status == "queued":
@@ -358,10 +372,14 @@ class KnowledgeService:
                 tenant_id=job.tenant_id,
                 knowledge_base_id=job.knowledge_base_id,
                 knowledge_base_version_id=job.knowledge_base_version_id,
+                lineage_id=new_id("lineage"),
                 filename=job.filename,
                 file_type=file_type,
                 title=str(metadata.get("title") or Path(job.filename).stem),
                 status="processing",
+                normalized_source=normalized_text,
+                source_checksum=sha256(normalized_text.encode("utf-8")).hexdigest(),
+                source_kind="normalized",
                 metadata_json={
                     **(metadata.get("metadata") if isinstance(metadata.get("metadata"), dict) else {}),
                     "ingest_schema_version": KNOWLEDGE_INGEST_SCHEMA_VERSION,
@@ -920,10 +938,18 @@ class KnowledgeService:
         section_nodes: list[dict[str, Any]],
         document_card: dict[str, Any],
         job: KnowledgeIngestJob,
+        *,
+        use_llm: bool = True,
     ) -> list[KnowledgeBucket]:
+        """按章节生成桶；正文修订显式关闭模型以保持首版构建确定性。"""
+
         model_config = self._default_model_config(tenant_id)
         structure_buckets = _structure_bucket_specs(section_nodes)
-        llm_buckets = self._bucket_with_llm(section_nodes, model_config) if model_config else []
+        llm_buckets = (
+            self._bucket_with_llm(section_nodes, model_config)
+            if use_llm and model_config
+            else []
+        )
         self._raise_if_ingest_cancelled(job)
         bucket_specs = _unique_bucket_specs(structure_buckets + _normalize_llm_bucket_specs(llm_buckets, section_nodes))
         if not bucket_specs:
@@ -1228,9 +1254,22 @@ class KnowledgeService:
         return [item for item in buckets if isinstance(item, dict)] if isinstance(buckets, list) else []
 
     def _load_documents_for_search(self, request: KnowledgeSearchRequest) -> list[KnowledgeDocument]:
+        legacy_knowledge_base_ids = self._legacy_search_knowledge_base_ids(request)
         stmt = select(KnowledgeDocument).where(
             KnowledgeDocument.tenant_id == request.tenant_id,
             KnowledgeDocument.status == "ready",
+            or_(
+                KnowledgeDocument.knowledge_base_version_id.in_(
+                    select(KnowledgeBaseVersion.id).where(
+                        KnowledgeBaseVersion.tenant_id == request.tenant_id,
+                        KnowledgeBaseVersion.publication_state == "published",
+                    )
+                ),
+                and_(
+                    KnowledgeDocument.knowledge_base_version_id.is_(None),
+                    KnowledgeDocument.knowledge_base_id.in_(legacy_knowledge_base_ids),
+                ),
+            ),
         )
         if request.knowledge_base_ids:
             stmt = stmt.where(KnowledgeDocument.knowledge_base_id.in_(request.knowledge_base_ids))
@@ -1241,9 +1280,24 @@ class KnowledgeService:
         return self.db.exec(stmt.order_by(KnowledgeDocument.updated_at.desc())).all()
 
     def _load_concepts_for_search(self, request: KnowledgeSearchRequest) -> list[KnowledgeConcept]:
+        """完整加载原授权 published/legacy 范围的概念，避免评分前按更新时间丢失老事实。"""
+
+        legacy_knowledge_base_ids = self._legacy_search_knowledge_base_ids(request)
         stmt = select(KnowledgeConcept).where(
             KnowledgeConcept.tenant_id == request.tenant_id,
             KnowledgeConcept.status == "active",
+            or_(
+                KnowledgeConcept.knowledge_base_version_id.in_(
+                    select(KnowledgeBaseVersion.id).where(
+                        KnowledgeBaseVersion.tenant_id == request.tenant_id,
+                        KnowledgeBaseVersion.publication_state == "published",
+                    )
+                ),
+                and_(
+                    KnowledgeConcept.knowledge_base_version_id.is_(None),
+                    KnowledgeConcept.knowledge_base_id.in_(legacy_knowledge_base_ids),
+                ),
+            ),
         )
         if request.knowledge_base_ids:
             stmt = stmt.where(KnowledgeConcept.knowledge_base_id.in_(request.knowledge_base_ids))
@@ -1251,20 +1305,51 @@ class KnowledgeService:
             stmt = stmt.where(KnowledgeConcept.knowledge_base_version_id.in_(request.knowledge_base_version_ids))
         if request.document_ids:
             stmt = stmt.where(KnowledgeConcept.document_id.in_(request.document_ids))
-        return self.db.exec(stmt.order_by(KnowledgeConcept.updated_at.desc()).limit(120)).all()
+        return self.db.exec(stmt.order_by(KnowledgeConcept.updated_at.desc())).all()
 
     def _load_buckets_for_search(self, request: KnowledgeSearchRequest, document_ids: list[str]) -> list[KnowledgeBucket]:
         if not document_ids:
             return []
+        legacy_knowledge_base_ids = self._legacy_search_knowledge_base_ids(request)
         stmt = select(KnowledgeBucket).where(
             KnowledgeBucket.tenant_id == request.tenant_id,
             KnowledgeBucket.document_id.in_(document_ids),
+            or_(
+                KnowledgeBucket.knowledge_base_version_id.in_(
+                    select(KnowledgeBaseVersion.id).where(
+                        KnowledgeBaseVersion.tenant_id == request.tenant_id,
+                        KnowledgeBaseVersion.publication_state == "published",
+                    )
+                ),
+                and_(
+                    KnowledgeBucket.knowledge_base_version_id.is_(None),
+                    KnowledgeBucket.knowledge_base_id.in_(legacy_knowledge_base_ids),
+                ),
+            ),
         )
         if request.knowledge_base_ids:
             stmt = stmt.where(KnowledgeBucket.knowledge_base_id.in_(request.knowledge_base_ids))
         if request.knowledge_base_version_ids:
             stmt = stmt.where(KnowledgeBucket.knowledge_base_version_id.in_(request.knowledge_base_version_ids))
         return self.db.exec(stmt.order_by(KnowledgeBucket.created_at.asc())).all()
+
+    def _legacy_search_knowledge_base_ids(self, request: KnowledgeSearchRequest) -> list[str]:
+        """返回没有任何版本行的历史知识库，兼容 NULL version 但不推断历史归属。"""
+
+        if request.knowledge_base_version_ids:
+            return []
+        statement = select(KnowledgeBase.id).where(
+            KnowledgeBase.tenant_id == request.tenant_id,
+            ~select(KnowledgeBaseVersion.id)
+            .where(
+                KnowledgeBaseVersion.tenant_id == KnowledgeBase.tenant_id,
+                KnowledgeBaseVersion.knowledge_base_id == KnowledgeBase.id,
+            )
+            .exists(),
+        )
+        if request.knowledge_base_ids:
+            statement = statement.where(KnowledgeBase.id.in_(request.knowledge_base_ids))
+        return list(self.db.exec(statement).all())
 
     def _select_documents_with_llm(
         self,
@@ -1380,9 +1465,43 @@ class KnowledgeService:
 
         if not bucket_ids:
             return []
+        legacy_bucket_knowledge_base_ids = self.db.exec(
+            select(KnowledgeBucket.knowledge_base_id)
+            .where(
+                KnowledgeBucket.tenant_id == tenant_id,
+                KnowledgeBucket.id.in_(bucket_ids),
+                KnowledgeBucket.knowledge_base_version_id.is_(None),
+            )
+            .distinct()
+        ).all()
+        legacy_kb_ids = [
+            knowledge_base_id
+            for knowledge_base_id in legacy_bucket_knowledge_base_ids
+            if not self.db.exec(
+                select(KnowledgeBaseVersion.id).where(
+                    KnowledgeBaseVersion.tenant_id == tenant_id,
+                    KnowledgeBaseVersion.knowledge_base_id == knowledge_base_id,
+                )
+            ).first()
+        ]
         statement = (
             select(KnowledgeChunk)
-            .where(KnowledgeChunk.tenant_id == tenant_id, KnowledgeChunk.bucket_id.in_(bucket_ids))
+            .where(
+                KnowledgeChunk.tenant_id == tenant_id,
+                KnowledgeChunk.bucket_id.in_(bucket_ids),
+                or_(
+                    KnowledgeChunk.knowledge_base_version_id.in_(
+                        select(KnowledgeBaseVersion.id).where(
+                            KnowledgeBaseVersion.tenant_id == tenant_id,
+                            KnowledgeBaseVersion.publication_state == "published",
+                        )
+                    ),
+                    and_(
+                        KnowledgeChunk.knowledge_base_version_id.is_(None),
+                        KnowledgeChunk.knowledge_base_id.in_(legacy_kb_ids),
+                    ),
+                ),
+            )
             .order_by(KnowledgeChunk.bucket_id, KnowledgeChunk.chunk_index)
         )
         if max_chunks is not None and max_chunks > 0:

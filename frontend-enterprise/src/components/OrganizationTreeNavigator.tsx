@@ -12,6 +12,8 @@ import type {
 
 type OrganizationTreeNavigatorProps = {
   tenantId: string;
+  /** 当前认证身份；身份完成切换后必须重新读取组织树，避免沿用匿名首轮请求结果。 */
+  authIdentity?: string;
   selectedId: string;
   onSelect: (unit: OrganizationUnit) => void;
   refreshToken?: number;
@@ -21,6 +23,7 @@ type OrganizationTreeNavigatorProps = {
 
 export function OrganizationTreeNavigator({
   tenantId,
+  authIdentity,
   selectedId,
   onSelect,
   refreshToken = 0,
@@ -99,7 +102,7 @@ export function OrganizationTreeNavigator({
     return () => {
       cancelled = true;
     };
-  }, [loadChildren, refreshToken, selectRootOnInitialize, tenantId]);
+  }, [authIdentity, loadChildren, refreshToken, selectRootOnInitialize, tenantId]);
 
   useEffect(() => {
     const keyword = searchText.trim();

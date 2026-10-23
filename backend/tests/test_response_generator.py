@@ -111,6 +111,46 @@ def test_response_payload_has_single_source_for_each_business_fact() -> None:
     assert "awaiting_input" not in str(payload)
 
 
+def test_response_payload_accepts_frozen_sop_slots_after_session_cleanup() -> None:
+    """回复阶段可消费仍然有效的冻结 SOP 槽位，即使会话游标已被终态清理。"""
+
+    session = ChatSession(
+        id="session_sop_response_slots",
+        tenant_id="tenant_demo",
+        active_step_id="done",
+        slots_json={},
+    )
+    payload = ResponseGenerator()._payload(
+        "确认记忆核验",
+        session,
+        Skill(
+            tenant_id="tenant_demo",
+            skill_id="memory_check",
+            name="记忆核验",
+            status="published",
+            content_json={"response_rules": ["逐项回显确认事实"]},
+        ),
+        RouterDecision(decision="continue_active"),
+        StepAgentResult(is_step_completed=True),
+        None,
+        response_slots={"user_name": "青禾", "reply_style": "简洁要点"},
+    )
+
+    assert payload["slots"] == {"user_name": "青禾", "reply_style": "简洁要点"}
+
+
+def test_authoritative_sop_slots_replace_field_names_used_as_values() -> None:
+    """模型把说明词误当字段值时，回复必须回填已验证的 Runtime 槽位。"""
+
+    reply = ResponseGenerator._apply_authoritative_sop_slots(
+        "记忆核验结果：user_name 为青禾，reply_style 为输出偏好，omitted_code 为未知。",
+        {"user_name": "青禾", "reply_style": "简洁要点", "omitted_code": "未知"},
+    )
+
+    assert "reply_style 为简洁要点" in reply
+    assert "输出偏好" not in reply
+
+
 def test_multi_task_payload_projects_all_results_for_one_final_reply() -> None:
     generator = ResponseGenerator()
     payload = generator._payload(
@@ -212,6 +252,15 @@ def test_response_prompt_requires_guidance_application_checkpoint() -> None:
     assert "未触发的分支不强行套用" in prompt
     assert "把对应指针/层级/完成标准落成回答中的具体组织" in prompt
     assert "具体路径、文件名或文档指针保留下来" in prompt
+
+
+def test_response_prompt_preserves_user_unknown_placeholder_verbatim() -> None:
+    """用户指定未知占位时，回复阶段必须原样使用且不得扩写或猜测。"""
+
+    prompt = PROMPT_PATH.read_text(encoding="utf-8")
+
+    assert "用户明确指定未知占位时，字段值必须原样使用该占位" in prompt
+    assert "不得添加解释、修饰词或标点" in prompt
 
 
 def test_clarify_does_not_leak_internal_router_prompt(monkeypatch):

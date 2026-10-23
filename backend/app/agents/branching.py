@@ -30,11 +30,17 @@ from app.db.models import (
     KnowledgeDocument,
     ModelConfig,
     Skill,
+    SkillVersion,
     Tool,
     utc_now,
 )
 from app.sop_runtime import CompiledSopDefinition, SopCompilationError, compile_legacy_skill_card
-from app.sop_runtime.versioning import write_skill_version
+from app.sop_runtime.versioning import (
+    PublishedVersionConflictError,
+    annotate_skill_publication,
+    skill_content_checksum,
+    write_skill_version,
+)
 
 
 DEFAULT_AGENT_ROLES = ("default", "router", "step", "response", "general_skill")
@@ -99,26 +105,31 @@ def metadata_preserving_creator(
     return metadata
 
 
-def get_overall_agent(db: Session, tenant_id: str) -> AgentProfile | None:
-    return db.exec(
-        select(AgentProfile).where(
-            AgentProfile.tenant_id == tenant_id,
-            AgentProfile.is_overall == True,  # noqa: E712
-            AgentProfile.status != "archived",
-        )
-    ).first()
+def get_overall_agent(db: Session, tenant_id: str, *, current: bool = False) -> AgentProfile | None:
+    """读取整体档案；提交校验可要求当前锁读以拒绝MySQL旧授权快照。"""
+    query = select(AgentProfile).where(
+        AgentProfile.tenant_id == tenant_id,
+        AgentProfile.is_overall == True,  # noqa: E712
+        AgentProfile.status != "archived",
+    )
+    if current:
+        query = query.with_for_update().execution_options(populate_existing=True)
+    return db.exec(query).first()
 
 
-def get_agent(db: Session, tenant_id: str, agent_id: str | None) -> AgentProfile | None:
+def get_agent(db: Session, tenant_id: str, agent_id: str | None,
+              *, current: bool = False) -> AgentProfile | None:
+    """按实际tenant/ID读取档案，受管提交使用当前锁读。"""
     if not agent_id:
         return None
-    return db.exec(
-        select(AgentProfile).where(
-            AgentProfile.tenant_id == tenant_id,
-            AgentProfile.id == agent_id,
-            AgentProfile.status != "archived",
-        )
-    ).first()
+    query = select(AgentProfile).where(
+        AgentProfile.tenant_id == tenant_id,
+        AgentProfile.id == agent_id,
+        AgentProfile.status != "archived",
+    )
+    if current:
+        query = query.with_for_update().execution_options(populate_existing=True)
+    return db.exec(query).first()
 
 
 def _agent_creator_metadata(agent: AgentProfile | None) -> dict[str, Any]:
@@ -287,24 +298,28 @@ def resource_binding_metadata(
 
 
 def is_open_gallery_resource(
-    db: Session, tenant_id: str, resource_type: str, resource: object
+    db: Session, tenant_id: str, resource_type: str, resource: object, *, current: bool = False
 ) -> bool:
+    """复用广场可见规则；受管校验当前读取整体与绑定，拒绝旧RR快照。"""
     if resource_type == "general_skill" and is_platform_catalog_general_skill(resource):
         return getattr(resource, "status", None) == "published"
     resource_id = getattr(resource, "id", None)
     if not resource_id or getattr(resource, "tenant_id", None) != tenant_id:
         return False
-    overall = get_overall_agent(db, tenant_id)
+    overall = get_overall_agent(db, tenant_id, current=current)
     if not overall:
         return False
-    overall_binding = db.exec(
+    query = (
         select(AgentResourceBinding).where(
             AgentResourceBinding.tenant_id == tenant_id,
             AgentResourceBinding.agent_id == overall.id,
             AgentResourceBinding.resource_type == resource_type,
             AgentResourceBinding.resource_id == resource_id,
         )
-    ).first()
+    )
+    if current:
+        query = query.with_for_update().execution_options(populate_existing=True)
+    overall_binding = db.exec(query).first()
     if not overall_binding:
         return False
     return overall_binding.status != "deleted" and not _binding_is_private(overall_binding)
@@ -348,6 +363,7 @@ def is_bound_resource_visible_for_agent(
     resource_type: str,
     resource: object,
     binding: AgentResourceBinding,
+    *, current: bool = False,
 ) -> bool:
     """按绑定状态、显式可见范围和旧 metadata 兼容规则判断 Agent 是否可见资源。"""
 
@@ -369,7 +385,7 @@ def is_bound_resource_visible_for_agent(
         return True
     if _binding_is_private(binding) or _metadata_is_private(_resource_metadata(resource)):
         return True
-    return is_open_gallery_resource(db, tenant_id, resource_type, resource)
+    return is_open_gallery_resource(db, tenant_id, resource_type, resource, current=current)
 
 
 def project_skill_with_branch(
@@ -377,6 +393,8 @@ def project_skill_with_branch(
     branch: AgentSkillBranch | None,
     binding_status: str | None = None,
 ) -> Skill:
+    """投影服务端员工分支及真实发布范围，不把整体版本当成员工版本。"""
+
     if not branch:
         return skill
     content = dict(branch.content_json or {})
@@ -405,6 +423,9 @@ def project_skill_with_branch(
         updated_at=branch.updated_at,
     )
     object.__setattr__(projected, "agent_branch_meta", metadata)
+    publication = (branch.metadata_json or {}).get("runtime_publication")
+    if isinstance(publication, dict) and publication.get("version") == branch.head_version:
+        object.__setattr__(projected, "publication_identity", publication)
     return projected
 
 
@@ -454,7 +475,7 @@ def visible_skill_rows(
             object.__setattr__(
                 row, "agent_branch_meta", {"metadata": metadata_by_id.get(row.id, {})}
             )
-        return visible_rows
+        return [annotate_skill_publication(db, row) for row in visible_rows]
     if agent.status != "active":
         return []
     rows: list[Skill] = []
@@ -478,7 +499,9 @@ def visible_skill_rows(
         branch = ensure_agent_skill_branch(db, tenant_id, agent.id, skill)
         if not include_inactive and branch.status != "active":
             continue
-        rows.append(project_skill_with_branch(skill, branch, binding.status))
+        rows.append(annotate_skill_publication(
+            db, project_skill_with_branch(skill, branch, binding.status)
+        ))
     return sorted(rows, key=lambda item: item.updated_at, reverse=True)
 
 
@@ -493,43 +516,49 @@ def visible_published_skills(
 
 
 def visible_skill(
-    db: Session, tenant_id: str, skill_id: str, agent_id: str | None = None
+    db: Session, tenant_id: str, skill_id: str, agent_id: str | None = None,
+    *, current: bool = False,
 ) -> Skill | None:
-    skill = db.exec(
-        select(Skill).where(Skill.tenant_id == tenant_id, Skill.skill_id == skill_id)
-    ).first()
+    """沿原可见及分支投影规则读取；受管提交对实际头/绑定作当前锁读。"""
+    query = select(Skill).where(Skill.tenant_id == tenant_id, Skill.skill_id == skill_id)
+    if current:
+        query = query.with_for_update().execution_options(populate_existing=True)
+    skill = db.exec(query).first()
     if not skill or skill.status == "deleted":
         return None
-    agent = get_agent(db, tenant_id, agent_id)
+    agent = get_agent(db, tenant_id, agent_id, current=current)
+    if agent_id and agent is None:
+        return None
     if not agent or agent.is_overall:
         if skill.status == "archived":
             return None
-        if not is_open_gallery_resource(db, tenant_id, "skill", skill):
+        if not is_open_gallery_resource(db, tenant_id, "skill", skill, current=current):
             return None
-        metadata_by_id = resource_binding_metadata(
-            db, tenant_id, agent.id if agent else None, "skill"
-        )
-        object.__setattr__(
-            skill, "agent_branch_meta", {"metadata": metadata_by_id.get(skill.id, {})}
-        )
-        return skill
-    binding = db.exec(
-        select(AgentResourceBinding).where(
-            AgentResourceBinding.tenant_id == tenant_id,
-            AgentResourceBinding.agent_id == agent.id,
-            AgentResourceBinding.resource_type == "skill",
-            AgentResourceBinding.resource_id == skill.id,
-            AgentResourceBinding.status == "active",
-        )
-    ).first()
-    if not binding:
+        metadata_by_id = resource_binding_metadata(db, tenant_id, agent.id if agent else None, "skill")
+        object.__setattr__(skill, "agent_branch_meta", {"metadata": metadata_by_id.get(skill.id, {})})
+        return annotate_skill_publication(db, skill)
+    query = select(AgentResourceBinding).where(
+        AgentResourceBinding.tenant_id == tenant_id,
+        AgentResourceBinding.agent_id == agent.id,
+        AgentResourceBinding.resource_type == "skill",
+        AgentResourceBinding.resource_id == skill.id,
+        AgentResourceBinding.status == "active",
+    )
+    if current:
+        query = query.with_for_update().execution_options(populate_existing=True)
+    binding = db.exec(query).first()
+    if not binding or not is_bound_resource_visible_for_agent(
+        db, tenant_id, "skill", skill, binding, current=current
+    ):
         return None
-    if not is_bound_resource_visible_for_agent(db, tenant_id, "skill", skill, binding):
-        return None
+    if current:
+        db.exec(select(AgentSkillBranch).where(AgentSkillBranch.tenant_id == tenant_id,
+            AgentSkillBranch.agent_id == agent.id, AgentSkillBranch.skill_id == skill_id)
+            .with_for_update().execution_options(populate_existing=True)).first()
     branch = ensure_agent_skill_branch(db, tenant_id, agent.id, skill)
     if branch.status != "active":
         return None
-    return project_skill_with_branch(skill, branch)
+    return annotate_skill_publication(db, project_skill_with_branch(skill, branch))
 
 
 def visible_tool_rows(
@@ -537,26 +566,28 @@ def visible_tool_rows(
     tenant_id: str,
     agent_id: str | None = None,
     include_inactive: bool = True,
+    *, current: bool = False,
 ) -> list[Tool]:
     """返回租户或指定活动 Agent 可见的 Tool，并阻断归档 Agent 目录读取。"""
 
-    agent = get_agent(db, tenant_id, agent_id)
+    agent = get_agent(db, tenant_id, agent_id, current=current)
     if agent_id and not agent:
         return []
     if agent is not None and agent.status != "active":
         return []
     if not agent or agent.is_overall:
-        rows = db.exec(
-            select(Tool).where(Tool.tenant_id == tenant_id).order_by(Tool.bucket, Tool.name)
-        ).all()
+        query = select(Tool).where(Tool.tenant_id == tenant_id).order_by(Tool.bucket, Tool.name)
+        if current:
+            query = query.with_for_update().execution_options(populate_existing=True)
+        rows = db.exec(query).all()
         return [
             row
             for row in rows
-            if is_open_gallery_resource(db, tenant_id, "tool", row)
+            if is_open_gallery_resource(db, tenant_id, "tool", row, current=current)
             and (include_inactive or row.enabled)
         ]
 
-    bindings = db.exec(
+    query = (
         select(AgentResourceBinding)
         .where(
             AgentResourceBinding.tenant_id == tenant_id,
@@ -565,15 +596,18 @@ def visible_tool_rows(
             AgentResourceBinding.status != "deleted",
         )
         .order_by(AgentResourceBinding.updated_at.desc())
-    ).all()
+    )
+    if current:
+        query = query.with_for_update().execution_options(populate_existing=True)
+    bindings = db.exec(query).all()
     visible: list[Tool] = []
     for binding in bindings:
         if not include_inactive and binding.status != "active":
             continue
-        row = db.get(Tool, binding.resource_id)
+        row = db.get(Tool, binding.resource_id, populate_existing=current, with_for_update=current)
         if not row or row.tenant_id != tenant_id:
             continue
-        if not is_bound_resource_visible_for_agent(db, tenant_id, "tool", row, binding):
+        if not is_bound_resource_visible_for_agent(db, tenant_id, "tool", row, binding, current=current):
             continue
         if not include_inactive and not row.enabled:
             continue
@@ -588,6 +622,8 @@ def ensure_agent_skill_branch(
     skill: Skill,
     metadata_json: dict[str, Any] | None = None,
 ) -> AgentSkillBranch:
+    """领用原资源；只有已证实的整体发布可产生同内容员工运行快照。"""
+
     branch = db.exec(
         select(AgentSkillBranch).where(
             AgentSkillBranch.tenant_id == tenant_id,
@@ -604,6 +640,12 @@ def ensure_agent_skill_branch(
             branch.metadata_json = metadata
             branch.updated_at = utc_now()
             db.add(branch)
+        # 旧分支可能在整体发布快照落库前已经创建，不能因为分支行存在就
+        # 永久跳过精确员工范围的 SkillVersion 补齐。只有整体仍是已发布状态
+        # 且正文与整体快照一致时，inherit_branch_publication 才会写入；分支
+        # 已分叉或整体已撤下时它会安全地保持原状态。
+        if branch.status == "active" and skill.status == "published":
+            inherit_branch_publication(db, skill, branch)
         return branch
     branch = AgentSkillBranch(
         tenant_id=tenant_id,
@@ -620,6 +662,7 @@ def ensure_agent_skill_branch(
     db.add(branch)
     db.flush()
     _ensure_branch_version(db, branch, "初始化分支")
+    inherit_branch_publication(db, skill, branch)
     return branch
 
 
@@ -630,7 +673,10 @@ def update_branch_skill(
     skill: Skill,
     content: dict[str, Any],
     change_summary: str = "分支改写",
+    *, derived_from_version_id: str | None = None,
 ) -> AgentSkillBranch:
+    """沿原分支版本策略编辑，活动分支在同事务内写入精确运行快照。"""
+
     branch = ensure_agent_skill_branch(db, tenant_id, agent_id, skill)
     previous_status = branch.status
     next_version = next_unique_branch_version(db, branch, str(content.get("version") or ""))
@@ -642,12 +688,15 @@ def update_branch_skill(
     branch.sync_state = "diverged"
     branch.updated_at = utc_now()
     _ensure_branch_version(db, branch, change_summary)
+    publish_branch_version(db, skill, branch, derived_from_version_id=derived_from_version_id)
     return branch
 
 
 def sync_branch_from_overall(
     db: Session, tenant_id: str, agent_id: str, skill: Skill
 ) -> AgentSkillBranch:
+    """同步有效整体定义，保留员工已发布历史并继承可证明发布身份。"""
+
     if skill.status != "published" or not is_open_gallery_resource(db, tenant_id, "skill", skill):
         from fastapi import HTTPException
 
@@ -656,23 +705,42 @@ def sync_branch_from_overall(
         )
     branch = ensure_agent_skill_branch(db, tenant_id, agent_id, skill)
     expected_content = dict(skill.content_json)
+    head_version = skill.version
+    occupied = db.exec(select(SkillVersion).where(
+        SkillVersion.tenant_id == tenant_id,
+        SkillVersion.skill_id == skill.skill_id,
+        SkillVersion.scope_agent_id == agent_id,
+        SkillVersion.version == head_version,
+        SkillVersion.status == "published",
+    )).first()
+    old_branch_version = db.exec(select(AgentSkillBranchVersion).where(
+        AgentSkillBranchVersion.tenant_id == tenant_id,
+        AgentSkillBranchVersion.agent_id == agent_id,
+        AgentSkillBranchVersion.skill_id == skill.skill_id,
+        AgentSkillBranchVersion.version == head_version,
+    )).first()
+    if ((occupied and occupied.content_json != expected_content)
+            or (old_branch_version and old_branch_version.content_json != expected_content)):
+        head_version = next_unique_branch_version(db, branch)
+        expected_content["version"] = head_version
     expected_status = "active" if skill.status == "published" else "inactive"
     changed = (
         branch.base_version != skill.version
-        or branch.head_version != skill.version
+        or branch.head_version != head_version
         or branch.content_json != expected_content
         or branch.status != expected_status
         or branch.sync_state != "synced"
     )
     if changed:
         branch.base_version = skill.version
-        branch.head_version = skill.version
+        branch.head_version = head_version
         branch.content_json = expected_content
         branch.status = expected_status
         branch.sync_state = "synced"
         branch.updated_at = utc_now()
         db.add(branch)
     _ensure_branch_version(db, branch, "同步整体版本")
+    inherit_branch_publication(db, skill, branch)
     return branch
 
 
@@ -709,6 +777,7 @@ def promote_branch_to_overall(db: Session, tenant_id: str, branch: AgentSkillBra
     branch.sync_state = "synced"
     branch.updated_at = utc_now()
     _ensure_branch_version(db, branch, "推送到整体")
+    publish_branch_version(db, skill, branch, compiled_definition=compiled_definition)
     return skill
 
 
@@ -751,7 +820,75 @@ def rollback_branch(
     branch.sync_state = "synced" if version_row.version == branch.base_version else "diverged"
     branch.updated_at = utc_now()
     _ensure_branch_version(db, branch, f"从 {version_row.version} 派生回滚")
+    skill = db.get(Skill, branch.source_skill_id)
+    if skill is None or skill.tenant_id != tenant_id:
+        from fastapi import HTTPException
+
+        raise HTTPException(status_code=404, detail="Skill not found")
+    publish_branch_version(db, skill, branch)
     return branch
+
+
+def publish_branch_version(
+    db: Session,
+    skill: Skill,
+    branch: AgentSkillBranch,
+    *,
+    compiled_definition: CompiledSopDefinition | None = None,
+    derived_from_version_id: str | None = None,
+) -> SkillVersion | None:
+    """原分支发布职责写入同一Runtime版本表；非活动草稿不产生发布身份。"""
+
+    if branch.status != "active":
+        return None
+    projected = project_skill_with_branch(skill, branch)
+    compiled_definition = compiled_definition or _compile_branch_for_publication(
+        projected.content_json
+    )
+    try:
+        result = write_skill_version(
+            db, projected, compiled_definition=compiled_definition, scope_agent_id=branch.agent_id,
+            derived_from_version_id=derived_from_version_id,
+        )
+    except PublishedVersionConflictError as exc:
+        from fastapi import HTTPException
+
+        raise HTTPException(status_code=409, detail={
+            "code": "PUBLISHED_SKILL_VERSION_IMMUTABLE",
+            "skill_id": exc.skill_id, "version": exc.version,
+        }) from exc
+    branch.metadata_json = {**(branch.metadata_json or {}), "runtime_publication": {
+        "id": result.version.id, "scope_agent_id": branch.agent_id,
+        "checksum": result.version.compiled_definition_checksum, "version": branch.head_version,
+    }}
+    db.add(branch)
+    return result.version
+
+
+def inherit_branch_publication(db: Session, skill: Skill, branch: AgentSkillBranch) -> None:
+    """仅从已编译整体快照继承；旧未编译管理卡片不被自动强制发布。"""
+
+    if branch.status != "active":
+        return
+    original = db.exec(select(SkillVersion).where(
+        SkillVersion.tenant_id == skill.tenant_id,
+        SkillVersion.skill_id == skill.skill_id,
+        SkillVersion.scope_agent_id == "",
+        SkillVersion.version == skill.version,
+        SkillVersion.status == "published",
+    )).first()
+    if original is None or not original.compiled_definition_checksum:
+        return
+    source_content = dict(branch.content_json)
+    source_content["version"] = skill.version
+    if skill_content_checksum(source_content) != skill_content_checksum(original.content_json):
+        return
+    compiled_source = _compile_branch_for_publication(original.content_json)
+    if compiled_source.checksum != original.compiled_definition_checksum:
+        from fastapi import HTTPException
+
+        raise HTTPException(status_code=409, detail="PUBLISHED_SKILL_CHECKSUM_INVALID")
+    publish_branch_version(db, skill, branch)
 
 
 def _compile_branch_for_publication(content: dict[str, Any]) -> CompiledSopDefinition:
@@ -820,10 +957,12 @@ def visible_knowledge_base_versions(
         rows = [
             row for row in rows if is_open_gallery_resource(db, tenant_id, "knowledge_base", row)
         ]
-        return {
-            row.id: ensure_knowledge_base_version(db, row, _current_knowledge_version(row))
-            for row in rows
-        }
+        result: dict[str, KnowledgeBaseVersion] = {}
+        for row in rows:
+            version = ensure_knowledge_base_version(db, row, _current_knowledge_version(row))
+            if version.publication_state == "published":
+                result[row.id] = version
+        return result
     branch_status_clause = (
         AgentKnowledgeBranch.status != "deleted"
         if include_inactive
@@ -857,7 +996,9 @@ def visible_knowledge_base_versions(
             continue
         if not include_inactive and binding.status != "active":
             continue
-        result[kb.id] = ensure_knowledge_base_version(db, kb, branch.head_version)
+        version = ensure_knowledge_base_version(db, kb, branch.head_version)
+        if version.publication_state == "published":
+            result[kb.id] = version
     return result
 
 
@@ -1000,12 +1141,32 @@ def sync_knowledge_branch_from_overall(
         )
     branch = _ensure_knowledge_branch(db, tenant_id, agent_id, kb)
     current_version = _current_knowledge_version(kb)
-    ensure_knowledge_base_version(db, kb, current_version)
+    source = db.exec(
+        select(KnowledgeBaseVersion).where(
+            KnowledgeBaseVersion.tenant_id == tenant_id,
+            KnowledgeBaseVersion.knowledge_base_id == knowledge_base_id,
+            KnowledgeBaseVersion.version == current_version,
+            KnowledgeBaseVersion.publication_state == "published",
+        )
+    ).first()
+    if not source:
+        from fastapi import HTTPException
+
+        raise HTTPException(status_code=409, detail="Overall knowledge head is not published")
+    changed = (
+        branch.base_version != current_version
+        or branch.head_version != current_version
+        or branch.sync_state != "synced"
+        or branch.status != "active"
+    )
     branch.base_version = current_version
     branch.head_version = current_version
     branch.status = "active"
     branch.sync_state = "synced"
+    if changed:
+        branch.content_revision = int(branch.content_revision or 1) + 1
     branch.updated_at = utc_now()
+    db.add(branch)
     return branch
 
 
@@ -1027,26 +1188,52 @@ def promote_knowledge_branch_to_overall(
         from fastapi import HTTPException
 
         raise HTTPException(status_code=404, detail="Knowledge branch not found")
-    source = ensure_knowledge_base_version(db, kb, branch.head_version)
+    source = db.exec(
+        select(KnowledgeBaseVersion).where(
+            KnowledgeBaseVersion.tenant_id == tenant_id,
+            KnowledgeBaseVersion.knowledge_base_id == knowledge_base_id,
+            KnowledgeBaseVersion.version == branch.head_version,
+            KnowledgeBaseVersion.publication_state == "published",
+        )
+    ).first()
+    if not source:
+        from fastapi import HTTPException
+
+        raise HTTPException(status_code=409, detail="Agent knowledge head is not published")
     next_version = next_global_version(_current_knowledge_version(kb))
     target = ensure_knowledge_base_version(db, kb, next_version)
     target.name = source.name
     target.description = source.description
+    target.scope = "overall"
+    target.parent_version_id = source.id
+    target.publication_state = "candidate"
     target.metadata_json = dict(source.metadata_json or {})
     target.status = "active"
     target.updated_at = utc_now()
-    _retag_knowledge_version(db, tenant_id, knowledge_base_id, source.id, target.id)
+    clone_knowledge_version_assets(
+        db,
+        tenant_id,
+        knowledge_base_id,
+        source.id,
+        target.id,
+    )
+    target.publication_state = "published"
     kb.name = source.name
     kb.description = source.description
     kb.metadata_json = open_gallery_metadata(
         {**(kb.metadata_json or {}), "current_version": next_version}
     )
+    kb.content_revision = int(kb.content_revision or 1) + 1
     kb.updated_at = utc_now()
     ensure_open_gallery_binding(db, tenant_id, "knowledge_base", kb.id, "active")
     branch.base_version = next_version
     branch.head_version = next_version
     branch.sync_state = "synced"
+    branch.content_revision = int(branch.content_revision or 1) + 1
     branch.updated_at = utc_now()
+    db.add(target)
+    db.add(kb)
+    db.add(branch)
     return target
 
 
@@ -1058,12 +1245,29 @@ def rollback_knowledge_branch(
     version: str,
 ) -> AgentKnowledgeBranch:
     kb = _get_knowledge_base(db, tenant_id, knowledge_base_id)
-    target = ensure_knowledge_base_version(db, kb, version)
+    target = db.exec(
+        select(KnowledgeBaseVersion).where(
+            KnowledgeBaseVersion.tenant_id == tenant_id,
+            KnowledgeBaseVersion.knowledge_base_id == knowledge_base_id,
+            KnowledgeBaseVersion.version == version,
+            KnowledgeBaseVersion.publication_state == "published",
+        )
+    ).first()
+    if not target:
+        from fastapi import HTTPException
+
+        raise HTTPException(status_code=404, detail="Knowledge version not found")
     branch = _ensure_knowledge_branch(db, tenant_id, agent_id, kb)
+    changed = branch.head_version != target.version or branch.sync_state != (
+        "synced" if target.version == branch.base_version else "diverged"
+    )
     branch.head_version = target.version
     branch.status = "active"
     branch.sync_state = "synced" if target.version == branch.base_version else "diverged"
+    if changed:
+        branch.content_revision = int(branch.content_revision or 1) + 1
     branch.updated_at = utc_now()
+    db.add(branch)
     return branch
 
 
@@ -1371,11 +1575,461 @@ def clone_knowledge_version_assets(
     source_version_id: str,
     target_version_id: str,
 ) -> None:
+    """按稳定 lineage 和派生键恢复整库快照，不用文件名猜测物理身份。"""
+
     if source_version_id == target_version_id:
         return
 
+    from app.knowledge.revisions import _remap_reference_json, _remap_reference_text
+
+    source_documents = db.exec(
+        select(KnowledgeDocument)
+        .where(
+            KnowledgeDocument.tenant_id == tenant_id,
+            KnowledgeDocument.knowledge_base_id == knowledge_base_id,
+            KnowledgeDocument.knowledge_base_version_id == source_version_id,
+        )
+        .order_by(KnowledgeDocument.created_at.asc(), KnowledgeDocument.id.asc())
+    ).all()
+    source_buckets = db.exec(
+        select(KnowledgeBucket)
+        .where(
+            KnowledgeBucket.tenant_id == tenant_id,
+            KnowledgeBucket.knowledge_base_id == knowledge_base_id,
+            KnowledgeBucket.knowledge_base_version_id == source_version_id,
+        )
+        .order_by(KnowledgeBucket.created_at.asc(), KnowledgeBucket.id.asc())
+    ).all()
+    source_chunks = db.exec(
+        select(KnowledgeChunk)
+        .where(
+            KnowledgeChunk.tenant_id == tenant_id,
+            KnowledgeChunk.knowledge_base_id == knowledge_base_id,
+            KnowledgeChunk.knowledge_base_version_id == source_version_id,
+        )
+        .order_by(KnowledgeChunk.bucket_id.asc(), KnowledgeChunk.chunk_index.asc(), KnowledgeChunk.id.asc())
+    ).all()
+    source_concepts = db.exec(
+        select(KnowledgeConcept)
+        .where(
+            KnowledgeConcept.tenant_id == tenant_id,
+            KnowledgeConcept.knowledge_base_id == knowledge_base_id,
+            KnowledgeConcept.knowledge_base_version_id == source_version_id,
+            KnowledgeConcept.status != "deleted",
+        )
+        .order_by(KnowledgeConcept.created_at.asc(), KnowledgeConcept.id.asc())
+    ).all()
+    source_suggestions = db.exec(
+        select(KnowledgeDiscoverySuggestion)
+        .where(
+            KnowledgeDiscoverySuggestion.tenant_id == tenant_id,
+            KnowledgeDiscoverySuggestion.knowledge_base_id == knowledge_base_id,
+            KnowledgeDiscoverySuggestion.knowledge_base_version_id == source_version_id,
+        )
+        .order_by(KnowledgeDiscoverySuggestion.created_at.asc(), KnowledgeDiscoverySuggestion.id.asc())
+    ).all()
+
+    target_documents = db.exec(
+        select(KnowledgeDocument)
+        .where(
+            KnowledgeDocument.tenant_id == tenant_id,
+            KnowledgeDocument.knowledge_base_id == knowledge_base_id,
+            KnowledgeDocument.knowledge_base_version_id == target_version_id,
+        )
+        .order_by(KnowledgeDocument.created_at.asc(), KnowledgeDocument.id.asc())
+    ).all()
+    target_buckets = db.exec(
+        select(KnowledgeBucket)
+        .where(
+            KnowledgeBucket.tenant_id == tenant_id,
+            KnowledgeBucket.knowledge_base_id == knowledge_base_id,
+            KnowledgeBucket.knowledge_base_version_id == target_version_id,
+        )
+        .order_by(KnowledgeBucket.created_at.asc(), KnowledgeBucket.id.asc())
+    ).all()
+    target_chunks = db.exec(
+        select(KnowledgeChunk)
+        .where(
+            KnowledgeChunk.tenant_id == tenant_id,
+            KnowledgeChunk.knowledge_base_id == knowledge_base_id,
+            KnowledgeChunk.knowledge_base_version_id == target_version_id,
+        )
+        .order_by(KnowledgeChunk.bucket_id.asc(), KnowledgeChunk.chunk_index.asc(), KnowledgeChunk.id.asc())
+    ).all()
+    target_concepts = db.exec(
+        select(KnowledgeConcept)
+        .where(
+            KnowledgeConcept.tenant_id == tenant_id,
+            KnowledgeConcept.knowledge_base_id == knowledge_base_id,
+            KnowledgeConcept.knowledge_base_version_id == target_version_id,
+        )
+        .order_by(KnowledgeConcept.created_at.asc(), KnowledgeConcept.id.asc())
+    ).all()
+    target_suggestions = db.exec(
+        select(KnowledgeDiscoverySuggestion)
+        .where(
+            KnowledgeDiscoverySuggestion.tenant_id == tenant_id,
+            KnowledgeDiscoverySuggestion.knowledge_base_id == knowledge_base_id,
+            KnowledgeDiscoverySuggestion.knowledge_base_version_id == target_version_id,
+        )
+        .order_by(KnowledgeDiscoverySuggestion.created_at.asc(), KnowledgeDiscoverySuggestion.id.asc())
+    ).all()
+
+    def one_match(rows: list[object], predicate: object, label: str) -> object | None:
+        """返回唯一显式匹配，重复物理候选直接拒绝恢复。"""
+
+        matches = [row for row in rows if predicate(row)]  # type: ignore[operator]
+        if len(matches) > 1:
+            raise ValueError(f"ambiguous knowledge {label} mapping")
+        return matches[0] if matches else None
+
     document_id_map: dict[str, str] = {}
     bucket_id_map: dict[str, str] = {}
+    chunk_id_map: dict[str, str] = {}
+    concept_id_map: dict[str, str] = {}
+
+    for source in source_documents:
+        source_lineage = source.lineage_id or source.id
+        target = one_match(
+            target_documents,
+            lambda row: (
+                row.lineage_id == source_lineage
+                or (not source.lineage_id and row.lineage_id == source.id)
+                or row.parent_document_id == source.id
+            ),
+            "document",
+        )
+        if target is None:
+            target = KnowledgeDocument(
+                tenant_id=source.tenant_id,
+                knowledge_base_id=source.knowledge_base_id,
+                knowledge_base_version_id=target_version_id,
+                lineage_id=source_lineage,
+                parent_document_id=None,
+                filename=source.filename,
+                file_type=source.file_type,
+                title=source.title,
+                status=source.status,
+                normalized_source=source.normalized_source,
+                source_checksum=source.source_checksum,
+                source_kind=source.source_kind,
+                ingest_schema_version=source.ingest_schema_version,
+                bucket_count=source.bucket_count,
+                chunk_count=source.chunk_count,
+                metadata_json=deepcopy(source.metadata_json or {}),
+                error=source.error,
+                created_at=source.created_at,
+                updated_at=utc_now(),
+            )
+            db.add(target)
+            db.flush()
+            target_documents.append(target)
+        else:
+            target.filename = source.filename
+            target.file_type = source.file_type
+            target.title = source.title
+            target.status = source.status
+            target.normalized_source = source.normalized_source
+            target.source_checksum = source.source_checksum
+            target.source_kind = source.source_kind
+            target.ingest_schema_version = source.ingest_schema_version
+            target.bucket_count = source.bucket_count
+            target.chunk_count = source.chunk_count
+            target.metadata_json = deepcopy(source.metadata_json or {})
+            target.error = source.error
+            target.updated_at = utc_now()
+            db.add(target)
+        document_id_map[source.id] = target.id
+
+    for source in source_documents:
+        target = db.get(KnowledgeDocument, document_id_map[source.id])
+        if target:
+            target.parent_document_id = document_id_map.get(
+                source.parent_document_id or "", source.parent_document_id
+            )
+            db.add(target)
+
+    for source in source_buckets:
+        target_document_id = document_id_map[source.document_id]
+        target = one_match(
+            target_buckets,
+            lambda row: (
+                row.document_id == target_document_id
+                and row.bucket_key == source.bucket_key
+                and row.title == source.title
+            ),
+            "bucket",
+        )
+        if target is None:
+            target = KnowledgeBucket(
+                tenant_id=source.tenant_id,
+                knowledge_base_id=source.knowledge_base_id,
+                knowledge_base_version_id=target_version_id,
+                document_id=target_document_id,
+                bucket_key=source.bucket_key,
+                title=source.title,
+                summary=source.summary,
+                token_estimate=source.token_estimate,
+                metadata_json=deepcopy(source.metadata_json or {}),
+                created_at=source.created_at,
+                updated_at=utc_now(),
+            )
+            db.add(target)
+            db.flush()
+            target_buckets.append(target)
+        else:
+            target.document_id = target_document_id
+            target.bucket_key = source.bucket_key
+            target.title = source.title
+            target.summary = source.summary
+            target.token_estimate = source.token_estimate
+            target.metadata_json = deepcopy(source.metadata_json or {})
+            target.updated_at = utc_now()
+            db.add(target)
+        bucket_id_map[source.id] = target.id
+
+    for source in source_chunks:
+        target_bucket_id = bucket_id_map[source.bucket_id]
+        target = one_match(
+            target_chunks,
+            lambda row: row.bucket_id == target_bucket_id and row.chunk_index == source.chunk_index,
+            "chunk",
+        )
+        if target is None:
+            target = KnowledgeChunk(
+                tenant_id=source.tenant_id,
+                knowledge_base_id=source.knowledge_base_id,
+                knowledge_base_version_id=target_version_id,
+                document_id=document_id_map[source.document_id],
+                bucket_id=target_bucket_id,
+                chunk_index=source.chunk_index,
+                content=source.content,
+                summary=source.summary,
+                source_ref=source.source_ref,
+                metadata_json=deepcopy(source.metadata_json or {}),
+                created_at=source.created_at,
+                updated_at=utc_now(),
+            )
+            db.add(target)
+            db.flush()
+            target_chunks.append(target)
+        else:
+            target.document_id = document_id_map[source.document_id]
+            target.bucket_id = target_bucket_id
+            target.chunk_index = source.chunk_index
+            target.content = source.content
+            target.summary = source.summary
+            target.source_ref = source.source_ref
+            target.metadata_json = deepcopy(source.metadata_json or {})
+            target.updated_at = utc_now()
+            db.add(target)
+        chunk_id_map[source.id] = target.id
+
+    for source in source_concepts:
+        target_document_id = document_id_map.get(source.document_id or "")
+        target = one_match(
+            target_concepts,
+            lambda row: row.concept_id == source.concept_id
+            and row.document_id == target_document_id,
+            "concept",
+        )
+        if target is None:
+            target = KnowledgeConcept(
+                tenant_id=source.tenant_id,
+                knowledge_base_id=source.knowledge_base_id,
+                knowledge_base_version_id=target_version_id,
+                document_id=target_document_id,
+                concept_id=source.concept_id,
+                concept_type=source.concept_type,
+                title=source.title,
+                description=source.description,
+                content_md=source.content_md,
+                frontmatter_json=deepcopy(source.frontmatter_json or {}),
+                links_json=deepcopy(source.links_json or []),
+                citations_json=deepcopy(source.citations_json or []),
+                source_refs_json=deepcopy(source.source_refs_json or []),
+                status=source.status,
+                created_at=source.created_at,
+                updated_at=utc_now(),
+            )
+            db.add(target)
+            db.flush()
+            target_concepts.append(target)
+        else:
+            target.document_id = target_document_id
+            target.concept_id = source.concept_id
+            target.concept_type = source.concept_type
+            target.title = source.title
+            target.description = source.description
+            target.content_md = source.content_md
+            target.frontmatter_json = deepcopy(source.frontmatter_json or {})
+            target.links_json = deepcopy(source.links_json or [])
+            target.citations_json = deepcopy(source.citations_json or [])
+            target.source_refs_json = deepcopy(source.source_refs_json or [])
+            target.status = source.status
+            target.updated_at = utc_now()
+            db.add(target)
+        concept_id_map[source.id] = target.id
+
+    for source in source_suggestions:
+        target_document_id = document_id_map.get(source.document_id or "")
+        target_bucket_id = bucket_id_map.get(source.bucket_id or "")
+        target = one_match(
+            target_suggestions,
+            lambda row: (
+                row.document_id == target_document_id
+                and row.bucket_id == target_bucket_id
+                and row.suggestion_type == source.suggestion_type
+                and row.title == source.title
+            ),
+            "discovery suggestion",
+        )
+        if target is None:
+            target = KnowledgeDiscoverySuggestion(
+                tenant_id=source.tenant_id,
+                knowledge_base_id=source.knowledge_base_id,
+                knowledge_base_version_id=target_version_id,
+                document_id=target_document_id,
+                bucket_id=target_bucket_id,
+                suggestion_type=source.suggestion_type,
+                title=source.title,
+                status=source.status,
+                payload_json=deepcopy(source.payload_json or {}),
+                source_refs_json=deepcopy(source.source_refs_json or []),
+                reason=source.reason,
+                created_at=source.created_at,
+                updated_at=utc_now(),
+            )
+            db.add(target)
+            db.flush()
+            target_suggestions.append(target)
+        else:
+            target.document_id = target_document_id
+            target.bucket_id = target_bucket_id
+            target.suggestion_type = source.suggestion_type
+            target.title = source.title
+            target.status = source.status
+            target.payload_json = deepcopy(source.payload_json or {})
+            target.source_refs_json = deepcopy(source.source_refs_json or [])
+            target.reason = source.reason
+            target.updated_at = utc_now()
+            db.add(target)
+
+    target_documents = db.exec(
+        select(KnowledgeDocument).where(
+            KnowledgeDocument.tenant_id == tenant_id,
+            KnowledgeDocument.knowledge_base_id == knowledge_base_id,
+            KnowledgeDocument.knowledge_base_version_id == target_version_id,
+        )
+    ).all()
+    for document in target_documents:
+        document.parent_document_id = document_id_map.get(
+            document.parent_document_id or "", document.parent_document_id
+        )
+        document.metadata_json = _remap_reference_json(
+            document.metadata_json or {}, document_id_map, bucket_id_map, chunk_id_map
+        )
+        document.updated_at = utc_now()
+        db.add(document)
+    target_buckets = db.exec(
+        select(KnowledgeBucket).where(
+            KnowledgeBucket.tenant_id == tenant_id,
+            KnowledgeBucket.knowledge_base_id == knowledge_base_id,
+            KnowledgeBucket.knowledge_base_version_id == target_version_id,
+        )
+    ).all()
+    for bucket in target_buckets:
+        bucket.metadata_json = _remap_reference_json(
+            bucket.metadata_json or {}, document_id_map, bucket_id_map, chunk_id_map
+        )
+        bucket.updated_at = utc_now()
+        db.add(bucket)
+    target_chunks = db.exec(
+        select(KnowledgeChunk).where(
+            KnowledgeChunk.tenant_id == tenant_id,
+            KnowledgeChunk.knowledge_base_id == knowledge_base_id,
+            KnowledgeChunk.knowledge_base_version_id == target_version_id,
+        )
+    ).all()
+    for chunk in target_chunks:
+        chunk.source_ref = _remap_reference_text(
+            chunk.source_ref, document_id_map, bucket_id_map
+        )
+        chunk.metadata_json = _remap_reference_json(
+            chunk.metadata_json or {}, document_id_map, bucket_id_map, chunk_id_map
+        )
+        chunk.updated_at = utc_now()
+        db.add(chunk)
+    target_concepts = db.exec(
+        select(KnowledgeConcept).where(
+            KnowledgeConcept.tenant_id == tenant_id,
+            KnowledgeConcept.knowledge_base_id == knowledge_base_id,
+            KnowledgeConcept.knowledge_base_version_id == target_version_id,
+        )
+    ).all()
+    for concept in target_concepts:
+        concept.source_refs_json = _remap_reference_json(
+            concept.source_refs_json or {}, document_id_map, bucket_id_map, chunk_id_map
+        )
+        concept.links_json = _remap_reference_json(
+            concept.links_json or {}, document_id_map, bucket_id_map, chunk_id_map
+        )
+        concept.citations_json = _remap_reference_json(
+            concept.citations_json or {}, document_id_map, bucket_id_map, chunk_id_map
+        )
+        concept.content_md = _remap_reference_text(
+            concept.content_md, document_id_map, bucket_id_map
+        ) or concept.content_md
+        concept.updated_at = utc_now()
+        db.add(concept)
+    target_suggestions = db.exec(
+        select(KnowledgeDiscoverySuggestion).where(
+            KnowledgeDiscoverySuggestion.tenant_id == tenant_id,
+            KnowledgeDiscoverySuggestion.knowledge_base_id == knowledge_base_id,
+            KnowledgeDiscoverySuggestion.knowledge_base_version_id == target_version_id,
+        )
+    ).all()
+    for suggestion in target_suggestions:
+        suggestion.payload_json = _remap_reference_json(
+            suggestion.payload_json or {}, document_id_map, bucket_id_map, chunk_id_map
+        )
+        suggestion.source_refs_json = _remap_reference_json(
+            suggestion.source_refs_json or {}, document_id_map, bucket_id_map, chunk_id_map
+        )
+        suggestion.updated_at = utc_now()
+        db.add(suggestion)
+
+    target_version = db.get(KnowledgeBaseVersion, target_version_id)
+    if target_version:
+        target_version.content_manifest_json = {
+            **(target_version.content_manifest_json or {}),
+            "source_version_id": source_version_id,
+            "document_id_map": document_id_map,
+            "bucket_id_map": bucket_id_map,
+            "chunk_id_map": chunk_id_map,
+            "concept_id_map": concept_id_map,
+        }
+        target_version.updated_at = utc_now()
+        db.add(target_version)
+
+
+def _clone_knowledge_version_assets_legacy(
+    db: Session,
+    tenant_id: str,
+    knowledge_base_id: str,
+    source_version_id: str,
+    target_version_id: str,
+) -> None:
+    if source_version_id == target_version_id:
+        return
+
+    # 兼容入口沿用 SD-5 的显式物理映射规则，不能把旧版引用当成稳定 ID。
+    from app.knowledge.revisions import _remap_reference_json, _remap_reference_text
+
+    document_id_map: dict[str, str] = {}
+    bucket_id_map: dict[str, str] = {}
+    chunk_id_map: dict[str, str] = {}
+    concept_id_map: dict[str, str] = {}
     source_documents = db.exec(
         select(KnowledgeDocument)
         .where(
@@ -1399,10 +2053,16 @@ def clone_knowledge_version_assets(
                 tenant_id=document.tenant_id,
                 knowledge_base_id=document.knowledge_base_id,
                 knowledge_base_version_id=target_version_id,
+                lineage_id=document.lineage_id or document.id,
+                parent_document_id=document.parent_document_id,
                 filename=document.filename,
                 file_type=document.file_type,
                 title=document.title,
                 status=document.status,
+                normalized_source=document.normalized_source,
+                source_checksum=document.source_checksum,
+                source_kind=document.source_kind,
+                ingest_schema_version=document.ingest_schema_version,
                 bucket_count=document.bucket_count,
                 chunk_count=document.chunk_count,
                 metadata_json=deepcopy(document.metadata_json or {}),
@@ -1460,12 +2120,16 @@ def clone_knowledge_version_assets(
                 chunk_index=chunk.chunk_index,
                 content=chunk.content,
                 summary=chunk.summary,
-                source_ref=chunk.source_ref,
+                source_ref=_remap_reference_text(
+                    chunk.source_ref, document_id_map, bucket_id_map
+                ),
                 metadata_json=deepcopy(chunk.metadata_json or {}),
                 created_at=chunk.created_at,
                 updated_at=utc_now(),
             )
             db.add(clone)
+            db.flush()
+            chunk_id_map[chunk.id] = clone.id
 
         source_suggestions = db.exec(
             select(KnowledgeDiscoverySuggestion)
@@ -1487,8 +2151,11 @@ def clone_knowledge_version_assets(
                 title=suggestion.title,
                 status=suggestion.status,
                 payload_json=deepcopy(suggestion.payload_json or {}),
-                source_refs_json=_remap_source_refs(
-                    suggestion.source_refs_json or [], document_id_map
+                source_refs_json=_remap_reference_json(
+                    suggestion.source_refs_json or {},
+                    document_id_map,
+                    bucket_id_map,
+                    chunk_id_map,
                 ),
                 reason=suggestion.reason,
                 created_at=suggestion.created_at,
@@ -1572,16 +2239,104 @@ def clone_knowledge_version_assets(
             concept_type=concept.concept_type,
             title=concept.title,
             description=concept.description,
-            content_md=concept.content_md,
+            content_md=_remap_reference_text(
+                concept.content_md, document_id_map, bucket_id_map
+            ) or concept.content_md,
             frontmatter_json=deepcopy(concept.frontmatter_json or {}),
             links_json=deepcopy(concept.links_json or []),
             citations_json=deepcopy(concept.citations_json or []),
-            source_refs_json=_remap_source_refs(concept.source_refs_json or [], document_id_map),
+            source_refs_json=_remap_reference_json(
+                concept.source_refs_json or {},
+                document_id_map,
+                bucket_id_map,
+                chunk_id_map,
+            ),
             status=concept.status,
             created_at=concept.created_at,
             updated_at=utc_now(),
         )
         db.add(clone)
+        db.flush()
+        concept_id_map[concept.id] = clone.id
+
+    for document in db.exec(
+        select(KnowledgeDocument).where(
+            KnowledgeDocument.tenant_id == tenant_id,
+            KnowledgeDocument.knowledge_base_id == knowledge_base_id,
+            KnowledgeDocument.knowledge_base_version_id == target_version_id,
+        )
+    ).all():
+        document.parent_document_id = document_id_map.get(
+            document.parent_document_id or "", document.parent_document_id
+        )
+        document.metadata_json = _remap_reference_json(
+            document.metadata_json or {}, document_id_map, bucket_id_map, chunk_id_map
+        )
+        document.updated_at = utc_now()
+        db.add(document)
+    for bucket in db.exec(
+        select(KnowledgeBucket).where(
+            KnowledgeBucket.tenant_id == tenant_id,
+            KnowledgeBucket.knowledge_base_id == knowledge_base_id,
+            KnowledgeBucket.knowledge_base_version_id == target_version_id,
+        )
+    ).all():
+        bucket.metadata_json = _remap_reference_json(
+            bucket.metadata_json or {}, document_id_map, bucket_id_map, chunk_id_map
+        )
+        bucket.updated_at = utc_now()
+        db.add(bucket)
+    for chunk in db.exec(
+        select(KnowledgeChunk).where(
+            KnowledgeChunk.tenant_id == tenant_id,
+            KnowledgeChunk.knowledge_base_id == knowledge_base_id,
+            KnowledgeChunk.knowledge_base_version_id == target_version_id,
+        )
+    ).all():
+        chunk.metadata_json = _remap_reference_json(
+            chunk.metadata_json or {}, document_id_map, bucket_id_map, chunk_id_map
+        )
+        chunk.source_ref = _remap_reference_text(
+            chunk.source_ref, document_id_map, bucket_id_map
+        )
+        chunk.updated_at = utc_now()
+        db.add(chunk)
+    for concept in db.exec(
+        select(KnowledgeConcept).where(
+            KnowledgeConcept.tenant_id == tenant_id,
+            KnowledgeConcept.knowledge_base_id == knowledge_base_id,
+            KnowledgeConcept.knowledge_base_version_id == target_version_id,
+        )
+    ).all():
+        concept.source_refs_json = _remap_reference_json(
+            concept.source_refs_json or {}, document_id_map, bucket_id_map, chunk_id_map
+        )
+        concept.links_json = _remap_reference_json(
+            concept.links_json or {}, document_id_map, bucket_id_map, chunk_id_map
+        )
+        concept.citations_json = _remap_reference_json(
+            concept.citations_json or {}, document_id_map, bucket_id_map, chunk_id_map
+        )
+        concept.content_md = _remap_reference_text(
+            concept.content_md, document_id_map, bucket_id_map
+        ) or concept.content_md
+        concept.updated_at = utc_now()
+        db.add(concept)
+    for suggestion in db.exec(
+        select(KnowledgeDiscoverySuggestion).where(
+            KnowledgeDiscoverySuggestion.tenant_id == tenant_id,
+            KnowledgeDiscoverySuggestion.knowledge_base_id == knowledge_base_id,
+            KnowledgeDiscoverySuggestion.knowledge_base_version_id == target_version_id,
+        )
+    ).all():
+        suggestion.payload_json = _remap_reference_json(
+            suggestion.payload_json or {}, document_id_map, bucket_id_map, chunk_id_map
+        )
+        suggestion.source_refs_json = _remap_reference_json(
+            suggestion.source_refs_json or {}, document_id_map, bucket_id_map, chunk_id_map
+        )
+        suggestion.updated_at = utc_now()
+        db.add(suggestion)
 
 
 def _remap_source_refs(

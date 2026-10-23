@@ -27,7 +27,14 @@ from app.api.auth import (
     update_tenant_display,
     update_user,
 )
-from app.db.models import BusinessRole, EmployeeProfile, EmployeeRoleAssignment, Tenant, User
+from app.db.models import (
+    BusinessRole,
+    EmployeeProfile,
+    EmployeeRoleAssignment,
+    MemoryCaptureScope,
+    Tenant,
+    User,
+)
 from app.security.auth import create_access_token, get_current_user, hash_password
 
 
@@ -281,6 +288,15 @@ def test_account_management_validates_category_and_synchronizes_lifecycle() -> N
         assert suspended.left_at is None
         assert profile.status == "suspended"
         assert profile.leave_date is None
+        scope = db.exec(
+            select(MemoryCaptureScope).where(
+                MemoryCaptureScope.tenant_id == "tenant_demo",
+                MemoryCaptureScope.user_id == created.id,
+                MemoryCaptureScope.scope_kind == "user",
+                MemoryCaptureScope.agent_scope_key == "__user__",
+            )
+        ).one()
+        assert scope.permission_generation == 1
 
         left = update_user(
             created.id,

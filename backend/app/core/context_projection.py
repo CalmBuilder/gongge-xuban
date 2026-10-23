@@ -11,7 +11,9 @@ from __future__ import annotations
 from typing import Any
 
 from app.core.conversation_context import ConversationContextSettings, build_conversation_context
+from app.core.time_context import normalize_persisted_time_context
 from app.knowledge.citations import EMAIL_PATTERN
+from app.knowledge.schema import withhold_insufficient_knowledge_candidates
 from app.llm.stage_protocol import TURN_STAGE_MESSAGES_KEY
 
 
@@ -87,6 +89,20 @@ def compact_conversation_context(
         settings=effective_settings,
     )
     compacted[TURN_STAGE_MESSAGES_KEY] = turn_messages
+    time_context = normalize_persisted_time_context(
+        projected_context.get("time_context")
+        or (
+            metadata.get("time_context")
+            if isinstance(metadata, dict)
+            else None
+        )
+    )
+    if time_context is not None:
+        compacted["time_context"] = time_context
+        compacted_metadata = compacted.get("metadata")
+        if isinstance(compacted_metadata, dict):
+            compacted_metadata["time_context"] = time_context
+            compacted_metadata["current_turn_time"] = time_context["local_at"]
     return compacted
 
 
@@ -311,12 +327,25 @@ def _compact_knowledge_result(item: dict[str, Any]) -> dict[str, Any]:
     query = item.get("query")
     if isinstance(query, dict):
         query = query.get("query")
-    return _without_empty(
+    projected_item = withhold_insufficient_knowledge_candidates(item)
+    sufficiency = projected_item.get("evidence_sufficiency")
+    model_sufficiency = (
+        {key: sufficiency[key] for key in ("required", "satisfied")
+         if isinstance(sufficiency.get(key), bool)}
+        if isinstance(sufficiency, dict)
+        else None
+    )
+    projected = _without_empty(
         {
             "query": _short_text(query, 500),
-            "retrieved_knowledge": _compact_retrieved_knowledge(item),
+            "outcome": projected_item.get("outcome"),
+            "evidence_sufficiency": model_sufficiency,
+            "retrieved_knowledge": _compact_retrieved_knowledge(projected_item),
         }
     )
+    if projected_item.get("outcome") in ("no_match", "insufficient"):
+        projected["retrieved_knowledge"] = []
+    return projected
 
 
 def _compact_retrieved_knowledge(item: dict[str, Any]) -> list[dict[str, Any]]:

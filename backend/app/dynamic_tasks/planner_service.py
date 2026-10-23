@@ -1,5 +1,5 @@
 """
-@Time       : 2026/08/04 02:24
+@Time       : 2026/10/02
 @Author     : zhanglp8181
 @File       : planner_service.py
 @CallChain  : DynamicTaskAgent → DynamicTaskPlanner → LLMClient → NormalizedPlan
@@ -9,15 +9,19 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from collections.abc import Mapping, Sequence
 from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from app.core.time_context import normalize_persisted_time_context
 from app.dynamic_tasks.capability_catalog import CapabilitySnapshot
 from app.dynamic_tasks.planning import (
     DynamicPlanDraft,
+    DynamicPlanDraftStep,
+    GuidanceRequirementDraft,
     NormalizedPlan,
     SuccessCriterion,
     _guidance_phase_number,
@@ -25,6 +29,7 @@ from app.dynamic_tasks.planning import (
     guidance_principle_candidates,
     normalize_plan_draft,
 )
+from app.memory.request_projection import MemoryRequestEnvelope, MemoryRequestPayload
 from app.observability.spans import llm_operation
 
 
@@ -43,6 +48,27 @@ class DynamicTaskPlannerError(ValueError):
 
         super().__init__(message[:1000])
         self.code = code
+
+
+def _planner_failure_message(error: ValueError | ValidationError | None) -> str:
+    """仅回传平台schema字段路径和错误类型，拒绝模型输入值、ctx与异常正文。"""
+    if isinstance(error, ValidationError):
+        fields = set().union(*(model.model_fields for model in (
+            DynamicPlanDraft, DynamicPlanDraftStep, GuidanceRequirementDraft, SuccessCriterion,
+        )))
+        errors = []
+        for item in error.errors(include_input=False, include_context=False, include_url=False)[:8]:
+            path = [part if type(part) is int or part in fields else "$extra"
+                    for part in item["loc"][:8]]
+            code = item["type"]
+            errors.append({"path": path, "type": code if re.fullmatch(r"[a-z_]+", code)
+                           else "schema_invalid"})
+        return json.dumps({"schema_errors": errors}, ensure_ascii=False)[:1000]
+    if error is not None and "受管附件" in str(error):
+        return "受管附件必须由平台内建读取；不能改用业务工具或请求额外授权。"
+    if error is not None and "required knowledge" in str(error):
+        return "required knowledge 必须由已冻结知识能力读取，最终answer依赖这些步骤。"
+    return "计划未满足依赖、能力或Guidance契约；请按宿主输出合同重新生成。"
 
 
 class DynamicGuidanceSelection(BaseModel):
@@ -97,6 +123,7 @@ class DynamicTaskPlanner:
         goal: str,
         success_criteria: Sequence[SuccessCriterion],
         catalog: Sequence[CapabilitySnapshot],
+        time_context: Mapping[str, object] | None = None,
     ) -> DynamicGuidanceSelection:
         """仅用无正文目录选择 model-allowed 指导 Skill，并拒绝模型虚构引用。"""
 
@@ -127,18 +154,22 @@ class DynamicTaskPlanner:
             }
             for item in eligible
         ]
+        payload = {
+            "goal": goal,
+            "success_criteria": [item.model_dump(mode="json") for item in success_criteria],
+            "skill_catalog": catalog_rows,
+            "output_contract": {
+                "selected_skill_names": ["skill_catalog 中的 slug，最多 3 个"],
+                "reason": "选择原因；不选择时也必须说明",
+            },
+        }
+        normalized_time_context = normalize_persisted_time_context(time_context)
+        if normalized_time_context is not None:
+            payload["time_context"] = normalized_time_context
         with llm_operation("general_skill.select"):
             raw = self.client.generate_json(
                 _GUIDANCE_SELECTOR_SYSTEM_PROMPT,
-                {
-                "goal": goal,
-                "success_criteria": [item.model_dump(mode="json") for item in success_criteria],
-                "skill_catalog": catalog_rows,
-                "output_contract": {
-                    "selected_skill_names": ["skill_catalog 中的 slug，最多 3 个"],
-                    "reason": "选择原因；不选择时也必须说明",
-                },
-                },
+                payload,
             )
         selection = DynamicGuidanceSelection.model_validate(raw)
         allowed_names = {item.name for item in eligible}
@@ -155,6 +186,7 @@ class DynamicTaskPlanner:
         input_resources: Sequence[dict[str, object]] = (),
         loaded_guidance: Sequence[dict[str, object]] = (),
         memory_context: Sequence[dict[str, object]] = (),
+        time_context: Mapping[str, object] | None = None,
     ) -> NormalizedPlan:
         """生成完整草案并覆盖目标/成功标准，防止模型改写用户任务契约。"""
 
@@ -236,6 +268,9 @@ class DynamicTaskPlanner:
                 "allowed_step_kinds": allowed_step_kinds,
             },
         }
+        normalized_time_context = normalize_persisted_time_context(time_context)
+        if normalized_time_context is not None:
+            payload["time_context"] = normalized_time_context
         guidance_use_ids_by_name = {
             str(item.get("name") or ""): tuple(
                 str(use_id)
@@ -253,6 +288,18 @@ class DynamicTaskPlanner:
             guidance_sources_by_name
         )
         repair_payload = dict(payload)
+        from app.memory.projection import MemoryCandidate, MemoryProjectionPolicy
+
+        memory_envelope = getattr(memory_context, "envelope", None)
+        if memory_envelope is None:
+            memory_envelope = MemoryRequestEnvelope(tuple(
+                MemoryCandidate(id=f"internal-{index}", key=str(index),
+                                kind=str(item.get("kind") or "fact"),
+                                content=str(item.get("content") or ""),
+                                metadata=dict(item.get("metadata") or {}))
+                for index, item in enumerate(memory_context)
+            ), goal, MemoryProjectionPolicy(max_items=20, max_fact_characters=4000))
+        self.last_memory_envelope = memory_envelope
         research_depth_repair_instruction = _research_depth_repair_instruction(
             goal=goal,
             loaded_guidance=loaded_guidance,
@@ -261,6 +308,7 @@ class DynamicTaskPlanner:
         # 三轮常规计划收敛之外，研究深度错误允许一次额外的定向修复；
         # 只有该错误能进入第四轮，其他语义错误仍在原有边界内停止。
         for attempt in range(4):
+            repair_payload = MemoryRequestPayload(repair_payload, memory_envelope)
             with llm_operation("dynamic_task.plan"):
                 raw = _normalize_model_display_fields(
                     self.client.generate_json(_PLANNER_SYSTEM_PROMPT, repair_payload)
@@ -300,7 +348,8 @@ class DynamicTaskPlanner:
                     success_criteria=success_criteria,
                     loaded_guidance=loaded_guidance,
                     candidate_catalog=payload["guidance_principle_candidates"],
-                    failure_message=str(last_error),
+                    failure_message=_planner_failure_message(last_error),
+                    memory_envelope=memory_envelope,
                 )
                 # 修复器本身也可能因 provider 超时或返回半截 JSON 而交回原草案。
                 # 在进入身份修复前再做一次宿主后置检查，确保“已加载 Skill 但
@@ -322,6 +371,7 @@ class DynamicTaskPlanner:
                 self.client,
                 raw,
                 candidate_catalog=payload["guidance_principle_candidates"],
+                memory_envelope=memory_envelope,
             )
             if (
                 attempt == 1
@@ -464,7 +514,7 @@ class DynamicTaskPlanner:
                         "repair": {
                             "attempt": attempt + 1,
                             "failure_code": "DYNAMIC_PLAN_SEMANTIC_INVALID",
-                            "failure_message": str(exc)[:1000],
+                            "failure_message": _planner_failure_message(exc),
                             "instruction": (
                                 "上一轮把输入的 output_contract/schema 回显成了结果，禁止再次回显。"
                                 "只返回一个完整 DynamicPlanDraft JSON：顶层必须有 goal、success_criteria、"
@@ -483,7 +533,7 @@ class DynamicTaskPlanner:
                         "repair": {
                             "attempt": attempt + 1,
                             "failure_code": "DYNAMIC_RESEARCH_DEPTH_INVALID",
-                            "failure_message": str(exc)[:1000],
+                            "failure_message": _planner_failure_message(exc),
                             "instruction": (
                                 "上一轮研究计划没有满足已加载能力包的研究深度契约。"
                                 + research_depth_repair_instruction
@@ -502,7 +552,7 @@ class DynamicTaskPlanner:
                     "repair": {
                         "attempt": 1,
                         "failure_code": "DYNAMIC_PLAN_SEMANTIC_INVALID",
-                        "failure_message": str(exc)[:1000],
+                        "failure_message": _planner_failure_message(exc),
                         "instruction": (
                             "重新生成完整计划；只能按 capabilities[].allowed_step_kind 使用能力，"
                             "每个能力步骤必须且只能逐字复制一个 capabilities[].name 到"
@@ -553,6 +603,8 @@ input_resources 是平台自动读取的受管输入，不是 capabilities；公
 在 answer 前自动执行内建 input.* / table.compute。禁止为附件虚构 tool.read 或 capability_ref，
 禁止以缺少这些内建能力为由生成 clarification；clarification 只能询问真实缺失的业务信息。
 如果 goal 已经给出事实、约束和输出要求，不得为“确认交付要求/输出格式”增加 clarification；应直接规划 answer。
+但用户明确要求先询问并等待其确认时，这个尚未取得的确认是用户规定的执行前置条件，
+必须先规划 clarification 再规划 answer，不能用已知记忆或完整输出要求代替用户确认。
 澄清 title 必须明确请求/等待用户提供、确认、选择或授权；不得把读取、分析、设计或撰写等
 Agent 内部工作伪装成 clarification。
 draft_id 只用于本次草案依赖，持久 step key 由服务端生成。
@@ -648,8 +700,9 @@ def _repair_missing_guidance_requirements(
     loaded_guidance: Sequence[dict[str, object]],
     candidate_catalog: object,
     failure_message: str,
+    memory_envelope: MemoryRequestEnvelope | None = None,
 ) -> dict:
-    """只修复完整计划遗漏的 GuidanceRequirement，并把其他计划字段原样保留。"""
+    """修复遗漏Guidance；派生要求槽沿同一信封检查撤销，其他计划字段保持。"""
 
     candidate_options = _guidance_candidate_options(candidate_catalog)
     loaded_skill_contract: list[dict[str, object]] = []
@@ -701,7 +754,10 @@ def _repair_missing_guidance_requirements(
         with llm_operation("general_skill.requirement_repair"):
             repaired = client.generate_json(
                 _GUIDANCE_REQUIREMENT_REPAIR_SYSTEM_PROMPT,
-                repair_payload,
+                MemoryRequestPayload({**repair_payload, "memory_context": []},
+                                     memory_envelope, model_output_fields=(
+                    "current_guidance_requirements", "previous_repair_requirements",
+                )) if memory_envelope is not None else repair_payload,
             )
         requirements = repaired.get("guidance_requirements") if isinstance(repaired, dict) else None
         if _repair_covers_loaded_skills(requirements, loaded_skill_contract):
@@ -879,8 +935,9 @@ def _repair_guidance_identity_fields(
     raw: dict,
     *,
     candidate_catalog: object,
+    memory_envelope: MemoryRequestEnvelope | None = None,
 ) -> dict:
-    """为缺失候选身份执行一次最小、只读的候选选择，不替模型改写原则。"""
+    """沿同一信封检查派生身份修复要求，保持可信候选选择与原原则校验。"""
 
     raw_requirements = raw.get("guidance_requirements")
     if not isinstance(raw_requirements, list):
@@ -991,21 +1048,20 @@ def _repair_guidance_identity_fields(
         repaired = dict(raw)
         repaired["guidance_requirements"] = hydrated_requirements
         return repaired
+    identity_payload = {
+        "requirements": missing,
+        "candidate_options": candidate_options,
+        "output_contract": {
+            "identities": [{"index": "输入 requirements 中的整数 index",
+                            "candidate_index": "candidate_options 中的整数 candidate_index"}],
+        },
+    }
     with llm_operation("general_skill.requirement_identity"):
         selection = client.generate_json(
             _GUIDANCE_IDENTITY_REPAIR_SYSTEM_PROMPT,
-            {
-                "requirements": missing,
-                "candidate_options": candidate_options,
-                "output_contract": {
-                    "identities": [
-                        {
-                            "index": "输入 requirements 中的整数 index",
-                            "candidate_index": "candidate_options 中的整数 candidate_index",
-                        }
-                    ]
-                },
-            },
+            MemoryRequestPayload({**identity_payload, "memory_context": []}, memory_envelope,
+                                 model_output_fields=("requirements",))
+            if memory_envelope is not None else identity_payload,
         )
     identities = selection.get("identities") if isinstance(selection, dict) else None
     if not isinstance(identities, list):

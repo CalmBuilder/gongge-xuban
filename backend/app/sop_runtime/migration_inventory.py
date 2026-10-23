@@ -163,10 +163,12 @@ def build_sop_migration_inventory(db: Session, tenant_id: str) -> SopMigrationIn
     current_versions: dict[tuple[str, str], SkillVersion] = {}
     version_skill_ids: dict[str, str] = {}
     for version in versions:
+        version_skill_ids[version.id] = version.skill_id
+        if version.scope_agent_id:
+            continue
         versions_by_skill.setdefault(version.skill_id, []).append(version)
         current_version_ids[(version.skill_id, version.version)] = version.id
         current_versions[(version.skill_id, version.version)] = version
-        version_skill_ids[version.id] = version.skill_id
 
     instances_by_skill: Counter[str] = Counter()
     historical_instances_by_skill: Counter[str] = Counter()

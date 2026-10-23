@@ -15,15 +15,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import LargeBinary, cast, delete, func, select as sa_select
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from sqlalchemy import LargeBinary, and_, cast, delete, func, or_, select as sa_select
 from sqlmodel import Session, select
 
 from app.agents.branching import (
     ensure_agent_private_knowledge_branch,
+    ensure_knowledge_base_version,
     ensure_open_gallery_binding,
     is_open_gallery_resource,
-    knowledge_version_for_upload,
+    get_agent,
     mark_resource_open_gallery,
     mark_resource_private_for_agent,
     metadata_preserving_creator,
@@ -33,6 +34,7 @@ from app.async_jobs import enqueue_async_job
 from app.audit.service import append_user_management_audit
 from app.db import get_session
 from app.db.models import (
+    AgentKnowledgeBranch,
     KnowledgeBucket,
     KnowledgeChunk,
     KnowledgeConcept,
@@ -51,17 +53,18 @@ from app.knowledge.schema import (
     KnowledgeChunkUpdateRequest,
     KnowledgeDiscoveryRead,
     KnowledgeDocumentRead,
+    KnowledgeDocumentContentRead,
     KnowledgeDocumentUpdateRequest,
     KnowledgeDocumentUploadRequest,
     KnowledgeBucketUpdateRequest,
     KnowledgeOkfImportRequest,
     KnowledgeIngestJobRead,
+    KnowledgeRevisionAccepted,
     KnowledgeSearchRequest,
     KnowledgeSearchResponse,
 )
 from app.knowledge.okf import (
     build_okf_for_document,
-    create_concept_evidence_rows,
     parse_okf_bundle,
     upsert_concepts,
 )
@@ -70,13 +73,24 @@ from app.knowledge.access import (
     resolve_knowledge_access,
 )
 from app.knowledge.service import (
-    IngestPayload,
     KnowledgeDiscoveryConflictError,
     KnowledgeDiscoveryValidationError,
     KnowledgeService,
     bucket_read,
     chunk_read,
     validate_discovered_skill,
+)
+from app.knowledge.revisions import (
+    KnowledgeRevisionConflictError,
+    KnowledgeRevisionInputError,
+    RevisionPrepareInput,
+    build_revision,
+    prepare_revision,
+    prepare_compatibility_revision,
+    prepare_initial_revision,
+    publish_revision,
+    run_compatibility_revision,
+    run_revision_job,
 )
 from app.security.auth import ensure_current_user_tenant, get_current_user
 from app.security.permissions import (
@@ -110,33 +124,87 @@ def upload_document(
         current_user,
         creator_metadata=creator_metadata,
     )
-    version = knowledge_version_for_upload(
-        db,
-        request.tenant_id,
-        knowledge_base.id,
-        agent_id,
-        metadata_json=creator_metadata,
+    source_version = _current_upload_scope_version(db, knowledge_base, agent_id)
+    upload_scope = _upload_scope(db, knowledge_base, agent_id)
+    source_document = (
+        db.exec(
+            select(KnowledgeDocument)
+            .where(
+                KnowledgeDocument.tenant_id == request.tenant_id,
+                KnowledgeDocument.knowledge_base_id == knowledge_base.id,
+                KnowledgeDocument.knowledge_base_version_id == source_version.id,
+            )
+            .order_by(KnowledgeDocument.created_at.asc(), KnowledgeDocument.id.asc())
+        ).first()
+        if source_version
+        else None
     )
-    db.commit()
-    service = KnowledgeService(db)
-    job = service.create_ingest_job(
-        IngestPayload(
-            tenant_id=request.tenant_id,
-            knowledge_base_id=knowledge_base.id,
-            knowledge_base_version_id=version.id,
-            filename=request.filename,
-            content_base64=request.content_base64,
-            title=request.title,
-            metadata=creator_metadata,
-        )
-    )
-    enqueue_async_job(
-        "knowledge_ingest",
-        service.run_ingest_job,
-        job.id,
-        metadata={"tenant_id": request.tenant_id, "filename": request.filename},
-    )
-    return job_read(job)
+    if source_document and isinstance(current_user, User):
+        try:
+            job = prepare_compatibility_revision(
+                db,
+                tenant_id=request.tenant_id,
+                knowledge_base_id=knowledge_base.id,
+                scope=upload_scope,
+                actor_user_id=current_user.id,
+                document_id=source_document.id,
+                operation_kind="upload",
+                mutation_payload={
+                    "filename": request.filename,
+                    "content_base64": request.content_base64,
+                    "title": request.title,
+                    "metadata": creator_metadata,
+                },
+            )
+        except KnowledgeRevisionConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except KnowledgeRevisionInputError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        metadata = dict(job.metadata_json or {})
+        if not metadata.get("wake_requested") and job.status == "queued":
+            job.metadata_json = {**metadata, "wake_requested": True}
+            db.add(job)
+            db.commit()
+            enqueue_async_job(
+                "knowledge_revision",
+                run_revision_job,
+                job.id,
+                metadata={"tenant_id": request.tenant_id, "knowledge_base_id": knowledge_base.id},
+            )
+        return job_read(job)
+    if source_version:
+        try:
+            job = prepare_initial_revision(
+                db,
+                tenant_id=request.tenant_id,
+                knowledge_base_id=knowledge_base.id,
+                scope=upload_scope,
+                actor_user_id=current_user.id,
+                operation_kind="upload",
+                mutation_payload={
+                    "filename": request.filename,
+                    "content_base64": request.content_base64,
+                    "title": request.title,
+                    "metadata": creator_metadata,
+                },
+            )
+        except KnowledgeRevisionConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except KnowledgeRevisionInputError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        metadata = dict(job.metadata_json or {})
+        if not metadata.get("wake_requested") and job.status == "queued":
+            job.metadata_json = {**metadata, "wake_requested": True}
+            db.add(job)
+            db.commit()
+            enqueue_async_job(
+                "knowledge_revision",
+                run_revision_job,
+                job.id,
+                metadata={"tenant_id": request.tenant_id, "knowledge_base_id": knowledge_base.id},
+            )
+        return job_read(job)
+    raise HTTPException(status_code=409, detail="Knowledge base head is not ready for upload")
 
 
 @router.post("/okf/import")
@@ -173,76 +241,107 @@ def import_okf_bundle(
         current_user,
         creator_metadata=creator_metadata,
     )
-    version = knowledge_version_for_upload(
-        db,
-        request.tenant_id,
-        knowledge_base.id,
-        request.agent_id,
-        metadata_json=creator_metadata,
+    source_version = _current_upload_scope_version(db, knowledge_base, request.agent_id)
+    upload_scope = _upload_scope(db, knowledge_base, request.agent_id)
+    source_document = (
+        db.exec(
+            select(KnowledgeDocument)
+            .where(
+                KnowledgeDocument.tenant_id == request.tenant_id,
+                KnowledgeDocument.knowledge_base_id == knowledge_base.id,
+                KnowledgeDocument.knowledge_base_version_id == source_version.id,
+            )
+            .order_by(KnowledgeDocument.created_at.asc(), KnowledgeDocument.id.asc())
+        ).first()
+        if source_version
+        else None
     )
-    document = KnowledgeDocument(
-        tenant_id=request.tenant_id,
-        knowledge_base_id=knowledge_base.id,
-        knowledge_base_version_id=version.id,
-        filename=request.filename,
-        file_type="okf",
-        title=Path(request.filename).stem or request.filename,
-        status="processing",
-        metadata_json={
-            **creator_metadata,
-            "okf_import": True,
-            "document_card": {
-                "title": Path(request.filename).stem or request.filename,
-                "filename": request.filename,
-                "file_type": "okf",
-                "summary": f"从 OKF bundle 导入 {len(parsed_docs)} 个概念页。",
-                "outline": [
-                    {
-                        "section_id": item.concept_id,
-                        "title": item.frontmatter.get("title") or item.concept_id,
-                        "path": item.concept_id,
-                        "level": 1,
-                        "summary": item.frontmatter.get("description") or "",
-                    }
-                    for item in parsed_docs[:80]
-                ],
-                "applicable_scenarios": ["OKF Wiki", "业务知识检索"],
-                "key_entities": sorted(
-                    {str(item.frontmatter.get("type") or "Topic") for item in parsed_docs}
-                ),
-                "section_count": len(parsed_docs),
-            },
-            "okf": {"version": "0.1", "concept_count": len(parsed_docs)},
-        },
-    )
-    db.add(document)
-    db.flush()
-    concept_rows = upsert_concepts(
-        db,
-        request.tenant_id,
-        knowledge_base.id,
-        version.id,
-        [
-            {
-                "concept_id": item.concept_id,
-                "content_md": item.content_md,
-                "document_id": document.id,
-                "source_refs": [{"document_id": document.id, "okf_file": f"{item.concept_id}.md"}],
-            }
-            for item in parsed_docs
-        ],
-    )
-    create_concept_evidence_rows(
-        db, request.tenant_id, knowledge_base.id, version.id, document, concept_rows
-    )
-    return {
-        "status": "imported",
-        "knowledge_base_id": knowledge_base.id,
-        "knowledge_base_version_id": version.id,
-        "version": version.version,
-        "document_id": document.id,
-        "concept_count": len(concept_rows),
-    }
+    if source_document and source_document.normalized_source:
+        try:
+            job = run_compatibility_revision(
+                db,
+                tenant_id=request.tenant_id,
+                knowledge_base_id=knowledge_base.id,
+                scope=upload_scope,
+                actor_user_id=current_user.id,
+                document_id=source_document.id,
+                operation_kind="okf_import",
+                mutation_payload={
+                    "filename": request.filename,
+                    "title": Path(request.filename).stem or request.filename,
+                    "metadata": creator_metadata,
+                    "parsed_docs": [
+                        {
+                            "concept_id": item.concept_id,
+                            "frontmatter": item.frontmatter,
+                            "body": item.body,
+                            "content_md": item.content_md,
+                        }
+                        for item in parsed_docs
+                    ],
+                },
+            )
+        except KnowledgeRevisionConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except KnowledgeRevisionInputError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {
+            "status": "imported",
+            "knowledge_base_id": knowledge_base.id,
+            "knowledge_base_version_id": job.published_version_id,
+            "version": (
+                db.get(KnowledgeBaseVersion, job.published_version_id).version
+                if job.published_version_id
+                and db.get(KnowledgeBaseVersion, job.published_version_id)
+                else None
+            ),
+            "document_id": job.published_document_id,
+            "concept_count": len(parsed_docs),
+        }
+    if source_version:
+        try:
+            job = prepare_initial_revision(
+                db,
+                tenant_id=request.tenant_id,
+                knowledge_base_id=knowledge_base.id,
+                scope=upload_scope,
+                actor_user_id=current_user.id,
+                operation_kind="okf_import",
+                mutation_payload={
+                    "filename": request.filename,
+                    "title": Path(request.filename).stem or request.filename,
+                    "metadata": creator_metadata,
+                    "parsed_docs": [
+                        {
+                            "concept_id": item.concept_id,
+                            "frontmatter": item.frontmatter,
+                            "body": item.body,
+                            "content_md": item.content_md,
+                        }
+                        for item in parsed_docs
+                    ],
+                },
+            )
+            build_revision(db, job.id)
+            job = publish_revision(db, job.id)
+        except KnowledgeRevisionConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except KnowledgeRevisionInputError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        published_version = (
+            db.get(KnowledgeBaseVersion, job.published_version_id)
+            if job.published_version_id
+            else None
+        )
+        return {
+            "status": "imported",
+            "knowledge_base_id": knowledge_base.id,
+            "knowledge_base_version_id": job.published_version_id,
+            "version": published_version.version if published_version else None,
+            "document_id": job.published_document_id,
+            "concept_count": len(parsed_docs),
+        }
+    raise HTTPException(status_code=409, detail="Knowledge base head is not ready for OKF import")
 
 
 def _resolve_upload_knowledge_base(
@@ -312,6 +411,74 @@ def _resolve_upload_knowledge_base(
     return knowledge_base
 
 
+def _current_upload_scope_version(
+    db: Session,
+    knowledge_base: KnowledgeBase,
+    agent_id: str | None,
+) -> KnowledgeBaseVersion | None:
+    """返回上传兼容适配所需的当前已发布 scope 版本，空库保留旧建库路径。"""
+
+    agent = get_agent(db, knowledge_base.tenant_id, agent_id)
+    if not agent_id or (agent and agent.is_overall):
+        version = ensure_knowledge_base_version(db, knowledge_base)
+        return version if version.publication_state == "published" else None
+    branch = db.exec(
+        select(AgentKnowledgeBranch).where(
+            AgentKnowledgeBranch.tenant_id == knowledge_base.tenant_id,
+            AgentKnowledgeBranch.agent_id == agent_id,
+            AgentKnowledgeBranch.knowledge_base_id == knowledge_base.id,
+            AgentKnowledgeBranch.status == "active",
+        )
+    ).first()
+    if not branch:
+        if not agent or agent.is_overall:
+            return None
+        ensure_agent_private_knowledge_branch(
+            db,
+            knowledge_base.tenant_id,
+            agent.id,
+            knowledge_base,
+        )
+        branch = db.exec(
+            select(AgentKnowledgeBranch).where(
+                AgentKnowledgeBranch.tenant_id == knowledge_base.tenant_id,
+                AgentKnowledgeBranch.agent_id == agent.id,
+                AgentKnowledgeBranch.knowledge_base_id == knowledge_base.id,
+                AgentKnowledgeBranch.status == "active",
+            )
+        ).first()
+    if not branch:
+        return None
+    version = db.exec(
+        select(KnowledgeBaseVersion).where(
+            KnowledgeBaseVersion.tenant_id == knowledge_base.tenant_id,
+            KnowledgeBaseVersion.knowledge_base_id == knowledge_base.id,
+            KnowledgeBaseVersion.version == branch.head_version,
+            KnowledgeBaseVersion.publication_state == "published",
+        )
+    ).first()
+    return version
+
+
+def _upload_scope(
+    db: Session,
+    knowledge_base: KnowledgeBase,
+    agent_id: str | None,
+) -> str:
+    """将上传请求解析为整体或实际私有 Agent 内容作用域。"""
+
+    return _scope_for_agent(db, knowledge_base.tenant_id, agent_id)
+
+
+def _scope_for_agent(db: Session, tenant_id: str, agent_id: str | None) -> str:
+    """将客户端 Agent 参数解析为持久任务使用的实际内容作用域。"""
+
+    agent = get_agent(db, tenant_id, agent_id)
+    if agent and not agent.is_overall:
+        return f"agent:{agent.id}"
+    return "overall"
+
+
 def _knowledge_base_name_from_upload(request: KnowledgeDocumentUploadRequest) -> str:
     """按标题、文件主名和文件名的优先级生成上传知识库名称。"""
     title = (request.title or "").strip()
@@ -367,7 +534,17 @@ def list_jobs(
         return []
     statement = select(KnowledgeIngestJob).where(
         KnowledgeIngestJob.tenant_id == tenant_id,
-        KnowledgeIngestJob.knowledge_base_version_id.in_(visible_version_ids),
+        or_(
+            and_(
+                KnowledgeIngestJob.job_kind == "revision",
+                KnowledgeIngestJob.knowledge_base_id.in_(list(visible_versions)),
+                KnowledgeIngestJob.scope == _scope_for_agent(db, tenant_id, agent_id),
+            ),
+            and_(
+                KnowledgeIngestJob.job_kind != "revision",
+                KnowledgeIngestJob.knowledge_base_version_id.in_(visible_version_ids),
+            ),
+        ),
     )
     if status:
         statuses = [item.strip() for item in status.split(",") if item.strip()]
@@ -379,6 +556,55 @@ def list_jobs(
         ).limit(limit)
     ).all()
     return [job_read(row) for row in rows]
+
+
+@router.get(
+    "/jobs/by-client-request",
+    response_model=KnowledgeIngestJobRead | None,
+    dependencies=[Depends(require_agent_scope_viewer)],
+)
+def get_revision_job_by_client_request(
+    tenant_id: str = Query(...),
+    knowledge_base_id: str = Query(...),
+    document_id: str = Query(...),
+    client_request_id: str = Query(..., min_length=1, max_length=64),
+    source_version_id: str = Query(...),
+    expected_revision: int = Query(..., ge=1),
+    agent_id: str | None = Query(None),
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> KnowledgeIngestJobRead | None:
+    """按完整冻结来源身份对账正文修订回执丢失后的持久任务。"""
+
+    ensure_current_user_tenant(tenant_id, current_user)
+    ensure_tenant(db, tenant_id)
+    expected_scope = _scope_for_agent(db, tenant_id, agent_id)
+    job = db.exec(
+        select(KnowledgeIngestJob).where(
+            KnowledgeIngestJob.tenant_id == tenant_id,
+            KnowledgeIngestJob.knowledge_base_id == knowledge_base_id,
+            KnowledgeIngestJob.document_id == document_id,
+            KnowledgeIngestJob.job_kind == "revision",
+            KnowledgeIngestJob.scope == expected_scope,
+            KnowledgeIngestJob.client_request_id == client_request_id,
+            KnowledgeIngestJob.source_version_id == source_version_id,
+            KnowledgeIngestJob.expected_revision == expected_revision,
+        )
+    ).first()
+    if not job:
+        visible_versions = _accessible_knowledge_versions(
+            db,
+            tenant_id=tenant_id,
+            current_user=current_user,
+            agent_id=agent_id,
+            requested_knowledge_base_ids=[knowledge_base_id],
+        )
+        if knowledge_base_id not in visible_versions:
+            raise HTTPException(status_code=404, detail="Knowledge ingest job not found")
+        return None
+    _ensure_revision_job_visible(db, tenant_id, job, agent_id, current_user)
+    KnowledgeService(db).finalize_stale_cancel_requested_job(job)
+    return job_read(job)
 
 
 @router.get(
@@ -401,13 +627,16 @@ def get_job(
     job = db.get(KnowledgeIngestJob, job_id)
     if not job or job.tenant_id != tenant_id:
         raise HTTPException(status_code=404, detail="Knowledge ingest job not found")
-    _ensure_knowledge_version_visible(
-        db,
-        tenant_id,
-        job.knowledge_base_version_id,
-        agent_id,
-        current_user,
-    )
+    if job.job_kind == "revision":
+        _ensure_revision_job_visible(db, tenant_id, job, agent_id, current_user)
+    else:
+        _ensure_knowledge_version_visible(
+            db,
+            tenant_id,
+            job.knowledge_base_version_id,
+            agent_id,
+            current_user,
+        )
     KnowledgeService(db).finalize_stale_cancel_requested_job(job)
     return job_read(job)
 
@@ -416,6 +645,7 @@ def get_job(
 def cancel_job(
     job_id: str,
     tenant_id: str = Query(...),
+    agent_id: str | None = Query(None),
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> KnowledgeIngestJobRead:
@@ -424,9 +654,13 @@ def cancel_job(
     ensure_tenant(db, tenant_id)
     existing = db.get(KnowledgeIngestJob, job_id)
     if existing and existing.tenant_id == tenant_id:
-        _ensure_open_gallery_knowledge_admin(
-            db, tenant_id, existing.knowledge_base_id, current_user
-        )
+        if existing.job_kind == "revision":
+            _ensure_revision_job_visible(db, tenant_id, existing, agent_id, current_user)
+            _ensure_revision_job_manager(db, tenant_id, existing, current_user)
+        else:
+            _ensure_open_gallery_knowledge_admin(
+                db, tenant_id, existing.knowledge_base_id, current_user
+            )
     job = KnowledgeService(db).cancel_ingest_job(job_id, tenant_id)
     if not job:
         raise HTTPException(status_code=404, detail="Knowledge ingest job not found")
@@ -464,7 +698,17 @@ def list_documents(
         visible_knowledge_base_ids = (
             [knowledge_base_id] if knowledge_base_id else list(visible_versions)
         )
-        stmt = stmt.where(KnowledgeDocument.knowledge_base_id.in_(visible_knowledge_base_ids))
+        published_version_ids = db.exec(
+            select(KnowledgeBaseVersion.id).where(
+                KnowledgeBaseVersion.tenant_id == tenant_id,
+                KnowledgeBaseVersion.knowledge_base_id.in_(visible_knowledge_base_ids),
+                KnowledgeBaseVersion.publication_state == "published",
+            )
+        ).all()
+        stmt = stmt.where(
+            KnowledgeDocument.knowledge_base_id.in_(visible_knowledge_base_ids),
+            KnowledgeDocument.knowledge_base_version_id.in_(published_version_ids),
+        )
     else:
         visible_version_ids = [
             version.id
@@ -500,16 +744,217 @@ def get_document(
     return document_read(row)
 
 
-@router.put("/documents/{document_id}", response_model=KnowledgeDocumentRead)
+@router.get(
+    "/documents/{document_id}/content",
+    response_model=KnowledgeDocumentContentRead,
+)
+def get_document_content(
+    document_id: str,
+    tenant_id: str = Query(...),
+    agent_id: str | None = Query(None),
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> KnowledgeDocumentContentRead:
+    """读取当前 scope head 的完整规范正文，拒绝历史文档或不可重建的摘要伪正文。"""
+
+    ensure_current_user_tenant(tenant_id, current_user)
+    row = _get_document(db, tenant_id, document_id)
+    _ensure_knowledge_version_visible(
+        db,
+        tenant_id,
+        row.knowledge_base_version_id,
+        agent_id,
+        current_user,
+    )
+    version = db.get(KnowledgeBaseVersion, row.knowledge_base_version_id)
+    knowledge_base = db.get(KnowledgeBase, row.knowledge_base_id)
+    if not version or version.publication_state != "published" or not knowledge_base:
+        raise HTTPException(status_code=404, detail="Knowledge document head is not published")
+
+    if agent_id:
+        branch = db.exec(
+            select(AgentKnowledgeBranch).where(
+                AgentKnowledgeBranch.tenant_id == tenant_id,
+                AgentKnowledgeBranch.agent_id == agent_id,
+                AgentKnowledgeBranch.knowledge_base_id == row.knowledge_base_id,
+                AgentKnowledgeBranch.status == "active",
+            )
+        ).first()
+        if not branch or branch.head_version != version.version:
+            raise HTTPException(status_code=404, detail="Knowledge document is not the current Agent head")
+        scope = f"agent:{agent_id}"
+        content_revision = branch.content_revision
+    else:
+        current_version = str((knowledge_base.metadata_json or {}).get("current_version") or "1.0.0")
+        if current_version != version.version:
+            raise HTTPException(status_code=404, detail="Knowledge document is not the current overall head")
+        scope = "overall"
+        content_revision = knowledge_base.content_revision
+
+    content_md = row.normalized_source
+    source_kind = row.source_kind
+    if not content_md:
+        content_md = _reconstruct_document_source(row)
+        if content_md:
+            source_kind = "reconstructed_sections"
+    if not content_md:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "KNOWLEDGE_SOURCE_UNAVAILABLE",
+                "message": "历史文档没有可验证的完整正文，请粘贴替换正文。",
+            },
+        )
+    return KnowledgeDocumentContentRead(
+        document_id=row.id,
+        lineage_id=row.lineage_id or row.id,
+        knowledge_base_version_id=version.id,
+        scope=scope,
+        head_version_id=version.id,
+        content_revision=content_revision,
+        content_md=content_md,
+        source_checksum=row.source_checksum,
+        source_kind=source_kind,
+    )
+
+
+@router.put(
+    "/documents/{document_id}",
+    response_model=KnowledgeDocumentRead | KnowledgeRevisionAccepted,
+)
 def update_document(
     document_id: str,
     request: KnowledgeDocumentUpdateRequest,
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
-) -> KnowledgeDocumentRead:
+    agent_id: str | None = None,
+    response: Response = None,
+) -> KnowledgeDocumentRead | KnowledgeRevisionAccepted:
     """提交文档字段；文档存在章节或分桶时，刷新并持久化来源类 OKF 概念后返回详情。"""
+    if isinstance(current_user, User):
+        ensure_current_user_tenant(request.tenant_id, current_user)
     row = _get_document(db, request.tenant_id, document_id)
-    _ensure_open_gallery_knowledge_admin(db, request.tenant_id, row.knowledge_base_id, current_user)
+
+    if request.content_md is not None:
+        if (
+            not request.expected_version_id
+            or request.expected_revision is None
+            or not request.client_request_id
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "正文修订必须同时提供 expected_version_id、expected_revision "
+                    "和 client_request_id。"
+                ),
+            )
+        if agent_id:
+            ensure_agent_scope_manager(db, request.tenant_id, agent_id, current_user)
+        else:
+            _ensure_open_gallery_knowledge_admin(
+                db, request.tenant_id, row.knowledge_base_id, current_user
+            )
+        try:
+            job = prepare_revision(
+                db,
+                RevisionPrepareInput(
+                    tenant_id=request.tenant_id,
+                    knowledge_base_id=row.knowledge_base_id,
+                    scope=_scope_for_agent(db, request.tenant_id, agent_id),
+                    actor_user_id=current_user.id,
+                    document_id=row.id,
+                    content_md=request.content_md,
+                    expected_revision=request.expected_revision,
+                    client_request_id=request.client_request_id,
+                    source_version_id=request.expected_version_id,
+                    title=request.title,
+                ),
+            )
+        except KnowledgeRevisionConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except KnowledgeRevisionInputError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        metadata = dict(job.metadata_json or {})
+        if not metadata.get("wake_requested") and job.status == "queued":
+            job.metadata_json = {**metadata, "wake_requested": True}
+            db.add(job)
+            db.commit()
+            enqueue_async_job(
+                "knowledge_revision",
+                run_revision_job,
+                job.id,
+                metadata={"tenant_id": request.tenant_id, "knowledge_base_id": row.knowledge_base_id},
+            )
+        if response is not None:
+            response.status_code = 202
+        return KnowledgeRevisionAccepted(
+            job_id=job.id,
+            status=job.status,
+            source_version_id=job.source_version_id or "",
+            expected_revision=job.expected_revision or request.expected_revision,
+        )
+
+    _ensure_current_published_asset(
+        db,
+        request.tenant_id,
+        row.knowledge_base_id,
+        row.knowledge_base_version_id,
+        agent_id=agent_id,
+    )
+    if agent_id:
+        ensure_agent_scope_manager(db, request.tenant_id, agent_id, current_user)
+    else:
+        _ensure_open_gallery_knowledge_admin(db, request.tenant_id, row.knowledge_base_id, current_user)
+    if isinstance(current_user, User) and (
+        row.normalized_source or _reconstruct_document_source(row)
+    ):
+        mutation_metadata = (
+            metadata_preserving_creator(row.metadata_json, request.metadata)
+            if request.metadata is not None
+            else None
+        )
+        try:
+            job = run_compatibility_revision(
+                db,
+                tenant_id=request.tenant_id,
+                knowledge_base_id=row.knowledge_base_id,
+                scope=_scope_for_agent(db, request.tenant_id, agent_id),
+                actor_user_id=current_user.id,
+                document_id=row.id,
+                operation_kind="document_fields",
+                mutation_payload={
+                    "title": request.title,
+                    "status": request.status,
+                    "metadata": mutation_metadata,
+                },
+            )
+        except KnowledgeRevisionConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except KnowledgeRevisionInputError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        published_document = (
+            db.get(KnowledgeDocument, job.published_document_id)
+            if job.published_document_id
+            else None
+        )
+        if published_document:
+            return document_read(published_document)
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "KNOWLEDGE_SOURCE_UNAVAILABLE",
+                "message": "历史文档没有可验证的完整正文，请粘贴替换正文后再修改字段。",
+            },
+        )
+    if isinstance(current_user, User):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "KNOWLEDGE_SOURCE_UNAVAILABLE",
+                "message": "历史文档没有可验证的完整正文，请粘贴替换正文后再修改字段。",
+            },
+        )
     metadata = dict(row.metadata_json or {})
     if request.metadata is not None:
         metadata = metadata_preserving_creator(row.metadata_json, request.metadata)
@@ -572,13 +1017,79 @@ def update_bucket(
     request: KnowledgeBucketUpdateRequest,
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
+    agent_id: str | None = None,
 ) -> KnowledgeBucketRead:
     """更新并提交分桶；找到所属文档时，刷新并持久化来源类 OKF 概念后返回统计结果。"""
     ensure_tenant(db, request.tenant_id)
     row = db.get(KnowledgeBucket, bucket_id)
     if not row or row.tenant_id != request.tenant_id:
         raise HTTPException(status_code=404, detail="Knowledge bucket not found")
-    _ensure_open_gallery_knowledge_admin(db, request.tenant_id, row.knowledge_base_id, current_user)
+    _ensure_current_published_asset(
+        db,
+        request.tenant_id,
+        row.knowledge_base_id,
+        row.knowledge_base_version_id,
+        agent_id=agent_id,
+    )
+    if agent_id:
+        ensure_agent_scope_manager(db, request.tenant_id, agent_id, current_user)
+    else:
+        _ensure_open_gallery_knowledge_admin(db, request.tenant_id, row.knowledge_base_id, current_user)
+    document = db.get(KnowledgeDocument, row.document_id)
+    if isinstance(current_user, User) and document and (
+        document.normalized_source or _reconstruct_document_source(document)
+    ):
+        try:
+            job = run_compatibility_revision(
+                db,
+                tenant_id=request.tenant_id,
+                knowledge_base_id=row.knowledge_base_id,
+                scope=_scope_for_agent(db, request.tenant_id, agent_id),
+                actor_user_id=current_user.id,
+                document_id=document.id,
+                operation_kind="bucket_fields",
+                mutation_payload={
+                    "bucket_id": row.id,
+                    "title": request.title,
+                    "summary": request.summary,
+                    "metadata": request.metadata,
+                },
+            )
+        except KnowledgeRevisionConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except KnowledgeRevisionInputError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        candidate_bucket_id = (
+            (db.get(KnowledgeBaseVersion, job.published_version_id).content_manifest_json or {})
+            .get("bucket_id_map", {})
+            .get(row.id)
+            if job.published_version_id
+            else None
+        )
+        published_bucket = db.get(KnowledgeBucket, candidate_bucket_id) if candidate_bucket_id else None
+        if published_bucket:
+            chunk_count = db.exec(
+                select(func.count(KnowledgeChunk.id)).where(
+                    KnowledgeChunk.tenant_id == request.tenant_id,
+                    KnowledgeChunk.bucket_id == published_bucket.id,
+                )
+            ).one()
+            return bucket_read_with_stats(published_bucket, int(chunk_count or 0))
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "KNOWLEDGE_SOURCE_UNAVAILABLE",
+                "message": "所属文档没有可验证的完整正文，不能在当前快照原地编辑分桶。",
+            },
+        )
+    if isinstance(current_user, User):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "KNOWLEDGE_SOURCE_UNAVAILABLE",
+                "message": "所属文档没有可验证的完整正文，不能在当前快照原地编辑分桶。",
+            },
+        )
     if request.title is not None:
         row.title = request.title.strip() or row.title
     if request.summary is not None:
@@ -638,13 +1149,73 @@ def update_chunk(
     request: KnowledgeChunkUpdateRequest,
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
+    agent_id: str | None = None,
 ) -> KnowledgeChunkRead:
     """更新分块并重建所属分桶汇总；找到所属文档时，刷新并持久化来源类 OKF 概念后返回详情。"""
     ensure_tenant(db, request.tenant_id)
     row = db.get(KnowledgeChunk, chunk_id)
     if not row or row.tenant_id != request.tenant_id:
         raise HTTPException(status_code=404, detail="Knowledge chunk not found")
-    _ensure_open_gallery_knowledge_admin(db, request.tenant_id, row.knowledge_base_id, current_user)
+    _ensure_current_published_asset(
+        db,
+        request.tenant_id,
+        row.knowledge_base_id,
+        row.knowledge_base_version_id,
+        agent_id=agent_id,
+    )
+    if agent_id:
+        ensure_agent_scope_manager(db, request.tenant_id, agent_id, current_user)
+    else:
+        _ensure_open_gallery_knowledge_admin(db, request.tenant_id, row.knowledge_base_id, current_user)
+    document = db.get(KnowledgeDocument, row.document_id)
+    if isinstance(current_user, User) and document and (
+        document.normalized_source or _reconstruct_document_source(document)
+    ):
+        try:
+            job = run_compatibility_revision(
+                db,
+                tenant_id=request.tenant_id,
+                knowledge_base_id=row.knowledge_base_id,
+                scope=_scope_for_agent(db, request.tenant_id, agent_id),
+                actor_user_id=current_user.id,
+                document_id=document.id,
+                operation_kind="chunk_fields",
+                mutation_payload={
+                    "chunk_id": row.id,
+                    "content": request.content,
+                    "summary": request.summary,
+                    "metadata": request.metadata,
+                },
+            )
+        except KnowledgeRevisionConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except KnowledgeRevisionInputError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        candidate_chunk_id = (
+            (db.get(KnowledgeBaseVersion, job.published_version_id).content_manifest_json or {})
+            .get("chunk_id_map", {})
+            .get(row.id)
+            if job.published_version_id
+            else None
+        )
+        published_chunk = db.get(KnowledgeChunk, candidate_chunk_id) if candidate_chunk_id else None
+        if published_chunk:
+            return chunk_read(published_chunk)
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "KNOWLEDGE_SOURCE_UNAVAILABLE",
+                "message": "所属文档没有可验证的完整正文，不能在当前快照原地编辑分块。",
+            },
+        )
+    if isinstance(current_user, User):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "KNOWLEDGE_SOURCE_UNAVAILABLE",
+                "message": "所属文档没有可验证的完整正文，不能在当前快照原地编辑分块。",
+            },
+        )
     if request.content is not None:
         row.content = request.content
     if request.summary is not None:
@@ -928,6 +1499,15 @@ def job_read(row: KnowledgeIngestJob) -> KnowledgeIngestJobRead:
         knowledge_base_id=row.knowledge_base_id,
         document_id=row.document_id,
         filename=row.filename,
+        job_kind=row.job_kind,
+        scope=row.scope,
+        source_version_id=row.source_version_id,
+        expected_revision=row.expected_revision,
+        published_version_id=row.published_version_id,
+        published_document_id=row.published_document_id,
+        content_revision=(row.metadata_json or {}).get("published_content_revision"),
+        manifest_hash=(row.metadata_json or {}).get("manifest_hash"),
+        error_code=row.error_code,
         status=row.status,
         stage=row.stage,
         progress=row.progress,
@@ -1180,6 +1760,70 @@ def _get_document(db: Session, tenant_id: str, document_id: str) -> KnowledgeDoc
     return row
 
 
+def _reconstruct_document_source(row: KnowledgeDocument) -> str | None:
+    """仅从每节均含完整正文的历史 section_tree 重建编辑源，不使用摘要字段冒充全文。"""
+
+    metadata = row.metadata_json or {}
+    section_tree = metadata.get("section_tree") if isinstance(metadata, dict) else None
+    if not isinstance(section_tree, list) or not section_tree:
+        return None
+    parts: list[str] = []
+    for section in section_tree:
+        if not isinstance(section, dict):
+            return None
+        content = section.get("content")
+        if not isinstance(content, str) or not content.strip():
+            return None
+        title = str(section.get("title") or section.get("path") or "").strip()
+        parts.append(f"# {title}\n\n{content.strip()}" if title else content.strip())
+    return "\n\n".join(parts).strip() or None
+
+
+def _ensure_current_published_asset(
+    db: Session,
+    tenant_id: str,
+    knowledge_base_id: str,
+    version_id: str | None,
+    *,
+    agent_id: str | None = None,
+) -> KnowledgeBaseVersion:
+    """阻止旧同步写入口直接改历史或 candidate 资产，只允许当前 scope head。"""
+
+    version = db.get(KnowledgeBaseVersion, version_id) if version_id else None
+    knowledge_base = db.get(KnowledgeBase, knowledge_base_id)
+    current_version = ""
+    if knowledge_base:
+        if agent_id:
+            branch = db.exec(
+                select(AgentKnowledgeBranch).where(
+                    AgentKnowledgeBranch.tenant_id == tenant_id,
+                    AgentKnowledgeBranch.agent_id == agent_id,
+                    AgentKnowledgeBranch.knowledge_base_id == knowledge_base_id,
+                    AgentKnowledgeBranch.status == "active",
+                )
+            ).first()
+            current_version = branch.head_version if branch else ""
+        else:
+            current_version = str(
+                (knowledge_base.metadata_json or {}).get("current_version") or "1.0.0"
+            )
+    if (
+        not version
+        or version.tenant_id != tenant_id
+        or version.knowledge_base_id != knowledge_base_id
+        or version.publication_state != "published"
+        or version.version != current_version
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "KNOWLEDGE_VERSION_WRITE_REQUIRES_REVISION",
+                "message": "历史或候选知识版本不可直接修改，请从当前正文修订入口提交。",
+            },
+        )
+    return version
+
+
 def _ensure_knowledge_version_visible(
     db: Session,
     tenant_id: str,
@@ -1296,6 +1940,49 @@ def _accessible_knowledge_versions(
         requested_knowledge_base_ids=requested_knowledge_base_ids,
     )
     return accessible_knowledge_base_versions(db, resolution=resolution)
+
+
+def _ensure_revision_job_visible(
+    db: Session,
+    tenant_id: str,
+    job: KnowledgeIngestJob,
+    agent_id: str | None,
+    current_user: User,
+) -> None:
+    """按当前 scope 的知识库授权读取修订任务，不把冻结源版本当作正文权限。"""
+
+    visible_versions = _accessible_knowledge_versions(
+        db,
+        tenant_id=tenant_id,
+        current_user=current_user,
+        agent_id=agent_id,
+        requested_knowledge_base_ids=[job.knowledge_base_id],
+    )
+    expected_scope = _scope_for_agent(db, tenant_id, agent_id)
+    if not visible_versions or job.scope != expected_scope:
+        raise HTTPException(status_code=404, detail="Knowledge ingest job not found")
+
+
+def _ensure_revision_job_manager(
+    db: Session,
+    tenant_id: str,
+    job: KnowledgeIngestJob,
+    current_user: User,
+) -> None:
+    """把正文任务的取消授权收敛到管理员或对应 Agent 管理者，而非读取权限。"""
+
+    if job.scope == "overall":
+        ensure_open_gallery_admin(tenant_id, current_user)
+        return
+    if job.scope.startswith("agent:"):
+        ensure_agent_scope_manager(
+            db,
+            tenant_id,
+            job.scope.removeprefix("agent:").strip(),
+            current_user,
+        )
+        return
+    raise HTTPException(status_code=403, detail="正文修订作用域没有可验证的管理权限")
 
 
 def _get_discovery(db: Session, tenant_id: str, suggestion_id: str) -> KnowledgeDiscoverySuggestion:

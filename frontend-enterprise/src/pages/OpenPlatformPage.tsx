@@ -1,6 +1,6 @@
 import { Button as UIButton, notify, UnderlineTabs, type UnderlineTabItem } from '@/components/ui';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { api, getRequestTenantId } from '../api/client';
 import { isEmployeeOwnedBy, isGalleryEmployee, type EnterpriseAuthUser } from '../auth';
@@ -12,7 +12,14 @@ import {
   resourceDisplayNameWithCreator,
   isExpertTemplate,
 } from '../employee';
-import type { AgentProfileRead, GeneralSkillRead, KnowledgeBaseRead, SkillRead, ToolRead } from '../types';
+import type {
+  AgentGalleryPageRead,
+  AgentProfileRead,
+  GeneralSkillRead,
+  KnowledgeBaseRead,
+  SkillRead,
+  ToolRead,
+} from '../types';
 
 import AppHeader from '@/components/AppHeader';
 import { ConceptHelp, ConceptNote } from '@/components/ConceptHelp';
@@ -170,6 +177,7 @@ export default function OpenPlatformPage({
   const [agentId, setAgentId] = useState(() => window.localStorage.getItem(ENTERPRISE_AGENT_STORAGE_KEY) || '');
   const [detailItem, setDetailItem] = useState<{ kind: PlatformKind; item: PlatformItem } | null>(null);
   const [confirmTarget, setConfirmTarget] = useState<{ kind: PlatformKind; item: PlatformItem } | null>(null);
+  const loadRequestId = useRef(0);
 
   useEffect(() => {
     const onScopeChange = (event: Event) => {
@@ -183,17 +191,23 @@ export default function OpenPlatformPage({
   }, []);
 
   const loadPlatformData = useCallback(async () => {
+    const requestId = ++loadRequestId.current;
     setLoading(true);
     try {
       const tenantId = getRequestTenantId();
-      const [allAgentsResult, galleryAgentsResult, expertAgentsResult] = await Promise.allSettled([
-        api.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${tenantId}`),
-        api.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${tenantId}&scope=gallery`),
-        api.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${tenantId}&scope=expert`),
+      const [ownedAgentsResult, galleryAgentsResult, expertAgentsResult, overallResult] = await Promise.allSettled([
+        api.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${tenantId}&scope=owned`),
+        api.get<AgentGalleryPageRead>(
+          `/api/enterprise/agents/gallery-page?tenant_id=${tenantId}&scope=gallery&page=1&page_size=48`,
+        ),
+        api.get<AgentGalleryPageRead>(
+          `/api/enterprise/agents/gallery-page?tenant_id=${tenantId}&scope=expert&page=1&page_size=48`,
+        ),
+        api.get<AgentProfileRead | null>(`/api/enterprise/agents/overall?tenant_id=${tenantId}`),
       ]);
-      if (allAgentsResult.status === 'rejected') throw allAgentsResult.reason;
-      const agentRows = allAgentsResult.value;
-      const overall = agentRows.find((item) => item.is_overall);
+      if (ownedAgentsResult.status === 'rejected') throw ownedAgentsResult.reason;
+      const agentRows = ownedAgentsResult.value;
+      const overall = overallResult.status === 'fulfilled' ? overallResult.value : null;
       const overallSuffix = overall ? `&agent_id=${encodeURIComponent(overall.id)}` : '';
       const [kbResult, generalResult, skillResult, toolResult] = await Promise.allSettled([
         api.get<KnowledgeBaseRead[]>(`/api/enterprise/knowledge-bases?tenant_id=${tenantId}${overallSuffix}`),
@@ -203,14 +217,17 @@ export default function OpenPlatformPage({
           : Promise.resolve([]),
         api.get<ToolRead[]>(`/api/enterprise/tools?tenant_id=${tenantId}${overallSuffix}`),
       ]);
-      setAgents(agentRows);
+      // 快速切换登录身份或路由时，旧请求仍可能晚于新请求返回；旧快照不能覆盖当前页面。
+      if (requestId !== loadRequestId.current) return;
+      setAgents(overall ? [...agentRows, overall] : agentRows);
       const failures: string[] = [];
-      if (galleryAgentsResult.status === 'fulfilled') setGalleryAgents(galleryAgentsResult.value);
+      if (overallResult.status === 'rejected') failures.push('整体员工');
+      if (galleryAgentsResult.status === 'fulfilled') setGalleryAgents(galleryAgentsResult.value.items);
       else {
         setGalleryAgents([]);
         failures.push('数字员工广场');
       }
-      if (expertAgentsResult.status === 'fulfilled') setExpertAgents(expertAgentsResult.value);
+      if (expertAgentsResult.status === 'fulfilled') setExpertAgents(expertAgentsResult.value.items);
       else {
         setExpertAgents([]);
         failures.push('专家分类');
@@ -227,14 +244,18 @@ export default function OpenPlatformPage({
         notify.error(`开放广场部分资源加载失败：${failures.join('、')}。`);
       }
     } catch (error) {
+      if (requestId !== loadRequestId.current) return;
       notify.error(error instanceof Error ? error.message : '加载开放广场失败');
     } finally {
-      setLoading(false);
+      if (requestId === loadRequestId.current) setLoading(false);
     }
   }, []);
 
   useEffect(() => {
     void loadPlatformData();
+    return () => {
+      loadRequestId.current += 1;
+    };
   }, [loadPlatformData]);
 
   const visibleAgents = useMemo(
@@ -321,7 +342,10 @@ export default function OpenPlatformPage({
       .map((item) => ({
         id: item.id,
         deleteKey: item.slug,
-        detailHref: `/enterprise/general-skills/catalog/${encodeURIComponent(item.slug)}`,
+        // 只有受控目录 Skill 才有 catalog 详情契约；旧通用 Skill 仍可展示/安装，不能伪造目录详情 URL。
+        detailHref: item.metadata?.managed_catalog === true
+          ? `/enterprise/general-skills/catalog/${encodeURIComponent(item.slug)}`
+          : undefined,
         title: resourceDisplayNameWithCreator(item.name_zh || item.name, item),
         description: item.description_zh || item.description || '可复制到当前数字员工的技能。',
         meta: item.slug,

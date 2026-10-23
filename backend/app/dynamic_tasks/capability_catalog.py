@@ -1,5 +1,5 @@
 """
-@Time       : 2026/08/10 18:55
+@Time       : 2026/10/04
 @Author     : zhanglp8181
 @File       : capability_catalog.py
 @CallChain  : Tool/GeneralSkill publish → capability catalog → DynamicTaskAgent dispatch
@@ -72,6 +72,9 @@ _SECRET_PATH_PARTS = frozenset(
 )
 _PATH_PATTERN = re.compile(r"^(input|output)(?:\.[A-Za-z_][A-Za-z0-9_-]*)+$")
 logger = logging.getLogger(__name__)
+
+# 仅用于读取历史持久化合同；新发布永远规范化为 internal_worker。
+_LEGACY_INTERNAL_WORKER_STRATEGY = "staffdeck_worker"
 
 
 class CapabilityAccessDenied(RuntimeError):
@@ -233,15 +236,50 @@ class ToolReliabilityContract(BaseModel):
     canonical_target: str | None = Field(default=None, max_length=512)
     target_checksum: str | None = Field(default=None, max_length=128)
     destructive_provider: Literal["disposable", "isolated"] | None = None
+    execution_mode: Literal["sync", "detached"] = "sync"
+    async_strategy: Literal["internal_worker", "provider_task"] = "internal_worker"
+    status_url: str | None = Field(default=None, max_length=2000)
+    poll_interval_seconds: int = Field(default=5, ge=1, le=3600)
+    task_id_field: str = Field(default="taskId", min_length=1, max_length=128)
+    status_field: str = Field(default="status", min_length=1, max_length=128)
+    result_field: str = Field(default="result", min_length=1, max_length=128)
+    status_mapping: dict[str, str] = Field(default_factory=dict)
+    max_tracking_seconds: int = Field(default=86400, ge=1, le=2592000)
     explore_safe: bool = False
     parallel_safe: bool = False
     concurrency_key: str | None = Field(default=None, max_length=128)
     max_in_flight: int = Field(default=1, ge=1, le=8)
     model_config = ConfigDict(extra="forbid")
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_async_strategy(cls, value: Any) -> Any:
+        """把历史持久化的后台策略别名规范化为当前中性名称。"""
+
+        if not isinstance(value, Mapping) or value.get("async_strategy") != _LEGACY_INTERNAL_WORKER_STRATEGY:
+            return value
+        normalized = dict(value)
+        normalized["async_strategy"] = "internal_worker"
+        return normalized
+
     @model_validator(mode="after")
     def validate_reliability(self) -> "ToolReliabilityContract":
         """校验风险、副作用、确认、超时与幂等/对账之间的不变式。"""
+
+        if self.async_strategy == "provider_task":
+            if self.execution_mode != "detached":
+                raise ValueError("provider_task 必须使用 detached execution_mode")
+            if not (self.status_url or "").strip():
+                raise ValueError("provider_task 必须声明 status_url")
+            if any(
+                not key.strip() or not value.strip()
+                for key, value in self.status_mapping.items()
+            ):
+                raise ValueError("provider_task status_mapping 不能为空键或值")
+        elif self.execution_mode != "sync":
+            raise ValueError("internal_worker 只允许保持 sync execution_mode")
+        elif (self.status_url or "").strip() or self.status_mapping:
+            raise ValueError("非 provider_task 契约不得声明异步查询字段")
 
         expected_side_effect = {
             "read": "none",
@@ -447,6 +485,31 @@ def project_tool_capability(tool: Tool, contract: ToolReliabilityContract) -> Ca
     return CapabilityViews(model=model_view, user=user_view, audit=audit_view)
 
 
+def _legacy_tool_snapshot_checksum(
+    tool: Tool,
+    agent_id: str,
+    contract: ToolReliabilityContract,
+    raw_contract: Mapping[str, Any],
+) -> str:
+    """按历史原始合同重算快照摘要，供旧库读取过渡期校验，不产生新旧写入。"""
+
+    views = project_tool_capability(tool, contract)
+    legacy_audit_view = dict(views.audit)
+    legacy_audit_view["contract"] = dict(raw_contract)
+    return capability_checksum(
+        {
+            "capability_type": "tool",
+            "capability_id": tool.id,
+            "tenant_id": tool.tenant_id,
+            "name": tool.name,
+            "contract": dict(raw_contract),
+            "model_view": views.model,
+            "user_view": views.user,
+            "audit_view": legacy_audit_view,
+        }
+    )
+
+
 def publish_tool_contract(
     tool: Tool, contract: ToolReliabilityContract | None
 ) -> None:
@@ -490,7 +553,7 @@ class DynamicCapabilityCatalog:
         tenant_id: str,
         agent_id: str,
     ) -> list[CapabilitySnapshot]:
-        """仅返回已绑定、已启用且显式发布为动态可用的工具。"""
+        """返回已发布绑定工具；HTTP外部写另需原高风险门禁和单次请求幂等。"""
 
         snapshots: list[CapabilitySnapshot] = []
         for tool in visible_tool_rows(self.db, tenant_id, agent_id, include_inactive=False):
@@ -508,7 +571,18 @@ class DynamicCapabilityCatalog:
                     agent_id,
                 )
             )
-            if not ordinary_tool and not destructive_tool:
+            http_external_write = contract is not None and (
+                contract.risk_class == "external_write"
+                and contract.dynamic_task_enabled
+                and contract.confirmation_policy == "once"
+                and contract.idempotency.mode == "request_key"
+                and tool.tool_type == "http"
+                and tool.method.upper() in {"POST", "PUT", "PATCH", "DELETE"}
+                and get_settings().dynamic_task_high_risk_external_write_allows(
+                    tenant_id, agent_id,
+                )
+            )
+            if not ordinary_tool and not destructive_tool and not http_external_write:
                 continue
             snapshots.append(self._tool_snapshot(tool, agent_id, contract))
         return snapshots
@@ -1270,7 +1344,15 @@ class DynamicCapabilityCatalog:
         checksum = capability_checksum(payload)
         published_checksum = getattr(tool, "reliability_checksum", None)
         if published_checksum and published_checksum != checksum:
-            raise CapabilityAccessDenied("CAPABILITY_PUBLISHED_CHECKSUM_INVALID")
+            raw_contract = getattr(tool, "reliability_contract_json", None)
+            legacy_checksum_matches = (
+                isinstance(raw_contract, Mapping)
+                and raw_contract.get("async_strategy") == _LEGACY_INTERNAL_WORKER_STRATEGY
+                and published_checksum
+                == _legacy_tool_snapshot_checksum(tool, agent_id, contract, raw_contract)
+            )
+            if not legacy_checksum_matches:
+                raise CapabilityAccessDenied("CAPABILITY_PUBLISHED_CHECKSUM_INVALID")
         return CapabilitySnapshot(
             **payload,
             agent_id=agent_id,

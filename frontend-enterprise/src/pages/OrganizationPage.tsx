@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   BriefcaseBusiness,
   CircleAlert,
@@ -109,8 +109,12 @@ export default function OrganizationPage({
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [treeRefreshToken, setTreeRefreshToken] = useState(0);
+  const foundationRequestIdRef = useRef(0);
+  const leaderTypesRequestIdRef = useRef(0);
 
   const load = useCallback(async () => {
+    const requestId = foundationRequestIdRef.current + 1;
+    foundationRequestIdRef.current = requestId;
     setLoading(true);
     const tenantId = encodeURIComponent(tenant.id);
     try {
@@ -132,6 +136,7 @@ export default function OrganizationPage({
         ),
       ]);
       const failedResources: string[] = [];
+      if (requestId !== foundationRequestIdRef.current) return;
       const applyResult = <T,>(
         result: PromiseSettledResult<T>,
         resourceName: string,
@@ -154,9 +159,11 @@ export default function OrganizationPage({
         notify.error(`部分组织数据加载失败：${failedResources.join('、')}。请检查服务版本。`);
       }
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '组织数据加载失败');
+      if (requestId === foundationRequestIdRef.current) {
+        notify.error(error instanceof Error ? error.message : '组织数据加载失败');
+      }
     } finally {
-      setLoading(false);
+      if (requestId === foundationRequestIdRef.current) setLoading(false);
     }
   }, [tenant.id]);
 
@@ -249,13 +256,28 @@ export default function OrganizationPage({
       setLeaders([]);
       return;
     }
-    try {
-      setLeaders(await api.get<OrganizationLeaderAssignment[]>(
+    const requestId = leaderTypesRequestIdRef.current + 1;
+    leaderTypesRequestIdRef.current = requestId;
+    const [leadersResult, leaderTypesResult] = await Promise.allSettled([
+      api.get<OrganizationLeaderAssignment[]>(
         `/api/organization/leader-assignments?tenant_id=${encodeURIComponent(tenant.id)}`
         + `&org_unit_id=${encodeURIComponent(selectedUnitId)}&include_history=true`,
-      ));
-    } catch (error) {
-      notify.error(error instanceof Error ? error.message : '负责人记录加载失败');
+      ),
+      api.get<OrganizationLeaderType[]>(
+        `/api/organization/leader-types?tenant_id=${encodeURIComponent(tenant.id)}`,
+      ),
+    ]);
+    if (requestId !== leaderTypesRequestIdRef.current) return;
+    if (leadersResult.status === 'fulfilled') {
+      setLeaders(leadersResult.value);
+    } else {
+      notify.error('负责人记录加载失败');
+    }
+    // 负责人关系和码表必须同一代次刷新，避免 MySQL 慢响应把编码回退到代码显示。
+    if (leaderTypesResult.status === 'fulfilled') {
+      setLeaderTypes(leaderTypesResult.value);
+    } else {
+      notify.error('负责人类型加载失败');
     }
   }, [selectedUnitId, tenant.id]);
 
@@ -519,6 +541,7 @@ export default function OrganizationPage({
               </Button>
             </div>
             <OrganizationTreeNavigator
+              authIdentity={currentUser?.id}
               onSelect={selectOrganization}
               refreshToken={treeRefreshToken}
               selectedId={selectedUnitId}

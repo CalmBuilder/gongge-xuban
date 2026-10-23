@@ -69,6 +69,7 @@ def test_enterprise_read_endpoints_require_authentication() -> None:
         "/api/enterprise/traces?tenant_id=tenant_demo",
         "/api/enterprise/ui-config?tenant_id=tenant_demo",
         "/api/enterprise/agents?tenant_id=tenant_demo",
+        "/api/enterprise/agents/overall?tenant_id=tenant_demo",
         "/api/enterprise/agents/gallery-page?tenant_id=tenant_demo&scope=owned",
         "/api/enterprise/agents/management-page?tenant_id=tenant_demo&view=all",
         "/api/organization/business-roles/page?tenant_id=tenant_demo",

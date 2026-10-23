@@ -65,14 +65,23 @@ from app.knowledge.schema import KnowledgeBaseUpdateRequest
 from app.skills.skill_schema import SkillCard, SkillUpdateRequest
 
 
-def _admin_user() -> User:
-    return User(
+def _admin_user(db: Session | None = None) -> User:
+    """初始化真实账号供生产当前授权检查；纯传输替身可只构造登录对象。"""
+    row = User(
         id="user_admin",
         tenant_id="tenant_demo",
         username="admin",
         role="admin",
         password_hash="test",
     )
+
+    if db is not None:
+        existing = db.get(User, row.id)
+        if existing is not None:
+            return existing
+        db.add(row)
+        db.flush()
+    return row
 
 
 def test_management_and_chat_agent_lists_share_one_access_scope() -> None:
@@ -335,7 +344,7 @@ def test_open_gallery_delete_skill_hides_gallery_without_removing_agent_binding(
             "tenant_demo",
             db,
             agent_id="agent_overall",
-            current_user=_admin_user(),
+            current_user=_admin_user(db),
         )
 
         assert result == {"status": "hidden"}
@@ -381,7 +390,7 @@ def test_open_gallery_deleted_skill_binding_is_not_restored_by_ensure() -> None:
             "tenant_demo",
             db,
             agent_id="agent_overall",
-            current_user=_admin_user(),
+            current_user=_admin_user(db),
         ) == {"status": "hidden"}
 
         ensure_open_gallery_binding(db, "tenant_demo", "skill", skill.id, "active")
@@ -541,7 +550,7 @@ def test_list_agents_allows_tool_resource_bindings() -> None:
         ensure_private_resource_binding(db, "tenant_demo", agent.id, "tool", tool.id, "active")
         db.commit()
 
-        result = list_agents("tenant_demo", db, _admin_user())
+        result = list_agents("tenant_demo", db, _admin_user(db))
 
         assert result[0].resources[0].resource_type == "tool"
         assert result[0].resources[0].resource_id == tool.id
@@ -612,7 +621,7 @@ def test_copy_overall_scope_to_agent_does_not_auto_bind_open_gallery_knowledge_b
     """复制整体 Agent 时不隐式绑定知识库，且所有者仍可通过整体 Agent 读取。"""
 
     with _test_session() as db:
-        admin = _admin_user()
+        admin = _admin_user(db)
         db.add(Tenant(id="tenant_demo", name="Demo"))
         db.add(admin)
         db.add(
@@ -721,7 +730,7 @@ def test_list_agents_knowledge_count_ignores_stale_or_empty_default_bindings() -
         )
         db.commit()
 
-        rows = list_agents("tenant_demo", db, _admin_user())
+        rows = list_agents("tenant_demo", db, _admin_user(db))
         target = next(row for row in rows if row.id == agent.id)
 
         assert target.resources == []
@@ -832,7 +841,7 @@ def test_agent_summary_resources_match_operational_resource_lists() -> None:
         db.commit()
 
         summary = next(
-            row for row in list_agents("tenant_demo", db, _admin_user()) if row.id == agent.id
+            row for row in list_agents("tenant_demo", db, _admin_user(db)) if row.id == agent.id
         )
         summary_ids = {
             (row.resource_type, row.resource_id)
@@ -863,7 +872,7 @@ def test_agent_summary_resources_match_operational_resource_lists() -> None:
 
 def test_archiving_open_gallery_resources_updates_binding_status() -> None:
     with _test_session() as db:
-        admin = _admin_user()
+        admin = _admin_user(db)
         db.add(Tenant(id="tenant_demo", name="Demo"))
         overall = AgentProfile(
             id="agent_overall", tenant_id="tenant_demo", name="开放广场", is_overall=True
@@ -964,7 +973,7 @@ def test_import_open_gallery_tool_creates_private_agent_binding() -> None:
                 resource_ids=[tool.id],
             ),
             db,
-            current_user=_admin_user(),
+            current_user=_admin_user(db),
         )
 
         assert result["missing"] == []
@@ -1254,7 +1263,7 @@ def test_inactive_bound_skill_can_be_loaded_and_saved_from_management_api() -> N
             ),
             agent.id,
             db,
-            _admin_user(),
+            _admin_user(db),
         )
 
         assert saved.status == "archived"
@@ -1331,7 +1340,7 @@ def test_inactive_bound_skill_can_be_reenabled_from_management_api() -> None:
         db.add(binding)
         db.commit()
 
-        published = publish_skill(skill.skill_id, "tenant_demo", agent.id, db, _admin_user())
+        published = publish_skill(skill.skill_id, "tenant_demo", agent.id, db, _admin_user(db))
 
         assert published.status == "published"
         assert published.branch_status == "active"
@@ -1409,7 +1418,7 @@ def test_disabled_open_gallery_resources_cannot_be_learned() -> None:
                     resource_ids=[resource_id],
                 ),
                 db,
-                current_user=_admin_user(),
+                current_user=_admin_user(db),
             )
 
             assert result["imported"] == []
@@ -1480,7 +1489,7 @@ def test_archived_knowledge_remains_manageable_but_is_not_runtime_visible() -> N
                 resource_ids=[kb.id],
             ),
             db,
-            current_user=_admin_user(),
+            current_user=_admin_user(db),
         )
         assert [item["resource_id"] for item in imported["imported"]] == [kb.id]
 
@@ -1614,7 +1623,7 @@ def test_private_agent_resources_are_not_visible_in_open_gallery() -> None:
                     resource_ids=[resource_id],
                 ),
                 db,
-                current_user=_admin_user(),
+                current_user=_admin_user(db),
             )
 
             assert result["imported"] == []

@@ -1,5 +1,5 @@
 """
-@Time       : 2026/07/18 09:22
+@Time       : 2026/10/03
 @Author     : zhanglp8181
 @File       : sqlite_legacy.py
 @CallChain  : SQLite Adapter → initialize_sqlite_database → metadata/legacy migrations → SQLite
@@ -35,6 +35,28 @@ def configure_sqlite_runtime(engine: Engine) -> None:
         conn.execute(text("PRAGMA journal_mode=WAL"))
 
 
+def _migrate_skill_version_scope(conn, tables: set[str]) -> None:
+    """桌面旧表扩充非空发布范围及唯一性，重复启动保留所有旧ID。"""
+
+    if "skill_versions" not in tables:
+        return
+    inspector = inspect(conn)
+    if "scope_agent_id" in {column["name"] for column in
+                            inspector.get_columns("skill_versions")}:
+        return
+    old_unique = next((item for item in inspector.get_unique_constraints("skill_versions")
+                       if item["column_names"] == ["tenant_id", "skill_id", "version"]), None)
+    with _sqlite_operations(conn).batch_alter_table(
+        "skill_versions", naming_convention={"uq": "uq_%(table_name)s_%(column_0_name)s"}
+    ) as batch:
+        batch.add_column(Column("scope_agent_id", String(128), nullable=False, server_default=""))
+        if old_unique:
+            batch.drop_constraint(old_unique["name"] or "uq_skill_versions_tenant_id", type_="unique")
+        batch.create_unique_constraint("uq_skill_version",
+                                       ["tenant_id", "skill_id", "scope_agent_id", "version"])
+        batch.create_index("ix_skill_versions_scope_agent_id", ["scope_agent_id"])
+
+
 def migrate_sqlite_skill_schema(engine: Engine) -> None:
     """迁移 SQLite 的模型、用户、会话、工具、知识及智能体相关表，并修复遗留数据。
 
@@ -53,6 +75,8 @@ def migrate_sqlite_skill_schema(engine: Engine) -> None:
     with engine.begin() as conn:
         _migrate_default_model_output_limit(conn, tables)
         _migrate_unique_default_model(conn, inspector, tables)
+        _migrate_memory_claim_budget(conn, tables)
+        _migrate_skill_version_scope(conn, tables)
 
         if "model_configs" in tables:
             model_config_columns = {
@@ -71,6 +95,8 @@ def migrate_sqlite_skill_schema(engine: Engine) -> None:
             user_columns = {column["name"] for column in inspector.get_columns("users")}
             if "role" not in user_columns:
                 conn.execute(text("ALTER TABLE users ADD COLUMN role VARCHAR NOT NULL DEFAULT 'member'"))
+            if "auth_revision" not in user_columns:
+                conn.execute(text("ALTER TABLE users ADD COLUMN auth_revision INTEGER NOT NULL DEFAULT 1"))
 
         if "sessions" in tables:
             session_columns = {column["name"] for column in inspector.get_columns("sessions")}
@@ -177,6 +203,8 @@ def migrate_sqlite_skill_schema(engine: Engine) -> None:
         if "message_feedback" in tables:
             message_feedback_columns = {column["name"] for column in inspector.get_columns("message_feedback")}
             feedback_column_sql = {
+                "revision": "ALTER TABLE message_feedback ADD COLUMN revision INTEGER NOT NULL DEFAULT 1",
+                "analysis_generation": "ALTER TABLE message_feedback ADD COLUMN analysis_generation INTEGER NOT NULL DEFAULT 1",
                 "analysis_status": "ALTER TABLE message_feedback ADD COLUMN analysis_status VARCHAR NOT NULL DEFAULT 'pending'",
                 "analysis_bucket": "ALTER TABLE message_feedback ADD COLUMN analysis_bucket VARCHAR",
                 "analysis_reason": "ALTER TABLE message_feedback ADD COLUMN analysis_reason VARCHAR",
@@ -277,6 +305,22 @@ def migrate_sqlite_skill_schema(engine: Engine) -> None:
             _normalize_agent_branch_rows(conn, tables)
             _seed_agent_branch_state(conn, inspector, tables)
             _sync_explicit_skill_tool_bindings(conn, tables)
+
+
+def _migrate_memory_claim_budget(conn, tables: set[str]) -> None:
+    """为已存在的 SD-6B SQLite 任务补齐 claim 计数和原完成截止，保持重启幂等。"""
+
+    if "memory_capture_jobs" not in tables:
+        return
+    columns = {item["name"] for item in inspect(conn).get_columns("memory_capture_jobs")}
+    if "claim_dispatch_count" not in columns:
+        conn.execute(text(
+            "ALTER TABLE memory_capture_jobs ADD COLUMN claim_dispatch_count INTEGER NOT NULL DEFAULT 0"
+        ))
+    conn.execute(text(
+        "UPDATE memory_capture_jobs SET deadline_at = datetime(created_at, '+600 seconds') "
+        "WHERE deadline_at IS NULL"
+    ))
 
 
 def _migrate_agent_identity_fields(conn, tables: set[str]) -> None:
@@ -1328,6 +1372,7 @@ def _migrate_execution_reliability_fields(conn, tables: set[str]) -> None:
         "effect_state",
     }.issubset(initial_operation_columns)
     if not instance_needs_migration and not operation_needs_migration:
+        _migrate_external_operation_fields(conn, tables)
         return
     instance_rows = conn.execute(
         text(
@@ -1569,6 +1614,155 @@ def _migrate_execution_reliability_fields(conn, tables: set[str]) -> None:
         )
     if operation_needs_migration:
         _backfill_sqlite_instance_effects(conn, instance_rows)
+    _migrate_external_operation_fields(conn, tables)
+
+
+def _migrate_external_operation_fields(conn, tables: set[str]) -> None:
+    """为桌面 SQLite 旧账本补齐 provider_task 等待字段和状态检查。"""
+
+    if "sop_operations" not in tables or "sop_operation_attempts" not in tables:
+        return
+    operation_additions = {
+        "external_strategy": "ALTER TABLE sop_operations ADD COLUMN external_strategy VARCHAR(64)",
+        "external_provider": "ALTER TABLE sop_operations ADD COLUMN external_provider VARCHAR(128)",
+        "external_submission_id": (
+            "ALTER TABLE sop_operations ADD COLUMN external_submission_id VARCHAR(512)"
+        ),
+        "external_task_id": "ALTER TABLE sop_operations ADD COLUMN external_task_id VARCHAR(512)",
+        "external_status_url": (
+            "ALTER TABLE sop_operations ADD COLUMN external_status_url VARCHAR(2000)"
+        ),
+        "external_status": "ALTER TABLE sop_operations ADD COLUMN external_status VARCHAR(128)",
+        "external_next_poll_at": (
+            "ALTER TABLE sop_operations ADD COLUMN external_next_poll_at DATETIME"
+        ),
+        "external_deadline_at": (
+            "ALTER TABLE sop_operations ADD COLUMN external_deadline_at DATETIME"
+        ),
+        "external_observation_revision": (
+            "ALTER TABLE sop_operations ADD COLUMN external_observation_revision "
+            "INTEGER NOT NULL DEFAULT 0"
+        ),
+        "external_last_event_id": (
+            "ALTER TABLE sop_operations ADD COLUMN external_last_event_id VARCHAR(512)"
+        ),
+        "external_callback_token_hash": (
+            "ALTER TABLE sop_operations ADD COLUMN external_callback_token_hash VARCHAR(128)"
+        ),
+        "external_receipt_json": (
+            "ALTER TABLE sop_operations ADD COLUMN external_receipt_json JSON"
+        ),
+        "external_wait_started_at": (
+            "ALTER TABLE sop_operations ADD COLUMN external_wait_started_at DATETIME"
+        ),
+    }
+    attempt_additions = {
+        "external_task_id": (
+            "ALTER TABLE sop_operation_attempts ADD COLUMN external_task_id VARCHAR(512)"
+        ),
+        "external_status": (
+            "ALTER TABLE sop_operation_attempts ADD COLUMN external_status VARCHAR(128)"
+        ),
+        "external_observation_revision": (
+            "ALTER TABLE sop_operation_attempts ADD COLUMN external_observation_revision "
+            "INTEGER NOT NULL DEFAULT 0"
+        ),
+        "external_receipt_json": (
+            "ALTER TABLE sop_operation_attempts ADD COLUMN external_receipt_json JSON"
+        ),
+        "waiting_at": "ALTER TABLE sop_operation_attempts ADD COLUMN waiting_at DATETIME",
+    }
+    for table_name, additions in (
+        ("sop_operations", operation_additions),
+        ("sop_operation_attempts", attempt_additions),
+    ):
+        existing = {column["name"] for column in inspect(conn).get_columns(table_name)}
+        for column_name, ddl in additions.items():
+            if column_name not in existing:
+                conn.execute(text(ddl))
+        if table_name == "sop_operations":
+            conn.execute(
+                text(
+                    "UPDATE sop_operations SET external_receipt_json='{}' "
+                    "WHERE external_receipt_json IS NULL"
+                )
+            )
+        else:
+            conn.execute(
+                text(
+                    "UPDATE sop_operation_attempts SET external_receipt_json='{}' "
+                    "WHERE external_receipt_json IS NULL"
+                )
+            )
+
+    _rebuild_sqlite_external_status_table(conn, "sop_operations")
+    _rebuild_sqlite_external_status_table(conn, "sop_operation_attempts")
+
+
+def _rebuild_sqlite_external_status_table(conn, table_name: str) -> None:
+    """在历史 SQLite 状态 CHECK 缺少 waiting_external 时按当前模型安全重建表。"""
+
+    inspector = inspect(conn)
+    checks = inspector.get_check_constraints(table_name)
+    if any("waiting_external" in str(item.get("sqltext") or "") for item in checks):
+        return
+
+    from app.db.models import SopOperation, SopOperationAttempt
+
+    model_table = {
+        "sop_operations": SopOperation.__table__,
+        "sop_operation_attempts": SopOperationAttempt.__table__,
+    }[table_name]
+    reflected = Table(table_name, MetaData(), autoload_with=conn)
+    model_columns = {column.name for column in model_table.columns}
+    existing_columns = {column.name for column in reflected.columns}
+    unknown_columns = existing_columns - model_columns
+    if unknown_columns:
+        raise RuntimeError(
+            f"legacy SQLite {table_name} has columns unsupported by the current model: "
+            + ",".join(sorted(unknown_columns))
+        )
+    rows = conn.execute(reflected.select()).mappings().all()
+    indexes = [item for item in inspector.get_indexes(table_name) if item.get("name")]
+    preparer = conn.dialect.identifier_preparer
+    for index in indexes:
+        conn.execute(text(f"DROP INDEX {preparer.quote(str(index['name']))}"))
+    backup_name = f"_legacy_sd4_{table_name}"
+    if inspector.has_table(backup_name):
+        raise RuntimeError(f"legacy SQLite {table_name} rebuild was interrupted")
+    conn.execute(text(f"ALTER TABLE {table_name} RENAME TO {backup_name}"))
+    model_table.create(conn)
+    for row in rows:
+        values = {
+            column.name: row[column.name]
+            for column in model_table.columns
+            if column.name in row
+        }
+        for column in model_table.columns:
+            if column.name in values or not column.name.endswith("_json"):
+                continue
+            values[column.name] = [] if column.name.endswith("ids_json") else {}
+        conn.execute(model_table.insert().values(**values))
+    conn.execute(text(f"DROP TABLE {backup_name}"))
+
+    current_indexes = {
+        str(item.get("name"))
+        for item in inspect(conn).get_indexes(table_name)
+        if item.get("name")
+    }
+    for index in indexes:
+        index_name = str(index["name"])
+        columns = [str(column) for column in (index.get("column_names") or [])]
+        if index_name in current_indexes or not columns:
+            continue
+        unique = "UNIQUE " if index.get("unique") else ""
+        quoted_columns = ", ".join(preparer.quote(column) for column in columns)
+        conn.execute(
+            text(
+                f"CREATE {unique}INDEX {preparer.quote(index_name)} "
+                f"ON {table_name} ({quoted_columns})"
+            )
+        )
 
 
 def _ensure_sqlite_operation_effect_kind_constraint(conn) -> None:
@@ -1673,28 +1867,52 @@ def _backfill_sqlite_operation_ledgers(
 
     operation_id = str(row["id"])
     digest = hashlib.sha256(operation_id.encode("utf-8")).hexdigest()
+    attempt_columns = {
+        column["name"]
+        for column in inspect(conn).get_columns("sop_operation_attempts")
+    }
+    attempt_fields = [
+        "id",
+        "tenant_id",
+        "instance_id",
+        "operation_id",
+        "node_execution_id",
+        "attempt_number",
+        "status",
+        "error_json",
+        "started_at",
+        "completed_at",
+        "created_at",
+        "updated_at",
+    ]
+    attempt_values: dict[str, object] = {
+        "id": f"legacyattempt:{digest}",
+        "tenant_id": row["tenant_id"],
+        "instance_id": row["instance_id"],
+        "operation_id": operation_id,
+        "node_execution_id": row["node_execution_id"],
+        "status": row["status"],
+        "error_json": row["error_json"],
+        "started_at": row["started_at"],
+        "completed_at": row["completed_at"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "attempt_number": 1,
+    }
+    if "external_observation_revision" in attempt_columns:
+        attempt_fields.append("external_observation_revision")
+        attempt_values["external_observation_revision"] = 0
+    if "external_receipt_json" in attempt_columns:
+        attempt_fields.append("external_receipt_json")
+        attempt_values["external_receipt_json"] = "{}"
+    field_sql = ", ".join(attempt_fields)
+    value_sql = ", ".join(f":{field}" for field in attempt_fields)
     conn.execute(
         text(
-            "INSERT OR IGNORE INTO sop_operation_attempts ("
-            "id, tenant_id, instance_id, operation_id, node_execution_id, attempt_number, "
-            "status, error_json, started_at, completed_at, created_at, updated_at"
-            ") VALUES ("
-            ":id, :tenant_id, :instance_id, :operation_id, :node_execution_id, 1, "
-            ":status, :error_json, :started_at, :completed_at, :created_at, :updated_at)"
+            f"INSERT OR IGNORE INTO sop_operation_attempts ({field_sql}) "
+            f"VALUES ({value_sql})"
         ),
-        {
-            "id": f"legacyattempt:{digest}",
-            "tenant_id": row["tenant_id"],
-            "instance_id": row["instance_id"],
-            "operation_id": operation_id,
-            "node_execution_id": row["node_execution_id"],
-            "status": row["status"],
-            "error_json": row["error_json"],
-            "started_at": row["started_at"],
-            "completed_at": row["completed_at"],
-            "created_at": row["created_at"],
-            "updated_at": row["updated_at"],
-        },
+        attempt_values,
     )
     if effect_state not in {"complete", "unknown"}:
         return
@@ -2178,6 +2396,7 @@ def _seed_skill_versions(conn) -> None:
                 """
                 SELECT id FROM skill_versions
                 WHERE tenant_id = :tenant_id AND skill_id = :skill_id AND version = :version
+                  AND scope_agent_id = ''
                 """
             ),
             {"tenant_id": row["tenant_id"], "skill_id": row["skill_id"], "version": version},
@@ -2328,7 +2547,7 @@ def _backfill_sqlite_knowledge_owners(conn, tables: set[str]) -> None:
 
 
 def _migrate_knowledge_base_schema(conn, inspector, tables: set[str]) -> None:
-    """迁移知识库各表的 knowledge_base_id 与版本列，补种默认库和版本并拆分多文档旧库。
+    """迁移旧知识归属并补种版本；已有修订身份的整库保持冻结快照，不拆库。
 
     副作用：可能变更 knowledge_bases、knowledge_base_versions、文档、分桶、分块、
     概念、发现建议及摄取任务表的数据与列定义；本函数不自行提交。
@@ -2348,11 +2567,12 @@ def _migrate_knowledge_base_schema(conn, inspector, tables: set[str]) -> None:
                         INSERT INTO knowledge_bases (
                             id, tenant_id, name, description, owner_user_id,
                             responsible_org_unit_id, access_scope, download_policy, revision,
+                            content_revision,
                             status, metadata_json, created_at, updated_at
                         )
                         VALUES (
                             :id, :tenant_id, :name, :description, NULL, NULL,
-                            'owner', 'restricted', 1, 'active', '{}',
+                            'owner', 'restricted', 1, 1, 'active', '{}',
                             CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
                         )
                         """
@@ -2390,25 +2610,35 @@ def _migrate_knowledge_base_schema(conn, inspector, tables: set[str]) -> None:
                     {"tenant_id": tenant_id, "knowledge_base_id": _default_knowledge_base_id(tenant_id)},
                 )
 
+    revision_base_ids: set[str] = set()
+    legacy_version_ids: dict[str, str] = {}
     if "knowledge_base_versions" in tables and "knowledge_bases" in tables:
         knowledge_bases = conn.execute(text("SELECT * FROM knowledge_bases")).mappings().all()
         for row in knowledge_bases:
+            if _knowledge_base_has_revision_identity(conn, str(row["id"])):
+                revision_base_ids.add(str(row["id"]))
+                continue
             version_id = _knowledge_base_version_id(str(row["id"]), "1.0.0")
             existing = conn.execute(
-                text("SELECT id FROM knowledge_base_versions WHERE id = :id"),
-                {"id": version_id},
+                text("SELECT id FROM knowledge_base_versions "
+                     "WHERE tenant_id = :tenant_id AND knowledge_base_id = :knowledge_base_id "
+                     "AND version = '1.0.0'"),
+                {"tenant_id": row["tenant_id"], "knowledge_base_id": row["id"]},
             ).first()
+            legacy_version_ids[str(row["id"])] = str(existing[0]) if existing else version_id
             if not existing:
                 conn.execute(
                     text(
                         """
                         INSERT INTO knowledge_base_versions (
                             id, tenant_id, knowledge_base_id, version, name, description,
-                            status, metadata_json, created_at, updated_at
+                            status, scope, publication_state, metadata_json,
+                            created_at, updated_at
                         )
                         VALUES (
                             :id, :tenant_id, :knowledge_base_id, '1.0.0', :name, :description,
-                            :status, :metadata_json, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                            :status, 'overall', 'published', :metadata_json,
+                            CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
                         )
                         """
                     ),
@@ -2441,7 +2671,7 @@ def _migrate_knowledge_base_schema(conn, inspector, tables: set[str]) -> None:
         ).mappings().all()
         for row in rows:
             knowledge_base_id = str(row.get("knowledge_base_id") or "")
-            if not knowledge_base_id:
+            if not knowledge_base_id or knowledge_base_id in revision_base_ids:
                 continue
             conn.execute(
                 text(
@@ -2454,15 +2684,32 @@ def _migrate_knowledge_base_schema(conn, inspector, tables: set[str]) -> None:
                 ),
                 {
                     "knowledge_base_id": knowledge_base_id,
-                    "version_id": _knowledge_base_version_id(knowledge_base_id, "1.0.0"),
+                    "version_id": legacy_version_ids.get(
+                        knowledge_base_id, _knowledge_base_version_id(knowledge_base_id, "1.0.0")
+                    ),
                 },
             )
 
     _split_document_backed_knowledge_bases(conn, tables)
 
 
+def _knowledge_base_has_revision_identity(conn, knowledge_base_id: str) -> bool:
+    """只读已有版本整行识别现代身份，缺列旧表兼容；任一明确身份保护整库。"""
+    versions = conn.execute(text(
+        "SELECT * FROM knowledge_base_versions WHERE knowledge_base_id = :knowledge_base_id"
+    ), {"knowledge_base_id": knowledge_base_id}).mappings().all()
+    return len(versions) > 1 or any(
+        row.get("build_job_id") or row.get("parent_version_id")
+        or row.get("content_manifest_hash") or _json_object(row.get("content_manifest_json"))
+        or (row.get("scope") or "overall") != "overall"
+        or (row.get("publication_state") or "published") != "published"
+        or (row.get("version") or "1.0.0") != "1.0.0"
+        for row in versions
+    )
+
+
 def _split_document_backed_knowledge_bases(conn, tables: set[str]) -> None:
-    """把含多个 knowledge_documents 的遗留知识库按文档拆成独立知识库和 1.0.0 版本。"""
+    """仅把无现代版本身份的遗留多文档库拆分；修订快照及候选整库不移动。"""
     required_tables = {"knowledge_bases", "knowledge_base_versions", "knowledge_documents"}
     if not required_tables.issubset(tables):
         return
@@ -2486,6 +2733,8 @@ def _split_document_backed_knowledge_bases(conn, tables: set[str]) -> None:
         return
 
     for source_knowledge_base_id in sorted(multi_document_base_ids):
+        if _knowledge_base_has_revision_identity(conn, source_knowledge_base_id):
+            continue
         source = conn.execute(
             text("SELECT * FROM knowledge_bases WHERE id = :id"),
             {"id": source_knowledge_base_id},
@@ -2533,11 +2782,12 @@ def _split_document_backed_knowledge_bases(conn, tables: set[str]) -> None:
                         INSERT INTO knowledge_bases (
                             id, tenant_id, name, description, owner_user_id,
                             responsible_org_unit_id, access_scope, download_policy, revision,
+                            content_revision,
                             status, metadata_json, created_at, updated_at
                         )
                         VALUES (
                             :id, :tenant_id, :name, :description, :owner_user_id, NULL,
-                            'owner', 'restricted', 1, :status, :metadata_json,
+                            'owner', 'restricted', 1, 1, :status, :metadata_json,
                             :created_at, CURRENT_TIMESTAMP
                         )
                         """
@@ -2564,11 +2814,12 @@ def _split_document_backed_knowledge_bases(conn, tables: set[str]) -> None:
                         """
                         INSERT INTO knowledge_base_versions (
                             id, tenant_id, knowledge_base_id, version, name, description,
-                            status, metadata_json, created_at, updated_at
+                            status, scope, publication_state, metadata_json, created_at, updated_at
                         )
                         VALUES (
                             :id, :tenant_id, :knowledge_base_id, '1.0.0', :name, :description,
-                            'active', :metadata_json, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                            'active', 'overall', 'published', :metadata_json,
+                            CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
                         )
                         """
                     ),

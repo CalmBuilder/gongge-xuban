@@ -1,5 +1,5 @@
 """
-@Time       : 2026/08/10 17:15
+@Time       : 2026/10/02
 @Author     : zhanglp8181
 @File       : test_alembic_configuration.py
 @CallChain  : pytest → Alembic ScriptDirectory → 迁移链和配置安全断言
@@ -21,7 +21,13 @@ def test_alembic_has_single_expected_head_and_baseline() -> None:
     config = Config(str(BACKEND_DIR / "alembic.ini"))
     script = ScriptDirectory.from_config(config)
 
-    assert script.get_heads() == ["20260906_0083"]
+    assert script.get_heads() == ["20261002_0092"]
+    skill_edit_candidates = script.get_revision("20261002_0092")
+    assert skill_edit_candidates.down_revision == "20261002_0091"
+    skill_version_scope = script.get_revision("20261002_0091")
+    assert skill_version_scope.down_revision == "20261002_0090"
+    feedback_materials = script.get_revision("20261002_0090")
+    assert feedback_materials.down_revision == "20261001_0089"
     member_lifecycle = script.get_revision("20260728_0016")
     assert member_lifecycle.down_revision == "20260727_0015"
     organization_units = script.get_revision("20260728_0017")
@@ -182,7 +188,13 @@ def test_context_summary_budget_migration_follows_current_head_without_a_branch(
     event_precision = script.get_revision("20260906_0083")
     assert event_precision is not None
     assert event_precision.down_revision == "20260905_0082"
-    assert script.get_heads() == ["20260906_0083"]
+    external_operation_waiting = script.get_revision("20260928_0084")
+    assert external_operation_waiting is not None
+    assert external_operation_waiting.down_revision == "20260906_0083"
+    external_event_inbox = script.get_revision("20260928_0085")
+    assert external_event_inbox is not None
+    assert external_event_inbox.down_revision == "20260928_0084"
+    assert script.get_heads() == ["20261002_0092"]
 
 
 def test_alembic_files_do_not_embed_runtime_credentials() -> None:

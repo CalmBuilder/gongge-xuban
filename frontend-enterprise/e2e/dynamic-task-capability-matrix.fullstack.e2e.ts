@@ -11,10 +11,43 @@ import { expect, test, type Page } from '@playwright/test';
 const PROFILE = process.env.FULLSTACK_E2E_PROFILE ?? 'base-open';
 const TENANT_ID = 'tenant_demo';
 const AGENT_ID = 'agent_e2e_employee';
+const OVERALL_AGENT_ID = 'agent_tenant_demo_overall';
+
+test.use({ timezoneId: 'Asia/Shanghai' });
 
 type SessionFacts = {
-  events: Array<{ event_type: string; data?: Record<string, unknown> }>;
-  messages: Array<{ id: string; role: string; content: string }>;
+  events: Array<{
+    event_type: string;
+    data?: Record<string, unknown>;
+    persistent_action_id?: string;
+    receipt_source?: string;
+    success?: boolean;
+  }>;
+  messages: Array<{
+    id: string;
+    role: string;
+    content: string;
+    metadata?: { time_context?: Record<string, string> };
+  }>;
+};
+
+type Sd1RestoreSnapshot = {
+  tool_id: string;
+  skill_id: string;
+  operation_id: string | null;
+  operation_status: string | null;
+  instance_status: string | null;
+  execution_status: string | null;
+  dispatch_count: number;
+  phase?: string;
+  action?: string | null;
+  is_step_completed?: boolean;
+  runtime_error_code?: string | null;
+};
+
+type Sd1ActionSnapshot = {
+  dispatch_count: number;
+  dispatched_products: string[];
 };
 
 async function login(page: Page, username = 'admin', password = 'admin'): Promise<void> {
@@ -128,7 +161,294 @@ async function activeAttention(page: Page, executionId: string): Promise<Record<
   }, { executionId, tenantId: TENANT_ID });
 }
 
+async function readProviderDispatchCount(page: Page, provider: string): Promise<number> {
+  /** 从隔离 provider 适配器边界读取真实 send_text 调用次数。 */
+
+  return page.evaluate(async (providerName) => {
+    const response = await fetch('/__e2e/provider-dispatches');
+    if (!response.ok) throw new Error(`provider dispatch snapshot failed: ${response.status}`);
+    const body = await response.json() as Record<string, number>;
+    return Number(body[providerName] || 0);
+  }, provider);
+}
+
+async function readSd1ActionSnapshot(page: Page): Promise<Sd1ActionSnapshot> {
+  /** 从隔离 HTTP 工具适配器边界读取同轮多个动作的真实派发计数。 */
+
+  const response = await page.request.get('/__e2e/sd1/action/snapshot');
+  expect(response.status()).toBe(200);
+  return await response.json() as Sd1ActionSnapshot;
+}
+
+async function readSd1PendingActionSnapshot(page: Page): Promise<Sd1ActionSnapshot> {
+  /** 从隔离 HTTP 工具适配器边界读取两个待办任务的实际派发顺序和次数。 */
+
+  const response = await page.request.get('/__e2e/sd1/pending/snapshot');
+  expect(response.status()).toBe(200);
+  return await response.json() as Sd1ActionSnapshot;
+}
+
+async function setToolAllowedSkills(
+  page: Page,
+  toolId: string,
+  allowedSkills: string[],
+): Promise<void> {
+  /** 通过真实管理 API 撤销或恢复正式 SOP 工具的 Skill 白名单。 */
+
+  const status = await page.evaluate(async ({ toolId, allowedSkills, tenantId, agentId }) => {
+    const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
+    const headers = { Authorization: `Bearer ${auth.token}` };
+    const detailResponse = await fetch(
+      `/api/enterprise/tools/${toolId}?tenant_id=${tenantId}&agent_id=${agentId}`,
+      { headers },
+    );
+    if (!detailResponse.ok) return detailResponse.status;
+    const current = await detailResponse.json() as {
+      tenant_id: string;
+      name: string;
+      display_name: string | null;
+      description: string | null;
+      bucket: string;
+      tool_type: 'http' | 'mcp' | 'managed_workspace';
+      method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
+      url: string;
+      input_schema: Record<string, unknown>;
+      output_schema: Record<string, unknown>;
+      required_permission_code: string | null;
+      permission_authorization_mode: string;
+      reliability_contract: Record<string, unknown> | null;
+      enabled: boolean;
+    };
+    const updateResponse = await fetch(
+      `/api/enterprise/tools/${toolId}?agent_id=${agentId}`,
+      {
+        method: 'PUT',
+        headers: { ...headers, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          tenant_id: current.tenant_id,
+          name: current.name,
+          display_name: current.display_name,
+          description: current.description,
+          bucket: current.bucket,
+          tool_type: current.tool_type,
+          method: current.method,
+          url: current.url,
+          headers: {},
+          auth: {},
+          mcp_config: {},
+          input_schema: current.input_schema,
+          output_schema: current.output_schema,
+          allowed_skills: allowedSkills,
+          required_permission_code: current.required_permission_code,
+          permission_authorization_mode: current.permission_authorization_mode,
+          reliability_contract: current.reliability_contract,
+          enabled: current.enabled,
+          preserve_credential_fields: [],
+          clear_credential_fields: [],
+        }),
+      },
+    );
+    return updateResponse.status;
+  }, { toolId, allowedSkills, tenantId: TENANT_ID, agentId: OVERALL_AGENT_ID });
+  expect(status).toBe(200);
+}
+
 test.describe.configure({ mode: 'serial', timeout: 120_000 });
+
+test('正式 SOP 浏览器恢复在撤权时不推进，恢复绑定后复用原 Operation', async ({ page }) => {
+  /** 通过真实 AgentLoop 派发、管理 API 撤权和正式 prepare_step 核对恢复边界。 */
+
+  test.skip(PROFILE !== 'base-open', '正式 SOP 恢复授权场景只在 base-open 隔离 profile 运行');
+  const prepareResponse = await page.request.get('/__e2e/sd1/prepare');
+  expect(prepareResponse.status()).toBe(200);
+  const prepared = await prepareResponse.json() as Sd1RestoreSnapshot;
+  expect(prepared).toMatchObject({
+    phase: 'prepared',
+    operation_status: 'succeeded',
+    instance_status: 'running',
+    execution_status: 'running',
+    dispatch_count: 1,
+  });
+  expect(prepared.operation_id).not.toBeNull();
+
+  await login(page);
+  // 空白 allowlist 在本项目表示不限制 Skill；改为无关 Skill 才是真正撤销当前 SOP。
+  await setToolAllowedSkills(page, prepared.tool_id, ['sd1_browser_unrelated_skill']);
+  const deniedResponse = await page.request.get('/__e2e/sd1/restore');
+  expect(deniedResponse.status()).toBe(200);
+  const denied = await deniedResponse.json() as Sd1RestoreSnapshot;
+  expect(denied).toMatchObject({
+    phase: 'restored',
+    action: 'reply',
+    runtime_error_code: 'NOT_ALLOWED',
+    is_step_completed: false,
+    operation_status: 'succeeded',
+    instance_status: 'running',
+    execution_status: 'running',
+    dispatch_count: 1,
+    operation_id: prepared.operation_id,
+  });
+
+  await setToolAllowedSkills(page, prepared.tool_id, [prepared.skill_id]);
+  const restoredResponse = await page.request.get('/__e2e/sd1/restore');
+  expect(restoredResponse.status()).toBe(200);
+  const restored = await restoredResponse.json() as Sd1RestoreSnapshot;
+  expect(restored).toMatchObject({
+    phase: 'restored',
+    is_step_completed: true,
+    operation_status: 'succeeded',
+    instance_status: 'succeeded',
+    execution_status: 'succeeded',
+    dispatch_count: 1,
+    operation_id: prepared.operation_id,
+  });
+});
+
+test('SD-1 真实 Composer 同轮多个业务动作保持独立身份并分别派发', async ({ page }) => {
+  /** 沿真实页面、AgentLoop、Step Agent 和 HTTP ToolExecutor 核对双动作回执与派发次数。 */
+
+  test.skip(PROFILE !== 'base-open', 'SD-1 同轮动作身份只在 base-open 隔离 profile 运行');
+  const resetResponse = await page.request.get('/__e2e/sd1/action/reset');
+  expect(resetResponse.status()).toBe(200);
+
+  await login(page);
+  const sessionId = await createSession(page, 'SD-1 同轮多动作身份');
+  await page.goto(`/workspace/chat/${sessionId}`);
+  let replayBody: Record<string, unknown> | null = null;
+  const captureComposerRequest = (request: { method(): string; url(): string; postDataJSON(): unknown }) => {
+    if (request.method() !== 'POST' || !request.url().includes('/api/chat/stream')) return;
+    replayBody = request.postDataJSON() as Record<string, unknown>;
+  };
+  page.on('request', captureComposerRequest);
+  await sendThroughComposer(page, 'SD1-ACTION-IDENTITY：请分别查询 A1 和 A3，并返回两次工具结果。');
+  page.off('request', captureComposerRequest);
+
+  await expect(page.getByRole('paragraph').filter({ hasText: 'SD1-ACTION-IDENTITY-SUCCESS' }))
+    .toBeVisible({ timeout: 45_000 });
+  const facts = await readFacts(page, sessionId);
+  const started = facts.events.filter((event) => event.event_type === 'tool_call_started');
+  const finished = facts.events.filter((event) => event.event_type === 'tool_call_finished');
+  const authoritativeFinished = finished.filter((event) => event.receipt_source !== 'compatibility_event');
+  expect(started).toHaveLength(2);
+  expect(authoritativeFinished).toHaveLength(2);
+  expect(started.map((event) => event.data?.persistent_action_id)).toEqual([
+    expect.stringContaining(':step:query_a1:action:0:'),
+    expect.stringContaining(':step:query_a3:action:0:'),
+  ]);
+  expect(new Set(started.map((event) => event.data?.persistent_action_id)).size).toBe(2);
+  expect(started.map((event) => (event.data?.arguments as { product_name?: string } | undefined)
+    ?.product_name)).toEqual(['A1', 'A3']);
+  expect(authoritativeFinished.map((event) => event.success)).toEqual([true, true]);
+
+  const snapshot = await readSd1ActionSnapshot(page);
+  expect(snapshot).toEqual({
+    dispatch_count: 2,
+    dispatched_products: ['A1', 'A3'],
+  });
+  expect(facts.messages.at(-1)?.content || '').toContain('A1');
+  expect(facts.messages.at(-1)?.content || '').toContain('A3');
+  expect(facts.events.some((event) => (
+    event.event_type === 'skill_completed' && event.data?.step_id === 'query_a3'
+  ))).toBe(true);
+
+  expect(replayBody).not.toBeNull();
+  expect(replayBody?.client_turn_id).toEqual(expect.any(String));
+  const authToken = await page.evaluate(() => (
+    (JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string }).token || ''
+  ));
+  const replayResponse = await page.request.post('/api/chat/stream', {
+    headers: {
+      Authorization: `Bearer ${authToken}`,
+      'Content-Type': 'application/json',
+    },
+    data: replayBody,
+  });
+  expect(replayResponse.status()).toBe(200);
+  await replayResponse.text();
+  const replayFacts = await readFacts(page, sessionId);
+  const replayStarted = replayFacts.events.filter((event) => event.event_type === 'tool_call_started');
+  expect(replayStarted).toHaveLength(2);
+  const replaySnapshot = await readSd1ActionSnapshot(page);
+  expect(replaySnapshot).toEqual(snapshot);
+  console.log('SD1_BROWSER_ACTION_RESULT', JSON.stringify({
+    session_id: sessionId,
+    action_ids: started.map((event) => event.data?.persistent_action_id),
+    dispatch_count: snapshot.dispatch_count,
+    dispatched_products: snapshot.dispatched_products,
+    receipt_statuses: authoritativeFinished.map((event) => event.success),
+    replay_dispatch_count: replaySnapshot.dispatch_count,
+  }));
+});
+
+test('SD-1 真实 Composer 同轮两个独立待办任务各派发一次且重试不重复', async ({ page }) => {
+  /** 沿真实页面待办续接链核对同 Skill/Step 的双任务身份、完成回执和重放计数。 */
+
+  test.skip(PROFILE !== 'base-open', 'SD-1 待办任务身份只在 base-open 隔离 profile 运行');
+  const resetResponse = await page.request.get('/__e2e/sd1/pending/reset');
+  expect(resetResponse.status()).toBe(200);
+
+  await login(page);
+  const sessionId = await createSession(page, 'SD-1 双待办任务身份');
+  await page.goto(`/workspace/chat/${sessionId}`);
+  let replayBody: Record<string, unknown> | null = null;
+  const captureComposerRequest = (request: { method(): string; url(): string; postDataJSON(): unknown }) => {
+    if (request.method() !== 'POST' || !request.url().includes('/api/chat/stream')) return;
+    replayBody = request.postDataJSON() as Record<string, unknown>;
+  };
+  page.on('request', captureComposerRequest);
+  await sendThroughComposer(page, 'SD1-PENDING-TASK-IDENTITY：请分别完成任务 A1 和 A3。');
+  page.off('request', captureComposerRequest);
+
+  await expect(page.getByRole('paragraph').filter({ hasText: 'SD1-PENDING-TASK-IDENTITY-SUCCESS' }))
+    .toBeVisible({ timeout: 45_000 });
+  const facts = await readFacts(page, sessionId);
+  const started = facts.events.filter((event) => event.event_type === 'tool_call_started');
+  const finished = facts.events.filter((event) => event.event_type === 'tool_call_finished');
+  const authoritativeFinished = finished.filter((event) => event.receipt_source !== 'compatibility_event');
+  expect(started).toHaveLength(2);
+  expect(authoritativeFinished).toHaveLength(2);
+  expect(started.map((event) => event.data?.persistent_action_id)).toEqual([
+    expect.stringContaining(':task:task_A1:skill:sd1_browser_pending_sop:step:query:'),
+    expect.stringContaining(':task:task_A3:skill:sd1_browser_pending_sop:step:query:'),
+  ]);
+  expect(new Set(started.map((event) => event.data?.persistent_action_id)).size).toBe(2);
+  expect(started.map((event) => (event.data?.arguments as { product_name?: string } | undefined)
+    ?.product_name)).toEqual(['A1', 'A3']);
+  expect(authoritativeFinished.map((event) => event.success)).toEqual([true, true]);
+
+  const snapshot = await readSd1PendingActionSnapshot(page);
+  expect(snapshot).toEqual({
+    dispatch_count: 2,
+    dispatched_products: ['A1', 'A3'],
+  });
+  expect(replayBody).not.toBeNull();
+
+  const authToken = await page.evaluate(() => (
+    (JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string }).token || ''
+  ));
+  const replayResponse = await page.request.post('/api/chat/stream', {
+    headers: {
+      Authorization: `Bearer ${authToken}`,
+      'Content-Type': 'application/json',
+    },
+    data: replayBody,
+  });
+  expect(replayResponse.status()).toBe(200);
+  await replayResponse.text();
+  const replayFacts = await readFacts(page, sessionId);
+  expect(replayFacts.events.filter((event) => event.event_type === 'tool_call_started'))
+    .toHaveLength(2);
+  const replaySnapshot = await readSd1PendingActionSnapshot(page);
+  expect(replaySnapshot).toEqual(snapshot);
+  console.log('SD1_BROWSER_PENDING_TASK_RESULT', JSON.stringify({
+    session_id: sessionId,
+    action_ids: started.map((event) => event.data?.persistent_action_id),
+    dispatch_count: snapshot.dispatch_count,
+    dispatched_products: snapshot.dispatched_products,
+    receipt_statuses: authoritativeFinished.map((event) => event.success),
+    replay_dispatch_count: replaySnapshot.dispatch_count,
+  }));
+});
 
 test('普通 DynamicTaskAgent 通过真实 Composer 多轮澄清并闭环完成', async ({ page }) => {
   /** 验证无 SOP 时普通动态链路默认开放，首轮等待、次轮补充和终态均可恢复。 */
@@ -140,6 +460,16 @@ test('普通 DynamicTaskAgent 通过真实 Composer 多轮澄清并闭环完成'
   await expect(page.getByPlaceholder('输入消息，按 Enter 发送...')).toBeVisible();
 
   await sendThroughComposer(page, '请做一次合同巡检，并先确认本次需要检查的范围。');
+  await expect.poll(async () => {
+    const facts = await readFacts(page, sessionId);
+    return facts.messages.find((item) => item.role === 'user')?.id || '';
+  }, { timeout: 15_000 }).not.toBe('');
+  const initialFacts = await readFacts(page, sessionId);
+  const initialUserMessage = initialFacts.messages.find((item) => item.role === 'user');
+  expect(initialUserMessage?.metadata?.time_context).toMatchObject({
+    source_input_id: initialUserMessage?.id,
+    timezone: 'Asia/Shanghai',
+  });
   await expect.poll(() => executionIdFor(page, sessionId), {
     timeout: 45_000,
     intervals: [250, 500, 1_000, 2_000],
@@ -244,6 +574,7 @@ test('external_write 独立灰度时可逐次审批发送，未灰度时保持�
 
   await login(page, 'admin', 'admin');
   const sessionId = 'session_e2e_dynamic_external_write';
+  const providerDispatchesBefore = await readProviderDispatchCount(page, 'wecom_message_send');
   await page.goto(`/workspace/chat/${sessionId}`);
   await expect(page.getByPlaceholder('输入消息，按 Enter 发送...')).toBeVisible();
   await sendThroughComposer(
@@ -293,11 +624,35 @@ test('external_write 独立灰度时可逐次审批发送，未灰度时保持�
   }).toMatchObject({ status: 'succeeded' });
   const completed = await readExecution(page, executionId);
   const operations = Array.isArray(completed.operations) ? completed.operations : [];
-  expect(operations).toEqual(expect.arrayContaining([
+  const writeOperations = operations.filter((operation) => (
+    String((operation as Record<string, unknown>).operation_name || '').startsWith('wecom.message_send@')
+  ));
+  expect(writeOperations).toHaveLength(1);
+  expect(writeOperations[0]).toMatchObject({
+    operation_name: expect.stringMatching(/^wecom\.message_send@/),
+    effect_kind: 'external_write',
+    status: 'succeeded',
+  });
+  const traceOperations = await page.evaluate(async ({ sessionId, executionId }) => {
+    const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
+    const response = await fetch(`/api/enterprise/traces/${sessionId}?tenant_id=tenant_demo`, {
+      headers: { Authorization: `Bearer ${auth.token}` },
+    });
+    const trace = await response.json() as {
+      sop_runtime?: Array<{ instance_id: string; operations?: Array<Record<string, unknown>> }>;
+    };
+    return trace.sop_runtime?.find((item) => item.instance_id === executionId)?.operations || [];
+  }, { sessionId, executionId });
+  expect(traceOperations).toEqual(expect.arrayContaining([
     expect.objectContaining({
       operation_name: expect.stringMatching(/^wecom\.message_send@/),
-      effect_kind: 'external_write',
       status: 'succeeded',
+      result: expect.objectContaining({
+        data: expect.objectContaining({
+          delivery_status: 'sent',
+          message_id: expect.stringMatching(/^e2e-wecom-message-/),
+        }),
+      }),
     }),
   ]));
   await page.goto(`/workspace/chat/${sessionId}`);
@@ -308,6 +663,18 @@ test('external_write 独立灰度时可逐次审批发送，未灰度时保持�
     'dynamic_task_delegated',
     'execution_succeeded',
   ]));
+  const providerDispatchesAfter = await readProviderDispatchCount(page, 'wecom_message_send');
+  expect(providerDispatchesAfter - providerDispatchesBefore).toBe(1);
+  console.log('EXTERNAL_WRITE_OPERATION_RESULT', JSON.stringify({
+    execution_id: executionId,
+    dispatch_count: providerDispatchesAfter - providerDispatchesBefore,
+    operation_count: writeOperations.length,
+    operation_status: writeOperations[0]?.status,
+    receipt_source: 'operation.result.data.provider',
+    message_id: (traceOperations.find((operation) => (
+      String(operation.operation_name || '').startsWith('wecom.message_send@')
+    ))?.result as { data?: { message_id?: string } } | undefined)?.data?.message_id,
+  }));
 });
 
 test('模型或 Provider 错误只结束当前轮，不改变普通动态开放状态', async ({ page }) => {

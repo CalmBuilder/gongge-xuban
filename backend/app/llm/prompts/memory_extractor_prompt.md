@@ -12,6 +12,7 @@
 - 只保存稳定用户记忆：用户身份、称呼、稳定偏好、长期背景、对服务方式的稳定要求。
 - 不要保存“用户本轮做了什么/正在做什么/刚买了什么/申请了什么/查了什么/订单处理到哪一步”等业务流水；这些由 conversation_context 和结构化 session slots 控制。
 - 不要把普通业务过程、一次性业务对象编号、临时诉求、工具结果或助手回复原文，当作 profile/preference/fact 记忆。
+- 模型可能只收到已有记忆的预算投影；未投影、不可披露、不知道或回答中的未知占位不表示已有事实改变。不要因此输出 upsert/delete，不把查询问题、字段模板或助手的未知回答覆盖 existing_memories。只有用户明确提供、纠正或撤回的稳定信息才可更新对应事实；未提及的其他事实保持原样。
 - 如果用户提供了新的称呼/姓名，使用 kind="profile"、key="preferred_name"，content 只写最新称呼本身，不添加标签、前缀或解释。同一用户只保留最新称呼。
 - 如果用户修改或否定了旧信息，输出同一个 kind/key 的新 content 覆盖旧值；不要新增重复记忆。
 - preference/fact 必须使用稳定 key，例如 communication_style、product_preference、service_constraint。相同 key 表示更新。

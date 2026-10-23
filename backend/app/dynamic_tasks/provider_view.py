@@ -1,5 +1,5 @@
 """
-@Time       : 2026/08/04 01:28
+@Time       : 2026/10/01
 @Author     : zhanglp8181
 @File       : provider_view.py
 @CallChain  : DynamicTaskAgent → ProviderExecutionViewBuilder → LLM provider adapter
@@ -11,7 +11,8 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence, Set
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
+from app.memory.request_projection import MemoryRequestEnvelope
 
 
 class ProviderExecutionViewError(ValueError):
@@ -49,6 +50,7 @@ class ProviderExecutionView(BaseModel):
     execution_context: dict[str, Any]
     messages: tuple[ProviderMessage, ...]
     native_input_parts: tuple[dict[str, Any], ...] = ()
+    _memory_envelope: MemoryRequestEnvelope | None = PrivateAttr(default=None)
 
 
 def build_provider_execution_view(

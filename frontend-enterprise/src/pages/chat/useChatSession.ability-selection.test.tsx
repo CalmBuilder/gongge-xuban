@@ -14,6 +14,7 @@ import { useChatSession } from './useChatSession';
 
 const boundary = vi.hoisted(() => ({
   get: vi.fn<(path: string) => Promise<unknown>>(),
+  cancel: vi.fn<() => Promise<unknown>>(),
   stream: vi.fn<(
     body: Record<string, unknown>,
     onEvent: (event: { event: string; data: Record<string, unknown> }) => void,
@@ -50,7 +51,7 @@ vi.mock('@/api/client', async (importOriginal) => {
   return {
     ...original,
     getRequestTenantId: () => 'tenant_ability',
-    api: { ...original.api, get: boundary.get },
+    api: { ...original.api, get: boundary.get, postKeepalive: boundary.cancel },
     streamChatTurn: boundary.stream,
   };
 });
@@ -133,6 +134,7 @@ beforeEach(() => {
   boundary.auth = auth;
   boundary.params = { sessionId: 'session_ability' };
   boundary.stream.mockResolvedValue(undefined);
+  boundary.cancel.mockResolvedValue({ status: 'cancelled' });
   boundary.get.mockImplementation(async (path) => {
     if (path === '/api/chat/abilities') return { items: [ability] };
     if (path.includes('/readiness')) return readiness;
@@ -236,4 +238,82 @@ describe('useChatSession vertical ability selection', () => {
     });
     expect(boundary.navigate).toHaveBeenCalledWith('/workspace/chat/session_promoted', { replace: true });
   });
+
+  it('draft 已收到 session_created 后停止会向真实 session 发送取消', async () => {
+    /** 验证 draft URL 延迟提升期间，停止动作仍绑定服务端真实会话身份。 */
+    boundary.params = { draftAgentId: agent.id };
+    let resolveSessionCreated: () => void = () => undefined;
+    const sessionCreated = new Promise<void>((resolve) => {
+      resolveSessionCreated = resolve;
+    });
+    let releaseStream: () => void = () => undefined;
+    const streamGate = new Promise<void>((resolve) => {
+      releaseStream = resolve;
+    });
+    boundary.stream.mockImplementation(async (_body, onEvent) => {
+      onEvent({
+        event: 'session_created',
+        data: { newSessionId: 'session_cancel_target', sessionId: 'session_cancel_target' },
+      });
+      resolveSessionCreated();
+      await streamGate;
+    });
+
+    const hook = renderHook(() => useChatSession({ anonymous: true }));
+    await waitFor(() => {
+      expect(hook.result.current.selectedModelConfig?.id).toBe(model.id);
+      expect(hook.result.current.agents).toHaveLength(1);
+    });
+    await act(async () => {
+      hook.result.current.setInput('Run a cancellable draft turn');
+    });
+    let sendPromise: Promise<void> | undefined;
+    await act(async () => {
+      sendPromise = hook.result.current.send();
+      await sessionCreated;
+    });
+
+    await act(async () => {
+      hook.result.current.abortStream();
+    });
+    expect(boundary.cancel).toHaveBeenCalledWith(
+      '/api/chat/sessions/session_cancel_target/cancel',
+      expect.objectContaining({ tenant_id: 'tenant_ability', turn_id: expect.any(String) }),
+    );
+    releaseStream();
+    await act(async () => {
+      await sendPromise;
+    });
+  });
+
+  it.each(['error_occurred', 'stream_interrupted', 'stream_cancelled'] as const)(
+    'promotes a created draft session on %s terminal', async (terminalEvent) => {
+      /** 首轮非成功终态仍属于已创建会话，路由需落到可继续查看和重试的持久会话。 */
+      boundary.params = { draftAgentId: agent.id };
+      boundary.stream.mockImplementation(async (_body, onEvent) => {
+        onEvent({
+          event: 'session_created',
+          data: { newSessionId: 'session_failed_turn', sessionId: 'session_failed_turn' },
+        });
+        onEvent({
+          event: terminalEvent,
+          data: { sessionId: 'session_failed_turn', message: '本轮失败', turn_id: 'turn_failed' },
+        });
+      });
+      const hook = renderHook(() => useChatSession({ anonymous: true }));
+      await waitFor(() => {
+        expect(hook.result.current.selectedModelConfig?.id).toBe(model.id);
+        expect(hook.result.current.agents).toHaveLength(1);
+      });
+      await act(async () => {
+        hook.result.current.setInput('Run a turn that can fail');
+      });
+
+      await act(async () => {
+        await hook.result.current.send();
+      });
+
+      expect(boundary.navigate).toHaveBeenCalledWith('/workspace/chat/session_failed_turn', { replace: true });
+    },
+  );
 });

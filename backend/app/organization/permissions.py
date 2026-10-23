@@ -792,7 +792,7 @@ def sync_role_permissions(
         select(PermissionDefinition).where(
             PermissionDefinition.tenant_id == role.tenant_id,
             PermissionDefinition.status == "active",
-        )
+        ).with_for_update()
     ).all()
     definitions_by_code = {
         item.permission_code: item

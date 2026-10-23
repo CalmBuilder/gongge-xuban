@@ -1,8 +1,28 @@
+"""
+@Time       : 2026/10/20
+@Author     : zhanglp8181
+@File       : test_memory_service.py
+@CallChain  : pytest → Memory API/MemoryService → 清空代数、墓碑与本人读取
+@Description: 验证记忆读取、清空、来源代数和 key tombstone 的一致性。
+"""
+
+from __future__ import annotations
+
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from app.api.memories import clear_my_memories, list_memories
-from app.db.models import AgentProfile, ChatSession, MemoryRecord, Message, ModelConfig, Tenant, User
+from app.db.models import (
+    AgentProfile,
+    ChatSession,
+    MemoryCaptureScope,
+    MemoryKeyState,
+    MemoryRecord,
+    Message,
+    ModelConfig,
+    Tenant,
+    User,
+)
 from app.llm.client import LLMClient
 from app.memory.jobs import _conversation_messages_for_turn
 from app.memory.service import MemoryService, memory_rows_for_read
@@ -381,6 +401,72 @@ def test_clear_my_memories_scopes_to_current_user_and_agent() -> None:
         "原始对话记录不清理",
         "当前用户其他员工记忆",
     ]
+
+
+def test_clear_my_memories_advances_generation_and_tombstones_key_state() -> None:
+    """本人清空同时推进来源代数并保留 key tombstone，阻断迟到任务复活。"""
+
+    with _test_session() as db:
+        user = User(
+            id="user_clear_barrier",
+            tenant_id="tenant_clear_barrier",
+            username="clear-barrier",
+            password_hash="hash",
+        )
+        db.add(Tenant(id=user.tenant_id, name="清空屏障租户"))
+        agent = AgentProfile(
+            id="agent_clear_barrier",
+            tenant_id=user.tenant_id,
+            name="清空屏障员工",
+            owner_user_id=user.id,
+        )
+        session = ChatSession(
+            id="session_clear_barrier",
+            tenant_id=user.tenant_id,
+            user_id=user.id,
+            agent_id=agent.id,
+        )
+        scope = MemoryCaptureScope(
+            id="scope_clear_barrier",
+            tenant_id=user.tenant_id,
+            user_id=user.id,
+            scope_kind="agent",
+            agent_scope_key=agent.id,
+        )
+        record = MemoryRecord(
+            id="memory_clear_barrier",
+            tenant_id=user.tenant_id,
+            agent_id=agent.id,
+            agent_scope_key=agent.id,
+            user_id=user.id,
+            username=user.username,
+            session_id=session.id,
+            kind="fact",
+            content="清空前事实",
+            metadata_json={"key": "old_fact"},
+        )
+        key_state = MemoryKeyState(
+            id="key_clear_barrier",
+            tenant_id=user.tenant_id,
+            user_id=user.id,
+            agent_scope_key=agent.id,
+            kind="fact",
+            normalized_key="old_fact",
+            record_id=record.id,
+            last_source_sequence=1,
+        )
+        db.add_all([user, agent, session, scope, record, key_state])
+        db.commit()
+
+        result = clear_my_memories(user.tenant_id, agent.id, user, db)
+
+        db.refresh(scope)
+        db.refresh(key_state)
+        assert result == {"deleted": 1}
+        assert scope.clear_generation == 1
+        assert key_state.tombstoned is True
+        assert key_state.record_id is None
+        assert db.get(MemoryRecord, record.id) is None
 
 
 def test_list_memories_for_gallery_agent_only_returns_current_user_for_non_creator() -> None:

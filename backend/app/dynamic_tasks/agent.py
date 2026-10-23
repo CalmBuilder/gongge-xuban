@@ -1,9 +1,9 @@
 """
-@Time       : 2026/08/10 19:20
+@Time       : 2026/10/04
 @Author     : zhanglp8181
 @File       : agent.py
 @CallChain  : Agent Loop/signal worker → DynamicTaskAgent → Execution Store/ToolExecutor
-@Description: 以统一 Execution 账本推进动态动作、可信 Artifact，并支持崩溃后的安全恢复。
+@Description: 以统一 Execution 推进动态动作/Artifact，恢复和每次SDK披露重核已消费知识授权。
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ from sqlalchemy import update
 from sqlmodel import Session, select
 
 from app.cancellation import TurnCancellationRequested, raise_if_cancelled
+from app.core.time_context import normalize_persisted_time_context
 from app.connectors.service import ConnectionError, ConnectionService
 from app.connectors.runtime import ConnectorRuntimeService
 from app.db.models import (
@@ -77,6 +78,7 @@ from app.dynamic_tasks.capability_catalog import (
     capability_checksum,
     dynamic_model_snapshot_checksum,
     dynamic_model_snapshot_matches,
+    schema_path_exists,
 )
 from app.dynamic_tasks.planner_service import DynamicTaskPlanner
 from app.general_skills.runtime import (
@@ -91,6 +93,9 @@ from app.general_skills.proposals import (
     SKILL_PROPOSAL_TOOL_NAME,
 )
 from app.dynamic_tasks.execution_context import build_execution_context_projection
+from app.memory.projection import MemoryProjectionPolicy, safe_memory_metadata
+from app.memory.request_projection import MemoryContext, MemoryRequestEnvelope
+from app.memory.service import MemoryService
 from app.dynamic_tasks.execution_context import project_result_for_model
 from app.dynamic_tasks.explorer import (
     ReadOnlyExploreProposer,
@@ -115,10 +120,12 @@ from app.dynamic_tasks.standing_approvals import (
     record_standing_rule_hit,
 )
 from app.knowledge.access import accessible_knowledge_base_versions, resolve_knowledge_access
-from app.knowledge.schema import KnowledgeSearchRequest
+from app.knowledge.citations import knowledge_citations_from_results
+from app.knowledge.schema import KnowledgeSearchRequest, knowledge_result_output_schema
 from app.knowledge.service import KnowledgeService
-from app.llm.client import LLMClient
+from app.llm.client import LLMClient, LLMError
 from app.config import get_settings
+from app.memory.capture import register_memory_capture_job, wake_memory_capture_job
 from app.observability.spans import llm_operation
 from app.observability.event_log import EventLog, TurnEventFenceClosed, ensure_turn_event_open
 from app.organization.governance import has_governance_permission
@@ -151,6 +158,7 @@ from app.vertical_abilities.resolver import (
     VerticalAbilityResolution,
     VerticalAbilityResolver,
 )
+from app.session.session_schema import ChatTurnRequest
 
 
 def _bounded_failure_diagnostics(details: object) -> dict[str, object] | None:
@@ -908,8 +916,9 @@ class DynamicToolExecutor(Protocol):
         remote_idempotency_key: str | None = None,
         execution_id: str | None = None,
         is_cancelled: Callable[[], bool] | None = None,
+        before_http_dispatch: Callable[[], None] | None = None,
     ) -> ToolResult:
-        """执行已经过服务端验证和再授权的现有 ToolCall。"""
+        """执行已验证ToolCall，普通HTTP写可传原租约发送守卫。"""
 
 
 class DynamicTaskAgent:
@@ -1141,6 +1150,38 @@ class DynamicTaskAgent:
     ) -> CompletedProviderProposal:
         """为纯读步骤执行一次有界动作修复，并避免同一研究波次重复读取来源。"""
 
+        return self._propose_action_with_shape_repair(
+            instance=instance, step=step, model_config=model_config, worker_id=worker_id,
+            expected_kind="tool.read", reserved_read_urls=reserved_read_urls,
+        )
+
+    def _propose_write_action(
+        self,
+        *,
+        instance: SopInstance,
+        step: PlanStep,
+        model_config: ModelConfig,
+        worker_id: str,
+    ) -> CompletedProviderProposal:
+        """外部写提案在严格校验失败时最多请求一次修复，不授予外写或审批权限。"""
+
+        return self._propose_action_with_shape_repair(
+            instance=instance, step=step, model_config=model_config, worker_id=worker_id,
+            expected_kind="tool.write",
+        )
+
+    def _propose_action_with_shape_repair(
+        self,
+        *,
+        instance: SopInstance,
+        step: PlanStep,
+        model_config: ModelConfig,
+        worker_id: str,
+        expected_kind: str,
+        reserved_read_urls: Sequence[str] = (),
+    ) -> CompletedProviderProposal:
+        """对纯读或外部写动作仅进行一轮严格JSON结构修复，其他错误维持失败关闭。"""
+
         try:
             return self._propose_action(
                 instance=instance,
@@ -1152,12 +1193,22 @@ class DynamicTaskAgent:
         except SopExecutionConflictError:
             raise
         except (ValidationError, ValueError) as exc:
-            if step.kind != "tool.read" or len(step.capability_refs) != 1:
+            if step.kind != expected_kind or len(step.capability_refs) != 1:
                 raise DynamicTaskAgentError(
                     "DYNAMIC_ACTION_PROPOSAL_INVALID",
                     details={"error": str(exc)[:1000]},
                 ) from exc
             capability_ref = step.capability_refs[0]
+            repair_instruction = (
+                "只返回完整 RuntimeActionProposal。当前是 "
+                f"{expected_kind} 步骤，action_kind 必须为 call_tool，"
+                "capability_ref 必须逐字返回冻结的唯一能力 "
+                f"{capability_ref}，arguments 必须是该能力 schema 要求的对象，"
+                "rationale 必须为非空字符串；禁止增加未列出的顶层字段或包装层，"
+                "也不得返回 wait_input、wait_attention、answer、complete 或其他能力引用。"
+            )
+            if expected_kind == "tool.write":
+                repair_instruction += "该提案仍需原审批，禁止声称已获授权或已执行。"
             try:
                 return self._propose_action(
                     instance=instance,
@@ -1168,13 +1219,7 @@ class DynamicTaskAgent:
                     repair_feedback={
                         "code": "DYNAMIC_ACTION_PROPOSAL_INVALID",
                         "error": str(exc)[:1000],
-                        "instruction": (
-                            "只返回完整 RuntimeActionProposal。当前是 tool.read 步骤，"
-                            "action_kind 必须为 call_tool，capability_ref 必须逐字返回冻结的唯一能力 "
-                            f"{capability_ref}，arguments 必须是该能力 schema 要求的对象，"
-                            "rationale 必须为非空字符串；禁止返回 wait_input、wait_attention、"
-                            "answer 或 complete，也不得省略或携带其他 capability_ref。"
-                        ),
+                        "instruction": repair_instruction,
                     },
                 )
             except SopExecutionConflictError:
@@ -2035,6 +2080,7 @@ class DynamicTaskAgent:
                             signal_worker_id=signal_worker_id,
                             expected_plan_revision_id=expected_plan_revision_id,
                             user_message_id=user_message_id,
+                            memory_model_config_id=model_config.id,
                         )
                         break
                     except DynamicTaskAgentError as exc:
@@ -2187,6 +2233,15 @@ class DynamicTaskAgent:
                 terminal_reason["diagnostics"] = diagnostic_summary
             instance.terminal_reason_json = terminal_reason
             self.db.add(instance)
+            running_steps = self.db.exec(
+                select(SopNodeExecution).where(
+                    SopNodeExecution.tenant_id == instance.tenant_id,
+                    SopNodeExecution.instance_id == instance.id,
+                    SopNodeExecution.status == "running",
+                )
+            ).all()
+            for step in running_steps:
+                self.store.fail_node(instance, step, error={"code": safe_code})
             self.store.fail_instance(
                 instance,
                 context_patch={"failure_code": safe_code},
@@ -2336,6 +2391,9 @@ class DynamicTaskAgent:
                             observations=observations,
                             remaining_tool_calls=max(0, remaining_tool_calls),
                             general_skill_guidance=skill_guidance,
+                            time_context=normalize_persisted_time_context(
+                                (instance.context_json or {}).get("time_context")
+                            ),
                         )
                     self.db.refresh(instance)
                 except ValueError:
@@ -2752,7 +2810,13 @@ class DynamicTaskAgent:
                 actor_user_id=instance.initiator_user_id,
                 user_message_id=user_message_id,
             )
-        control.claim_signal(signal, worker_id=worker_id, ttl_seconds=300)
+        # 与后台扫描和独立 heartbeat 共用同一个短租约；恢复 worker 崩溃后，
+        # 调度器应在有界窗口内重新领取，而不是被固定的长租约阻塞。
+        control.claim_signal(
+            signal,
+            worker_id=worker_id,
+            ttl_seconds=_signal_lease_ttl_seconds(),
+        )
         self.db.commit()
         cancelled = False
         with self.store.owned(instance, worker_id=worker_id):
@@ -2811,15 +2875,16 @@ class DynamicTaskAgent:
         self.db.commit()
         if cancelled:
             return DynamicRunOutcome("cancelled", instance.id)
-        return self.run_until_blocked_or_complete(
-            execution_id=instance.id,
-            model_config=model_config,
-            worker_id=worker_id,
-            actor_user_id=actor_user_id,
-            user_message_id=user_message_id,
-            resume_signal_id=signal.id,
-            signal_worker_id=worker_id,
-        )
+        with self._signal_lease_heartbeat(signal.id, worker_id=worker_id):
+            return self.run_until_blocked_or_complete(
+                execution_id=instance.id,
+                model_config=model_config,
+                worker_id=worker_id,
+                actor_user_id=actor_user_id,
+                user_message_id=user_message_id,
+                resume_signal_id=signal.id,
+                signal_worker_id=worker_id,
+            )
 
     def resume_chat_clarification(
         self,
@@ -2853,6 +2918,20 @@ class DynamicTaskAgent:
         ):
             return None
 
+        persisted_time_context = normalize_persisted_time_context(
+            (
+                conversation_context.get("time_context")
+                if isinstance(conversation_context, Mapping)
+                else None
+            )
+            or (
+                conversation_context.get("metadata", {}).get("time_context")
+                if isinstance(conversation_context, Mapping)
+                and isinstance(conversation_context.get("metadata"), Mapping)
+                else None
+            ),
+            expected_source_input_id=user_message_id,
+        )
         attention = None
         signal_id = ""
         normalized_message = message.strip() or "请根据本轮输入继续处理。"
@@ -2927,6 +3006,12 @@ class DynamicTaskAgent:
                         dict(item) for item in conversation_projection
                     ],
                 }
+            if persisted_time_context is not None:
+                instance.context_json = {
+                    **(instance.context_json or {}),
+                    "time_context": persisted_time_context,
+                }
+            if conversation_projection or persisted_time_context is not None:
                 self.db.add(instance)
             signal = self.db.exec(
                 select(ExecutionSignal).where(
@@ -3173,7 +3258,7 @@ class DynamicTaskAgent:
             projected.append(
                 {
                     "kind": kind,
-                    "content": f"{prefix}{content}"[:4000],
+                    "content": f"{prefix}{content}",
                     # provider view 将 source 视为审计侧带；会话来源已经由 kind
                     # 和受控的 memory_context 位置表达，不应把内部 metadata 带出。
                     "metadata": {"origin": "same_chat_session"},
@@ -3198,7 +3283,7 @@ class DynamicTaskAgent:
         worker_id: str,
         actor_user_id: str,
     ) -> SopWorkItem | None:
-        """冻结 external-write；精确长期规则命中时派发，否则创建一次性审批。"""
+        """冻结外部写；HTTP工具逐次独立批准，连接器保留精确长期规则。"""
 
         instance = self.db.get(SopInstance, execution_id)
         if instance is None or instance.kind != "dynamic_task":
@@ -3208,6 +3293,23 @@ class DynamicTaskAgent:
             instance.agent_id,
         ):
             raise DynamicTaskAgentError("DYNAMIC_EXTERNAL_WRITE_DISABLED")
+        ready_write = next(
+            (item for item in self._current_plan(instance).steps
+             if item.kind == "tool.write"
+             and item.step_key not in self._completed_step_keys(instance)
+             and set(item.depends_on) <= self._completed_step_keys(instance)),
+            None,
+        )
+        frozen_tools = (instance.capability_snapshot_json or {}).get("tools", [])
+        if ready_write is not None and any(
+            isinstance(item, Mapping) and item.get("name") in ready_write.capability_refs
+            for item in frozen_tools
+        ):
+            return self.advance_next_local_step(
+                execution_id=execution_id, model_config=model_config,
+                worker_id=worker_id, actor_user_id=actor_user_id,
+                step_kind="tool.write", external_http_write=True,
+            )
         dispatch: tuple[
             StandingApprovalMatch,
             SopNodeExecution,
@@ -3423,8 +3525,9 @@ class DynamicTaskAgent:
         worker_id: str,
         actor_user_id: str,
         step_kind: str,
+        external_http_write: bool = False,
     ) -> SopWorkItem:
-        """冻结受管工作区本地写或隔离检查，并始终创建一次性人工批准。"""
+        """冻结受管本地动作或HTTP外部写，在原账本上创建独立一次性批准。"""
 
         if step_kind not in {"tool.write", "tool.execute", "tool.destructive"}:
             raise DynamicTaskAgentError("DYNAMIC_LOCAL_STEP_KIND_INVALID")
@@ -3432,7 +3535,12 @@ class DynamicTaskAgent:
         if instance is None or instance.kind != "dynamic_task":
             raise DynamicTaskAgentError("DYNAMIC_EXECUTION_NOT_FOUND")
         settings = get_settings()
-        if step_kind == "tool.destructive":
+        if external_http_write:
+            if step_kind != "tool.write" or not settings.dynamic_task_high_risk_external_write_allows(
+                instance.tenant_id, instance.agent_id,
+            ):
+                raise DynamicTaskAgentError("DYNAMIC_EXTERNAL_WRITE_DISABLED")
+        elif step_kind == "tool.destructive":
             if not settings.dynamic_task_high_risk_destructive_allows(
                 instance.tenant_id,
                 instance.agent_id,
@@ -3444,6 +3552,9 @@ class DynamicTaskAgent:
         ):
             raise DynamicTaskAgentError("DYNAMIC_MANAGED_WORKSPACE_DISABLED")
         expected_effect = (
+            "external_write"
+            if external_http_write
+            else
             "local_write"
             if step_kind == "tool.write"
             else "execute"
@@ -3515,12 +3626,18 @@ class DynamicTaskAgent:
                     required=definition.required,
                 )
             if action_record is None:
-                completed = self._propose_action(
-                    instance=instance,
-                    step=definition,
-                    model_config=model_config,
-                    worker_id=worker_id,
-                )
+                if step_kind == "tool.write":
+                    completed = self._propose_write_action(
+                        instance=instance, step=definition, model_config=model_config,
+                        worker_id=worker_id,
+                    )
+                else:
+                    completed = self._propose_action(
+                        instance=instance,
+                        step=definition,
+                        model_config=model_config,
+                        worker_id=worker_id,
+                    )
                 proposal = completed.proposal
                 action_record, _ = self.store.record_action_proposal(
                     instance,
@@ -3545,6 +3662,8 @@ class DynamicTaskAgent:
             snapshot = (
                 self._frozen_destructive_snapshot(instance, capability_ref)
                 if expected_effect == "destructive"
+                else self._frozen_http_write_snapshot(instance, capability_ref)
+                if external_http_write
                 else self._frozen_local_snapshot(
                     instance,
                     capability_ref,
@@ -3552,7 +3671,12 @@ class DynamicTaskAgent:
                 )
             )
             arguments = dict(proposal.arguments)
-            self._validate_workspace_arguments(snapshot, arguments)
+            if external_http_write:
+                _validate_read_action_arguments(arguments, snapshot.audit_view)
+                if len(json.dumps(arguments, ensure_ascii=False)) > 128_000:
+                    raise DynamicTaskAgentError("DYNAMIC_HTTP_WRITE_ARGUMENTS_INVALID")
+            else:
+                self._validate_workspace_arguments(snapshot, arguments)
             idempotency_policy = (
                 self._destructive_idempotency_policy(snapshot)
                 if expected_effect == "destructive"
@@ -3591,7 +3715,7 @@ class DynamicTaskAgent:
         snapshot: CapabilitySnapshot,
         arguments: Mapping[str, object],
     ) -> SopWorkItem:
-        """为精确本地动作生成脱敏参数、能力修订和过期时间绑定的一次性审批。"""
+        """为精确工具动作冻结参数、能力、计划和期限；HTTP写不授予长期权限。"""
 
         is_skill_proposal = (
             snapshot.audit_view.get("platform_capability") == "general_skill_proposal"
@@ -3654,6 +3778,9 @@ class DynamicTaskAgent:
                 "审核并发布当前分身提出的 Skill"
                 if is_skill_proposal
                 else (
+                    "批准HTTP工具单次外部操作"
+                    if operation.effect_kind == "external_write"
+                    else
                     "批准 destructive 隔离 provider 单次操作"
                     if operation.effect_kind == "destructive"
                     else "批准受管代码工作区执行检查"
@@ -3679,7 +3806,7 @@ class DynamicTaskAgent:
         return attention
 
     def _workspace_approver_ids(self, tenant_id: str, *, exclude_user_id: str) -> list[str]:
-        """仅允许活动租户管理员审批代码变更，并保持发起人与批准人分离。"""
+        """仅允许活动租户管理员审批工具变更，并保持发起人与批准人分离。"""
 
         return [
             user.id
@@ -3957,6 +4084,94 @@ class DynamicTaskAgent:
             )
         raise DynamicTaskAgentError("DYNAMIC_STANDING_DISPATCH_OPERATION_INVALID")
 
+    def resume_external_task_signal(
+        self,
+        *,
+        signal_id: str,
+        model_config: ModelConfig,
+        worker_id: str,
+    ) -> DynamicRunOutcome:
+        """按可信 inbox 指向的 Operation 恢复 DTA 当前计划，不重复提交原动作。"""
+
+        signal = self.db.get(ExecutionSignal, signal_id)
+        instance = self.db.get(SopInstance, signal.execution_id) if signal is not None else None
+        if (
+            signal is None
+            or signal.signal_type != "external_event"
+            or signal.payload_json.get("kind") != "external_task"
+            or instance is None
+            or instance.kind != "dynamic_task"
+        ):
+            raise DynamicTaskAgentError("DYNAMIC_EXTERNAL_TASK_SIGNAL_INVALID")
+        if signal.status == "consumed":
+            return DynamicRunOutcome(instance.status, instance.id)
+        control = ExecutionControlService(self.db, self.store)
+        control.claim_signal(signal, worker_id=worker_id, ttl_seconds=300)
+        self.db.commit()
+        operation = self.db.get(
+            SopOperation,
+            str(signal.payload_json.get("operation_id") or ""),
+        )
+        step = self.db.get(
+            SopNodeExecution,
+            str(signal.payload_json.get("node_execution_id") or ""),
+        )
+        if (
+            operation is None
+            or step is None
+            or operation.tenant_id != instance.tenant_id
+            or operation.instance_id != instance.id
+            or operation.node_execution_id != step.id
+        ):
+            raise DynamicTaskAgentError("DYNAMIC_EXTERNAL_TASK_OPERATION_INVALID")
+        if operation.status == "unknown":
+            return self._park_unknown_effect(
+                instance=instance,
+                step=step,
+                operation=operation,
+                worker_id=worker_id,
+                error_code="DYNAMIC_EXTERNAL_TASK_REQUIRES_RECONCILIATION",
+                signal=signal,
+                control=control,
+            ) or DynamicRunOutcome("waiting", instance.id, blocking_step_key=step.step_key)
+        if operation.status not in {"succeeded", "failed"}:
+            raise DynamicTaskAgentError("DYNAMIC_EXTERNAL_TASK_NOT_SETTLED")
+        with self.store.owned(instance, worker_id=worker_id):
+            if step.status == "waiting" and instance.status == "waiting":
+                self.store.resume_waiting_node(
+                    instance,
+                    step,
+                    slots=instance.slots_json or {},
+                )
+            if operation.status == "succeeded":
+                self.store.complete_node(
+                    instance,
+                    step,
+                    output={"operation_id": operation.id, "data": operation.result_json},
+                )
+            else:
+                self.store.fail_node(
+                    instance,
+                    step,
+                    error=dict(operation.error_json or {"code": "EXTERNAL_TASK_FAILED"}),
+                )
+                instance.terminal_reason_json = dict(operation.error_json or {})
+                self.db.add(instance)
+                self.store.fail_instance(
+                    instance,
+                    context_patch={"failure_code": "EXTERNAL_TASK_FAILED"},
+                )
+            control.consume_signal(instance, signal, worker_id=worker_id)
+        self.db.commit()
+        if operation.status == "failed":
+            return DynamicRunOutcome("failed", instance.id)
+        return self.run_until_blocked_or_complete(
+            execution_id=instance.id,
+            model_config=model_config,
+            worker_id=worker_id,
+            actor_user_id=instance.initiator_user_id,
+        )
+
     def resume_tool_approval_signal(
         self,
         *,
@@ -3997,6 +4212,25 @@ class DynamicTaskAgent:
                 worker_id=worker_id,
                 actor_user_id=actor_user_id,
             )
+        if (
+            operation_probe is not None
+            and operation_probe.effect_kind == "external_write"
+            and operation_probe.capability_snapshot_json.get("capability_type") == "tool"
+        ):
+            if signal.status == "consumed":
+                if instance.status in {"succeeded", "failed", "cancelled", "timed_out"}:
+                    return DynamicRunOutcome(instance.status, instance.id)
+                if operation_probe.status in {"waiting_external", "unknown", "succeeded"}:
+                    return DynamicRunOutcome("waiting", instance.id)
+            # 保留同一派发的原租约跨越running提交，最终guard不能改领新fence。
+            with self.store.owned(instance, worker_id=worker_id, ttl_seconds=300):
+                outcome = self._resume_local_tool_approval_signal(
+                    signal=signal, instance=instance, model_config=model_config,
+                    worker_id=worker_id, actor_user_id=actor_user_id,
+                )
+            # waiting后台返回不追加终态事件；外层租约释放必须在Session关闭前提交。
+            self.db.commit()
+            return outcome
         if signal.status == "consumed":
             if instance.status in {"failed", "cancelled", "timed_out"}:
                 return DynamicRunOutcome(instance.status, instance.id)
@@ -4249,7 +4483,7 @@ class DynamicTaskAgent:
         worker_id: str,
         actor_user_id: str,
     ) -> DynamicRunOutcome:
-        """办理或恢复本地一次性审批；running 中断按内容幂等契约安全重派。"""
+        """办理工具批准；本地内容幂等可恢复，外部HTTP running只能进入对账。"""
 
         settings = get_settings()
         if signal.status == "consumed":
@@ -4292,7 +4526,9 @@ class DynamicTaskAgent:
                 or step is None
                 or operation.instance_id != instance.id
                 or operation.node_execution_id != step.id
-                or operation.effect_kind not in {"local_write", "execute", "destructive"}
+                or operation.effect_kind not in {
+                    "local_write", "execute", "destructive", "external_write",
+                }
             ):
                 raise DynamicTaskAgentError("DYNAMIC_TOOL_APPROVAL_OPERATION_INVALID")
             if operation.status == "retry_wait":
@@ -4301,7 +4537,23 @@ class DynamicTaskAgent:
                 raise DynamicTaskAgentError(
                     "DYNAMIC_LOCAL_APPROVAL_OPERATION_RECONCILIATION_REQUIRED"
                 )
-            if operation.effect_kind == "destructive":
+            external_http_write = operation.effect_kind == "external_write"
+            if external_http_write:
+                if operation.status == "running":
+                    return self._park_unknown_effect(
+                        instance=instance, step=step, operation=operation,
+                        worker_id=worker_id, error_code="DYNAMIC_WRITE_DISPATCH_INTERRUPTED",
+                        signal=signal, control=control,
+                    )
+                if operation.status == "waiting_external":
+                    control.consume_signal(instance, signal, worker_id=worker_id)
+                    self.db.commit()
+                    return DynamicRunOutcome("waiting", instance.id)
+                if not settings.dynamic_task_high_risk_external_write_allows(
+                    instance.tenant_id, instance.agent_id,
+                ):
+                    raise DynamicTaskAgentError("DYNAMIC_EXTERNAL_WRITE_DISABLED")
+            elif operation.effect_kind == "destructive":
                 if not settings.dynamic_task_high_risk_destructive_allows(
                     instance.tenant_id,
                     instance.agent_id,
@@ -4364,6 +4616,8 @@ class DynamicTaskAgent:
                 snapshot = (
                     self._frozen_destructive_snapshot(instance, operation.operation_name)
                     if expected_risk == "destructive"
+                    else self._frozen_http_write_snapshot(instance, operation.operation_name)
+                    if external_http_write
                     else self._frozen_local_snapshot(
                         instance,
                         operation.operation_name,
@@ -4372,6 +4626,8 @@ class DynamicTaskAgent:
                 )
                 if payload.get("capability_checksum") != snapshot.checksum:
                     raise DynamicTaskAgentError("DYNAMIC_TOOL_APPROVAL_CAPABILITY_CHANGED")
+                if external_http_write:
+                    self._validate_http_write_approval(instance, operation, attention, snapshot)
                 if is_skill_proposal:
                     if actor_user_id != instance.initiator_user_id:
                         raise DynamicTaskAgentError("DYNAMIC_LOCAL_APPROVER_DENIED")
@@ -4399,7 +4655,12 @@ class DynamicTaskAgent:
                 self.store.resume_waiting_node(instance, step, slots=instance.slots_json or {})
                 self._acquire_tool_quota(operation)
                 try:
-                    self.store.authorize_local_operation_dispatch(
+                    authorize_dispatch = (
+                        self.store.authorize_external_operation_dispatch
+                        if external_http_write
+                        else self.store.authorize_local_operation_dispatch
+                    )
+                    authorize_dispatch(
                         operation,
                         approval_work_item_id=attention.id,
                         approval_fingerprint=frozen_fingerprint,
@@ -4442,6 +4703,28 @@ class DynamicTaskAgent:
             else:
                 raise DynamicTaskAgentError("DYNAMIC_TOOL_APPROVAL_OPERATION_INVALID")
         self.db.commit()
+
+        def authorize_http_dispatch() -> None:
+            """在HTTP发送边界重读原批准及权限，沿持有的owner/fence拒绝提交间隙失效。"""
+            self.db.expire_all()
+            self.store.authorize_mutation(instance, "operation.http_write_dispatch")
+            current_snapshot = self._frozen_http_write_snapshot(instance, operation.operation_name)
+            self._validate_http_write_approval(instance, operation, attention, current_snapshot)
+            if attention.expires_at is None or attention.expires_at <= self.store.database_now():
+                raise DynamicTaskAgentError("DYNAMIC_TOOL_APPROVAL_FINGERPRINT_INVALID")
+            if actor_user_id not in self._workspace_approver_ids(
+                instance.tenant_id, exclude_user_id=instance.initiator_user_id,
+            ):
+                raise DynamicTaskAgentError("DYNAMIC_LOCAL_APPROVER_DENIED")
+            self.catalog.reauthorize_tool(
+                current_snapshot, actor_user_id=instance.initiator_user_id,
+                organization_unit_id=None,
+            )
+            self.store.authorize_operation_skill_causes(operation)
+
+        if external_http_write:
+            authorize_http_dispatch()
+            self.db.commit()
         try:
             result = self.tool_executor.execute(
                 instance.tenant_id,
@@ -4453,26 +4736,41 @@ class DynamicTaskAgent:
                 actor_user_id=instance.initiator_user_id,
                 remote_idempotency_key=operation.remote_idempotency_key,
                 execution_id=instance.id,
+                **({"before_http_dispatch": authorize_http_dispatch}
+                   if external_http_write else {}),
             )
-        except Exception:
-            if operation.effect_kind == "destructive":
+        except Exception as exc:
+            if external_http_write and isinstance(
+                exc, (SopExecutionConflictError, CapabilityAccessDenied, DynamicTaskAgentError),
+            ):
+                raise
+            if operation.effect_kind in {"destructive", "external_write"}:
                 return self._park_unknown_effect(
                     instance=instance,
                     step=step,
                     operation=operation,
                     worker_id=worker_id,
-                    error_code="DYNAMIC_DESTRUCTIVE_DISPATCH_UNKNOWN",
+                    error_code=("DYNAMIC_HTTP_WRITE_DISPATCH_UNKNOWN" if external_http_write
+                                else "DYNAMIC_DESTRUCTIVE_DISPATCH_UNKNOWN"),
                     signal=signal,
                     control=control,
                 )
             raise
+        if operation.effect_kind in {"destructive", "external_write"} and result.disposition == "unknown":
+            return self._park_unknown_effect(
+                instance=instance, step=step, operation=operation, worker_id=worker_id,
+                error_code=(result.error.code if result.error else "DYNAMIC_WRITE_EFFECT_UNKNOWN"),
+                signal=signal, control=control,
+            )
         if (
-            operation.effect_kind == "destructive"
+            operation.effect_kind in {"destructive", "external_write"}
             and not result.success
             and result.error is not None
-            and self._is_ambiguous_tool_failure(
-                result.error.code,
-                result.error.message,
+            and (
+                (external_http_write and result.error.code in {
+                    "HTTP_ERROR", "PROVIDER_TASK_ID_MISSING", "PROVIDER_RESPONSE_INVALID",
+                })
+                or self._is_ambiguous_tool_failure(result.error.code, result.error.message)
             )
         ):
             return self._park_unknown_effect(
@@ -4485,6 +4783,27 @@ class DynamicTaskAgent:
                 control=control,
             )
         with self.store.owned(instance, worker_id=worker_id):
+            if external_http_write and result.disposition == "accepted":
+                receipt = result.data if isinstance(result.data, Mapping) else {}
+                contract = snapshot.contract
+                provider_task_id = str(receipt.get("provider_task_id") or "").strip()
+                status_url = str(contract.get("status_url") or "").strip()
+                if not provider_task_id or not status_url:
+                    return self._park_unknown_effect(
+                        instance=instance, step=step, operation=operation,
+                        worker_id=worker_id, error_code="PROVIDER_TASK_RECEIPT_INVALID",
+                        signal=signal, control=control,
+                    )
+                self.store.mark_operation_waiting_external(
+                    operation, provider_task_id=provider_task_id,
+                    provider_status=str(receipt.get("provider_status") or "accepted"),
+                    receipt=receipt, status_url=status_url,
+                    tracking_seconds=int(contract.get("max_tracking_seconds") or 86400),
+                    poll_interval_seconds=int(contract.get("poll_interval_seconds") or 5),
+                )
+                control.consume_signal(instance, signal, worker_id=worker_id)
+                self.db.commit()
+                return DynamicRunOutcome("waiting", instance.id, blocking_step_key=step.step_key)
             self.store.finish_operation(
                 operation,
                 succeeded=result.success,
@@ -4789,6 +5108,12 @@ class DynamicTaskAgent:
                     "target_checksum": contract.get("target_checksum"),
                     "destructive_provider": contract.get("destructive_provider"),
                 }
+            elif operation.capability_snapshot_json.get("capability_type") == "tool":
+                data = {
+                    "effect_status": "manually_confirmed",
+                    "operation_id": operation.id,
+                    "external_reference": operation.external_reference or "",
+                }
             else:
                 data = {
                     "delivery_status": "manually_confirmed",
@@ -4876,7 +5201,11 @@ class DynamicTaskAgent:
         with self.store.owned(instance, worker_id=worker_id):
             self.store.mark_operation_unknown(operation, error={"code": error_code})
             is_destructive = operation.effect_kind == "destructive"
-            if is_destructive:
+            is_http_write = (
+                operation.capability_snapshot_json.get("capability_type") == "tool"
+                and operation.effect_kind == "external_write"
+            )
+            if is_destructive or is_http_write:
                 manager_ids = self._workspace_approver_ids(
                     instance.tenant_id,
                     exclude_user_id=instance.initiator_user_id,
@@ -4901,11 +5230,15 @@ class DynamicTaskAgent:
             title = (
                 "核对 destructive 隔离 provider 是否已经生效"
                 if is_destructive
+                else "核对HTTP工具外部操作是否已经生效"
+                if is_http_write
                 else "核对企业微信消息是否送达"
             )
             instruction = (
                 "请依据隔离 provider 的目标状态确认是否已生效；系统不会自动重发。"
                 if is_destructive
+                else "请依据外部业务系统的实际回执确认是否已生效；系统不会自动重发。"
+                if is_http_write
                 else "请依据企业微信后台或客户端证据确认是否已送达；系统不会自动重发。"
             )
             payload: dict[str, object] = {
@@ -5255,6 +5588,18 @@ class DynamicTaskAgent:
                             success_criteria=current_plan.success_criteria,
                             capabilities=frozen_capabilities,
                             loaded_guidance=planning_guidance,
+                            **(
+                                {
+                                    "time_context": normalize_persisted_time_context(
+                                        (instance.context_json or {}).get("time_context")
+                                    )
+                                }
+                                if normalize_persisted_time_context(
+                                    (instance.context_json or {}).get("time_context")
+                                )
+                                is not None
+                                else {}
+                            ),
                         )
                         proposed_plan = proposed_plan.model_copy(
                             update={"budget": dict(current_plan.budget)}
@@ -5798,11 +6143,25 @@ class DynamicTaskAgent:
             return None
         self._consume_call_budget(instance, "model_calls")
         self.db.commit()
-        selection = selector(
-            goal=plan.goal,
-            success_criteria=plan.success_criteria,
-            catalog=catalog,
+        persisted_time_context = normalize_persisted_time_context(
+            (instance.context_json or {}).get("time_context")
         )
+        selector_kwargs: dict[str, object] = {
+            "goal": plan.goal,
+            "success_criteria": plan.success_criteria,
+            "catalog": catalog,
+        }
+        if persisted_time_context is not None:
+            selector_kwargs["time_context"] = persisted_time_context
+        try:
+            selection = selector(**selector_kwargs)
+        except TypeError as exc:
+            if "time_context" not in str(exc) or "time_context" not in selector_kwargs:
+                raise
+            # 旧扩展 selector 仍可运行，但真实 DynamicTaskPlanner 已接收该合同；
+            # 兼容回退不改变生产路径的时间事实，只避免替身签名阻断恢复测试。
+            selector_kwargs.pop("time_context", None)
+            selection = selector(**selector_kwargs)
         by_name = {row.name: row for row in catalog}
         selected = next(
             (
@@ -6001,6 +6360,10 @@ class DynamicTaskAgent:
                 model_config,
             )
             result_payload = response.model_dump(mode="json")
+            result_payload["knowledge_base_ids"] = [str(item["id"]) for item in cards]
+            result_payload["knowledge_base_version_ids"] = [
+                str(item["version_id"]) for item in cards
+            ]
             self.store.finish_operation(operation, succeeded=True, result={"data": result_payload})
             self.store.complete_node(instance, step, output={"data": result_payload})
             self.db.commit()
@@ -6031,6 +6394,7 @@ class DynamicTaskAgent:
         vertical_ability_resolution: VerticalAbilityResolution | None = None,
         memory_context: Sequence[Mapping[str, object]] = (),
         conversation_context: Mapping[str, object] | None = None,
+        time_context: Mapping[str, object] | None = None,
         continuation_of_execution_id: str | None = None,
     ) -> tuple[SopInstance, bool]:
         """经模型存在性、实时能力目录和有界规划创建或复用统一动态 Execution。
@@ -6042,6 +6406,20 @@ class DynamicTaskAgent:
         continuation_parent: SopInstance | None = None
         continuation_metadata: dict[str, object] = {}
         conversation_projection = self._conversation_context_projection(conversation_context)
+        persisted_time_context = normalize_persisted_time_context(
+            time_context
+            or (
+                conversation_context.get("time_context")
+                if isinstance(conversation_context, Mapping)
+                else None
+            )
+            or (
+                conversation_context.get("metadata", {}).get("time_context")
+                if isinstance(conversation_context, Mapping)
+                and isinstance(conversation_context.get("metadata"), Mapping)
+                else None
+            )
+        )
         if continuation_of_execution_id:
             continuation_parent = self.db.get(SopInstance, continuation_of_execution_id)
             if (
@@ -6167,7 +6545,19 @@ class DynamicTaskAgent:
         )
         if len(requested_forced_ids) > 8:
             raise DynamicTaskAgentError("GENERAL_SKILL_SELECTION_LIMIT_EXCEEDED")
-        memory_projection = self._memory_projection(planning_memory_context)
+        memory_service = MemoryService(self.db)
+        candidates = memory_service.projection_candidates(tenant_id, initiator_user_id, agent_id=agent_id)
+        echoes = memory_service.projection_echo_candidates(
+            tenant_id, initiator_user_id, agent_id=agent_id,
+            echoes=list(self._conversation_memory_projection(conversation_projection)),
+        )
+        validator = memory_service.projection_validator(tenant_id, initiator_user_id, agent_id=agent_id)
+        memory_envelope = MemoryRequestEnvelope(
+            (*candidates, *echoes), goal, MemoryProjectionPolicy(max_items=20, max_fact_characters=4000),
+            validate=validator,
+            source_input_id=source_ref or "",
+        )
+        memory_projection = MemoryContext(self._memory_projection(planning_memory_context), memory_envelope)
         resources: list[ManagedInputResource] = []
         requested_resource_versions = dict(input_resource_versions or {})
         requested_source_message_ids = dict(input_resource_source_message_ids or {})
@@ -6271,6 +6661,11 @@ class DynamicTaskAgent:
                 goal=goal.strip(),
                 success_criteria=criteria,
                 catalog=guidance_catalog,
+                **(
+                    {"time_context": persisted_time_context}
+                    if persisted_time_context is not None
+                    else {}
+                ),
             )
             selected_by_name = {item.name: item for item in guidance_catalog}
             selected_guidance = [
@@ -6345,6 +6740,11 @@ class DynamicTaskAgent:
                 input_resources=planning_inputs,
                 loaded_guidance=tuple(loaded_guidance),
                 memory_context=memory_projection,
+                **(
+                    {"time_context": persisted_time_context}
+                    if persisted_time_context is not None
+                    else {}
+                ),
             )
         elif memory_projection:
             plan = planner.create_plan(
@@ -6353,6 +6753,11 @@ class DynamicTaskAgent:
                 capabilities=capabilities,
                 input_resources=planning_inputs,
                 memory_context=memory_projection,
+                **(
+                    {"time_context": persisted_time_context}
+                    if persisted_time_context is not None
+                    else {}
+                ),
             )
         else:
             plan = planner.create_plan(
@@ -6360,6 +6765,11 @@ class DynamicTaskAgent:
                 success_criteria=criteria,
                 capabilities=capabilities,
                 input_resources=planning_inputs,
+                **(
+                    {"time_context": persisted_time_context}
+                    if persisted_time_context is not None
+                    else {}
+                ),
             )
         plan = plan.model_copy(update={"budget": budget_profile.snapshot()})
         if any(
@@ -6511,6 +6921,7 @@ class DynamicTaskAgent:
             goal_metadata=continuation_metadata,
             context={
                 "conversation_context": [dict(item) for item in conversation_projection],
+                "time_context": persisted_time_context,
                 "dynamic_chat_continuation": continuation_metadata,
                 "vertical_ability_ids": list(
                     vertical_ability_resolution.ability_ids
@@ -6549,6 +6960,7 @@ class DynamicTaskAgent:
             use.execution_id = instance.id
             use.updated_at = instance.created_at
             self.db.add(use)
+        memory_envelope = getattr(planner, "last_memory_envelope", memory_envelope)
         instance.context_json = {
             **(instance.context_json or {}),
             "dynamic_budget_usage": {
@@ -6558,7 +6970,10 @@ class DynamicTaskAgent:
                 "output_tokens": 0,
                 "total_tokens": 0,
             },
-            "memory_context": list(memory_projection),
+            "memory_context": ([item.provider_payload() for item in memory_envelope.selected]
+                               if memory_envelope.selected is not None else list(memory_projection)),
+            "memory_projection": memory_envelope.snapshot(),
+            "time_context": persisted_time_context,
             "forced_general_skill_ids": list(requested_forced_ids),
         }
         self.db.add(instance)
@@ -6616,25 +7031,15 @@ class DynamicTaskAgent:
         """以有界白名单冻结用户/Agent 记忆，剥离身份、凭据和存储侧带。"""
 
         projected: list[dict[str, object]] = []
-        blocked_keys = {"token", "secret", "password", "authorization", "api_key"}
-        for raw in memory_context[:20]:
-            content = str(raw.get("content") or "").strip()
-            if not content:
+        for raw in memory_context:
+            content = str(raw.get("content") or "")
+            if not content.strip() or len(content) > 4000:
                 continue
-            metadata = raw.get("metadata")
-            safe_metadata = {
-                str(key): value
-                for key, value in (metadata.items() if isinstance(metadata, Mapping) else ())
-                if str(key).casefold() not in blocked_keys
-                and (value is None or isinstance(value, (str, bool, int, float)))
-            }
-            projected.append(
-                {
-                    "kind": str(raw.get("kind") or "fact")[:64],
-                    "content": content[:4000],
-                    "metadata": safe_metadata,
-                }
-            )
+            projected.append({"kind": str(raw.get("kind") or "fact")[:64],
+                              "content": content,
+                              "metadata": safe_memory_metadata(raw.get("metadata"))})
+            if len(projected) == 20:
+                break
         return tuple(projected)
 
     @staticmethod
@@ -6644,7 +7049,7 @@ class DynamicTaskAgent:
         agent_id: str,
         capability: dict[str, object],
     ) -> CapabilitySnapshot | None:
-        """把入口已计算的成员/Agent 知识交集冻结为只读能力，不包含正文。"""
+        """冻结入口的成员/Agent知识交集与证据输出白名单，能力卡片不含正文。"""
 
         cards = capability.get("knowledge_bases")
         if capability.get("available") is not True or not isinstance(cards, list) or not cards:
@@ -6672,7 +7077,8 @@ class DynamicTaskAgent:
                 "side_effect": "none",
                 "required_for_answer": capability.get("required") is True,
             },
-            "model_view": {"name": "knowledge.search", "knowledge_bases": safe_cards},
+            "model_view": {"name": "knowledge.search", "knowledge_bases": safe_cards,
+                           "output_schema": knowledge_result_output_schema()},
             "user_view": {"name": "企业知识检索", "knowledge_base_count": len(safe_cards)},
             "audit_view": {"knowledge_bases": safe_cards},
         }
@@ -7650,8 +8056,9 @@ class DynamicTaskAgent:
         signal_worker_id: str | None = None,
         expected_plan_revision_id: str | None = None,
         user_message_id: str | None = None,
+        memory_model_config_id: str | None = None,
     ) -> Message:
-        """逐项验证最终结果，并原子写消息、publication 与 Execution 成功终态。"""
+        """逐项验证结果，原子写消息、原轮事实快照、publication、记忆任务和成功终态。"""
 
         instance = self.db.get(SopInstance, execution_id)
         if instance is None or instance.kind != "dynamic_task":
@@ -7838,6 +8245,7 @@ class DynamicTaskAgent:
                 )
             self.db.commit()
             raise rejected_error
+        memory_capture_registration = None
         with (
             self._cancellation_boundary(instance, worker_id=worker_id),
             self.store.owned(instance, worker_id=worker_id), self.db.begin_nested(),
@@ -8045,6 +8453,9 @@ class DynamicTaskAgent:
                 "result_checksum": result_row.checksum,
                 "artifact_ids": [item.id for item in artifacts],
             }
+            knowledge_citations = self._verified_result_knowledge_citations(instance, plan, result)
+            if knowledge_citations:
+                message_metadata["knowledge_citations"] = knowledge_citations
             render_policy = self._render_policy_for_verified_result(instance, verification)
             if render_policy is not None:
                 message_metadata["render_policy"] = render_policy
@@ -8057,6 +8468,7 @@ class DynamicTaskAgent:
                 )
             if self._client_turn_id:
                 message_metadata["client_turn_id"] = self._client_turn_id
+            session = self.db.get(ChatSession, instance.session_id)
             message = Message(
                 tenant_id=instance.tenant_id,
                 session_id=instance.session_id,
@@ -8072,7 +8484,6 @@ class DynamicTaskAgent:
                 message_id=message.id,
             )
             self.store.consume_result_proposal(instance, proposal)
-            session = self.db.get(ChatSession, instance.session_id)
             if session is not None and session.tenant_id == instance.tenant_id:
                 session.status = "active"
                 session.summary = f"最近回复：{result.markdown[:120]}"
@@ -8085,6 +8496,8 @@ class DynamicTaskAgent:
                 "result_id": result_row.id,
                 "artifact_ids": [item.id for item in artifacts],
             }
+            if knowledge_citations:
+                assistant_event_payload["knowledge_citations"] = knowledge_citations
             if render_policy is not None:
                 assistant_event_payload["render_policy"] = render_policy
             if user_message_id:
@@ -8157,8 +8570,94 @@ class DynamicTaskAgent:
                     )
             else:
                 self.store.wait_for_publication(instance)
+            if user_message_id and session is not None and session.tenant_id == instance.tenant_id:
+                from app.feedback.source import freeze_execution_source
+
+                message.metadata_json = {
+                    **message_metadata,
+                    "feedback_source": freeze_execution_source(
+                        self.db, session, user_message_id, instance.id,
+                    ),
+                }
+                self.db.add(message)
+            effective_turn_id = str(user_message_id or self._turn_id or "").strip()
+            if (
+                instance.source_kind == "chat"
+                and effective_turn_id
+                and memory_model_config_id
+            ):
+                source_message = self.db.get(Message, effective_turn_id)
+                memory_model_config = self.db.get(ModelConfig, memory_model_config_id)
+                session_for_memory = self.db.get(ChatSession, instance.session_id)
+                if (
+                    source_message is not None
+                    and memory_model_config is not None
+                    and memory_model_config.tenant_id == instance.tenant_id
+                    and session_for_memory is not None
+                ):
+                    memory_request = ChatTurnRequest(
+                        tenant_id=instance.tenant_id,
+                        session_id=instance.session_id,
+                        agent_id=instance.agent_id,
+                        user_id=instance.initiator_user_id or session_for_memory.user_id,
+                        client_turn_id=self._client_turn_id,
+                        message=source_message.content,
+                    )
+                    memory_capture_registration = register_memory_capture_job(
+                        self.db,
+                        memory_request,
+                        session_for_memory,
+                        memory_model_config,
+                        user_message_id=effective_turn_id,
+                        assistant_message_id=message.id,
+                        events=self.events,
+                    )
         self.db.commit()
+        if memory_capture_registration is not None and memory_capture_registration.created:
+            wake_memory_capture_job(memory_capture_registration.job.id)
         return message
+
+    def _verified_result_knowledge_citations(
+        self,
+        instance: SopInstance,
+        plan: NormalizedPlan,
+        result: DynamicTaskResult,
+    ) -> list[dict[str, object]]:
+        """仅从最终成果使用的本计划成功知识步骤提取充分证据，不借会话历史。
+
+        共用原物理身份引用提取器，原Operation、成果Markdown及冻结校验和保持原值。
+        """
+        used_keys = {key for refs in result.criterion_evidence.values() for key in refs}
+        node_ids = []
+        for definition in plan.steps:
+            if definition.kind != "knowledge" or definition.step_key not in used_keys:
+                continue
+            node = self._step(instance, definition.step_key)
+            if node is not None and node.status == "succeeded" and node.step_kind == "knowledge":
+                node_ids.append(node.id)
+        if not node_ids:
+            return []
+        operations = self.db.exec(
+            select(SopOperation)
+            .where(
+                SopOperation.tenant_id == instance.tenant_id,
+                SopOperation.instance_id == instance.id,
+                SopOperation.node_execution_id.in_(node_ids),
+                SopOperation.operation_name == "knowledge.search",
+                SopOperation.status == "succeeded",
+            )
+            .order_by(SopOperation.created_at, SopOperation.id)
+        ).all()
+        results = []
+        for operation in operations:
+            data = (operation.result_json or {}).get("data")
+            if not isinstance(data, dict) or data.get("outcome") != "evidence_found":
+                continue
+            sufficiency = data.get("evidence_sufficiency")
+            if not isinstance(sufficiency, dict) or sufficiency.get("satisfied") is not True:
+                continue
+            results.append(data)
+        return knowledge_citations_from_results(results)
 
     def _register_expected_artifacts(
         self,
@@ -8326,6 +8825,78 @@ class DynamicTaskAgent:
                 raise DynamicTaskAgentError("DYNAMIC_WRITE_CAPABILITY_INVALID")
             return snapshot
         raise DynamicTaskAgentError("DYNAMIC_WRITE_CAPABILITY_NOT_FROZEN")
+
+    def _frozen_http_write_snapshot(
+        self,
+        instance: SopInstance,
+        capability_ref: str,
+    ) -> CapabilitySnapshot:
+        """解析精确已冻结HTTP写；限制原灰度、单次批准及请求幂等，不借用连接器合同。"""
+        if not get_settings().dynamic_task_high_risk_external_write_allows(
+            instance.tenant_id, instance.agent_id,
+        ):
+            raise DynamicTaskAgentError("DYNAMIC_EXTERNAL_WRITE_DISABLED")
+        tools = (instance.capability_snapshot_json or {}).get("tools")
+        if not isinstance(tools, list):
+            raise DynamicTaskAgentError("DYNAMIC_CAPABILITY_SNAPSHOT_INVALID")
+        matches = [item for item in tools
+                   if isinstance(item, Mapping) and item.get("name") == capability_ref]
+        if len(matches) != 1:
+            raise DynamicTaskAgentError("DYNAMIC_WRITE_CAPABILITY_NOT_FROZEN")
+        try:
+            snapshot = CapabilitySnapshot.model_validate(matches[0])
+        except ValueError as exc:
+            raise DynamicTaskAgentError("DYNAMIC_CAPABILITY_SNAPSHOT_INVALID") from exc
+        contract = snapshot.contract
+        idempotency = contract.get("idempotency")
+        if (
+            snapshot.capability_type != "tool"
+            or snapshot.tenant_id != instance.tenant_id
+            or snapshot.agent_id != instance.agent_id
+            or contract.get("risk_class") != "external_write"
+            or contract.get("side_effect") != "external"
+            or contract.get("dynamic_task_enabled") is not True
+            or contract.get("confirmation_policy") != "once"
+            or contract.get("timeout_policy") != "unknown"
+            or not isinstance(idempotency, Mapping)
+            or idempotency.get("mode") != "request_key"
+            or snapshot.audit_view.get("tool_type") != "http"
+            or str(snapshot.audit_view.get("method") or "").upper()
+            not in {"POST", "PUT", "PATCH", "DELETE"}
+            or capability_checksum(
+                snapshot.model_dump(mode="json", exclude={"checksum", "agent_id"})
+            ) != snapshot.checksum
+        ):
+            raise DynamicTaskAgentError("DYNAMIC_HTTP_WRITE_CAPABILITY_INVALID")
+        return snapshot
+
+    @staticmethod
+    def _validate_http_write_approval(
+        instance: SopInstance,
+        operation: SopOperation,
+        attention: SopWorkItem,
+        snapshot: CapabilitySnapshot,
+    ) -> None:
+        """比较原批准、Operation实际参数及冻结能力，拒绝提交间隙的正文或身份漂移。"""
+        payload = dict(attention.payload_json or {})
+        fingerprint = str(payload.pop("approval_fingerprint", ""))
+        if (
+            not fingerprint
+            or capability_checksum(payload) != fingerprint
+            or payload.get("execution_id") != instance.id
+            or payload.get("operation_id") != operation.id
+            or payload.get("operation_name") != operation.operation_name
+            or payload.get("plan_revision_id") != instance.current_plan_revision_id
+            or payload.get("arguments") != operation.request_json
+            or payload.get("request_fingerprint") != operation.request_fingerprint
+            or SopExecutionStore.request_fingerprint(operation.request_json)
+            != operation.request_fingerprint
+            or payload.get("capability_checksum") != snapshot.checksum
+            or operation.capability_checksum != snapshot.checksum
+            or operation.capability_snapshot_json
+            != snapshot.model_dump(mode="json", exclude={"checksum", "agent_id"})
+        ):
+            raise DynamicTaskAgentError("DYNAMIC_TOOL_APPROVAL_FINGERPRINT_INVALID")
 
     def _frozen_local_snapshot(
         self,
@@ -8549,10 +9120,12 @@ class DynamicTaskAgent:
         snapshot: CapabilitySnapshot,
         *,
         actor_user_id: str,
+        db: Session | None = None,
     ) -> None:
-        """在每次检索前重算成员与 Agent 知识交集，并拒绝版本撤权或漂移。"""
+        """重算当前成员与Agent的精确分支版本；SDK披露使用独立当前会话。"""
 
-        actor = self.db.get(User, actor_user_id)
+        current_db = db if db is not None else self.db
+        actor = current_db.get(User, actor_user_id)
         if (
             actor is None
             or actor.tenant_id != instance.tenant_id
@@ -8561,21 +9134,206 @@ class DynamicTaskAgent:
         ):
             raise DynamicTaskAgentError("DYNAMIC_KNOWLEDGE_ACTOR_DENIED")
         resolution = resolve_knowledge_access(
-            self.db,
+            current_db,
             tenant_id=instance.tenant_id,
             current_user=actor,
             agent_id=instance.agent_id,
         )
-        current_versions = accessible_knowledge_base_versions(self.db, resolution=resolution)
-        current_ids = {version.id for version in current_versions.values()}
+        current_versions = accessible_knowledge_base_versions(current_db, resolution=resolution)
         cards = snapshot.model_view.get("knowledge_bases")
-        frozen_ids = {
-            str(item.get("version_id"))
-            for item in cards or []
-            if isinstance(item, dict) and item.get("version_id")
-        }
-        if not frozen_ids or not frozen_ids <= current_ids:
+        if not isinstance(cards, list) or not cards:
             raise DynamicTaskAgentError("DYNAMIC_KNOWLEDGE_ACCESS_CHANGED")
+        frozen_versions: dict[str, str] = {}
+        for item in cards:
+            if not isinstance(item, dict):
+                raise DynamicTaskAgentError("DYNAMIC_KNOWLEDGE_ACCESS_CHANGED")
+            knowledge_base_id = str(item.get("id") or "")
+            version_id = str(item.get("version_id") or "")
+            if not knowledge_base_id or not version_id or knowledge_base_id in frozen_versions:
+                raise DynamicTaskAgentError("DYNAMIC_KNOWLEDGE_ACCESS_CHANGED")
+            frozen_versions[knowledge_base_id] = version_id
+        for knowledge_base_id, frozen_version_id in frozen_versions.items():
+            current_version = current_versions.get(knowledge_base_id)
+            if (
+                current_version is None
+                or current_version.tenant_id != instance.tenant_id
+                or current_version.knowledge_base_id != knowledge_base_id
+                or current_version.publication_state != "published"
+                or current_version.id != frozen_version_id
+            ):
+                raise DynamicTaskAgentError("DYNAMIC_KNOWLEDGE_ACCESS_CHANGED")
+
+    def _revocation_safe_execution_references(
+        self,
+        instance: SopInstance,
+        *,
+        step: PlanStep,
+        completed_steps: Sequence[Mapping[str, object]],
+        envelope: MemoryRequestEnvelope,
+    ) -> dict[str, dict[str, str]]:
+        """撤权时只保留直接前序外部Operation合同声明且当前写入必需的非记忆引用。"""
+
+        if step.kind not in {"tool.write", "tool.execute", "tool.destructive"}:
+            return {}
+        if len(step.capability_refs) != 1:
+            return {}
+        raw_tools = (instance.capability_snapshot_json or {}).get("tools")
+        if not isinstance(raw_tools, list):
+            return {}
+        matches = [item for item in raw_tools
+                   if isinstance(item, Mapping) and item.get("name") == step.capability_refs[0]]
+        if len(matches) != 1:
+            return {}
+        try:
+            current_capability = CapabilitySnapshot.model_validate(matches[0])
+        except ValueError:
+            return {}
+        if (
+            current_capability.capability_type != "tool"
+            or current_capability.tenant_id != instance.tenant_id
+            or current_capability.agent_id != instance.agent_id
+            or current_capability.contract.get("risk_class") != "external_write"
+        ):
+            return {}
+        input_schema = current_capability.model_view.get("input_schema")
+        input_properties = input_schema.get("properties") if isinstance(input_schema, Mapping) else None
+        required_inputs = input_schema.get("required") if isinstance(input_schema, Mapping) else None
+        if not isinstance(input_properties, Mapping) or not isinstance(required_inputs, list):
+            return {}
+        required_reference_fields = {
+            str(name)
+            for name in required_inputs
+            if isinstance(name, str)
+            and re.search(r"(?:_id|_key|_ref|_reference|_receipt)$", name.casefold())
+            and isinstance(input_properties.get(name), Mapping)
+            and input_properties[name].get("type") == "string"
+        }
+        if not required_reference_fields:
+            return {}
+
+        completed_by_key = {
+            str(row.get("step_key") or ""): row
+            for row in completed_steps
+            if isinstance(row, Mapping) and str(row.get("step_key") or "") in step.depends_on
+        }
+        if not completed_by_key:
+            return {}
+        node_ids = {
+            str(reference.get("node_execution_id") or "")
+            for row in completed_by_key.values()
+            if isinstance((reference := row.get("output_ref")), Mapping)
+            and str(reference.get("node_execution_id") or "")
+        }
+        if not node_ids:
+            return {}
+        operations = self.db.exec(
+            select(SopOperation).where(
+                SopOperation.tenant_id == instance.tenant_id,
+                SopOperation.instance_id == instance.id,
+                SopOperation.node_execution_id.in_(node_ids),
+                SopOperation.status == "succeeded",
+                SopOperation.effect_kind == "external_write",
+            )
+        ).all()
+        operations_by_node: dict[str, list[SopOperation]] = {}
+        for operation in operations:
+            operations_by_node.setdefault(operation.node_execution_id, []).append(operation)
+
+        selected_memory = envelope.selected if envelope.selected is not None else envelope.candidates
+        memory_contents = [candidate.content for candidate in selected_memory]
+        safe_references: dict[str, dict[str, str]] = {}
+        for step_key, completed in completed_by_key.items():
+            output_ref = completed.get("output_ref")
+            if not isinstance(output_ref, Mapping):
+                continue
+            node_id = str(output_ref.get("node_execution_id") or "")
+            node_operations = operations_by_node.get(node_id, [])
+            if len(node_operations) != 1:
+                continue
+            operation = node_operations[0]
+            source_matches = [item for item in raw_tools
+                              if isinstance(item, Mapping)
+                              and item.get("name") == operation.operation_name]
+            if len(source_matches) != 1:
+                continue
+            try:
+                source_capability = CapabilitySnapshot.model_validate(source_matches[0])
+            except ValueError:
+                continue
+            if (
+                source_capability.capability_type != "tool"
+                or source_capability.tenant_id != instance.tenant_id
+                or source_capability.agent_id != instance.agent_id
+                or source_capability.contract.get("risk_class") != "external_write"
+                or operation.capability_checksum != source_capability.checksum
+            ):
+                continue
+            operation_snapshot = operation.capability_snapshot_json or {}
+            if any(operation_snapshot.get(key) != getattr(source_capability, key)
+                   for key in ("capability_type", "capability_id", "tenant_id", "name",
+                               "contract", "model_view", "user_view", "audit_view")):
+                continue
+            reconcile = source_capability.contract.get("reconcile")
+            reference_source = reconcile.get("reference_source") if isinstance(reconcile, Mapping) else None
+            if not isinstance(reconcile, Mapping) or reconcile.get("supported") is not True:
+                continue
+            if not isinstance(reference_source, str):
+                continue
+            path = reference_source.split(".")
+            if len(path) < 2 or path[0] != "output":
+                continue
+            output_schema = source_capability.model_view.get("output_schema")
+            if not isinstance(output_schema, Mapping) or not schema_path_exists(output_schema, path[1:]):
+                continue
+            reference_field = path[-1]
+            if reference_field not in required_reference_fields:
+                continue
+            if path[1] == "data":
+                value_path = path[2:]
+            else:
+                value_path = path[1:]
+            if not value_path:
+                continue
+            value: object = (operation.result_json or {}).get("data")
+            if path[1] == "data" and isinstance(value, Mapping):
+                value = value.get("data")
+            for part in value_path:
+                value = value.get(part) if isinstance(value, Mapping) else None
+            if (
+                not isinstance(value, str)
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}", value)
+                or any(content and value in content for content in memory_contents)
+            ):
+                continue
+            safe_references[step_key] = {reference_field: value}
+        return safe_references
+
+    def _consumed_knowledge_dispatch_guard(
+        self, instance: SopInstance, *, plan: NormalizedPlan,
+        completed_steps: Sequence[Mapping[str, object]],
+    ) -> Callable[[], None] | None:
+        """已完成检索随provider视图再次披露时复用原授权合同；重试和返回后同样检查。"""
+        completed_keys = {row.get("step_key") for row in completed_steps}
+        if not any(step.kind == "knowledge" and step.step_key in completed_keys
+                   for step in plan.steps):
+            return None
+        snapshot = self._frozen_knowledge_snapshot(instance)
+        engine = self.db.get_bind()
+        memory_database = (engine.dialect.name == "sqlite"
+                           and getattr(getattr(engine, "url", None), "database", None)
+                           in {None, "", ":memory:"})
+
+        def check() -> None:
+            """短独立读事务看到MySQL已提交撤权；内存SQLite不关闭共享外层连接。"""
+            if memory_database:
+                self._reauthorize_knowledge(instance, snapshot,
+                    actor_user_id=instance.initiator_user_id)
+            else:
+                with Session(engine) as probe_db:
+                    self._reauthorize_knowledge(instance, snapshot,
+                        actor_user_id=instance.initiator_user_id, db=probe_db)
+
+        return check
 
     def _required_result_evidence(
         self,
@@ -9085,7 +9843,7 @@ class DynamicTaskAgent:
         repair_feedback: Mapping[str, object] | None = None,
         reserved_read_urls: Sequence[str] = (),
     ) -> CompletedProviderProposal:
-        """从机械事实生成单步提案，并仅在终态校验失败后携带有界修复事实。"""
+        """机械事实生成单步提案；已消费知识每SDK/返回后重授权，终态修复保持有界。"""
 
         verified_model = self.catalog.require_dynamic_model(instance.tenant_id, model_config.id)
         with (
@@ -9279,18 +10037,48 @@ class DynamicTaskAgent:
                 model_capabilities=capabilities,
                 native_input_parts=proposal_native_parts,
             )
+            snapshot = ((instance.context_json or {}).get("memory_projection_active")
+                        or (instance.context_json or {}).get("memory_projection"))
+            memory_envelope = None
+            if isinstance(snapshot, dict):
+                memory_envelope = MemoryRequestEnvelope.restore(
+                    snapshot, validate=MemoryService(self.db).projection_validator(
+                        instance.tenant_id, instance.initiator_user_id, agent_id=instance.agent_id,
+                    ),
+                )
+            else:
+                # 旧执行没有来源代数，正文存在不能证明当前仍可披露；只保留领域上下文。
+                memory_envelope = MemoryRequestEnvelope(
+                    (), "", policy=MemoryProjectionPolicy(max_items=20, max_fact_characters=4000),
+                    selected=(),
+                )
+            memory_envelope.revoked_execution_references = (
+                self._revocation_safe_execution_references(
+                    instance,
+                    step=step,
+                    completed_steps=projection.completed_steps,
+                    envelope=memory_envelope,
+                )
+            )
+            view._memory_envelope = memory_envelope
             cancellation = self._execution_cancel_probe(instance, cancellation_only=True)
+            knowledge_guard = self._consumed_knowledge_dispatch_guard(
+                instance, plan=plan, completed_steps=projection.completed_steps,
+            )
             proposer = self.action_proposer or DynamicActionProposer(
                 LLMClient(
                     verified_model,
                     timeout_seconds=self._stage_timeout_seconds(
                         instance, "max_model_call_seconds"
                     ),
+                    dispatch_observer=knowledge_guard,
                 ),
                 is_cancelled=cancellation,
             )
             try:
                 raise_if_cancelled(cancellation)
+                if knowledge_guard is not None:
+                    knowledge_guard()
                 with self._model_lease_heartbeat(lease):
                     operation_name = (
                         "dynamic_task.answer"
@@ -9307,6 +10095,15 @@ class DynamicTaskAgent:
                     )
                     with llm_operation(operation_name):
                         completed = proposer.propose(view=view, step=step)
+                    if knowledge_guard is not None:
+                        knowledge_guard()
+                    if memory_envelope is not None and memory_envelope.audits:
+                        context = dict(instance.context_json or {})
+                        audits = list(context.get("memory_projection_derivations", []))
+                        context["memory_projection_derivations"] = [*audits, *memory_envelope.audits][-64:]
+                        context["memory_projection_active"] = memory_envelope.snapshot()
+                        instance.context_json = context
+                        self.db.add(instance)
                     if step.kind == "tool.read":
                         if len(step_capability_views) != 1:
                             raise ValueError("read 步骤必须只有一个当前能力视图")
@@ -9333,10 +10130,23 @@ class DynamicTaskAgent:
                 if dispatch_group is not None:
                     gateway.settle_delivered(dispatch_group)
                 raise
-            except Exception:
+            except Exception as exc:
                 if dispatch_group is not None:
                     gateway.mark_unknown(dispatch_group)
                     self.db.commit()
+                cause = exc.__cause__
+                knowledge_error = (exc if isinstance(exc, DynamicTaskAgentError) else
+                                   cause if isinstance(exc, LLMError)
+                                   and isinstance(cause, DynamicTaskAgentError) else None)
+                if knowledge_error is not None and str(knowledge_error) in {
+                    "DYNAMIC_KNOWLEDGE_ACCESS_CHANGED", "DYNAMIC_KNOWLEDGE_ACTOR_DENIED",
+                }:
+                    # 模型租约已在发送前提交；稳定拒绝须提交同token释放，不能被worker
+                    # 回滚恢复为长租约，导致原Signal已消费后的失败收敛无法取得所有权。
+                    self.store.release(lease)
+                    self.db.commit()
+                    if knowledge_error is not exc:
+                        raise DynamicTaskAgentError(str(knowledge_error)) from exc
                 raise
             # DeepSeek 等 provider 偶尔会在修复轮再次省略诊断正文的三条可证伪
             # 假设。这里仅补入不声称已验证事实的最小方法骨架；根因、回执和

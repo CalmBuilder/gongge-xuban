@@ -229,6 +229,12 @@ def test_resident_worker_dispatches_dynamic_signals_without_inline_execution(mon
     signal = SimpleNamespace(id="signal_schedule")
     submitted: list[str] = []
     inline: list[str] = []
+    monkeypatch.setattr(scheduled_worker, "due_sop_external_task_signals", lambda _db: [])
+    monkeypatch.setattr(
+        scheduled_worker,
+        "process_sop_external_task_signal",
+        lambda _db, _signal: None,
+    )
     monkeypatch.setattr(scheduled_worker, "due_dynamic_task_signals", lambda _db: [signal])
     monkeypatch.setattr(
         scheduled_worker,

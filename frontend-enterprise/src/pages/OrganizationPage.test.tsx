@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, expect, it, vi } from 'vitest';
 
@@ -300,4 +300,46 @@ it('keeps organization and member facts when leader history fails', async () => 
 
   expect(await screen.findByRole('treeitem', { name: /财务部/ })).toBeVisible();
   expect(screen.getByText('当前组织成员')).toBeVisible();
+});
+
+it('认证身份补齐后重新初始化组织树，避免匿名首轮请求污染结果', async () => {
+  const view = render(
+    <I18nProvider>
+      <EnterpriseContextProvider
+        value={{
+          tenant: { id: 'tenant_a', name: '企业甲' },
+          member: administrator,
+          is_administrator: true,
+        }}
+      >
+        <OrganizationPage />
+      </EnterpriseContextProvider>
+    </I18nProvider>,
+  );
+
+  await screen.findByRole('treeitem', { name: /财务部/ });
+  const initialTreeRequests = api.get.mock.calls.filter(([path]) => (
+    typeof path === 'string' && path.startsWith('/api/organization/unit-children?')
+  )).length;
+
+  view.rerender(
+    <I18nProvider>
+      <EnterpriseContextProvider
+        value={{
+          tenant: { id: 'tenant_a', name: '企业甲' },
+          member: administrator,
+          is_administrator: true,
+        }}
+      >
+        <OrganizationPage currentUser={administrator} />
+      </EnterpriseContextProvider>
+    </I18nProvider>,
+  );
+
+  await waitFor(() => {
+    const treeRequests = api.get.mock.calls.filter(([path]) => (
+      typeof path === 'string' && path.startsWith('/api/organization/unit-children?')
+    )).length;
+    expect(treeRequests).toBeGreaterThan(initialTreeRequests);
+  });
 });

@@ -1,5 +1,5 @@
 """
-@Time       : 2026/09/05
+@Time       : 2026/10/04
 @Author     : zhanglp8181
 @File       : agent_loop.py
 @CallChain  : Chat API → AgentLoop → Router/Runtime/Tool/ResponseGenerator → Message/Event
@@ -20,6 +20,7 @@ from time import monotonic, sleep
 from types import SimpleNamespace
 from typing import Any, Literal
 
+from sqlalchemy import or_
 from sqlmodel import Session, select
 
 from app.agents.branching import (
@@ -43,6 +44,10 @@ from app.core.cancellation import (
     raise_if_cancelled,
 )
 from app.core.conversation_context import ConversationContextSettings, build_conversation_context
+from app.core.time_context import (
+    freeze_time_context,
+    normalize_persisted_time_context,
+)
 from app.core.non_sop_capability import (
     LlmDynamicTaskShadowSelector,
     LlmDynamicTaskPrimarySelector,
@@ -124,8 +129,15 @@ from app.observability.turn_event_query import (
     partial_turn_events,
     primary_turn_identity,
 )
-from app.memory.jobs import enqueue_memory_capture
-from app.memory.service import MemoryService, memory_read
+from app.memory.capture import (
+    freeze_memory_model_selection,
+    freeze_memory_source_anchor,
+    memory_source_anchor_is_current,
+    register_memory_capture_job,
+    source_anchor_from_message,
+    wake_memory_capture_job,
+)
+from app.memory.service import MemoryService
 from app.observability import EventLog
 from app.session.attachments import (
     message_content_with_attachment_context,
@@ -143,6 +155,11 @@ from app.session.session_schema import (
 )
 from app.sop_runtime.coordinator import DeterministicSopCoordinator
 from app.sop_runtime.execution_control import ExecutionControlService, canonical_checksum
+from app.sop_runtime.execution_store import (
+    ACTIVE_INSTANCE_STATUSES,
+    SopExecutionConflictError,
+    SopExecutionStore,
+)
 from app.sop_runtime.scheduler import RuntimeAction
 from app.tools import ToolExecutor
 from app.tools.tool_schema import ToolCall, ToolError, ToolResult
@@ -335,7 +352,7 @@ class AgentLoop:
         settings = get_settings()
         self.db = db
         self.events = EventLog(db)
-        self.router = Router()
+        self.router = Router(MemoryService(db))
         self.runtime = SkillRuntime()
         self.step_agent = StepAgent()
         self.reflection_agent = ReflectionAgent()
@@ -402,6 +419,7 @@ class AgentLoop:
         payload: dict[str, object],
         user_message_id: str | None,
         waiting: bool = False,
+        commit: bool = True,
     ) -> None:
         """为同步 Turn 写入唯一成功终态或可继续恢复的等待事实。"""
 
@@ -425,7 +443,8 @@ class AgentLoop:
                 # 终态竞争时，另一个执行者已经完成或取消了本轮；等待投影不应
                 # 把这个正常并发结果重新包装成 Agent Loop 错误。
                 return
-            self.db.commit()
+            if commit:
+                self.db.commit()
             return
         record_terminal_once = getattr(events, "record_terminal_once", None)
         if callable(record_terminal_once):
@@ -443,7 +462,8 @@ class AgentLoop:
                 "complete",
                 {"status": "completed", **event_payload},
             )
-        self.db.commit()
+        if commit:
+            self.db.commit()
 
     def _hydrate_router_decision_from_context(
         self,
@@ -550,6 +570,41 @@ class AgentLoop:
             )
         return protected_decision
 
+    def _frozen_sop_response_slots(self, chat_session: ChatSession) -> dict[str, object] | None:
+        """在回复前读取仍受来源代数保护的 SOP 槽位，拒绝清空后的旧事实回流。"""
+
+        if not chat_session.user_id:
+            return None
+        instance = self.db.exec(
+            select(SopInstance).where(
+                SopInstance.tenant_id == chat_session.tenant_id,
+                SopInstance.session_id == chat_session.id,
+                SopInstance.status.in_(ACTIVE_INSTANCE_STATUSES),
+                SopInstance.kind == "sop",
+            ).order_by(SopInstance.updated_at.desc(), SopInstance.id.desc())
+        ).first()
+        if instance is None or instance.initiator_user_id not in {None, chat_session.user_id}:
+            return None
+        source_message = (
+            self.db.get(Message, instance.source_ref)
+            if instance.source_ref
+            else None
+        )
+        if source_message is None or source_message.tenant_id != chat_session.tenant_id:
+            return None
+        anchor = source_anchor_from_message(source_message)
+        if anchor is None:
+            return None
+        if not memory_source_anchor_is_current(
+            self.db,
+            tenant_id=chat_session.tenant_id,
+            user_id=chat_session.user_id,
+            anchor=anchor,
+        ):
+            return {}
+        slots = instance.slots_json or {}
+        return dict(slots) if isinstance(slots, dict) and slots else None
+
     def _slot_hydration_patch(
         self,
         skill: Skill | None,
@@ -585,7 +640,12 @@ class AgentLoop:
             router_decision.awaiting_input = None
         return remaining
 
-    def handle_turn(self, request: ChatTurnRequest) -> ChatTurnResponse:
+    def handle_turn(
+        self,
+        request: ChatTurnRequest,
+        *,
+        time_context: Mapping[str, Any] | None = None,
+    ) -> ChatTurnResponse:
         router_decision: RouterDecision | None = None
         step_result = StepAgentResult()
         tool_result: ToolResult | None = None
@@ -594,7 +654,13 @@ class AgentLoop:
         prepared_user_message_id: str | None = None
         error_event_payload: dict[str, object] | None = None
         try:
-            prepared = self._prepare_turn(request)
+            # 保留旧的轻量替身/兼容入口签名；真实调用只有在上游已经冻结了
+            # 时间事实时才显式传入新关键字，避免无关调用方被迫同步改造。
+            prepared = (
+                self._prepare_turn(request)
+                if time_context is None
+                else self._prepare_turn(request, time_context=time_context)
+            )
             prepared_user_message_id = prepared.user_message_id
             if prepared.general_response:
                 self._record_sync_turn_boundary(
@@ -829,17 +895,22 @@ class AgentLoop:
                     "session_state": public_session(chat_session).model_dump(mode="json"),
                 },
                 user_message_id=prepared_user_message_id,
+                commit=False,
             )
-        self.db.commit()
-        self.db.refresh(chat_session)
-        if memory_model_config:
-            self._enqueue_memory_capture(
+        memory_capture_refs: list[dict[str, object]] = []
+        if memory_model_config and error_event_payload is None and prepared_user_message_id:
+            memory_capture_refs = self._enqueue_memory_capture(
                 request,
                 chat_session,
                 step_result,
                 tool_result,
                 memory_model_config,
+                user_message_id=prepared_user_message_id,
+                commit=False,
             )
+        self.db.commit()
+        self.db.refresh(chat_session)
+        self._wake_memory_capture_refs(memory_capture_refs)
         return ChatTurnResponse(
             reply=reply,
             session_id=chat_session.id,
@@ -1005,15 +1076,18 @@ class AgentLoop:
             user_message_id=user_message_id,
             client_turn_id=request.client_turn_id,
         )
-        self.db.commit()
-        self.db.refresh(chat_session)
-        self._enqueue_memory_capture(
+        memory_capture_refs = self._enqueue_memory_capture(
             request,
             chat_session,
             step_result,
             tool_result,
             model_config,
+            user_message_id=user_message_id,
+            commit=False,
         )
+        self.db.commit()
+        self.db.refresh(chat_session)
+        self._wake_memory_capture_refs(memory_capture_refs)
         return ChatTurnResponse(
             reply=reply,
             session_id=chat_session.id,
@@ -1189,18 +1263,28 @@ class AgentLoop:
         if streaming:
             # 流式指导分支由调用方在同一事务中补写 canonical complete；此处只把
             # assistant、Skill 使用记录和记忆任务留在当前事务，避免终态后再提交。
-            self._enqueue_memory_capture(
+            memory_capture_refs = self._enqueue_memory_capture(
                 request,
                 chat_session,
                 step_result,
                 None,
                 model_config,
+                user_message_id=user_message_id,
                 commit=False,
             )
         else:
+            memory_capture_refs = self._enqueue_memory_capture(
+                request,
+                chat_session,
+                step_result,
+                None,
+                model_config,
+                user_message_id=user_message_id,
+                commit=False,
+            )
             self.db.commit()
             self.db.refresh(chat_session)
-            self._enqueue_memory_capture(request, chat_session, step_result, None, model_config)
+            self._wake_memory_capture_refs(memory_capture_refs)
         return ChatTurnResponse(
             reply=reply,
             session_id=chat_session.id,
@@ -1730,12 +1814,13 @@ class AgentLoop:
             self._turn_payload({}, user_message_id),
             commit=False,
         )
-        self._enqueue_memory_capture(
+        memory_capture_refs = self._enqueue_memory_capture(
             request,
             chat_session,
             step_result,
             tool_result,
             model_config,
+            user_message_id=user_message_id,
             commit=False,
         )
         result = ChatTurnResponse(
@@ -1752,6 +1837,7 @@ class AgentLoop:
             self._turn_payload(result.model_dump(mode="json"), user_message_id),
             terminal_once=True,
         )
+        self._wake_memory_capture_refs(memory_capture_refs)
         if replacement is not None:
             yield replacement
         yield stream_end
@@ -2071,16 +2157,26 @@ class AgentLoop:
             tool_result,
         )
 
-    def handle_turn_stream(self, request: ChatTurnRequest) -> Iterator[dict[str, object]]:
+    def handle_turn_stream(
+        self,
+        request: ChatTurnRequest,
+        *,
+        time_context: Mapping[str, Any] | None = None,
+    ) -> Iterator[dict[str, object]]:
         """运行一个流式 Turn，并在结束时释放本 Loop 上的活动取消探针。"""
 
         try:
-            yield from self._handle_turn_stream(request)
+            yield from self._handle_turn_stream(request, time_context=time_context)
         finally:
             self._active_cancellation_token = None
 
-    def _handle_turn_stream(self, request: ChatTurnRequest) -> Iterator[dict[str, object]]:
-        """执行流式 Turn 的实际编排逻辑，阶段取消由统一 token 向下传播。"""
+    def _handle_turn_stream(
+        self,
+        request: ChatTurnRequest,
+        *,
+        time_context: Mapping[str, Any] | None = None,
+    ) -> Iterator[dict[str, object]]:
+        """编排流式Turn并传播取消；普通回答与原complete同事务登记持久记忆。"""
 
         router_decision: RouterDecision | None = None
         step_result = StepAgentResult()
@@ -2284,12 +2380,10 @@ class AgentLoop:
                 chat_session,
                 {"newSessionId": chat_session.id, "sessionId": chat_session.id},
             )
-            user_message = self._append_message(
-                request.tenant_id,
+            user_message, persisted_time_context = self._append_user_input_message(
+                request,
                 chat_session.id,
-                "user",
-                request.message,
-                metadata=self._user_message_metadata(request),
+                time_context=time_context,
             )
             user_message_id = user_message.id
             cancel_probe_state: dict[str, float | bool] = {
@@ -2363,6 +2457,7 @@ class AgentLoop:
                         "message": request.message,
                         "channel": request.channel,
                         "user_id": request.user_id,
+                        "time_context": persisted_time_context,
                     },
                     user_message.id,
                 ),
@@ -2402,6 +2497,8 @@ class AgentLoop:
                     client_turn_id=request.client_turn_id,
                 )
             memory_model_config = model_config
+            freeze_memory_model_selection(self.db, user_message, model_config)
+            self.db.commit()
             skills = self._list_published_skills(request.tenant_id, chat_session.agent_id)
             tools = self._tools_with_general_skills(
                 request.tenant_id,
@@ -2410,14 +2507,11 @@ class AgentLoop:
             )
             persona_prompt = self._get_persona_prompt(request.tenant_id, chat_session.agent_id)
             self._drop_unavailable_skill_state(request.tenant_id, chat_session, skills)
-            memory_context = [
-                memory_read(row)
-                for row in self.memory.context_memories(
-                    request.tenant_id,
-                    request.user_id,
-                    agent_id=chat_session.agent_id,
-                )
-            ]
+            memory_context = self.memory.context_memory_payloads(
+                request.tenant_id,
+                request.user_id,
+                agent_id=chat_session.agent_id,
+            )
             if memory_context:
                 self.events.record(
                     request.tenant_id,
@@ -2624,17 +2718,23 @@ class AgentLoop:
                     step_result=step_result,
                     session_state=public_session(chat_session),
                 )
+                memory_capture_refs = self._enqueue_memory_capture(
+                    request, chat_session, step_result, None, model_config,
+                    user_message_id=user_message_id, commit=False,
+                )
                 complete = self._stream_event(
                     "complete",
                     chat_session,
                     self._turn_payload(result.model_dump(mode="json"), user_message_id),
                     terminal_once=True,
                 )
+                self._wake_memory_capture_refs(memory_capture_refs)
                 if replacement is not None:
                     yield replacement
                 yield stream_end
                 yield complete
                 return
+            frozen_sop_response_slots = self._frozen_sop_response_slots(chat_session)
             self._finish_stale_completed_skill(request.tenant_id, chat_session, skills)
             conversation_context = self._conversation_context(chat_session, model_config=model_config)
             self.db.commit()
@@ -2950,12 +3050,17 @@ class AgentLoop:
                     tool_result=tool_result,
                     session_state=public_session(chat_session),
                 )
+                memory_capture_refs = self._enqueue_memory_capture(
+                    request, chat_session, step_result, tool_result, model_config,
+                    user_message_id=user_message_id, commit=False,
+                )
                 complete = self._stream_event(
                     "complete",
                     chat_session,
                     self._turn_payload(result.model_dump(mode="json"), user_message_id),
                     terminal_once=True,
                 )
+                self._wake_memory_capture_refs(memory_capture_refs)
                 if replacement is not None:
                     yield replacement
                 yield stream_end
@@ -3228,6 +3333,7 @@ class AgentLoop:
                 conversation_context,
                 response_task_results,
                 is_cancelled=(cancellation_token.is_cancelled if cancellation_token else None),
+                response_slots=frozen_sop_response_slots,
             ):
                 chunks.append(chunk)
                 yield self._stream_event(
@@ -3332,13 +3438,15 @@ class AgentLoop:
                 self._turn_payload({}, user_message_id),
                 commit=False,
             )
+            memory_capture_refs: list[dict[str, object]] = []
             if memory_model_config:
-                self._enqueue_memory_capture(
+                memory_capture_refs = self._enqueue_memory_capture(
                     request,
                     chat_session,
                     step_result,
                     tool_result,
                     memory_model_config,
+                    user_message_id=user_message_id,
                     commit=False,
                 )
             result = ChatTurnResponse(
@@ -3356,6 +3464,7 @@ class AgentLoop:
                 terminal_once=True,
             )
             turn_commit_completed = True
+            self._wake_memory_capture_refs(memory_capture_refs)
             if replacement is not None:
                 yield replacement
             yield stream_end
@@ -3564,7 +3673,11 @@ class AgentLoop:
         sleep(STREAM_CHUNK_INTERVAL_SECONDS)
 
     def _prepare_turn(
-        self, request: ChatTurnRequest, status_callback: StatusCallback | None = None
+        self,
+        request: ChatTurnRequest,
+        status_callback: StatusCallback | None = None,
+        *,
+        time_context: Mapping[str, Any] | None = None,
     ) -> PreparedTurn:
         def status(phase: str, payload: dict[str, object] | None = None) -> None:
             if status_callback:
@@ -3574,12 +3687,10 @@ class AgentLoop:
         self._assert_agent_available_for_final_write(chat_session, request.tenant_id)
         self._mark_session_running(chat_session)
         status("received", {"session_id": chat_session.id})
-        user_message = self._append_message(
-            request.tenant_id,
+        user_message, persisted_time_context = self._append_user_input_message(
+            request,
             chat_session.id,
-            "user",
-            request.message,
-            metadata=self._user_message_metadata(request),
+            time_context=time_context,
         )
         bind_event_turn = getattr(self.events, "bind_turn", None)
         if callable(bind_event_turn):
@@ -3592,6 +3703,7 @@ class AgentLoop:
                 "message_id": user_message.id,
                 "client_turn_id": request.client_turn_id,
                 "message": request.message,
+                "time_context": persisted_time_context,
                 "channel": request.channel,
                 "user_id": request.user_id,
             },
@@ -3615,6 +3727,8 @@ class AgentLoop:
                 user_message_id=user_message.id,
                 client_turn_id=request.client_turn_id,
             ) from exc
+        if model_config is not None:
+            freeze_memory_model_selection(self.db, user_message, model_config)
         skills = self._list_published_skills(request.tenant_id, chat_session.agent_id)
         tools = self._tools_with_general_skills(
             request.tenant_id,
@@ -3629,14 +3743,11 @@ class AgentLoop:
                 client_turn_id=request.client_turn_id,
             )
         self._drop_unavailable_skill_state(request.tenant_id, chat_session, skills)
-        memory_context = [
-            memory_read(row)
-            for row in self.memory.context_memories(
-                request.tenant_id,
-                request.user_id,
-                agent_id=chat_session.agent_id,
-            )
-        ]
+        memory_context = self.memory.context_memory_payloads(
+            request.tenant_id,
+            request.user_id,
+            agent_id=chat_session.agent_id,
+        )
         if memory_context:
             self.events.record(
                 request.tenant_id,
@@ -4301,6 +4412,7 @@ class AgentLoop:
         conversation_context: dict[str, object],
         task_results: list[dict[str, object]] | None = None,
         is_cancelled: Callable[[], bool] | None = None,
+        response_slots: dict[str, object] | None = None,
     ) -> Iterator[str]:
         conversation_context = self._refresh_response_input_context(
             chat_session, conversation_context
@@ -4350,6 +4462,7 @@ class AgentLoop:
                     is_cancelled,
                     bool(read_receipt_ids),
                     bool(group),
+                    response_slots=response_slots,
                 )
                 if group is None:
                     for chunk in stream:
@@ -4800,6 +4913,7 @@ class AgentLoop:
     ) -> RouterDecision:
         return RouterDecision(
             decision="start_new_task",
+            selected_task_id=frame.task_id,
             target_skill_id=frame.target_skill_id,
             target_step_id=frame.target_step_id,
             confidence=frame.confidence,
@@ -5445,11 +5559,83 @@ class AgentLoop:
                 break
             seen_calls.add(signature)
             self._emit_tool_status(tool_call, tool_call_id, stream_events, status_callback)
+            persistent_action_id = self._trusted_tool_action_id(
+                request,
+                tool_call,
+                conversation_context,
+                action_scope=self._tool_action_scope(chat_session, active_skill),
+                action_ordinal=iteration,
+            )
+            accepts_tool_call = self._step_accepts_tool_call(
+                active_skill, chat_session, tool_call
+            )
+            if not accepts_tool_call:
+                recovered_action_id = self._recover_persisted_tool_action_id(
+                    request,
+                    chat_session,
+                    tool_call,
+                    persistent_action_id,
+                )
+                if recovered_action_id:
+                    persistent_action_id = recovered_action_id
+                elif self._requires_persisted_tool_recovery(active_skill, chat_session):
+                    authorization_error = self._authorize_tool_call_for_reuse(
+                        request,
+                        chat_session,
+                        tool_call,
+                        conversation_context=conversation_context,
+                        is_cancelled=is_cancelled,
+                    )
+                    tool_result = authorization_error or ToolResult(
+                        tool_name=tool_call.name,
+                        success=False,
+                        error=ToolError(
+                            code="TOOL_CALL_OUTCOME_UNKNOWN",
+                            message="原动作身份无法唯一恢复，禁止将恢复歧义当作新动作提交。",
+                        ),
+                    )
+                    payload = {
+                        "reason": (
+                            "tool_action_recovery_authorization_rejected"
+                            if authorization_error is not None
+                            else "tool_action_recovery_ambiguous"
+                        ),
+                        "tool_name": tool_call.name,
+                        "tool_call": tool_call.model_dump(mode="json"),
+                        "request_fingerprint": self._tool_request_fingerprint(tool_call),
+                        "error": tool_result.model_dump(mode="json"),
+                    }
+                    self.events.record(
+                        request.tenant_id,
+                        chat_session.id,
+                        "agent_loop_stopped",
+                        payload,
+                    )
+                    if stream_events is not None:
+                        stream_events.append(
+                            (
+                                "tool_result",
+                                self._tool_activity_payload(
+                                    request.tenant_id,
+                                    tool_call.name,
+                                    tool_result,
+                                    tool_call,
+                                    tool_call_id,
+                                ),
+                            )
+                        )
+                    step_result = step_result.model_copy(
+                        update={"tool_call": None, "is_step_completed": False}
+                    )
+                    self.db.commit()
+                    self.db.refresh(chat_session)
+                    break
             tool_result = self._execute_tool_call(
                 request,
                 chat_session,
                 tool_call,
                 tool_call_id,
+                persistent_action_id=persistent_action_id,
                 stream_events=stream_events,
                 conversation_context=conversation_context,
                 memory_context=memory_context,
@@ -5654,6 +5840,17 @@ class AgentLoop:
             self.db.refresh(chat_session)
             break
         return step_result, tool_result
+
+    def _requires_persisted_tool_recovery(
+        self,
+        active_skill: Skill | None,
+        chat_session: ChatSession,
+    ) -> bool:
+        """判断当前 Skill 节点是否已经形成不可猜测新动作的恢复边界。"""
+
+        if active_skill is None:
+            return False
+        return self._current_skill_step(active_skill, chat_session.active_step_id) is not None
 
     def _execute_knowledge_query_cycle(
         self,
@@ -6231,6 +6428,12 @@ class AgentLoop:
                 active_skill,
                 model_understanding,
                 user_message=request.message,
+                execution_org_unit_id=self._execution_org_unit_id(conversation_context),
+                time_context=(
+                    conversation_context.get("time_context")
+                    if isinstance(conversation_context, Mapping)
+                    else None
+                ),
             )
             missing_fields, slot_value_contract = (
                 self.deterministic_runtime.current_slot_repair_contract(
@@ -6302,6 +6505,12 @@ class AgentLoop:
                 active_skill,
                 repaired_understanding,
                 user_message=request.message,
+                execution_org_unit_id=self._execution_org_unit_id(conversation_context),
+                time_context=(
+                    conversation_context.get("time_context")
+                    if isinstance(conversation_context, Mapping)
+                    else None
+                ),
             )
         self._apply_step_result(request.tenant_id, chat_session, step_result, active_skill)
         step_result = self._retry_slot_validation_if_needed(
@@ -7070,31 +7279,118 @@ class AgentLoop:
         tenant_id: str,
         session_id: str,
         tool_call: ToolCall,
+        persistent_action_id: str | None = None,
     ) -> tuple[ToolResult, str] | None:
-        replay_enabled, key_fields = self._tool_requires_idempotent_replay(tenant_id, tool_call)
+        """只按受信持久动作身份和完整请求指纹读取兼容入口成功回执。"""
+
+        replay = self._compatibility_action_result(
+            tenant_id,
+            session_id,
+            tool_call,
+            persistent_action_id,
+        )
+        if replay is None or replay[2] != "succeeded":
+            return None
+        return replay[0], replay[1]
+
+    def _compatibility_action_result(
+        self,
+        tenant_id: str,
+        session_id: str,
+        tool_call: ToolCall,
+        persistent_action_id: str | None,
+    ) -> tuple[ToolResult, str, str] | None:
+        """读取兼容入口动作账本，成功复用、unknown 阻断，缺失身份则不猜测。"""
+
+        if not persistent_action_id:
+            return None
+        replay_enabled, _ = self._tool_requires_idempotent_replay(tenant_id, tool_call)
         if not replay_enabled:
             return None
-        target_signature = self._tool_signature(
-            tool_call.name,
-            self._idempotency_arguments(tool_call.arguments, key_fields),
-        )
+        target_fingerprint = self._tool_request_fingerprint(tool_call)
         rows = self.db.exec(
             select(AgentEvent)
             .where(
                 AgentEvent.tenant_id == tenant_id,
                 AgentEvent.session_id == session_id,
-                AgentEvent.event_type == "tool_call_finished",
+                AgentEvent.event_type.in_(
+                    ("tool_call_started", "tool_call_finished")
+                ),
+                AgentEvent.payload_json["persistent_action_id"].as_string()
+                == persistent_action_id,
             )
-            .order_by(AgentEvent.created_at.desc())
-            .limit(200)
+            .order_by(AgentEvent.created_at.desc(), AgentEvent.id.desc())
         ).all()
+        finished_call_ids = {
+            str((event.payload_json or {}).get("tool_call_id") or "").strip()
+            for event in rows
+            if event.event_type == "tool_call_finished"
+            and str((event.payload_json or {}).get("tool_call_id") or "").strip()
+        }
         for event in rows:
             payload = event.payload_json or {}
-            if payload.get("success") is not True:
+            if payload.get("persistent_action_id") != persistent_action_id:
                 continue
             payload_tool_name = str(payload.get("tool_name") or "").strip()
             if payload_tool_name != tool_call.name:
                 continue
+            receipt_source = str(payload.get("receipt_source") or "")
+            if event.event_type == "tool_call_finished" and receipt_source in {
+                "compatibility_conflict",
+                "operation_conflict",
+            }:
+                # 冲突回执是当前请求的审计结果，不是该持久动作的规范事实；
+                # 不能让它遮蔽更早的成功或 unknown 回执。
+                continue
+            payload_fingerprint = str(payload.get("request_fingerprint") or "").strip()
+            if payload_fingerprint != target_fingerprint:
+                return (
+                    ToolResult(
+                        tool_name=tool_call.name,
+                        success=False,
+                        error=ToolError(
+                            code="SOP_EXECUTION_CONFLICT",
+                            message="同一持久动作身份的请求指纹不一致，拒绝复用或重新派发。",
+                        ),
+                    ),
+                    event.id,
+                    "conflict",
+                )
+            if event.event_type == "tool_call_started":
+                event_tool_call_id = str(payload.get("tool_call_id") or "").strip()
+                if event_tool_call_id and event_tool_call_id in finished_call_ids:
+                    continue
+                return (
+                    ToolResult(
+                        tool_name=tool_call.name,
+                        success=False,
+                        error=ToolError(
+                            code="TOOL_CALL_OUTCOME_UNKNOWN",
+                            message="工具已进入派发边界但缺少可证明回执，禁止重复提交。",
+                        ),
+                    ),
+                    event.id,
+                    "unknown",
+                )
+            if event.event_type != "tool_call_finished":
+                continue
+            if payload.get("outcome_status") == "unknown" or receipt_source == "compatibility_unknown":
+                return (
+                    ToolResult(
+                        tool_name=tool_call.name,
+                        success=False,
+                        error=ToolError(
+                            code="TOOL_CALL_OUTCOME_UNKNOWN",
+                            message="工具结果未知，系统已停止重复提交并等待对账。",
+                        ),
+                    ),
+                    event.id,
+                    "unknown",
+                )
+            if receipt_source == "authorization_rejected":
+                continue
+            if payload.get("success") is not True:
+                return None
             payload_tool_call = (
                 payload.get("tool_call") if isinstance(payload.get("tool_call"), dict) else {}
             )
@@ -7103,8 +7399,7 @@ class AgentLoop:
                 payload_arguments = (
                     payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {}
                 )
-            replay_arguments = self._idempotency_arguments(payload_arguments, key_fields)
-            if self._tool_signature(payload_tool_name, replay_arguments) != target_signature:
+            if SopExecutionStore.request_fingerprint(payload_arguments) != target_fingerprint:
                 continue
             replay_data = payload.get("data")
             if isinstance(replay_data, dict):
@@ -7119,8 +7414,382 @@ class AgentLoop:
                     "idempotent_replay": True,
                     "replayed_from_event_id": event.id,
                 }
-            return ToolResult(tool_name=tool_call.name, success=True, data=replay_data), event.id
+            replay_data["receipt_source"] = "compatibility_event"
+            return (
+                ToolResult(tool_name=tool_call.name, success=True, data=replay_data),
+                event.id,
+                "succeeded",
+            )
         return None
+
+    @staticmethod
+    def _tool_request_fingerprint(tool_call: ToolCall) -> str:
+        """返回不含临时 tool_call_id 的严格工具请求指纹。"""
+
+        return SopExecutionStore.request_fingerprint(tool_call.arguments)
+
+    def _trusted_tool_action_id(
+        self,
+        request: ChatTurnRequest,
+        tool_call: ToolCall,
+        conversation_context: dict[str, object] | None,
+        *,
+        action_scope: str | None = None,
+        action_ordinal: int | None = None,
+    ) -> str | None:
+        """从受信 Turn、业务动作边界和循环序号派生持久身份。"""
+
+        explicit_action_id = str(
+            (conversation_context or {}).get("persistent_action_id") or ""
+        ).strip()
+        if explicit_action_id:
+            return explicit_action_id
+        candidate = str(
+            request.client_turn_id
+            or (conversation_context or {}).get("turn_id")
+            or ""
+        ).strip()
+        if not candidate:
+            return None
+        scope_part = f":scope:{action_scope}" if action_scope else ""
+        action_part = (
+            f":action:{action_ordinal}"
+            if isinstance(action_ordinal, int) and action_ordinal >= 0
+            else ""
+        )
+        return f"turn:{candidate}{scope_part}{action_part}:tool:{tool_call.name}"
+
+    def _tool_action_scope(
+        self,
+        chat_session: ChatSession,
+        active_skill: Skill | None,
+    ) -> str | None:
+        """以持久会话当前 Skill/Step 作为可恢复的业务动作边界。"""
+
+        awaiting_input = (
+            chat_session.awaiting_input_json
+            if isinstance(chat_session.awaiting_input_json, dict)
+            else {}
+        )
+        task_id = str(awaiting_input.get("task_id") or "").strip()
+        skill_id = str(
+            (active_skill.skill_id if active_skill is not None else None)
+            or chat_session.active_skill_id
+            or ""
+        ).strip()
+        step_id = str(chat_session.active_step_id or "").strip()
+        if not task_id and not skill_id and not step_id:
+            return None
+        task_part = f"task:{task_id}:" if task_id else ""
+        return f"{task_part}skill:{skill_id or 'unknown'}:step:{step_id or 'unknown'}"
+
+    def _step_accepts_tool_call(
+        self,
+        active_skill: Skill | None,
+        chat_session: ChatSession,
+        tool_call: ToolCall,
+    ) -> bool:
+        """判断当前持久化节点是否仍是指定工具的业务动作边界。"""
+
+        if active_skill is None:
+            return False
+        step = self._current_skill_step(active_skill, chat_session.active_step_id)
+        if not step:
+            return False
+        actions = set(self._step_actions(step))
+        return f"call_tool:{tool_call.name}" in actions or "call_tool" in actions
+
+    def _recover_persisted_tool_action_id(
+        self,
+        request: ChatTurnRequest,
+        chat_session: ChatSession,
+        tool_call: ToolCall,
+        current_action_id: str | None,
+    ) -> str | None:
+        """在节点已推进的恢复调用中唯一找回既有持久身份，不从参数生成身份。"""
+
+        if not current_action_id or not hasattr(self.db, "exec"):
+            return None
+        turn_prefix = current_action_id.split(":scope:", 1)[0]
+        target_fingerprint = self._tool_request_fingerprint(tool_call)
+        rows = self.db.exec(
+            select(AgentEvent)
+            .where(
+                AgentEvent.tenant_id == request.tenant_id,
+                AgentEvent.session_id == chat_session.id,
+                AgentEvent.event_type.in_(("tool_call_started", "tool_call_finished")),
+            )
+            .order_by(AgentEvent.created_at.asc(), AgentEvent.id.asc())
+        ).all()
+        matches: set[str] = set()
+        for event in rows:
+            payload = event.payload_json or {}
+            action_id = str(payload.get("persistent_action_id") or "").strip()
+            if not action_id or not action_id.startswith(f"{turn_prefix}:"):
+                continue
+            if str(payload.get("tool_name") or "").strip() != tool_call.name:
+                continue
+            if str(payload.get("request_fingerprint") or "").strip() != target_fingerprint:
+                continue
+            matches.add(action_id)
+        return next(iter(matches)) if len(matches) == 1 else None
+
+    def _operation_dispatch_was_recorded(
+        self,
+        tenant_id: str,
+        session_id: str,
+        operation: object,
+    ) -> bool:
+        """检查指定 Operation 是否已有本地派发事实，缺少终态时按 unknown 处理。"""
+
+        if not hasattr(self.db, "exec"):
+            return False
+        operation_id = str(getattr(operation, "id", "") or "")
+        logical_action_id = str(getattr(operation, "logical_action_id", "") or "")
+        if not operation_id and not logical_action_id:
+            return False
+        identity_matches = [
+            AgentEvent.payload_json[key].as_string() == value
+            for key, value in (
+                ("operation_id", operation_id),
+                ("logical_action_id", logical_action_id),
+            )
+            if value
+        ]
+        rows = self.db.exec(
+            select(AgentEvent)
+            .where(
+                AgentEvent.tenant_id == tenant_id,
+                AgentEvent.session_id == session_id,
+                AgentEvent.event_type.in_(("tool_call_started", "tool_call_finished")),
+                or_(*identity_matches),
+            )
+            .order_by(AgentEvent.created_at.desc(), AgentEvent.id.desc())
+        ).all()
+        for event in rows:
+            payload = event.payload_json or {}
+            if operation_id and payload.get("operation_id") == operation_id:
+                return True
+            if logical_action_id and payload.get("logical_action_id") == logical_action_id:
+                return True
+        return False
+
+    def _operation_tool_result(
+        self,
+        tenant_id: str,
+        session_id: str,
+        tool_call: ToolCall,
+        operation: object,
+    ) -> tuple[ToolResult, str] | None:
+        """把终态 Operation 回执转换为工具结果，或为活动派发返回禁止重提错误。"""
+
+        status = str(getattr(operation, "status", "") or "")
+        operation_id = str(getattr(operation, "id", "") or "")
+        logical_action_id = str(getattr(operation, "logical_action_id", "") or "")
+        if status in {"succeeded", "failed"}:
+            if status == "succeeded":
+                data = dict(getattr(operation, "result_json", {}) or {})
+                data.update(
+                    {
+                        "idempotent_replay": True,
+                        "receipt_source": "sop_operation",
+                        "operation_id": operation_id,
+                        "logical_action_id": logical_action_id,
+                    }
+                )
+                return ToolResult(tool_name=tool_call.name, success=True, data=data), "succeeded"
+            error_payload = getattr(operation, "error_json", {}) or {}
+            error_code = str(error_payload.get("code") or "RUNTIME_OPERATION_FAILED")
+            error_message = str(error_payload.get("message") or "SOP 操作已失败。")
+            return (
+                ToolResult(
+                    tool_name=tool_call.name,
+                    success=False,
+                    error=ToolError(code=error_code, message=error_message),
+                ),
+                "failed",
+            )
+        if status == "unknown":
+            return (
+                ToolResult(
+                    tool_name=tool_call.name,
+                    success=False,
+                    error=ToolError(
+                        code="RUNTIME_OPERATION_RECONCILIATION_REQUIRED",
+                        message="外部操作结果尚未确认，系统已停止重复提交并等待对账。",
+                    ),
+                ),
+                "unknown",
+            )
+        if status == "retry_wait":
+            return (
+                ToolResult(
+                    tool_name=tool_call.name,
+                    success=False,
+                    error=ToolError(
+                        code="RUNTIME_OPERATION_RETRY_WAIT",
+                        message="操作正在等待下一次重试，系统不会重复提交。",
+                    ),
+                ),
+                "retry_wait",
+            )
+        if status == "waiting_external":
+            return (
+                ToolResult(
+                    tool_name=tool_call.name,
+                    success=False,
+                    disposition="waiting",
+                    error=ToolError(
+                        code="RUNTIME_OPERATION_WAITING_EXTERNAL",
+                        message="外部任务已受理，系统将查询同一任务，不会重复提交。",
+                    ),
+                ),
+                "waiting_external",
+            )
+        if status in {"prepared", "running"} and self._operation_dispatch_was_recorded(
+            tenant_id, session_id, operation
+        ):
+            return (
+                ToolResult(
+                    tool_name=tool_call.name,
+                    success=False,
+                    error=ToolError(
+                        code="TOOL_CALL_OUTCOME_UNKNOWN",
+                        message="工具已进入派发边界但缺少可证明回执，禁止重复提交。",
+                    ),
+                ),
+                "unknown",
+            )
+        return None
+
+    def _tool_event_identity_payload(
+        self,
+        tool_call: ToolCall,
+        *,
+        persistent_action_id: str | None = None,
+        operation: object | None = None,
+    ) -> dict[str, object]:
+        """构造工具事件的持久身份字段，明确区分 Operation 与临时事件关联。"""
+
+        payload: dict[str, object] = {
+            "request_fingerprint": self._tool_request_fingerprint(tool_call),
+        }
+        if persistent_action_id:
+            payload["persistent_action_id"] = persistent_action_id
+        if operation is not None:
+            operation_id = str(getattr(operation, "id", "") or "")
+            logical_action_id = str(getattr(operation, "logical_action_id", "") or "")
+            if operation_id:
+                payload["operation_id"] = operation_id
+            if logical_action_id:
+                payload["logical_action_id"] = logical_action_id
+        return payload
+
+    def _authorize_tool_call_for_reuse(
+        self,
+        request: ChatTurnRequest,
+        chat_session: ChatSession,
+        tool_call: ToolCall,
+        *,
+        remote_idempotency_key: str | None = None,
+        conversation_context: dict[str, object] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
+    ) -> ToolResult | None:
+        """在读取缓存回执前复用 ToolExecutor 的完整实时授权边界。"""
+
+        authorize = getattr(self.tool_executor, "authorize", None)
+        if not callable(authorize):
+            return None
+        execution_org_unit_id = str(
+            (conversation_context or {}).get("execution_org_unit_id") or ""
+        ).strip() or None
+        return authorize(
+            request.tenant_id,
+            tool_call,
+            chat_session.active_skill_id,
+            chat_session.agent_id,
+            request.user_id,
+            execution_org_unit_id,
+            remote_idempotency_key,
+            is_cancelled,
+        )
+
+    @staticmethod
+    def _execution_org_unit_id(
+        conversation_context: dict[str, object] | None,
+    ) -> str | None:
+        """从当前对话上下文提取组织授权边界，缺失或空白时保持未指定。"""
+
+        return str((conversation_context or {}).get("execution_org_unit_id") or "").strip() or None
+
+    def _record_reused_tool_result(
+        self,
+        request: ChatTurnRequest,
+        chat_session: ChatSession,
+        tool_call: ToolCall,
+        tool_result: ToolResult,
+        *,
+        tool_call_id: str | None,
+        receipt_source: str,
+        replayed_from_event_id: str | None = None,
+        persistent_action_id: str | None = None,
+        operation: object | None = None,
+    ) -> ToolResult:
+        """写入不派发的回执复用审计，并保留来源和稳定动作身份。"""
+
+        replay_payload: dict[str, object] = {
+            "tool_name": tool_call.name,
+            "tool_call": tool_call.model_dump(mode="json"),
+            "receipt_source": receipt_source,
+            **self._tool_event_identity_payload(
+                tool_call,
+                persistent_action_id=persistent_action_id,
+                operation=operation,
+            ),
+        }
+        if replayed_from_event_id:
+            replay_payload["replayed_from_event_id"] = replayed_from_event_id
+        if tool_call_id:
+            replay_payload["tool_call_id"] = tool_call_id
+        self.events.record(
+            request.tenant_id,
+            chat_session.id,
+            "tool_call_reused",
+            replay_payload,
+        )
+        finished_payload = tool_result.model_dump(mode="json")
+        finished_payload.update(replay_payload)
+        finished_payload["outcome_status"] = self._tool_result_outcome_status(tool_result)
+        finished_payload["idempotent_replay"] = receipt_source in {
+            "sop_operation",
+            "compatibility_event",
+        }
+        self.events.record(
+            request.tenant_id,
+            chat_session.id,
+            "tool_call_finished",
+            finished_payload,
+        )
+        self.db.commit()
+        self.db.refresh(chat_session)
+        return tool_result
+
+    @staticmethod
+    def _tool_result_outcome_status(tool_result: ToolResult) -> str:
+        """把工具回执标成成功、确定失败或需要对账的 unknown。"""
+
+        if tool_result.disposition in {"accepted", "waiting"}:
+            return "waiting_external"
+        if tool_result.disposition == "unknown":
+            return "unknown"
+        if tool_result.success:
+            return "succeeded"
+        if tool_result.error is not None and DeterministicSopCoordinator._is_ambiguous_external_failure(
+            tool_result.error.code,
+            tool_result.error.message,
+        ):
+            return "unknown"
+        return "failed"
 
     def _execute_tool_call(
         self,
@@ -7132,11 +7801,17 @@ class AgentLoop:
         conversation_context: dict[str, object] | None = None,
         memory_context: list[dict[str, object]] | None = None,
         is_cancelled: Callable[[], bool] | None = None,
+        persistent_action_id: str | None = None,
     ) -> ToolResult:
         """记录工具调用边界并执行适配器；确定性外部写额外传递账本生成的远端幂等键。"""
 
         is_cancelled = is_cancelled or self._active_turn_cancel_callback()
         raise_if_cancelled(is_cancelled)
+        persistent_action_id = persistent_action_id or self._trusted_tool_action_id(
+            request,
+            tool_call,
+            conversation_context,
+        )
         if (
             not tool_call.name.startswith(GENERAL_SKILL_TOOL_PREFIX)
             and chat_session.agent_id
@@ -7153,6 +7828,13 @@ class AgentLoop:
                 error=ToolError(code="NOT_ALLOWED", message="当前员工未启用该工具。"),
             )
             started_payload = tool_call.model_dump(mode="json")
+            started_payload.update(
+                self._tool_event_identity_payload(
+                    tool_call,
+                    persistent_action_id=persistent_action_id,
+                )
+            )
+            started_payload["tool_name"] = tool_call.name
             if tool_call_id:
                 started_payload["tool_call_id"] = tool_call_id
             self.events.record(
@@ -7162,6 +7844,14 @@ class AgentLoop:
                 started_payload,
             )
             finished_payload = tool_result.model_dump(mode="json")
+            finished_payload.update(
+                self._tool_event_identity_payload(
+                    tool_call,
+                    persistent_action_id=persistent_action_id,
+                )
+            )
+            finished_payload["receipt_source"] = "authorization_rejected"
+            finished_payload["outcome_status"] = self._tool_result_outcome_status(tool_result)
             if tool_call_id:
                 finished_payload["tool_call_id"] = tool_call_id
             finished_payload["tool_call"] = tool_call.model_dump(mode="json")
@@ -7175,40 +7865,166 @@ class AgentLoop:
             self.db.refresh(chat_session)
             return tool_result
 
-        replayed = self._previous_successful_side_effect_tool_result(
-            request.tenant_id,
-            chat_session.id,
-            tool_call,
+        deterministic_runtime = getattr(self, "deterministic_runtime", None)
+        operation = None
+        if (
+            deterministic_runtime is not None
+            and not tool_call.name.startswith(GENERAL_SKILL_TOOL_PREFIX)
+        ):
+            current_operation = getattr(deterministic_runtime, "current_tool_operation", None)
+            if callable(current_operation):
+                try:
+                    operation = current_operation(chat_session, tool_call)
+                except SopExecutionConflictError as exc:
+                    conflict_result = ToolResult(
+                        tool_name=tool_call.name,
+                        success=False,
+                        error=ToolError(code=exc.code, message=str(exc)),
+                    )
+                    return self._record_reused_tool_result(
+                        request,
+                        chat_session,
+                        tool_call,
+                        conflict_result,
+                        tool_call_id=tool_call_id,
+                        receipt_source="operation_conflict",
+                        persistent_action_id=persistent_action_id,
+                    )
+        operation_remote_key = (
+            str(getattr(operation, "remote_idempotency_key", "") or "") or None
+            if operation is not None
+            else None
         )
-        if replayed:
-            tool_result, replayed_event_id = replayed
-            replay_payload = {
-                "tool_name": tool_call.name,
-                "tool_call": tool_call.model_dump(mode="json"),
-                "replayed_from_event_id": replayed_event_id,
-            }
-            if tool_call_id:
-                replay_payload["tool_call_id"] = tool_call_id
-            self.events.record(
-                request.tenant_id, chat_session.id, "tool_call_reused", replay_payload
+        remote_idempotency_key = operation_remote_key or (
+            deterministic_runtime.remote_idempotency_key_for(
+                chat_session,
+                tool_call.name,
             )
-            finished_payload = tool_result.model_dump(mode="json")
-            if tool_call_id:
-                finished_payload["tool_call_id"] = tool_call_id
-            finished_payload["tool_call"] = tool_call.model_dump(mode="json")
-            finished_payload["idempotent_replay"] = True
-            finished_payload["replayed_from_event_id"] = replayed_event_id
-            self.events.record(
+            if deterministic_runtime is not None
+            and callable(getattr(deterministic_runtime, "remote_idempotency_key_for", None))
+            else None
+        )
+        if operation is not None:
+            capability_is_current = getattr(
+                deterministic_runtime,
+                "operation_capability_is_current",
+                None,
+            )
+            if callable(capability_is_current) and not capability_is_current(
+                chat_session,
+                operation,
+            ):
+                capability_result = ToolResult(
+                    tool_name=tool_call.name,
+                    success=False,
+                    error=ToolError(
+                        code="CAPABILITY_CHANGED",
+                        message="工具发布能力已变化，当前 Operation 回执不能直接复用。",
+                    ),
+                )
+                return self._record_reused_tool_result(
+                    request,
+                    chat_session,
+                    tool_call,
+                    capability_result,
+                    tool_call_id=tool_call_id,
+                    receipt_source="authorization_rejected",
+                    persistent_action_id=persistent_action_id,
+                    operation=operation,
+                )
+            operation_replay = self._operation_tool_result(
                 request.tenant_id,
                 chat_session.id,
-                "tool_call_finished",
-                finished_payload,
+                tool_call,
+                operation,
             )
-            self.db.commit()
-            self.db.refresh(chat_session)
-            return tool_result
+            if operation_replay is not None:
+                operation_result, operation_source = operation_replay
+                authorization_error = self._authorize_tool_call_for_reuse(
+                    request,
+                    chat_session,
+                    tool_call,
+                    remote_idempotency_key=remote_idempotency_key,
+                    conversation_context=conversation_context,
+                    is_cancelled=is_cancelled,
+                )
+                if authorization_error is not None:
+                    return self._record_reused_tool_result(
+                        request,
+                        chat_session,
+                        tool_call,
+                        authorization_error,
+                        tool_call_id=tool_call_id,
+                        receipt_source="authorization_rejected",
+                        persistent_action_id=persistent_action_id,
+                        operation=operation,
+                    )
+                return self._record_reused_tool_result(
+                    request,
+                    chat_session,
+                    tool_call,
+                    operation_result,
+                    tool_call_id=tool_call_id,
+                    receipt_source="sop_operation",
+                    persistent_action_id=persistent_action_id,
+                    operation=operation,
+                )
+
+        compatibility = (
+            self._compatibility_action_result(
+                request.tenant_id,
+                chat_session.id,
+                tool_call,
+                persistent_action_id,
+            )
+            if operation is None
+            else None
+        )
+        if compatibility:
+            tool_result, replayed_event_id, compatibility_source = compatibility
+            authorization_error = self._authorize_tool_call_for_reuse(
+                request,
+                chat_session,
+                tool_call,
+                remote_idempotency_key=remote_idempotency_key,
+                conversation_context=conversation_context,
+                is_cancelled=is_cancelled,
+            )
+            if authorization_error is not None:
+                return self._record_reused_tool_result(
+                    request,
+                    chat_session,
+                    tool_call,
+                    authorization_error,
+                    tool_call_id=tool_call_id,
+                    receipt_source="authorization_rejected",
+                    replayed_from_event_id=replayed_event_id,
+                    persistent_action_id=persistent_action_id,
+                )
+            return self._record_reused_tool_result(
+                request,
+                chat_session,
+                tool_call,
+                tool_result,
+                tool_call_id=tool_call_id,
+                receipt_source="compatibility_event"
+                if compatibility_source == "succeeded"
+                else "compatibility_conflict"
+                if compatibility_source == "conflict"
+                else "compatibility_unknown",
+                replayed_from_event_id=replayed_event_id,
+                persistent_action_id=persistent_action_id,
+            )
 
         started_payload = tool_call.model_dump(mode="json")
+        started_payload.update(
+            self._tool_event_identity_payload(
+                tool_call,
+                persistent_action_id=persistent_action_id,
+                operation=operation,
+            )
+        )
+        started_payload["tool_name"] = tool_call.name
         if tool_call_id:
             started_payload["tool_call_id"] = tool_call_id
         self.events.record(
@@ -7231,6 +8047,14 @@ class AgentLoop:
                     ),
                 )
                 finished_payload = tool_result.model_dump(mode="json")
+                finished_payload.update(
+                    self._tool_event_identity_payload(
+                        tool_call,
+                        persistent_action_id=persistent_action_id,
+                        operation=operation,
+                    )
+                )
+                finished_payload["outcome_status"] = self._tool_result_outcome_status(tool_result)
                 if tool_call_id:
                     finished_payload["tool_call_id"] = tool_call_id
                 finished_payload["tool_call"] = tool_call.model_dump(mode="json")
@@ -7254,21 +8078,17 @@ class AgentLoop:
                 is_cancelled=is_cancelled,
             )
         else:
-            deterministic_runtime = getattr(self, "deterministic_runtime", None)
-            remote_idempotency_key = (
-                deterministic_runtime.remote_idempotency_key_for(
-                    chat_session,
-                    tool_call.name,
-                )
-                if deterministic_runtime is not None
-                else None
-            )
             execution_options = (
                 {"remote_idempotency_key": remote_idempotency_key}
                 if remote_idempotency_key
                 else {}
             )
             executor_options = dict(execution_options)
+            execution_org_unit_id = str(
+                (conversation_context or {}).get("execution_org_unit_id") or ""
+            ).strip() or None
+            if execution_org_unit_id:
+                executor_options["execution_org_unit_id"] = execution_org_unit_id
             if is_cancelled is not None:
                 executor_options["is_cancelled"] = is_cancelled
             tool_result = self.tool_executor.execute(
@@ -7281,6 +8101,14 @@ class AgentLoop:
             )
         raise_if_cancelled(is_cancelled)
         finished_payload = tool_result.model_dump(mode="json")
+        finished_payload.update(
+            self._tool_event_identity_payload(
+                tool_call,
+                persistent_action_id=persistent_action_id,
+                operation=operation,
+            )
+        )
+        finished_payload["outcome_status"] = self._tool_result_outcome_status(tool_result)
         if tool_call_id:
             finished_payload["tool_call_id"] = tool_call_id
         finished_payload["tool_call"] = tool_call.model_dump(mode="json")
@@ -8638,7 +9466,7 @@ class AgentLoop:
         resume_chat_clarification = getattr(dynamic_agent, "resume_chat_clarification", None)
         if (
             source_kind == "chat"
-            and can_continue_chat_turn
+            and (can_continue_chat_turn or request.execution_engine == "dynamic_task")
             and callable(resume_chat_clarification)
         ):
             resumed_outcome = resume_chat_clarification(
@@ -9248,6 +10076,14 @@ class AgentLoop:
             "turn_id": user_message_id,
             "user_message_id": user_message_id,
         }
+        from app.feedback.source import freeze_execution_source
+
+        message_metadata["feedback_source"] = freeze_execution_source(
+            self.db, chat_session, user_message_id, execution_id,
+        )
+        time_context = self._time_context_for_user_message(user_message_id)
+        if time_context is not None:
+            message_metadata["time_context"] = time_context
         if client_turn_id:
             message_metadata["client_turn_id"] = client_turn_id
         message = self._append_message(
@@ -9276,6 +10112,7 @@ class AgentLoop:
                 "turn_id": user_message_id,
                 "user_message_id": user_message_id,
                 "client_turn_id": client_turn_id,
+                "time_context": time_context,
             },
         )
         return message
@@ -9675,6 +10512,13 @@ class AgentLoop:
             else None,
             settings=self._get_conversation_context_settings(chat_session.tenant_id),
         )
+        context_metadata = context.get("metadata")
+        if isinstance(context_metadata, dict):
+            persisted_time_context = normalize_persisted_time_context(
+                context_metadata.get("time_context")
+            )
+            if persisted_time_context is not None:
+                context["time_context"] = persisted_time_context
         latest_user = next((row for row in reversed(rows) if row.role == "user"), None)
         if latest_user is not None and hasattr(self.db, "get") and hasattr(self.db, "add"):
             from app.session.input_bindings import InputBindingError
@@ -9743,6 +10587,13 @@ class AgentLoop:
             "content": message_content_with_attachment_context(row.content, row.metadata_json),
             "created_at": row.created_at,
         }
+        time_context = normalize_persisted_time_context(
+            (row.metadata_json or {}).get("time_context")
+            if isinstance(row.metadata_json, dict)
+            else None
+        )
+        if time_context is not None:
+            entry["time_context"] = time_context
         images = message_images_from_metadata(row.metadata_json)
         if images and row.role == "user":
             entry["images"] = images
@@ -9758,20 +10609,29 @@ class AgentLoop:
         """汇总回复控制、知识引用及当前用户消息精确关联的SOP Execution身份。"""
 
         metadata = step_result.runtime_reply_metadata() if step_result else {}
+        runtime_execution_id = step_result.runtime_execution_id() if step_result else None
         if user_message_id:
-            sop_instance = self.db.exec(
-                select(SopInstance)
-                .where(
-                    SopInstance.tenant_id == chat_session.tenant_id,
-                    SopInstance.session_id == chat_session.id,
-                    SopInstance.kind == "sop",
-                    SopInstance.source_kind == "chat",
-                    SopInstance.source_ref == user_message_id,
-                )
-                .order_by(SopInstance.created_at.desc(), SopInstance.id.desc())
-            ).first()
-            if sop_instance is not None:
+            if runtime_execution_id:
+                sop_instance = self.db.get(SopInstance, runtime_execution_id)
+            else:
+                matches = self.db.exec(
+                    select(SopInstance).where(
+                        SopInstance.tenant_id == chat_session.tenant_id,
+                        SopInstance.session_id == chat_session.id,
+                        SopInstance.kind == "sop",
+                        SopInstance.source_kind == "chat",
+                        SopInstance.source_ref == user_message_id,
+                    ).limit(2)
+                ).all()
+                sop_instance = matches[0] if len(matches) == 1 else None
+            if (sop_instance is not None and sop_instance.tenant_id == chat_session.tenant_id
+                    and sop_instance.session_id == chat_session.id):
                 metadata = {**metadata, "execution_id": sop_instance.id}
+            from app.feedback.source import freeze_execution_source
+
+            metadata["feedback_source"] = freeze_execution_source(
+                self.db, chat_session, user_message_id, metadata.get("execution_id"),
+            )
         knowledge_results = list(step_result.knowledge_results or []) if step_result else []
         citations = self._dedupe_knowledge_citations(
             knowledge_citations_from_results(knowledge_results)
@@ -9815,8 +10675,13 @@ class AgentLoop:
         role: str,
         content: str,
         metadata: dict[str, Any] | None = None,
+        *,
+        message_id: str | None = None,
     ) -> Message:
+        """追加一条账本消息，并允许调用方在需要时先冻结服务端来源身份。"""
+
         message = Message(
+            id=message_id or new_id("msg"),
             tenant_id=tenant_id,
             session_id=session_id,
             role=role,
@@ -9825,6 +10690,112 @@ class AgentLoop:
         )
         self.db.add(message)
         return message
+
+    def _append_user_input_message(
+        self,
+        request: ChatTurnRequest,
+        session_id: str,
+        *,
+        time_context: Mapping[str, Any] | None = None,
+    ) -> tuple[Message, dict[str, str]]:
+        """为同步、流式和恢复入口统一冻结并持久化当前用户输入时间事实。"""
+
+        persisted_context = normalize_persisted_time_context(time_context)
+        if persisted_context is None:
+            message_id = new_id("msg")
+            # 先创建账本消息，再用实际落盘身份冻结时间；这样测试替身、
+            # 兼容入口或未来存储适配器即使重写消息 ID，也不会留下悬空来源。
+            message = self._append_message(
+                request.tenant_id,
+                session_id,
+                "user",
+                request.message,
+                metadata={},
+                message_id=message_id,
+            )
+            persisted_context = freeze_time_context(
+                source_input_id=message.id,
+                client_timezone=request.client_timezone,
+            )
+            message.metadata_json = self._user_message_metadata(
+                request,
+                time_context=persisted_context,
+            )
+            self._freeze_memory_source_for_message(request, session_id, message)
+            return message, persisted_context
+        message_id = (
+            persisted_context["source_input_id"]
+            if persisted_context.get("timezone_source") != "scheduled_task"
+            else new_id("msg")
+        )
+        if persisted_context.get("timezone_source") != "scheduled_task":
+            existing_message = self.db.get(Message, message_id) if callable(
+                getattr(self.db, "get", None)
+            ) else None
+            if (
+                existing_message is not None
+                and existing_message.tenant_id == request.tenant_id
+                and existing_message.session_id == session_id
+                and existing_message.role == "user"
+            ):
+                return existing_message, normalize_persisted_time_context(
+                    (existing_message.metadata_json or {}).get("time_context")
+                ) or persisted_context
+        metadata = self._user_message_metadata(request, time_context=persisted_context)
+        message = self._append_message(
+            request.tenant_id,
+            session_id,
+            "user",
+            request.message,
+            metadata=metadata,
+            message_id=message_id,
+        )
+        self._freeze_memory_source_for_message(request, session_id, message)
+        return message, persisted_context
+
+    def _freeze_memory_source_for_message(
+        self,
+        request: ChatTurnRequest,
+        session_id: str,
+        message: Message,
+    ) -> None:
+        """在真实数据库事务内登记用户消息的可信记忆来源，替身数据库保持兼容。"""
+
+        if not callable(getattr(self.db, "get", None)) or not callable(
+            getattr(self.db, "exec", None)
+        ):
+            return
+        chat_session = self.db.get(ChatSession, session_id)
+        if chat_session is None:
+            return
+        freeze_memory_source_anchor(
+            self.db,
+            tenant_id=request.tenant_id,
+            user_id=request.user_id or chat_session.user_id,
+            agent_id=chat_session.agent_id or request.agent_id,
+            message=message,
+            model_config=self._memory_model_at_input(request, chat_session),
+        )
+
+    def _memory_model_at_input(
+        self, request: ChatTurnRequest, chat_session: ChatSession
+    ) -> ModelConfig | None:
+        """沿真实选模入口冻结输入合同，预条件错误仍由原处理链向用户返回。"""
+
+        try:
+            return self._get_request_model(request, chat_session.agent_id)
+        except AgentLoopPreconditionError:
+            return None
+
+    def _time_context_for_user_message(self, user_message_id: str | None) -> dict[str, str] | None:
+        """回查本轮用户消息的时间事实，供回复、取消和等待快照继续关联。"""
+
+        if not user_message_id or not callable(getattr(self.db, "get", None)):
+            return None
+        message = self.db.get(Message, user_message_id)
+        if message is None or not isinstance(message.metadata_json, dict):
+            return None
+        return normalize_persisted_time_context(message.metadata_json.get("time_context"))
 
     def _persist_cancelled_assistant_message(
         self,
@@ -9873,26 +10844,30 @@ class AgentLoop:
 
         canonical_partial = partial_text if partial_text.strip() else ""
         assistant_content = canonical_partial or CANCELLED_ASSISTANT_REPLY
+        time_context = self._time_context_for_user_message(user_message_id)
         last_seq = len(
             self._persisted_turn_delta_parts(tenant_id, chat_session.id, user_message_id)
         )
         chat_session.updated_at = utc_now()
         chat_session.status = "active"
         chat_session.summary = f"最近回复：{assistant_content}"
+        cancelled_metadata: dict[str, Any] = {
+            "turn_id": user_message_id,
+            "user_message_id": user_message_id,
+            "client_turn_id": normalized_client_turn_id or None,
+            "status": "cancelled",
+            "partial": bool(canonical_partial),
+            "terminal_reason": "user_cancelled",
+            "last_seq": last_seq,
+        }
+        if time_context is not None:
+            cancelled_metadata["time_context"] = time_context
         assistant_message = self._append_message(
             tenant_id,
             chat_session.id,
             "assistant",
             assistant_content,
-            metadata={
-                "turn_id": user_message_id,
-                "user_message_id": user_message_id,
-                "client_turn_id": normalized_client_turn_id or None,
-                "status": "cancelled",
-                "partial": bool(canonical_partial),
-                "terminal_reason": "user_cancelled",
-                "last_seq": last_seq,
-            },
+            metadata=cancelled_metadata,
         )
         self.events.record(
             tenant_id,
@@ -9909,6 +10884,7 @@ class AgentLoop:
                 "partial": bool(canonical_partial),
                 "terminal_reason": "user_cancelled",
                 "last_seq": last_seq,
+                "time_context": time_context,
             },
         )
         self.events.record(
@@ -9940,8 +10916,18 @@ class AgentLoop:
 
         return "".join(self._persisted_turn_delta_parts(tenant_id, session_id, turn_id))
 
-    def _user_message_metadata(self, request: ChatTurnRequest) -> dict[str, Any]:
+    def _user_message_metadata(
+        self,
+        request: ChatTurnRequest,
+        *,
+        time_context: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """汇总用户消息控制元数据，并写入已验证的输入时间事实。"""
+
         metadata: dict[str, Any] = {}
+        normalized_time_context = normalize_persisted_time_context(time_context)
+        if normalized_time_context is not None:
+            metadata["time_context"] = normalized_time_context
         if request.client_turn_id:
             metadata["client_turn_id"] = request.client_turn_id
         if request.interaction_mode == "scheduled_task":
@@ -10170,17 +11156,31 @@ class AgentLoop:
         tool_result: ToolResult | None,
         model_config: ModelConfig,
         *,
+        user_message_id: str | None = None,
+        assistant_message_id: str | None = None,
         commit: bool = True,
     ) -> list[dict[str, object]]:
-        """登记记忆捕获异步任务；流式终态可将事件留在同一最终事务中提交。"""
+        """在当前完成事务登记持久任务，并把唤醒推迟到事务提交之后。"""
 
         try:
-            job = enqueue_memory_capture(
+            resolved_user_message_id = str(user_message_id or "").strip()
+            resolved_assistant_message_id = str(
+                assistant_message_id
+                or getattr(self, "_last_finalized_assistant_message_id", "")
+                or ""
+            ).strip() or None
+            if not resolved_user_message_id:
+                return []
+            registration = register_memory_capture_job(
+                self.db,
                 request,
-                chat_session.id,
-                step_result,
-                tool_result,
-                model_config.id,
+                chat_session,
+                model_config,
+                user_message_id=resolved_user_message_id,
+                assistant_message_id=resolved_assistant_message_id,
+                step_result=step_result,
+                tool_result=tool_result,
+                events=self.events,
             )
         except Exception as exc:
             self.events.record(
@@ -10190,15 +11190,52 @@ class AgentLoop:
                 {"message": str(exc)},
             )
             return []
-        self.events.record(
-            request.tenant_id,
-            chat_session.id,
-            "async_job_enqueued",
-            {"job_id": job.id, "job_name": job.name, "feature": "memory"},
-        )
+        if registration is None:
+            return []
+        job = registration.job
+        refs = [{"job_id": job.id, "job_name": "memory.capture_turn"}]
+        if registration.created and not commit:
+            pending = getattr(self, "_pending_memory_capture_wake_ids", None)
+            if not isinstance(pending, list):
+                pending = []
+                self._pending_memory_capture_wake_ids = pending
+            if job.id not in pending:
+                pending.append(job.id)
         if commit:
             self.db.commit()
-        return [{"job_id": job.id, "job_name": job.name}]
+            if registration.created:
+                self._wake_memory_capture_refs(refs)
+        return refs
+
+    def _wake_memory_capture_refs(self, refs: list[dict[str, object]] | None = None) -> None:
+        """在原完成事务提交后发送 best-effort 唤醒，通知失败不丢持久任务。"""
+
+        if refs is None:
+            pending = list(getattr(self, "_pending_memory_capture_wake_ids", []) or [])
+            self._pending_memory_capture_wake_ids = []
+            job_ids = pending
+        else:
+            job_ids = [
+                str(item.get("job_id") or "").strip()
+                for item in refs
+                if str(item.get("job_id") or "").strip()
+            ]
+            pending = list(getattr(self, "_pending_memory_capture_wake_ids", []) or [])
+            if pending:
+                self._pending_memory_capture_wake_ids = [
+                    item for item in pending if item not in set(job_ids)
+                ]
+                job_ids.extend(item for item in pending if item not in job_ids)
+        for job_id in dict.fromkeys(job_ids):
+            try:
+                wake_memory_capture_job(job_id)
+            except Exception:  # noqa: BLE001 - durable job remains recoverable by scanner.
+                logger.exception("memory capture wakeup failed", extra={"job_id": job_id})
+
+    def _flush_memory_capture_wakeups(self) -> None:
+        """兼容测试和恢复入口，提交后发送当前事务积累的唤醒。"""
+
+        self._wake_memory_capture_refs()
 
     def _finish_with_error(
         self,
@@ -10279,12 +11316,15 @@ class AgentLoop:
         else:
             metadata.pop("knowledge_citations", None)
             metadata.pop("knowledge_query", None)
+        time_context = self._time_context_for_user_message(user_message_id)
         if not chat_session.title and source_message:
             fallback_title = self._fallback_session_title_from_message(source_message)
             if fallback_title:
                 chat_session.title = fallback_title
         chat_session.summary = f"最近回复：{reply[:120]}"
         assistant_metadata = dict(metadata or {})
+        if time_context is not None:
+            assistant_metadata.setdefault("time_context", time_context)
         if user_message_id:
             assistant_metadata.setdefault("user_message_id", user_message_id)
             assistant_metadata.setdefault("turn_id", user_message_id)
@@ -10298,6 +11338,7 @@ class AgentLoop:
             reply,
             metadata=assistant_metadata,
         )
+        self._last_finalized_assistant_message_id = assistant_message.id
         event_payload: dict[str, Any] = {
             "message_id": assistant_message.id,
             "assistant_message_id": assistant_message.id,
@@ -10310,6 +11351,8 @@ class AgentLoop:
             event_payload["client_turn_id"] = normalized_client_turn_id
         if assistant_metadata.get("knowledge_citations"):
             event_payload["knowledge_citations"] = assistant_metadata["knowledge_citations"]
+        if time_context is not None:
+            event_payload["time_context"] = time_context
         for metadata_key in (
             "response_source",
             "render_policy",

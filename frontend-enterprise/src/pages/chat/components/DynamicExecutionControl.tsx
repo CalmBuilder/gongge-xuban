@@ -1,9 +1,9 @@
 /**
- * @Time       : 2026/08/04 17:05
+ * @Time       : 2026/10/04
  * @Author     : zhanglp8181
  * @File       : DynamicExecutionControl.tsx
- * @CallChain  : Chat 动态执行消息 → Execution/Skill catalog API → add_skill/steer/cancel 持久命令
- * @Description: 展示动态计划、并行读取证据，并允许在安全边界追加固定 Skill 或约束。
+ * @CallChain  : Chat SOP/DTA执行消息 → Execution API → 原cancel及DTA add_skill/steer命令
+ * @Description: 共享执行结果与取消对账；仅DTA允许在安全边界追加Skill和约束。
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -248,11 +248,12 @@ export default function DynamicExecutionControl({ executionId }: { executionId: 
 
   if (!execution || !['dynamic_task', 'sop'].includes(execution.kind)) return null;
   const dynamicExecution = execution.kind === 'dynamic_task';
-  const active = dynamicExecution && ACTIVE_STATUSES.has(execution.status);
+  const active = ACTIVE_STATUSES.has(execution.status);
   const cancellationPending = isCancellationPending(command, execution);
 
   async function issue(commandType: 'steer' | 'cancel' | 'add_skill') {
     if (!execution || !active || submittingRef.current || (commandType !== 'cancel' && cancellationPending)) return;
+    if (commandType !== 'cancel' && !dynamicExecution) return;
     if (commandType === 'cancel' && cancellationPending) return;
     const normalized = instruction.trim();
     if (commandType === 'steer' && !normalized) {
@@ -357,12 +358,12 @@ export default function DynamicExecutionControl({ executionId }: { executionId: 
         </span>
         {active ? (
           <span className="flex flex-wrap justify-end gap-[6px]">
-            <Button variant="outline" size="sm" disabled={submitting || cancellationPending} onClick={() => void openSkillDialog()}>
+            {dynamicExecution ? <><Button variant="outline" size="sm" disabled={submitting || cancellationPending} onClick={() => void openSkillDialog()}>
               <Sparkles className="size-[13px]" />运行中增加 Skill
             </Button>
             <Button variant="outline" size="sm" disabled={submitting || cancellationPending} onClick={() => setDialogOpen(true)}>
               <SlidersHorizontal className="size-[13px]" />追加约束
-            </Button>
+            </Button></> : null}
             <Button variant="ghost" size="sm" disabled={submitting || cancellationPending} onClick={() => void issue('cancel')}>
               取消任务
             </Button>

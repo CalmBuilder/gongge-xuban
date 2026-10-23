@@ -1,5 +1,5 @@
 """
-@Time       : 2026/07/22 20:45
+@Time       : 2026/10/02
 @Author     : zhanglp8181
 @File       : test_agent_loop_completion.py
 @CallChain  : pytest → AgentLoop → 会话完成/消息与事件持久化
@@ -9,6 +9,8 @@
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy.pool import StaticPool
+from sqlmodel import Session, SQLModel, create_engine, select
 
 from app.core.agent_loop import (
     GRAPH_PENDING_STEPS_SLOT,
@@ -21,7 +23,8 @@ from app.core.non_sop_capability import (
     NonSopCapabilityRouter,
 )
 from app.core.skill_runtime import SkillRuntime
-from app.db.models import AgentEvent, ChatSession, MemoryRecord, Message, Skill, Tool
+from app.agents.branching import ensure_open_gallery_binding
+from app.db.models import AgentEvent, AgentProfile, ChatSession, MemoryRecord, Message, Skill, Tool
 from app.dynamic_tasks.agent import DynamicRunOutcome
 from app.knowledge.schema import KnowledgeSearchResponse
 from app.general_skills.schema import GeneralSkillSelection
@@ -35,8 +38,10 @@ from app.session.session_schema import (
     StepAgentResult,
 )
 from app.sop_runtime.coordinator import DeterministicSopCoordinator
+from app.sop_runtime.execution_store import SopExecutionStore
 from app.sop_runtime.scheduler import RuntimeAction, RuntimePlan
-from app.tools.tool_schema import ToolCall, ToolResult
+from app.tools.tool_executor import ToolExecutor
+from app.tools.tool_schema import ToolCall, ToolError, ToolResult
 
 
 class FakeEvents:
@@ -75,6 +80,15 @@ class FakeDb:
         return FakeExecResult([row for row in self.added if isinstance(row, Message)])
 
 
+class WaitingMessageDb(FakeDb):
+    """等待消息测试显式提供来源读取边界，不改变其他非数据库测试替身能力。"""
+
+    def get(self, model: type, identity: str) -> object | None:
+        """仅返回实际添加的行；未预置Execution保持未知来源而不制造零调用。"""
+        return next((row for row in self.added
+                     if isinstance(row, model) and getattr(row, "id", None) == identity), None)
+
+
 class FakeExecResult:
     def __init__(self, rows: list[object]) -> None:
         self.rows = rows
@@ -90,7 +104,7 @@ def test_dynamic_waiting_message_is_persisted_once_with_execution_identity() -> 
     """相同 Execution 阻塞点重放时复用等待消息并保留恢复所需身份。"""
 
     loop = object.__new__(AgentLoop)
-    loop.db = FakeDb()
+    loop.db = WaitingMessageDb()
     loop.events = FakeEvents()
     session = ChatSession(id="session_waiting", tenant_id="tenant_demo")
 
@@ -113,6 +127,10 @@ def test_dynamic_waiting_message_is_persisted_once_with_execution_identity() -> 
         "execution_id": "execution_1",
         "execution_status": "waiting",
         "blocking_step_key": "clarify_region",
+        "feedback_source": {
+            "policy_version": "feedback_source_v1", "turn_id": "message_1",
+            "agent_id": None, "execution_id": None, "operations": None,
+        },
         "turn_id": "message_1",
         "user_message_id": "message_1",
     }
@@ -347,6 +365,23 @@ class FakeToolExecutor:
     def __init__(self, db: FakeDb) -> None:
         self.db = db
         self.commits_seen_before_execute: int | None = None
+        self.execute_calls = 0
+        self.authorization_result: ToolResult | None = None
+
+    def authorize(
+        self,
+        _tenant_id: str,
+        _tool_call: ToolCall,
+        _active_skill_id: str | None = None,
+        _agent_id: str | None = None,
+        _actor_user_id: str | None = None,
+        _execution_org_unit_id: str | None = None,
+        _remote_idempotency_key: str | None = None,
+        _is_cancelled=None,
+    ) -> ToolResult | None:
+        """返回可控的当前授权结论，供兼容回执复用测试撤权。"""
+
+        return self.authorization_result
 
     def execute(
         self,
@@ -357,6 +392,7 @@ class FakeToolExecutor:
         actor_user_id: str | None = None,
     ) -> ToolResult:
         self.commits_seen_before_execute = self.db.commits
+        self.execute_calls += 1
         return ToolResult(tool_name=tool_call.name, success=True, data={"ok": True})
 
 
@@ -417,7 +453,10 @@ def _no_sop_stream_with_shadow(
         "accessible_count": 0,
     }
     loop._get_persona_prompt = lambda *_args, **_kwargs: None
-    loop.memory = SimpleNamespace(context_memories=lambda *_args, **_kwargs: [])
+    loop.memory = SimpleNamespace(
+        context_memories=lambda *_args, **_kwargs: [],
+        context_memory_payloads=lambda *_args, **_kwargs: [],
+    )
     loop._drop_unavailable_skill_state = lambda *_args, **_kwargs: False
     loop._conversation_context = lambda *_args, **_kwargs: {}
     loop._auto_knowledge_step_result = lambda *_args, **_kwargs: StepAgentResult()
@@ -476,7 +515,10 @@ def test_stream_dynamic_waiting_does_not_close_turn() -> None:
 
     loop.db = db
     loop.events = events
-    loop.memory = SimpleNamespace(context_memories=lambda *_args, **_kwargs: [])
+    loop.memory = SimpleNamespace(
+        context_memories=lambda *_args, **_kwargs: [],
+        context_memory_payloads=lambda *_args, **_kwargs: [],
+    )
     loop._get_or_create_session = lambda _request: session
     loop._mark_session_running = lambda *_args, **_kwargs: None
     loop._append_message = lambda *_args, **_kwargs: user_message
@@ -575,7 +617,10 @@ def test_stream_dynamic_success_does_not_append_after_runtime_terminal() -> None
 
     loop.db = db
     loop.events = events
-    loop.memory = SimpleNamespace(context_memories=lambda *_args, **_kwargs: [])
+    loop.memory = SimpleNamespace(
+        context_memories=lambda *_args, **_kwargs: [],
+        context_memory_payloads=lambda *_args, **_kwargs: [],
+    )
     loop._get_or_create_session = lambda _request: session
     loop._mark_session_running = lambda *_args, **_kwargs: None
     loop._append_message = lambda *_args, **_kwargs: user_message
@@ -683,7 +728,7 @@ def test_dynamic_blocked_projects_as_resumable_waiting_with_client_turn_identity
     """动态读取因重新认证或限流阻塞时，聊天层必须保留等待态和客户端 Turn 身份。"""
 
     loop = object.__new__(AgentLoop)
-    loop.db = FakeDb()
+    loop.db = WaitingMessageDb()
     loop.events = FakeEvents()
     session = ChatSession(
         id="session_dynamic_blocked",
@@ -767,7 +812,16 @@ def _no_sop_prepared_turn_with_shadow(
     }
     loop._drop_unavailable_skill_state = lambda *_args, **_kwargs: False
     loop.memory = SimpleNamespace(
-        context_memories=lambda *_args, **_kwargs: list(memories or [])
+        context_memories=lambda *_args, **_kwargs: list(memories or []),
+        context_memory_payloads=lambda *_args, **_kwargs: [
+            {
+                "id": row.id,
+                "kind": row.kind,
+                "content": row.content,
+                "metadata": row.metadata_json or {},
+            }
+            for row in memories or []
+        ],
     )
     loop._conversation_context = lambda *_args, **_kwargs: {}
     loop._auto_knowledge_step_result = lambda *_args, **_kwargs: StepAgentResult()
@@ -811,6 +865,7 @@ def test_no_sop_shadow_does_not_change_sse_frames() -> None:
         for item in items:
             data = dict(item.get("data") or {})
             data.pop("timestamp", None)
+            data.pop("time_context", None)
             normalized.append({**item, "data": data})
         return normalized
 
@@ -955,7 +1010,9 @@ def test_deterministic_tool_call_passes_remote_idempotency_key_to_executor() -> 
     }
 
 
-def test_side_effect_tool_call_reuses_previous_successful_result() -> None:
+def test_side_effect_tool_call_without_trusted_identity_does_not_reuse_result() -> None:
+    """没有持久动作身份时不得按会话内同参数猜测复用外部成功回执。"""
+
     tool = Tool(
         tenant_id="tenant_demo",
         name="crm.create_ticket",
@@ -1008,15 +1065,456 @@ def test_side_effect_tool_call_reuses_previous_successful_result() -> None:
     )
 
     assert result.success is True
-    assert result.data["ticket_id"] == "TCK-1001"
-    assert result.data["idempotent_replay"] is True
-    assert executor.commits_seen_before_execute is None
-    assert db.commits == 1
+    assert result.data == {"ok": True}
+    assert executor.commits_seen_before_execute == 1
+    assert db.commits == 2
     assert [record[2] for record in loop.events.records] == [
-        "tool_call_reused",
+        "tool_call_started",
         "tool_call_finished",
     ]
-    assert loop.events.records[-1][3]["idempotent_replay"] is True
+    assert loop.events.records[-1][3]["success"] is True
+
+
+def test_sop_operation_receipt_reuse_uses_exact_operation_and_not_executor() -> None:
+    """确定性 Runtime 只复用当前精确 Operation 的终态回执，不再次调用适配器。"""
+
+    tool_call = ToolCall(
+        name="crm.create_ticket",
+        arguments={"customer_id": "C-1", "subject": "发票开具"},
+    )
+    captured = {"dispatches": 0}
+    operation = SimpleNamespace(
+        id="operation_1",
+        logical_action_id="action_1",
+        status="succeeded",
+        request_fingerprint=SopExecutionStore.request_fingerprint(tool_call.arguments),
+        result_json={"ticket_id": "TCK-1001"},
+        error_json={},
+        remote_idempotency_key="remote-key-1",
+    )
+
+    class Runtime:
+        """提供当前 Operation 查询的最小确定性 Runtime 替身。"""
+
+        def current_tool_operation(self, _session, current_call):
+            """只返回名称和完整请求指纹均匹配的当前 Operation。"""
+
+            assert current_call == tool_call
+            assert operation.request_fingerprint == SopExecutionStore.request_fingerprint(
+                current_call.arguments
+            )
+            return operation
+
+    class Executor:
+        """记录授权和真实派发，验证回执复用顺序。"""
+
+        def authorize(self, *_args, **_kwargs):
+            """模拟当前授权仍然有效。"""
+
+            return None
+
+        def execute(self, *_args, **_kwargs):
+            """真实派发不应在 Operation 终态复用路径被调用。"""
+
+            captured["dispatches"] += 1
+            return ToolResult(tool_name=tool_call.name, success=True, data={"unexpected": True})
+
+    loop = object.__new__(AgentLoop)
+    loop.db = FakeDb()
+    loop.events = FakeEvents()
+    loop.tool_executor = Executor()
+    loop.deterministic_runtime = Runtime()
+    session = ChatSession(
+        id="session_test",
+        tenant_id="tenant_demo",
+        active_skill_id="skill_ticket",
+    )
+
+    result = loop._execute_tool_call(
+        _request("重试工单"),
+        session,
+        tool_call,
+        tool_call_id="temporary_retry_id",
+    )
+
+    assert result.success is True
+    assert result.data == {
+        "ticket_id": "TCK-1001",
+        "idempotent_replay": True,
+        "receipt_source": "sop_operation",
+        "operation_id": "operation_1",
+        "logical_action_id": "action_1",
+    }
+    assert captured["dispatches"] == 0
+    assert loop.events.records[0][3]["receipt_source"] == "sop_operation"
+    assert loop.events.records[0][3]["operation_id"] == "operation_1"
+
+
+def test_sop_operation_receipt_reuse_checks_current_authorization_first() -> None:
+    """确定性 Operation 即使已有成功回执，撤权后也不得泄露回执或继续复用。"""
+
+    tool_call = ToolCall(name="crm.create_ticket", arguments={"customer_id": "C-1"})
+    operation = SimpleNamespace(
+        id="operation_revoked",
+        logical_action_id="action_revoked",
+        status="succeeded",
+        request_fingerprint=SopExecutionStore.request_fingerprint(tool_call.arguments),
+        result_json={"ticket_id": "TCK-REVOKED"},
+        error_json={},
+        remote_idempotency_key="remote-key-revoked",
+    )
+
+    class Runtime:
+        """返回已完成但当前调用人已失去权限的 Operation。"""
+
+        def current_tool_operation(self, _session, _tool_call):
+            """返回测试 Operation。"""
+
+            return operation
+
+    class Executor:
+        """模拟撤权后的统一授权边界。"""
+
+        def authorize(self, *_args, **_kwargs):
+            """拒绝当前授权，不接触真实派发。"""
+
+            return ToolResult(
+                tool_name=tool_call.name,
+                success=False,
+                error=ToolError(code="ACTOR_PERMISSION_REQUIRED", message="权限已撤销。"),
+            )
+
+        def execute(self, *_args, **_kwargs):
+            """撤权路径不应调用执行器。"""
+
+            raise AssertionError("撤权后不得派发工具")
+
+    loop = object.__new__(AgentLoop)
+    loop.db = FakeDb()
+    loop.events = FakeEvents()
+    loop.tool_executor = Executor()
+    loop.deterministic_runtime = Runtime()
+    session = ChatSession(id="session_test", tenant_id="tenant_demo", active_skill_id="skill_ticket")
+
+    result = loop._execute_tool_call(_request("重试工单"), session, tool_call)
+
+    assert result.success is False
+    assert result.error is not None
+    assert result.error.code == "ACTOR_PERMISSION_REQUIRED"
+    assert result.data is None
+    assert loop.events.records[0][3]["receipt_source"] == "authorization_rejected"
+
+
+def test_compatibility_entry_reuses_same_persistent_action_across_temp_call_ids() -> None:
+    """兼容入口同一持久动作重试时复用回执，临时 tool_call_id 变化不影响身份。"""
+
+    tool_call = ToolCall(name="crm.create_ticket", arguments={"customer_id": "C-1"})
+    event = AgentEvent(
+        id="evt_action_1",
+        tenant_id="tenant_demo",
+        session_id="session_test",
+        event_type="tool_call_finished",
+        payload_json={
+            "tool_name": tool_call.name,
+            "success": True,
+            "data": {"ticket_id": "TCK-1001"},
+            "persistent_action_id": "action-1",
+            "request_fingerprint": SopExecutionStore.request_fingerprint(tool_call.arguments),
+            "tool_call": tool_call.model_dump(mode="json"),
+        },
+    )
+    tool = Tool(
+        tenant_id="tenant_demo",
+        name=tool_call.name,
+        display_name="创建工单",
+        method="POST",
+        url="http://localhost:8000/api/mock/tickets",
+        enabled=True,
+    )
+    db = FakeEventDb(tool, [event])
+    executor = FakeToolExecutor(db)
+    loop = object.__new__(AgentLoop)
+    loop.db = db
+    loop.events = FakeEvents()
+    loop.tool_executor = executor
+    session = ChatSession(id="session_test", tenant_id="tenant_demo")
+
+    result = loop._execute_tool_call(
+        _request("重试工单"),
+        session,
+        tool_call,
+        tool_call_id="temporary-call-2",
+        persistent_action_id="action-1",
+    )
+
+    assert result.success is True
+    assert result.data["ticket_id"] == "TCK-1001"
+    assert result.data["receipt_source"] == "compatibility_event"
+    assert executor.execute_calls == 0
+    assert loop.events.records[0][3]["persistent_action_id"] == "action-1"
+
+
+def test_compatibility_entry_new_identity_same_arguments_dispatches() -> None:
+    """兼容入口使用新持久动作身份时，即使参数相同也必须形成独立本地动作。"""
+
+    tool_call = ToolCall(name="crm.create_ticket", arguments={"customer_id": "C-1"})
+    old_event = AgentEvent(
+        id="evt_action_old",
+        tenant_id="tenant_demo",
+        session_id="session_test",
+        event_type="tool_call_finished",
+        payload_json={
+            "tool_name": tool_call.name,
+            "success": True,
+            "data": {"ticket_id": "TCK-OLD"},
+            "persistent_action_id": "action-old",
+            "request_fingerprint": SopExecutionStore.request_fingerprint(tool_call.arguments),
+            "tool_call": tool_call.model_dump(mode="json"),
+        },
+    )
+    tool = Tool(
+        tenant_id="tenant_demo",
+        name=tool_call.name,
+        display_name="创建工单",
+        method="POST",
+        url="http://localhost:8000/api/mock/tickets",
+        enabled=True,
+    )
+    db = FakeEventDb(tool, [old_event])
+    executor = FakeToolExecutor(db)
+    loop = object.__new__(AgentLoop)
+    loop.db = db
+    loop.events = FakeEvents()
+    loop.tool_executor = executor
+    session = ChatSession(id="session_test", tenant_id="tenant_demo")
+
+    result = loop._execute_tool_call(
+        _request("再次创建工单"),
+        session,
+        tool_call,
+        persistent_action_id="action-new",
+    )
+
+    assert result.success is True
+    assert result.data == {"ok": True}
+    assert executor.execute_calls == 1
+    assert [record[2] for record in loop.events.records] == [
+        "tool_call_started",
+        "tool_call_finished",
+    ]
+    assert loop.events.records[0][3]["persistent_action_id"] == "action-new"
+
+
+def test_compatibility_entry_same_identity_different_arguments_conflicts() -> None:
+    """兼容入口同一持久身份改参数时拒绝把它伪装成新派发。"""
+
+    original_call = ToolCall(name="crm.create_ticket", arguments={"customer_id": "C-1"})
+    changed_call = ToolCall(name="crm.create_ticket", arguments={"customer_id": "C-2"})
+    event = AgentEvent(
+        id="evt_action_conflict",
+        tenant_id="tenant_demo",
+        session_id="session_test",
+        event_type="tool_call_finished",
+        payload_json={
+            "tool_name": original_call.name,
+            "success": True,
+            "data": {"ticket_id": "TCK-ORIGINAL"},
+            "persistent_action_id": "action-fixed",
+            "request_fingerprint": SopExecutionStore.request_fingerprint(
+                original_call.arguments
+            ),
+            "tool_call": original_call.model_dump(mode="json"),
+        },
+    )
+    tool = Tool(
+        tenant_id="tenant_demo",
+        name=original_call.name,
+        display_name="创建工单",
+        method="POST",
+        url="http://localhost:8000/api/mock/tickets",
+        enabled=True,
+    )
+    db = FakeEventDb(tool, [event])
+    executor = FakeToolExecutor(db)
+    loop = object.__new__(AgentLoop)
+    loop.db = db
+    loop.events = FakeEvents()
+    loop.tool_executor = executor
+    session = ChatSession(id="session_test", tenant_id="tenant_demo")
+
+    result = loop._execute_tool_call(
+        _request("改成另一个客户"),
+        session,
+        changed_call,
+        persistent_action_id="action-fixed",
+    )
+
+    assert result.success is False
+    assert result.error is not None
+    assert result.error.code == "SOP_EXECUTION_CONFLICT"
+    assert executor.execute_calls == 0
+
+
+def test_compatibility_entry_unknown_action_never_redispatches() -> None:
+    """兼容入口已有 unknown 事实时必须停止并等待对账，不能再次调用执行器。"""
+
+    tool_call = ToolCall(name="crm.create_ticket", arguments={"customer_id": "C-1"})
+    unknown_event = AgentEvent(
+        id="evt_action_unknown",
+        tenant_id="tenant_demo",
+        session_id="session_test",
+        event_type="tool_call_finished",
+        payload_json={
+            "tool_name": tool_call.name,
+            "success": False,
+            "outcome_status": "unknown",
+            "persistent_action_id": "action-unknown",
+            "request_fingerprint": SopExecutionStore.request_fingerprint(tool_call.arguments),
+            "tool_call": tool_call.model_dump(mode="json"),
+        },
+    )
+    tool = Tool(
+        tenant_id="tenant_demo",
+        name=tool_call.name,
+        display_name="创建工单",
+        method="POST",
+        url="http://localhost:8000/api/mock/tickets",
+        enabled=True,
+    )
+    db = FakeEventDb(tool, [unknown_event])
+    executor = FakeToolExecutor(db)
+    loop = object.__new__(AgentLoop)
+    loop.db = db
+    loop.events = FakeEvents()
+    loop.tool_executor = executor
+    session = ChatSession(id="session_test", tenant_id="tenant_demo")
+
+    result = loop._execute_tool_call(
+        _request("继续重试"),
+        session,
+        tool_call,
+        persistent_action_id="action-unknown",
+    )
+
+    assert result.success is False
+    assert result.error is not None
+    assert result.error.code == "TOOL_CALL_OUTCOME_UNKNOWN"
+    assert executor.execute_calls == 0
+    assert loop.events.records[0][3]["receipt_source"] == "compatibility_unknown"
+    assert loop.events.records[1][3]["outcome_status"] == "unknown"
+
+
+def test_compatibility_entry_retries_known_failure_with_same_identity() -> None:
+    """兼容入口确定失败后允许同一持久动作重试，不把未完成起始事件误判为 unknown。"""
+
+    tool_call = ToolCall(name="crm.create_ticket", arguments={"customer_id": "C-1"})
+    failed_event = AgentEvent(
+        id="evt_action_failed",
+        tenant_id="tenant_demo",
+        session_id="session_test",
+        event_type="tool_call_finished",
+        payload_json={
+            "tool_name": tool_call.name,
+            "success": False,
+            "outcome_status": "failed",
+            "persistent_action_id": "action-failed",
+            "request_fingerprint": SopExecutionStore.request_fingerprint(tool_call.arguments),
+            "tool_call": tool_call.model_dump(mode="json"),
+            "tool_call_id": "temporary-failed",
+        },
+    )
+    started_event = AgentEvent(
+        id="evt_action_started",
+        tenant_id="tenant_demo",
+        session_id="session_test",
+        event_type="tool_call_started",
+        payload_json={
+            "tool_name": tool_call.name,
+            "persistent_action_id": "action-failed",
+            "request_fingerprint": SopExecutionStore.request_fingerprint(tool_call.arguments),
+            "tool_call": tool_call.model_dump(mode="json"),
+            "tool_call_id": "temporary-failed",
+        },
+    )
+    tool = Tool(
+        tenant_id="tenant_demo",
+        name=tool_call.name,
+        display_name="创建工单",
+        method="POST",
+        url="http://localhost:8000/api/mock/tickets",
+        enabled=True,
+    )
+    db = FakeEventDb(tool, [started_event, failed_event])
+    executor = FakeToolExecutor(db)
+    loop = object.__new__(AgentLoop)
+    loop.db = db
+    loop.events = FakeEvents()
+    loop.tool_executor = executor
+    session = ChatSession(id="session_test", tenant_id="tenant_demo")
+
+    result = loop._execute_tool_call(
+        _request("重试工单"),
+        session,
+        tool_call,
+        tool_call_id="temporary-retry",
+        persistent_action_id="action-failed",
+    )
+
+    assert result.success is True
+    assert executor.execute_calls == 1
+
+
+def test_compatibility_entry_checks_current_authorization_before_replay() -> None:
+    """兼容入口撤权后不得复用历史事件成功数据。"""
+
+    tool_call = ToolCall(name="crm.create_ticket", arguments={"customer_id": "C-1"})
+    event = AgentEvent(
+        id="evt_action_revoke",
+        tenant_id="tenant_demo",
+        session_id="session_test",
+        event_type="tool_call_finished",
+        payload_json={
+            "tool_name": tool_call.name,
+            "success": True,
+            "data": {"ticket_id": "TCK-REVOKED"},
+            "persistent_action_id": "action-revoke",
+            "request_fingerprint": SopExecutionStore.request_fingerprint(tool_call.arguments),
+            "tool_call": tool_call.model_dump(mode="json"),
+        },
+    )
+    tool = Tool(
+        tenant_id="tenant_demo",
+        name=tool_call.name,
+        display_name="创建工单",
+        method="POST",
+        url="http://localhost:8000/api/mock/tickets",
+        enabled=True,
+    )
+    db = FakeEventDb(tool, [event])
+    executor = FakeToolExecutor(db)
+    executor.authorization_result = ToolResult(
+        tool_name=tool_call.name,
+        success=False,
+        error=ToolError(code="ACTOR_PERMISSION_REQUIRED", message="权限已撤销。"),
+    )
+    loop = object.__new__(AgentLoop)
+    loop.db = db
+    loop.events = FakeEvents()
+    loop.tool_executor = executor
+    session = ChatSession(id="session_test", tenant_id="tenant_demo")
+
+    result = loop._execute_tool_call(
+        _request("重试工单"),
+        session,
+        tool_call,
+        persistent_action_id="action-revoke",
+    )
+
+    assert result.success is False
+    assert result.error is not None
+    assert result.error.code == "ACTOR_PERMISSION_REQUIRED"
+    assert result.data is None
+    assert executor.execute_calls == 0
 
 
 def test_post_read_only_tool_does_not_reuse_previous_result() -> None:
@@ -1087,7 +1585,10 @@ def test_stream_emits_context_status_only_when_compaction_runs(compacted_now: bo
 
     loop.db = db
     loop.events = FakeEvents()
-    loop.memory = SimpleNamespace(context_memories=lambda *_args, **_kwargs: [])
+    loop.memory = SimpleNamespace(
+        context_memories=lambda *_args, **_kwargs: [],
+        context_memory_payloads=lambda *_args, **_kwargs: [],
+    )
     loop.runtime = SimpleNamespace(apply_decision=lambda *_args, **_kwargs: None)
     loop.router = SimpleNamespace(
         decide=lambda *_args, **_kwargs: RouterDecision(
@@ -1169,7 +1670,10 @@ def test_stream_disconnect_does_not_persist_stop_event_without_cancel_flag() -> 
 
     loop.db = db
     loop.events = FakeEvents()
-    loop.memory = SimpleNamespace(context_memories=lambda *_args, **_kwargs: [])
+    loop.memory = SimpleNamespace(
+        context_memories=lambda *_args, **_kwargs: [],
+        context_memory_payloads=lambda *_args, **_kwargs: [],
+    )
     loop.runtime = SimpleNamespace(apply_decision=lambda *_args, **_kwargs: None)
     loop.router = SimpleNamespace(
         decide=lambda *_args, **_kwargs: RouterDecision(
@@ -1441,6 +1945,110 @@ def test_current_turn_task_frames_execute_in_order_without_pending_queue() -> No
     assert session.pending_tasks_json == []
     assert result is not None
     assert result.reply == "已完成\n\n已完成"
+
+
+def test_pending_task_reentry_keeps_same_turn_actions_distinct_by_task_id() -> None:
+    """真实待办续接中同 Skill/Step 的不同任务必须各自派发一次。"""
+
+    engine = create_engine("sqlite://", poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as db:
+        tool = _price_query_tool()
+        skill = Skill(
+            tenant_id="tenant_demo",
+            skill_id="query_product",
+            name="查询单个商品",
+            status="published",
+            content_json=_graph_content(
+                "query_product",
+                "查询单个商品",
+                [
+                    {
+                        "node_id": "query",
+                        "type": "tool_call",
+                        "name": "查询商品",
+                        "allowed_actions": ["call_tool:product.price_query"],
+                    },
+                    {"node_id": "reply", "name": "回复", "allowed_actions": ["answer_user"]},
+                ],
+            ),
+        )
+        overall = AgentProfile(
+            id="overall_pending_tasks",
+            tenant_id="tenant_demo",
+            name="公开广场",
+            is_overall=True,
+            status="active",
+        )
+        chat = ChatSession(id="pending_task_reentry", tenant_id="tenant_demo")
+        db.add_all([tool, skill, chat, overall])
+        db.flush()
+        ensure_open_gallery_binding(db, "tenant_demo", "skill", skill.id)
+        ensure_open_gallery_binding(db, "tenant_demo", "tool", tool.id)
+        db.commit()
+
+        loop = AgentLoop(db)
+        executor = _SqlitePriceToolExecutor(db)
+        loop.tool_executor = executor
+
+        def model_response(*_args: object, **kwargs: object) -> StepAgentResult:
+            """按当前待办任务槽位返回工具调用或工具后的确定性完成结果。"""
+
+            product = str(chat.slots_json.get("product_name") or "")
+            if kwargs.get("repair_reason") == "tool_continuation" or chat.active_step_id == "reply":
+                return StepAgentResult(reply=f"已查询 {product}。", is_step_completed=True)
+            return StepAgentResult(
+                tool_call=ToolCall(
+                    name=tool.name,
+                    arguments={"product_name": product},
+                )
+            )
+
+        loop._run_step_agent_once = model_response  # type: ignore[method-assign]
+        loop._get_reflection_max_rounds = lambda _tenant_id: 0  # type: ignore[method-assign]
+        request = _request("先查询 A1，再查询 A3")
+        request.client_turn_id = "stable-pending-turn"
+        frames = [
+            PendingTask(
+                task_id=f"task_{product}",
+                target_skill_id=skill.skill_id,
+                target_step_id="query",
+                confidence=1.0,
+                user_intent=f"查询 {product}",
+                slot_hints={"product_name": product},
+            )
+            for product in ["A1", "A3"]
+        ]
+
+        result = loop._try_continue_pending_after_completion(
+            request,
+            chat,
+            _model_config(),
+            [skill],
+            [tool],
+            None,
+            [],
+            {},
+            "前一任务已完成。",
+            turn_task_frames=frames,
+        )
+
+        assert executor.products == ["A1", "A3"]
+        assert result is not None and result.tool_result is not None
+        assert result.tool_result.success is True
+        started = db.exec(
+            select(AgentEvent)
+            .where(
+                AgentEvent.session_id == chat.id,
+                AgentEvent.event_type == "tool_call_started",
+            )
+            .order_by(AgentEvent.created_at, AgentEvent.id)
+        ).all()
+        action_ids = [str((event.payload_json or {}).get("persistent_action_id") or "") for event in started]
+        assert len(action_ids) == 2
+        assert len(set(action_ids)) == 2
+        assert "task:task_A1" in action_ids[0]
+        assert "task:task_A3" in action_ids[1]
 
 
 def test_only_started_waiting_task_becomes_pending_while_later_turn_frame_still_runs() -> None:
@@ -2720,6 +3328,398 @@ def test_tool_continuation_is_model_driven_and_accumulates_results() -> None:
     assert len(tool_result_events) == 2
     assert tool_result_events[0]["toolCallId"] != tool_result_events[1]["toolCallId"]
     assert any(event == "agent_loop_continued" for event, _ in stream_events)
+
+
+@pytest.mark.parametrize("client_turn_id", [None, "persisted-price-compare-turn"])
+def test_actual_tool_cycle_keeps_same_turn_business_actions_independent(
+    client_turn_id: str | None,
+) -> None:
+    """真实 SQLite 工具循环必须区分同轮同名工具的两个合法业务动作。"""
+
+    engine = create_engine("sqlite://", poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as db:
+        skill = _price_compare_skill()
+        tool = _price_query_tool()
+        session = ChatSession(
+            id="session_test",
+            tenant_id="tenant_demo",
+            active_skill_id=skill.skill_id,
+            active_step_id="query_price",
+            slots_json={"product_name_1": "A1", "product_name_2": "A3"},
+        )
+        db.add_all([skill, tool, session])
+        db.commit()
+
+        loop = AgentLoop(db)
+        executor = _SqlitePriceToolExecutor(db)
+        loop.tool_executor = executor
+        continuations = iter(
+            [
+                StepAgentResult(
+                    tool_call=ToolCall(
+                        name=tool.name,
+                        arguments={"product_name": "A3"},
+                    )
+                ),
+                StepAgentResult(
+                    reply="已查到两个商品。",
+                    next_step_id="reply_result",
+                    is_step_completed=True,
+                ),
+            ]
+        )
+        loop._run_step_agent_once = lambda *_args, **_kwargs: next(continuations)  # type: ignore[method-assign]
+        request = _request("比较 A1 和 A3 价格")
+        request.client_turn_id = client_turn_id
+
+        _step_result, tool_result = loop._execute_tool_action_cycle(
+            request,
+            session,
+            skill,
+            [tool],
+            _model_config(),
+            StepAgentResult(
+                tool_call=ToolCall(
+                    name=tool.name,
+                    arguments={"product_name": "A1"},
+                )
+            ),
+        )
+
+        assert executor.products == ["A1", "A3"]
+        assert tool_result is not None and tool_result.success is True
+
+        started_events = db.exec(
+            select(AgentEvent)
+            .where(
+                AgentEvent.tenant_id == request.tenant_id,
+                AgentEvent.session_id == session.id,
+                AgentEvent.event_type == "tool_call_started",
+            )
+        ).all()
+        action_ids = [
+            str((event.payload_json or {}).get("persistent_action_id") or "")
+            for event in started_events
+        ]
+        if client_turn_id is None:
+            assert action_ids == ["", ""]
+            return
+
+        assert len(action_ids) == 2
+        assert len(set(action_ids)) == 2
+        action_zero = next(
+            item for item in action_ids if ":action:0:tool:product.price_query" in item
+        )
+        assert any(":action:1:tool:product.price_query" in item for item in action_ids)
+        action_scope = "skill:price_compare:step:query_price"
+        assert loop._trusted_tool_action_id(
+            request,
+            ToolCall(name=tool.name, arguments={"product_name": "A1"}),
+            None,
+            action_scope=action_scope,
+            action_ordinal=0,
+        ) == action_zero
+
+        continuations = iter(
+            [
+                StepAgentResult(
+                    tool_call=ToolCall(
+                        name=tool.name,
+                        arguments={"product_name": "A3"},
+                    )
+                ),
+                StepAgentResult(
+                    reply="已查到两个商品。",
+                    next_step_id="reply_result",
+                    is_step_completed=True,
+                ),
+            ]
+        )
+        loop._execute_tool_action_cycle(
+            request,
+            session,
+            skill,
+            [tool],
+            _model_config(),
+            StepAgentResult(
+                tool_call=ToolCall(
+                    name=tool.name,
+                    arguments={"product_name": "A1"},
+                )
+            ),
+        )
+        assert executor.products == ["A1", "A3"]
+
+        changed_result = loop._execute_tool_call(
+            request,
+            session,
+            ToolCall(name=tool.name, arguments={"product_name": "A9"}),
+            tool_call_id="temporary-changed-arguments",
+            persistent_action_id=action_zero,
+        )
+        assert changed_result.success is False
+        assert changed_result.error is not None
+        assert changed_result.error.code == "SOP_EXECUTION_CONFLICT"
+        assert executor.products == ["A1", "A3"]
+
+
+@pytest.mark.parametrize("second_product", ["A3", "A1"])
+def test_graph_reentry_keeps_same_turn_actions_distinct_across_nodes(
+    second_product: str,
+) -> None:
+    """真实图自动推进再次进入工具循环时必须为不同节点保留不同业务身份。"""
+
+    engine = create_engine("sqlite://", poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as db:
+        tool = _price_query_tool()
+        skill = Skill(
+            tenant_id="tenant_demo",
+            skill_id="price_two_nodes",
+            name="分节点商品比价",
+            status="published",
+            content_json=_graph_content(
+                "price_two_nodes",
+                "分节点商品比价",
+                [
+                    {
+                        "node_id": "query_a1",
+                        "type": "tool_call",
+                        "name": "查询第一个商品",
+                        "allowed_actions": ["call_tool:product.price_query"],
+                    },
+                    {
+                        "node_id": "query_a3",
+                        "type": "tool_call",
+                        "name": "查询第二个商品",
+                        "allowed_actions": ["call_tool:product.price_query"],
+                    },
+                    {
+                        "node_id": "reply",
+                        "name": "回复结果",
+                        "allowed_actions": ["answer_user"],
+                    },
+                ],
+            ),
+        )
+        session = ChatSession(
+            id="session_two_nodes",
+            tenant_id="tenant_demo",
+            active_skill_id=skill.skill_id,
+            active_step_id="query_a1",
+        )
+        overall = AgentProfile(
+            id="overall_two_nodes",
+            tenant_id="tenant_demo",
+            name="公开广场",
+            is_overall=True,
+            status="active",
+        )
+        db.add_all([skill, tool, session, overall])
+        db.flush()
+        ensure_open_gallery_binding(db, "tenant_demo", "skill", skill.id)
+        ensure_open_gallery_binding(db, "tenant_demo", "tool", tool.id)
+        db.commit()
+
+        loop = AgentLoop(db)
+        executor = _SqlitePriceToolExecutor(db)
+        loop.tool_executor = executor
+        loop._get_reflection_max_rounds = lambda _tenant_id: 0  # type: ignore[method-assign]
+        continuations = iter(
+            [
+                StepAgentResult(reply="第一个商品已查询。", is_step_completed=True),
+                StepAgentResult(
+                    tool_call=ToolCall(
+                        name=tool.name,
+                        arguments={"product_name": second_product},
+                    )
+                ),
+                StepAgentResult(reply="两个商品均已查询。", is_step_completed=True),
+            ]
+        )
+        loop._run_step_agent_once = lambda *_args, **_kwargs: next(continuations)  # type: ignore[method-assign]
+        request = _request("比较 A1 和 A3 价格")
+        request.client_turn_id = "stable-two-node-turn"
+
+        first_step, first_result = loop._execute_tool_action_cycle(
+            request,
+            session,
+            skill,
+            [tool],
+            _model_config(),
+            StepAgentResult(
+                tool_call=ToolCall(
+                    name=tool.name,
+                    arguments={"product_name": "A1"},
+                )
+            ),
+        )
+        _active_skill, _router_decision, final_step, final_result = (
+            loop._auto_progress_skill_graph(
+                request,
+                session,
+                [skill],
+                [tool],
+                _model_config(),
+                skill,
+                RouterDecision(
+                    decision="continue_active",
+                    target_skill_id=skill.skill_id,
+                    target_step_id=session.active_step_id,
+                    confidence=1.0,
+                ),
+                first_step,
+                first_result,
+                conversation_context={},
+            )
+        )
+
+        assert executor.products == ["A1", second_product]
+        assert final_result is not None and final_result.success is True
+        assert final_step.tool_call is None
+        assert session.active_step_id == "reply"
+        started_events = db.exec(
+            select(AgentEvent)
+            .where(
+                AgentEvent.tenant_id == request.tenant_id,
+                AgentEvent.session_id == session.id,
+                AgentEvent.event_type == "tool_call_started",
+            )
+            .order_by(AgentEvent.created_at, AgentEvent.id)
+        ).all()
+        action_ids = [
+            str((event.payload_json or {}).get("persistent_action_id") or "")
+            for event in started_events
+        ]
+        assert len(action_ids) == 2
+        assert len(set(action_ids)) == 2
+        assert "step:query_a1" in action_ids[0]
+        assert "step:query_a3" in action_ids[1]
+
+        restarted_loop = AgentLoop(db)
+        restarted_executor = _SqlitePriceToolExecutor(db)
+        restarted_loop.tool_executor = restarted_executor
+        recovered_step, recovered = restarted_loop._execute_tool_action_cycle(
+            request,
+            session,
+            skill,
+            [tool],
+            None,
+            StepAgentResult(
+                tool_call=ToolCall(
+                    name=tool.name,
+                    arguments={"product_name": second_product},
+                )
+            ),
+        )
+        if second_product == "A3":
+            assert recovered is not None and recovered.success is True
+            assert recovered.data["receipt_source"] == "compatibility_event"
+        else:
+            assert recovered_step.tool_call is None
+            assert recovered is not None and recovered.success is False
+            assert recovered.error is not None
+            assert recovered.error.code == "TOOL_CALL_OUTCOME_UNKNOWN"
+        assert restarted_executor.products == []
+
+        replay = restarted_loop._execute_tool_call(
+            request,
+            session,
+            ToolCall(name=tool.name, arguments={"product_name": second_product}),
+            tool_call_id="restart-temporary-retry",
+            persistent_action_id=action_ids[1],
+        )
+        assert replay.success is True
+        assert replay.data["receipt_source"] == "compatibility_event"
+        assert restarted_executor.products == []
+
+        changed = restarted_loop._execute_tool_call(
+            request,
+            session,
+            ToolCall(name=tool.name, arguments={"product_name": "A9"}),
+            tool_call_id="restart-temporary-conflict",
+            persistent_action_id=action_ids[1],
+        )
+        assert changed.success is False
+        assert changed.error is not None
+        assert changed.error.code == "SOP_EXECUTION_CONFLICT"
+        assert restarted_executor.products == []
+
+        unknown_action_id = (
+            "turn:stable-two-node-turn:scope:skill:price_two_nodes:"
+            "step:query_unknown:action:0:tool:product.price_query"
+        )
+        db.add(
+            AgentEvent(
+                tenant_id=request.tenant_id,
+                session_id=session.id,
+                event_type="tool_call_started",
+                payload_json={
+                    "tool_name": tool.name,
+                    "tool_call": ToolCall(
+                        name=tool.name,
+                        arguments={"product_name": "unknown"},
+                    ).model_dump(mode="json"),
+                    "persistent_action_id": unknown_action_id,
+                    "request_fingerprint": AgentLoop._tool_request_fingerprint(
+                        ToolCall(name=tool.name, arguments={"product_name": "unknown"})
+                    ),
+                    "tool_call_id": "unknown-temporary-call",
+                },
+            )
+        )
+        db.commit()
+        unknown = restarted_loop._execute_tool_call(
+            request,
+            session,
+            ToolCall(name=tool.name, arguments={"product_name": "unknown"}),
+            tool_call_id="unknown-temporary-retry",
+            persistent_action_id=unknown_action_id,
+        )
+        assert unknown.success is False
+        assert unknown.error is not None
+        assert unknown.error.code == "TOOL_CALL_OUTCOME_UNKNOWN"
+        assert restarted_executor.products == []
+
+
+class _SqlitePriceToolExecutor(ToolExecutor):
+    """使用生产授权边界并在本地记录价格工具实际派发参数。"""
+
+    def __init__(self, db: Session) -> None:
+        """保存父类授权依赖和测试用的实际派发记录。"""
+
+        super().__init__(db)
+        self.products: list[str] = []
+
+    def execute(
+        self,
+        tenant_id: str,
+        tool_call: ToolCall,
+        active_skill_id: str | None = None,
+        agent_id: str | None = None,
+        actor_user_id: str | None = None,
+        **kwargs: object,
+    ) -> ToolResult:
+        """授权通过后记录商品参数并返回确定性价格回执，不访问外部 provider。"""
+
+        authorization_error = self.authorize(
+            tenant_id,
+            tool_call,
+            active_skill_id,
+            agent_id,
+            actor_user_id,
+            **kwargs,
+        )
+        if authorization_error is not None:
+            return authorization_error
+        product_name = str(tool_call.arguments.get("product_name") or "")
+        self.products.append(product_name)
+        return ToolResult(
+            tool_name=tool_call.name,
+            success=True,
+            data={"product_name": product_name, "price": 100},
+        )
 
 
 def test_tool_continuation_respects_configured_action_limit() -> None:

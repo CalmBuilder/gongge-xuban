@@ -109,6 +109,21 @@ def test_knowledge_citation_identity_keeps_same_title_chunks_in_final_agent_dedu
     assert knowledge_citation_identity(first) != knowledge_citation_identity(second)
 
 
+def test_knowledge_citations_withhold_insufficient_results() -> None:
+    """无匹配或证据不足时，即使原始回执带候选也不得生成回复引用。"""
+
+    citations = knowledge_citations_from_results(
+        [{
+            "outcome": "insufficient",
+            "evidence_sufficiency": {"required": True, "satisfied": False},
+            "selected_concepts": [{"concept_id": "insufficient-concept", "title": "不足候选"}],
+            "evidence_pack": [{"chunk_id": "insufficient-chunk", "excerpt": "不应引用"}],
+        }]
+    )
+
+    assert citations == []
+
+
 def test_restore_truncated_email_from_unique_cited_evidence() -> None:
     """证据只有一个匹配邮箱时恢复模型截断的完整值。"""
 

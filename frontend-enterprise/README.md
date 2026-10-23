@@ -28,3 +28,12 @@ npm run test:e2e:fullstack
 The Playwright runner starts and stops its own Vite server on port `4174`.
 The full-stack suite builds the frontend, starts FastAPI on port `5148`, and uses a temporary
 SQLite database that is removed when the test server exits.
+
+The attention center displays the original frozen arguments for generic tool approvals,
+alongside the existing connector and managed workspace views. Approval submits the original
+CAS decision; it does not edit the operation's parameters or grant lasting permission.
+
+Active SOP and dynamic task execution cards use the same original cancel command API.
+Only dynamic tasks offer Skill and constraint changes. Cancellation of an external write
+that has already been sent keeps the effect unknown until reconciliation; the card reads
+the latest persisted command after refresh and displays the pending reconciliation state.

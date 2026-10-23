@@ -208,6 +208,7 @@ class ResponseGenerator:
         task_results: list[dict[str, object]] | None = None,
         propagate_model_failure: bool = False,
         force_model_call: bool = False,
+        response_slots: dict[str, object] | None = None,
     ) -> str:
         runtime_control_reply = self._runtime_control_reply(step_result)
         if runtime_control_reply is not None:
@@ -226,6 +227,7 @@ class ResponseGenerator:
             memory_context,
             conversation_context,
             task_results,
+            response_slots=response_slots,
         )
         payload = self._stage_payload(raw_payload, persona_prompt)
         try:
@@ -241,6 +243,7 @@ class ResponseGenerator:
                     unified_system_prompt(), payload
                 )
             reply = text.strip() or step_result.reply or self._minimal_fallback(router_decision)
+            reply = self._apply_authoritative_sop_slots(reply, response_slots)
             return self._visible_reply_or_fallback(
                 reply, session, router_decision, step_result, tool_result, skill
             )
@@ -265,6 +268,7 @@ class ResponseGenerator:
         is_cancelled: Callable[[], bool] | None = None,
         force_model_call: bool = False,
         propagate_model_failure: bool = False,
+        response_slots: dict[str, object] | None = None,
     ) -> Iterator[str]:
         """流式生成用户回复，并在 provider 首 token 前及每个 chunk 边界响应取消。"""
 
@@ -289,6 +293,7 @@ class ResponseGenerator:
             memory_context,
             conversation_context,
             task_results,
+            response_slots=response_slots,
         )
         payload = self._stage_payload(raw_payload, persona_prompt)
         try:
@@ -318,14 +323,25 @@ class ResponseGenerator:
                     if not chunk:
                         continue
                     reply_parts.append(chunk)
+                    if response_slots is not None:
+                        continue
                     if not has_streamed:
                         preview = "".join(reply_parts).strip()
                         if not preview:
                             continue
                         has_streamed = True
                     yield chunk
-            if has_streamed:
-                return
+                if response_slots is not None:
+                    corrected = self._apply_authoritative_sop_slots(
+                        "".join(reply_parts).strip()
+                        or step_result.reply
+                        or self._minimal_fallback(router_decision),
+                        response_slots,
+                    )
+                    yield from self._cancelable_chunks(corrected, is_cancelled)
+                    return
+                if has_streamed:
+                    return
             reply = self._visible_reply_or_fallback(
                 "".join(reply_parts).strip() or step_result.reply or self._minimal_fallback(router_decision),
                 session,
@@ -344,6 +360,43 @@ class ResponseGenerator:
             yield from self.chunk_text(
                 format_runtime_failure_reply("模型调用失败", exc, "LLM_ERROR", model_failure_suggestion(exc))
             )
+
+    @staticmethod
+    def _apply_authoritative_sop_slots(
+        reply: str,
+        response_slots: dict[str, object] | None,
+    ) -> str:
+        """把有效冻结 SOP 槽位回填到模型字段，拒绝字段名或清空后的旧值冒充事实。"""
+
+        if response_slots is None:
+            return reply
+        aliases = {
+            "user_name": ("user_name", "用户名称", "用户姓名", "姓名"),
+            "reply_style": ("reply_style", "回复风格", "输出偏好"),
+            "omitted_code": ("omitted_code", "省略代码", "口令"),
+        }
+        canonical_names = {
+            "user_name": "user_name",
+            "reply_style": "reply_style",
+            "omitted_code": "omitted_code",
+        }
+        corrected = str(reply or "").strip()
+        for key, names in aliases.items():
+            value = str(response_slots.get(key) or "未知").strip() or "未知"
+            found = False
+            for name in sorted(names, key=len, reverse=True):
+                pattern = re.compile(
+                    rf"({re.escape(name)}\s*(?:[:：]|为)\s*)([^\r\n，,。；;]+)",
+                    re.IGNORECASE,
+                )
+                corrected, count = pattern.subn(
+                    lambda match: f"{match.group(1)}{value}", corrected
+                )
+                found = found or count > 0
+            if not found:
+                label = canonical_names[key]
+                corrected = f"{corrected}\n{label}：{value}" if corrected else f"{label}：{value}"
+        return corrected.strip()
 
     def chunk_text(self, text: str, chunk_size: int = 8) -> Iterator[str]:
         stripped = text.strip()
@@ -399,6 +452,7 @@ class ResponseGenerator:
         memory_context: list[dict[str, object]] | None = None,
         conversation_context: dict[str, object] | None = None,
         task_results: list[dict[str, object]] | None = None,
+        response_slots: dict[str, object] | None = None,
     ) -> dict[str, object]:
         projected_conversation_context = (
             dict(conversation_context) if isinstance(conversation_context, dict) else {}
@@ -431,7 +485,11 @@ class ResponseGenerator:
                 skill.content_json if skill else None, session.active_step_id
             ),
             "progress": self._progress_payload(session, skill, step_result, tool_result),
-            "slots": session.slots_json or {},
+            "slots": (
+                dict(response_slots)
+                if response_slots is not None
+                else session.slots_json or {}
+            ),
             "step_summary": compact_response_step_result(
                 step_result.model_dump(mode="json")
             ),

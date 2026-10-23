@@ -63,7 +63,8 @@ def test_router_payload_only_exposes_skill_routing_summary(monkeypatch):
     assert decision.target_skill_id == "price_compare"
     assert decision.target_step_id == "collect_products"
     assert captured["payload"]["current_session"]["active_skill_id"] == "purchase"
-    assert captured["payload"]["_agent_stage"]["memory"] == "- hm"
+    # Router 传递稳定候选键，避免同内容记忆在模型输入中失去身份。
+    assert captured["payload"]["_agent_stage"]["memory"] == "- profile/preferred_name: hm"
     assert "knowledge_context" not in captured["payload"]["current_session"]
     assert "tenant_id" not in captured["payload"]["current_session"]
 

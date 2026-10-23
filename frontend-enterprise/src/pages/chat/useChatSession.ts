@@ -25,7 +25,7 @@ import { clearEnterpriseAuthSession, getEnterpriseAuthSession } from '@/auth';
 import { emitAgentScopeChange, persistSharedAgentScope } from '@/lib/agent-scope-storage';
 import { BRAND_STORAGE_KEYS } from '@/lib/brand-storage';
 import { PRODUCT_EVENTS } from '@/lib/product-events';
-import { getClientTimeZone } from '@/lib/timezone';
+import { getClientTimeZone, getDetectedClientTimeZone } from '@/lib/timezone';
 import { createClientId } from '@/lib/client-id';
 import {
   agentResourceCount,
@@ -456,6 +456,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
   const scheduledEventIdsRef = useRef(new Set<string>());
   const knownSessionIdsRef = useRef(new Set<string>());
   const optimisticSessionIdsRef = useRef(new Set<string>());
+  const draftSessionIdentityRef = useRef(new Map<string, string>());
   const pendingPromotedSessionIdRef = useRef<string | null>(null);
   const queuedTurnsRef = useRef<PreparedChatTurn[]>(restoredQueuedTurns);
   const queuedTurnProcessingRef = useRef(false);
@@ -1095,6 +1096,9 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     }
     storeRef.current.delete(id);
     streamRef.current.delete(id);
+    draftSessionIdentityRef.current.forEach((value, key) => {
+      if (key === id || value === id) draftSessionIdentityRef.current.delete(key);
+    });
     const sessionPrefix = localCancellationKey(id, '');
     locallyCancelledTurnKeysRef.current.forEach((key) => {
       if (key.startsWith(sessionPrefix)) locallyCancelledTurnKeysRef.current.delete(key);
@@ -2068,18 +2072,22 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       runningTurn?.sessionId === activeConversationId ? runningTurn.turnId : null
     );
     const controller = stream.abortController;
+    // 草稿提升在终态前不切换 URL，但服务端已经拥有真实 session；停止必须命中该身份。
+    const cancellationSessionId = isDraftConversationKey(activeConversationId)
+      ? draftSessionIdentityRef.current.get(activeConversationId) || ''
+      : activeConversationId;
     const cancelledTurnKey = cancelledTurnId
       ? localCancellationKey(activeConversationId, cancelledTurnId)
       : null;
     if (cancelledTurnKey) locallyCancelledTurnKeysRef.current.add(cancelledTurnKey);
     const releaseLocalCancellation = () => {
-      if (isDraftConversationKey(activeConversationId)) return;
-      void loadMessages(activeConversationId);
-      void loadTraces(activeConversationId);
+      if (!cancellationSessionId || isDraftConversationKey(cancellationSessionId)) return;
+      void loadMessages(cancellationSessionId);
+      void loadTraces(cancellationSessionId);
       void loadSessions();
     };
-    const cancelRequest = cancelledTurnId && !isDraftConversationKey(activeConversationId)
-      ? api.postKeepalive(`/api/chat/sessions/${activeConversationId}/cancel`, {
+    const cancelRequest = cancelledTurnId && cancellationSessionId
+      ? api.postKeepalive(`/api/chat/sessions/${cancellationSessionId}/cancel`, {
           tenant_id: tenantId,
           turn_id: cancelledTurnId,
         }).catch(() => undefined)
@@ -3389,9 +3397,12 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
         channel: 'web',
         interaction_mode: resolvedInteractionMode,
         execution_engine: prepared.executionEngine || 'auto',
-        client_timezone: getClientTimeZone(),
         model_config_id: prepared.modelConfigId,
       };
+      const detectedClientTimeZone = getDetectedClientTimeZone();
+      if (detectedClientTimeZone) {
+        requestBody.client_timezone = detectedClientTimeZone;
+      }
       if (!startedAsDraftConversation) {
         requestBody.session_id = currentConversationId;
       } else {
@@ -3413,6 +3424,9 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
         }
         if (item.event === 'session_created') {
           createdSessionId = String(item.data.newSessionId || item.data.sessionId || '');
+          if (startedAsDraftConversation && createdSessionId) {
+            draftSessionIdentityRef.current.set(currentConversationId, createdSessionId);
+          }
           // 草稿提升会切换路由并重建 ChatPage；在 SSE 仍由当前 Hook 持有时提前
           // 导航会让实时响应失去拥有者，随后只能依赖持久事件恢复。先保存真实
           // 会话身份，等业务终态到达后再提升；网络中断时仍由 relay recovery 提前提升。
@@ -3451,8 +3465,14 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
           || item.event === 'error_occurred'
         ) {
           markStreamTerminal();
+          if (startedAsDraftConversation) {
+            const terminalSessionId = createdSessionId || String(item.data.sessionId || '');
+            if (terminalSessionId) {
+              promoteDraftConversation(terminalSessionId);
+            }
+          }
         }
-        handleStreamEvent(item, eventSessionId, turnId);
+        handleStreamEvent(item, startedAsDraftConversation ? liveConversationId : eventSessionId, turnId);
       }, controller.signal);
       clearStreamWatchdog();
       if (!receivedTerminalEvent && !controller.signal.aborted) {

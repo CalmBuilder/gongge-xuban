@@ -37,6 +37,8 @@ TURN_POST_TERMINAL_EVENT_TYPES = frozenset(
     {
         "assistant_message_created",
         "async_job_enqueued",
+        "memory_saved",
+        "memory_error",
         "session_state_changed",
     }
 )
@@ -117,6 +119,12 @@ def ensure_turn_event_open(
         if event_type == "session_state_changed":
             return
         if event_type == "async_job_enqueued":
+            if (
+                payload.get("feature") == "memory"
+                and payload.get("job_name") == "memory.capture_turn"
+            ):
+                return
+        if event_type in {"memory_saved", "memory_error"}:
             if (
                 payload.get("feature") == "memory"
                 and payload.get("job_name") == "memory.capture_turn"

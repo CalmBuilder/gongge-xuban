@@ -14,10 +14,16 @@ import IconListBulleted from '../../assets/icons/list-bulleted.svg?react';
 import IconHistory from '../../assets/icons/profile-history.svg?react';
 import IconRefresh from '../../assets/icons/refresh.svg?react';
 import IconSearch from '../../assets/icons/search.svg?react';
-import type { MemoryRead, MemoryUserPageRead } from '../../types';
+import type {
+  MemoryCaptureJobPageRead,
+  MemoryCaptureJobRead,
+  MemoryRead,
+  MemoryUserPageRead,
+} from '../../types';
 
 const ENTERPRISE_AGENT_STORAGE_KEY = 'gongge_enterprise_agent_scope';
 const MEMORY_PAGE_SIZE = 10;
+const MEMORY_CAPTURE_JOB_PAGE_SIZE = 20;
 
 type MemoryFilter = {
   username: string;
@@ -50,7 +56,12 @@ export default function MemoriesTab() {
   const [page, setPage] = useState(1);
   const [total, setTotal] = useState(0);
   const [refreshToken, setRefreshToken] = useState(0);
+  const [captureJobs, setCaptureJobs] = useState<MemoryCaptureJobRead[]>([]);
+  const [captureJobsLoading, setCaptureJobsLoading] = useState(false);
+  const [captureJobsError, setCaptureJobsError] = useState(false);
   const requestIdRef = useRef(0);
+  const captureJobRequestIdRef = useRef(0);
+  const scopeRef = useRef(agentId);
 
   async function load(targetPage: number, next: MemoryFilter) {
     const requestId = ++requestIdRef.current;
@@ -79,12 +90,45 @@ export default function MemoriesTab() {
     }
   }
 
+  async function loadCaptureJobs(scopeAgentId: string) {
+    const requestId = ++captureJobRequestIdRef.current;
+    setCaptureJobsLoading(true);
+    setCaptureJobsError(false);
+    try {
+      const params = new URLSearchParams({ tenant_id: getRequestTenantId() });
+      if (scopeAgentId) params.set('agent_id', scopeAgentId);
+      params.set('page', '1');
+      params.set('page_size', String(MEMORY_CAPTURE_JOB_PAGE_SIZE));
+      const result = await api.get<MemoryCaptureJobPageRead>(
+        `/api/enterprise/memories/jobs?${params.toString()}`,
+      );
+      if (requestId !== captureJobRequestIdRef.current || scopeAgentId !== scopeRef.current) return;
+      setCaptureJobs(result.items);
+    } catch (error) {
+      if (requestId !== captureJobRequestIdRef.current || scopeAgentId !== scopeRef.current) return;
+      setCaptureJobs([]);
+      setCaptureJobsError(true);
+      notify.error('提取状态查询失败，请稍后刷新');
+    } finally {
+      if (requestId === captureJobRequestIdRef.current) setCaptureJobsLoading(false);
+    }
+  }
+
   useEffect(() => {
     const onScopeChange = (event: Event) => {
       const nextAgentId =
         (event as CustomEvent<{ agentId?: string }>).detail?.agentId ||
         window.localStorage.getItem(ENTERPRISE_AGENT_STORAGE_KEY) ||
         '';
+      scopeRef.current = nextAgentId;
+      ++requestIdRef.current;
+      ++captureJobRequestIdRef.current;
+      setRows([]);
+      setTotal(0);
+      setDetail(null);
+      setCaptureJobs([]);
+      setCaptureJobsError(false);
+      setCaptureJobsLoading(true);
       setPage(1);
       setAgentId(nextAgentId);
     };
@@ -96,6 +140,16 @@ export default function MemoriesTab() {
     void load(page, appliedFilter);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [agentId, page, appliedFilter.username, appliedFilter.user_id, appliedFilter.q, refreshToken]);
+
+  useEffect(() => {
+    void loadCaptureJobs(agentId);
+    const timer = window.setInterval(() => void loadCaptureJobs(agentId), 5000);
+    return () => {
+      window.clearInterval(timer);
+      ++captureJobRequestIdRef.current;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentId, refreshToken]);
 
   const groups = useMemo(() => groupMemories(rows), [rows]);
   const pageCount = Math.max(1, Math.ceil(total / MEMORY_PAGE_SIZE));
@@ -111,6 +165,7 @@ export default function MemoriesTab() {
   }
 
   async function clearOwnMemories() {
+    const clearingScope = agentId;
     const scopeText = agentId ? '当前员工下你的长期记忆' : '当前租户下你的长期记忆';
     if (!window.confirm(`将清空${scopeText}，不会影响其他用户。确定继续？`)) {
       return;
@@ -120,6 +175,7 @@ export default function MemoriesTab() {
       const params = new URLSearchParams({ tenant_id: getRequestTenantId() });
       if (agentId) params.set('agent_id', agentId);
       const result = await api.delete<{ deleted: number }>(`/api/enterprise/memories/me?${params.toString()}`);
+      if (clearingScope !== scopeRef.current) return;
       notify.success(result.deleted > 0 ? `已清空 ${result.deleted} 条记忆` : '没有可清空的记忆');
       setDetail(null);
       setRefreshToken((value) => value + 1);
@@ -285,6 +341,8 @@ export default function MemoriesTab() {
             </UIButton>
           </form>
 
+          <MemoryCaptureStatus jobs={captureJobs} loading={captureJobsLoading} error={captureJobsError} />
+
           <div className="grid gap-[10px] md:hidden">
             {groups.length ? (
               groups.map(renderMobileCard)
@@ -319,6 +377,67 @@ export default function MemoriesTab() {
       <MemoryDetailDialog detail={detail} onClose={() => setDetail(null)} />
     </>
   );
+}
+
+function MemoryCaptureStatus({
+  jobs,
+  loading,
+  error,
+}: {
+  jobs: MemoryCaptureJobRead[];
+  loading: boolean;
+  error: boolean;
+}) {
+  return (
+    <section
+      aria-label="记忆提取状态"
+      className="rounded-[12px] border border-[#eef0f4] bg-[#fafbfe] px-[14px] py-[12px]"
+    >
+      <div className="flex items-center justify-between gap-[10px]">
+        <h2 className="gg-type-body font-medium text-[#464c5e]">记忆提取状态</h2>
+        {loading && <span className="gg-type-meta text-[#858b9c]">刷新中</span>}
+      </div>
+      {error ? (
+        <p role="status" className="mt-[8px] gg-type-meta text-[#858b9c]">提取状态查询失败，请稍后刷新</p>
+      ) : jobs.length === 0 ? (
+        <p className="mt-[8px] gg-type-meta text-[#858b9c]">
+          {loading ? '正在查询提取任务' : '暂无记忆提取任务'}
+        </p>
+      ) : (
+        <div className="mt-[8px] flex flex-col gap-[6px]">
+          {jobs.map((job) => (
+            <div
+              key={job.job_id}
+              className="flex flex-wrap items-center gap-x-[12px] gap-y-[4px] gg-type-meta text-[#858b9c]"
+            >
+              <span className="font-medium text-[#464c5e]">{memoryCaptureStatusLabel(job.status)}</span>
+              <span>{`已尝试 ${job.attempt_count}/${job.max_attempts} 次`}</span>
+              <span>实际模型派发 {job.model_dispatch_count} 次</span>
+              {job.reason_code && <span>{memoryCaptureReasonLabel(job.reason_code)}</span>}
+              {job.next_attempt_at && <span>{`下次重试：${formatDateTime(job.next_attempt_at)}`}</span>}
+              {job.applied_count > 0 && <span>新增或更新 {job.applied_count} 条</span>}
+              {job.discarded_count > 0 && <span>已忽略 {job.discarded_count} 条</span>}
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+const MEMORY_CAPTURE_REASONS: Record<NonNullable<MemoryCaptureJobRead['reason_code']>, string> = {
+  capture_contract_changed: '来源、权限或模型已变更；请在当前权限下重新发送新输入',
+  source_changed: '原轮来源已不可用；请重新发送新输入',
+  invalid_output: '提取结果不符合格式；请重新发送新输入',
+  deadline_exceeded: '提取已超过截止时间；请重新发送新输入',
+  attempts_exhausted: '提取重试次数已用尽；请重新发送新输入',
+  retry_scheduled: '临时提取失败，将自动重试',
+  processing_failed: '提取未完成；请稍后重新发送新输入',
+  superseded: '已保留较新的事实，旧轮结果已忽略',
+};
+
+function memoryCaptureReasonLabel(reason: NonNullable<MemoryCaptureJobRead['reason_code']>) {
+  return MEMORY_CAPTURE_REASONS[reason] || '';
 }
 
 function PrefixInput({
@@ -443,6 +562,19 @@ const MEMORY_KIND_TONE_CLASS: Record<MemoryTone, string> = {
   green: 'bg-[#e9f7ef] text-[#2cb360]',
   gray: 'bg-[#f2f3f7] text-[#858b9c]',
 };
+
+function memoryCaptureStatusLabel(status: MemoryCaptureJobRead['status']): string {
+  return (
+    {
+      pending: '等待提取',
+      running: '记忆提取中',
+      retry_wait: '等待重试',
+      failed: '提取失败',
+      discarded: '已忽略旧提取',
+      succeeded: '提取完成',
+    }[status] || '状态未知'
+  );
+}
 
 function groupMemories(rows: MemoryRead[]): MemoryUserGroup[] {
   const map = new Map<string, MemoryRead[]>();

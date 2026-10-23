@@ -10,15 +10,17 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from time import sleep
+from typing import Annotated
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from sqlalchemy import and_, func, or_
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.sql.elements import ColumnElement
 from sqlmodel import Session, select
 
 from app.audit.service import append_user_management_audit
+from app.skills.edit_context import start_skill_write
 from app.agents.deletion import AgentDeletionService, agent_deletion_state
 from app.agents.schema import (
     AgentGalleryPublicationRequest,
@@ -62,6 +64,8 @@ from app.agents.identity import (
     project_agent_governance,
 )
 from app.agents.branching import (
+    next_unique_branch_version,
+    publish_branch_version,
     agent_private_metadata,
     branch_versions,
     copy_overall_scope_to_agent,
@@ -117,6 +121,7 @@ from app.organization.reference_data import (
     ReferenceDataError,
     require_active_agent_category,
 )
+from app.memory.capture import advance_memory_agent_permission_generation
 from app.security.auth import get_current_user
 from app.security.permissions import agent_owned_by_user as _agent_owned_by_user
 from app.security.permissions import is_admin_user as _is_admin_user
@@ -334,6 +339,32 @@ def page_agent_gallery(
     )
 
 
+@enterprise_router.get("/overall", response_model=AgentProfileRead | None)
+def get_overall_agent_profile(
+    tenant_id: str = Query(...),
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> AgentProfileRead | None:
+    """只读取当前租户的整体员工，避免开放平台首页扫描全部员工治理关系。"""
+
+    ensure_tenant(db, tenant_id)
+    _ensure_request_tenant(tenant_id, current_user)
+    row = get_overall_agent(db, tenant_id)
+    if row is None:
+        return None
+    used_agent_ids = _used_agent_ids_for_user(db, tenant_id, current_user)
+    return agent_read(
+        row,
+        _bindings_by_agent(db, tenant_id, {row.id}).get(row.id, []),
+        row.id in used_agent_ids,
+        db=db,
+        viewer=current_user,
+        responsible_org_unit_name=_responsible_org_names(db, [row]).get(
+            row.responsible_org_unit_id or "",
+        ),
+    )
+
+
 @enterprise_router.get("/management-page", response_model=AgentManagementPageRead)
 def page_managed_agents(
     tenant_id: str = Query(...),
@@ -456,6 +487,7 @@ def create_agent(
     request: AgentProfileCreateRequest,
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
+    editor_context: Annotated[str | None, Header(alias="X-Skill-Editor-Context")] = None,
 ) -> AgentProfileRead:
     """创建当前成员拥有的数字员工，并阻止请求夹带广场治理状态。"""
     ensure_tenant(db, request.tenant_id)
@@ -463,6 +495,17 @@ def create_agent(
     _ensure_request_tenant(request.tenant_id, user)
     if request.is_overall and not _is_admin_user(user):
         raise HTTPException(status_code=403, detail="Only administrator can create overall agent")
+    if not request.is_overall and request.source_mode != "blank":
+        source_id = request.copy_from_agent_id
+        overall = get_overall_agent(db, request.tenant_id) if not source_id else None
+        actual_source = source_id or (overall.id if overall else None)
+        has_skills = db.exec(select(AgentResourceBinding.id).where(
+            AgentResourceBinding.tenant_id == request.tenant_id,
+            AgentResourceBinding.agent_id == actual_source,
+            AgentResourceBinding.resource_type == "skill",
+            AgentResourceBinding.status != "deleted")).first() if actual_source else None
+        if has_skills:
+            user = start_skill_write(db, request.tenant_id, user, actual_source, editor_context)
     category_code = _validated_agent_category(
         db,
         request.tenant_id,
@@ -786,6 +829,7 @@ def update_agent(
     row = _get_agent_for_mutation(db, request.tenant_id, agent_id)
     user = current_user
     _ensure_can_manage_agent(row, user)
+    status_changed = request.status is not None and request.status != row.status
     if request.name is not None:
         name = request.name.strip()
         if not name:
@@ -813,8 +857,10 @@ def update_agent(
         row.metadata_json = _metadata_preserving_creator(
             row.metadata_json or {}, request.metadata, user
         )
-    if prompt_changed:
+    if prompt_changed or status_changed:
         _bump_agent_revision(row)
+    if status_changed:
+        _bump_agent_memory_capture_generation(row)
     row.updated_at = utc_now()
     db.add(row)
     db.commit()
@@ -943,6 +989,7 @@ def set_agent_gallery_publication(
         "visibility_scope": row.visibility_scope,
         "gallery_published_by": row.gallery_published_by,
     }
+    publication_changed = request.published != agent_is_published(row)
     if request.published:
         _validate_gallery_publication(db, row)
     metadata = dict(row.metadata_json or {})
@@ -961,6 +1008,8 @@ def set_agent_gallery_publication(
         row.gallery_published_at = None
         row.gallery_published_by = None
     row.metadata_json = metadata
+    if publication_changed:
+        _bump_agent_memory_capture_generation(row)
     row.updated_at = utc_now()
     db.add(row)
     append_user_management_audit(
@@ -1048,7 +1097,15 @@ def update_agent_resources(
     request: AgentResourcesUpdateRequest,
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
+    editor_context: Annotated[str | None, Header(alias="X-Skill-Editor-Context")] = None,
 ) -> list[AgentResourceBindingRead]:
+    """当前资源替换涉及Skill时先进入原头写屏障和编辑上下文；纯知识沿原合同。"""
+    existing_skill = db.exec(select(AgentResourceBinding.id).where(
+        AgentResourceBinding.tenant_id == request.tenant_id,
+        AgentResourceBinding.agent_id == agent_id,
+        AgentResourceBinding.resource_type == "skill")).first()
+    if existing_skill or any(item.resource_type == "skill" for item in request.resources):
+        current_user = start_skill_write(db, request.tenant_id, current_user, agent_id, editor_context)
     agent = _get_agent_for_mutation(db, request.tenant_id, agent_id)
     _ensure_can_manage_agent(agent, current_user)
     if agent.is_overall:
@@ -1090,6 +1147,7 @@ def update_agent_resources(
             db.delete(row)
     if changed:
         _bump_agent_revision(agent)
+        _bump_agent_memory_capture_generation(agent)
         db.add(agent)
     db.commit()
     return get_agent_resources(agent_id, request.tenant_id, db, current_user)
@@ -1101,9 +1159,13 @@ def import_agent_resources(
     request: AgentResourceImportRequest,
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
+    editor_context: Annotated[str | None, Header(alias="X-Skill-Editor-Context")] = None,
 ) -> dict[str, object]:
+    """重试原资源导入；技能导入在内部实际业务锁前校验当前编辑上下文。"""
     for attempt in range(IMPORT_LOCK_RETRY_ATTEMPTS):
         try:
+            if editor_context is not None:
+                return _import_agent_resources_once(agent_id, request, db, current_user, editor_context)
             return _import_agent_resources_once(agent_id, request, db, current_user)
         except OperationalError as exc:
             db.rollback()
@@ -1118,7 +1180,11 @@ def _import_agent_resources_once(
     request: AgentResourceImportRequest,
     db: Session,
     current_user: User | object,
+    editor_context: str | None = None,
 ) -> dict[str, object]:
+    """技能导入目标scope统一校验当前账号/上下文，再排序锁源与目标员工。"""
+    if request.resource_type == "skill":
+        current_user = start_skill_write(db, request.tenant_id, current_user, agent_id, editor_context)
     agents = _get_agents_for_mutation(
         db,
         request.tenant_id,
@@ -1211,7 +1277,10 @@ def sync_agent_skill_from_overall(
     tenant_id: str = Query(...),
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
+    editor_context: Annotated[str | None, Header(alias="X-Skill-Editor-Context")] = None,
 ) -> dict[str, object]:
+    """同步原整体发布到员工分支，受管编辑不能从派生入口洗来源。"""
+    current_user = start_skill_write(db, tenant_id, current_user, agent_id, editor_context)
     agent = _get_agent_for_mutation(db, tenant_id, agent_id)
     _ensure_can_manage_agent(agent, current_user)
     if agent.is_overall:
@@ -1233,7 +1302,10 @@ def promote_agent_skill_to_overall(
     tenant_id: str = Query(...),
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
+    editor_context: Annotated[str | None, Header(alias="X-Skill-Editor-Context")] = None,
 ) -> dict[str, object]:
+    """提升原员工版本到整体，按实际目的范围校验普通重载身份。"""
+    current_user = start_skill_write(db, tenant_id, current_user, None, editor_context)
     _ensure_admin_user(tenant_id, current_user)
     agent = _get_agent_for_mutation(db, tenant_id, agent_id)
     _ensure_agent_not_tombstoned(agent)
@@ -1262,7 +1334,10 @@ def rollback_agent_skill(
     request: AgentSkillRollbackRequest,
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
+    editor_context: Annotated[str | None, Header(alias="X-Skill-Editor-Context")] = None,
 ) -> dict[str, object]:
+    """沿原分支回滚职责派生，先核验真实当前操作者与编辑上下文。"""
+    current_user = start_skill_write(db, request.tenant_id, current_user, agent_id, editor_context)
     agent = _get_agent_for_mutation(db, request.tenant_id, agent_id)
     _ensure_can_manage_agent(agent, current_user)
     if agent.is_overall:
@@ -1341,6 +1416,7 @@ def update_agent_models(
         changed = True
     if changed:
         _bump_agent_revision(agent)
+        _bump_agent_memory_capture_generation(agent)
         db.add(agent)
     db.commit()
     return {"status": "updated", "agent_id": agent_id}
@@ -1435,6 +1511,12 @@ def remove_chat_agent_usage(
         )
     ).first()
     if row is not None:
+        advance_memory_agent_permission_generation(
+            db,
+            tenant_id=tenant_id,
+            user_id=current_user.id,
+            agent_id=agent_id,
+        )
         db.delete(row)
         db.commit()
     return {"status": "removed", "agent_id": agent_id, "removed": row is not None}
@@ -2227,6 +2309,12 @@ def _mark_agent_used(db: Session, tenant_id: str, user: User, agent_id: str) -> 
         row.updated_at = utc_now()
     else:
         row = AgentUsage(tenant_id=tenant_id, user_id=user.id, agent_id=agent_id)
+        advance_memory_agent_permission_generation(
+            db,
+            tenant_id=tenant_id,
+            user_id=user.id,
+            agent_id=agent_id,
+        )
     db.add(row)
     try:
         db.commit()
@@ -2321,6 +2409,13 @@ def _bump_agent_revision(row: AgentProfile) -> None:
     """在能力契约发生有效变化时单调递增数字员工资料版本。"""
 
     row.profile_revision = max(int(row.profile_revision or 1), 1) + 1
+    row.updated_at = utc_now()
+
+
+def _bump_agent_memory_capture_generation(row: AgentProfile) -> None:
+    """递增 Agent 记忆提取失效代数，阻断生命周期或绑定变更后的迟到写入。"""
+
+    row.memory_capture_generation = max(int(row.memory_capture_generation or 1), 1) + 1
     row.updated_at = utc_now()
 
 
@@ -2708,6 +2803,8 @@ def _upsert_imported_resource_binding(
 def _copy_or_update_skill_branch(
     db: Session, tenant_id: str, source_agent_id: str, target_agent_id: str, skill: Skill
 ) -> None:
+    """导入员工定义时保留目标已发布历史，并写入目标范围的Runtime身份。"""
+
     with db.no_autoflush:
         source_branch = db.exec(
             select(AgentSkillBranch).where(
@@ -2735,9 +2832,20 @@ def _copy_or_update_skill_branch(
             skill_id=source_branch.skill_id,
             source_skill_id=source_branch.source_skill_id,
         )
+    head_version = source_branch.head_version
+    content = dict(source_branch.content_json or {})
+    occupied = db.exec(select(AgentSkillBranchVersion).where(
+        AgentSkillBranchVersion.tenant_id == tenant_id,
+        AgentSkillBranchVersion.agent_id == target_agent_id,
+        AgentSkillBranchVersion.skill_id == skill.skill_id,
+        AgentSkillBranchVersion.version == head_version,
+    )).first()
+    if occupied and occupied.content_json != content:
+        head_version = next_unique_branch_version(db, target_branch)
+        content["version"] = head_version
     target_branch.base_version = source_branch.base_version
-    target_branch.head_version = source_branch.head_version
-    target_branch.content_json = dict(source_branch.content_json or {})
+    target_branch.head_version = head_version
+    target_branch.content_json = content
     target_branch.status = source_branch.status
     target_branch.sync_state = source_branch.sync_state
     target_branch.metadata_json = dict(source_branch.metadata_json or {})
@@ -2745,11 +2853,14 @@ def _copy_or_update_skill_branch(
     db.add(target_branch)
     db.flush()
     _ensure_copied_skill_branch_version(db, target_branch, f"导入自 {source_agent_id}")
+    publish_branch_version(db, skill, target_branch)
 
 
 def _ensure_copied_skill_branch_version(
     db: Session, branch: AgentSkillBranch, change_summary: str
 ) -> None:
+    """保留已存在分支快照正文，重复导入不覆盖原版历史。"""
+
     existing = db.exec(
         select(AgentSkillBranchVersion).where(
             AgentSkillBranchVersion.tenant_id == branch.tenant_id,
@@ -2759,11 +2870,8 @@ def _ensure_copied_skill_branch_version(
         )
     ).first()
     if existing:
-        existing.content_json = dict(branch.content_json or {})
-        existing.status = branch.status
-        existing.sync_state = branch.sync_state
-        existing.updated_at = utc_now()
-        db.add(existing)
+        if existing.content_json != branch.content_json:
+            raise HTTPException(409, "PUBLISHED_SKILL_VERSION_IMMUTABLE")
         return
     db.add(
         AgentSkillBranchVersion(

@@ -1,5 +1,5 @@
 """
-@Time       : 2026/08/10 19:55
+@Time       : 2026/10/05
 @Author     : zhanglp8181
 @File       : execution_control.py
 @CallChain  : Attention/Execution API/Workers → ExecutionControlService → Execution Store/SQLModel
@@ -32,6 +32,7 @@ from app.db.models import (
     SopWorkItem,
     SopWorkItemCandidate,
     SopWorkItemCommandReceipt,
+    User,
     utc_now,
 )
 from app.sop_runtime.contracts import (
@@ -427,6 +428,9 @@ class ExecutionControlService:
         from app.sop_runtime.work_items import SopWorkItemService
 
         self.store.authorize_mutation(instance, "attention.resolve")
+        self._assert_current_reconciliation_permission(
+            instance, attention, actor_user_id=actor_user_id,
+        )
         resolved, completed = SopWorkItemService(self.db).complete(
             attention,
             actor_user_id=actor_user_id,
@@ -474,6 +478,44 @@ class ExecutionControlService:
             )
         self.db.flush()
         return resolved, completed
+
+    def _assert_current_reconciliation_permission(
+        self,
+        instance: SopInstance,
+        attention: SopWorkItem,
+        *,
+        actor_user_id: str,
+    ) -> None:
+        """仅复核原Store提供的SOP对账治理候选，保留DTA连接器与HTTP各自的原候选合同。"""
+
+        if instance.kind != "sop" or not self.is_external_reconciliation_attention(
+            instance, attention,
+        ):
+            return
+        actor = self.db.exec(
+            select(User).where(
+                User.tenant_id == instance.tenant_id, User.id == actor_user_id,
+            ).with_for_update().execution_options(populate_existing=True)
+        ).first()
+        operation = self.db.get(SopOperation, str(attention.payload_json.get("operation_id") or ""))
+        from app.organization.governance import has_governance_permission
+
+        authorized = (
+            actor is not None and actor.membership_status == "active"
+            and operation is not None
+            and (
+                actor.role == "admin" if operation.effect_kind == "destructive"
+                else has_governance_permission(
+                    self.db, tenant_id=instance.tenant_id, user_id=actor_user_id,
+                    permission_code="connection_profile.manage",
+                )
+            )
+        )
+        if not authorized:
+            raise ExecutionControlError(
+                "ATTENTION_RECONCILIATION_PERMISSION_FORBIDDEN",
+                "当前成员已不具备该外部效果的治理对账权限。",
+            )
 
     def replayed_attention_resolution(
         self,

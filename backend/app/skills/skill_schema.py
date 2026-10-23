@@ -111,18 +111,26 @@ class ToolSuggestion(BaseModel):
 
 
 class SkillCreateRequest(BaseModel):
+    """普通技能创建请求；显式反馈候选身份必须走隔离入口，不能忽略。"""
+
     tenant_id: str
+    feedback_candidate_id: str | None = Field(default=None, min_length=1, max_length=128)
     content: SkillCard
     status: Literal["draft", "published", "archived"] = "draft"
 
 
 class SkillUpdateRequest(BaseModel):
+    """原活动版保存契约，受管反馈候选字段不授予活动写入权限。"""
+
     tenant_id: str
+    feedback_candidate_id: str | None = Field(default=None, min_length=1, max_length=128)
     content: SkillCard
     status: Optional[Literal["draft", "published", "archived"]] = None
 
 
 class SkillRead(BaseModel):
+    """保留业务头与分支元数据，另列真实不可变Runtime发布身份。"""
+
     id: str
     tenant_id: str
     skill_id: str
@@ -154,6 +162,9 @@ class SkillRead(BaseModel):
     branch_base_version: Optional[str] = None
     branch_head_version: Optional[str] = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    publication_id: str | None = None
+    publication_scope_agent_id: str = ""
+    publication_checksum: str | None = None
     created_at: str
     updated_at: str
 
@@ -161,6 +172,8 @@ class SkillRead(BaseModel):
 
 
 class SkillVersionRead(BaseModel):
+    """区分管理分支历史行ID和实际Runtime发布ID，缺失不伪装成发布。"""
+
     id: str
     tenant_id: str
     skill_id: str
@@ -181,6 +194,8 @@ class SkillVersionRead(BaseModel):
     source_schema_version: Optional[int] = None
     published_at: Optional[str] = None
     derived_from_version_id: Optional[str] = None
+    runtime_version_id: str | None = None
+    scope_agent_id: str = ""
     agent_id: Optional[str] = None
     branch_sync_state: Optional[str] = None
     branch_base_version: Optional[str] = None
@@ -191,6 +206,7 @@ class SkillVersionRead(BaseModel):
 
 
 class SkillDistillRequest(BaseModel):
+    """普通新建沿原生成合同，已有反馈上下文必须先明确重载取得新身份。"""
     tenant_id: str
     agent_id: Optional[str] = None
     title: str
@@ -198,6 +214,7 @@ class SkillDistillRequest(BaseModel):
     business_domain: Optional[str] = None
     model_config_id: Optional[str] = None
     available_tools: list[dict[str, Any]] = Field(default_factory=list)
+    editor_context: str | None = None
 
 
 class SkillDistillResponse(BaseModel):
@@ -207,6 +224,7 @@ class SkillDistillResponse(BaseModel):
 
 
 class SkillRewriteRequest(BaseModel):
+    """复用原局部改写，反馈链显式绑定候选修订，来源正文只能由服务器补入。"""
     tenant_id: str
     agent_id: Optional[str] = None
     current_skill: SkillCard
@@ -217,14 +235,21 @@ class SkillRewriteRequest(BaseModel):
     target_label: Optional[str] = None
     conversation: list[dict[str, str]] = Field(default_factory=list)
     available_tools: list[dict[str, Any]] = Field(default_factory=list)
+    feedback_candidate_id: str | None = Field(default=None, min_length=1, max_length=512)
+    expected_candidate_revision: int | None = Field(default=None, ge=1)
+    feedback_materials: list[dict[str, Any]] = Field(default_factory=list)
+    editor_context: str | None = None
 
 
 class SkillRewriteResponse(BaseModel):
+    """候选改写只返回已结算修订；原普通改写响应字段保持可读。"""
     draft_skill: SkillCard
     assistant_message: str
     changed_paths: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     tool_suggestions: list[ToolSuggestion] = Field(default_factory=list)
+    feedback_candidate_id: str | None = None
+    candidate_revision: int | None = None
 
 
 class SkillFileExtractRequest(BaseModel):

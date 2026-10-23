@@ -542,24 +542,37 @@ test('DynamicTask 首轮等待后用附件恢复同一 Execution', async ({ page
   const sessionId = await createSession(page, 'DynamicTask 等待态恢复回归');
   const composer = await prepareChat(page, sessionId);
   await sendTurn(page, composer, sessionId, '请先建立日志分析上下文并确认范围。', 1);
+  const waitingFacts = await readFacts(page, sessionId);
+  const waitingDelegated = waitingFacts.events.filter(
+    (event) => event.event_type === 'dynamic_task_delegated',
+  );
+  expect(waitingDelegated).toHaveLength(1);
+  const waitingExecutionId = eventExecutionId(waitingDelegated[0]);
+  expect(waitingExecutionId).not.toBe('');
+  expect(await readExecution(page, waitingExecutionId)).toMatchObject({ status: 'waiting' });
   await uploadLog(page);
   await sendTurn(page, composer, sessionId, '根据附件继续分析，并在本轮确认范围。', 2);
 
   const facts = await readFacts(page, sessionId);
   const delegated = facts.events.filter((event) => event.event_type === 'dynamic_task_delegated');
-  const resumed = facts.events.filter((event) => event.event_type === 'dynamic_task_resumed');
+  const chatResumed = facts.events.filter((event) => event.event_type === 'dynamic_task_chat_resumed');
   const continuations = facts.events.filter((event) => event.event_type === 'dynamic_task_continued');
   expect(delegated).toHaveLength(1);
-  expect(resumed).toHaveLength(1);
+  expect(chatResumed).toHaveLength(1);
+  expect(eventExecutionId(chatResumed[0])).toBe(waitingExecutionId);
   expect(continuations).toHaveLength(0);
-  expect(eventExecutionId(resumed[0])).toBe(eventExecutionId(delegated[0]));
+  // 成功恢复在同一 Execution 事务内追加 dynamic_task_chat_resumed；外层
+  // dynamic_task_resumed 仅用于等待/失败等非成功恢复，避免终态之后追加迟到审计。
+  expect(facts.events.filter((event) => event.event_type === 'dynamic_task_resumed')).toHaveLength(0);
+  const resumedExecutionId = eventExecutionId(delegated[0]);
+  expect(resumedExecutionId).not.toBe('');
   expect(eventTypes(facts).filter((type) => (
     type === 'error_occurred'
     || type === 'dynamic_task_execution_failed'
     || type === 'dynamic_task_chat_turn_deferred'
   ))).toEqual([]);
 
-  const execution = await readExecution(page, eventExecutionId(delegated[0]));
+  const execution = await readExecution(page, resumedExecutionId);
   expect(execution.status).toBe('succeeded');
   const resources = execution.input_resources as Array<Record<string, unknown>>;
   expect(resources.some((resource) => resource.filename === basename(LOG_FILE))).toBe(true);
@@ -567,7 +580,7 @@ test('DynamicTask 首轮等待后用附件恢复同一 Execution', async ({ page
   expect((streamRequests[1].body.attachments as unknown[]).length).toBeGreaterThan(0);
   console.log('DYNAMIC_WAITING_RESUME_RESULT', JSON.stringify({
     session_id: sessionId,
-    execution_id: eventExecutionId(delegated[0]),
+    execution_id: resumedExecutionId,
     event_types: eventTypes(facts),
   }));
 });

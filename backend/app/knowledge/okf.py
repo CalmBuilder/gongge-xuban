@@ -1,3 +1,11 @@
+"""
+@Time       : 2026/10/03
+@Author     : zhanglp8181
+@File       : okf.py
+@CallChain  : 知识重建/检索/导出 → OKF 概念 → 精确来源与确定性相关排序
+@Description: 构建与读取 OKF 概念，按相关性/更新时间及物理身份稳定选择证据。
+"""
+
 from __future__ import annotations
 
 import json
@@ -49,7 +57,12 @@ def build_okf_for_document(
     buckets: list[KnowledgeBucket],
 ) -> list[dict[str, Any]]:
     document_slug = safe_path_segment(document.title or Path(document.filename).stem or document.id)
-    document_concept_id = f"sources/{document_slug}"
+    lineage_namespace = safe_path_segment(document.lineage_id or document.id)
+    document_concept_id = (
+        f"sources/{lineage_namespace}/{document_slug}"
+        if document.lineage_id
+        else f"sources/{document_slug}"
+    )
     document_card = document.metadata_json.get("document_card") if isinstance(document.metadata_json, dict) else {}
     if not isinstance(document_card, dict):
         document_card = {}
@@ -149,6 +162,8 @@ def selected_concept_cards(concepts: list[KnowledgeConcept]) -> list[dict[str, A
 
 
 def search_concepts(query: str, concepts: list[KnowledgeConcept], limit: int = 6) -> list[KnowledgeConcept]:
+    """从完整受权候选按原分数/时间排序，同分用物理ID字典序消除方言和输入顺序差异。"""
+
     if not query.strip():
         return []
     scored = []
@@ -182,6 +197,7 @@ def search_concepts(query: str, concepts: list[KnowledgeConcept], limit: int = 6
             score -= 2
         if score >= MIN_CONCEPT_SEARCH_SCORE and matched:
             scored.append((score, row.updated_at, row))
+    scored.sort(key=lambda item: item[2].id)
     scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
     return [row for _score, _updated_at, row in scored[:limit]]
 
@@ -607,7 +623,12 @@ def _bucket_concept(document: KnowledgeDocument, document_concept_id: str, bucke
     metadata = bucket.metadata_json or {}
     concept_type = _concept_type_for_bucket(bucket)
     folder = "playbooks" if concept_type == "Playbook" else "rules" if concept_type == "Business Rule" else "topics"
-    concept_id = f"{folder}/{safe_path_segment(bucket.bucket_key or bucket.title)}"
+    bucket_slug = safe_path_segment(bucket.bucket_key or bucket.title)
+    concept_id = (
+        f"{folder}/{safe_path_segment(document.lineage_id)}/{bucket_slug}"
+        if document.lineage_id
+        else f"{folder}/{bucket_slug}"
+    )
     content = str(metadata.get("content") or bucket.summary)
     section_links = [
         f"- [{path}](/{document_concept_id}/sections/{safe_path_segment(str(section_id))}.md)"

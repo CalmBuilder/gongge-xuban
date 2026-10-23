@@ -1,5 +1,5 @@
 """
-@Time       : 2026/08/03 21:35
+@Time       : 2026/10/05
 @Author     : zhanglp8181
 @File       : attention_items.py
 @CallChain  : 统一待我处理中心 → FastAPI → ExecutionControl/SOP Coordinator
@@ -126,7 +126,7 @@ def resolve_attention_item(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_session),
 ) -> AttentionRead:
-    """以首个 CAS 胜者办理 Attention，并为异步恢复原子生成唯一 signal。"""
+    """以首个CAS办理原Attention；SOP未知效果同事务消费原对账信号，DTA保留自身消费者。"""
 
     ensure_current_user_tenant(request.tenant_id, current_user)
     item = _tenant_attention(db, request.tenant_id, attention_id)
@@ -139,6 +139,10 @@ def resolve_attention_item(
     worker_id = f"attention-{item.id[-16:]}"
     was_completed = item.status == "completed"
     reconciliation_attention = control.is_external_reconciliation_attention(instance, item)
+    if reconciliation_attention and instance.kind == "sop":
+        coordinator = DeterministicSopCoordinator(db)
+        store = coordinator.store
+        control = ExecutionControlService(db, store)
     lease_context = (
         store.owned_for_reconciliation(instance, worker_id=worker_id)
         if reconciliation_attention
@@ -164,14 +168,17 @@ def resolve_attention_item(
                 comment=request.comment,
             )
             if completed and coordinator is not None:
-                _consume_synchronous_attention_signal(
-                    db,
-                    control,
-                    instance,
-                    item,
-                    worker_id=worker_id,
-                )
-                if not was_completed:
+                if reconciliation_attention:
+                    coordinator.resume_reconciliation_attention(item, worker_id=worker_id)
+                else:
+                    _consume_synchronous_attention_signal(
+                        db,
+                        control,
+                        instance,
+                        item,
+                        worker_id=worker_id,
+                    )
+                if not was_completed and not reconciliation_attention:
                     coordinator.resume_completed_work_item(item)
         db.commit()
         db.refresh(item)

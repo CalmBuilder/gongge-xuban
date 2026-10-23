@@ -23,11 +23,13 @@ from app.api.executions import (
 )
 from app.db.models import (
     AgentProfile,
+    AgentEvent,
     DynamicReadDispatchBatch,
     DynamicReadDispatchItem,
     DynamicReadDispatchResult,
     ExecutionCommand,
     ExecutionPlanRevision,
+    ExecutionSignal,
     GeneralSkillUse,
     SopInstance,
     SopNodeExecution,
@@ -144,6 +146,75 @@ def test_cancel_command_reaches_terminal_result_and_publication(db: Session) -> 
     assert result.result["status"] == "cancelled"
     assert result.publications[0]["required"] is True
     assert result.publications[0]["status"] == "settled"
+
+
+def test_stale_cancel_revision_is_rejected_without_side_effects_and_current_revision_can_cancel(
+    db: Session,
+) -> None:
+    """验证旧revision取消被拒绝且不留下命令、Signal或事件，刷新后仍可合法取消。"""
+
+    owner, _, instance = _seed_execution(db, suffix="stale_cancel")
+    assert owner is not None
+    stale_revision = instance.revision
+    instance.revision += 1
+    db.add(instance)
+    db.commit()
+    db.refresh(instance)
+    current_revision = instance.revision
+    assert current_revision > stale_revision
+
+    with pytest.raises(HTTPException) as caught:
+        issue_execution_command(
+            instance.id,
+            ExecutionCommandRequest(
+                tenant_id="tenant_demo",
+                command_id="stale_cancel_1",
+                command_type="cancel",
+                expected_revision=stale_revision,
+                payload={"reason": "user_requested"},
+            ),
+            owner,
+            db,
+        )
+
+    assert caught.value.status_code == 409
+    assert caught.value.detail == "EXECUTION_REVISION_CONFLICT"
+    db.refresh(instance)
+    assert instance.revision == current_revision
+    assert instance.status == "running"
+    assert instance.cancellation_requested_at is None
+    assert instance.cancellation_disposition == "none"
+    assert db.exec(select(ExecutionCommand).where(
+        ExecutionCommand.execution_id == instance.id
+    )).all() == []
+    assert db.exec(select(ExecutionSignal).where(
+        ExecutionSignal.execution_id == instance.id
+    )).all() == []
+    assert db.exec(select(AgentEvent).where(
+        AgentEvent.aggregate_type == "execution",
+        AgentEvent.aggregate_id == instance.id,
+    )).all() == []
+
+    accepted = issue_execution_command(
+        instance.id,
+        ExecutionCommandRequest(
+            tenant_id="tenant_demo",
+            command_id="fresh_cancel_1",
+            command_type="cancel",
+            expected_revision=current_revision,
+            payload={"reason": "user_requested"},
+        ),
+        owner,
+        db,
+    )
+    db.refresh(instance)
+    assert accepted.status == "applied"
+    assert instance.status == "cancelled"
+    commands = db.exec(select(ExecutionCommand).where(
+        ExecutionCommand.execution_id == instance.id
+    )).all()
+    assert len(commands) == 1
+    assert commands[0].command_id == "fresh_cancel_1"
 
 
 def test_execution_card_projects_plan_progress_budget_and_attention(db: Session) -> None:

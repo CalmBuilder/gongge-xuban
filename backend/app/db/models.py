@@ -1,5 +1,5 @@
 """
-@Time       : 2026/08/10 16:20
+@Time       : 2026/10/02
 @Author     : zhanglp8181
 @File       : models.py
 @CallChain  : API/Seed/Workers → SQLModel Session → models.py → SQLAlchemy Engine
@@ -67,6 +67,8 @@ class Tenant(SQLModel, table=True):
 
 
 class User(SQLModel, table=True):
+    """原登录成员及单调授权修订，撤销再授予不能恢复旧候选身份。"""
+
     __tablename__ = "users"
     __table_args__ = (UniqueConstraint("tenant_id", "username", name="uq_user_tenant_username"),)
 
@@ -76,6 +78,7 @@ class User(SQLModel, table=True):
     display_name: OptionalNameString = None
     role: LabelString = Field(default="member", index=True)
     membership_status: LabelString = Field(default="active", index=True)
+    auth_revision: int = Field(default=1, sa_column_kwargs={"server_default": "1"})
     member_category_code: IdentifierString = Field(default="employee", index=True)
     joined_at: datetime = Field(default_factory=utc_now)
     left_at: Optional[datetime] = None
@@ -567,14 +570,21 @@ class Skill(SQLModel, table=True):
 
 
 class SkillVersion(SQLModel, table=True):
+    """保存整体或指定员工范围的不可变发布身份，空范围只表示整体。"""
+
     __tablename__ = "skill_versions"
     __table_args__ = (
-        UniqueConstraint("tenant_id", "skill_id", "version", name="uq_skill_version"),
+        UniqueConstraint(
+            "tenant_id", "skill_id", "scope_agent_id", "version", name="uq_skill_version"
+        ),
     )
 
     id: PrimaryKeyString = Field(default_factory=lambda: new_id("skillver"), primary_key=True)
     tenant_id: IdentifierString = Field(index=True)
     skill_id: IdentifierString = Field(index=True)
+    scope_agent_id: IdentifierString = Field(
+        default="", index=True, sa_column_kwargs={"server_default": ""}
+    )
     version: VersionString = Field(index=True)
     name: NameString
     business_domain: OptionalNameString = None
@@ -587,6 +597,46 @@ class SkillVersion(SQLModel, table=True):
     source_schema_version: int | None = None
     published_at: datetime | None = None
     derived_from_version_id: Optional[str] = Field(default=None, max_length=512, index=True)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class SkillEditCandidate(SQLModel, table=True):
+    """保存当前SkillCard隔离候选及持久编辑关联，发布仍使用原SkillVersion。"""
+
+    __tablename__ = "skill_edit_candidates"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "editor_slot_key", name="uq_skill_candidate_editor_slot"),
+        UniqueConstraint("tenant_id", "create_request_identity",
+                         name="uq_skill_candidate_create_request"),
+        CheckConstraint("status IN ('draft','ready','rejected','closed','published')",
+                        name="ck_skill_candidate_status"),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("skillcand"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    actor_user_id: PrimaryKeyString = Field(index=True)
+    skill_id: IdentifierString = Field(index=True)
+    scope_agent_id: IdentifierString = Field(default="", index=True)
+    editor_slot_key: OptionalVersionString = None
+    create_request_identity: VersionString
+    create_request_hash: VersionString
+    actor_auth_revision: int
+    scope_profile_id: OptionalIdentifierString = None
+    scope_profile_revision: int | None = None
+    base_skill_version_id: PrimaryKeyString
+    base_checksum: VersionString
+    source_refs_json: list[dict[str, Any]] = Field(sa_column=Column(JSON, nullable=False))
+    candidate_json: dict[str, Any] = Field(sa_column=Column(JSON, nullable=False))
+    revision: int = Field(default=1)
+    generation: int = Field(default=0)
+    base_difference_confirmed: bool = Field(default=False)
+    status: LabelString = Field(default="draft", index=True)
+    ordinary_context_json: dict[str, Any] = Field(default_factory=dict,
+                                                sa_column=Column(JSON, nullable=False))
+    publish_request_hash: OptionalVersionString = None
+    publish_receipt_json: dict[str, Any] = Field(default_factory=dict,
+                                              sa_column=Column(JSON, nullable=False))
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
@@ -1765,7 +1815,7 @@ class SopOperation(SQLModel, table=True):
         ),
         CheckConstraint(
             "status IN ('prepared', 'running', 'retry_wait', 'succeeded', 'failed', "
-            "'unknown', 'cancelled')",
+            "'unknown', 'waiting_external', 'cancelled')",
             name="ck_sop_operation_status",
         ),
         CheckConstraint(
@@ -1821,6 +1871,19 @@ class SopOperation(SQLModel, table=True):
     )
     dispatched_at: datetime | None = None
     external_reference: OptionalIdentifierString = Field(default=None, index=True)
+    external_strategy: OptionalLabelString = Field(default=None, index=True)
+    external_provider: OptionalLabelString = Field(default=None, index=True)
+    external_submission_id: OptionalIdentifierString = Field(default=None, index=True)
+    external_task_id: OptionalIdentifierString = Field(default=None, index=True)
+    external_status_url: OptionalPlainTextString = None
+    external_status: OptionalLabelString = Field(default=None, index=True)
+    external_next_poll_at: datetime | None = Field(default=None, index=True)
+    external_deadline_at: datetime | None = Field(default=None, index=True)
+    external_observation_revision: int = Field(default=0, ge=0)
+    external_last_event_id: OptionalIdentifierString = None
+    external_callback_token_hash: OptionalVersionString = None
+    external_receipt_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    external_wait_started_at: datetime | None = None
     reconciled_at: datetime | None = None
     revision: int = Field(default=0, ge=0)
     started_at: datetime | None = None
@@ -1847,7 +1910,7 @@ class SopOperationAttempt(SQLModel, table=True):
         ),
         CheckConstraint(
             "status IN ('prepared', 'running', 'retry_wait', 'succeeded', 'failed', 'unknown', "
-            "'cancelled', 'reused')",
+            "'waiting_external', 'cancelled', 'reused')",
             name="ck_sop_operation_attempt_status",
         ),
     )
@@ -1861,10 +1924,62 @@ class SopOperationAttempt(SQLModel, table=True):
     dispatch_token: OptionalVersionString = Field(default=None, index=True)
     status: LabelString = Field(default="prepared", index=True)
     error_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    external_task_id: OptionalIdentifierString = Field(default=None, index=True)
+    external_status: OptionalLabelString = Field(default=None, index=True)
+    external_observation_revision: int = Field(default=0, ge=0)
+    external_receipt_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    waiting_at: datetime | None = None
     deadline_at: datetime | None = Field(default=None, index=True)
     retry_at: datetime | None = Field(default=None, index=True)
     started_at: datetime | None = None
     completed_at: datetime | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class ExternalTaskEventInbox(SQLModel, table=True):
+    """保存已认证 provider 回执，作为 Operation 观察与恢复 Signal 的可信 inbox。"""
+
+    __tablename__ = "sop_external_task_event_inbox"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "provider_event_id",
+            name="uq_sop_external_event_provider_id",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'claimed', 'applied', 'ignored', 'rejected')",
+            name="ck_sop_external_event_status",
+        ),
+        CheckConstraint("attempt_count >= 0 AND observation_revision >= 0", name="ck_sop_external_event_bounds"),
+        Index(
+            "ix_sop_external_event_dispatch",
+            "status",
+            "available_at",
+            "created_at",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("sopxevent"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    operation_id: OptionalIdentifierString = Field(default=None, index=True)
+    external_submission_id: OptionalIdentifierString = Field(default=None, index=True)
+    provider_task_id: IdentifierString = Field(index=True)
+    provider_event_id: IdentifierString = Field(index=True)
+    event_type: LabelString = Field(default="status", index=True)
+    provider_status: LabelString = Field(index=True)
+    observation_revision: int = Field(default=0, ge=0, index=True)
+    payload_checksum: VersionString = Field(index=True)
+    payload_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    status: LabelString = Field(default="pending", index=True)
+    attempt_count: int = Field(default=0, ge=0)
+    available_at: datetime = Field(default_factory=utc_now, index=True)
+    lease_owner: OptionalIdentifierString = Field(default=None, index=True)
+    lease_expires_at: datetime | None = Field(default=None, index=True)
+    signal_id: OptionalIdentifierString = Field(default=None, index=True)
+    last_error_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    received_at: datetime = Field(default_factory=utc_now, index=True)
+    applied_at: datetime | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
@@ -3542,6 +3657,7 @@ class KnowledgeBase(SQLModel, table=True):
     access_scope: LabelString = Field(default="owner", index=True)
     download_policy: LabelString = Field(default="restricted", index=True)
     revision: int = Field(default=1, ge=1)
+    content_revision: int = Field(default=1, ge=1)
     status: LabelString = Field(default="active", index=True)
     metadata_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     created_at: datetime = Field(default_factory=utc_now)
@@ -3589,9 +3705,15 @@ class KnowledgeBaseVersion(SQLModel, table=True):
     tenant_id: IdentifierString = Field(index=True)
     knowledge_base_id: IdentifierString = Field(index=True)
     version: VersionString = Field(default="1.0.0", index=True)
+    scope: str = Field(default="overall", max_length=512, index=True)
     name: NameString
     description: OptionalMediumTextString = None
     status: LabelString = Field(default="active", index=True)
+    publication_state: LabelString = Field(default="published", index=True)
+    parent_version_id: OptionalIdentifierString = Field(default=None, index=True)
+    build_job_id: OptionalIdentifierString = Field(default=None, index=True)
+    content_manifest_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    content_manifest_hash: OptionalVersionString = Field(default=None, index=True)
     metadata_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
@@ -3611,6 +3733,7 @@ class AgentKnowledgeBranch(SQLModel, table=True):
     knowledge_base_id: IdentifierString = Field(index=True)
     base_version: VersionString = "1.0.0"
     head_version: VersionString = "1.0.0"
+    content_revision: int = Field(default=1, ge=1)
     status: LabelString = Field(default="active", index=True)
     sync_state: LabelString = Field(default="synced", index=True)
     metadata_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
@@ -3625,10 +3748,16 @@ class KnowledgeDocument(SQLModel, table=True):
     tenant_id: IdentifierString = Field(index=True)
     knowledge_base_id: IdentifierString = Field(index=True)
     knowledge_base_version_id: OptionalIdentifierString = Field(default=None, index=True)
+    lineage_id: OptionalIdentifierString = Field(default=None, index=True)
+    parent_document_id: OptionalIdentifierString = Field(default=None, index=True)
     filename: NameString
     file_type: LabelString = Field(index=True)
     title: OptionalNameString = None
     status: LabelString = Field(default="processing", index=True)
+    normalized_source: OptionalLongTextString = None
+    source_checksum: OptionalVersionString = Field(default=None, index=True)
+    source_kind: LabelString = Field(default="legacy", index=True)
+    ingest_schema_version: int = Field(default=1, ge=1)
     bucket_count: int = 0
     chunk_count: int = 0
     metadata_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
@@ -3722,7 +3851,16 @@ class KnowledgeDiscoverySuggestion(SQLModel, table=True):
 
 
 class KnowledgeIngestJob(SQLModel, table=True):
+    """持久化知识入库与正文修订任务的身份、租约和恢复边界。"""
+
     __tablename__ = "knowledge_ingest_jobs"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "dedupe_key",
+            name="uq_knowledge_ingest_job_tenant_dedupe",
+        ),
+    )
 
     id: PrimaryKeyString = Field(default_factory=lambda: new_id("kjob"), primary_key=True)
     tenant_id: IdentifierString = Field(index=True)
@@ -3730,6 +3868,24 @@ class KnowledgeIngestJob(SQLModel, table=True):
     knowledge_base_version_id: OptionalIdentifierString = Field(default=None, index=True)
     document_id: OptionalIdentifierString = Field(default=None, index=True)
     filename: NameString
+    job_kind: LabelString = Field(default="legacy", index=True)
+    request_payload_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    actor_user_id: OptionalIdentifierString = Field(default=None, index=True)
+    scope: str = Field(default="overall", max_length=512, index=True)
+    source_version_id: OptionalIdentifierString = Field(default=None, index=True)
+    expected_revision: int | None = Field(default=None, ge=1)
+    candidate_version_id: OptionalIdentifierString = Field(default=None, index=True)
+    client_request_id: OptionalVersionString = Field(default=None, index=True)
+    request_hash: OptionalVersionString = Field(default=None, index=True)
+    dedupe_key: OptionalVersionString = Field(default=None, index=True)
+    lease_owner: str | None = Field(default=None, sa_column=Column(String(512), nullable=True))
+    lease_until: Optional[datetime] = Field(default=None, index=True)
+    fence: int = Field(default=0, ge=0)
+    attempt_count: int = Field(default=0, ge=0)
+    deadline_at: Optional[datetime] = Field(default=None, index=True)
+    error_code: OptionalLabelString = Field(default=None, index=True)
+    published_version_id: OptionalIdentifierString = Field(default=None, index=True)
+    published_document_id: OptionalIdentifierString = Field(default=None, index=True)
     status: LabelString = Field(default="queued", index=True)
     stage: LabelString = "queued"
     progress: float = 0.0
@@ -3780,6 +3936,11 @@ class ModelConfig(SQLModel, table=True):
         ),
     )
     enabled: bool = True
+    memory_capture_generation: int = Field(
+        default=1,
+        ge=1,
+        sa_column=Column(Integer, nullable=False, server_default="1"),
+    )
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
@@ -4076,6 +4237,11 @@ class AgentProfile(SQLModel, table=True):
     source_agent_version: OptionalVersionString = None
     profile_revision: int = Field(
         default=1,
+        sa_column=Column(Integer, nullable=False, server_default="1"),
+    )
+    memory_capture_generation: int = Field(
+        default=1,
+        ge=1,
         sa_column=Column(Integer, nullable=False, server_default="1"),
     )
     published_to_gallery: bool | None = Field(
@@ -4840,6 +5006,7 @@ class Message(SQLModel, table=True):
 
 
 class MessageFeedback(SQLModel, table=True):
+    """保存本人评分修订及独立分析代数，禁止迟到归因覆盖新的反馈事实。"""
     __tablename__ = "message_feedback"
     __table_args__ = (
         UniqueConstraint("tenant_id", "message_id", "user_id", name="uq_feedback_message_user"),
@@ -4851,6 +5018,8 @@ class MessageFeedback(SQLModel, table=True):
     message_id: IdentifierString = Field(index=True)
     user_id: IdentifierString = Field(index=True)
     rating: LabelString = Field(index=True)
+    revision: int = Field(default=1, ge=1)
+    analysis_generation: int = Field(default=1, ge=1)
     analysis_status: LabelString = Field(default="pending", index=True)
     analysis_bucket: OptionalLabelString = Field(default=None, index=True)
     analysis_reason: OptionalMediumTextString = None
@@ -4858,6 +5027,32 @@ class MessageFeedback(SQLModel, table=True):
     analysis_confidence: Optional[float] = None
     analysis_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     analyzed_at: Optional[datetime] = None
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class FeedbackMaterial(SQLModel, table=True):
+    """保存本人明确预览的最小授权投影；撤回身份永久失效而不改写执行历史。"""
+
+    __tablename__ = "feedback_materials"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "owner_user_id", "request_key",
+                         name="uq_feedback_material_owner_request"),
+        CheckConstraint("status IN ('preview','shared','withdrawn','invalid')",
+                        name="ck_feedback_material_status"),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("fbmat"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    feedback_id: IdentifierString = Field(index=True)
+    feedback_revision: int = Field(ge=1)
+    owner_user_id: IdentifierString = Field(index=True)
+    target_agent_id: IdentifierString = Field(index=True)
+    request_key: IdentifierString
+    request_hash: VersionString
+    material_checksum: VersionString
+    material_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    status: LabelString = Field(default="preview", index=True)
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
@@ -4990,6 +5185,10 @@ class MemoryRecord(SQLModel, table=True):
     id: PrimaryKeyString = Field(default_factory=lambda: new_id("mem"), primary_key=True)
     tenant_id: IdentifierString = Field(index=True)
     agent_id: OptionalIdentifierString = Field(default=None, index=True)
+    agent_scope_key: str = Field(
+        default="__user__",
+        sa_column=Column(String(128), nullable=False, index=True),
+    )
     user_id: IdentifierString = Field(index=True)
     username: OptionalNameString = Field(default=None, index=True)
     session_id: OptionalIdentifierString = Field(default=None, index=True)
@@ -4997,5 +5196,262 @@ class MemoryRecord(SQLModel, table=True):
     content: LongTextString
     importance: float = 0.5
     metadata_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    source_sequence: int = Field(
+        default=0,
+        ge=0,
+        sa_column=Column(BigInteger, nullable=False, server_default="0", index=True),
+    )
+    capture_job_id: OptionalIdentifierString = Field(default=None, index=True)
+    source_hash: OptionalVersionString = Field(default=None, index=True)
+    user_generation: int = Field(
+        default=0,
+        ge=0,
+        sa_column=Column(BigInteger, nullable=False, server_default="0"),
+    )
+    agent_generation: int = Field(
+        default=0,
+        ge=0,
+        sa_column=Column(BigInteger, nullable=False, server_default="0"),
+    )
+    user_permission_generation: int = Field(
+        default=0,
+        ge=0,
+        sa_column=Column(BigInteger, nullable=False, server_default="0"),
+    )
+    agent_permission_generation: int = Field(
+        default=0,
+        ge=0,
+        sa_column=Column(BigInteger, nullable=False, server_default="0"),
+    )
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class MemoryCaptureScope(SQLModel, table=True):
+    """保存记忆提取来源序号和清空/权限失效代数。"""
+
+    __tablename__ = "memory_capture_scopes"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "user_id",
+            "scope_kind",
+            "agent_scope_key",
+            name="uq_memory_capture_scope_identity",
+        ),
+        Index(
+            "ix_memory_capture_scope_tenant_user_kind",
+            "tenant_id",
+            "user_id",
+            "scope_kind",
+            "agent_scope_key",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("memscope"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    user_id: IdentifierString = Field(index=True)
+    scope_kind: LabelString = Field(default="user", index=True)
+    agent_scope_key: str = Field(
+        default="__user__",
+        sa_column=Column(String(128), nullable=False, index=True),
+    )
+    source_sequence: int = Field(
+        default=0,
+        ge=0,
+        sa_column=Column(BigInteger, nullable=False, server_default="0"),
+    )
+    clear_generation: int = Field(
+        default=0,
+        ge=0,
+        sa_column=Column(BigInteger, nullable=False, server_default="0"),
+    )
+    permission_generation: int = Field(
+        default=0,
+        ge=0,
+        sa_column=Column(BigInteger, nullable=False, server_default="0"),
+    )
+    row_version: int = Field(
+        default=1,
+        ge=1,
+        sa_column=Column(BigInteger, nullable=False, server_default="1"),
+    )
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class MemoryCaptureJob(SQLModel, table=True):
+    """登记一轮原始完成事实对应的唯一、可恢复记忆提取任务。"""
+
+    __tablename__ = "memory_capture_jobs"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "user_id",
+            "agent_scope_key",
+            "source_message_id",
+            name="uq_memory_capture_job_source",
+        ),
+        Index(
+            "ix_memory_capture_job_claimable",
+            "status",
+            "next_attempt_at",
+            "lease_expires_at",
+        ),
+        Index(
+            "ix_memory_capture_job_tenant_user_created",
+            "tenant_id",
+            "user_id",
+            "created_at",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("memjob"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    user_id: IdentifierString = Field(index=True)
+    agent_id: OptionalIdentifierString = Field(default=None, index=True)
+    agent_scope_key: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    scope_id: IdentifierString = Field(index=True)
+    source_message_id: IdentifierString = Field(index=True)
+    source_assistant_message_id: OptionalIdentifierString = Field(default=None, index=True)
+    source_sequence: int = Field(
+        default=0,
+        ge=0,
+        sa_column=Column(BigInteger, nullable=False, server_default="0"),
+    )
+    user_generation: int = Field(
+        default=0,
+        ge=0,
+        sa_column=Column(BigInteger, nullable=False, server_default="0"),
+    )
+    agent_generation: int = Field(
+        default=0,
+        ge=0,
+        sa_column=Column(BigInteger, nullable=False, server_default="0"),
+    )
+    user_permission_generation: int = Field(
+        default=0,
+        ge=0,
+        sa_column=Column(BigInteger, nullable=False, server_default="0"),
+    )
+    agent_permission_generation: int = Field(
+        default=0,
+        ge=0,
+        sa_column=Column(BigInteger, nullable=False, server_default="0"),
+    )
+    agent_capture_generation: int = Field(
+        default=1,
+        ge=1,
+        sa_column=Column(BigInteger, nullable=False, server_default="1"),
+    )
+    source_manifest_json: dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSON, nullable=False),
+    )
+    source_hash: VersionString = Field(index=True)
+    model_config_id: IdentifierString = Field(index=True)
+    model_capture_generation: int = Field(
+        default=1,
+        ge=1,
+        sa_column=Column(BigInteger, nullable=False, server_default="1"),
+    )
+    model_contract_hash: VersionString = Field(index=True)
+    extractor_schema_version: VersionString = Field(default="sd6b.v1")
+    prompt_hash: VersionString = Field(default="")
+    status: LabelString = Field(default="pending", index=True)
+    row_version: int = Field(
+        default=1,
+        ge=1,
+        sa_column=Column(BigInteger, nullable=False, server_default="1"),
+    )
+    attempt_count: int = Field(default=0, ge=0)
+    max_attempts: int = Field(default=3, ge=1)
+    model_dispatch_count: int = Field(default=0, ge=0)
+    claim_dispatch_count: int = Field(
+        default=0, ge=0, sa_column=Column(Integer, nullable=False, server_default="0")
+    )
+    next_attempt_at: Optional[datetime] = Field(default=None, index=True)
+    deadline_at: Optional[datetime] = Field(default=None, index=True)
+    lease_owner: OptionalIdentifierString = Field(default=None, index=True)
+    lease_expires_at: Optional[datetime] = Field(default=None, index=True)
+    fencing_token: int = Field(default=0, ge=0)
+    created_at: datetime = Field(default_factory=utc_now)
+    finished_at: Optional[datetime] = None
+    terminal_reason: OptionalLabelString = None
+    error_code: OptionalLabelString = Field(default=None, index=True)
+    applied_count: int = Field(default=0, ge=0)
+    discarded_count: int = Field(default=0, ge=0)
+
+
+class MemoryKeyState(SQLModel, table=True):
+    """保存结构化记忆键的最新来源、代数和删除屏障。"""
+
+    __tablename__ = "memory_key_states"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "user_id",
+            "agent_scope_key",
+            "kind",
+            "normalized_key",
+            name="uq_memory_key_state_identity",
+        ),
+        Index(
+            "ix_memory_key_state_tenant_user_scope",
+            "tenant_id",
+            "user_id",
+            "agent_scope_key",
+        ),
+    )
+
+    id: PrimaryKeyString = Field(default_factory=lambda: new_id("memkey"), primary_key=True)
+    tenant_id: IdentifierString = Field(index=True)
+    user_id: IdentifierString = Field(index=True)
+    agent_scope_key: str = Field(sa_column=Column(String(128), nullable=False, index=True))
+    kind: LabelString = Field(index=True)
+    normalized_key: VersionString = Field(index=True)
+    record_id: OptionalIdentifierString = Field(default=None, index=True)
+    last_source_sequence: int = Field(
+        default=0,
+        ge=0,
+        sa_column=Column(BigInteger, nullable=False, server_default="0"),
+    )
+    last_job_id: OptionalIdentifierString = Field(default=None, index=True)
+    clear_generation: int = Field(
+        default=0,
+        ge=0,
+        sa_column=Column(BigInteger, nullable=False, server_default="0"),
+    )
+    permission_generation: int = Field(
+        default=0,
+        ge=0,
+        sa_column=Column(BigInteger, nullable=False, server_default="0"),
+    )
+    user_generation: int = Field(
+        default=0,
+        ge=0,
+        sa_column=Column(BigInteger, nullable=False, server_default="0"),
+    )
+    agent_generation: int = Field(
+        default=0,
+        ge=0,
+        sa_column=Column(BigInteger, nullable=False, server_default="0"),
+    )
+    user_permission_generation: int = Field(
+        default=0,
+        ge=0,
+        sa_column=Column(BigInteger, nullable=False, server_default="0"),
+    )
+    agent_permission_generation: int = Field(
+        default=0,
+        ge=0,
+        sa_column=Column(BigInteger, nullable=False, server_default="0"),
+    )
+    tombstoned: bool = Field(default=False, index=True)
+    row_version: int = Field(
+        default=1,
+        ge=1,
+        sa_column=Column(BigInteger, nullable=False, server_default="1"),
+    )
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)

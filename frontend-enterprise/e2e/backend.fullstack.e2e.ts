@@ -13,17 +13,35 @@ async function login(page: Page, username: string, password: string, agentId?: s
       localStorage.setItem('gongge_enterprise_agent_scope', value);
     }, agentId);
   }
-  await page.getByRole('button', { name: '进入平台' }).click();
+  const enterButton = page.getByRole('button', { name: '进入平台' });
+  await expect(enterButton).toBeVisible();
+  // 登录页存在入场动画，等待可见后用真实按钮触发，不以 localStorage 写入代替页面登录。
+  await enterButton.click({ force: true });
+  await expect(page.getByRole('textbox', { name: '账号' })).toBeVisible();
   await page.getByRole('textbox', { name: '账号' }).fill(username);
   await page.getByRole('textbox', { name: '密码', exact: true }).fill(password);
   await page.getByRole('button', { name: '登录', exact: true }).click();
   await expect.poll(
     async () => page.evaluate(() => Boolean(localStorage.getItem('gongge_auth'))),
   ).toBe(true);
+  // 会话写入早于企业上下文请求；等待登录页卸载，确保后续旅程从已认证页面开始。
+  // 知识新增页是无全局账户栏的专用页面，不能把“账户菜单出现”当作通用认证完成条件。
+  await expect(page.locator('.gongge-login')).toHaveCount(0, { timeout: 15_000 });
 }
 
 async function loginAsAdmin(page: Page, agentId?: string) {
   await login(page, 'admin', 'admin', agentId);
+}
+
+/**
+ * 通过真实账户菜单退出当前用户，避免只删 localStorage 时旧的上下文请求把身份写回。
+ */
+async function logout(page: Page) {
+  await expect(page.getByRole('button', { name: '账户菜单' })).toBeVisible({ timeout: 15_000 });
+  await page.getByRole('button', { name: '账户菜单' }).click({ force: true });
+  await expect(page.getByRole('menuitem', { name: '退出登录' })).toBeVisible();
+  await page.getByRole('menuitem', { name: '退出登录' }).click({ force: true });
+  await expect(page.getByRole('button', { name: '进入平台' })).toBeVisible();
 }
 
 async function loginForTenant(
@@ -111,6 +129,9 @@ test('M5-A 知识治理在真实 SQLite 服务中默认私有并拒绝伪造组�
 
     await page.goto('/enterprise/knowledge');
     await page.getByRole('button', { name: '平台知识治理' }).click();
+    // MySQL 的时间精度和并列排序可能把刚创建的记录放到客户端分页第二页，
+    // 通过名称过滤验证本次业务对象，避免把分页顺序误判成写入失败。
+    await page.getByPlaceholder('搜索知识库名称、描述、状态或版本').fill('M5-A SQLite 浏览器知识库');
     const row = page.getByRole('row').filter({ hasText: 'M5-A SQLite 浏览器知识库' });
     await expect(row).toBeVisible();
     await row.getByRole('button', { name: '知识库操作' }).click();
@@ -538,6 +559,9 @@ test('超标特批 v2.1 按申请部门子树竞争认领并流转到集中财�
 });
 
 test('管理员治理发布后普通成员可添加对话和复制，但不能绕过发布命令', async ({ page }) => {
+  // 该旅程连续切换四个真实用户身份，并包含组织范围、工作项与广场读回；给浏览器轮次独立预算。
+  // MySQL 真实浏览器下每次登录都要等待服务端上下文读回，不能让前序身份切换挤掉最后一次登录的预算。
+  test.setTimeout(120_000);
   const sourceName = 'M0 广场行政助手';
   const copiedName = 'M0 我的行政分身';
 
@@ -570,7 +594,7 @@ test('管理员治理发布后普通成员可添加对话和复制，但不能�
   }, sourceName);
   expect(sourceAgent.createStatus).toBe(200);
 
-  await page.evaluate(() => localStorage.removeItem('gongge_auth'));
+  await logout(page);
   await page.goto('/enterprise/platform/agents');
   await login(page, 'member', 'member');
   const privateAgentGuards = await page.evaluate(async (sourceId) => {
@@ -602,7 +626,7 @@ test('管理员治理发布后普通成员可添加对话和复制，但不能�
   }, sourceAgent.id);
   expect(privateAgentGuards).toEqual([403, 403, 403]);
 
-  await page.evaluate(() => localStorage.removeItem('gongge_auth'));
+  await logout(page);
   await page.goto('/enterprise/platform/agents');
   await loginAsAdmin(page);
   const publishStatus = await page.evaluate(async (sourceId) => {
@@ -624,12 +648,13 @@ test('管理员治理发布后普通成员可添加对话和复制，但不能�
   }, sourceAgent.id);
   expect(publishStatus).toBe(200);
   await page.reload();
-  await expect(page.getByText('数字员工广场', { exact: true }).first()).toBeVisible();
+  // 当前管理路由的页面标题是“开放广场平台”；“数字员工广场”仍是产品概念和对话入口名称。
+  await expect(page.getByText('开放广场平台', { exact: true }).first()).toBeVisible();
   await page.goto('/enterprise/work-items');
   await expect(page.getByRole('tab', { name: '可认领' })).toBeVisible();
   await expect(page.getByText('m0_admin_process', { exact: true })).toBeHidden();
 
-  await page.evaluate(() => localStorage.removeItem('gongge_auth'));
+  await logout(page);
   await page.goto('/enterprise/platform/agents');
   await login(page, 'member', 'member');
   await page.goto('/enterprise/work-items');
@@ -651,7 +676,7 @@ test('管理员治理发布后普通成员可添加对话和复制，但不能�
     return item;
   });
 
-  await page.evaluate(() => localStorage.removeItem('gongge_auth'));
+  await logout(page);
   await page.goto('/enterprise/platform/agents');
   await login(page, 'other-member', 'other-member');
   await page.goto('/enterprise/work-items');
@@ -676,7 +701,7 @@ test('管理员治理发布后普通成员可添加对话和复制，但不能�
   }, scopedWorkItem);
   expect(outsideClaimStatus).toBe(403);
 
-  await page.evaluate(() => localStorage.removeItem('gongge_auth'));
+  await logout(page);
   await page.goto('/enterprise/platform/agents');
   await login(page, 'member', 'member');
   await page.goto('/enterprise/work-items');
@@ -694,7 +719,7 @@ test('管理员治理发布后普通成员可添加对话和复制，但不能�
   await page.getByRole('tab', { name: '待我处理' }).click();
   await expect(page.getByText('m0_admin_process', { exact: true })).toBeVisible();
 
-  await page.evaluate(() => localStorage.removeItem('gongge_auth'));
+  await logout(page);
   await page.goto('/enterprise/dashboard');
   await loginAsAdmin(page);
   const endScopedAssignmentStatus = await page.evaluate(async () => {
@@ -732,7 +757,7 @@ test('管理员治理发布后普通成员可添加对话和复制，但不能�
   });
   expect(endScopedAssignmentStatus).toBe(200);
 
-  await page.evaluate(() => localStorage.removeItem('gongge_auth'));
+  await logout(page);
   await page.goto('/enterprise/platform/agents');
   await login(page, 'member', 'member');
   await page.goto('/enterprise/work-items');
@@ -794,7 +819,17 @@ test('管理员治理发布后普通成员可添加对话和复制，但不能�
   await page.getByRole('button', { name: '同意' }).click();
   expect((await legacyCompleteResponse).status()).toBe(200);
   await expect(page.getByRole('dialog')).toBeHidden();
+  // MySQL 的广场查询可能晚于路由切换完成；先等待本次 scope=gallery 的真实响应，
+  // 再读取卡片，避免用固定短等待把合法慢查询误判为业务缺陷。
+  const galleryPageResponse = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return response.request().method() === 'GET'
+      && url.pathname.endsWith('/api/enterprise/agents/gallery-page')
+      && url.searchParams.get('scope') === 'gallery'
+      && response.status() === 200;
+  });
   await page.goto('/enterprise/platform/agents');
+  await galleryPageResponse;
 
   const sourceCard = page.getByRole('button', { name: new RegExp(sourceName) });
   await expect(sourceCard).toBeVisible();
@@ -991,7 +1026,7 @@ test('管理员治理发布后普通成员可添加对话和复制，但不能�
   expect(m4Contracts.rejectedSessionStatus).toBe(403);
   expect(m4Contracts.readdStatus).toBe(200);
 
-  await page.evaluate(() => localStorage.removeItem('gongge_auth'));
+  await logout(page);
   await page.goto('/enterprise/platform/agents');
   await login(page, 'other-member', 'other-member');
   const secondMemberIsolation = await page.evaluate(async ({ sourceId, firstSessionId }) => {
@@ -1442,7 +1477,7 @@ test('管理员维护单根组织树，普通成员不能通过浏览器构造�
   );
 
   await page.reload();
-  await expect(page.getByRole('button', { name: '账户菜单' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '账户菜单' })).toBeVisible({ timeout: 15_000 });
   const persistedPath = await page.evaluate(async (divisionId) => {
     const rawSession = localStorage.getItem('gongge_auth');
     if (!rawSession) throw new Error('刷新后未保存认证会话');
@@ -1700,6 +1735,8 @@ test('管理员通过真实浏览器执行组织调动和岗位任职并保留�
 });
 
 test('管理员在组织页面配置任职和岗位默认角色，普通成员不能进入或伪造绑定', async ({ page }) => {
+  // 该旅程包含组织树、岗位任职、角色绑定及再次登录越权核验；原生 MySQL 的真实页面读取需要独立预算。
+  test.setTimeout(120_000);
   await page.goto('/enterprise/organization');
   await loginAsAdmin(page);
 
@@ -1710,7 +1747,11 @@ test('管理员在组织页面配置任职和岗位默认角色，普通成员�
   await page.getByRole('button', { name: '调入成员' }).click();
   const memberDialog = page.getByRole('dialog', { name: /调入“M2-B 研发部”/ });
   await memberDialog.getByRole('combobox').click();
-  await page.getByRole('option').first().click();
+  // 原生 MySQL 的成员候选由真实接口异步返回，必须等候选进入 DOM 后再选择。
+  const financeOption = page.getByRole('option', { name: /^E2E Finance/ });
+  await expect(financeOption).toBeVisible({ timeout: 15_000 });
+  // SQLite 与 MySQL 的默认排序可能不同；按业务身份选取，不能用候选数组首项代替确定性事实。
+  await financeOption.click();
   const orgAssignmentResponse = page.waitForResponse((response) =>
     response.url().endsWith('/api/organization/member-org-assignments')
     && response.request().method() === 'POST',
@@ -1718,9 +1759,21 @@ test('管理员在组织页面配置任职和岗位默认角色，普通成员�
   await memberDialog.getByRole('button', { name: '保存', exact: true }).click();
   expect((await orgAssignmentResponse).status()).toBe(200);
 
+  // MySQL 的组织刷新可能晚于写入响应；先等当前成员的真实结束操作读回，避免组件 key 重建时关闭岗位选择器。
+  const currentOrgSection = page.locator('section').filter({
+    has: page.getByRole('heading', { name: '当前组织成员' }),
+  });
+  const financeMember = currentOrgSection.locator('span').filter({ hasText: /^E2E Finance/ });
+  const currentMemberEnd = financeMember.getByRole('button', { name: '结束', exact: true });
+  await expect(financeMember).toBeVisible({ timeout: 15_000 });
+  // 页面快照已读回成员，但 React 文本节点可能跨 span 重建；读取同一成员胶囊保持业务断言。
+  await expect(currentMemberEnd).toBeVisible({ timeout: 15_000 });
   const positionPicker = page.getByRole('combobox', { name: '选择岗位任职成员' });
   await positionPicker.click();
-  await page.getByRole('option').first().click();
+  // 调入成员会触发一次新的组织范围查询，避免在响应到达前读取空候选。
+  const positionFinanceOption = page.getByRole('option', { name: /^E2E Finance/ });
+  await expect(positionFinanceOption).toBeVisible({ timeout: 15_000 });
+  await positionFinanceOption.click();
   await page.keyboard.press('Escape');
   const positionAssignmentResponse = page.waitForResponse((response) =>
     response.url().endsWith('/api/organization/position-assignments')
@@ -1777,6 +1830,8 @@ test('成员管理通过真实后端写入唯一员工工号绑定', async ({ pa
   await page.goto('/enterprise/accounts');
   await loginAsAdmin(page);
 
+  // 成员列表按创建时间分页，演示管理员不保证落在第一页；用工号搜索验证唯一绑定。
+  await page.getByPlaceholder('搜索成员、账号、工号、状态或类别').fill('E001');
   await expect(page.getByRole('cell', { name: 'E001', exact: true })).toBeVisible();
   await page.getByRole('button', { name: '新增成员' }).click();
   await page.getByLabel('用户名').fill('employee-e100');
@@ -2161,7 +2216,6 @@ test('治理角色按组织子树授权，范围管理员与普通成员在真�
       }
     });
   }
-
   await adminPage.goto('/enterprise/dashboard');
   await loginAsAdmin(adminPage);
   const fixture = await adminPage.evaluate(async () => {

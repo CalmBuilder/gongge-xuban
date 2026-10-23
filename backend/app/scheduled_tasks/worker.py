@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import signal
 import threading
 from time import sleep
@@ -34,11 +35,17 @@ from app.scheduled_tasks.service import (
     start_scheduled_task_async,
 )
 from app.sop_runtime.coordinator import DeterministicSopCoordinator
+from app.sop_runtime.external_tasks import (
+    due_sop_external_task_signals,
+    poll_due_external_operations,
+    process_sop_external_task_signal,
+)
 from app.sop_runtime.work_items import SopWorkItemService
 
 
 _stopped = False
 _background_thread: threading.Thread | None = None
+LOGGER = logging.getLogger(__name__)
 
 
 def _handle_stop(_signum: int, _frame: object) -> None:
@@ -62,7 +69,7 @@ def run_worker(*, once: bool = False, poll_seconds: float = WORKER_SLEEP_SECONDS
                     execute_scheduled_task(db, task)
                 else:
                     start_scheduled_task_async(db, task)
-            _process_due_dynamic_signals(db, once=once)
+            _process_external_task_maintenance(db, once=once)
             reconcile_parallel_read_batches(db)
             reconcile_scheduled_dynamic_runs(db)
             reconcile_pending_agent_deletions(db)
@@ -76,9 +83,12 @@ def run_worker(*, once: bool = False, poll_seconds: float = WORKER_SLEEP_SECONDS
 
 
 def _process_due_dynamic_signals(db: Session, *, once: bool) -> int:
-    """单次模式确定性执行，常驻模式有界派发，避免慢 Agent 阻塞调度扫描。"""
+    """先消费 SOP 外部回执，再按原规则派发 DTA Signal，避免跨分支吞掉唤醒。"""
 
     dispatched = 0
+    for sop_signal in due_sop_external_task_signals(db):
+        process_sop_external_task_signal(db, sop_signal)
+        dispatched += 1
     for dynamic_signal in due_dynamic_task_signals(db):
         if once:
             process_dynamic_task_signal(db, dynamic_signal)
@@ -86,6 +96,30 @@ def _process_due_dynamic_signals(db: Session, *, once: bool) -> int:
         elif start_dynamic_task_signal_async(dynamic_signal.id):
             dispatched += 1
     return dispatched
+
+
+def _process_external_task_maintenance(db: Session, *, once: bool) -> int:
+    """轮询已受理的 provider task，并在同一轮消费 SOP/DTA 回执 Signal。"""
+
+    polled = poll_due_external_operations(db)
+    recovered = _recover_knowledge_revision_jobs(db)
+    return polled + _process_due_dynamic_signals(db, once=once) + recovered
+
+
+def _recover_knowledge_revision_jobs(db: Session) -> int:
+    """在生产维护轮询中接管有限批次正文任务，并继续同一持久 job。"""
+
+    from app.knowledge import revisions
+
+    job_ids = revisions.recover_revision_jobs(db)
+    for job_id in job_ids:
+        try:
+            # 直接在维护 worker 中运行，确保扫描后立即 claim；重复进程由
+            # revision job 的持久状态/Fence 阻断重复构建与发布。
+            revisions.run_revision_job(job_id)
+        except Exception:  # noqa: BLE001 - 单个修订不能终止整轮恢复扫描。
+            LOGGER.exception("knowledge revision recovery failed", extra={"job_id": job_id})
+    return len(job_ids)
 
 
 def process_expired_work_item(db: Session, work_item: SopWorkItem) -> None:

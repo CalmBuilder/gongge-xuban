@@ -2642,6 +2642,33 @@ def test_desktop_sqlite_legacy_path_backfills_execution_and_capability_contracts
         assert len(str(operation[1])) == 64
         assert tuple(operation[2:4]) == ("external_write", "unknown")
         assert operation[4] == "{}"
+        operation_columns = {
+            column["name"] for column in inspect(connection).get_columns("sop_operations")
+        }
+        attempt_columns = {
+            column["name"]
+            for column in inspect(connection).get_columns("sop_operation_attempts")
+        }
+        assert {
+            "external_strategy",
+            "external_task_id",
+            "external_status_url",
+            "external_next_poll_at",
+            "external_observation_revision",
+            "external_receipt_json",
+        }.issubset(operation_columns)
+        assert {
+            "external_task_id",
+            "external_status",
+            "external_observation_revision",
+            "external_receipt_json",
+            "waiting_at",
+        }.issubset(attempt_columns)
+        assert any(
+            "waiting_external" in str(item.get("sqltext") or "")
+            for item in inspect(connection).get_check_constraints("sop_operations")
+            if item.get("name") == "ck_sop_operation_status"
+        )
         assert connection.execute(
             text("SELECT COUNT(*) FROM sop_operation_attempts")
         ).scalar_one() == 1
@@ -2658,6 +2685,129 @@ def test_desktop_sqlite_legacy_path_backfills_execution_and_capability_contracts
             )
         ).one() == ("submit", "sop_node", 1)
         assert "execution_plan_revisions" in inspect(connection).get_table_names()
+
+
+def test_external_operation_waiting_migration_is_idempotent_and_protects_waiting_history(
+    tmp_path,
+) -> None:
+    """验证 0084 在 SQLite 可重复升级，并拒绝丢弃仍待外部对账的账本事实。"""
+
+    database_url = f"sqlite:///{tmp_path / 'external-operation-waiting.db'}"
+    config = Config(str(BACKEND_DIR / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
+    config.attributes["database_url"] = database_url
+    engine = create_engine(database_url)
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)"))
+        connection.execute(text("INSERT INTO alembic_version VALUES ('20260906_0083')"))
+        connection.execute(
+            text(
+                "CREATE TABLE sop_operations ("
+                "id VARCHAR(512) PRIMARY KEY, status VARCHAR(64) NOT NULL, "
+                "CONSTRAINT ck_sop_operation_status CHECK "
+                "(status IN ('prepared', 'running', 'succeeded', 'failed', 'unknown', 'cancelled'))"
+                ")"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE TABLE sop_operation_attempts ("
+                "id VARCHAR(512) PRIMARY KEY, status VARCHAR(64) NOT NULL, "
+                "CONSTRAINT ck_sop_operation_attempt_status CHECK "
+                "(status IN ('prepared', 'running', 'succeeded', 'failed', 'unknown', 'cancelled', 'reused'))"
+                ")"
+            )
+        )
+
+    command.upgrade(config, "20260928_0084")
+    command.upgrade(config, "20260928_0084")
+    with engine.begin() as connection:
+        operation_columns = {
+            column["name"] for column in inspect(connection).get_columns("sop_operations")
+        }
+        attempt_columns = {
+            column["name"]
+            for column in inspect(connection).get_columns("sop_operation_attempts")
+        }
+        assert {
+            "external_submission_id",
+            "external_task_id",
+            "external_status_url",
+            "external_next_poll_at",
+            "external_observation_revision",
+            "external_receipt_json",
+        }.issubset(operation_columns)
+        assert {
+            "external_task_id",
+            "external_observation_revision",
+            "external_receipt_json",
+            "waiting_at",
+        }.issubset(attempt_columns)
+        connection.execute(
+            text("INSERT INTO sop_operations (id, status) VALUES ('waiting-op', 'waiting_external')")
+        )
+
+    with pytest.raises(RuntimeError, match="cannot downgrade"):
+        command.downgrade(config, "20260906_0083")
+
+    with engine.begin() as connection:
+        connection.execute(text("DELETE FROM sop_operations WHERE id='waiting-op'"))
+    command.downgrade(config, "20260906_0083")
+    with engine.connect() as connection:
+        assert "external_task_id" not in {
+            column["name"] for column in inspect(connection).get_columns("sop_operations")
+        }
+
+
+def test_external_event_inbox_migration_is_idempotent_and_protects_receipts(tmp_path) -> None:
+    """验证 0085 的 inbox 结构、append-once 约束和有回执事实时的回退保护。"""
+
+    database_url = f"sqlite:///{tmp_path / 'external-event-inbox.db'}"
+    config = Config(str(BACKEND_DIR / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
+    config.attributes["database_url"] = database_url
+    engine = create_engine(database_url)
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)"))
+        connection.execute(text("INSERT INTO alembic_version VALUES ('20260928_0084')"))
+
+    command.upgrade(config, "20260928_0085")
+    command.upgrade(config, "20260928_0085")
+    inspector = inspect(engine)
+    assert "sop_external_task_event_inbox" in inspector.get_table_names()
+    assert {
+        "operation_id",
+        "provider_task_id",
+        "provider_event_id",
+        "observation_revision",
+        "payload_checksum",
+        "signal_id",
+    }.issubset({column["name"] for column in inspector.get_columns("sop_external_task_event_inbox")})
+    assert "uq_sop_external_event_provider_id" in {
+        item["name"] for item in inspector.get_unique_constraints("sop_external_task_event_inbox")
+    }
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO sop_external_task_event_inbox ("
+                "id, tenant_id, provider_task_id, provider_event_id, event_type, provider_status, "
+                "observation_revision, payload_checksum, payload_json, status, attempt_count, "
+                "available_at, last_error_json, received_at, created_at, updated_at"
+                ") VALUES ("
+                "'event-1', 'tenant_sd4', 'provider-1', 'event-1', 'status', 'completed', "
+                "1, 'checksum', '{}', 'pending', 0, CURRENT_TIMESTAMP, '{}', CURRENT_TIMESTAMP, "
+                "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+        )
+
+    with pytest.raises(RuntimeError, match="cannot downgrade"):
+        command.downgrade(config, "20260928_0084")
+    with engine.begin() as connection:
+        connection.execute(
+            text("DELETE FROM sop_external_task_event_inbox WHERE id='event-1'")
+        )
+    command.downgrade(config, "20260928_0084")
+    assert "sop_external_task_event_inbox" not in inspect(engine).get_table_names()
 
 
 def test_desktop_sqlite_legacy_path_rejects_invalid_operation_request(tmp_path) -> None:

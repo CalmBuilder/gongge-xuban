@@ -386,7 +386,7 @@ def _ensure_catalog(
                 select(CodeSet).where(
                     CodeSet.tenant_id == tenant_id,
                     CodeSet.set_code == set_code,
-                )
+                ).with_for_update()
             ).first()
             if code_set is None:
                 raise
@@ -419,7 +419,7 @@ def _ensure_catalog(
                         CodeItem.tenant_id == tenant_id,
                         CodeItem.code_set_id == code_set.id,
                         CodeItem.item_code == item_code,
-                    )
+                    ).with_for_update()
                 ).first()
                 if existing_item is None:
                     raise

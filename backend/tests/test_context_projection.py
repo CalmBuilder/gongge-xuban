@@ -6,6 +6,8 @@
 @Description: 验证会话、SOP 与知识证据投影的预算、连续性和原子引用完整性。
 """
 
+import pytest
+
 from app.core.context_projection import (
     compact_awaiting_input,
     compact_conversation_context,
@@ -57,6 +59,42 @@ def test_compact_knowledge_context_keeps_evidence_without_duplicate_payloads() -
     assert "outline" not in knowledge[1]
     assert len(knowledge[1]["summary"]) <= 603
     assert result["chunks"][0]["content"].startswith("重复切片")
+
+
+@pytest.mark.parametrize(
+    ("aligned_evidence_count", "covered_aspects"),
+    [(0, []), (3, ["ZIRCON999UNKNOWN 政策额度"])],
+    ids=["zero-coverage", "partial-coverage"],
+)
+def test_compact_knowledge_context_withholds_candidates_when_required_evidence_is_unsatisfied(
+    aligned_evidence_count: int, covered_aspects: list[str],
+) -> None:
+    """整体验证未满足时，不把零覆盖或部分覆盖的候选送进SOP/Router最终回答上下文。"""
+    result = {
+        "query": "ZIRCON999UNKNOWN 政策额度和截止时间",
+        "outcome": "insufficient",
+        "evidence_sufficiency": {
+            "required": True,
+            "satisfied": False,
+            "aligned_evidence_count": aligned_evidence_count,
+            "covered_aspects": covered_aspects,
+            "reason": "desired_evidence_not_aligned",
+        },
+        "selected_documents": [{"title": "已发布政策", "summary": "其他政策1500元，截止17:30。"}],
+        "selected_concepts": [{"title": "已发布政策", "content": "其他政策1500元，截止17:30。"}],
+        "okf_citations": [{"title": "已发布政策", "label": "其他政策1500元，截止17:30。"}],
+        "evidence_pack": [{"content": "其他政策1500元，截止17:30。"}],
+    }
+
+    compacted = compact_knowledge_context([result])
+
+    assert compacted[0]["outcome"] == "insufficient"
+    assert compacted[0]["evidence_sufficiency"] == {
+        "required": True, "satisfied": False,
+    }
+    assert compacted[0]["retrieved_knowledge"] == []
+    assert "1500元" not in str(compacted)
+    assert "17:30" not in str(compacted)
 
 
 def test_compact_step_result_only_projects_knowledge_results() -> None:

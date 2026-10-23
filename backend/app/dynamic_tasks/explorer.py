@@ -78,6 +78,7 @@ class ReadOnlyExploreProposer:
         observations: Sequence[Mapping[str, object]],
         remaining_tool_calls: int,
         general_skill_guidance: Sequence[Mapping[str, object]] = (),
+        time_context: Mapping[str, object] | None = None,
     ) -> CompletedProviderProposal:
         """只披露本 Step 安全能力和已投影回执，并校验动作不能越界或递归。"""
 
@@ -93,25 +94,28 @@ class ReadOnlyExploreProposer:
         }
         if set(step.capability_refs) != set(allowed):
             raise ValueError("Explore 能力未由当前步骤冻结或未显式发布为安全")
+        payload = {
+            "research_goal": goal,
+            "current_step": {
+                "title": step.title,
+                "expected_output_schema": step.expected_output_schema,
+            },
+            "capabilities": [allowed[name].model_view for name in step.capability_refs],
+            "observations": [dict(item) for item in observations],
+            "general_skill_guidance": [dict(item) for item in general_skill_guidance],
+            "limits": {
+                "remaining_tool_calls": remaining_tool_calls,
+                "recursion_allowed": False,
+                "write_allowed": False,
+                "attention_allowed": False,
+            },
+            "output_contract": _EXPLORE_OUTPUT_CONTRACT,
+        }
+        if isinstance(time_context, Mapping):
+            payload["time_context"] = dict(time_context)
         raw, metadata = self.client.generate_json_with_metadata(
             _EXPLORE_SYSTEM_PROMPT,
-            {
-                "research_goal": goal,
-                "current_step": {
-                    "title": step.title,
-                    "expected_output_schema": step.expected_output_schema,
-                },
-                "capabilities": [allowed[name].model_view for name in step.capability_refs],
-                "observations": [dict(item) for item in observations],
-                "general_skill_guidance": [dict(item) for item in general_skill_guidance],
-                "limits": {
-                    "remaining_tool_calls": remaining_tool_calls,
-                    "recursion_allowed": False,
-                    "write_allowed": False,
-                    "attention_allowed": False,
-                },
-                "output_contract": _EXPLORE_OUTPUT_CONTRACT,
-            },
+            payload,
         )
         proposal = RuntimeActionProposal.model_validate(raw)
         if proposal.action_kind == ActionKind.CALL_TOOL:

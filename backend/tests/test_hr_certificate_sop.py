@@ -1,5 +1,5 @@
 """
-@Time       : 2026/07/22 23:52
+@Time       : 2026/10/03
 @Author     : zhanglp8181
 @File       : test_hr_certificate_sop.py
 @CallChain  : pytest → 在职证明发布定义 → Scheduler/WorkItem/Tool 分支
@@ -197,7 +197,7 @@ def test_certificate_seed_freezes_roles_permissions_tool_and_published_version()
             select(Skill).where(Skill.skill_id == HR_CERTIFICATE_SKILL_ID)
         ).one()
         version = db.exec(
-            select(SkillVersion).where(
+            select(SkillVersion).where(SkillVersion.tenant_id == "tenant_demo", SkillVersion.scope_agent_id == "",
                 SkillVersion.skill_id == HR_CERTIFICATE_SKILL_ID,
                 SkillVersion.version == HR_CERTIFICATE_DETERMINISTIC_VERSION,
             )

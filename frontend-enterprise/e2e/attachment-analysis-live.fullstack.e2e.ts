@@ -31,6 +31,7 @@ const LIVE_DYNAMIC_EXECUTION_WAIT_TIMEOUT_MS = 1_920_000;
 
 test.describe.configure({ mode: 'serial', timeout: 600_000 });
 test.skip(!LIVE_ENABLED, '仅在 LIVE_ATTACHMENT_E2E=1 时调用真实外部模型');
+test.use({ timezoneId: 'Pacific/Honolulu' });
 
 test.afterEach(async ({}, testInfo) => {
   liveTestResults.push({
@@ -234,6 +235,7 @@ test('真实模型连续三轮消费CSV且每轮权威输入链完整', async ({
 });
 
 test('真实模型在无Skill无附件时委托纯DynamicTaskAgent并闭环', async ({ page }) => {
+  const dtaPromptMarker = 'SD3-LIVE-DTA-TIME-CONTEXT';
   await page.goto('/enterprise/dashboard');
   await login(page);
   await page.goto('/workspace/chat');
@@ -245,7 +247,7 @@ test('真实模型在无Skill无附件时委托纯DynamicTaskAgent并闭环', as
   await agentCard.getByRole('button', { name: '发起对话' }).click({ timeout: 15_000 });
   await expect(page.getByText('Hello Skill演示A｜文档规范分身！')).toBeVisible();
   await page.getByPlaceholder('输入消息，按 Enter 发送...').fill(
-    '请完成一个需要持久计划、故障恢复和结果校验的交付任务：为版本 v2.4 生成生产发布验收报告。'
+    `${dtaPromptMarker}：请完成一个需要持久计划、故障恢复和结果校验的交付任务：为版本 v2.4 生成生产发布验收报告。`
     + '已知发布窗口为22:00-23:00，成功标准是错误率低于0.5%、P95低于300ms、'
     + '核心交易成功率高于99.9%；容量风险是峰值流量2倍尚未压测，回滚风险是数据库迁移不可逆。'
     + '必须依次形成执行目标、核对三项标准、列出这两项风险，最后给出“满足数据后方可通过”的'
@@ -302,6 +304,27 @@ test('真实模型在无Skill无附件时委托纯DynamicTaskAgent并闭环', as
     );
   }
   const facts = await readExecution();
+  const timeFacts = await page.evaluate(async ({ marker }) => {
+    const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
+    const headers = { Authorization: `Bearer ${auth.token}` };
+    const sessionId = location.pathname.split('/').at(-1) || '';
+    const messages = await fetch(
+      `/api/chat/sessions/${sessionId}/messages?tenant_id=tenant_demo`, { headers },
+    ).then((response) => response.json()) as Array<{
+      id: string;
+      role: string;
+      content: string;
+      metadata?: { time_context?: Record<string, string> };
+    }>;
+    return [...messages].reverse().find((item) => (
+      item.role === 'user' && item.content.includes(marker)
+    ));
+  }, { marker: dtaPromptMarker });
+  expect(timeFacts?.metadata?.time_context).toMatchObject({
+    source_input_id: timeFacts?.id,
+    timezone: 'Pacific/Honolulu',
+  });
+  await page.reload();
   expect(facts?.executionId).toMatch(/^sopinst_/);
   expect(facts?.execution).toMatchObject({
     kind: 'dynamic_task',
@@ -763,6 +786,47 @@ test('LIVE配置下正式SOP确定性读取XLSX与CSV并从页面下载核验XLS
     timeout: 60_000,
   }).toBe('succeeded');
   const facts = await readExecution();
+  const timeFacts = await page.evaluate(async () => {
+    const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
+    const headers = { Authorization: `Bearer ${auth.token}` };
+    const messages = await fetch(
+      '/api/chat/sessions/session_attachment_sales_sop/messages?tenant_id=tenant_demo',
+      { headers },
+    ).then((response) => response.json()) as Array<{
+      id: string;
+      role: string;
+      content: string;
+      metadata?: { time_context?: Record<string, string> };
+    }>;
+    const userMessage = [...messages].reverse().find((item) => (
+      item.role === 'user' && item.content.includes('ATTACHMENT-SOP-SALES')
+    ));
+    return { userMessage };
+  });
+  expect(timeFacts.userMessage?.metadata?.time_context).toMatchObject({
+    source_input_id: timeFacts.userMessage?.id,
+    timezone: 'Pacific/Honolulu',
+  });
+  await page.reload();
+  const reloadedTimeFacts = await page.evaluate(async () => {
+    const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
+    const headers = { Authorization: `Bearer ${auth.token}` };
+    const messages = await fetch(
+      '/api/chat/sessions/session_attachment_sales_sop/messages?tenant_id=tenant_demo',
+      { headers },
+    ).then((response) => response.json()) as Array<{
+      id: string;
+      role: string;
+      content: string;
+      metadata?: { time_context?: Record<string, string> };
+    }>;
+    return [...messages].reverse().find((item) => (
+      item.role === 'user' && item.content.includes('ATTACHMENT-SOP-SALES')
+    ));
+  });
+  expect(reloadedTimeFacts?.metadata?.time_context).toEqual(
+    timeFacts.userMessage?.metadata?.time_context,
+  );
   expect(facts.execution).toMatchObject({ kind: 'sop', input_binding_count: 2 });
   expect(facts.events.some((event) => event.event_type === 'dynamic_task_delegated')).toBe(false);
   expect(facts.execution.operations).toEqual(expect.arrayContaining([

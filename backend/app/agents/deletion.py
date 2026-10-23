@@ -314,6 +314,9 @@ class AgentDeletionService:
         if agent.status != "archived":
             agent.status = "archived"
             agent.profile_revision = max(int(agent.profile_revision or 1), 1) + 1
+            agent.memory_capture_generation = max(
+                int(agent.memory_capture_generation or 1), 1
+            ) + 1
         agent.published_to_gallery = False
         agent.visibility_scope = "private"
         agent.gallery_published_at = None

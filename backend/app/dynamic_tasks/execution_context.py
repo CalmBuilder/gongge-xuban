@@ -1,5 +1,5 @@
 """
-@Time       : 2026/08/03 23:24
+@Time       : 2026/10/03
 @Author     : zhanglp8181
 @File       : execution_context.py
 @CallChain  : DynamicTaskAgent resume/planning → database projection → provider execution view
@@ -21,9 +21,15 @@ from app.db.models import (
     SopInstance,
     SopNodeExecution,
     SopOperation,
+    SopWorkItem,
 )
+from app.core.time_context import normalize_persisted_time_context
 from app.dynamic_tasks.capability_catalog import capability_checksum
 from app.dynamic_tasks.planning import canonical_checksum
+from app.knowledge.schema import (
+    knowledge_result_output_schema,
+    withhold_insufficient_knowledge_candidates,
+)
 
 
 _SENSITIVE_RESULT_KEYS = frozenset(
@@ -53,6 +59,7 @@ class ExecutionContextProjection(BaseModel):
     input_resources: tuple[dict[str, Any], ...]
     memory_context: tuple[dict[str, Any], ...] = ()
     conversation_context: tuple[dict[str, Any], ...] = ()
+    time_context: dict[str, str] | None = None
     attention_refs: tuple[str, ...] = ()
 
 
@@ -140,14 +147,16 @@ def build_execution_context_projection(
         if step.status != "succeeded":
             continue
         operation = operation_by_node_id.get(step.id)
-        model_output = (
-            _model_visible_explore_output(step.output_json)
-            if step.step_kind == "explore"
-            else _model_visible_operation_output(
+        if step.step_kind == "explore":
+            model_output = _model_visible_explore_output(step.output_json)
+        elif step.step_kind == "clarification":
+            model_output = _model_visible_clarification_output(db, step, instance)
+        else:
+            model_output = _model_visible_operation_output(
                 operation,
                 capability_by_name=capability_by_name,
+                instance=instance,
             )
-        )
         completed_items.append(
             {
                 "step_key": step.step_key,
@@ -162,6 +171,8 @@ def build_execution_context_projection(
         )
     completed = tuple(completed_items)
     pending = proposals[-1] if proposals else None
+    stored_context = instance.context_json or {}
+    time_context = normalize_persisted_time_context(stored_context.get("time_context"))
     return ExecutionContextProjection(
         execution_id=instance.id,
         execution_revision=instance.revision,
@@ -210,14 +221,15 @@ def build_execution_context_projection(
         ),
         memory_context=tuple(
             dict(item)
-            for item in (instance.context_json or {}).get("memory_context", [])
+            for item in stored_context.get("memory_context", [])
             if isinstance(item, dict)
         ),
         conversation_context=tuple(
             dict(item)
-            for item in (instance.context_json or {}).get("conversation_context", [])
+            for item in stored_context.get("conversation_context", [])
             if isinstance(item, dict)
         ),
+        time_context=time_context,
     )
 
 
@@ -240,18 +252,48 @@ def _model_visible_operation_output(
     operation: SopOperation | None,
     *,
     capability_by_name: dict[str, dict[str, Any]],
+    instance: SopInstance | None = None,
 ) -> object | None:
-    """按冻结能力的 output schema 回注工具结果，剥离未声明字段和展示侧带。"""
+    """按冻结schema回注结果；精确旧内置知识缺字段时只读采用同一证据白名单。"""
 
     if operation is None or operation.status != "succeeded":
         return None
     snapshot = capability_by_name.get(operation.operation_name)
     model_view = snapshot.get("model_view") if isinstance(snapshot, dict) else None
     schema = model_view.get("output_schema") if isinstance(model_view, dict) else None
+    contract = snapshot.get("contract") if isinstance(snapshot, dict) else None
+    if (
+        instance is not None
+        and isinstance(snapshot, dict)
+        and isinstance(model_view, dict)
+        and "output_schema" not in model_view
+        and snapshot.get("capability_type") == "knowledge"
+        and snapshot.get("capability_id") == "knowledge.search"
+        and snapshot.get("name") == "knowledge.search"
+        and snapshot.get("tenant_id") == instance.tenant_id == operation.tenant_id
+        and snapshot.get("agent_id") == instance.agent_id
+        and operation.instance_id == instance.id
+        and isinstance(contract, dict)
+        and contract.get("risk_class") == "read"
+        and contract.get("side_effect") == "none"
+    ):
+        schema = knowledge_result_output_schema()
     data = (operation.result_json or {}).get("data")
     if not isinstance(schema, dict):
         return None
-    return _project_result_by_schema(data, schema, depth=0)
+    projected = _project_result_by_schema(data, schema, depth=0)
+    is_knowledge_operation = (
+        isinstance(snapshot, dict)
+        and operation.operation_name == "knowledge.search"
+        and snapshot.get("capability_type") == "knowledge"
+        and snapshot.get("capability_id") == "knowledge.search"
+        and snapshot.get("name") == "knowledge.search"
+        and snapshot.get("tenant_id") == operation.tenant_id
+        and (instance is None or snapshot.get("agent_id") == instance.agent_id)
+    )
+    if is_knowledge_operation and isinstance(projected, dict):
+        return withhold_insufficient_knowledge_candidates(projected)
+    return projected
 
 
 def project_result_for_model(value: object, schema: Mapping[str, Any]) -> object:
@@ -284,6 +326,46 @@ def _model_visible_explore_output(output: object) -> dict[str, object] | None:
             str(item)[:1000]
             for item in (limitations if isinstance(limitations, list) else [])[:20]
         ],
+    }
+
+
+def _model_visible_clarification_output(
+    db: Session,
+    step: SopNodeExecution,
+    instance: SopInstance,
+) -> dict[str, str] | None:
+    """只回注已完成、同执行、本人回答与 Attention resolution 精确一致的澄清输入。"""
+
+    output = step.output_json if isinstance(step.output_json, dict) else {}
+    answer = output.get("answer")
+    attention_id = output.get("attention_id")
+    if (
+        not isinstance(answer, str)
+        or not answer.strip()
+        or not isinstance(attention_id, str)
+        or not attention_id.strip()
+    ):
+        return None
+    attention = db.get(SopWorkItem, attention_id)
+    resolution = attention.resolution_json if attention is not None else None
+    if (
+        attention is None
+        or attention.tenant_id != instance.tenant_id
+        or attention.instance_id != instance.id
+        or attention.node_execution_id != step.id
+        or attention.attention_kind != "clarification"
+        or attention.status != "completed"
+        or attention.initiator_user_id != instance.initiator_user_id
+        or not isinstance(resolution, dict)
+        or resolution.get("command") != "answer"
+        or resolution.get("actor_user_id") != instance.initiator_user_id
+        or resolution.get("revision") != attention.revision
+        or resolution.get("comment") != answer
+    ):
+        return None
+    return {
+        "source_kind": "authenticated_user_clarification",
+        "answer": _clip_result_text(answer),
     }
 
 

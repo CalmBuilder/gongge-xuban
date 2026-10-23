@@ -1,8 +1,8 @@
 """
-@Time       : 2026/09/03 13:20
+@Time       : 2026/10/03
 @Author     : zhanglp8181
 @File       : start_fullstack_server.py
-@CallChain  : Playwright fullstack 配置 → 临时 SQLite → FastAPI 单端口应用
+@CallChain  : Playwright fullstack 配置 → 临时 SQLite/随机 MySQL → FastAPI 单端口应用
 @Description: 启动隔离真实全栈服务，并准备登录、流程、动态任务、垂直能力和分页浏览器数据。
 """
 
@@ -2090,6 +2090,8 @@ def seed_e2e_fixtures() -> None:
         expense_version = db.exec(
             select(SkillVersion).where(
                 SkillVersion.skill_id == expense_skill.skill_id,
+                SkillVersion.tenant_id == "tenant_demo",
+                SkillVersion.scope_agent_id == "",
                 SkillVersion.version == EXPENSE_SPECIAL_APPROVAL_ORG_SCOPE_VERSION,
             )
         ).one()
@@ -2190,6 +2192,165 @@ def seed_e2e_fixtures() -> None:
             department_node.config,
             initiator_user_id="requestor_e2e",
         )
+        db.commit()
+
+
+def seed_sd5_browser_consumer_fixture() -> None:
+    """为 SD-5 浏览器回归准备可编辑正文及绑定 SOP 消费者。"""
+
+    from hashlib import sha256
+
+    from sqlmodel import Session, select
+
+    from app.agents.branching import ensure_private_resource_binding
+    from app.db import engine
+    from app.db.models import KnowledgeBucket, KnowledgeChunk, KnowledgeDocument, Skill, SkillVersion
+    from app.sop_runtime.legacy_skill_card_adapter import compile_legacy_skill_card
+
+    tenant_id = "tenant_demo"
+    agent_id = "agent_e2e_member_employee"
+    document_id = "kdoc_e2e_member"
+    skill_id = "sd5_browser_knowledge_sop"
+    source = "# SD5 浏览器初始正文\n\n唯一旧事实：sd5-browser-old。"
+    skill_content = {
+        "skill_id": skill_id,
+        "name": "SD-5 浏览器知识消费者 SOP",
+        "version": "1.0.0",
+        "execution_mode": "deterministic",
+        "condition_schemas": {
+            "node_output": {
+                "type": "object",
+                "properties": {
+                    "knowledge_evidence": {
+                        "type": "object",
+                        "properties": {
+                            "status": {"type": "string"},
+                            "data": {
+                                "type": "object",
+                                "properties": {"outcome": {"type": "string"}},
+                            },
+                        },
+                    }
+                },
+            }
+        },
+        "nodes": [
+            {
+                "node_id": "search_current",
+                "type": "knowledge_query",
+                "name": "读取当前正文",
+                "instruction": "检索当前发布版本中的新事实。",
+                "allowed_actions": ["knowledge_query"],
+                "metadata": {
+                    "operation_result_key": "knowledge_evidence",
+                    "knowledge_query": {
+                        "query_type": "policy_check",
+                        "desired_evidence": "当前发布正文",
+                    },
+                },
+            },
+            {"node_id": "done", "type": "terminal", "name": "完成"},
+            {"node_id": "manual", "type": "terminal", "name": "人工复核"},
+        ],
+        "edges": [
+            {
+                "source_node_id": "search_current",
+                "next_node_id": "done",
+                "condition": {
+                    "op": "eq",
+                    "left": {"path": "node_output.knowledge_evidence.data.outcome"},
+                    "right": {"value": "evidence_found"},
+                },
+                "priority": 100,
+            },
+            {
+                "source_node_id": "search_current",
+                "next_node_id": "manual",
+                "condition": {"op": "always"},
+                "priority": 0,
+            },
+        ],
+        "start_node_id": "search_current",
+        "terminal_node_ids": ["done", "manual"],
+    }
+
+    with Session(engine) as db:
+        document = db.get(KnowledgeDocument, document_id)
+        bucket = db.exec(
+            select(KnowledgeBucket).where(KnowledgeBucket.id == "kbucket_e2e_member_agent_loop")
+        ).first()
+        chunk = db.exec(
+            select(KnowledgeChunk).where(KnowledgeChunk.id == "kchunk_e2e_member_agent_loop")
+        ).first()
+        if document is None or bucket is None or chunk is None:
+            raise RuntimeError("SD-5 browser knowledge fixture rows are missing")
+        document.normalized_source = source
+        document.title = "SD5 浏览器知识"
+        document.source_kind = "normalized"
+        document.source_checksum = sha256(source.encode("utf-8")).hexdigest()
+        document.metadata_json = {
+            "document_card": {
+                "title": "SD5 浏览器知识",
+                "summary": "当前版本正文包含 sd5-browser-old 或 sd5-browser-new。",
+            },
+            "section_tree": [
+                {
+                    "section_id": "sd5_policy",
+                    "path": "SD5 浏览器正文",
+                    "title": "SD5 浏览器正文",
+                    "content": source,
+                }
+            ],
+        }
+        bucket.title = "SD5 浏览器当前正文"
+        bucket.summary = "当前版本正文包含 sd5-browser-old 或 sd5-browser-new。"
+        bucket.metadata_json = {
+            "content": source,
+            "section_ids": ["sd5_policy"],
+            "section_paths": ["SD5 浏览器正文"],
+            "representative_chunk_ids": [chunk.id],
+        }
+        chunk.content = "唯一旧事实：sd5-browser-old。"
+        chunk.summary = "SD5 浏览器旧事实"
+        chunk.source_ref = "e2e-member-knowledge.md#sd5-browser"
+        chunk.metadata_json = {
+            "section_id": "sd5_policy",
+            "section_path": "SD5 浏览器正文",
+            "section_title": "SD5 浏览器正文",
+            "bucket_title": bucket.title,
+        }
+        skill = db.exec(
+            select(Skill).where(Skill.tenant_id == tenant_id, Skill.skill_id == skill_id)
+        ).first()
+        definition = compile_legacy_skill_card(skill_content)
+        if skill is None:
+            skill = Skill(
+                tenant_id=tenant_id,
+                skill_id=skill_id,
+                version="1.0.0",
+                name="SD-5 浏览器知识消费者 SOP",
+                content_json=skill_content,
+                status="published",
+            )
+            db.add(skill)
+            db.flush()
+            db.add(
+                SkillVersion(
+                    id="skillver_sd5_browser_knowledge_100",
+                    tenant_id=tenant_id,
+                    skill_id=skill_id,
+                    version="1.0.0",
+                    name=skill.name,
+                    content_json=skill_content,
+                    status="published",
+                    compiled_definition_checksum=definition.checksum,
+                )
+            )
+        else:
+            skill.content_json = skill_content
+            skill.status = "published"
+        db.flush()
+        ensure_private_resource_binding(db, tenant_id, agent_id, "skill", skill.id, "active")
         db.commit()
 
 
@@ -3241,6 +3402,50 @@ def install_schedule_llm_override() -> None:
         raise_if_cancelled(is_cancelled)
         raise_if_model_error_profile()
 
+        if "你是用户长期记忆抽取与更新助手" in system_prompt and "SD6B-MEMORY" in str(user_payload):
+            if client.dispatch_observer is not None:
+                client.dispatch_observer()
+            context = user_payload.get("conversation_context", {})
+            messages = context.get("messages", []) if isinstance(context, dict) else []
+            source = next((str(item.get("content") or "") for item in reversed(messages)
+                if isinstance(item, dict) and item.get("role") == "user"), "")
+            if "CONSUME" in source:
+                return {"memories": [], "updated_summary": ""}
+            gate = "late-clear" if "LATE-CLEAR" in source else "late-update" if "LATE-UPDATE" in source else None
+            if gate and os.environ.get("FULLSTACK_SD6B_CONTROL_DIR"):
+                control = Path(os.environ["FULLSTACK_SD6B_CONTROL_DIR"])
+                (control / f"{gate}.started").touch()
+                deadline = time.monotonic() + 55
+                while not (control / f"{gate}.release").exists():
+                    if time.monotonic() > deadline:
+                        raise RuntimeError("SD6B_BROWSER_GATE_TIMEOUT")
+                    time.sleep(0.05)
+            if "FRESH" in source:
+                content = "SD6B 浏览器新事实：用户偏好逐条列出下一步。"
+            elif "UPDATE" in source and "LATE-UPDATE" not in source:
+                content = "SD6B 浏览器更新事实：用户偏好在任务完成后收到简洁摘要。"
+            elif "SOP" in source:
+                content = "SD6B 浏览器 SOP 事实：用户偏好先看到核验结论。"
+            else:
+                content = "SD6B 浏览器 DTA 事实：用户偏好简洁回复。"
+            client._last_completed_response_metadata = {
+                "response_id": "e2e-sd6b-memory-extractor",
+                "finish_reason": "stop",
+                "usage": {"input_tokens": 24, "output_tokens": 16},
+            }
+            return {
+                "memories": [
+                    {
+                        "operation": "upsert",
+                        "kind": "preference",
+                        "key": "sd6b_browser_preference",
+                        "content": content,
+                        "importance": 0.85,
+                    }
+                ],
+                "updated_summary": "",
+            }
+
         if "附件视觉证据复核器" in system_prompt:
             resources = user_payload.get("reviewed_structural_evidence")
             parts = user_payload.get("_provider_content_parts")
@@ -3252,7 +3457,8 @@ def install_schedule_llm_override() -> None:
                 "usage": {"input_tokens": 20, "output_tokens": 20},
             }
             if "ATTACHMENT-VISUAL-CANCEL-DYNAMIC" in str(user_payload):
-                for _ in range(80):
+                # 给真实浏览器保留足够的取消/撤权窗口；8 秒在慢机上会在停止请求到达前结束。
+                for _ in range(300):
                     time.sleep(0.1)
                     raise_if_cancelled(is_cancelled)
             if "ATTACHMENT-VISUAL-CONFLICT-DYNAMIC" in str(user_payload):
@@ -3333,6 +3539,54 @@ def install_schedule_llm_override() -> None:
         phase = str(stage.get("phase") or "") if isinstance(stage, dict) else ""
         if phase == "Router":
             user_message = str(user_payload.get("user_message") or "")
+            if "SD1-PENDING-TASK-IDENTITY" in user_message:
+                return {
+                    "decision": "start_new_task",
+                    "selected_task_id": "task_A1",
+                    "target_skill_id": "sd1_browser_pending_sop",
+                    "target_step_id": "query",
+                    "confidence": 0.99,
+                    "general_intent": None,
+                    "reason": "用户明确要求在同一轮分别完成两个独立待办任务。",
+                    "task_frames": [
+                        {
+                            "task_id": "task_A1",
+                            "decision": "start_new_task",
+                            "target_skill_id": "sd1_browser_pending_sop",
+                            "target_step_id": "query",
+                            "confidence": 0.99,
+                            "user_intent": "完成待办任务 A1",
+                            "slot_hints": {"product_name": "A1"},
+                        },
+                        {
+                            "task_id": "task_A3",
+                            "decision": "start_new_task",
+                            "target_skill_id": "sd1_browser_pending_sop",
+                            "target_step_id": "query",
+                            "confidence": 0.99,
+                            "user_intent": "完成待办任务 A3",
+                            "slot_hints": {"product_name": "A3"},
+                        },
+                    ],
+                }
+            if "SD1-ACTION-IDENTITY" in user_message:
+                return {
+                    "decision": "start_new_task",
+                    "target_skill_id": "sd1_browser_action_sop",
+                    "target_step_id": "query_a1",
+                    "confidence": 0.99,
+                    "general_intent": None,
+                    "reason": "用户明确启动 SD-1 同轮多动作身份验证 SOP",
+                }
+            if "SD5-SOP-KNOWLEDGE" in user_message:
+                return {
+                    "decision": "start_new_task",
+                    "target_skill_id": "sd5_browser_knowledge_sop",
+                    "target_step_id": "search_current",
+                    "confidence": 0.99,
+                    "general_intent": None,
+                    "reason": "用户明确启动 SD-5 当前知识版本消费者 SOP",
+                }
             if "ATTACHMENT-SOP-SALES" in user_message:
                 return {
                     "decision": "start_new_task",
@@ -3406,6 +3660,189 @@ def install_schedule_llm_override() -> None:
                 "reason": "任务需要跨轮等待用户确认",
             }
         if phase == "Step Agent":
+            if "SD1-PENDING-TASK-IDENTITY" in str(user_payload):
+                active_skill = user_payload.get("active_skill")
+                current_step = (
+                    active_skill.get("current_step")
+                    if isinstance(active_skill, dict)
+                    else None
+                )
+                current_node_id = (
+                    str(current_step.get("node_id") or current_step.get("step_id") or "")
+                    if isinstance(current_step, dict)
+                    else ""
+                )
+                if current_node_id == "done":
+                    return {
+                        "action": "reply",
+                        "reply": "SD1-PENDING-TASK-IDENTITY-SUCCESS：task_A1 与 task_A3 已分别完成。",
+                        "slot_updates": {},
+                        "tool_call": None,
+                        "knowledge_query": None,
+                        "knowledge_results": [],
+                        "next_step_id": None,
+                        "is_step_completed": True,
+                        "handoff": False,
+                    }
+                repair_context = user_payload.get("repair_context")
+                tool_call_history = (
+                    repair_context.get("tool_call_history")
+                    if isinstance(repair_context, dict)
+                    else None
+                )
+                history_count = len(tool_call_history) if isinstance(tool_call_history, list) else 0
+                if current_node_id == "query" and history_count >= 1:
+                    return {
+                        "action": "advance",
+                        "reply": "当前待办工具已完成，继续完成该任务。",
+                        "slot_updates": {},
+                        "tool_call": None,
+                        "knowledge_query": None,
+                        "knowledge_results": [],
+                        "next_step_id": None,
+                        "is_step_completed": True,
+                        "handoff": False,
+                    }
+                slots = user_payload.get("slots")
+                product_name = (
+                    str(slots.get("product_name") or "").strip()
+                    if isinstance(slots, dict)
+                    else ""
+                ) or "A1"
+                return {
+                    "action": "call_tool",
+                    "reply": None,
+                    "slot_updates": {},
+                    "tool_call": {
+                        "name": "sd1.browser_pending_probe",
+                        "arguments": {"product_name": product_name},
+                    },
+                    "knowledge_query": None,
+                    "knowledge_results": [],
+                    "next_step_id": None,
+                    "is_step_completed": False,
+                    "handoff": False,
+                }
+            if "SD1-ACTION-IDENTITY" in str(user_payload):
+                active_skill = user_payload.get("active_skill")
+                current_step = (
+                    active_skill.get("current_step")
+                    if isinstance(active_skill, dict)
+                    else None
+                )
+                if (
+                    isinstance(current_step, dict)
+                    and str(current_step.get("node_id") or current_step.get("step_id") or "")
+                    == "done"
+                ):
+                    return {
+                        "action": "reply",
+                        "reply": "SD1-ACTION-IDENTITY-SUCCESS：A1 与 A3 已分别查询。",
+                        "slot_updates": {},
+                        "tool_call": None,
+                        "knowledge_query": None,
+                        "knowledge_results": [],
+                        "next_step_id": None,
+                        "is_step_completed": True,
+                        "handoff": False,
+                    }
+                repair_context = user_payload.get("repair_context")
+                tool_call_history = (
+                    repair_context.get("tool_call_history")
+                    if isinstance(repair_context, dict)
+                    else None
+                )
+                history_count = len(tool_call_history) if isinstance(tool_call_history, list) else 0
+                current_node_id = (
+                    str(current_step.get("node_id") or current_step.get("step_id") or "")
+                    if isinstance(current_step, dict)
+                    else ""
+                )
+                if current_node_id == "query_a1" and history_count >= 1:
+                    return {
+                        "action": "advance",
+                        "reply": "A1 已查询，继续第二个商品节点。",
+                        "slot_updates": {},
+                        "tool_call": None,
+                        "knowledge_query": None,
+                        "knowledge_results": [],
+                        "next_step_id": None,
+                        "is_step_completed": True,
+                        "handoff": False,
+                    }
+                if current_node_id == "query_a3" and history_count >= 2:
+                    return {
+                        "action": "reply",
+                        "reply": "SD1-ACTION-IDENTITY-SUCCESS：A1 与 A3 已分别查询。",
+                        "slot_updates": {},
+                        "tool_call": None,
+                        "knowledge_query": None,
+                        "knowledge_results": [],
+                        "next_step_id": None,
+                        "is_step_completed": True,
+                        "handoff": False,
+                    }
+                product_name = "A3" if (
+                    isinstance(current_step, dict)
+                    and str(current_step.get("node_id") or current_step.get("step_id") or "")
+                    == "query_a3"
+                ) else "A1"
+                return {
+                    "action": "call_tool",
+                    "reply": None,
+                    "slot_updates": {},
+                    "tool_call": {
+                        "name": "sd1.browser_action_probe",
+                        "arguments": {"product_name": product_name},
+                    },
+                    "knowledge_query": None,
+                    "knowledge_results": [],
+                    "next_step_id": None,
+                    "is_step_completed": False,
+                    "handoff": False,
+                }
+            if "SD5-SOP-KNOWLEDGE" in str(user_payload):
+                active_skill = user_payload.get("active_skill")
+                current_step = (
+                    active_skill.get("current_step")
+                    if isinstance(active_skill, dict)
+                    else None
+                )
+                current_node_id = (
+                    str(current_step.get("node_id") or current_step.get("step_id") or "")
+                    if isinstance(current_step, dict)
+                    else ""
+                )
+                if current_node_id == "done":
+                    return {
+                        "action": "reply",
+                        "reply": "SD5-SOP-KNOWLEDGE-SUCCESS：已消费当前发布知识版本。",
+                        "slot_updates": {},
+                        "tool_call": None,
+                        "knowledge_query": None,
+                        "knowledge_results": [],
+                        "next_step_id": None,
+                        "is_step_completed": True,
+                        "handoff": False,
+                    }
+                return {
+                    "action": "query_knowledge",
+                    "reply": None,
+                    "slot_updates": {},
+                    "tool_call": None,
+                    "knowledge_query": {
+                        "query": "sd5-browser-new",
+                        "reason": "读取 SD5 当前发布正文",
+                        "query_type": "policy_check",
+                        "desired_evidence": "当前发布正文",
+                        "max_chunks": 6,
+                        "max_depth": 2,
+                    },
+                    "knowledge_results": [],
+                    "next_step_id": None,
+                    "is_step_completed": False,
+                    "handoff": False,
+                }
             is_attachment_sop = "ATTACHMENT-SOP-SALES" in str(user_payload)
             return {
                 "action": "advance" if is_attachment_sop else "reply",
@@ -3448,6 +3885,8 @@ def install_schedule_llm_override() -> None:
                 selected = ["s4-code-deny-guidance"]
             elif "S4代码" in goal and "s4-code-guidance" in names:
                 selected = ["s4-code-guidance"]
+            elif "SD5-DYNAMIC-KNOWLEDGE" in goal and "sd5-dynamic-knowledge-guidance" in names:
+                selected = ["sd5-dynamic-knowledge-guidance"]
             elif "S4动态" in goal and "s4-dynamic-guidance" in names:
                 selected = ["s4-dynamic-guidance"]
             else:
@@ -4778,6 +5217,49 @@ def install_schedule_llm_override() -> None:
                         },
                     ],
                 }
+            if (
+                isinstance(loaded_guidance, list)
+                and loaded_guidance
+                and (
+                    "SD5-DYNAMIC-KNOWLEDGE-GUIDANCE" in str(loaded_guidance)
+                    or "sd5-dynamic-knowledge-guidance" in loaded_names
+                )
+            ):
+                knowledge_names = [
+                    str(item.get("name") or "")
+                    for item in user_payload.get("capabilities", [])
+                    if isinstance(item, dict) and item.get("name") == "knowledge.search"
+                ]
+                if knowledge_names != ["knowledge.search"]:
+                    raise RuntimeError("SD5 planner did not receive governed knowledge capability")
+                return {
+                    "goal": str(user_payload.get("goal") or "完成 SD5 动态知识核验"),
+                    "success_criteria": user_payload.get("success_criteria", []),
+                    "constraints": ["必须检索当前发布知识版本"],
+                    "assumptions": [],
+                    "steps": [
+                        {
+                            "draft_id": "search_current",
+                            "title": "检索当前知识版本",
+                            "kind": "knowledge",
+                            "required": True,
+                            "depends_on": [],
+                            "capability_refs": ["knowledge.search"],
+                            "guidance_skill_refs": ["sd5-dynamic-knowledge-guidance"],
+                            "expected_output_schema": {},
+                        },
+                        {
+                            "draft_id": "answer",
+                            "title": "形成当前版本结论",
+                            "kind": "answer",
+                            "required": True,
+                            "depends_on": ["search_current"],
+                            "capability_refs": [],
+                            "guidance_skill_refs": ["sd5-dynamic-knowledge-guidance"],
+                            "expected_output_schema": {},
+                        },
+                    ],
+                }
             if isinstance(loaded_guidance, list) and loaded_guidance:
                 if "S4-DYNAMIC-FULL-GUIDANCE" not in str(loaded_guidance):
                     raise RuntimeError("S4 planner did not receive fixed Skill instructions")
@@ -4857,6 +5339,7 @@ def install_schedule_llm_override() -> None:
         if "受控单步动作提议器" in system_prompt:
             current_step = user_payload.get("current_step", {})
             step_kind = str(current_step.get("kind") or "") if isinstance(current_step, dict) else ""
+            step_key = str(current_step.get("step_key") or "") if isinstance(current_step, dict) else ""
             step_title = str(current_step.get("title") or "") if isinstance(current_step, dict) else ""
             is_s4_code = (
                 "S4-CODE-FULL-GUIDANCE" in str(user_payload)
@@ -6090,6 +6573,88 @@ def install_schedule_llm_override() -> None:
                 }
             is_s4_diagnosis = "agent_e2e_diagnosis" in str(user_payload)
             is_s4 = "S4-DYNAMIC-FULL-GUIDANCE" in str(user_payload)
+            is_sd5_dynamic = (
+                "SD5-DYNAMIC-KNOWLEDGE-GUIDANCE" in str(user_payload)
+                or step_key == "search_current"
+                or step_title in {"检索当前知识版本", "形成当前版本结论"}
+            )
+            if is_sd5_dynamic and step_kind == "knowledge":
+                client._last_completed_response_metadata = {
+                    "response_id": "e2e-sd5-knowledge-response",
+                    "finish_reason": "stop",
+                    "usage": {"input_tokens": 12, "output_tokens": 8},
+                }
+                return {
+                    "action_kind": "query_knowledge",
+                    "arguments": {
+                        "query": "sd5-browser-new",
+                        "desired_evidence": "当前发布正文",
+                    },
+                    "capability_ref": "knowledge.search",
+                    "expected_output_schema": {},
+                    "rationale": "按固定 SD5 Skill 检索当前发布知识版本",
+                }
+            if is_sd5_dynamic and step_kind == "answer":
+                execution_view = user_payload.get("provider_execution_view", {})
+                execution_context = (
+                    execution_view.get("execution_context", {})
+                    if isinstance(execution_view, dict)
+                    else {}
+                )
+                guidance_requirements: list[dict[str, object]] = []
+                if isinstance(execution_view, dict):
+                    for message in execution_view.get("messages", []):
+                        content = message.get("content") if isinstance(message, dict) else None
+                        requirements = (
+                            content.get("guidance_requirements")
+                            if isinstance(content, dict)
+                            else None
+                        )
+                        if isinstance(requirements, list):
+                            guidance_requirements.extend(
+                                item for item in requirements if isinstance(item, dict)
+                            )
+                completed = [
+                    str(item.get("step_key") or "")
+                    for item in execution_context.get("completed_steps", [])
+                    if isinstance(item, dict) and item.get("step_key")
+                ]
+                criteria = [
+                    str(item.get("id") or "")
+                    for item in execution_context.get("success_criteria", [])
+                    if isinstance(item, dict) and item.get("id")
+                ]
+                client._last_completed_response_metadata = {
+                    "response_id": "e2e-sd5-answer-response",
+                    "finish_reason": "stop",
+                    "usage": {"input_tokens": 14, "output_tokens": 12},
+                }
+                return {
+                    "action_kind": "answer",
+                    "arguments": {
+                        "markdown": "SD5-DYNAMIC-KNOWLEDGE-SUCCESS：已消费当前发布知识版本。",
+                        "criterion_evidence": {criterion: completed for criterion in criteria},
+                        "pending_questions": [],
+                        "guidance_applications": [
+                            {
+                                "skill_use_id": str(item.get("skill_use_id") or ""),
+                                "items": [
+                                    {
+                                        "requirement_id": str(item.get("requirement_id") or ""),
+                                        "principle": str(item.get("principle") or ""),
+                                        "application": "按冻结指导要求检索当前发布知识版本并形成结论。",
+                                        "evidence_excerpt": "已从当前发布正文取得新事实并写入本次结果证据。",
+                                    }
+                                ],
+                            }
+                            for item in guidance_requirements
+                            if str(item.get("disposition") or "apply") == "apply"
+                        ],
+                    },
+                    "capability_ref": None,
+                    "expected_output_schema": {},
+                    "rationale": "按固定 SD5 Skill 形成当前版本可审计结论",
+                }
             if "EXTERNAL-WRITE-GRAY" in str(user_payload):
                 client._last_completed_response_metadata = {
                     "response_id": (
@@ -6733,6 +7298,53 @@ def install_schedule_llm_override() -> None:
                     "expected_output_schema": {},
                     "rationale": "按固定 Skill 和真实检索证据完成任务",
                 }
+            if step_kind == "answer" and "SD6B-MEMORY-CONSUME" in str(user_payload):
+                execution_view = user_payload.get("provider_execution_view", {})
+                execution_context = (
+                    execution_view.get("execution_context", {})
+                    if isinstance(execution_view, dict)
+                    else {}
+                )
+                memory_context = execution_context.get("memory_context", [])
+                memory_context_text = json.dumps(
+                    memory_context,
+                    ensure_ascii=False,
+                )
+                expected_fact = (
+                    "SD6B 浏览器新事实" if "EXPECT=FRESH" in str(user_payload)
+                    else "SD6B 浏览器更新事实" if "EXPECT=UPDATE" in str(user_payload)
+                    else "SD6B 浏览器 DTA 事实"
+                )
+                memory_state = "present" if expected_fact in memory_context_text else "missing"
+                criteria = [
+                    str(item.get("id") or "")
+                    for item in execution_context.get("success_criteria", [])
+                    if isinstance(item, dict) and item.get("id")
+                ]
+                current_step_key = str(current_step.get("step_key") or "answer")
+                client._last_completed_response_metadata = {
+                    "response_id": "e2e-sd6b-memory-consumer-answer",
+                    "finish_reason": "stop",
+                    "usage": {"input_tokens": 20, "output_tokens": 12},
+                }
+                return {
+                    "action_kind": "answer",
+                    "arguments": {
+                        "markdown": (
+                            "SD6B-MEMORY-CONSUME-SUCCESS：最终 DynamicTaskAgent 请求已读取"
+                            f"刚完成提取的 DTA 长期事实（memory_context={memory_state}），"
+                            f"并据此生成本轮回答。fact={expected_fact}"
+                        ),
+                        "criterion_evidence": {
+                            criterion: [current_step_key] for criterion in criteria
+                        },
+                        "pending_questions": [],
+                        "claims": [],
+                    },
+                    "capability_ref": None,
+                    "expected_output_schema": {},
+                    "rationale": "依据冻结 ExecutionContext 中的持久记忆事实完成回答",
+                }
             if step_kind == "answer" and step_title == "分析 S3 上传警告":
                 execution_view = user_payload.get("provider_execution_view", {})
                 execution_context = (
@@ -6837,6 +7449,14 @@ def install_schedule_llm_override() -> None:
 
         raise_if_model_error_profile()
         if isinstance(user_payload, dict):
+            if "SD1-PENDING-TASK-IDENTITY" in str(user_payload):
+                return "SD1-PENDING-TASK-IDENTITY-SUCCESS：task_A1 与 task_A3 已分别完成。"
+            if "SD1-ACTION-IDENTITY" in str(user_payload):
+                return "SD1-ACTION-IDENTITY-SUCCESS：A1 与 A3 已分别查询。"
+            if "SD5-SOP-KNOWLEDGE" in str(user_payload):
+                return "SD5-SOP-KNOWLEDGE-SUCCESS：已消费当前发布知识版本。"
+            if "SD5-DYNAMIC-KNOWLEDGE" in str(user_payload):
+                return "SD5-DYNAMIC-KNOWLEDGE-SUCCESS：已消费当前发布知识版本。"
             if "No content length specified for stream data" in str(
                 user_payload.get("user_message") or ""
             ):
@@ -7129,6 +7749,18 @@ def install_schedule_llm_override() -> None:
             loaded = context.get("loaded_general_skills") if isinstance(context, dict) else None
         turn_inputs = context.get("current_turn_inputs") if isinstance(context, dict) else None
         if (
+            isinstance(user_payload, dict)
+            and "SD1-ACTION-IDENTITY" in str(user_payload)
+        ) or (
+            isinstance(user_payload, dict)
+            and "SD1-PENDING-TASK-IDENTITY" in str(user_payload)
+        ) or (
+            isinstance(user_payload, dict)
+            and (
+                "SD5-SOP-KNOWLEDGE" in str(user_payload)
+                or "SD5-DYNAMIC-KNOWLEDGE" in str(user_payload)
+            )
+        ) or (
             os.environ.get("BUILTIN_SKILL_MATRIX_E2E") == "1"
             or os.environ.get("GAIN_E2E") == "1"
             or os.environ.get("SKILL_AB_E2E") == "1"
@@ -7733,6 +8365,8 @@ def install_connection_service_override() -> None:
     from app.db import get_session
     from app.main import app
 
+    provider_dispatches = {"wecom_message_send": 0}
+
     class BrowserSlack:
         """模拟同一待重授权 workspace 的验证与安全只读响应。"""
 
@@ -7787,6 +8421,7 @@ def install_connection_service_override() -> None:
 
             if not recipient_ref or not content:
                 return WeComCallResult(False, {}, error_code="WECOM_MESSAGE_INVALID")
+            provider_dispatches["wecom_message_send"] += 1
             message_id = "e2e-wecom-message-" + hashlib.sha256(
                 content.encode("utf-8")
             ).hexdigest()[:16]
@@ -7807,7 +8442,957 @@ def install_connection_service_override() -> None:
 
         return ConnectionService(db, slack=BrowserSlack())
 
+    def provider_dispatch_snapshot() -> dict[str, int]:
+        """返回隔离 provider 适配器边界的实际派发计数，供浏览器验收读取。"""
+
+        return dict(provider_dispatches)
+
     app.dependency_overrides[get_connection_service] = override_service
+    app.add_api_route(
+        "/__e2e/provider-dispatches",
+        provider_dispatch_snapshot,
+        methods=["GET"],
+        include_in_schema=False,
+    )
+
+
+def install_sd5_browser_failure_fixture() -> None:
+    """为 SD-5 真实页面回归注入一次性构建失败，不伪造知识 API 的成功终态。"""
+
+    from app.knowledge import revisions
+    from app.main import app
+
+    state = {"armed": False}
+    original_build = revisions._build_revision_claimed
+
+    def arm_failure() -> dict[str, bool]:
+        """让下一次正文候选构建在真实 worker 中失败并自动复位。"""
+
+        state["armed"] = True
+        return {"armed": True}
+
+    def build_with_failure_once(
+        db: object,
+        job_id: str,
+        worker_id: str,
+        fence: int,
+    ) -> object:
+        """保留真实构建流程，仅在一次受控任务进入构建边界时抛出失败。"""
+
+        if state["armed"]:
+            state["armed"] = False
+            raise revisions.KnowledgeRevisionInputError("SD5 E2E 受控构建失败")
+        return original_build(db, job_id, worker_id, fence)
+
+    revisions._build_revision_claimed = build_with_failure_once
+    app.add_api_route(
+        "/__e2e/sd5/arm-failure",
+        arm_failure,
+        methods=["POST"],
+        include_in_schema=False,
+    )
+
+
+def install_sd1_browser_restore_fixture() -> None:
+    """为隔离 Chromium 注册正式 SOP Operation 恢复、撤权和 provider 计数夹具。"""
+
+    from sqlmodel import Session, select
+
+    from app.agents.branching import ensure_open_gallery_binding
+    from app.core.agent_loop import AgentLoop
+    from app.db import engine
+    from app.db.models import (
+        ChatSession,
+        Skill,
+        SkillVersion,
+        SopInstance,
+        SopNodeExecution,
+        SopOperation,
+        Tool,
+    )
+    from app.main import app
+    from app.session.session_schema import ChatTurnRequest, StepAgentResult
+    from app.sop_runtime.coordinator import DeterministicSopCoordinator
+    from app.sop_runtime.legacy_skill_card_adapter import compile_legacy_skill_card
+
+    tenant_id = "tenant_demo"
+    skill_id = "sd1_browser_restore_sop"
+    tool_name = "sd1.browser_restore_probe"
+    tool_id = "tool_sd1_browser_restore"
+    session_id = "session_sd1_browser_restore"
+    dispatches = {"sd1_browser_restore_probe": 0}
+
+    def content() -> dict[str, object]:
+        """构造只含一个工具节点的正式确定性 SOP 定义。"""
+
+        return {
+            "skill_id": skill_id,
+            "name": "SD-1 浏览器恢复授权验证",
+            "version": "1.0.0",
+            "execution_mode": "deterministic",
+            "condition_schemas": {
+                "slots": {
+                    "type": "object",
+                    "properties": {"employee_id": {"type": "string"}},
+                },
+                "tool_result": {
+                    "type": "object",
+                    "properties": {
+                        "sd1_probe": {"type": "object"},
+                    },
+                },
+            },
+            "nodes": [
+                {
+                    "node_id": "collect_employee",
+                    "type": "collect_info",
+                    "name": "收集员工号",
+                    "expected_user_info": ["employee_id"],
+                    "allowed_actions": ["ask_user", "continue_flow"],
+                },
+                {
+                    "node_id": "probe",
+                    "type": "tool_call",
+                    "name": "验证恢复工具",
+                    "allowed_actions": [f"call_tool:{tool_name}"],
+                    "metadata": {
+                        "operation_input": {"employee_id": "slots.employee_id"},
+                        "operation_result_key": "sd1_probe",
+                    },
+                },
+                {
+                    "node_id": "done",
+                    "type": "response",
+                    "name": "恢复验证完成",
+                    "allowed_actions": ["answer_user"],
+                },
+            ],
+            "edges": [
+                {"source_node_id": "collect_employee", "next_node_id": "probe"},
+                {"source_node_id": "probe", "next_node_id": "done"},
+            ],
+            "start_node_id": "collect_employee",
+            "terminal_node_ids": ["done"],
+        }
+
+    def ensure_rows(db: Session) -> tuple[Skill, Tool, ChatSession]:
+        """懒加载浏览器专用 Skill、工具和会话，并确保初始工具授权。"""
+
+        skill = db.exec(
+            select(Skill).where(Skill.tenant_id == tenant_id, Skill.skill_id == skill_id)
+        ).first()
+        if skill is None:
+            skill_content = content()
+            definition = compile_legacy_skill_card(skill_content)
+            skill = Skill(
+                tenant_id=tenant_id,
+                skill_id=skill_id,
+                version="1.0.0",
+                name="SD-1 浏览器恢复授权验证",
+                content_json=skill_content,
+                status="published",
+            )
+            db.add(skill)
+            db.add(
+                SkillVersion(
+                    id="skillver_sd1_browser_restore_100",
+                    tenant_id=tenant_id,
+                    skill_id=skill_id,
+                    version="1.0.0",
+                    name=skill.name,
+                    content_json=skill_content,
+                    status="published",
+                    compiled_definition_checksum=definition.checksum,
+                )
+            )
+            db.flush()
+        tool = db.exec(
+            select(Tool).where(Tool.tenant_id == tenant_id, Tool.id == tool_id)
+        ).first()
+        if tool is None:
+            tool = Tool(
+                id=tool_id,
+                tenant_id=tenant_id,
+                name=tool_name,
+                display_name="SD-1 浏览器恢复探针",
+                description="仅用于隔离浏览器验证正式 SOP 回执恢复授权。",
+                method="GET",
+                url="/__e2e/sd1/provider",
+                allowed_skills_json=[skill_id],
+                enabled=True,
+            )
+            db.add(tool)
+            db.flush()
+        ensure_open_gallery_binding(db, tenant_id, "tool", tool.id, "active")
+        session = db.exec(
+            select(ChatSession).where(
+                ChatSession.tenant_id == tenant_id,
+                ChatSession.id == session_id,
+            )
+        ).first()
+        if session is None:
+            session = ChatSession(
+                id=session_id,
+                tenant_id=tenant_id,
+                user_id="member_e2e",
+                active_skill_id=skill_id,
+                active_step_id="collect_employee",
+                status="active",
+            )
+            db.add(session)
+        db.commit()
+        db.refresh(skill)
+        db.refresh(tool)
+        db.refresh(session)
+        return skill, tool, session
+
+    def snapshot(db: Session) -> dict[str, object]:
+        """返回浏览器需要核对的 Operation、节点和实例事实。"""
+
+        operation = db.exec(
+            select(SopOperation).where(
+                SopOperation.tenant_id == tenant_id,
+                SopOperation.instance_id == (
+                    select(SopInstance.id)
+                    .where(
+                        SopInstance.tenant_id == tenant_id,
+                        SopInstance.session_id == session_id,
+                    )
+                    .scalar_subquery()
+                ),
+            )
+        ).first()
+        instance = db.exec(
+            select(SopInstance).where(
+                SopInstance.tenant_id == tenant_id,
+                SopInstance.session_id == session_id,
+            )
+        ).first()
+        execution = (
+            db.exec(
+                select(SopNodeExecution).where(
+                    SopNodeExecution.tenant_id == tenant_id,
+                    SopNodeExecution.instance_id == instance.id if instance else False,
+                    SopNodeExecution.node_id == "probe",
+                )
+            ).first()
+            if instance is not None
+            else None
+        )
+        return {
+            "tool_id": tool_id,
+            "skill_id": skill_id,
+            "operation_id": operation.id if operation else None,
+            "operation_status": operation.status if operation else None,
+            "instance_status": instance.status if instance else None,
+            "execution_status": execution.status if execution else None,
+            "dispatch_count": dispatches["sd1_browser_restore_probe"],
+        }
+
+    def provider(employee_id: str = "") -> dict[str, object]:
+        """在隔离工具适配器边界计数一次真实 HTTP 派发并返回固定回执。"""
+
+        dispatches["sd1_browser_restore_probe"] += 1
+        return {"employee_id": employee_id, "remaining": 20000, "currency": "CNY"}
+
+    def prepare() -> dict[str, object]:
+        """通过生产 AgentLoop 完成一次派发，再只落 Operation 回执模拟崩溃窗口。"""
+
+        with Session(engine) as db:
+            skill, _tool, chat_session = ensure_rows(db)
+            existing = db.exec(
+                select(SopInstance).where(
+                    SopInstance.tenant_id == tenant_id,
+                    SopInstance.session_id == session_id,
+                )
+            ).first()
+            if existing is not None:
+                return {**snapshot(db), "phase": "prepared"}
+            chat_session.slots_json = {"employee_id": "E2E-SD1"}
+            coordinator = DeterministicSopCoordinator(db)
+            prepared = coordinator.prepare_step(
+                chat_session,
+                skill,
+                StepAgentResult(slot_updates={"employee_id": "E2E-SD1"}),
+            )
+            if prepared.tool_call is None:
+                raise RuntimeError("SD-1 browser fixture did not prepare a tool operation")
+            db.commit()
+            loop = AgentLoop(db)
+            request = ChatTurnRequest(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                user_id=chat_session.user_id,
+                client_turn_id="sd1-browser-restore-turn",
+                message="SD-1 浏览器正式恢复授权验证",
+            )
+            result = loop._execute_tool_call(
+                request,
+                chat_session,
+                prepared.tool_call,
+                tool_call_id="sd1-temporary-tool-call",
+            )
+            if not result.success:
+                raise RuntimeError(f"SD-1 browser fixture dispatch failed: {result}")
+            instance = db.exec(
+                select(SopInstance).where(
+                    SopInstance.tenant_id == tenant_id,
+                    SopInstance.session_id == session_id,
+                )
+            ).one()
+            operation = db.exec(
+                select(SopOperation).where(SopOperation.instance_id == instance.id)
+            ).one()
+            with coordinator.store.owned(instance, worker_id="sd1-browser-recovery"):
+                coordinator.store.finish_operation(
+                    operation,
+                    succeeded=True,
+                    result=dict(result.data or {}),
+                )
+            db.commit()
+            return {**snapshot(db), "phase": "prepared"}
+
+    def restore() -> dict[str, object]:
+        """经正式 `prepare_step` 恢复当前 Operation，并返回授权拒绝或完成事实。"""
+
+        with Session(engine) as db:
+            skill, _tool, chat_session = ensure_rows(db)
+            coordinator = DeterministicSopCoordinator(db)
+            result = coordinator.prepare_step(chat_session, skill, StepAgentResult())
+            db.commit()
+            metadata = result.runtime_reply_metadata()
+            return {
+                **snapshot(db),
+                "phase": "restored",
+                "action": result.action,
+                "is_step_completed": result.is_step_completed,
+                "runtime_error_code": metadata.get("runtime_error_code"),
+            }
+
+    app.add_api_route(
+        "/__e2e/sd1/provider",
+        provider,
+        methods=["GET"],
+        include_in_schema=False,
+    )
+    app.add_api_route(
+        "/__e2e/sd1/prepare",
+        prepare,
+        methods=["GET"],
+        include_in_schema=False,
+    )
+    app.add_api_route(
+        "/__e2e/sd1/restore",
+        restore,
+        methods=["GET"],
+        include_in_schema=False,
+    )
+
+
+def install_sd1_browser_action_fixture() -> None:
+    """为真实 Composer 回归注册同轮双动作的隔离 Skill、HTTP 工具和派发快照。"""
+
+    from sqlmodel import Session, select
+
+    from app.agents.branching import ensure_private_resource_binding
+    from app.db import engine
+    from app.db.models import Skill, SkillVersion, Tool
+    from app.main import app
+    from app.sop_runtime.legacy_skill_card_adapter import compile_legacy_skill_card
+
+    tenant_id = "tenant_demo"
+    agent_id = "agent_e2e_employee"
+    skill_id = "sd1_browser_action_sop"
+    tool_id = "tool_sd1_browser_action"
+    tool_name = "sd1.browser_action_probe"
+    dispatches: dict[str, object] = {"count": 0, "products": []}
+
+    def content() -> dict[str, object]:
+        """构造走 AgentLoop 兼容动作循环、而非确定性 Runtime 的最小隔离 SOP。"""
+
+        return {
+            "skill_id": skill_id,
+            "name": "SD-1 同轮动作身份验证",
+            "version": "1.0.0",
+            "business_domain": "e2e",
+            "description": "验证同一浏览器轮次内跨两个 SOP 节点的合法业务动作身份和真实派发。",
+            "nodes": [
+                {
+                    "node_id": "query_a1",
+                    "type": "tool_call",
+                    "name": "查询第一个隔离商品",
+                    "instruction": "调用隔离商品查询工具查询 A1，完成后推进到下一个查询节点。",
+                    "allowed_actions": [f"call_tool:{tool_name}"],
+                },
+                {
+                    "node_id": "query_a3",
+                    "type": "tool_call",
+                    "name": "查询第二个隔离商品",
+                    "instruction": "调用隔离商品查询工具查询 A3，完成后推进到完成节点。",
+                    "allowed_actions": [f"call_tool:{tool_name}"],
+                },
+                {
+                    "node_id": "done",
+                    "type": "terminal",
+                    "name": "查询完成",
+                },
+            ],
+            "edges": [
+                {"source_node_id": "query_a1", "next_node_id": "query_a3"},
+                {"source_node_id": "query_a3", "next_node_id": "done"},
+            ],
+            "start_node_id": "query_a1",
+            "terminal_node_ids": ["done"],
+        }
+
+    def ensure_rows(db: Session) -> None:
+        """幂等准备真实 AgentLoop 可见的 Skill、工具及私有授权绑定。"""
+
+        skill_content = content()
+        definition = compile_legacy_skill_card(skill_content)
+        skill = db.exec(
+            select(Skill).where(Skill.tenant_id == tenant_id, Skill.skill_id == skill_id)
+        ).first()
+        if skill is None:
+            skill = Skill(
+                tenant_id=tenant_id,
+                skill_id=skill_id,
+                version="1.0.0",
+                name="SD-1 同轮动作身份验证",
+                business_domain="e2e",
+                description=str(skill_content["description"]),
+                content_json=skill_content,
+                status="published",
+            )
+            db.add(skill)
+            db.flush()
+            db.add(
+                SkillVersion(
+                    id="skillver_sd1_browser_action_100",
+                    tenant_id=tenant_id,
+                    skill_id=skill_id,
+                    version="1.0.0",
+                    name=skill.name,
+                    business_domain="e2e",
+                    description=skill.description,
+                    content_json=skill_content,
+                    status="published",
+                    compiled_definition_checksum=definition.checksum,
+                )
+            )
+        else:
+            skill.content_json = skill_content
+            skill.status = "published"
+        tool = db.exec(
+            select(Tool).where(Tool.tenant_id == tenant_id, Tool.id == tool_id)
+        ).first()
+        if tool is None:
+            tool = Tool(
+                id=tool_id,
+                tenant_id=tenant_id,
+                name=tool_name,
+                display_name="SD-1 隔离商品查询",
+                description="只返回隔离浏览器回归所需商品结果，并在 HTTP 边界计数。",
+                method="POST",
+                url="/__e2e/sd1/action/provider",
+                input_schema={
+                    "type": "object",
+                    "properties": {"product_name": {"type": "string"}},
+                    "required": ["product_name"],
+                    "additionalProperties": False,
+                },
+                output_schema={"type": "object"},
+                allowed_skills_json=[skill_id],
+                enabled=True,
+            )
+            db.add(tool)
+        else:
+            tool.enabled = True
+            tool.url = "/__e2e/sd1/action/provider"
+            tool.allowed_skills_json = [skill_id]
+        db.flush()
+        ensure_private_resource_binding(db, tenant_id, agent_id, "skill", skill.id, "active")
+        ensure_private_resource_binding(db, tenant_id, agent_id, "tool", tool.id, "active")
+        db.commit()
+
+    def reset() -> dict[str, object]:
+        """清除本次浏览器回归的隔离派发计数，不修改业务数据库。"""
+
+        dispatches["count"] = 0
+        dispatches["products"] = []
+        return snapshot()
+
+    def snapshot() -> dict[str, object]:
+        """返回实际 HTTP 工具派发次数和顺序，供页面验收核对。"""
+
+        products = dispatches.get("products")
+        return {
+            "dispatch_count": int(dispatches.get("count") or 0),
+            "dispatched_products": list(products) if isinstance(products, list) else [],
+        }
+
+    async def provider(payload: dict[str, object]) -> dict[str, object]:
+        """在隔离 HTTP 工具边界记录一次派发并返回固定商品回执。"""
+
+        product_name = str(payload.get("product_name") or "").strip()
+        prices = {"A1": 101, "A3": 303}
+        if product_name not in prices:
+            return {"found": False, "product_name": product_name}
+        dispatches["count"] = int(dispatches.get("count") or 0) + 1
+        products = dispatches.get("products")
+        if isinstance(products, list):
+            products.append(product_name)
+        return {
+            "found": True,
+            "product_name": product_name,
+            "price": prices[product_name],
+            "currency": "CNY",
+        }
+
+    with Session(engine) as db:
+        ensure_rows(db)
+
+    app.add_api_route(
+        "/__e2e/sd1/action/reset",
+        reset,
+        methods=["GET"],
+        include_in_schema=False,
+    )
+    app.add_api_route(
+        "/__e2e/sd1/action/snapshot",
+        snapshot,
+        methods=["GET"],
+        include_in_schema=False,
+    )
+    app.add_api_route(
+        "/__e2e/sd1/action/provider",
+        provider,
+        methods=["POST"],
+        include_in_schema=False,
+    )
+
+
+def install_sd1_browser_pending_fixture() -> None:
+    """为真实 Composer 注册同一 Skill/Step 双待办任务的隔离工具夹具。"""
+
+    from sqlmodel import Session, select
+
+    from app.agents.branching import ensure_private_resource_binding
+    from app.db import engine
+    from app.db.models import Skill, SkillVersion, Tool
+    from app.main import app
+    from app.sop_runtime.legacy_skill_card_adapter import compile_legacy_skill_card
+
+    tenant_id = "tenant_demo"
+    agent_id = "agent_e2e_employee"
+    skill_id = "sd1_browser_pending_sop"
+    tool_id = "tool_sd1_browser_pending"
+    tool_name = "sd1.browser_pending_probe"
+    dispatches: dict[str, object] = {"count": 0, "products": []}
+
+    def content() -> dict[str, object]:
+        """构造两个任务共用同一工具节点的最小隔离 SOP。"""
+
+        return {
+            "skill_id": skill_id,
+            "name": "SD-1 双待办任务身份验证",
+            "version": "1.0.0",
+            "business_domain": "e2e",
+            "description": "验证同一轮两个独立任务在相同 Skill/Step 上保持独立业务身份。",
+            "nodes": [
+                {
+                    "node_id": "query",
+                    "type": "tool_call",
+                    "name": "查询待办商品",
+                    "instruction": "调用隔离商品查询工具完成当前待办任务。",
+                    "allowed_actions": [f"call_tool:{tool_name}"],
+                },
+                {"node_id": "done", "type": "terminal", "name": "待办完成"},
+            ],
+            "edges": [{"source_node_id": "query", "next_node_id": "done"}],
+            "start_node_id": "query",
+            "terminal_node_ids": ["done"],
+        }
+
+    def ensure_rows(db: Session) -> None:
+        """幂等准备双待办验证所需的发布 Skill、工具和私有授权绑定。"""
+
+        skill_content = content()
+        definition = compile_legacy_skill_card(skill_content)
+        skill = db.exec(
+            select(Skill).where(Skill.tenant_id == tenant_id, Skill.skill_id == skill_id)
+        ).first()
+        if skill is None:
+            skill = Skill(
+                tenant_id=tenant_id,
+                skill_id=skill_id,
+                version="1.0.0",
+                name="SD-1 双待办任务身份验证",
+                business_domain="e2e",
+                description=str(skill_content["description"]),
+                content_json=skill_content,
+                status="published",
+            )
+            db.add(skill)
+            db.flush()
+            db.add(
+                SkillVersion(
+                    id="skillver_sd1_browser_pending_100",
+                    tenant_id=tenant_id,
+                    skill_id=skill_id,
+                    version="1.0.0",
+                    name=skill.name,
+                    business_domain="e2e",
+                    description=skill.description,
+                    content_json=skill_content,
+                    status="published",
+                    compiled_definition_checksum=definition.checksum,
+                )
+            )
+        else:
+            skill.content_json = skill_content
+            skill.status = "published"
+        tool = db.exec(
+            select(Tool).where(Tool.tenant_id == tenant_id, Tool.id == tool_id)
+        ).first()
+        if tool is None:
+            tool = Tool(
+                id=tool_id,
+                tenant_id=tenant_id,
+                name=tool_name,
+                display_name="SD-1 双待办隔离商品查询",
+                description="只返回隔离浏览器回归所需商品结果，并在 HTTP 边界计数。",
+                method="POST",
+                url="/__e2e/sd1/pending/provider",
+                input_schema={
+                    "type": "object",
+                    "properties": {"product_name": {"type": "string"}},
+                    "required": ["product_name"],
+                    "additionalProperties": False,
+                },
+                output_schema={"type": "object"},
+                allowed_skills_json=[skill_id],
+                enabled=True,
+            )
+            db.add(tool)
+        else:
+            tool.enabled = True
+            tool.url = "/__e2e/sd1/pending/provider"
+            tool.allowed_skills_json = [skill_id]
+        db.flush()
+        ensure_private_resource_binding(db, tenant_id, agent_id, "skill", skill.id, "active")
+        ensure_private_resource_binding(db, tenant_id, agent_id, "tool", tool.id, "active")
+        db.commit()
+
+    def reset() -> dict[str, object]:
+        """清除双待办验证的隔离 HTTP 派发计数。"""
+
+        dispatches["count"] = 0
+        dispatches["products"] = []
+        return snapshot()
+
+    def snapshot() -> dict[str, object]:
+        """返回双待办工具实际派发次数和顺序。"""
+
+        products = dispatches.get("products")
+        return {
+            "dispatch_count": int(dispatches.get("count") or 0),
+            "dispatched_products": list(products) if isinstance(products, list) else [],
+        }
+
+    async def provider(payload: dict[str, object]) -> dict[str, object]:
+        """在隔离 HTTP 工具边界记录一次待办派发并返回固定商品回执。"""
+
+        product_name = str(payload.get("product_name") or "").strip()
+        prices = {"A1": 101, "A3": 303}
+        if product_name not in prices:
+            return {"found": False, "product_name": product_name}
+        dispatches["count"] = int(dispatches.get("count") or 0) + 1
+        products = dispatches.get("products")
+        if isinstance(products, list):
+            products.append(product_name)
+        return {
+            "found": True,
+            "product_name": product_name,
+            "price": prices[product_name],
+            "currency": "CNY",
+        }
+
+    with Session(engine) as db:
+        ensure_rows(db)
+
+    app.add_api_route(
+        "/__e2e/sd1/pending/reset",
+        reset,
+        methods=["GET"],
+        include_in_schema=False,
+    )
+    app.add_api_route(
+        "/__e2e/sd1/pending/snapshot",
+        snapshot,
+        methods=["GET"],
+        include_in_schema=False,
+    )
+    app.add_api_route(
+        "/__e2e/sd1/pending/provider",
+        provider,
+        methods=["POST"],
+        include_in_schema=False,
+    )
+
+
+def install_sd4_browser_external_task_fixture() -> None:
+    """注册受控 provider_task，验证工具页刷新/重放和真实 inbox 恢复链路。"""
+
+    import httpx
+    from fastapi import Body, Header
+    from fastapi.responses import JSONResponse
+    from sqlmodel import Session, select
+
+    from app.agents.branching import ensure_open_gallery_binding
+    from app.db import engine
+    from app.db.models import SopInstance, SopOperation, Tool
+    from app.dynamic_tasks.capability_catalog import ToolReliabilityContract
+    from app.main import app
+
+    tenant_id = "tenant_demo"
+    tool_id = "tool_sd4_browser_external_task"
+    tool_name = "sd4.browser_external_task"
+    dispatches: dict[str, object] = {"count": 0, "tasks": {}}
+    status_url = f"http://127.0.0.1:{E2E_PORT}/__e2e/sd4/provider/status/{{taskId}}"
+    contract = ToolReliabilityContract.model_validate(
+        {
+            "risk_class": "external_write",
+            "side_effect": "external",
+            "confirmation_policy": "once",
+            "timeout_policy": "unknown",
+            "idempotency": {
+                "mode": "request_key",
+                "remote_scope": "sd4-browser-provider",
+            },
+            "reconcile": {
+                "supported": True,
+                "tool_name": tool_name,
+                "reference_source": "output.provider_task_id",
+                "terminal_status_mapping": {
+                    "completed": "complete",
+                    "failed": "unknown",
+                },
+            },
+            "dynamic_task_enabled": True,
+            "execution_mode": "detached",
+            "async_strategy": "provider_task",
+            "status_url": status_url,
+            "status_mapping": {"accepted": "working", "queued": "working"},
+            "poll_interval_seconds": 1,
+            "max_tracking_seconds": 300,
+            "model_visibility": {
+                "allowed_paths": ["input.product_name", "output.product_name", "output.price"],
+                "user_display_paths": ["output.product_name", "output.price"],
+                "audit_only_paths": [],
+            },
+        }
+    )
+
+    def ensure_rows(db: Session) -> None:
+        """幂等准备公开到整体 Agent 的异步工具和结果 schema。"""
+
+        tool = db.get(Tool, tool_id)
+        if tool is None:
+            tool = Tool(
+                id=tool_id,
+                tenant_id=tenant_id,
+                name=tool_name,
+                display_name="SD-4 受控异步查询",
+                description="只返回隔离浏览器回归所需结果，不连接真实业务供应商。",
+                method="POST",
+                url="/__e2e/sd4/provider",
+                input_schema={
+                    "type": "object",
+                    "properties": {"product_name": {"type": "string"}},
+                    "required": ["product_name"],
+                    "additionalProperties": False,
+                },
+                output_schema={
+                    "type": "object",
+                    "properties": {
+                        "product_name": {"type": "string"},
+                        "price": {"type": "integer"},
+                    },
+                    "required": ["product_name", "price"],
+                },
+                reliability_contract_json=contract.model_dump(mode="json"),
+                enabled=True,
+            )
+            db.add(tool)
+        else:
+            tool.url = "/__e2e/sd4/provider"
+            tool.input_schema = {
+                "type": "object",
+                "properties": {"product_name": {"type": "string"}},
+                "required": ["product_name"],
+                "additionalProperties": False,
+            }
+            tool.output_schema = {
+                "type": "object",
+                "properties": {
+                    "product_name": {"type": "string"},
+                    "price": {"type": "integer"},
+                },
+                "required": ["product_name", "price"],
+            }
+            tool.reliability_contract_json = contract.model_dump(mode="json")
+            tool.enabled = True
+        db.flush()
+        ensure_open_gallery_binding(db, tenant_id, "tool", tool.id, "active")
+        db.commit()
+
+    def reset() -> dict[str, object]:
+        """清除受控 provider 内存计数，不删除隔离数据库历史。"""
+
+        dispatches["count"] = 0
+        dispatches["tasks"] = {}
+        return {"dispatch_count": 0, "tasks": []}
+
+    def snapshot() -> dict[str, object]:
+        """返回 provider 派发次数及真实 Operation/实例终态。"""
+
+        tasks = dispatches.get("tasks")
+        with Session(engine) as db:
+            operations = db.exec(
+                select(SopOperation)
+                .where(
+                    SopOperation.tenant_id == tenant_id,
+                    SopOperation.operation_name == tool_name,
+                )
+                .order_by(SopOperation.created_at, SopOperation.id)
+            ).all()
+            rows = []
+            for operation in operations:
+                instance = db.get(SopInstance, operation.instance_id)
+                rows.append(
+                    {
+                        "operation_id": operation.id,
+                        "status": operation.status,
+                        "instance_status": instance.status if instance is not None else None,
+                        "result": dict(operation.result_json or {}),
+                    }
+                )
+        return {
+            "dispatch_count": int(dispatches.get("count") or 0),
+            "tasks": list(tasks.values()) if isinstance(tasks, dict) else [],
+            "operations": rows,
+        }
+
+    async def provider(
+        payload: dict[str, object] = Body(...),
+        submission_header: str | None = Header(
+            default=None,
+            alias="X-Gongge-Xuban-External-Submission-Id",
+        ),
+        callback_token_header: str | None = Header(
+            default=None,
+            alias="X-Gongge-Xuban-External-Task-Token",
+        ),
+    ) -> JSONResponse:
+        """记录一次真实 HTTP 提交并返回 202；同一远端提交号由夹具自身去重。"""
+
+        submission_id = str(submission_header or "").strip()
+        tasks = dispatches.get("tasks")
+        if not isinstance(tasks, dict):
+            tasks = {}
+            dispatches["tasks"] = tasks
+        existing = tasks.get(submission_id)
+        if isinstance(existing, dict):
+            return JSONResponse(status_code=202, content={"taskId": existing["task_id"], "status": "accepted"})
+        sequence = int(dispatches.get("count") or 0) + 1
+        task_id = f"sd4-browser-task-{sequence}"
+        tasks[submission_id] = {
+            "task_id": task_id,
+            "status": "working",
+            "product_name": str(payload.get("product_name") or ""),
+            "callback_token": callback_token_header or "",
+        }
+        dispatches["count"] = sequence
+        return JSONResponse(status_code=202, content={"taskId": task_id, "status": "accepted"})
+
+    async def provider_status(task_id: str) -> dict[str, object]:
+        """返回 provider 当前观察，供真实轮询入口使用。"""
+
+        tasks = dispatches.get("tasks")
+        if not isinstance(tasks, dict):
+            return {"status": "failed", "result": {"code": "TASK_NOT_FOUND"}}
+        task = next((item for item in tasks.values() if item.get("task_id") == task_id), None)
+        if not isinstance(task, dict):
+            return {"status": "failed", "result": {"code": "TASK_NOT_FOUND"}}
+        return {
+            "status": task.get("status", "working"),
+            "result": task.get("result"),
+        }
+
+    def complete() -> dict[str, object]:
+        """通过真实 callback API 发出一次受控完成回执，等待后台 worker 恢复。"""
+
+        tasks = dispatches.get("tasks")
+        if not isinstance(tasks, dict):
+            return {"status": 404, "detail": "provider task missing"}
+        with Session(engine) as db:
+            operation = db.exec(
+                select(SopOperation)
+                .where(
+                    SopOperation.tenant_id == tenant_id,
+                    SopOperation.operation_name == tool_name,
+                    SopOperation.status == "waiting_external",
+                )
+                .order_by(SopOperation.created_at.desc(), SopOperation.id.desc())
+            ).first()
+            if operation is None or not operation.external_task_id:
+                return {"status": 409, "detail": "waiting operation missing"}
+            task = next(
+                (
+                    item
+                    for item in tasks.values()
+                    if item.get("task_id") == operation.external_task_id
+                ),
+                None,
+            )
+            if not isinstance(task, dict):
+                return {"status": 409, "detail": "provider task missing"}
+            product_name = str(task.get("product_name") or "")
+            result = {"product_name": product_name, "price": 404}
+            task["status"] = "completed"
+            task["result"] = result
+            callback_url = f"http://127.0.0.1:{E2E_PORT}/api/external-tasks/{operation.id}/callback"
+            response = httpx.post(
+                callback_url,
+                headers={
+                    "X-Gongge-Xuban-External-Task-Token": str(task.get("callback_token") or ""),
+                },
+                json={
+                    "provider_task_id": operation.external_task_id,
+                    "provider_event_id": f"sd4-browser-event-{operation.external_task_id}",
+                    "provider_status": "completed",
+                    "observation_revision": operation.external_observation_revision + 1,
+                    "external_submission_id": operation.external_submission_id,
+                    "payload": {"result": result, "reference": operation.external_task_id},
+                },
+                timeout=10,
+            )
+        return {"status": response.status_code, "body": response.json()}
+
+    with Session(engine) as db:
+        ensure_rows(db)
+
+    app.add_api_route("/__e2e/sd4/reset", reset, methods=["GET"], include_in_schema=False)
+    app.add_api_route("/__e2e/sd4/snapshot", snapshot, methods=["GET"], include_in_schema=False)
+    app.add_api_route("/__e2e/sd4/provider", provider, methods=["POST"], include_in_schema=False)
+    app.add_api_route(
+        "/__e2e/sd4/provider/status/{task_id}",
+        provider_status,
+        methods=["GET"],
+        include_in_schema=False,
+    )
+    app.add_api_route("/__e2e/sd4/complete", complete, methods=["POST"], include_in_schema=False)
 
 
 def install_general_skill_remote_fetcher_override() -> None:
@@ -8019,6 +9604,113 @@ def seed_pagination_browser_fixtures() -> None:
     now = utc_now()
     agent_id = "agent_e2e_employee"
     with Session(engine) as db:
+        db.add(
+            AgentProfile(
+                id="agent_e2e_memory_other",
+                tenant_id="tenant_demo",
+                name="浏览器切换记忆员工",
+                owner_user_id="admin",
+                status="active",
+                metadata_json={"owner_user_id": "admin", "owner_username": "admin"},
+            )
+        )
+        db.add(
+            ChatSession(
+                id="session_e2e_memory_legacy",
+                tenant_id="tenant_demo",
+                user_id="admin",
+                agent_id=agent_id,
+                title="浏览器历史归属记忆会话",
+                updated_at=now,
+            )
+        )
+        db.add(
+            MemoryRecord(
+                id="memory_e2e_memory_admin",
+                tenant_id="tenant_demo",
+                agent_id=agent_id,
+                user_id="admin",
+                username="admin",
+                kind="fact",
+                content="浏览器清空个人记忆",
+                updated_at=now + timedelta(minutes=3),
+            )
+        )
+        db.add(
+            MemoryRecord(
+                id="memory_e2e_memory_member",
+                tenant_id="tenant_demo",
+                agent_id=agent_id,
+                user_id="member_e2e",
+                username="member",
+                kind="fact",
+                content="浏览器成员个人记忆",
+                updated_at=now + timedelta(minutes=3),
+            )
+        )
+        db.add(
+            MemoryRecord(
+                id="memory_e2e_memory_overwritten_old",
+                tenant_id="tenant_demo",
+                agent_id=agent_id,
+                user_id="admin",
+                username="admin",
+                kind="profile",
+                content="浏览器覆盖前的旧值",
+                metadata_json={"key": "browser_overwritten_value"},
+                updated_at=now + timedelta(minutes=1),
+            )
+        )
+        db.add(
+            MemoryRecord(
+                id="memory_e2e_memory_overwritten_new",
+                tenant_id="tenant_demo",
+                agent_id=agent_id,
+                user_id="admin",
+                username="admin",
+                kind="profile",
+                content="浏览器覆盖后的新值",
+                metadata_json={"key": "browser_overwritten_value"},
+                updated_at=now + timedelta(minutes=2),
+            )
+        )
+        db.add(
+            MemoryRecord(
+                id="memory_e2e_memory_wildcard_probe",
+                tenant_id="tenant_demo",
+                agent_id=agent_id,
+                user_id="admin",
+                username="admin",
+                kind="fact",
+                content="a" * 80,
+                updated_at=now + timedelta(minutes=1),
+            )
+        )
+        db.add(
+            MemoryRecord(
+                id="memory_e2e_memory_legacy",
+                tenant_id="tenant_demo",
+                user_id="admin",
+                username="admin",
+                session_id="session_e2e_memory_legacy",
+                kind="fact",
+                content="浏览器历史归属记忆",
+                metadata_json={"key": "browser_legacy_memory"},
+                updated_at=now + timedelta(minutes=2),
+            )
+        )
+        db.add(
+            MemoryRecord(
+                id="memory_e2e_memory_other_agent",
+                tenant_id="tenant_demo",
+                agent_id="agent_e2e_memory_other",
+                user_id="admin",
+                username="admin",
+                kind="fact",
+                content="浏览器其他员工不应混入",
+                updated_at=now + timedelta(minutes=4),
+            )
+        )
         pagination_session = ChatSession(
             id="session_e2e_work_item_pagination",
             tenant_id="tenant_demo",
@@ -8211,26 +9903,83 @@ def seed_context_128k_browser_fixture() -> None:
         db.commit()
 
 
+
+def install_sd6b_browser_controls() -> None:
+    """只控制隔离 worker 通知和领取时机；所有 job 均由真实 Composer 原完成事务创建。"""
+
+    directory = os.environ.get("FULLSTACK_SD6B_CONTROL_DIR")
+    if not directory:
+        return
+    control = Path(directory).resolve()
+    if not control.is_relative_to(E2E_RUNTIME_DIR.parent.resolve()):
+        raise RuntimeError("SD6B_CONTROL_OUTSIDE_ISOLATED_RUNTIME")
+    control.mkdir(parents=True, exist_ok=True)
+    from app.memory import worker
+    original_claim = worker.claim_memory_capture_job
+    original_submit = worker._submit_woken_memory_capture
+    def claim(db, **kwargs):
+        """模拟进程领取暂停，不更改持久任务、租约、时钟或来源。"""
+        return None if (control / "pause").exists() else original_claim(db, **kwargs)
+    def submit(job_id):
+        """模拟 best-effort 通知丢失，重启后的持久 scanner 仍需发现原任务。"""
+        if not (control / "drop-notification").exists():
+            original_submit(job_id)
+    worker.claim_memory_capture_job = claim
+    worker._submit_woken_memory_capture = submit
+
 def main() -> None:
-    """启动临时全栈服务，并确保普通与大组织浏览器夹具都可用。"""
+    """启动自有临时服务；F1受控SDKHTTP、SD8真实SDK及既有夹具分别启用。"""
 
     reuse_runtime = os.environ.get("FULLSTACK_E2E_REUSE_RUNTIME") == "1"
     database_path = E2E_RUNTIME_DIR / "e2e.sqlite3"
-    if reuse_runtime and not database_path.is_file():
+    if reuse_runtime and not os.environ.get("FULLSTACK_E2E_DATABASE_URL") and not database_path.is_file():
         raise RuntimeError("FULLSTACK_E2E_REUSE_RUNTIME requires an existing database")
     if not reuse_runtime:
         shutil.rmtree(E2E_RUNTIME_DIR, ignore_errors=True)
         E2E_RUNTIME_DIR.mkdir(mode=0o700)
     configure_environment(database_path)
+    if os.environ.get("FULLSTACK_FINAL_F1") == "1":
+        os.environ["DYNAMIC_TASK_EXTERNAL_WRITE_AGENT_ALLOWLIST"] = "agent_f1_dta"
+        from final_f1_fullstack_fixture import prepare_final_f1
+
+        prepare_final_f1(E2E_RUNTIME_DIR, reuse=reuse_runtime)
+        install_sd6b_browser_controls()
+        import uvicorn
+        from single_port_app import app
+
+        uvicorn.run(app, host="127.0.0.1", port=E2E_PORT, log_level="warning")
+        return
     live_attachment = live_attachment_e2e_enabled()
     if live_attachment:
         assert_live_attachment_model_configured()
+    if os.environ.get("FULLSTACK_SD8") == "1":
+        from sd8_fullstack_fixture import prepare_sd8
+
+        if not live_attachment:
+            raise RuntimeError("SD8_REQUIRES_REAL_PROVIDER")
+        prepare_sd8(E2E_RUNTIME_DIR, reuse=reuse_runtime)
+        if not reuse_runtime:
+            certify_live_dynamic_model()
+        import uvicorn
+        from single_port_app import app
+
+        uvicorn.run(app, host="127.0.0.1", port=E2E_PORT, log_level="warning")
+        return
     if not reuse_runtime:
         seed_e2e_fixtures()
+        seed_sd5_browser_consumer_fixture()
         seed_skill_demo_agents()
         if os.environ.get("FULLSTACK_E2E_CONTEXT_128K") == "1":
             seed_context_128k_browser_fixture()
         if live_attachment:
+            if os.environ.get("FULLSTACK_SD7_F3") == "1":
+                from sd7_f3_fullstack_fixture import observe_sd7_sdk
+
+                observe_sd7_sdk(E2E_RUNTIME_DIR)
+            if os.environ.get("FULLSTACK_SD6A") == "1":
+                from sd6a_fullstack_fixture import observe_sd6a_sdk
+
+                observe_sd6a_sdk(E2E_RUNTIME_DIR)
             certify_live_dynamic_model()
         seed_managed_workspace_browser_fixture()
         if not live_attachment:
@@ -8241,8 +9990,30 @@ def main() -> None:
             seed_pagination_browser_fixtures()
         seed_large_organization_browser_fixture()
     install_connection_service_override()
+    install_sd1_browser_restore_fixture()
+    install_sd1_browser_action_fixture()
+    install_sd1_browser_pending_fixture()
+    install_sd4_browser_external_task_fixture()
+    install_sd5_browser_failure_fixture()
+    install_sd6b_browser_controls()
+    if os.environ.get("FULLSTACK_SD6A") == "1":
+        from sd6a_fullstack_fixture import prepare_sd6a
+
+        prepare_sd6a(E2E_RUNTIME_DIR, reuse=reuse_runtime)
+    if os.environ.get("FULLSTACK_SD7_F3") == "1":
+        from sd7_f3_fullstack_fixture import prepare_sd7_f3
+
+        prepare_sd7_f3(E2E_RUNTIME_DIR, reuse=reuse_runtime)
+    elif os.environ.get("FULLSTACK_SD7") == "1":
+        from sd7_fullstack_fixture import prepare_sd7
+
+        prepare_sd7(E2E_RUNTIME_DIR, reuse=reuse_runtime)
+    if os.environ.get("FULLSTACK_SD7_REPAIR") == "1":
+        from sd7_repair_fullstack_fixture import install_repair_sdk
+
+        install_repair_sdk(E2E_RUNTIME_DIR)
     install_general_skill_remote_fetcher_override()
-    if not live_attachment:
+    if not live_attachment and os.environ.get("FULLSTACK_SD7_REPAIR") != "1":
         install_schedule_llm_override()
 
     import uvicorn

@@ -200,4 +200,5 @@ describe('Composer new-session action', () => {
 
     expect(chat.setExecutionEngine).not.toHaveBeenCalled();
   });
+
 });

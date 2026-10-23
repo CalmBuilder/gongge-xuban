@@ -68,6 +68,10 @@ from app.sop_runtime.contracts import (
     OperationStatus,
     SopInstanceStatus,
 )
+from app.sop_runtime.external_identity import (
+    external_task_callback_token,
+    external_task_callback_token_hash,
+)
 from app.sop_runtime.state_machine import (
     TransitionResult,
     transition_instance,
@@ -93,7 +97,7 @@ _OPERATION_EFFECT_SIDES = {
     "destructive": "external",
 }
 _ACTIVE_OPERATION_ATTEMPT_STATUSES = frozenset(
-    {"prepared", "running", "retry_wait"}
+    {"prepared", "running", "retry_wait", "waiting_external"}
 )
 _DISPATCH_ITEM_ACTIVE_STATUSES = frozenset(
     {"dispatch_pending", "dispatched", "result_ready"}
@@ -636,6 +640,7 @@ class SopExecutionStore:
         source_ref: str | None = None,
         goal_metadata: Mapping[str, object] | None = None,
         context: Mapping[str, object] | None = None,
+        active_slot_key: str | None = None,
         enforce_agent_lifecycle: bool = True,
     ) -> tuple[SopInstance, ExecutionPlanRevision]:
         """原子创建动态 Execution 与首个活动计划，不伪造 SkillVersion 身份。"""
@@ -656,6 +661,7 @@ class SopExecutionStore:
         plan_checksum = canonical_checksum(plan)
         capability_digest = capability_checksum(capability_payload)
         resolved_source_ref = source_ref or session_id
+        resolved_active_slot_key = active_slot_key or f"foreground:{session_id}"
         active = self._active_instance(tenant_id, session_id)
         if active is not None:
             if (
@@ -680,7 +686,7 @@ class SopExecutionStore:
             session_id=session_id,
             run_number=self._next_execution_run_number(tenant_id, session_id),
             kind="dynamic_task",
-            active_slot_key=f"foreground:{session_id}",
+            active_slot_key=resolved_active_slot_key,
             initiator_user_id=initiator_user_id,
             source_kind=source_kind,
             source_ref=resolved_source_ref,
@@ -1282,8 +1288,9 @@ class SopExecutionStore:
         execution: SopNodeExecution,
         *,
         slots: Mapping[str, object],
+        resume_time_context: Mapping[str, object] | None = None,
     ) -> None:
-        """用新的槽位快照恢复暂停节点，不创建重复 attempt。"""
+        """用新的槽位快照恢复暂停节点，不创建重复 attempt，并记录新输入时间。"""
 
         self._assert_execution_owner(instance, execution)
         self._guard_mutation(instance, "node.resume")
@@ -1300,6 +1307,11 @@ class SopExecutionStore:
         self._apply_node_transition(execution, node_transition)
         self._apply_instance_transition(instance, instance_transition)
         instance.slots_json = dict(slots)
+        if resume_time_context is not None:
+            execution.input_json = {
+                **(execution.input_json or {}),
+                "resume_time_context": dict(resume_time_context),
+            }
         self.db.add(execution)
         self.db.add(instance)
         self.db.flush()
@@ -1506,6 +1518,19 @@ class SopExecutionStore:
             logical_action_id=action_id,
             request_fingerprint=fingerprint,
             remote_idempotency_key=remote_key,
+            external_submission_id=(
+                remote_key
+                if isinstance(frozen_capability.get("contract"), Mapping)
+                and frozen_capability["contract"].get("async_strategy") == "provider_task"
+                else None
+            ),
+            external_callback_token_hash=(
+                external_task_callback_token_hash(external_task_callback_token(remote_key))
+                if remote_key
+                and isinstance(frozen_capability.get("contract"), Mapping)
+                and frozen_capability["contract"].get("async_strategy") == "provider_task"
+                else None
+            ),
             idempotency_required=policy.required,
             idempotency_scope=policy.scope.value,
             idempotency_key_fields_json=list(policy.key_fields),
@@ -1596,6 +1621,160 @@ class SopExecutionStore:
             attempt.updated_at = operation.started_at
             self.db.add(attempt)
         self.db.add(operation)
+        self.db.flush()
+
+    def mark_operation_waiting_external(
+        self,
+        operation: SopOperation,
+        *,
+        provider_task_id: str,
+        provider_status: str,
+        receipt: Mapping[str, object],
+        status_url: str,
+        tracking_seconds: int,
+        poll_interval_seconds: int = 5,
+        provider: str = "http",
+        event_id: str | None = None,
+        callback_token: str | None = None,
+    ) -> None:
+        """把已受理的 provider task 记为外部等待，并暂停原节点而不新增派发。"""
+
+        if operation.status != OperationStatus.RUNNING.value:
+            raise SopExecutionConflictError("只有 running 操作可以进入 waiting_external。")
+        if not provider_task_id.strip() or not status_url.strip():
+            raise SopExecutionConflictError("外部等待必须持有 provider task ID 和查询地址。")
+        if tracking_seconds < 1 or poll_interval_seconds < 1:
+            raise ValueError("外部任务跟踪时间和轮询周期必须为正数。")
+        self._guard_operation_mutation(operation, "operation.wait_external")
+        now = utc_now()
+        transition = transition_operation(
+            OperationStatus(operation.status),
+            OperationStatus.WAITING_EXTERNAL,
+            actual_revision=operation.revision,
+        )
+        self._apply_operation_transition(operation, transition)
+        operation.external_strategy = "provider_task"
+        operation.external_provider = provider
+        operation.external_submission_id = (
+            operation.external_submission_id or operation.remote_idempotency_key or operation.id
+        )
+        if callback_token:
+            operation.external_callback_token_hash = external_task_callback_token_hash(callback_token)
+        elif not operation.external_callback_token_hash and operation.remote_idempotency_key:
+            operation.external_callback_token_hash = external_task_callback_token_hash(
+                external_task_callback_token(operation.remote_idempotency_key)
+            )
+        operation.external_task_id = provider_task_id.strip()
+        operation.external_status_url = status_url.strip()
+        operation.external_status = provider_status.strip() or "accepted"
+        operation.external_wait_started_at = now
+        operation.external_next_poll_at = now + timedelta(seconds=poll_interval_seconds)
+        operation.external_deadline_at = now + timedelta(seconds=tracking_seconds)
+        operation.external_observation_revision += 1
+        operation.external_last_event_id = event_id
+        operation.external_receipt_json = dict(receipt)
+        attempt = self._latest_operation_attempt(operation)
+        if attempt is None or attempt.status != OperationStatus.RUNNING.value:
+            raise SopExecutionConflictError("外部等待缺少当前 running dispatch attempt。")
+        attempt.status = OperationStatus.WAITING_EXTERNAL.value
+        attempt.external_task_id = operation.external_task_id
+        attempt.external_status = operation.external_status
+        attempt.external_observation_revision = operation.external_observation_revision
+        attempt.external_receipt_json = dict(receipt)
+        attempt.waiting_at = now
+        attempt.updated_at = now
+        self.db.add(attempt)
+        instance = self._operation_instance(operation)
+        execution = self.db.get(SopNodeExecution, operation.node_execution_id)
+        if execution is None or execution.tenant_id != operation.tenant_id:
+            raise SopExecutionConflictError("外部等待的节点执行不存在或租户不一致。")
+        self.wait_for_external_operation(instance, execution, operation)
+        DynamicTaskQuotaService(self.db).release_tool_operation(operation)
+        self.db.add(operation)
+        self.db.flush()
+
+    def wait_for_external_operation(
+        self,
+        instance: SopInstance,
+        execution: SopNodeExecution,
+        operation: SopOperation,
+    ) -> None:
+        """将原节点和实例置为 waiting，保留精确 Operation 作为唯一阻塞依据。"""
+
+        self._assert_execution_owner(instance, execution)
+        self._guard_mutation(instance, "node.wait_external")
+        if operation.instance_id != instance.id or operation.node_execution_id != execution.id:
+            raise SopExecutionConflictError("外部等待操作不属于当前节点执行。")
+        node_transition = transition_node(
+            NodeExecutionStatus(execution.status),
+            NodeExecutionStatus.WAITING,
+            actual_revision=execution.revision,
+        )
+        instance_transition = transition_instance(
+            SopInstanceStatus(instance.status),
+            SopInstanceStatus.WAITING,
+            actual_revision=instance.revision,
+        )
+        self._apply_node_transition(execution, node_transition)
+        execution.output_json = {
+            "operation_id": operation.id,
+            "external_task_id": operation.external_task_id,
+            "status": OperationStatus.WAITING_EXTERNAL.value,
+        }
+        self._apply_instance_transition(instance, instance_transition)
+        self.db.add(execution)
+        self.db.add(instance)
+        self.db.flush()
+
+    def wait_for_unknown_operation(
+        self,
+        instance: SopInstance,
+        execution: SopNodeExecution,
+        operation: SopOperation,
+    ) -> None:
+        """把仍未知的原外部写节点重新挂起，不创建新动作或伪造人工对账项。"""
+
+        self._assert_execution_owner(instance, execution)
+        self._guard_mutation(instance, "node.wait_unknown")
+        if (
+            operation.tenant_id != instance.tenant_id
+            or operation.instance_id != instance.id
+            or operation.node_execution_id != execution.id
+            or operation.status != OperationStatus.UNKNOWN.value
+            or instance.current_node_id != execution.node_id
+        ):
+            raise SopExecutionConflictError("unknown Operation 未绑定当前等待节点。")
+
+        instance_transition = None
+        if instance.status == SopInstanceStatus.RUNNING.value:
+            instance_transition = transition_instance(
+                SopInstanceStatus(instance.status),
+                SopInstanceStatus.WAITING,
+                actual_revision=instance.revision,
+            )
+        elif instance.status != SopInstanceStatus.WAITING.value:
+            raise SopExecutionConflictError("unknown Operation 所属 Execution 已不可等待。")
+
+        node_transition = None
+        if execution.status in {
+            NodeExecutionStatus.SCHEDULED.value,
+            NodeExecutionStatus.RUNNING.value,
+        }:
+            node_transition = transition_node(
+                NodeExecutionStatus(execution.status),
+                NodeExecutionStatus.WAITING,
+                actual_revision=execution.revision,
+            )
+        elif execution.status != NodeExecutionStatus.WAITING.value:
+            raise SopExecutionConflictError("unknown Operation 所属原节点已不可等待。")
+
+        if instance_transition is not None:
+            self._apply_instance_transition(instance, instance_transition)
+            self.db.add(instance)
+        if node_transition is not None:
+            self._apply_node_transition(execution, node_transition)
+        execution.output_json = {"operation_id": operation.id, "status": "unknown"}
+        self.db.add(execution)
         self.db.flush()
 
     def authorize_operation_skill_causes(self, operation: SopOperation) -> None:
@@ -1908,8 +2087,11 @@ class SopExecutionStore:
     ) -> None:
         """将工具结果写成成功或失败回执，供条件 DSL 和恢复逻辑消费。"""
 
-        if operation.status != OperationStatus.RUNNING.value:
-            raise SopExecutionConflictError("只有 running 操作可以直接写入工具回执。")
+        if operation.status not in {
+            OperationStatus.RUNNING.value,
+            OperationStatus.WAITING_EXTERNAL.value,
+        }:
+            raise SopExecutionConflictError("只有 running 或 waiting_external 操作可以写入工具回执。")
         self._guard_operation_mutation(operation, "operation.finish")
         target = OperationStatus.SUCCEEDED if succeeded else OperationStatus.FAILED
         transition = transition_operation(
@@ -1926,6 +2108,7 @@ class SopExecutionStore:
         if attempt is not None and attempt.status in {
             OperationStatus.PREPARED.value,
             OperationStatus.RUNNING.value,
+            OperationStatus.WAITING_EXTERNAL.value,
         }:
             attempt.status = target.value
             attempt.error_json = dict(error or {})
@@ -1992,7 +2175,10 @@ class SopExecutionStore:
         operation.error_json = dict(error)
         operation.cancellation_disposition = "awaiting_reconciliation"
         attempt = self._latest_operation_attempt(operation)
-        if attempt is not None and attempt.status == OperationStatus.RUNNING.value:
+        if attempt is not None and attempt.status in {
+            OperationStatus.RUNNING.value,
+            OperationStatus.WAITING_EXTERNAL.value,
+        }:
             attempt.status = OperationStatus.UNKNOWN.value
             attempt.error_json = dict(error)
             attempt.updated_at = utc_now()
@@ -2118,6 +2304,18 @@ class SopExecutionStore:
                     )
                 else:
                     self._cancel_running_read(operation)
+            elif operation.status == OperationStatus.WAITING_EXTERNAL.value:
+                if operation.effect_kind in _EFFECTS_WITH_UNKNOWN_RECONCILIATION:
+                    self.mark_operation_unknown(
+                        operation,
+                        error={"code": "CANCELLED_WHILE_EXTERNAL_PENDING"},
+                    )
+                else:
+                    self.finish_operation(
+                        operation,
+                        succeeded=False,
+                        error={"code": "CANCELLED_WHILE_EXTERNAL_PENDING"},
+                    )
         unknown_operations = [
             operation
             for operation in operations
@@ -2211,7 +2409,7 @@ class SopExecutionStore:
         *,
         actor_user_id: str,
     ) -> SopWorkItem | None:
-        """为 unknown external/destructive 效果补齐可办理的异常对账工作项。"""
+        """补齐unknown效果对账项，并在重入时修复原节点仍可运行的等待屏障。"""
 
         if (
             operation.instance_id != instance.id
@@ -2245,6 +2443,20 @@ class SopExecutionStore:
                 existing.updated_at = now
                 self.db.add(existing)
                 self.db.flush()
+            step = self.db.get(SopNodeExecution, operation.node_execution_id)
+            if (
+                existing.status in {"offered", "claimed"}
+                and step is not None
+                and step.tenant_id == instance.tenant_id
+                and step.instance_id == instance.id
+                and instance.current_node_id == step.node_id
+                and instance.status == SopInstanceStatus.RUNNING.value
+                and step.status in {
+                    NodeExecutionStatus.SCHEDULED.value,
+                    NodeExecutionStatus.RUNNING.value,
+                }
+            ):
+                self.wait_for_work_item(instance, step, work_item_id=existing.id)
             return existing
 
         from app.organization.governance import has_governance_permission
@@ -2320,6 +2532,23 @@ class SopExecutionStore:
                     },
                 )
                 self.db.flush()
+            step = self.db.get(SopNodeExecution, operation.node_execution_id)
+            if (
+                step is not None
+                and step.tenant_id == instance.tenant_id
+                and step.instance_id == instance.id
+                and instance.current_node_id == step.node_id
+                and instance.status in {
+                    SopInstanceStatus.RUNNING.value,
+                    SopInstanceStatus.WAITING.value,
+                }
+                and step.status in {
+                    NodeExecutionStatus.SCHEDULED.value,
+                    NodeExecutionStatus.RUNNING.value,
+                    NodeExecutionStatus.WAITING.value,
+                }
+            ):
+                self.wait_for_unknown_operation(instance, step, operation)
             return None
         step = self.db.get(SopNodeExecution, operation.node_execution_id)
         step_key = step.step_key if step is not None else operation.node_execution_id

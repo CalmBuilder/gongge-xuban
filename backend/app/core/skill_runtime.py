@@ -149,6 +149,7 @@ class SkillRuntime:
             session.active_step_id = decision.target_step_id
             session.slots_json = strip_router_generated_message_slots(decision.slot_hints)
             session.awaiting_input_json = None
+            _set_active_task_id(session, decision.selected_task_id)
             session.last_agent_question = None
             return
         if not session.active_skill_id and decision.target_skill_id:
@@ -160,6 +161,7 @@ class SkillRuntime:
             session.active_skill_id = decision.target_skill_id
             session.slots_json = strip_router_generated_message_slots(decision.slot_hints)
             session.awaiting_input_json = None
+            _set_active_task_id(session, decision.selected_task_id)
             session.last_agent_question = None
         preserve_active_step = (
             decision.decision == "continue_active"

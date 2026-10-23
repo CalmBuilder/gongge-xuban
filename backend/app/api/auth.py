@@ -13,7 +13,8 @@ from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import func, or_
+from sqlalchemy import func, or_, update
+from sqlalchemy.exc import OperationalError
 from sqlmodel import Session, select
 
 from app.audit.service import append_user_management_audit
@@ -62,6 +63,7 @@ from app.organization.roles import (
     replace_employee_business_roles,
 )
 from app.organization.units import OrganizationUnitError, ensure_organization_foundation
+from app.memory.capture import advance_memory_user_permission_generation
 from app.security.auth import (
     create_access_token,
     ensure_active_member,
@@ -874,11 +876,30 @@ def update_user(
 ) -> UserRead:
     """更新账号基础信息和员工档案绑定，空工号表示解除绑定。"""
 
-    user = db.get(User, user_id)
+    user = _lock_user_account(db, request.tenant_id, user_id)
     if not user or user.tenant_id != request.tenant_id:
         raise HTTPException(status_code=404, detail="Account not found")
     target_org_unit_id = _member_target_org_unit_id(db, request.tenant_id, user.id)
     profile = _employee_profile(db, request.tenant_id, user.id)
+    before_membership_status = user.membership_status
+    before_platform_role = user.role
+    before_member_category = user.member_category_code
+    before_employee_identity = (
+        profile.employee_id,
+        profile.employee_name,
+        profile.department_id,
+    ) if profile is not None else None
+    before_business_role_codes = (
+        tuple(
+            active_business_role_codes(
+                db,
+                tenant_id=request.tenant_id,
+                employee_profile_id=profile.id,
+            )
+        )
+        if profile is not None
+        else ()
+    )
     before = _member_audit_snapshot(user, profile)
     ensure_governance_permission(
         db,
@@ -973,6 +994,37 @@ def update_user(
                 db, profile, request.membership_status, now=now
             )
     user.updated_at = utc_now()
+    after_employee_identity = (
+        profile.employee_id,
+        profile.employee_name,
+        profile.department_id,
+    ) if profile is not None else None
+    after_business_role_codes = (
+        tuple(
+            active_business_role_codes(
+                db,
+                tenant_id=request.tenant_id,
+                employee_profile_id=profile.id,
+            )
+        )
+        if profile is not None
+        else ()
+    )
+    memory_permission_changed = (
+        before_membership_status != user.membership_status
+        or before_platform_role != user.role
+        or before_member_category != user.member_category_code
+        or before_employee_identity != after_employee_identity
+        or before_business_role_codes != after_business_role_codes
+    )
+    if before_membership_status != user.membership_status or before_platform_role != user.role:
+        user.auth_revision += 1
+    if memory_permission_changed:
+        advance_memory_user_permission_generation(
+            db,
+            tenant_id=request.tenant_id,
+            user_id=user.id,
+        )
     db.add(user)
     append_user_management_audit(
         db,
@@ -1004,7 +1056,7 @@ def delete_user(
 ) -> dict[str, bool]:
     """兼容旧删除入口，将普通成员标记离职并保留全部历史 actor 关系。"""
 
-    user = db.get(User, user_id)
+    user = _lock_user_account(db, tenant_id, user_id)
     if not user or user.tenant_id != tenant_id:
         raise HTTPException(status_code=404, detail="Account not found")
     ensure_governance_permission(
@@ -1020,6 +1072,9 @@ def delete_user(
     target_org_unit_id = _member_target_org_unit_id(db, tenant_id, user.id)
     before = _member_audit_snapshot(user, profile)
     now = utc_now()
+    membership_changed = user.membership_status != "left"
+    if membership_changed:
+        user.auth_revision += 1
     user.membership_status = "left"
     user.left_at = now
     user.updated_at = now
@@ -1027,6 +1082,12 @@ def delete_user(
     if profile is not None:
         _sync_employee_lifecycle(db, profile, "left", now=now)
         db.add(profile)
+    if membership_changed:
+        advance_memory_user_permission_generation(
+            db,
+            tenant_id=tenant_id,
+            user_id=user.id,
+        )
     append_user_management_audit(
         db,
         current_user=current_user,
@@ -1106,6 +1167,20 @@ def _member_category_read(item: CodeItem) -> MemberCategoryRead:
         sort_order=item.sort_order,
         revision=item.revision,
     )
+
+
+def _lock_user_account(db: Session, tenant_id: str, user_id: str) -> User | None:
+    """账号写入共用真实屏障，SQLite先写、MySQL当前锁读，防授权代数丢失。"""
+
+    try:
+        db.exec(update(User).where(User.id == user_id, User.tenant_id == tenant_id)
+                .values(auth_revision=User.auth_revision)
+                .execution_options(synchronize_session=False))
+        return db.exec(select(User).where(User.id == user_id, User.tenant_id == tenant_id)
+                       .with_for_update().execution_options(populate_existing=True)).first()
+    except OperationalError as error:
+        db.rollback()
+        raise HTTPException(409, "ACCOUNT_AUTHORITY_WRITE_CONFLICT") from error
 
 
 def _user_read_with_roles(

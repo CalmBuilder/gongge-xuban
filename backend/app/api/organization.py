@@ -18,6 +18,7 @@ from sqlmodel import Session, select
 
 from app.audit.service import append_user_management_audit
 from app.db import get_session
+from app.db.retry import retry_mysql_deadlock_once
 from app.db.models import (
     AgentProfile,
     AgentRoleBinding,
@@ -473,6 +474,29 @@ def list_permission_definitions(
     db: Session = Depends(get_session),
 ) -> list[PermissionDefinitionRead]:
     """按编码、名称、描述或业务域查询权限目录，供角色多选控件检索和回填。"""
+
+    return retry_mysql_deadlock_once(
+        db,
+        lambda: _list_permission_definitions_once(
+            tenant_id,
+            q,
+            category,
+            status,
+            current_user,
+            db,
+        ),
+    )
+
+
+def _list_permission_definitions_once(
+    tenant_id: str,
+    q: str | None,
+    category: str | None,
+    status: Literal["active", "inactive", "all"],
+    current_user: User,
+    db: Session,
+) -> list[PermissionDefinitionRead]:
+    """完整校验授权、同步治理目录并读取筛选结果，供死锁后原样重放。"""
 
     _ensure_authorization_read(db, tenant_id, current_user)
     ensure_builtin_governance_catalog(db, tenant_id)

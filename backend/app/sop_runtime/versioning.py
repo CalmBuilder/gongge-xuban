@@ -57,8 +57,9 @@ def write_skill_version(
     compiled_definition: CompiledSopDefinition | None = None,
     derived_from_version_id: str | None = None,
     version_id: str | None = None,
+    scope_agent_id: str = "",
 ) -> SkillVersionWriteResult:
-    """在当前事务内写入版本快照，并保护已发布版本的内容与来源元数据。"""
+    """在同租户和精确发布范围内写快照，保护已发布内容和派生来源。"""
 
     candidate_checksum = skill_content_checksum(skill.content_json)
     existing = db.exec(
@@ -66,6 +67,7 @@ def write_skill_version(
         .where(
             SkillVersion.tenant_id == skill.tenant_id,
             SkillVersion.skill_id == skill.skill_id,
+            SkillVersion.scope_agent_id == scope_agent_id,
             SkillVersion.version == skill.version,
         )
         .with_for_update()
@@ -99,6 +101,7 @@ def write_skill_version(
         **identity_fields,
         tenant_id=skill.tenant_id,
         skill_id=skill.skill_id,
+        scope_agent_id=scope_agent_id,
         version=skill.version,
         name=skill.name,
         business_domain=skill.business_domain,
@@ -117,7 +120,7 @@ def write_skill_version(
     return SkillVersionWriteResult(version=version_row, created=True, idempotent=False)
 
 
-def next_derived_skill_version(db: Session, skill: Skill) -> str:
+def next_derived_skill_version(db: Session, skill: Skill, *, scope_agent_id: str = "") -> str:
     """基于当前头版本生成未占用的派生版本，避免回滚复用历史版本号。"""
 
     candidate = _increment_version(skill.version)
@@ -125,11 +128,36 @@ def next_derived_skill_version(db: Session, skill: Skill) -> str:
         select(SkillVersion.id).where(
             SkillVersion.tenant_id == skill.tenant_id,
             SkillVersion.skill_id == skill.skill_id,
+            SkillVersion.scope_agent_id == scope_agent_id,
             SkillVersion.version == candidate,
         )
     ).first():
         candidate = _increment_version(candidate)
     return candidate
+
+
+def annotate_skill_publication(db: Session, skill: Skill) -> Skill:
+    """只用精确范围且完整内容吻合的发布行标注管理响应，不为旧头猜发布身份。"""
+
+    metadata = getattr(skill, "agent_branch_meta", {})
+    scope = metadata.get("agent_id") or ""
+    publication = db.exec(select(SkillVersion).where(
+        SkillVersion.tenant_id == skill.tenant_id,
+        SkillVersion.skill_id == skill.skill_id,
+        SkillVersion.scope_agent_id == scope,
+        SkillVersion.version == skill.version,
+        SkillVersion.status == "published",
+    )).first() if skill.status == "published" else None
+    if publication and skill_content_checksum(publication.content_json) != skill_content_checksum(
+        skill.content_json
+    ):
+        publication = None
+    object.__setattr__(skill, "publication_identity", {
+        "id": publication.id if publication else None,
+        "scope_agent_id": scope,
+        "checksum": publication.compiled_definition_checksum if publication else None,
+    })
+    return skill
 
 
 def _increment_version(version: str) -> str:

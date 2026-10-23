@@ -1,9 +1,9 @@
 """
-@Time       : 2026/07/27 16:05
+@Time       : 2026/10/14
 @Author     : zhanglp8181
 @File       : test_model_configs_api.py
 @CallChain  : pytest → model_configs API helpers → SQLite/SQLModel
-@Description: 回归默认模型唯一约束、无瞬时冲突切换及同租户并发串行化。
+@Description: 回归默认模型唯一约束、并发切换，以及目录未列别名时以实际生成验证配置。
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import threading
 
+import pytest
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, SQLModel, create_engine, select
 
@@ -20,6 +21,7 @@ from app.api.model_configs import (
     test_model_config as run_model_config_test,
     update_model_config,
 )
+from app.api import model_configs as model_config_api
 from app.db.models import ModelConfig, Tenant
 from app.security.encryption import encrypt_secret
 from app.llm.schemas import ModelConfigUpdateRequest
@@ -170,6 +172,7 @@ def test_dynamic_preflight_persists_capabilities_and_config_change_invalidates(
         assert response.success is True
         assert persisted is not None and persisted.preflight_status == "ready"
         assert persisted.capability_checksum == response.checksum
+        previous_generation = persisted.memory_capture_generation
 
         update_model_config(
             "a_next",
@@ -181,6 +184,7 @@ def test_dynamic_preflight_persists_capabilities_and_config_change_invalidates(
         assert persisted.preflight_status == "unverified"
         assert persisted.capability_snapshot_json == {}
         assert persisted.capability_checksum is None
+        assert persisted.memory_capture_generation == previous_generation + 1
 
 
 def test_connection_test_reports_auth_catalog_and_generation_success(
@@ -211,6 +215,78 @@ def test_connection_test_reports_auth_catalog_and_generation_success(
     ]
 
 
+def test_connection_test_uses_generation_when_catalog_omits_working_model_alias(
+    tmp_path, monkeypatch
+) -> None:
+    """目录未列出兼容别名时，必须以配置模型的实际生成结果判定可用性。"""
+
+    engine = _engine(tmp_path)
+    _seed_models(engine)
+    generation_calls: list[str] = []
+    monkeypatch.setattr(
+        "app.api.model_configs.LLMClient.probe_model_catalog",
+        lambda self: ["provider-family-v2", "provider-family-fast"],
+    )
+
+    def generate(self) -> str:
+        """记录最小生成已实际尝试，并模拟供应商接受配置的兼容别名。"""
+
+        generation_calls.append(self.model)
+        return "连接成功"
+
+    monkeypatch.setattr("app.api.model_configs.LLMClient.probe_text_connection", generate)
+    with Session(engine) as db:
+        response = run_model_config_test("a_next", tenant_id="tenant_a", db=db)
+
+    assert response.success is True
+    assert response.output == "连接成功"
+    assert generation_calls == ["model-next"]
+    assert [(item.name, item.status) for item in response.checks] == [
+        ("配置", "passed"),
+        ("模型目录", "skipped"),
+        ("账户状态", "skipped"),
+        ("最小生成", "passed"),
+    ]
+
+
+def test_connection_test_reports_generation_failure_after_catalog_alias_mismatch(
+    tmp_path, monkeypatch
+) -> None:
+    """目录别名不匹配时仍须发出最小生成，并以真实生成失败给出最终结论。"""
+
+    engine = _engine(tmp_path)
+    _seed_models(engine)
+    generation_calls: list[str] = []
+    monkeypatch.setattr(
+        "app.api.model_configs.LLMClient.probe_model_catalog",
+        lambda self: ["provider-family-v2"],
+    )
+
+    def fail_generation(self) -> str:
+        """记录生成确实被调用，再返回稳定的供应商传输失败。"""
+
+        generation_calls.append(self.model)
+        from app.llm.client import LLMError
+
+        raise LLMError("provider_transport_error")
+
+    monkeypatch.setattr(
+        "app.api.model_configs.LLMClient.probe_text_connection", fail_generation
+    )
+    with Session(engine) as db:
+        response = run_model_config_test("a_next", tenant_id="tenant_a", db=db)
+
+    assert response.success is False
+    assert response.error_code == "MODEL_CONNECTION_FAILED"
+    assert generation_calls == ["model-next"]
+    assert [(item.name, item.status) for item in response.checks] == [
+        ("配置", "passed"),
+        ("模型目录", "skipped"),
+        ("账户状态", "skipped"),
+        ("最小生成", "failed"),
+    ]
+
+
 def test_connection_test_explains_deepseek_key_account_balance(
     tmp_path, monkeypatch
 ) -> None:
@@ -230,21 +306,32 @@ def test_connection_test_explains_deepseek_key_account_balance(
     )
 
     class BalanceResponse:
-        """模拟DeepSeek对当前API Key返回不可用余额。"""
+        """模拟DeepSeek对当前API Key返回不可用余额的identity响应流。"""
 
         status_code = 200
-        content = b"{}"
+        headers = {"content-encoding": "identity"}
 
-        @staticmethod
-        def json() -> dict[str, object]:
-            """返回不包含账户身份的余额事实。"""
+        def iter_raw(self, chunk_size: int):
+            """返回有界合成余额正文，不包括任何账户身份。"""
+            yield (
+                b'{"is_available":false,"balance_infos":'
+                b'[{"currency":"CNY","total_balance":"-0.13"}]}'
+            )
 
-            return {
-                "is_available": False,
-                "balance_infos": [{"currency": "CNY", "total_balance": "-0.13"}],
-            }
+    class BalanceStream:
+        """提供与httpx同步流式响应相同的上下文边界。"""
 
-    monkeypatch.setattr("app.api.model_configs.httpx.get", lambda *args, **kwargs: BalanceResponse())
+        def __enter__(self) -> BalanceResponse:
+            """开始合成请求并返回响应。"""
+            return BalanceResponse()
+
+        def __exit__(self, *_exc_info: object) -> None:
+            """结束合成响应流。"""
+
+    monkeypatch.setattr(
+        "app.api.model_configs.httpx.stream",
+        lambda *_args, **_kwargs: BalanceStream(),
+    )
     with Session(engine) as db:
         response = run_model_config_test("a_next", tenant_id="tenant_a", db=db)
 
@@ -257,6 +344,87 @@ def test_connection_test_explains_deepseek_key_account_balance(
     assert "CNY余额 -0.13" in response.checks[-2].message
     assert response.checks[-1].name == "最小生成"
     assert response.checks[-1].status == "skipped"
+
+
+@pytest.mark.parametrize("content_length", [64 * 1024 + 1, None])
+def test_deepseek_balance_response_is_bounded_before_json_parse(
+        tmp_path, monkeypatch, content_length: int | None) -> None:
+    """DeepSeek余额响应超上限时应停止读取并继续标记账户状态不可用。"""
+    engine = _engine(tmp_path)
+    _seed_models(engine)
+    with Session(engine) as db:
+        row = db.get(ModelConfig, "a_next")
+        assert row is not None
+        row.base_url = "https://api.deepseek.com"
+        db.add(row)
+        db.commit()
+        row = db.get(ModelConfig, "a_next")
+        assert row is not None
+
+        read_chunks: list[int] = []
+        stream_calls: list[dict[str, object]] = []
+
+        class OversizedResponse:
+            """只暴露超限响应元数据，并记录单次有限流块。"""
+
+            status_code = 200
+
+            def __init__(self) -> None:
+                """为合成响应设置可选长度和identity编码头。"""
+                self.headers = {"content-encoding": "identity"}
+                if content_length is not None:
+                    self.headers["content-length"] = str(content_length)
+
+            def iter_raw(self, chunk_size: int):
+                """返回一块超过接受正文上限的合成流并记录最多读取字节。"""
+                read_chunks.append(chunk_size)
+                yield b"x" * chunk_size
+
+        class StreamContext:
+            """模拟httpx流式请求上下文而不建立网络连接。"""
+
+            def __enter__(self) -> OversizedResponse:
+                """返回合成流响应。"""
+                return OversizedResponse()
+
+            def __exit__(self, *_exc_info: object) -> None:
+                """关闭合成请求上下文。"""
+
+        def stream_response(method: str, url: str, *, headers: dict[str, str], timeout: int):
+            """记录不含端点和认证头值的请求边界，再返回合成响应。"""
+            stream_calls.append({
+                "method": method,
+                "balance_path": url.endswith("/user/balance"),
+                "timeout": timeout,
+                "accept_encoding": headers.get("Accept-Encoding"),
+            })
+            return StreamContext()
+
+        monkeypatch.setattr(model_config_api.httpx, "stream", stream_response)
+        monkeypatch.setattr(
+            model_config_api.httpx,
+            "get",
+            lambda *_args, **_kwargs: type(
+                "UnboundedResponse",
+                (),
+                {"status_code": 200, "content": b"{}", "json": lambda _self: {"is_available": True}},
+            )(),
+        )
+
+        checks = []
+        result = model_config_api._deepseek_balance_failure(row, checks)
+
+    assert result is None
+    assert checks[-1].name == "账户状态"
+    assert checks[-1].status == "skipped"
+    assert model_config_api.DEEPSEEK_BALANCE_MAX_RESPONSE_BYTES == 64 * 1024
+    assert stream_calls == [{
+        "method": "GET",
+        "balance_path": True,
+        "timeout": 15,
+        "accept_encoding": "identity",
+    }]
+    assert sum(read_chunks) <= 64 * 1024 + 1
 
 
 def test_dynamic_preflight_accepts_supported_provider_aliases(tmp_path, monkeypatch) -> None:

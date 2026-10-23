@@ -1,5 +1,5 @@
 """
-@Time       : 2026/08/10 19:20
+@Time       : 2026/10/01
 @Author     : zhanglp8181
 @File       : test_dynamic_task_agent.py
 @CallChain  : pytest → DynamicTaskAgent → Execution Store/受控 ToolExecutor
@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime
+import multiprocessing
+from datetime import UTC, datetime
 from contextlib import contextmanager
 from io import BytesIO
 from pathlib import Path
@@ -29,6 +30,7 @@ from app.connectors.runtime import ConnectorRuntimeService
 from app.connectors.slack import SlackCallResult
 from app.connectors.wecom import WeComCallResult
 from app.config import get_settings
+from app.core.time_context import freeze_time_context
 from app.db.models import (
     ActionProposalRecord,
     AgentProfile,
@@ -56,6 +58,8 @@ from app.db.models import (
     MCPServer,
     Message,
     MessageInputResourceLink,
+    MemoryCaptureJob,
+    MemoryRecord,
     ModelConfig,
     ProviderInputDispatchGroup,
     ProviderInputDispatchReceipt,
@@ -118,6 +122,8 @@ from app.dynamic_tasks.capability_catalog import (
     publish_tool_contract,
 )
 from app.dynamic_tasks.execution_context import build_execution_context_projection
+from app.memory.capture import freeze_memory_source_anchor
+from app.memory.service import MemoryService
 from app.dynamic_tasks.result_verifier import (
     DynamicTaskResult,
     GuidanceApplication,
@@ -379,6 +385,22 @@ class _RecordingPlanner(_Planner):
 
         self.resource_batches.append(tuple(input_resources))
         return super().create_plan(input_resources=input_resources, **kwargs)
+
+
+class _MemoryRecordingPlanner(_Planner):
+    """记录动态任务启动和续接实际收到的记忆输入。"""
+
+    def __init__(self) -> None:
+        """初始化逐轮记忆 payload 记录。"""
+
+        super().__init__()
+        self.memory_batches: list[tuple[dict[str, object], ...]] = []
+
+    def create_plan(self, *, memory_context=(), **kwargs):
+        """保存每轮 Planner 的记忆输入，再复用测试计划实现。"""
+
+        self.memory_batches.append(tuple(dict(item) for item in memory_context))
+        return super().create_plan(memory_context=memory_context, **kwargs)
 
 
 class _EmptyStartCatalog(_StartCatalog):
@@ -2390,9 +2412,24 @@ class _ClarificationPlanner:
 class _ClarificationProposer(_RunProposer):
     """为澄清步骤返回结构化问题，其余步骤复用只读完整闭环提案。"""
 
+    def __init__(self) -> None:
+        """记录最终回答实际收到的已完成用户澄清，供恢复合同断言。"""
+        super().__init__()
+        self.completed_clarification_answers: list[list[str]] = []
+
     def propose(self, *, view, step):
         """按 clarification/read/answer 顺序返回当前步骤唯一合法动作。"""
 
+        if step.kind == "answer":
+            completed = view.execution_context.get("completed_steps", [])
+            self.completed_clarification_answers.append([
+                str(item.get("model_output", {}).get("answer"))
+                for item in completed
+                if isinstance(item, dict)
+                and item.get("step_key") == "clarify_partner"
+                and isinstance(item.get("model_output"), dict)
+                and item["model_output"].get("source_kind") == "authenticated_user_clarification"
+            ])
         if step.kind == "clarification":
             self.calls += 1
             return CompletedProviderProposal(
@@ -2408,6 +2445,16 @@ class _ClarificationProposer(_RunProposer):
                 ),
             )
         return super().propose(view=view, step=step)
+
+
+class _TimeContextClarificationPlanner(_ClarificationPlanner):
+    """接受时间侧带并保持跨进程恢复测试所需的固定澄清计划。"""
+
+    def create_plan(self, **kwargs):
+        """忽略仅用于验证持久事实的时间侧带。"""
+
+        kwargs.pop("time_context", None)
+        return super().create_plan(**kwargs)
 
 
 def _snapshot(*, risk_class: str = "read") -> CapabilitySnapshot:
@@ -2428,6 +2475,125 @@ def _snapshot(*, risk_class: str = "read") -> CapabilitySnapshot:
         agent_id="agent_demo",
         checksum=capability_checksum(payload),
     )
+
+
+def _run_dynamic_task_time_recovery_worker(
+    database_path: str,
+    signal_id: str,
+    model_id: str,
+    expected_time_context: dict[str, str],
+) -> None:
+    """在独立进程中消费 DTA signal，验证恢复只读取持久输入锚点。"""
+
+    engine = create_engine(f"sqlite:///{database_path}")
+    with Session(engine, expire_on_commit=False) as db:
+        signal = db.get(ExecutionSignal, signal_id)
+        model = db.get(ModelConfig, model_id)
+        if signal is None or model is None:
+            raise AssertionError("新 worker 未读取到持久 signal/model")
+        recovered_agent = DynamicTaskAgent(
+            db,
+            catalog=_StartCatalog(model, _snapshot()),
+            tool_executor=_Executor(),
+            planner=_TimeContextClarificationPlanner(),
+            action_proposer=_ClarificationProposer(),
+        )
+        outcome = process_dynamic_task_signal(
+            db,
+            signal,
+            agent_factory=lambda _db: recovered_agent,
+        )
+        instance = db.get(SopInstance, signal.execution_id)
+        if outcome is None or outcome.status != "succeeded":
+            raise AssertionError(f"新 worker 未完成恢复：{outcome!r}")
+        if instance is None or instance.context_json.get("time_context") != expected_time_context:
+            raise AssertionError("新 worker 改写或丢失了原输入时间锚点")
+        if signal.status != "consumed":
+            raise AssertionError("新 worker 未消费恢复 signal")
+
+
+def test_runtime_skill_discovery_passes_execution_time_context_to_selector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DTA 运行中指导选择必须接收当前 Execution 的致因时间事实。"""
+
+    engine = create_engine("sqlite://", poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as db:
+        captured: dict[str, object] = {}
+
+        class _Catalog:
+            """返回一个可自动选择但最终不选中的最小目录。"""
+
+            def list_general_skills(self, *args, **kwargs):
+                """确认生产目录调用保留同租户 Agent 和操作者边界。"""
+
+                assert args[:2] == ("tenant_demo", "agent_demo")
+                assert kwargs["actor_user_id"] == "user_demo"
+                return [
+                    SimpleNamespace(
+                        capability_id="guidance_demo",
+                        name="诊断指导",
+                        contract={"invocation_policy": "model_allowed"},
+                    )
+                ]
+
+        class _Planner:
+            """捕获运行中选择请求并返回空选择，避免进入后续 add-skill 写入。"""
+
+            def select_guidance_skills(self, **kwargs):
+                """记录 selector 的完整时间参数。"""
+
+                captured.update(kwargs)
+                return SimpleNamespace(selected_skill_names=())
+
+        monkeypatch.setattr(
+            "app.dynamic_tasks.agent.get_settings",
+            lambda: SimpleNamespace(dynamic_task_skill_loading_enabled=True),
+        )
+        monkeypatch.setattr(
+            DynamicTaskAgent,
+            "_consume_call_budget",
+            lambda *_args, **_kwargs: None,
+        )
+        context = freeze_time_context(
+            source_input_id="scheduled_run_selector",
+            client_timezone="Asia/Shanghai",
+            anchor_at_utc=datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC),
+            timezone_source="scheduled_task",
+        )
+        instance = SimpleNamespace(
+            id="execution_selector_time",
+            tenant_id="tenant_demo",
+            agent_id="agent_demo",
+            current_plan_revision_id="plan_selector_time",
+            revision=1,
+            context_json={"time_context": context},
+        )
+        plan = NormalizedPlan(
+            goal="按时间处理任务",
+            success_criteria=(
+                SuccessCriterion(id="done", type="assertion", spec={"required": True}),
+            ),
+            steps=(PlanStep(step_key="answer", title="回答", kind="answer"),),
+            budget={"model_calls": 3},
+        )
+        runtime = object.__new__(DynamicTaskAgent)
+        runtime.db = db
+        runtime.catalog = _Catalog()
+        runtime.planner = _Planner()
+        runtime.explore_enabled = False
+
+        result = runtime._try_runtime_skill_discovery(
+            instance=instance,
+            plan=plan,
+            model_config=SimpleNamespace(),
+            worker_id="selector-time-worker",
+            actor_user_id="user_demo",
+        )
+
+    assert result is None
+    assert captured["time_context"] == context
 
 
 def _output_snapshot() -> CapabilitySnapshot:
@@ -3626,6 +3792,71 @@ def test_start_task_uses_preflight_catalog_and_reuses_same_active_execution() ->
         assert first.goal_snapshot_json["success_criteria"][0]["id"] == "criterion_01"
 
 
+def test_start_task_persists_time_context_for_planner_and_execution_projection() -> None:
+    """DynamicTaskAgent 启动时把聊天输入锚点同时交给 Planner 与执行账本。"""
+
+    class _TimeAwarePlanner(_Planner):
+        """记录结构化时间后复用固定计划替身。"""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.time_context: dict[str, object] | None = None
+
+        def create_plan(self, **kwargs):
+            """捕获时间事实并避免改变原有测试计划契约。"""
+
+            self.time_context = kwargs.pop("time_context", None)
+            return super().create_plan(**kwargs)
+
+    engine = create_engine("sqlite://", poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as db:
+        _ensure_dynamic_agent(db)
+        capabilities = _model_capabilities()
+        model = ModelConfig(
+            id="model_time_context",
+            tenant_id="tenant_demo",
+            name="动态时间模型",
+            api_key_encrypted="encrypted",
+            model="model-demo",
+            capability_snapshot_json=capabilities,
+            capability_checksum=capability_checksum(capabilities),
+            preflight_status="ready",
+        )
+        db.add(model)
+        db.flush()
+        context = freeze_time_context(
+            source_input_id="message_dynamic_start",
+            client_timezone="Asia/Shanghai",
+            anchor_at_utc=datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC),
+        )
+        planner = _TimeAwarePlanner()
+        agent = DynamicTaskAgent(
+            db,
+            catalog=_StartCatalog(model, _snapshot()),
+            tool_executor=_Executor(),
+            planner=planner,
+        )
+
+        instance, created = agent.start_task(
+            tenant_id="tenant_demo",
+            session_id="session_time_context",
+            agent_id="agent_demo",
+            initiator_user_id="user_demo",
+            goal="生成带日期的风险简报",
+            success_criteria=("覆盖合同证据",),
+            model_config=model,
+            source_ref="message_dynamic_start",
+            conversation_context={"time_context": context},
+        )
+        db.commit()
+        db.refresh(instance)
+
+        assert created is True
+        assert planner.time_context == context
+        assert instance.context_json["time_context"] == context
+
+
 def test_continue_chat_turn_reuses_terminal_lineage_and_is_idempotent() -> None:
     """终态后的追问必须沿同一会话链创建下一轮，并可按消息幂等重放。"""
 
@@ -3733,6 +3964,118 @@ def test_continue_chat_turn_reuses_terminal_lineage_and_is_idempotent() -> None:
         assert replayed_created is False
         assert replayed.id == child.id
         assert planner.calls == 2
+
+
+def test_dynamic_task_start_and_continue_consume_scoped_memory_payload() -> None:
+    """验证 DTA 启动与续接都消费 AgentLoop 生成的有效归属记忆输入。"""
+
+    engine = create_engine("sqlite://", poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as db:
+        _ensure_dynamic_agent(db)
+        db.add(
+            ChatSession(
+                id="session_memory_consumer",
+                tenant_id="tenant_demo",
+                user_id="user_demo",
+                agent_id="agent_demo",
+            )
+        )
+        db.add(
+            MemoryRecord(
+                id="memory_dta_consumer",
+                tenant_id="tenant_demo",
+                agent_id="agent_demo",
+                user_id="user_demo",
+                kind="preference",
+                content="DTA 应使用的当前员工记忆",
+                metadata_json={"key": "communication_style"},
+                updated_at=datetime(2026, 8, 1, 10, 0),
+            )
+        )
+        db.add(
+            MemoryRecord(
+                id="memory_dta_legacy_consumer",
+                tenant_id="tenant_demo",
+                user_id="user_demo",
+                session_id="session_memory_consumer",
+                kind="fact",
+                content="DTA 应使用的历史会话记忆",
+                metadata_json={"key": "legacy_consumer"},
+                updated_at=datetime(2026, 8, 1, 9, 0),
+            )
+        )
+        capabilities = _model_capabilities()
+        model = ModelConfig(
+            id="model_memory_consumer",
+            tenant_id="tenant_demo",
+            name="动态记忆模型",
+            api_key_encrypted="encrypted",
+            model="model-demo",
+            capability_snapshot_json=capabilities,
+            capability_checksum=capability_checksum(capabilities),
+            preflight_status="ready",
+        )
+        db.add(model)
+        db.flush()
+        memory_context = MemoryService(db).context_memory_payloads(
+            "tenant_demo",
+            "user_demo",
+            agent_id="agent_demo",
+        )
+        planner = _MemoryRecordingPlanner()
+        agent = DynamicTaskAgent(
+            db,
+            catalog=_StartCatalog(model, _snapshot()),
+            tool_executor=_Executor(),
+            planner=planner,
+        )
+
+        parent, created = agent.start_task(
+            tenant_id="tenant_demo",
+            session_id="session_memory_consumer",
+            agent_id="agent_demo",
+            initiator_user_id="user_demo",
+            goal="读取当前员工记忆并形成简报",
+            success_criteria=("使用当前员工偏好",),
+            model_config=model,
+            source_ref="memory_message_1",
+            memory_context=memory_context,
+        )
+        assert created is True
+        with agent.store.owned(parent, worker_id="memory-parent"):
+            agent.store.fail_instance(parent, context_patch={"failure_code": "TEST_FAILED"})
+        db.commit()
+
+        child, child_created = agent.continue_chat_turn(
+            tenant_id="tenant_demo",
+            session_id="session_memory_consumer",
+            agent_id="agent_demo",
+            initiator_user_id="user_demo",
+            user_message_id="memory_message_2",
+            message="继续用这个偏好核对结果",
+            success_criteria=("沿用当前员工偏好",),
+            model_config=model,
+            source_ref="memory_message_2",
+            memory_context=memory_context,
+        )
+
+        assert child_created is True
+        expected_memory = [
+            {
+                "kind": "preference",
+                "content": "DTA 应使用的当前员工记忆",
+                "metadata": {"key": "communication_style"},
+            },
+            {
+                "kind": "fact",
+                "content": "DTA 应使用的历史会话记忆",
+                "metadata": {"key": "legacy_consumer"},
+            },
+        ]
+        assert planner.memory_batches == [tuple(expected_memory), tuple(expected_memory)]
+        assert parent.context_json["memory_context"] == expected_memory
+        assert child.context_json["memory_context"] == expected_memory
 
 
 def test_continue_chat_turn_inherits_parent_input_resource_snapshot(tmp_path) -> None:
@@ -3976,6 +4319,41 @@ def test_read_action_shape_repair_ends_with_stable_error_after_one_retry() -> No
     assert len(repair_feedback) == 2
     assert repair_feedback[0] is None
     assert repair_feedback[1]["code"] == "DYNAMIC_ACTION_PROPOSAL_INVALID"
+
+
+def test_write_action_shape_repair_uses_one_strict_retry() -> None:
+    """外部写动作结构错误只重问一次，第二个回执仍须匹配冻结能力。"""
+    agent = DynamicTaskAgent.__new__(DynamicTaskAgent)
+    calls: list[object] = []
+    capability_ref = "f3_async_order"
+
+    def proposer(**kwargs):
+        """首轮产生形状错误，修复轮返回当前唯一冻结能力的规范动作。"""
+        calls.append(kwargs.get("repair_feedback"))
+        if len(calls) == 1:
+            raise ValueError("动作包含未知顶层字段")
+        return CompletedProviderProposal(
+            response_id="provider_write_repaired", finish_reason="stop",
+            proposal=RuntimeActionProposal(
+                action_kind=ActionKind.CALL_TOOL, capability_ref=capability_ref,
+                arguments={"quantity": 3}, rationale="提交当前订单步骤",
+            ),
+        )
+
+    agent._propose_action = proposer
+    step = PlanStep(step_key="submit_order", title="提交订单", kind="tool.write",
+                    capability_refs=(capability_ref,))
+
+    completed = agent._propose_write_action(
+        instance=None, step=step, model_config=ModelConfig(id="model_write_repair", tenant_id="tenant_demo"),
+        worker_id="worker_write_repair",
+    )
+
+    assert len(calls) == 2
+    assert calls[0] is None
+    assert calls[1]["code"] == "DYNAMIC_ACTION_PROPOSAL_INVALID"
+    assert "tool.write" in calls[1]["instruction"]
+    assert completed.proposal.capability_ref == capability_ref
 
 
 def test_completed_read_result_is_schema_projected_into_answer_context() -> None:
@@ -4444,12 +4822,33 @@ def test_artifact_integrity_failure_rolls_back_result_message_and_terminal_state
 
 
 def test_run_loop_serially_reaches_verified_terminal_result() -> None:
-    """验证真实多步循环按 read→answer 串行推进，不需要 Agent Loop 复制 Runtime 状态。"""
+    """原输入固定所选模型后 read→answer 串行完成，回复与同轮记忆任务一并提交。"""
 
     engine = create_engine("sqlite://", poolclass=StaticPool)
     SQLModel.metadata.create_all(engine)
     with Session(engine, expire_on_commit=False) as db:
         _ensure_dynamic_agent(db)
+        source_user = User(
+            id="user_demo",
+            tenant_id="tenant_demo",
+            username="dynamic-user",
+            password_hash="x",
+        )
+        source_session = ChatSession(
+            id="session_loop",
+            tenant_id="tenant_demo",
+            user_id=source_user.id,
+            agent_id="agent_demo",
+        )
+        source_message = Message(
+            id="user_message_loop",
+            tenant_id="tenant_demo",
+            session_id=source_session.id,
+            role="user",
+            content="请生成续约风险简报。",
+        )
+        db.add_all([source_user, source_session, source_message])
+        db.flush()
         capabilities = _model_capabilities()
         model = ModelConfig(
             id="model_loop",
@@ -4463,6 +4862,15 @@ def test_run_loop_serially_reaches_verified_terminal_result() -> None:
         )
         db.add(model)
         db.flush()
+        freeze_memory_source_anchor(
+            db,
+            tenant_id="tenant_demo",
+            user_id=source_user.id,
+            agent_id="agent_demo",
+            message=source_message,
+            model_config=model,
+        )
+        assert source_message.metadata_json["memory_capture_source"]["model_config_id"] == model.id
         snapshot = _snapshot()
         executor = _Executor()
         proposer = _RunProposer()
@@ -4505,6 +4913,9 @@ def test_run_loop_serially_reaches_verified_terminal_result() -> None:
         ).one()
         assert assistant_event.payload_json["user_message_id"] == "user_message_loop"
         assert assistant_event.payload_json["turn_id"] == "user_message_loop"
+        capture_job = db.exec(select(MemoryCaptureJob)).one()
+        assert capture_job.source_message_id == source_message.id
+        assert capture_job.source_assistant_message_id == outcome.message.id
 
 
 def test_run_loop_repairs_invalid_result_once_and_settles_skill_use() -> None:
@@ -4702,8 +5113,8 @@ def test_run_loop_repairs_invalid_answer_shape_before_result_verification(tmp_pa
         assert receipts and all(receipt.status == "settled" for receipt in receipts)
 
 
-def test_fail_execution_settles_active_skill_use_with_stable_reason() -> None:
-    """动态执行确定性失败时 Skill Use 同步失败，且保留稳定错误码。"""
+def test_fail_execution_settles_active_skill_use_and_running_node() -> None:
+    """动态执行失败须同步结束活动 Skill Use 与运行步骤，并保留稳定错误码。"""
 
     engine = create_engine("sqlite://", poolclass=StaticPool)
     SQLModel.metadata.create_all(engine)
@@ -4736,6 +5147,13 @@ def test_fail_execution_settles_active_skill_use_with_stable_reason() -> None:
             success_criteria=("覆盖合同证据",),
             model_config=model,
         )
+        first_step = agent._current_plan(instance).steps[0]
+        with agent.store.owned(instance, worker_id="seed_active_node"):
+            running_node = agent.store.enter_node(
+                instance, first_step.step_key, step_key=first_step.step_key,
+                plan_revision_id=instance.current_plan_revision_id, step_kind=first_step.kind,
+            )
+            db.commit()
         use = GeneralSkillUse(
             tenant_id="tenant_demo",
             session_id="session_failure_settlement",
@@ -4761,8 +5179,11 @@ def test_fail_execution_settles_active_skill_use_with_stable_reason() -> None:
 
         db.refresh(instance)
         db.refresh(use)
+        db.refresh(running_node)
         assert instance.status == "failed"
         assert instance.terminal_reason_json["code"] == "DYNAMIC_RESULT_VERIFICATION_FAILED"
+        assert running_node.status == "failed"
+        assert running_node.error_json == {"code": "DYNAMIC_RESULT_VERIFICATION_FAILED"}
         assert use.status == "failed"
         assert use.invalidation_reason == "DYNAMIC_RESULT_VERIFICATION_FAILED"
 
@@ -6362,7 +6783,9 @@ def test_knowledge_revocation_is_rejected_before_search_dispatch() -> None:
         assert service.calls == 0
 
 
-def test_clarification_attention_resumes_same_execution_after_restart_style_signal() -> None:
+def test_clarification_attention_resumes_same_execution_after_restart_style_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """验证澄清进入统一待处理中心，决定后由持久 signal 恢复同一 Execution。"""
 
     engine = create_engine("sqlite://", poolclass=StaticPool)
@@ -6442,6 +6865,29 @@ def test_clarification_attention_resumes_same_execution_after_restart_style_sign
             )
         db.commit()
         signal = db.exec(select(ExecutionSignal)).one()
+        monkeypatch.setattr("app.dynamic_tasks.agent._signal_lease_ttl_seconds", lambda: 3)
+        claimed_ttls: list[int] = []
+        original_claim_signal = ExecutionControlService.claim_signal
+
+        def capture_resume_signal_claim(
+            control_service: ExecutionControlService,
+            signal_row: ExecutionSignal,
+            *,
+            worker_id: str,
+            ttl_seconds: int = 30,
+        ) -> ExecutionSignal:
+            """记录澄清恢复首次领取的TTL，确保崩溃恢复窗口使用统一短租约。"""
+
+            if signal_row.id == signal.id and worker_id == "worker_after_restart":
+                claimed_ttls.append(ttl_seconds)
+            return original_claim_signal(
+                control_service,
+                signal_row,
+                worker_id=worker_id,
+                ttl_seconds=ttl_seconds,
+            )
+
+        monkeypatch.setattr(ExecutionControlService, "claim_signal", capture_resume_signal_claim)
 
         restarted_agent = DynamicTaskAgent(
             db,
@@ -6450,6 +6896,20 @@ def test_clarification_attention_resumes_same_execution_after_restart_style_sign
             planner=_ClarificationPlanner(),
             action_proposer=proposer,
         )
+        heartbeat_events: list[str] = []
+
+        @contextmanager
+        def signal_heartbeat(_signal_id: str, *, worker_id: str):
+            """记录澄清恢复期间必须持有的 signal 续租边界。"""
+
+            heartbeat_events.append(f"enter:{worker_id}")
+            try:
+                yield
+            finally:
+                heartbeat_events.append(f"exit:{worker_id}")
+
+        restarted_agent._signal_lease_heartbeat = signal_heartbeat
+
         def crash_after_resume_commit(**kwargs):
             """模拟 clarification 已恢复提交、但后续计划尚未推进时进程退出。"""
 
@@ -6497,6 +6957,217 @@ def test_clarification_attention_resumes_same_execution_after_restart_style_sign
         assert signal.status == "consumed"
         assert executor.calls == 1
         assert proposer.calls == 3
+        assert proposer.completed_clarification_answers == [["星海科技"]]
+        assert claimed_ttls == [3]
+        assert heartbeat_events == [
+            "enter:worker_after_restart",
+            "exit:worker_after_restart",
+        ]
+
+
+def test_dynamic_task_time_context_recovers_after_fresh_worker_process(tmp_path: Path) -> None:
+    """验证独立 worker 进程沿用持久锚点恢复同一动态任务，而不是重解释日期。"""
+
+    database_path = tmp_path / "dynamic-task-time-recovery.sqlite"
+    engine = create_engine(f"sqlite:///{database_path}")
+    SQLModel.metadata.create_all(engine)
+    first_context = freeze_time_context(
+        source_input_id="message_dta_recovery_first",
+        client_timezone="Pacific/Honolulu",
+        anchor_at_utc=datetime(2026, 9, 28, 9, 59, tzinfo=UTC),
+    )
+
+    with Session(engine, expire_on_commit=False) as db:
+        capabilities = _model_capabilities()
+        user = User(
+            id="user_dta_time_recovery",
+            tenant_id="tenant_demo",
+            username="dta_time_recovery",
+            password_hash="x",
+        )
+        profile = AgentProfile(
+            id="agent_demo",
+            tenant_id="tenant_demo",
+            name="时间恢复数字员工",
+            owner_user_id=user.id,
+        )
+        model = ModelConfig(
+            id="model_dta_time_recovery",
+            tenant_id="tenant_demo",
+            name="动态时间恢复模型",
+            api_key_encrypted="encrypted",
+            model="model-demo",
+            capability_snapshot_json=capabilities,
+            capability_checksum=capability_checksum(capabilities),
+            preflight_status="ready",
+        )
+        db.add_all([user, profile, model])
+        db.flush()
+        agent = DynamicTaskAgent(
+            db,
+            catalog=_StartCatalog(model, _snapshot()),
+            tool_executor=_Executor(),
+            planner=_TimeContextClarificationPlanner(),
+            action_proposer=_ClarificationProposer(),
+        )
+        instance, _ = agent.start_task(
+            tenant_id="tenant_demo",
+            session_id="session_dta_time_recovery",
+            agent_id=profile.id,
+            initiator_user_id=user.id,
+            goal="生成带日期的合作方风险简报",
+            success_criteria=("覆盖合同证据",),
+            model_config=model,
+            source_kind="manual",
+            source_ref="dta-time-recovery-test",
+            conversation_context={"time_context": first_context},
+        )
+        waiting = agent.run_until_blocked_or_complete(
+            execution_id=instance.id,
+            model_config=model,
+            worker_id="worker_time_before_process_restart",
+            actor_user_id=user.id,
+        )
+        attention = db.exec(select(SopWorkItem)).one()
+        assert waiting.status == "waiting"
+        assert attention.attention_kind == "clarification"
+        assert instance.context_json["time_context"] == first_context
+
+        control = ExecutionControlService(db)
+        with control.store.owned(instance, worker_id="attention_time_recovery"):
+            control.resolve_attention(
+                instance,
+                attention,
+                actor_user_id=user.id,
+                command_id="dta-time-recovery-answer",
+                command="answer",
+                expected_revision=attention.revision,
+                comment="星海科技",
+            )
+        db.commit()
+        signal = db.exec(select(ExecutionSignal)).one()
+        execution_id = instance.id
+        signal_id = signal.id
+        model_id = model.id
+
+    worker_context = multiprocessing.get_context("spawn")
+    worker = worker_context.Process(
+        target=_run_dynamic_task_time_recovery_worker,
+        args=(str(database_path), signal_id, model_id, first_context),
+    )
+    worker.start()
+    worker.join(timeout=120)
+    assert not worker.is_alive()
+    assert worker.exitcode == 0
+
+    # 新进程退出后重新读取，验证恢复结果和输入锚点均已持久提交。
+    with Session(engine, expire_on_commit=False) as db:
+        signal = db.get(ExecutionSignal, signal_id)
+        instance = db.get(SopInstance, execution_id)
+        assert signal is not None
+        assert instance is not None
+        assert instance.context_json["time_context"] == first_context
+        assert signal.status == "consumed"
+
+
+def test_chat_clarification_refreshes_time_context_for_new_input() -> None:
+    """验证澄清新消息建立新锚点，后续自动 signal 恢复沿用该锚点。"""
+
+    class _TimeClarificationPlanner(_ClarificationPlanner):
+        """接受时间侧带后复用澄清计划替身。"""
+
+        def create_plan(self, **kwargs):
+            """丢弃仅供本测试验证持久事实的时间侧带。"""
+
+            kwargs.pop("time_context", None)
+            return super().create_plan(**kwargs)
+
+    engine = create_engine("sqlite://", poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as db:
+        capabilities = _model_capabilities()
+        user = User(
+            id="user_time_clarification",
+            tenant_id="tenant_demo",
+            username="time_clarification",
+            password_hash="x",
+        )
+        profile = AgentProfile(
+            id="agent_time_clarification",
+            tenant_id="tenant_demo",
+            name="时间澄清数字员工",
+            owner_user_id=user.id,
+        )
+        model = ModelConfig(
+            id="model_time_clarification",
+            tenant_id="tenant_demo",
+            name="动态时间模型",
+            api_key_encrypted="encrypted",
+            model="model-demo",
+            capability_snapshot_json=capabilities,
+            capability_checksum=capability_checksum(capabilities),
+            preflight_status="ready",
+        )
+        db.add_all([user, profile, model])
+        db.flush()
+        agent = DynamicTaskAgent(
+            db,
+            catalog=_StartCatalog(model, _snapshot()),
+            tool_executor=_Executor(),
+            planner=_TimeClarificationPlanner(),
+            action_proposer=_ClarificationProposer(),
+        )
+        first_context = freeze_time_context(
+            source_input_id="message_dta_first",
+            client_timezone="America/Los_Angeles",
+            anchor_at_utc=datetime(2026, 3, 8, 9, 30, tzinfo=UTC),
+        )
+        second_context = freeze_time_context(
+            source_input_id="message_dta_second",
+            client_timezone="America/Los_Angeles",
+            anchor_at_utc=datetime(2026, 3, 9, 9, 30, tzinfo=UTC),
+        )
+        instance, _ = agent.start_task(
+            tenant_id="tenant_demo",
+            session_id="session_time_clarification",
+            agent_id=profile.id,
+            initiator_user_id=user.id,
+            goal="生成带日期的合作方风险简报",
+            success_criteria=("覆盖合同证据",),
+            model_config=model,
+            source_ref="message_dta_first",
+            conversation_context={"time_context": first_context},
+        )
+        waiting = agent.run_until_blocked_or_complete(
+            execution_id=instance.id,
+            model_config=model,
+            worker_id="worker_time_before_resume",
+            actor_user_id=user.id,
+        )
+        assert waiting.status == "waiting"
+
+        def fake_resume_clarification_signal(**kwargs):
+            """只验证恢复入口收到持久锚点后的 signal 接续。"""
+
+            assert kwargs["user_message_id"] == "message_dta_second"
+            return DynamicRunOutcome("waiting", instance.id)
+
+        agent.resume_clarification_signal = fake_resume_clarification_signal
+        outcome = agent.resume_chat_clarification(
+            tenant_id="tenant_demo",
+            session_id="session_time_clarification",
+            agent_id=profile.id,
+            initiator_user_id=user.id,
+            user_message_id="message_dta_second",
+            message="改成明天处理",
+            model_config=model,
+            conversation_context={"time_context": second_context},
+            worker_id="worker_time_after_resume",
+        )
+        db.refresh(instance)
+
+    assert outcome is not None and outcome.status == "waiting"
+    assert instance.context_json["time_context"] == second_context
 
 
 def _steering_execution(db: Session):

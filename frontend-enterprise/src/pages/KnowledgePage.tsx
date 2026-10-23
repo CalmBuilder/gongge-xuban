@@ -85,7 +85,9 @@ import type {
   KnowledgeConceptRead,
   KnowledgeDiscoveryRead,
   KnowledgeDocumentRead,
+  KnowledgeDocumentContentRead,
   KnowledgeIngestJobRead,
+  KnowledgeRevisionAccepted,
   KnowledgeSearchResponse,
   AgentProfileRead,
   ModelConfigRead,
@@ -94,7 +96,7 @@ import type { OrganizationUnit } from '../types/organization';
 
 const KNOWLEDGE_PAGE_SIZE = 10;
 const KNOWLEDGE_SEARCH_MODEL_STORAGE_KEY = 'knowledge-search-model';
-const TERMINAL_KNOWLEDGE_JOB_STATUSES = new Set(['succeeded', 'failed', 'cancelled']);
+const TERMINAL_KNOWLEDGE_JOB_STATUSES = new Set(['succeeded', 'completed', 'failed', 'conflict', 'cancelled']);
 
 type KnowledgeBaseVersionRead = {
   id: string;
@@ -123,6 +125,36 @@ type OkfLintIssue = {
   concept_type?: string;
   document_id?: string;
 };
+
+type KnowledgeRevisionIdentity = {
+  tenant_id: string;
+  knowledge_base_id: string;
+  document_id: string;
+  job_kind: 'revision';
+  scope: string;
+  source_version_id: string;
+  expected_revision: number;
+  client_request_id: string;
+};
+
+type KnowledgeRevisionSource = Omit<KnowledgeRevisionIdentity, 'job_kind' | 'client_request_id' | 'expected_revision'> & {
+  expected_revision?: number;
+};
+
+/** 仅当任务的全部冻结来源字段一致时，才允许把响应绑定到正文修订身份。 */
+function knowledgeRevisionJobMatchesIdentity(
+  job: KnowledgeIngestJobRead,
+  identity: KnowledgeRevisionIdentity,
+): boolean {
+  return job.id.length > 0
+    && job.tenant_id === identity.tenant_id
+    && job.knowledge_base_id === identity.knowledge_base_id
+    && job.document_id === identity.document_id
+    && job.job_kind === identity.job_kind
+    && job.scope === identity.scope
+    && job.source_version_id === identity.source_version_id
+    && job.expected_revision === identity.expected_revision;
+}
 
 const DEFAULT_INGEST_STEPS: IngestStepView[] = [
   { key: 'queued', label: '排队中', progress: 0, status: 'pending' },
@@ -173,6 +205,15 @@ function effectiveKnowledgeAgentId(rows: AgentProfileRead[], agentId: string): s
   return agent && !agent.is_overall ? agent.id : '';
 }
 
+/** 将已冻结的知识范围还原为请求参数；拒绝未知或格式错误的范围。 */
+function knowledgeAgentIdForScope(scope: string | undefined): string | null {
+  if (scope === undefined) return null;
+  if (scope === 'overall') return '';
+  if (!scope.startsWith('agent:')) return null;
+  const agentId = scope.slice('agent:'.length);
+  return agentId && !/\s/u.test(agentId) ? agentId : null;
+}
+
 export default function KnowledgeManagePage({ currentUser, onLogout }: KnowledgePageProps = {}) {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -207,6 +248,23 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
   const [knowledgeBaseVersions, setKnowledgeBaseVersions] = useState<KnowledgeBaseVersionRead[]>([]);
   const [editingDocument, setEditingDocument] = useState<KnowledgeDocumentRead | null>(null);
   const [documentDraft, setDocumentDraft] = useState({ title: '', status: 'ready' });
+  const [documentContent, setDocumentContent] = useState<KnowledgeDocumentContentRead | null>(null);
+  const [documentContentDraft, setDocumentContentDraft] = useState('');
+  const [documentContentUnavailable, setDocumentContentUnavailable] = useState(false);
+  const [documentContentLoading, setDocumentContentLoading] = useState(false);
+  const [documentRevisionJobId, setDocumentRevisionJobId] = useState('');
+  const [documentRevisionJob, setDocumentRevisionJob] = useState<KnowledgeIngestJobRead | null>(null);
+  const [documentRevisionIdentity, setDocumentRevisionIdentity] = useState<KnowledgeRevisionIdentity | null>(null);
+  const [documentRevisionRecoveryUnknown, setDocumentRevisionRecoveryUnknown] = useState(false);
+  const [documentRevisionRecoveryChecking, setDocumentRevisionRecoveryChecking] = useState(false);
+  const documentRevisionClientRequestIdRef = useRef<string | null>(null);
+  const documentEditorScopeRef = useRef('overall');
+  const documentEditorSourceRef = useRef<KnowledgeRevisionSource | null>(null);
+  const documentRevisionIdentityRef = useRef<KnowledgeRevisionIdentity | null>(null);
+  const documentContentRequestIdRef = useRef(0);
+  const knowledgeRefreshRequestIdRef = useRef(0);
+  const agentScopeRequestIdRef = useRef(0);
+  const agentScopeMutationIdRef = useRef(0);
   const [editingBucket, setEditingBucket] = useState<KnowledgeBucketRead | null>(null);
   const [bucketDraft, setBucketDraft] = useState({ title: '', summary: '' });
   const [bucketChunks, setBucketChunks] = useState<KnowledgeChunkRead[]>([]);
@@ -360,14 +418,117 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
 
   useEffect(() => {
     const onScopeChange = (event: Event) => {
+      agentScopeMutationIdRef.current += 1;
       setAgentId((event as CustomEvent<{ agentId?: string }>).detail?.agentId || window.localStorage.getItem(ENTERPRISE_AGENT_STORAGE_KEY) || '');
     };
     window.addEventListener('gongge-enterprise-agent-scope-change', onScopeChange);
     return () => window.removeEventListener('gongge-enterprise-agent-scope-change', onScopeChange);
   }, []);
 
+  useEffect(() => {
+    if (!documentRevisionJobId) return undefined;
+    let active = true;
+    let polling = false;
+    const pollingJobId = documentRevisionJobId;
+    const identity = documentRevisionIdentity;
+    const pinnedJobAgentId = identity ? knowledgeAgentIdForScope(identity.scope) : null;
+    if (!identity || pinnedJobAgentId === null) {
+      clearDocumentEditorAfterAccessLoss();
+      notify.error('正文修订任务缺少有效的冻结身份，已停止轮询');
+      return undefined;
+    }
+    const pollingAgentId = pinnedJobAgentId;
+    const editingDocumentId = identity.document_id;
+
+    const retireRevisionIdentity = () => {
+      window.sessionStorage.removeItem(documentRevisionRequestStorageKey(editingDocumentId, pollingAgentId));
+      window.sessionStorage.removeItem(documentRevisionJobStorageKey(editingDocumentId, pollingAgentId));
+      window.sessionStorage.removeItem(documentRevisionIdentityStorageKey(editingDocumentId, pollingAgentId));
+      documentRevisionClientRequestIdRef.current = null;
+      documentRevisionIdentityRef.current = null;
+      setDocumentRevisionIdentity(null);
+      setDocumentRevisionRecoveryUnknown(false);
+      setDocumentRevisionRecoveryChecking(false);
+    };
+
+    const poll = async () => {
+      if (!active || polling) return;
+      polling = true;
+      try {
+        const next = await api.get<KnowledgeIngestJobRead>(
+          `/api/enterprise/knowledge/jobs/${pollingJobId}?tenant_id=${identity.tenant_id}${pollingAgentId ? `&agent_id=${encodeURIComponent(pollingAgentId)}` : ''}`,
+        );
+        if (!active) return;
+        if (next.id !== pollingJobId || !knowledgeRevisionJobMatchesIdentity(next, identity)) {
+          active = false;
+          clearDocumentEditorAfterAccessLoss();
+          notify.error('正文修订任务身份与已受理来源不一致，已清除私密内容并停止轮询');
+          return;
+        }
+        setDocumentRevisionJob(next);
+        if (!TERMINAL_KNOWLEDGE_JOB_STATUSES.has(next.status)) return;
+        if (next.status === 'completed') {
+          if (!next.published_document_id) {
+            retireRevisionIdentity();
+            setDocumentRevisionJobId('');
+            notify.error('正文修订已完成，但服务端没有返回发布文档');
+            return;
+          }
+          const stillShowingPinnedScope = effectiveAgentId === pollingAgentId;
+          if (stillShowingPinnedScope) {
+            await refresh(pollingAgentId);
+            if (!active) return;
+          }
+          const freshDocument = await api.get<KnowledgeDocumentRead>(
+            `/api/enterprise/knowledge/documents/${next.published_document_id}?tenant_id=${identity.tenant_id}${pollingAgentId ? `&agent_id=${encodeURIComponent(pollingAgentId)}` : ''}`,
+          );
+          if (!active) return;
+          if (stillShowingPinnedScope) {
+            setDocuments((current) => [
+              freshDocument,
+              ...current.filter((item) => item.id !== freshDocument.id && item.id !== editingDocumentId),
+            ]);
+            setSelectedDocument(freshDocument);
+          }
+          setDocumentContent(null);
+          if (active && stillShowingPinnedScope) await loadBuckets(freshDocument, false, pollingAgentId);
+          if (!active) return;
+          retireRevisionIdentity();
+          setEditingDocument(null);
+          setDocumentRevisionJobId('');
+          notify.success(stillShowingPinnedScope
+            ? '正文重建并发布完成'
+            : '正文已在原知识范围发布；当前范围已切换，未显示原范围内容');
+        } else if (next.status === 'conflict') {
+          retireRevisionIdentity();
+          setDocumentRevisionJobId('');
+          notify.warning('正文修订依据已变化，请重新读取当前正文后合并保存');
+        } else {
+          retireRevisionIdentity();
+          setDocumentRevisionJobId('');
+          notify.error(next.error || '正文重建失败，当前已发布版本未改变');
+        }
+      } catch (error) {
+        if (active && error instanceof ApiError && (error.status === 403 || error.status === 404)) {
+          active = false;
+          clearDocumentEditorAfterAccessLoss();
+          notify.warning('当前知识范围权限已变化，已清除编辑内容并停止显示');
+        }
+      } finally {
+        polling = false;
+      }
+    };
+    void poll();
+    const timer = window.setInterval(() => void poll(), 1400);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [documentRevisionJobId, documentRevisionIdentity, effectiveAgentId]);
+
   function applyResolvedAgentScope(nextAgentId: string) {
     if (nextAgentId === agentId) return;
+    agentScopeMutationIdRef.current += 1;
     if (nextAgentId) {
       persistSharedAgentScope(nextAgentId, currentUser?.id);
     } else {
@@ -377,7 +538,10 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
     emitAgentScopeChange(nextAgentId);
   }
 
+  /** 切换或失效时清空当前知识页的读取结果和临时编辑状态。 */
   function clearKnowledgeViewState() {
+    knowledgeRefreshRequestIdRef.current += 1;
+    documentContentRequestIdRef.current += 1;
     setDocuments([]);
     setKnowledgeBases([]);
     setSelectedDocument(null);
@@ -385,26 +549,74 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
     setOkfConcepts([]);
     setOkfLintIssues([]);
     setSearchResult(null);
+    setEditingDocument(null);
+    setDocumentContent(null);
+    setDocumentContentDraft('');
+    setDocumentContentUnavailable(false);
+    setDocumentContentLoading(false);
+    setDocumentRevisionJobId('');
+    setDocumentRevisionJob(null);
+    setDocumentRevisionIdentity(null);
+    setDocumentRevisionRecoveryUnknown(false);
+    setDocumentRevisionRecoveryChecking(false);
+    documentRevisionClientRequestIdRef.current = null;
+    documentRevisionIdentityRef.current = null;
+    documentEditorSourceRef.current = null;
+  }
+
+  /** 撤权或资源失效时清除编辑器私有内容，并停止展示任务但保留恢复指针。 */
+  function clearDocumentEditorAfterAccessLoss() {
+    documentContentRequestIdRef.current += 1;
+    setEditingDocument(null);
+    setDocumentDraft({ title: '', status: 'ready' });
+    setDocumentContent(null);
+    setDocumentContentDraft('');
+    setDocumentContentUnavailable(false);
+    setDocumentContentLoading(false);
+    setDocumentRevisionJobId('');
+    setDocumentRevisionJob(null);
+    setDocumentRevisionIdentity(null);
+    setDocumentRevisionRecoveryUnknown(false);
+    setDocumentRevisionRecoveryChecking(false);
+    documentRevisionClientRequestIdRef.current = null;
+    documentRevisionIdentityRef.current = null;
+    documentEditorSourceRef.current = null;
   }
 
   async function loadAgentScope() {
+    const requestId = agentScopeRequestIdRef.current + 1;
+    agentScopeRequestIdRef.current = requestId;
+    const requestedUserId = currentUser?.id || '';
+    const requestedMutationId = agentScopeMutationIdRef.current;
     setAgentScopeLoaded(false);
     try {
       const agentRows = await api.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${getRequestTenantId()}`);
+      // 登录身份或人工范围已变化时，旧的员工列表不能重新选择并写回上一范围。
+      if (requestId !== agentScopeRequestIdRef.current
+        || requestedUserId !== (currentUser?.id || '')) return;
       setAgents(agentRows);
-      const resolvedAgentId = resolveKnowledgeAgentScope(agentRows, currentUser, agentId);
-      if (resolvedAgentId !== agentId) {
-        clearKnowledgeViewState();
-        applyResolvedAgentScope(resolvedAgentId);
+      if (requestedMutationId === agentScopeMutationIdRef.current) {
+        const resolvedAgentId = resolveKnowledgeAgentScope(agentRows, currentUser, agentId);
+        if (resolvedAgentId !== agentId) {
+          clearKnowledgeViewState();
+          applyResolvedAgentScope(resolvedAgentId);
+        }
       }
+      if (requestId !== agentScopeRequestIdRef.current
+        || requestedUserId !== (currentUser?.id || '')) return;
       setAgentScopeLoaded(true);
     } catch (error) {
+      if (requestId !== agentScopeRequestIdRef.current
+        || requestedUserId !== (currentUser?.id || '')) return;
       clearKnowledgeViewState();
       notify.error(error instanceof Error ? error.message : '加载员工失败');
     }
   }
 
+  /** 按显式知识范围刷新列表，并让随后发起的索引读取沿用同一范围。 */
   async function refresh(scopedAgentId = effectiveAgentId) {
+    const requestId = knowledgeRefreshRequestIdRef.current + 1;
+    knowledgeRefreshRequestIdRef.current = requestId;
     if (!agentScopeLoaded) return;
     const canViewOverall = isEnterpriseAdmin(currentUser)
       || hasGovernancePermission(currentUser, 'knowledge.read')
@@ -424,6 +636,8 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
         api.get<KnowledgeDocumentRead[]>(`/api/enterprise/knowledge/documents?tenant_id=${getRequestTenantId()}${suffix}`),
         api.get<KnowledgeBaseRead[]>(`/api/enterprise/knowledge-bases?tenant_id=${getRequestTenantId()}${suffix}`),
       ]);
+      // MySQL 慢请求可能晚于后续刷新返回；旧代次不能覆盖当前范围的事实。
+      if (requestId !== knowledgeRefreshRequestIdRef.current) return;
       const failures: string[] = [];
       const docRows = documentsResult.status === 'fulfilled' ? documentsResult.value : documents;
       const kbRows = knowledgeBasesResult.status === 'fulfilled' ? knowledgeBasesResult.value : knowledgeBases;
@@ -444,31 +658,36 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
         : scopedDocRows[0] || null;
       setSelectedDocument(current);
       if (current) {
-        await loadBuckets(current, false);
+        await loadBuckets(current, false, scopedAgentId);
       } else {
         setBuckets([]);
         const visibleKbRows = kbRows.filter((item) => !isEmptyDefaultKnowledgeBase(item));
         const fallbackKnowledgeBaseId =
           knowledgeBaseFilter !== '__all__' ? knowledgeBaseFilter : visibleKbRows[0]?.id || '';
-        await loadOkfConcepts(fallbackKnowledgeBaseId, false);
+        await loadOkfConcepts(fallbackKnowledgeBaseId, false, scopedAgentId);
       }
+      if (requestId !== knowledgeRefreshRequestIdRef.current) return;
     } catch (error) {
       notify.error(error instanceof Error ? error.message : '刷新知识库失败');
     } finally {
-      setLoading(false);
+      if (requestId === knowledgeRefreshRequestIdRef.current) setLoading(false);
     }
   }
 
-  async function loadBuckets(document: KnowledgeDocumentRead, select = true) {
+  async function loadBuckets(
+    document: KnowledgeDocumentRead,
+    select = true,
+    scopedAgentId = effectiveAgentId,
+  ) {
     if (select) setSelectedDocument(document);
     setBuckets([]);
     setSearchResult(null);
     try {
       const [rows] = await Promise.all([
         api.get<KnowledgeBucketRead[]>(
-          `/api/enterprise/knowledge/documents/${document.id}/buckets?tenant_id=${getRequestTenantId()}${effectiveAgentId ? `&agent_id=${encodeURIComponent(effectiveAgentId)}` : ''}`,
+          `/api/enterprise/knowledge/documents/${document.id}/buckets?tenant_id=${getRequestTenantId()}${scopedAgentId ? `&agent_id=${encodeURIComponent(scopedAgentId)}` : ''}`,
         ),
-        loadOkfConcepts(document.knowledge_base_id, false),
+        loadOkfConcepts(document.knowledge_base_id, false, scopedAgentId),
       ]);
       setBuckets(rows);
     } catch (error) {
@@ -477,14 +696,81 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
     }
   }
 
-  async function loadOkfConcepts(knowledgeBaseId?: string, showLoading = true) {
+  /** 读取正文时冻结来源scope与head CAS，丢弃过期或跨范围响应。 */
+  async function loadDocumentContent(document: KnowledgeDocumentRead, scopedAgentId = effectiveAgentId) {
+    const requestId = documentContentRequestIdRef.current + 1;
+    documentContentRequestIdRef.current = requestId;
+    const requestedScope = scopedAgentId ? `agent:${scopedAgentId}` : 'overall';
+    documentEditorScopeRef.current = requestedScope;
+    const base = documentEditorSourceRef.current;
+    if (base && base.document_id === document.id && base.scope === requestedScope) {
+      documentEditorSourceRef.current = {
+        ...base,
+        source_version_id: document.knowledge_base_version_id || '',
+      };
+    }
+    setDocumentContentLoading(true);
+    setDocumentContentUnavailable(false);
+    try {
+      const content = await api.get<KnowledgeDocumentContentRead>(
+        `/api/enterprise/knowledge/documents/${document.id}/content?tenant_id=${getRequestTenantId()}${scopedAgentId ? `&agent_id=${encodeURIComponent(scopedAgentId)}` : ''}`,
+      );
+      if (requestId !== documentContentRequestIdRef.current) return;
+      if (knowledgeAgentIdForScope(content.scope) !== scopedAgentId) {
+        setDocumentContent(null);
+        setDocumentContentDraft('');
+        setDocumentContentUnavailable(false);
+        setEditingDocument(null);
+        notify.warning('读取的正文范围与请求不一致，已拒绝编辑');
+        return;
+      }
+      documentEditorScopeRef.current = content.scope;
+      documentEditorSourceRef.current = {
+        tenant_id: getRequestTenantId(),
+        knowledge_base_id: document.knowledge_base_id,
+        document_id: content.document_id,
+        scope: content.scope,
+        source_version_id: content.head_version_id,
+        expected_revision: content.content_revision,
+      };
+      setDocumentContent(content);
+      setDocumentContentDraft(content.content_md);
+    } catch (error) {
+      if (requestId !== documentContentRequestIdRef.current) return;
+      setDocumentContent(null);
+      setDocumentContentDraft('');
+      const status = error instanceof ApiError
+        ? error.status
+        : (error as { status?: unknown } | null)?.status;
+      const body = error instanceof ApiError
+        ? error.body
+        : String((error as { body?: unknown } | null)?.body || '');
+      if (status === 403 || status === 404) {
+        clearDocumentEditorAfterAccessLoss();
+        notify.warning('当前知识范围已失效，已清除编辑内容并停止显示');
+        return;
+      }
+      setDocumentContentUnavailable(
+        status === 409 && body.includes('KNOWLEDGE_SOURCE_UNAVAILABLE'),
+      );
+      notify.warning(error instanceof Error ? error.message : '历史文档没有可编辑的完整正文，请粘贴替换正文');
+    } finally {
+      if (requestId === documentContentRequestIdRef.current) setDocumentContentLoading(false);
+    }
+  }
+
+  async function loadOkfConcepts(
+    knowledgeBaseId?: string,
+    showLoading = true,
+    scopedAgentId = effectiveAgentId,
+  ) {
     if (!knowledgeBaseId) {
       setOkfConcepts([]);
       setOkfLintIssues([]);
       return;
     }
     if (showLoading) setOkfLoading(true);
-    const suffix = effectiveAgentId ? `&agent_id=${encodeURIComponent(effectiveAgentId)}` : '';
+    const suffix = scopedAgentId ? `&agent_id=${encodeURIComponent(scopedAgentId)}` : '';
     try {
       const rows = await api.get<KnowledgeConceptRead[]>(
         `/api/enterprise/knowledge-bases/${knowledgeBaseId}/okf/concepts?tenant_id=${getRequestTenantId()}${suffix}`,
@@ -946,29 +1232,389 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
     }
   }
 
+  /** 打开编辑器并恢复该文档、租户与scope绑定的修订身份。 */
   function openEditDocument(row: KnowledgeDocumentRead) {
+    const scopeAgentId = effectiveAgentId;
+    const requestKey = documentRevisionRequestStorageKey(row.id, scopeAgentId);
+    const persistedRequestId = window.sessionStorage.getItem(requestKey);
+    const persistedJobId = window.sessionStorage.getItem(documentRevisionJobStorageKey(row.id, scopeAgentId));
+    const persistedIdentity = readDocumentRevisionIdentity(row, row.id, scopeAgentId);
+    const pendingSameDocument = Boolean(
+      persistedRequestId
+      || persistedJobId
+      || (documentRevisionIdentity?.document_id === row.id
+        && !TERMINAL_KNOWLEDGE_JOB_STATUSES.has(documentRevisionJob?.status || '')),
+    );
+    if (pendingSameDocument) {
+      documentRevisionClientRequestIdRef.current = persistedRequestId || documentRevisionClientRequestIdRef.current;
+      documentRevisionIdentityRef.current = persistedIdentity;
+      setDocumentRevisionIdentity(persistedIdentity);
+      setDocumentRevisionRecoveryUnknown(!persistedIdentity || !persistedJobId);
+      if (!documentRevisionJobId && persistedJobId && persistedIdentity) {
+        setDocumentRevisionJobId(persistedJobId);
+        setDocumentRevisionJob(null);
+      } else if (!persistedIdentity) {
+        setDocumentRevisionJobId('');
+        setDocumentRevisionJob(null);
+        notify.warning('修订恢复信息不完整，已保留原请求身份并禁止再次提交');
+      }
+    } else {
+      window.sessionStorage.removeItem(requestKey);
+      window.sessionStorage.removeItem(documentRevisionJobStorageKey(row.id, scopeAgentId));
+      window.sessionStorage.removeItem(documentRevisionIdentityStorageKey(row.id, scopeAgentId));
+      documentRevisionClientRequestIdRef.current = null;
+      documentRevisionIdentityRef.current = null;
+      setDocumentRevisionIdentity(null);
+      setDocumentRevisionRecoveryUnknown(false);
+    }
+    const selectedBase = knowledgeBases.find((item) => item.id === row.knowledge_base_id);
+    const editorScope = scopeAgentId ? `agent:${scopeAgentId}` : 'overall';
+    documentEditorScopeRef.current = editorScope;
+    documentEditorSourceRef.current = {
+      tenant_id: getRequestTenantId(),
+      knowledge_base_id: row.knowledge_base_id,
+      document_id: row.id,
+      scope: editorScope,
+      source_version_id: row.knowledge_base_version_id || '',
+      expected_revision: selectedBase?.content_revision,
+    };
     setEditingDocument(row);
     setDocumentDraft({
       title: row.title || row.filename,
       status: row.status,
     });
+    setDocumentContent(null);
+    setDocumentContentDraft('');
+    setDocumentContentUnavailable(false);
+    if (!pendingSameDocument || persistedIdentity) void loadDocumentContent(row, scopeAgentId);
+    if (pendingSameDocument && persistedIdentity && !persistedJobId) {
+      void reconcileDocumentRevision(persistedIdentity);
+    }
   }
 
+  function documentRevisionRequestStorageKey(documentId: string, scopedAgentId = effectiveAgentId): string {
+    return `gongge-knowledge-revision:${getRequestTenantId()}:${scopedAgentId || 'overall'}:${documentId}`;
+  }
+
+  function documentRevisionJobStorageKey(documentId: string, scopedAgentId = effectiveAgentId): string {
+    return `${documentRevisionRequestStorageKey(documentId, scopedAgentId)}:job`;
+  }
+
+  /** 返回当前文档与知识范围专属的非正文任务身份存储键。 */
+  function documentRevisionIdentityStorageKey(documentId: string, scopedAgentId = effectiveAgentId): string {
+    return `${documentRevisionRequestStorageKey(documentId, scopedAgentId)}:identity`;
+  }
+
+  /** 在派发前持久化任务的完整冻结来源元组供恢复对账。 */
+  function saveDocumentRevisionIdentity(identity: KnowledgeRevisionIdentity) {
+    documentRevisionIdentityRef.current = identity;
+    setDocumentRevisionIdentity(identity);
+    window.sessionStorage.setItem(
+      documentRevisionIdentityStorageKey(identity.document_id, knowledgeAgentIdForScope(identity.scope) || ''),
+      JSON.stringify(identity),
+    );
+  }
+
+  /** 通过完整冻结身份查找已提交任务；无结果时只保留unknown，不自动重发。 */
+  async function reconcileDocumentRevision(
+    identity = documentRevisionIdentity,
+    retireWhenAbsent = false,
+  ) {
+    if (!identity) return;
+    const scopedAgentId = knowledgeAgentIdForScope(identity.scope);
+    if (scopedAgentId === null) {
+      clearDocumentEditorAfterAccessLoss();
+      notify.error('正文修订冻结范围无效，已停止核对');
+      return;
+    }
+    const query = new URLSearchParams({
+      tenant_id: identity.tenant_id,
+      knowledge_base_id: identity.knowledge_base_id,
+      document_id: identity.document_id,
+      client_request_id: identity.client_request_id,
+      source_version_id: identity.source_version_id,
+      expected_revision: String(identity.expected_revision),
+    });
+    if (scopedAgentId) query.set('agent_id', scopedAgentId);
+    setDocumentRevisionRecoveryChecking(true);
+    try {
+      const reconciled = await api.get<KnowledgeIngestJobRead | null>(
+        `/api/enterprise/knowledge/jobs/by-client-request?${query.toString()}`,
+      );
+      if (!reconciled) {
+        if (retireWhenAbsent) {
+          window.sessionStorage.removeItem(documentRevisionRequestStorageKey(identity.document_id, scopedAgentId));
+          window.sessionStorage.removeItem(documentRevisionJobStorageKey(identity.document_id, scopedAgentId));
+          window.sessionStorage.removeItem(documentRevisionIdentityStorageKey(identity.document_id, scopedAgentId));
+          documentRevisionClientRequestIdRef.current = null;
+          documentRevisionIdentityRef.current = null;
+          setDocumentRevisionIdentity(null);
+          setDocumentRevisionRecoveryUnknown(false);
+          if (editingDocument?.id === identity.document_id) {
+            await loadDocumentContent(editingDocument, scopedAgentId);
+          }
+          notify.warning('已核实原请求没有持久任务，请按当前正文重新编辑');
+          return;
+        }
+        setDocumentRevisionRecoveryUnknown(true);
+        notify.warning('当前未读到匹配的持久任务，原请求身份已保留；不会自动重发');
+        return;
+      }
+      if (!knowledgeRevisionJobMatchesIdentity(reconciled, identity)) {
+        clearDocumentEditorAfterAccessLoss();
+        notify.error('对账任务与冻结来源不一致，已清除私密内容并保留原指针');
+        return;
+      }
+      window.sessionStorage.setItem(
+        documentRevisionJobStorageKey(identity.document_id, scopedAgentId),
+        reconciled.id,
+      );
+      documentRevisionIdentityRef.current = identity;
+      setDocumentRevisionIdentity(identity);
+      setDocumentRevisionJob(reconciled);
+      setDocumentRevisionJobId(reconciled.id);
+      setDocumentRevisionRecoveryUnknown(false);
+      notify.success('已按原请求身份找到持久修订任务');
+    } catch (error) {
+      const status = error instanceof ApiError
+        ? error.status
+        : (error as { status?: unknown } | null)?.status;
+      if (status === 403 || status === 404) {
+        clearDocumentEditorAfterAccessLoss();
+        notify.warning('当前知识范围权限已变化，已清除编辑内容并停止核对');
+        return;
+      }
+      setDocumentRevisionRecoveryUnknown(true);
+      notify.error(error instanceof Error ? error.message : '核对正文修订状态失败');
+    } finally {
+      setDocumentRevisionRecoveryChecking(false);
+    }
+  }
+
+  /** 仅恢复与当前租户、文档和scope完全相符的非正文身份。 */
+  function readDocumentRevisionIdentity(
+    row: KnowledgeDocumentRead,
+    documentId: string,
+    scopedAgentId: string,
+  ): KnowledgeRevisionIdentity | null {
+    const raw = window.sessionStorage.getItem(documentRevisionIdentityStorageKey(documentId, scopedAgentId));
+    if (!raw) return null;
+    try {
+      const value = JSON.parse(raw) as Partial<KnowledgeRevisionIdentity>;
+      const expectedScope = scopedAgentId ? `agent:${scopedAgentId}` : 'overall';
+      if (value.tenant_id !== getRequestTenantId()
+          || value.knowledge_base_id !== row.knowledge_base_id
+          || value.document_id !== documentId
+          || value.job_kind !== 'revision'
+          || value.scope !== expectedScope
+          || typeof value.source_version_id !== 'string'
+          || !value.source_version_id
+          || !Number.isInteger(value.expected_revision)
+          || (value.expected_revision || 0) < 1
+          || typeof value.client_request_id !== 'string'
+          || !value.client_request_id
+          || value.client_request_id !== window.sessionStorage.getItem(
+            documentRevisionRequestStorageKey(documentId, scopedAgentId),
+          )) return null;
+      return value as KnowledgeRevisionIdentity;
+    } catch {
+      return null;
+    }
+  }
+
+  function documentRevisionClientRequestId(documentId: string, scopedAgentId = effectiveAgentId): string {
+    const current = documentRevisionClientRequestIdRef.current;
+    if (current) return current;
+    const key = documentRevisionRequestStorageKey(documentId, scopedAgentId);
+    const stored = window.sessionStorage.getItem(key);
+    if (stored) {
+      documentRevisionClientRequestIdRef.current = stored;
+      return stored;
+    }
+    const next = typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID()
+      : `knowledge-revision-${Date.now()}`;
+    documentRevisionClientRequestIdRef.current = next;
+    window.sessionStorage.setItem(key, next);
+    return next;
+  }
+
+  /** 以正文打开时冻结的权限范围和head CAS受理发布修订。 */
   async function saveDocument() {
     if (!editingDocument) return;
+    if (documentRevisionRecoveryUnknown) {
+      notify.warning('上次正文修订状态尚未核对，请先查询原请求结果');
+      return;
+    }
+    let attemptedRevisionIdentity: KnowledgeRevisionIdentity | null = null;
     try {
-      const next = await api.put<KnowledgeDocumentRead>(`/api/enterprise/knowledge/documents/${editingDocument.id}`, {
-        tenant_id: getRequestTenantId(),
-        title: documentDraft.title,
-        status: documentDraft.status,
-      });
+      const shouldCreateContentRevision = Boolean(
+        documentContent && documentContentDraft !== documentContent.content_md,
+      ) || Boolean(documentContentUnavailable && documentContentDraft.trim());
+      if (shouldCreateContentRevision) {
+        const frozenSource = documentEditorSourceRef.current;
+        const revisionScope = documentContent?.scope || frozenSource?.scope || documentEditorScopeRef.current;
+        const revisionAgentId = knowledgeAgentIdForScope(revisionScope);
+        if (revisionAgentId === null) {
+          notify.error('正文来源范围无效，请重新读取当前正文后重试');
+          return;
+        }
+        const expectedVersionId = documentContent?.head_version_id || frozenSource?.source_version_id;
+        const expectedRevision = documentContent?.content_revision ?? frozenSource?.expected_revision;
+        if (!frozenSource
+            || frozenSource.tenant_id !== getRequestTenantId()
+            || frozenSource.knowledge_base_id !== editingDocument.knowledge_base_id
+            || frozenSource.document_id !== editingDocument.id
+            || frozenSource.scope !== revisionScope) {
+          notify.error('正文修订冻结来源已失效，请重新打开文档读取当前来源');
+          return;
+        }
+        if (!expectedVersionId || !expectedRevision || !Number.isInteger(expectedRevision) || expectedRevision < 1) {
+          notify.error('当前文档缺少可验证的 head 版本或 revision，请刷新后重试');
+          return;
+        }
+        const clientRequestId = documentRevisionClientRequestId(editingDocument.id, revisionAgentId);
+        const suffix = revisionAgentId ? `?agent_id=${encodeURIComponent(revisionAgentId)}` : '';
+        const identity: KnowledgeRevisionIdentity = {
+          ...frozenSource,
+          job_kind: 'revision',
+          source_version_id: expectedVersionId,
+          expected_revision: expectedRevision,
+          client_request_id: clientRequestId,
+        };
+        attemptedRevisionIdentity = identity;
+        saveDocumentRevisionIdentity(identity);
+        const accepted = await api.put<KnowledgeRevisionAccepted>(
+          `/api/enterprise/knowledge/documents/${editingDocument.id}${suffix}`,
+          {
+            tenant_id: identity.tenant_id,
+            title: documentDraft.title,
+            content_md: documentContentDraft,
+            expected_version_id: identity.source_version_id,
+            expected_revision: identity.expected_revision,
+            client_request_id: clientRequestId,
+          },
+        );
+        if (accepted.source_version_id !== identity.source_version_id
+            || accepted.expected_revision !== identity.expected_revision) {
+          setDocumentRevisionRecoveryUnknown(true);
+          void reconcileDocumentRevision(identity);
+          notify.warning('正文修订受理回包与冻结来源不一致，请先核对持久任务');
+          return;
+        }
+        window.sessionStorage.setItem(
+          documentRevisionJobStorageKey(editingDocument.id, revisionAgentId),
+          accepted.job_id,
+        );
+        setDocumentRevisionRecoveryUnknown(false);
+        setDocumentRevisionJobId(accepted.job_id);
+        setDocumentRevisionJob({
+          id: accepted.job_id,
+          tenant_id: identity.tenant_id,
+          knowledge_base_id: editingDocument.knowledge_base_id,
+          document_id: editingDocument.id,
+          filename: editingDocument.filename,
+          job_kind: 'revision',
+          scope: identity.scope,
+          source_version_id: accepted.source_version_id,
+          expected_revision: accepted.expected_revision,
+          status: accepted.status,
+          stage: 'prepare',
+          progress: 0,
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        });
+        notify.success('已受理正文修订，正在重建知识版本');
+        return;
+      }
+      const frozenScopeAgentId = knowledgeAgentIdForScope(documentEditorSourceRef.current?.scope);
+      if (frozenScopeAgentId === null || documentEditorSourceRef.current?.document_id !== editingDocument.id) {
+        notify.error('文档编辑来源范围已失效，请重新打开后重试');
+        return;
+      }
+      const suffix = frozenScopeAgentId ? `?agent_id=${encodeURIComponent(frozenScopeAgentId)}` : '';
+      const next = await api.put<KnowledgeDocumentRead>(
+        `/api/enterprise/knowledge/documents/${editingDocument.id}${suffix}`,
+        {
+          tenant_id: documentEditorSourceRef.current.tenant_id,
+          title: documentDraft.title,
+          status: documentDraft.status,
+        },
+      );
       setDocuments((current) => current.map((item) => (item.id === next.id ? next : item)));
       setSelectedDocument((current) => (current?.id === next.id ? next : current));
       setEditingDocument(null);
-      await loadBuckets(next, false);
+      await loadBuckets(next, false, frozenScopeAgentId);
       notify.success('已保存文档');
     } catch (error) {
+      const status = error instanceof ApiError
+        ? error.status
+        : (error as { status?: unknown } | null)?.status;
+      if (status === 403 || status === 404) {
+        clearDocumentEditorAfterAccessLoss();
+        notify.warning('当前知识范围权限已变化，已清除编辑内容并停止显示');
+        return;
+      }
+      if (attemptedRevisionIdentity && status === 422) {
+        const scopedAgentId = knowledgeAgentIdForScope(attemptedRevisionIdentity.scope) || '';
+        window.sessionStorage.removeItem(documentRevisionRequestStorageKey(editingDocument.id, scopedAgentId));
+        window.sessionStorage.removeItem(documentRevisionJobStorageKey(editingDocument.id, scopedAgentId));
+        window.sessionStorage.removeItem(documentRevisionIdentityStorageKey(editingDocument.id, scopedAgentId));
+        documentRevisionClientRequestIdRef.current = null;
+        documentRevisionIdentityRef.current = null;
+        setDocumentRevisionIdentity(null);
+        setDocumentRevisionRecoveryUnknown(false);
+        notify.error(error instanceof Error ? error.message : '正文修订输入无效');
+        return;
+      }
+      if (attemptedRevisionIdentity && (status === 409 || status === undefined || Number(status) >= 500)) {
+        setDocumentRevisionRecoveryUnknown(true);
+        await reconcileDocumentRevision(attemptedRevisionIdentity, status === 409);
+        return;
+      }
       notify.error(error instanceof Error ? error.message : '保存文档失败');
+    }
+  }
+
+  /** 仅按完整冻结身份取消任务并拒绝错scope响应。 */
+  async function cancelDocumentRevision() {
+    if (!documentRevisionJobId || !documentRevisionIdentity) return;
+    try {
+      const identity = documentRevisionIdentity;
+      const jobAgentId = knowledgeAgentIdForScope(identity.scope);
+      if (jobAgentId === null) {
+        notify.error('正文修订任务范围无效，无法安全取消');
+        return;
+      }
+      const next = await api.post<KnowledgeIngestJobRead>(
+        `/api/enterprise/knowledge/jobs/${documentRevisionJobId}/cancel?tenant_id=${identity.tenant_id}${jobAgentId ? `&agent_id=${encodeURIComponent(jobAgentId)}` : ''}`,
+      );
+      if (next.id !== documentRevisionJobId || !knowledgeRevisionJobMatchesIdentity(next, identity)) {
+        clearDocumentEditorAfterAccessLoss();
+        notify.error('取消回包不属于当前正文修订，已停止展示并保留原任务指针');
+        return;
+      }
+      setDocumentRevisionJob(next);
+      if (TERMINAL_KNOWLEDGE_JOB_STATUSES.has(next.status)) {
+        window.sessionStorage.removeItem(documentRevisionRequestStorageKey(identity.document_id, jobAgentId));
+        window.sessionStorage.removeItem(documentRevisionJobStorageKey(identity.document_id, jobAgentId));
+        window.sessionStorage.removeItem(documentRevisionIdentityStorageKey(identity.document_id, jobAgentId));
+        documentRevisionClientRequestIdRef.current = null;
+        documentRevisionIdentityRef.current = null;
+        setDocumentRevisionIdentity(null);
+        setDocumentRevisionRecoveryUnknown(false);
+        setDocumentRevisionJobId('');
+      }
+    } catch (error) {
+      const status = error instanceof ApiError
+        ? error.status
+        : (error as { status?: unknown } | null)?.status;
+      if (status === 403 || status === 404) {
+        clearDocumentEditorAfterAccessLoss();
+        notify.warning('当前知识范围权限已变化，已清除编辑内容并停止显示');
+        return;
+      }
+      notify.error(error instanceof Error ? error.message : '取消正文修订失败');
     }
   }
 
@@ -1817,15 +2463,44 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
       <KDialog
         open={Boolean(editingDocument)}
         title="编辑文档"
-        onClose={() => setEditingDocument(null)}
+        width={920}
+        onClose={() => {
+          if (!documentRevisionJobId) setEditingDocument(null);
+        }}
         footer={(
           <>
-            <KDialogCancelButton onClick={() => setEditingDocument(null)} />
-            <KDialogPrimaryButton onClick={() => void saveDocument()}>保存</KDialogPrimaryButton>
+            <KDialogCancelButton disabled={Boolean(documentRevisionJobId)} onClick={() => setEditingDocument(null)} />
+            {documentRevisionJobId ? (
+              <KDialogPrimaryButton onClick={() => void cancelDocumentRevision()}>取消重建</KDialogPrimaryButton>
+            ) : documentRevisionRecoveryUnknown ? (
+              <KDialogPrimaryButton
+                disabled={documentRevisionRecoveryChecking}
+                onClick={() => void reconcileDocumentRevision()}
+              >
+                {documentRevisionRecoveryChecking ? '正在核对…' : '核对修订状态'}
+              </KDialogPrimaryButton>
+            ) : (
+            <KDialogPrimaryButton
+              disabled={
+                documentContentLoading
+                || documentRevisionRecoveryChecking
+                || (!documentContent && !documentContentUnavailable)
+                || (documentContentUnavailable && !documentContentDraft.trim())
+              }
+              onClick={() => void saveDocument()}
+            >
+              保存正文
+              </KDialogPrimaryButton>
+            )}
           </>
         )}
       >
         <div className="flex w-full flex-col gap-[12px]">
+          {documentRevisionRecoveryUnknown ? (
+            <p className="gg-type-body rounded-[10px] border border-amber-200 bg-amber-50 px-[12px] py-[10px] text-amber-900" role="alert">
+              正文修订回执尚未确认。系统会按冻结请求身份查询持久任务；找回任务前不会重发。
+            </p>
+          ) : null}
           <Input
             value={documentDraft.title}
             onChange={(event) => setDocumentDraft((prev) => ({ ...prev, title: event.target.value }))}
@@ -1845,6 +2520,31 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
               <SelectItem value="archived">下线</SelectItem>
             </SelectContent>
           </UISelect>
+          {documentContentLoading ? <p className="gg-type-control text-muted-foreground">正在读取当前 head 正文…</p> : null}
+          {documentContentUnavailable ? (
+            <p className="gg-type-body rounded-[10px] border border-amber-200 bg-amber-50 px-[12px] py-[10px] text-amber-900" role="alert">
+              历史文档没有可验证的完整正文，请粘贴替换正文；保存将基于当前已发布 head 创建新版本。
+            </p>
+          ) : null}
+          {documentContent || documentContentUnavailable ? (
+            <Textarea
+              aria-label="文档正文"
+              rows={18}
+              value={documentContentDraft}
+              disabled={Boolean(documentRevisionJobId) || documentRevisionRecoveryUnknown || documentRevisionRecoveryChecking}
+              onChange={(event) => setDocumentContentDraft(event.target.value)}
+              placeholder="完整 Markdown 正文"
+            />
+          ) : null}
+          {documentRevisionJob ? (
+            <div className="rounded-[10px] border border-[#e8ebf0] bg-[#fafbfc] p-[12px]" role="status">
+              <div className="flex items-center justify-between gap-[8px]">
+                <strong className="gg-type-control">正文重建：{documentRevisionJob.stage || documentRevisionJob.status}</strong>
+                <span className="gg-type-control text-muted-foreground">{Math.round((documentRevisionJob.progress || 0) * 100)}%</span>
+              </div>
+              {documentRevisionJob.error ? <p className="gg-type-control mt-[6px] text-destructive">{documentRevisionJob.error}</p> : null}
+            </div>
+          ) : null}
         </div>
       </KDialog>
       <KDialog

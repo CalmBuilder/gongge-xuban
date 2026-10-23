@@ -9,15 +9,19 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 
 from app.cancellation import TurnCancellationRequested
+from app.core.time_context import freeze_time_context
 from app.dynamic_tasks.action_proposer import DynamicActionProposer
 from app.dynamic_tasks.planning import PlanStep
 from app.dynamic_tasks.provider_view import build_provider_execution_view
 from app.llm.client import LLMClient, LLMStreamCancelled
+from app.memory.projection import MemoryCandidate
+from app.memory.request_projection import MemoryRequestEnvelope
 
 
 class _Client:
@@ -103,6 +107,17 @@ class _AnswerClient(_Client):
         )
 
 
+class _MemoryLabelPrefixAnswerClient(_AnswerClient):
+    """模拟模型给STYLE值附加“输出偏好”前缀的完整答案。"""
+
+    def generate_json_with_metadata(self, system_prompt, user_payload):
+        """返回语义正确但违反字段值格式约束的记忆答案。"""
+
+        raw, metadata = super().generate_json_with_metadata(system_prompt, user_payload)
+        raw["arguments"]["markdown"] = "NAME=柳南\nSTYLE=输出偏好简洁要点\nCODE=未知"
+        return raw, metadata
+
+
 class _MisnestedAnswerClient(_AnswerClient):
     """模拟真实模型把 claims 错放到动作信封顶层。"""
 
@@ -165,6 +180,28 @@ class _ListCriterionEvidenceAnswerClient(_AnswerClient):
         return raw, metadata
 
 
+class _ScalarCriterionEvidenceAnswerClient(_AnswerClient):
+    """模拟模型将单一成功标准的步骤证据直接返回为字符串。"""
+
+    def generate_json_with_metadata(self, system_prompt, user_payload):
+        """返回可归属到唯一成功标准的单个步骤键。"""
+
+        raw, metadata = super().generate_json_with_metadata(system_prompt, user_payload)
+        raw["arguments"]["criterion_evidence"] = "query_contract"
+        return raw, metadata
+
+
+class _MappedScalarCriterionEvidenceAnswerClient(_AnswerClient):
+    """模拟模型将成功标准映射值压成单个步骤字符串。"""
+
+    def generate_json_with_metadata(self, system_prompt, user_payload):
+        """返回保留标准归属、但需要收敛为单元素证据数组的结果。"""
+
+        raw, metadata = super().generate_json_with_metadata(system_prompt, user_payload)
+        raw["arguments"]["criterion_evidence"] = {"criterion_01": "query_contract"}
+        return raw, metadata
+
+
 class _MissingRationaleAnswerClient(_AnswerClient):
     """模拟模型给出完整answer结果但遗漏非权威动作说明。"""
 
@@ -211,6 +248,26 @@ class _ClarificationClient(_Client):
                 "rationale": "等待用户补充诊断前置证据",
             },
             {"response_id": "response_clarification", "finish_reason": "stop"},
+        )
+
+
+class _InvalidRevokedMemoryAnswerClient(_AnswerClient):
+    """模拟清空后模型仍返回 clarification，验证 Runtime 的安全收敛。"""
+
+    def generate_json_with_metadata(self, system_prompt, user_payload):
+        """返回当前 answer 步骤不允许的 wait_input 动作。"""
+
+        self.system_prompt = system_prompt
+        self.payload = user_payload
+        return (
+            {
+                "action_kind": "wait_input",
+                "arguments": {"question": "是否继续"},
+                "capability_ref": None,
+                "expected_output_schema": {},
+                "rationale": "等待模型重新确认",
+            },
+            {"response_id": "response_invalid_revoked", "finish_reason": "stop"},
         )
 
 
@@ -311,6 +368,7 @@ def _view(
     include_guidance: bool = False,
     include_visual_review: bool = False,
     include_formula_checks: bool = False,
+    include_time_context: bool = False,
     guidance_principle: str = "Use a deep module",
     guidance_task_mapping: str = "将支付职责收敛到深模块",
     guidance_acceptance: str = "正文给出窄接口和内部职责",
@@ -318,6 +376,12 @@ def _view(
     """构造已验证协议下的最小 provider execution view。"""
 
     execution_context = {"execution_id": "exec_1", "plan_checksum": "a" * 64}
+    if include_time_context:
+        execution_context["time_context"] = freeze_time_context(
+            source_input_id="message_action",
+            client_timezone="Asia/Shanghai",
+            anchor_at_utc=datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC),
+        )
     if include_result_facts:
         execution_context.update(
             {
@@ -439,6 +503,91 @@ def test_proposer_preserves_provider_identity_and_current_step_scope() -> None:
     assert "contract.query" in client.payload["output_contract"]["capability_ref"]
     assert "工具ID" in client.payload["output_contract"]["capability_ref"]
     assert "必须为 call_tool" in client.payload["output_contract"]["action_kind"]
+
+
+def test_proposer_converges_to_unknown_answer_when_frozen_memory_is_revoked() -> None:
+    """清空后只剩失效冻结记忆时，错误模型动作不能让执行无限重试或泄漏旧事实。"""
+
+    view = _view(include_result_facts=True)
+    candidate = MemoryCandidate(
+        id="memory_revoked_name",
+        key="preferred_name",
+        kind="profile",
+        content="青禾",
+        scope=("tenant", "user", "agent"),
+    )
+    view._memory_envelope = MemoryRequestEnvelope(
+        (candidate,),
+        "清空后输出 NAME、STYLE、CODE；实际可用记忆为空时三项都填未知。",
+        selected=(candidate,),
+        validate=lambda _candidate: False,
+        derived_values_revoked=True,
+    )
+    completed = DynamicActionProposer(_InvalidRevokedMemoryAnswerClient()).propose(
+        view=view,
+        step=PlanStep(step_key="answer", title="输出三字段", kind="answer"),
+    )
+
+    assert completed.proposal.action_kind.value == "answer"
+    assert completed.proposal.arguments["markdown"] == "NAME=未知\nSTYLE=未知\nCODE=未知"
+    assert completed.proposal.arguments["criterion_evidence"] == {"criterion_01": ["answer"]}
+
+
+def test_proposer_normalizes_memory_style_prefix_to_requested_keyword() -> None:
+    """记忆字段要求关键词时，去除模型附加的字段说明而保留实际值。"""
+
+    view = _view(include_result_facts=True)
+    candidate = MemoryCandidate(
+        id="memory_style",
+        key="reply_style",
+        kind="preference",
+        content="输出偏好：简洁要点；原样保留代码。",
+        scope=("tenant", "user", "agent"),
+    )
+    view._memory_envelope = MemoryRequestEnvelope(
+        (candidate,),
+        "请严格逐行输出 NAME、STYLE、CODE；STYLE 只填格式关键词。",
+        selected=(candidate,),
+        validate=lambda _candidate: True,
+    )
+    completed = DynamicActionProposer(_MemoryLabelPrefixAnswerClient()).propose(
+        view=view,
+        step=PlanStep(step_key="answer", title="输出三字段", kind="answer"),
+    )
+
+    assert completed.proposal.arguments["markdown"] == (
+        "NAME=柳南\nSTYLE=简洁要点\nCODE=未知"
+    )
+
+
+def test_action_provider_payload_keeps_execution_time_context() -> None:
+    """动作和最终 answer 共用的 provider view 必须携带冻结输入时间。"""
+
+    client = _Client()
+    DynamicActionProposer(client).propose(
+        view=_view(include_time_context=True),
+        step=PlanStep(
+            step_key="query_contract",
+            title="查询合同",
+            kind="tool.read",
+            capability_refs=("contract.query",),
+        ),
+    )
+
+    execution_context = client.payload["provider_execution_view"]["execution_context"]
+    assert execution_context["time_context"]["source_input_id"] == "message_action"
+
+    answer_client = _AnswerClient()
+    DynamicActionProposer(answer_client).propose(
+        view=_view(include_time_context=True, include_result_facts=True),
+        step=PlanStep(
+            step_key="answer",
+            title="形成结论",
+            kind="answer",
+        ),
+    )
+    answer_context = answer_client.payload["provider_execution_view"]["execution_context"]
+    assert answer_context["time_context"]["source_input_id"] == "message_action"
 
 
 def test_proposer_forwards_same_cancellation_callback_through_real_json_metadata_client(
@@ -942,6 +1091,32 @@ def test_single_criterion_evidence_list_is_normalized_to_criterion_mapping() -> 
 
     assert completed.proposal.arguments["criterion_evidence"] == {
         "criterion_01": ["query_contract", "final_answer"]
+    }
+
+
+def test_single_criterion_evidence_scalar_is_normalized_to_one_reference() -> None:
+    """单一成功标准的字符串步骤证据可收敛为规范的单元素引用数组。"""
+
+    completed = DynamicActionProposer(_ScalarCriterionEvidenceAnswerClient()).propose(
+        view=_view(include_result_facts=True),
+        step=PlanStep(step_key="final_answer", title="形成验收结果", kind="answer"),
+    )
+
+    assert completed.proposal.arguments["criterion_evidence"] == {
+        "criterion_01": ["query_contract"]
+    }
+
+
+def test_mapped_scalar_criterion_evidence_is_normalized_to_one_reference() -> None:
+    """成功标准映射中的单步骤字符串可安全收敛为单元素引用数组。"""
+
+    completed = DynamicActionProposer(_MappedScalarCriterionEvidenceAnswerClient()).propose(
+        view=_view(include_result_facts=True),
+        step=PlanStep(step_key="final_answer", title="形成验收结果", kind="answer"),
+    )
+
+    assert completed.proposal.arguments["criterion_evidence"] == {
+        "criterion_01": ["query_contract"]
     }
 
 

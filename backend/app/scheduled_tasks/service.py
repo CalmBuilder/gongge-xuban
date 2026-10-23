@@ -11,6 +11,7 @@ from __future__ import annotations
 import calendar
 import re
 import socket
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, time, timedelta
 from threading import BoundedSemaphore
@@ -26,6 +27,7 @@ from sqlmodel import Session, select
 from app.agents.branching import model_for_agent
 from app.agents.session_snapshot import anchor_chat_session
 from app.core import AgentLoop
+from app.core.time_context import freeze_time_context, normalize_persisted_time_context
 from app.db import engine
 from app.db.models import (
     AgentEvent,
@@ -300,13 +302,28 @@ def detect_scheduled_task_draft(
     message: str,
     source_session_id: str | None = None,
     timezone: str | None = None,
+    *,
+    time_context: Mapping[str, Any] | None = None,
 ) -> ScheduledTaskDraftRead | None:
     ensure_tenant(db, tenant_id)
     agent = db.get(AgentProfile, agent_id)
     if not agent or agent.tenant_id != tenant_id or agent.is_overall or agent.status != "active":
         return None
     user_timezone = _safe_timezone(timezone)
-    llm_draft = _detect_with_llm(db, tenant_id, agent_id, message, user_timezone)
+    persisted_time_context = normalize_persisted_time_context(time_context)
+    if persisted_time_context is None:
+        persisted_time_context = freeze_time_context(
+            source_input_id=source_session_id or new_id("schedule_input"),
+            client_timezone=timezone,
+        )
+    llm_draft = _detect_with_llm(
+        db,
+        tenant_id,
+        agent_id,
+        message,
+        user_timezone,
+        time_context=persisted_time_context,
+    )
     if llm_draft is None or not llm_draft.should_create:
         return None
     draft = llm_draft
@@ -743,8 +760,26 @@ def _execute_prepared_scheduled_task(
             interaction_mode="scheduled_task",
             client_timezone=task.timezone,
         )
+        time_context = freeze_time_context(
+            source_input_id=run.id,
+            client_timezone=task.timezone,
+            anchor_at_utc=run.scheduled_for,
+            timezone_source="scheduled_task",
+        )
         result: ChatTurnResponse | None = None
-        for seq, item in enumerate(AgentLoop(db).handle_turn_stream(request), start=1):
+        turn_stream = AgentLoop(db)
+        try:
+            stream = turn_stream.handle_turn_stream(request, time_context=time_context)
+        except TypeError as exc:
+            # 保持旧的轻量执行替身和第三方兼容入口可运行；真实 AgentLoop 已接收
+            # 冻结事实，只有不声明新关键字参数的替身才走历史调用形态。
+            if "time_context" not in str(exc):
+                raise
+            stream = turn_stream.handle_turn_stream(request)
+        for seq, item in enumerate(
+            stream,
+            start=1,
+        ):
             _record_scheduled_task_stream_event(
                 db,
                 run,
@@ -769,6 +804,7 @@ def _execute_prepared_scheduled_task(
             else None,
             "session_state": result.session_state.model_dump(mode="json"),
             "execution_id": dynamic_execution.id if dynamic_execution is not None else None,
+            "time_context": time_context,
         }
         if not _lock_scheduled_run_for_execution(db, task, run, lease_owner=lease_owner):
             return run
@@ -1241,16 +1277,25 @@ def _detect_with_llm(
     agent_id: str,
     message: str,
     timezone: str,
+    *,
+    time_context: Mapping[str, Any] | None = None,
 ) -> _LLMScheduledTaskDraft | None:
     model_config = model_for_agent(db, tenant_id, agent_id, "router") or model_for_agent(db, tenant_id, agent_id)
     if not model_config:
         return None
+    persisted_time_context = normalize_persisted_time_context(time_context)
+    if persisted_time_context is None:
+        persisted_time_context = freeze_time_context(
+            source_input_id=new_id("schedule_input"),
+            client_timezone=timezone,
+        )
+    detection_now = _time_context_local_at(persisted_time_context, timezone)
     try:
         with llm_operation("scheduled_task.detect"):
             raw = LLMClient(model_config).generate_json(
                 SCHEDULE_DRAFT_PROMPT,
                 {
-                    "now": _to_local(utc_now(), timezone).isoformat(),
+                    "now": detection_now,
                     "default_timezone": timezone,
                     "user_message": message,
                 },
@@ -1258,6 +1303,24 @@ def _detect_with_llm(
         return _LLMScheduledTaskDraft.model_validate(raw)
     except (LLMError, ValidationError):
         return None
+
+
+def _time_context_local_at(
+    time_context: Mapping[str, Any],
+    timezone: str,
+) -> str:
+    """把同一冻结 UTC 锚点投影到调度时区，避免识别跨越日期边界。"""
+
+    try:
+        anchor = datetime.fromisoformat(
+            str(time_context["anchor_at_utc"]).replace("Z", "+00:00")
+        )
+        if anchor.tzinfo is None:
+            anchor = anchor.replace(tzinfo=UTC)
+        local = _to_local(anchor, _safe_timezone(timezone))
+        return local.isoformat(timespec="microseconds" if local.microsecond else "seconds")
+    except (KeyError, TypeError, ValueError):
+        return str(time_context.get("local_at") or "")
 
 
 def _execution_goal_from_message(message: str) -> str:

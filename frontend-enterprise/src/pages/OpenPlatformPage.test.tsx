@@ -6,7 +6,7 @@ import { beforeEach, expect, it, vi } from 'vitest';
 import { api } from '../api/client';
 import type { EnterpriseAuthUser } from '../auth';
 import { I18nProvider } from '../i18n';
-import type { AgentProfileRead, GeneralSkillRead, KnowledgeBaseRead } from '../types';
+import type { AgentGalleryPageRead, AgentProfileRead, GeneralSkillRead, KnowledgeBaseRead } from '../types';
 import OpenPlatformPage from './OpenPlatformPage';
 
 vi.mock('../api/client', () => ({
@@ -60,6 +60,15 @@ const galleryExpert: AgentProfileRead = {
   },
 };
 
+const galleryPage = (items: AgentProfileRead[]): AgentGalleryPageRead => ({
+  items,
+  total: items.length,
+  scope_counts: { used: 0, owned: 0, gallery: items.length, expert: 0 },
+  facets: { sources: [], departments: [], directions: [] },
+  page: 1,
+  page_size: 48,
+});
+
 const galleryKnowledge: KnowledgeBaseRead = {
   id: 'gallery-knowledge',
   tenant_id: 'tenant_demo',
@@ -69,6 +78,7 @@ const galleryKnowledge: KnowledgeBaseRead = {
   access_scope: 'tenant',
   download_policy: 'allowed',
   revision: 1,
+  content_revision: 1,
   organization_access: [],
   version: 'v1.0.0',
   document_count: 8,
@@ -122,8 +132,14 @@ beforeEach(() => {
   vi.mocked(api.get).mockReset();
   vi.mocked(api.post).mockReset();
   vi.mocked(api.get).mockImplementation(async (path: string) => {
+    if (path.includes('/api/enterprise/agents/gallery-page')) {
+      return path.includes('scope=expert') ? galleryPage([galleryExpert]) : galleryPage([galleryAgent]);
+    }
+    if (path.includes('/api/enterprise/agents/overall')) {
+      return null as never;
+    }
     if (path.startsWith('/api/enterprise/agents?')) {
-      return [galleryAgent, galleryExpert, ownedAgent] as never;
+      return [ownedAgent] as never;
     }
     if (path.startsWith('/api/enterprise/knowledge-bases?')) {
       return Array.from({ length: 13 }, (_, index) => ({
@@ -191,6 +207,32 @@ it('已发布平台 Skill 出现在开放广场的 Skill 分类而不是管理�
   await userEvent.click(screen.getByText('数据统计分析'));
   await userEvent.click(await screen.findByRole('link', { name: '查看详情' }));
   expect(await screen.findByText('Skill 详情路由')).toBeInTheDocument();
+});
+
+it('旧通用 Skill 不伪造受控目录详情链接', async () => {
+  const legacySkill: GeneralSkillRead = {
+    ...galleryGeneralSkill,
+    id: 'legacy-general-skill',
+    slug: 'document-generation-for-proofs',
+    name: 'document-generation-for-proofs',
+    name_zh: '旧版文档生成',
+    metadata: { managed_catalog: false },
+  };
+  vi.mocked(api.get).mockImplementation(async (path: string) => {
+    if (path.includes('/api/enterprise/agents/gallery-page')) {
+      return galleryPage([]) as never;
+    }
+    if (path.includes('/api/enterprise/agents/overall')) {
+      return null as never;
+    }
+    if (path.startsWith('/api/enterprise/general-skills?')) return [legacySkill] as never;
+    return [] as never;
+  });
+
+  renderPage('/enterprise/platform/general-skills');
+
+  await userEvent.click(await screen.findByText('旧版文档生成'));
+  expect(screen.queryByRole('link', { name: '查看详情' })).not.toBeInTheDocument();
 });
 
 it('普通用户从开放广场直接安装 Skill 到本人能力分身', async () => {

@@ -77,6 +77,7 @@ def test_m55_upgrade_creates_derived_versions_without_reanchoring_old_instance()
         source_snapshot = db.exec(
             select(SkillVersion).where(
                 SkillVersion.skill_id == source_skill.skill_id,
+                SkillVersion.scope_agent_id == "",
                 SkillVersion.version == source_skill.version,
             )
         ).one()
@@ -94,7 +95,7 @@ def test_m55_upgrade_creates_derived_versions_without_reanchoring_old_instance()
         db.commit()
 
         source_snapshots = {
-            (row.skill_id, row.version): (row.id, row.content_json)
+            (row.skill_id, row.version, row.scope_agent_id): (row.id, row.content_json)
             for row in db.exec(select(SkillVersion)).all()
         }
         report = apply_m55_published_head_upgrade(
@@ -119,11 +120,12 @@ def test_m55_upgrade_creates_derived_versions_without_reanchoring_old_instance()
                 select(SkillVersion).where(
                     SkillVersion.tenant_id == skill.tenant_id,
                     SkillVersion.skill_id == skill.skill_id,
+                    SkillVersion.scope_agent_id == "",
                     SkillVersion.version == skill.version,
                 )
             ).one()
             source_id, source_content = source_snapshots[
-                (skill.skill_id, M55_SOURCE_VERSIONS[skill.skill_id])
+                (skill.skill_id, M55_SOURCE_VERSIONS[skill.skill_id], "")
             ]
             assert target.derived_from_version_id == source_id
             assert db.get(SkillVersion, source_id).content_json == source_content

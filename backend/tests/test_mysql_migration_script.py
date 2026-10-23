@@ -41,7 +41,7 @@ def test_mysql_check_returns_distinct_code_when_schema_is_stale(capsys, monkeypa
             backend="mysql",
             database_url="mysql+pymysql://user:***@127.0.0.1:3306/app",
             current_revision="20260830_0077",
-            head_revision="20260906_0083",
+            head_revision="20260928_0085",
         ),
     )
 
@@ -50,7 +50,7 @@ def test_mysql_check_returns_distinct_code_when_schema_is_stale(capsys, monkeypa
     assert "数据库需要迁移" in output
     assert "../scripts/migrate_mysql.py" in output
     assert "20260830_0077" in output
-    assert "20260906_0083" in output
+    assert "20260928_0085" in output
 
 
 def test_mysql_check_accepts_current_schema(capsys, monkeypatch) -> None:
@@ -63,8 +63,8 @@ def test_mysql_check_accepts_current_schema(capsys, monkeypatch) -> None:
         lambda: migration.MigrationStatus(
             backend="mysql",
             database_url="mysql+pymysql://user:***@127.0.0.1:3306/app",
-            current_revision="20260906_0083",
-            head_revision="20260906_0083",
+            current_revision="20260928_0085",
+            head_revision="20260928_0085",
         ),
     )
 

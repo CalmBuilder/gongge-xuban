@@ -183,6 +183,7 @@ def _published_snapshot(db: Session, skill: Skill, version: str) -> SkillVersion
         .where(
             SkillVersion.tenant_id == skill.tenant_id,
             SkillVersion.skill_id == skill.skill_id,
+            SkillVersion.scope_agent_id == "",
             SkillVersion.version == version,
             SkillVersion.status == "published",
         )

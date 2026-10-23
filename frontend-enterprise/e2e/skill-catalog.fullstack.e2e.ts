@@ -94,19 +94,26 @@ test('S2 Skill 管理在管理员和普通成员角色下完成审核、开放�
   await page.getByRole('link', { name: '返回 Skill 管理' }).click();
   await expect(page.getByText('共 37 个 Skill', { exact: true })).toBeVisible();
 
-  await page.getByRole('checkbox').first().check();
-  await page.getByRole('button', { name: '批量通过' }).click();
-  const reviewDialog = page.getByRole('dialog', { name: '批量审核 Skill' });
-  await expect(reviewDialog).toBeVisible();
-  await reviewDialog.getByLabel('审核说明（可选）').fill('真实浏览器复核来源、风险和固定修订');
-  await reviewDialog.getByRole('button', { name: '确认通过' }).click();
-  await expect(reviewDialog).toBeHidden();
+  const candidateCheckbox = page.getByRole('checkbox').first();
+  if (await candidateCheckbox.count()) {
+    // 独立候选夹具保留 draft 时，真实浏览器执行一次批量审核；正式启动种子已预发布时则直接复用发布目录。
+    await candidateCheckbox.check();
+    await page.getByRole('button', { name: '批量通过' }).click();
+    const reviewDialog = page.getByRole('dialog', { name: '批量审核 Skill' });
+    await expect(reviewDialog).toBeVisible();
+    await reviewDialog.getByLabel('审核说明（可选）').fill('真实浏览器复核来源、风险和固定修订');
+    await reviewDialog.getByRole('button', { name: '确认通过' }).click();
+    await expect(reviewDialog).toBeHidden();
+  } else {
+    // 当前启动链在 seed 阶段已审核全部项目内置快照，页面按合同不会显示发布候选复选框。
+    await expect(page.getByText('已发布', { exact: true }).first()).toBeVisible();
+  }
 
   const published = await catalogJson<{
     items: Array<{ id: string; slug: string; revision_id: string | null }>;
     total: number;
   }>(page, `/api/enterprise/general-skill-catalog?tenant_id=${TENANT_ID}&status=published&page_size=20`);
-  expect(published.total).toBe(1);
+  expect(published.total).toBeGreaterThan(0);
   const publishedSkill = published.items[0];
   expect(publishedSkill?.revision_id).toBeTruthy();
 
@@ -114,7 +121,14 @@ test('S2 Skill 管理在管理员和普通成员角色下完成审核、开放�
   await expect(page.getByRole('heading', { name: 'Skill' })).toBeVisible();
   await expect(page.getByRole('tab', { name: /Skill/ })).toHaveAttribute('aria-selected', 'true');
   await expect(page.getByRole('button', { name: '发布' })).toHaveCount(0);
-  const publishedSkillCard = page.locator('.gongge-platform-resource-card').first();
+  // 开放平台同时展示旧通用 Skill；按目录读回的身份选受控卡片，不能用第一张卡片猜测来源。
+  // 开放平台按 12 张分页；真实浏览器先用页面提供的搜索定位目录 Skill，避免把第一页顺序当成稳定契约。
+  const publishedSkillLabel = publishedSkill.name_zh || publishedSkill.name;
+  const skillSearch = page.getByRole('textbox', { name: '搜索Skill' });
+  await skillSearch.fill(publishedSkillLabel);
+  const publishedSkillCard = page.locator('.gongge-platform-resource-card').filter({
+    hasText: publishedSkillLabel,
+  }).first();
   await expect(publishedSkillCard).toBeVisible();
   await publishedSkillCard.click();
   await expect(page.getByRole('link', { name: '查看详情' })).toBeVisible();

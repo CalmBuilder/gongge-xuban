@@ -1,13 +1,14 @@
 """
-@Time       : 2026/07/22 14:25
+@Time       : 2026/10/05
 @Author     : zhanglp8181
 @File       : coordinator.py
 @CallChain  : Agent Loop → DeterministicSopCoordinator → Scheduler/ExecutionStore/服务执行器
-@Description: 连接确定性计划、不可变版本和可靠 Operation 回执，形成可恢复且不重复副作用的运行链。
+@Description: 连接确定性计划、冻结版本和Operation回执，原子交付可恢复且不重复副作用的结果。
 """
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from contextlib import AbstractContextManager
 from uuid import uuid4
@@ -16,10 +17,14 @@ from sqlmodel import Session, select
 
 from app.approvals import ApprovalRequestService
 from app.config import get_settings
+from app.core.time_context import normalize_persisted_time_context
 from app.db.models import (
     AgentEvent,
+    AgentProfile,
     ChatSession,
     ExecutionArtifact,
+    ExecutionResult,
+    ExecutionSignal,
     InputDocumentElement,
     InputResourceSnapshot,
     Message,
@@ -29,28 +34,35 @@ from app.db.models import (
     SelectedResourceExtraction,
     Skill,
     SkillVersion,
+    ScheduledTaskRun,
     SopInstance,
     SopNodeExecution,
     SopOperation,
     SopOperationAttempt,
     SopWorkItem,
     Tool,
+    User,
+    utc_now,
 )
 from app.dynamic_tasks.artifact_renderer import ArtifactRenderError, ArtifactRendererService
 from app.dynamic_tasks.capability_catalog import (
     ToolReliabilityContract,
     published_tool_snapshot,
 )
-from app.session.session_schema import KnowledgeQuery, StepAgentResult
+from app.session.helpers import public_session
 from app.session.input_bindings import InputBindingError
 from app.session.input_runtime import TurnInputRuntimeService
+from app.session.session_schema import KnowledgeQuery, StepAgentResult
+from app.memory.capture import memory_source_anchor_is_current, source_anchor_from_message
 from app.sop_runtime.capabilities import DEFAULT_CAPABILITY_REGISTRY
 from app.sop_runtime.definition import CollectInputNode, HumanTaskNode
 from app.sop_runtime.execution_store import (
     ACTIVE_INSTANCE_STATUSES,
     ExecutionLease,
+    SopExecutionConflictError,
     SopExecutionStore,
 )
+from app.sop_runtime.execution_control import ExecutionControlService
 from app.sop_runtime.contracts import IdempotencyPolicy, IdempotencyScope
 from app.sop_runtime.explicit_confirmation import resolve_explicit_confirmation_slots
 from app.sop_runtime.identity_context import (
@@ -62,6 +74,7 @@ from app.sop_runtime.legacy_skill_card_adapter import compile_legacy_skill_card
 from app.sop_runtime.scheduler import RuntimeAction, RuntimePlan, plan_next_action
 from app.sop_runtime.slot_values import canonicalize_slot_keys, normalize_slot_values
 from app.sop_runtime.work_items import SopWorkItemService, WorkItemError
+from app.sop_runtime.versioning import skill_content_checksum
 from app.tools import ToolExecutor
 from app.tools.tool_schema import ToolCall, ToolResult
 
@@ -157,7 +170,24 @@ class DeterministicSopCoordinator:
             return None
         chat_session.active_skill_id = instance.skill_id
         chat_session.active_step_id = instance.current_node_id
-        chat_session.slots_json = dict(instance.slots_json or {})
+        source_message = self.db.get(Message, instance.source_ref) if instance.source_ref else None
+        anchor = source_anchor_from_message(source_message) if source_message is not None else None
+        if (
+            chat_session.user_id
+            and source_message is not None
+            and anchor is not None
+            and not memory_source_anchor_is_current(
+                self.db,
+                tenant_id=chat_session.tenant_id,
+                user_id=chat_session.user_id,
+                anchor=anchor,
+            )
+        ):
+            # 记忆清空/撤权已经使原来源失效；保留实例版本和游标供审计，
+            # 但清除会话槽位，禁止旧事实穿过确认轮进入真实消费者。
+            chat_session.slots_json = {}
+        else:
+            chat_session.slots_json = dict(instance.slots_json or {})
         return instance
 
     def normalize_model_slot_updates(
@@ -313,10 +343,25 @@ class DeterministicSopCoordinator:
         model_result: StepAgentResult,
         *,
         user_message: str = "",
+        execution_org_unit_id: str | None = None,
+        time_context: Mapping[str, object] | None = None,
     ) -> StepAgentResult:
         """接收模型抽取的槽位后，由 Runtime 唯一决定等待、工具调用或完成。"""
 
         active_instance = self._active_instance(chat_session)
+        source_message_id = self._latest_user_message_id(chat_session)
+        (
+            incoming_time_context,
+            incoming_source_kind,
+            incoming_source_ref,
+        ) = self._resolve_input_time_context(
+            chat_session,
+            source_message_id=source_message_id,
+            time_context=time_context,
+        )
+        persisted_time_context = incoming_time_context or self._instance_time_context(
+            active_instance
+        )
         version, definition = (
             self._definition_for_instance(active_instance)
             if active_instance is not None
@@ -364,6 +409,7 @@ class DeterministicSopCoordinator:
                 definition,
                 model_result,
                 error,
+                time_context=persisted_time_context,
             )
         chat_session.slots_json = identity_resolution.slots
         model_result = model_result.model_copy(
@@ -384,18 +430,22 @@ class DeterministicSopCoordinator:
             initiator_user_id=chat_session.user_id,
             agent_id=chat_session.agent_id,
             slots=identity_resolution.slots,
-            context={"identity": identity_resolution.audit_context}
-            if identity_resolution.audit_context
-            else None,
+            context=self._instance_context(
+                identity=identity_resolution.audit_context,
+                time_context=persisted_time_context,
+            ),
             # 历史无 Agent 绑定的会话仍由旧 SOP 兼容路径托管；一旦会话带有
             # Agent 身份，则必须经过墓碑/租户/状态门禁，避免删除并发穿透。
             enforce_agent_lifecycle=chat_session.agent_id is not None,
         )
-        source_message_id = self._latest_user_message_id(chat_session)
         with self._owned(instance):
             if instance_created:
-                instance.source_kind = "chat"
-                instance.source_ref = source_message_id
+                if incoming_source_kind is not None and incoming_source_ref is not None:
+                    instance.source_kind = incoming_source_kind
+                    instance.source_ref = incoming_source_ref
+                elif source_message_id is not None:
+                    instance.source_kind = "chat"
+                    instance.source_ref = source_message_id
                 self.db.add(instance)
                 self.db.add(
                     AgentEvent(
@@ -417,10 +467,20 @@ class DeterministicSopCoordinator:
                 definition,
                 source_message_id=source_message_id,
             )
+            if instance.slots_json != (chat_session.slots_json or {}):
+                # 等待节点恢复会从会话槽位生成下一次输入快照；附件绑定先写入
+                # Execution 实例后必须同步回会话，否则恢复路径会立即用空槽位覆盖它。
+                chat_session.slots_json = dict(instance.slots_json or {})
+                self.db.add(chat_session)
             if identity_resolution.audit_context:
                 instance.context_json = {
                     **(instance.context_json or {}),
                     "identity": identity_resolution.audit_context,
+                }
+            if persisted_time_context is not None:
+                instance.context_json = {
+                    **(instance.context_json or {}),
+                    "time_context": persisted_time_context,
                 }
             current_node_id = instance.current_node_id or chat_session.active_step_id
             if not current_node_id:
@@ -437,14 +497,16 @@ class DeterministicSopCoordinator:
                     instance,
                     execution,
                     slots=chat_session.slots_json or {},
+                    resume_time_context=incoming_time_context,
                 )
             plan = self._advance_until_external_action(
                 chat_session,
                 instance,
                 execution,
                 definition,
+                execution_org_unit_id=execution_org_unit_id,
             )
-            return self.merge_plan(model_result, plan)
+            return self.merge_plan(model_result.mark_runtime_execution(instance.id), plan)
 
     def record_tool_result(
         self,
@@ -460,28 +522,148 @@ class DeterministicSopCoordinator:
         execution = self._current_execution(instance, instance.current_node_id or "")
         if execution is None:
             return None
-        operation = self.db.exec(
-            select(SopOperation)
-            .join(
-                SopOperationAttempt,
-                SopOperationAttempt.operation_id == SopOperation.id,
+        try:
+            operation = self.current_tool_operation(chat_session, tool_call)
+        except SopExecutionConflictError as exc:
+            return RuntimePlan(
+                action=RuntimeAction.FAIL,
+                node_id=execution.node_id,
+                operation_name=tool_call.name,
+                error_code=exc.code,
+                control_reply="当前工具请求与已持久化 Operation 不一致，系统拒绝继续派发。",
             )
-            .where(
-                SopOperation.tenant_id == instance.tenant_id,
-                SopOperation.instance_id == instance.id,
-                SopOperationAttempt.tenant_id == instance.tenant_id,
-                SopOperationAttempt.node_execution_id == execution.id,
-                SopOperation.operation_name == tool_call.name,
-                SopOperation.status.in_(("prepared", "running")),
-            )
-            .order_by(SopOperation.created_at.desc())
-        ).first()
         if operation is None:
             return None
+        if operation.status == "waiting_external":
+            return self._wait_for_operation_plan(
+                RuntimePlan(
+                    action=RuntimeAction.CALL_TOOL,
+                    node_id=execution.node_id,
+                    operation_name=operation.operation_name,
+                    operation_arguments=dict(operation.request_json or {}),
+                ),
+                operation,
+            )
+        if not tool_result.success and tool_result.error is not None and operation.status in {
+            "succeeded",
+            "failed",
+        }:
+            return RuntimePlan(
+                action=RuntimeAction.FAIL,
+                node_id=execution.node_id,
+                operation_name=operation.operation_name,
+                error_code=tool_result.error.code,
+                control_reply=tool_result.error.message,
+            )
+        if operation.status in {"unknown", "retry_wait"}:
+            if operation.status == "unknown":
+                with self.store.owned_for_reconciliation(instance, worker_id=self.worker_id):
+                    self.store._ensure_effect_reconciliation_attention(
+                        instance, operation, actor_user_id=instance.initiator_user_id or "",
+                    )
+            if (
+                not tool_result.success
+                and tool_result.error is not None
+                and tool_result.error.code
+                not in {
+                    "TOOL_CALL_OUTCOME_UNKNOWN",
+                    "RUNTIME_OPERATION_RECONCILIATION_REQUIRED",
+                    "RUNTIME_OPERATION_RETRY_WAIT",
+                }
+            ):
+                return RuntimePlan(
+                    action=RuntimeAction.FAIL,
+                    node_id=execution.node_id,
+                    operation_name=operation.operation_name,
+                    error_code=tool_result.error.code,
+                    control_reply=tool_result.error.message,
+                )
+            return self._wait_for_operation_plan(
+                RuntimePlan(
+                    action=RuntimeAction.CALL_TOOL,
+                    node_id=execution.node_id,
+                    operation_name=operation.operation_name,
+                    operation_arguments=dict(operation.request_json or {}),
+                ),
+                operation,
+            )
+        if operation.status in {"succeeded", "failed"}:
+            with self._owned(instance):
+                if execution.status == "running":
+                    self._restore_operation_receipt(instance, execution, operation)
+                    self.store.complete_node(
+                        instance,
+                        execution,
+                        output={"operation_id": operation.id, "restored": True},
+                    )
+                _, definition = self._definition_for_instance(instance)
+                return self._advance_until_external_action(
+                    chat_session,
+                    instance,
+                    execution,
+                    definition,
+                    current_already_completed=True,
+                )
         with self._owned(instance):
             if operation.status == "prepared":
                 self.store.start_operation(operation)
             error_payload = tool_result.error.model_dump(mode="json") if tool_result.error else {}
+            if tool_result.disposition == "accepted":
+                data = tool_result.data if isinstance(tool_result.data, Mapping) else {}
+                contract = (operation.capability_snapshot_json or {}).get("contract", {})
+                provider_task_id = str(data.get("provider_task_id") or "").strip()
+                status_url = str(contract.get("status_url") or "").strip()
+                if not provider_task_id or not status_url:
+                    self.store.mark_operation_unknown(
+                        operation,
+                        error={
+                            "code": "PROVIDER_TASK_RECEIPT_INVALID",
+                            "message": "provider_task 受理回执缺少任务身份或查询地址。",
+                        },
+                    )
+                    self.store._ensure_effect_reconciliation_attention(
+                        instance, operation, actor_user_id=instance.initiator_user_id or "",
+                    )
+                    return RuntimePlan(
+                        action=RuntimeAction.WAIT_OPERATION,
+                        node_id=execution.node_id,
+                        operation_name=operation.operation_name,
+                        error_code="RUNTIME_OPERATION_RECONCILIATION_REQUIRED",
+                        control_reply="外部任务受理回执不完整，系统已停止重复提交并等待对账。",
+                    )
+                self.store.mark_operation_waiting_external(
+                    operation,
+                    provider_task_id=provider_task_id,
+                    provider_status=str(data.get("provider_status") or "accepted"),
+                    receipt=data,
+                    status_url=status_url,
+                    tracking_seconds=int(contract.get("max_tracking_seconds") or 86400),
+                    poll_interval_seconds=int(contract.get("poll_interval_seconds") or 5),
+                )
+                return self._wait_for_operation_plan(
+                    RuntimePlan(
+                        action=RuntimeAction.CALL_TOOL,
+                        node_id=execution.node_id,
+                        operation_name=operation.operation_name,
+                        operation_arguments=dict(operation.request_json or {}),
+                    ),
+                    operation,
+                )
+            if tool_result.disposition == "unknown" and operation.effect_kind in {
+                "external_write",
+                "destructive",
+            }:
+                self.store.mark_operation_unknown(operation, error=error_payload)
+                self.store._ensure_effect_reconciliation_attention(
+                    instance, operation, actor_user_id=instance.initiator_user_id or "",
+                )
+                return RuntimePlan(
+                    action=RuntimeAction.WAIT_OPERATION,
+                    node_id=execution.node_id,
+                    operation_name=operation.operation_name,
+                    error_code="RUNTIME_OPERATION_RECONCILIATION_REQUIRED",
+                    control_reply="外部任务结果仍需对账，系统已停止重复提交。",
+                )
             if (
                 not tool_result.success
                 and operation.effect_kind == "external_write"
@@ -492,6 +674,9 @@ class DeterministicSopCoordinator:
                 )
             ):
                 self.store.mark_operation_unknown(operation, error=error_payload)
+                self.store._ensure_effect_reconciliation_attention(
+                    instance, operation, actor_user_id=instance.initiator_user_id or "",
+                )
                 return RuntimePlan(
                     action=RuntimeAction.WAIT_OPERATION,
                     node_id=execution.node_id,
@@ -651,6 +836,425 @@ class DeterministicSopCoordinator:
         with self._owned(instance):
             return self._resume_completed_work_item_owned(work_item, instance, execution)
 
+    def resume_reconciliation_attention(
+        self,
+        attention: SopWorkItem,
+        *,
+        worker_id: str,
+    ) -> RuntimePlan:
+        """在原API对账lease事务消费唯一signal后结算原动作；取消仅记账，正常走冻结定义。
+
+        先消费信号以保持原取消终态闭合；已生效只生成原对账身份元数据，comment留私密证据。
+        不新建Operation/Attempt，不重新提交原动作，也不从comment或失败回执拼造业务结果。
+        """
+
+        instance = self.db.get(SopInstance, attention.instance_id)
+        control = ExecutionControlService(self.db, self.store)
+        if (
+            instance is None or instance.kind != "sop" or attention.status != "completed"
+            or not control.is_external_reconciliation_attention(instance, attention)
+        ):
+            raise SopExecutionConflictError("SOP 对账工作项未绑定当前unknown外部效果。")
+        self.store.authorize_mutation(instance, "operation.reconciliation_resume")
+        operation = self.db.get(SopOperation, str(attention.payload_json.get("operation_id") or ""))
+        execution = self.db.get(
+            SopNodeExecution, str(attention.payload_json.get("node_execution_id") or ""),
+        )
+        if (
+            operation is None or execution is None or attention.source_ref != operation.id
+            or execution.tenant_id != instance.tenant_id or execution.instance_id != instance.id
+            or operation.node_execution_id != execution.id or execution.status != "waiting"
+        ):
+            raise SopExecutionConflictError("SOP 对账未绑定同一Operation及等待节点。")
+        resolution = attention.resolution_json or {}
+        command = str(resolution.get("command") or "")
+        actor_user_id = str(resolution.get("actor_user_id") or "")
+        if (
+            command not in {"confirm_applied", "confirm_not_applied"} or not actor_user_id
+            or resolution.get("revision") != attention.revision or not (attention.comment or "").strip()
+        ):
+            raise SopExecutionConflictError("SOP 对账缺少原完成revision、命令或证据。")
+        signal = self.db.exec(select(ExecutionSignal).where(
+            ExecutionSignal.tenant_id == instance.tenant_id,
+            ExecutionSignal.execution_id == instance.id,
+            ExecutionSignal.signal_type == "attention_decided",
+            ExecutionSignal.causation_id == f"{attention.id}:{attention.revision}",
+        )).first()
+        if (
+            signal is None or signal.status != "pending"
+            or signal.payload_json.get("attention_id") != attention.id
+            or signal.payload_json.get("command") != command
+            or signal.payload_json.get("revision") != attention.revision
+        ):
+            raise SopExecutionConflictError("SOP 对账缺少唯一且尚未消费的原恢复信号。")
+        cancellation_requested = instance.cancellation_requested_at is not None
+        chat_session = self.db.get(ChatSession, instance.session_id)
+        if chat_session is None or chat_session.tenant_id != instance.tenant_id:
+            raise SopExecutionConflictError("SOP 对账所属原会话不存在。")
+        if not cancellation_requested:
+            self.store.resume_waiting_node(instance, execution, slots=instance.slots_json or {})
+        applied = command == "confirm_applied"
+        evidence = {
+            "code": "MANUAL_RECONCILIATION", "actor_user_id": actor_user_id,
+            "attention_id": attention.id, "comment_present": bool(attention.comment),
+        }
+        data = {
+            "effect_status": "manually_confirmed", "operation_id": operation.id,
+            "external_reference": operation.external_reference or "",
+        }
+        control.claim_signal(signal, worker_id=worker_id, allow_archived_agent=True)
+        control.consume_signal(instance, signal, worker_id=worker_id)
+        settled = self.store.reconcile_operation(
+            instance, operation, succeeded=applied,
+            result={"data": data} if applied else None,
+            error=None if applied else evidence, effect_confirmed=applied,
+        )
+        if cancellation_requested or settled:
+            return RuntimePlan(action=RuntimeAction.FAIL, node_id=execution.node_id,
+                               error_code="RUNTIME_INSTANCE_CANCELLED")
+        chat_session.active_skill_id = instance.skill_id
+        chat_session.active_step_id = instance.current_node_id
+        chat_session.slots_json = dict(instance.slots_json or {})
+        if not applied:
+            self.store.fail_node(instance, execution, error=evidence)
+            self.store.fail_instance(instance, context_patch={"failure_code": "SOP_WRITE_NOT_APPLIED"})
+            self.db.add(chat_session)
+            return RuntimePlan(action=RuntimeAction.FAIL, node_id=execution.node_id,
+                               error_code="SOP_WRITE_NOT_APPLIED")
+        unavailable = self._current_runtime_actor_unavailable_code(instance)
+        if unavailable is not None:
+            # 治理人已确认的效果是独立事实。来源关闭只阻止普通推进，不得借最终消息
+            # 权限拒绝回滚该对账，也不能虚构一项原本不存在的用户取消请求。
+            self.store.fail_node(instance, execution, error={"code": unavailable})
+            instance.terminal_reason_json = {"code": unavailable}
+            self.db.add(instance)
+            self.store.fail_instance(instance, context_patch={"failure_code": unavailable})
+            self.db.add(chat_session)
+            return RuntimePlan(
+                action=RuntimeAction.FAIL, node_id=execution.node_id, error_code=unavailable,
+            )
+        self._restore_operation_receipt(instance, execution, operation)
+        self.store.complete_node(instance, execution, output={"operation_id": operation.id,
+                                                            "reconciled": True})
+        try:
+            _, definition = self._definition_for_instance(instance)
+        except ValueError as error:
+            raise SopExecutionConflictError("SOP 对账的冻结定义身份已失效。") from error
+        plan = self._advance_until_external_action(
+            chat_session, instance, execution, definition, current_already_completed=True,
+        )
+        plan = self._execute_resumed_tool_plans(
+            chat_session, instance, plan, execution_org_unit_id=None,
+            source="external_reconciliation_resume", durable_dispatch=True,
+        )
+        if plan.action is RuntimeAction.COMPLETE and instance.status == "succeeded":
+            self._deliver_external_completion(chat_session, instance, execution, operation)
+        self.db.add(chat_session)
+        return plan
+
+    def _current_runtime_actor_unavailable_code(self, instance: SopInstance) -> str | None:
+        """锁读原员工和发起人当前使用资格；旧无完整聊天身份保持原工具授权边界。"""
+
+        if not instance.agent_id:
+            return None
+        agent = self.db.get(
+            AgentProfile, instance.agent_id, populate_existing=True, with_for_update=True,
+        )
+        if agent is None or agent.tenant_id != instance.tenant_id or agent.status != "active":
+            return "AGENT_NOT_AVAILABLE"
+        if not instance.initiator_user_id:
+            return None
+        actor = self.db.get(
+            User, instance.initiator_user_id, populate_existing=True, with_for_update=True,
+        )
+        if (actor is None or actor.tenant_id != instance.tenant_id
+                or actor.membership_status != "active"):
+            return "SOP_ACTOR_NOT_ACTIVE"
+        from app.security.permissions import can_use_agent_in_chat
+
+        if not can_use_agent_in_chat(self.db, agent, actor, current=True):
+            return "SOP_ACTOR_PERMISSION_REVOKED"
+        return None
+
+    def resume_external_task_signal(
+        self,
+        *,
+        signal_id: str,
+        worker_id: str,
+    ) -> RuntimePlan:
+        """恢复原Operation并派发后继，成功后原子交付真实回执，保持旧动作和Turn幂等。"""
+
+        signal = self.db.get(ExecutionSignal, signal_id)
+        instance = self.db.get(SopInstance, signal.execution_id) if signal is not None else None
+        if (
+            signal is None
+            or signal.signal_type != "external_event"
+            or signal.payload_json.get("kind") != "external_task"
+            or instance is None
+            or instance.kind != "sop"
+            or signal.status != "claimed"
+            or signal.lease_owner != worker_id
+        ):
+            raise SopExecutionConflictError("SOP 外部回执 Signal 身份无效。")
+        operation = self.db.get(
+            SopOperation,
+            str(signal.payload_json.get("operation_id") or ""),
+        )
+        execution = self.db.get(
+            SopNodeExecution,
+            str(signal.payload_json.get("node_execution_id") or ""),
+        )
+        if (
+            operation is None
+            or execution is None
+            or operation.tenant_id != instance.tenant_id
+            or operation.instance_id != instance.id
+            or operation.node_execution_id != execution.id
+        ):
+            raise SopExecutionConflictError("SOP 外部回执未绑定同一 Operation/节点。")
+        if operation.status == "unknown":
+            with self._owned(instance):
+                self.store._ensure_effect_reconciliation_attention(
+                    instance,
+                    operation,
+                    actor_user_id=instance.initiator_user_id or "",
+                )
+                ExecutionControlService(self.db, self.store).consume_signal(
+                    instance,
+                    signal,
+                    worker_id=worker_id,
+                )
+            return RuntimePlan(
+                action=RuntimeAction.WAIT_OPERATION,
+                node_id=execution.node_id,
+                operation_name=operation.operation_name,
+                error_code="RUNTIME_OPERATION_RECONCILIATION_REQUIRED",
+                control_reply="外部结果需要对账，系统不会重新提交原动作。",
+            )
+        if operation.status not in {"succeeded", "failed"}:
+            raise SopExecutionConflictError("SOP 外部回执尚未形成终态 Operation。")
+        chat_session = self.db.get(ChatSession, instance.session_id)
+        if chat_session is None or chat_session.tenant_id != instance.tenant_id:
+            raise SopExecutionConflictError("SOP 外部回执所属会话不存在。")
+        with self._owned(instance):
+            chat_session.active_skill_id = instance.skill_id
+            chat_session.active_step_id = instance.current_node_id
+            chat_session.slots_json = dict(instance.slots_json or {})
+            if execution.status == "waiting" and instance.status == "waiting":
+                self.store.resume_waiting_node(
+                    instance,
+                    execution,
+                    slots=instance.slots_json or {},
+                )
+            self._restore_operation_receipt(instance, execution, operation)
+            if execution.status == "running":
+                self.store.complete_node(
+                    instance,
+                    execution,
+                    output={"operation_id": operation.id, "restored": True},
+                )
+            # 先在同一事务消费回执 Signal，再进入可能闭合实例的推进；否则终态门禁会把
+            # 当前已处理的 Signal 误当成活动阻塞事实。后继派发身份提交前异常可回滚重试；
+            # 提交后 Signal 已 consumed，外呼异常保留 running Operation 供原超时入口对账。
+            ExecutionControlService(self.db, self.store).consume_signal(
+                instance,
+                signal,
+                worker_id=worker_id,
+            )
+            _, definition = self._definition_for_instance(instance)
+            plan = self._advance_until_external_action(
+                chat_session,
+                instance,
+                execution,
+                definition,
+                current_already_completed=True,
+            )
+            plan = self._execute_resumed_tool_plans(
+                chat_session,
+                instance,
+                plan,
+                execution_org_unit_id=None,
+                source="external_task_resume",
+                durable_dispatch=True,
+            )
+            if plan.action is RuntimeAction.COMPLETE and instance.status == "succeeded":
+                self._deliver_external_completion(chat_session, instance, execution, operation)
+            self.db.add(chat_session)
+            return plan
+
+    def _external_completion_source(
+        self,
+        chat_session: ChatSession,
+        instance: SopInstance,
+        execution: SopNodeExecution,
+    ) -> tuple[Message, dict[str, str] | None] | None:
+        """从原工具节点输入绑定确认致因，并锁读本人及当前权限；不从最新消息猜来源。"""
+
+        if instance.source_kind != "chat" or not instance.agent_id or not instance.initiator_user_id:
+            # 历史无完整聊天身份的SOP仍沿原恢复合同推进，不捏造可反馈的用户来源。
+            return None
+        if (chat_session.tenant_id != instance.tenant_id
+                or chat_session.id != instance.session_id
+                or chat_session.user_id != instance.initiator_user_id
+                or chat_session.agent_id != instance.agent_id
+                or execution.tenant_id != instance.tenant_id
+                or execution.instance_id != instance.id):
+            raise SopExecutionConflictError("SOP 最终交付的会话身份已失效。")
+        raw_time = (execution.input_json or {}).get("time_context")
+        time_context = normalize_persisted_time_context(raw_time)
+        if raw_time is not None and time_context is None:
+            raise SopExecutionConflictError("SOP 最终交付的致因时间已损坏。")
+        if raw_time is None and instance.source_ref == instance.session_id:
+            # start_instance 的旧默认来源是会话ID，并非致因消息。保留原恢复合同，
+            # 不能从现存消息猜来源，也不为缺失聊天交付身份回滚已验证的流程终态。
+            return None
+        source_id = time_context["source_input_id"] if time_context else instance.source_ref
+        if not source_id:
+            return None
+        source = self.db.get(Message, source_id, populate_existing=True, with_for_update=True)
+        if (source is None or source.role != "user"
+                or source.tenant_id != instance.tenant_id
+                or source.session_id != instance.session_id):
+            raise SopExecutionConflictError("SOP 最终交付的原始输入已失效。")
+        if time_context is not None and normalize_persisted_time_context(
+            (source.metadata_json or {}).get("time_context"),
+            expected_source_input_id=source.id,
+        ) != time_context:
+            raise SopExecutionConflictError("SOP 最终交付的时间与原始输入不一致。")
+        actor = self.db.get(
+            User, instance.initiator_user_id, populate_existing=True, with_for_update=True,
+        )
+        agent = self.db.get(
+            AgentProfile, instance.agent_id, populate_existing=True, with_for_update=True,
+        )
+        from app.security.permissions import can_use_agent_in_chat
+
+        if (actor is None or actor.tenant_id != instance.tenant_id
+                or actor.membership_status != "active" or agent is None
+                or not can_use_agent_in_chat(self.db, agent, actor, current=True)):
+            raise SopExecutionConflictError("SOP 最终交付的本人权限已失效。")
+        version = self.db.get(
+            SkillVersion, instance.skill_version_id, populate_existing=True, with_for_update=True,
+        )
+        if (version is None or version.tenant_id != instance.tenant_id
+                or version.skill_id != instance.skill_id
+                or version.version != instance.skill_version
+                or version.compiled_definition_checksum != instance.definition_checksum):
+            raise SopExecutionConflictError("SOP 最终交付的冻结版本身份已失效。")
+        return source, time_context
+
+    def _deliver_external_completion(
+        self,
+        chat_session: ChatSession,
+        instance: SopInstance,
+        execution: SopNodeExecution,
+        operation: SopOperation,
+    ) -> Message | None:
+        """在原恢复事务和owner屏障内交付实际成功回执，保留旧Turn封口及一次消息语义。"""
+
+        if operation.status != "succeeded":
+            return None
+        self.db.flush()
+        binding = self._external_completion_source(chat_session, instance, execution)
+        if binding is None:
+            return None
+        self.store.authorize_mutation(instance, "result.external_chat_delivery")
+        source, time_context = binding
+        from app.feedback.source import feedback_source, freeze_execution_source
+        from app.observability.event_log import EventLog
+
+        client_turn_id = str((source.metadata_json or {}).get("client_turn_id") or "").strip()
+        events = EventLog(self.db)
+        events.bind_turn(source.id, client_turn_id or None)
+        turn_payload = {"turn_id": source.id, "user_message_id": source.id}
+        terminals = events.terminal_event_types(instance.tenant_id, instance.session_id, turn_payload)
+        if terminals - {"complete"}:
+            return None
+        result = self.db.get(ExecutionResult, instance.current_result_id)
+        if (result is None or result.tenant_id != instance.tenant_id
+                or result.execution_id != instance.id or result.status != "verified"):
+            raise SopExecutionConflictError("SOP 最终交付缺少同一实例的验证结果。")
+        for existing in self.db.exec(select(Message).where(
+            Message.tenant_id == instance.tenant_id, Message.session_id == instance.session_id,
+            Message.role == "assistant",
+        )).all():
+            metadata = existing.metadata_json or {}
+            if (metadata.get("execution_id") == instance.id
+                    and metadata.get("result_id") == result.id
+                    and (metadata.get("feedback_source") or {}).get("execution_status")
+                    == "succeeded"):
+                return existing
+        completed = self.db.exec(select(SopOperation).where(
+            SopOperation.tenant_id == instance.tenant_id,
+            SopOperation.instance_id == instance.id, SopOperation.status == "succeeded",
+        ).order_by(SopOperation.created_at, SopOperation.id)).all()
+        receipts = [row for row in completed if row.id == operation.id or row.external_task_id
+                    or row.effect_kind in {"external_write", "destructive"}]
+        reply = "流程已完成。以下是已确认的任务回执：\n\n" + json.dumps(
+            [dict(operation_name=row.operation_name,
+                  result=self._user_visible_operation_result(row)) for row in receipts],
+            ensure_ascii=False, sort_keys=True, indent=2,
+        )
+        metadata = {
+            "source": "runtime_control", "response_source": "runtime_control",
+            "render_policy": "verbatim", "execution_id": instance.id,
+            "result_id": result.id, "result_checksum": result.checksum,
+            "operation_ids": [row.id for row in receipts],
+            "user_message_id": source.id, "turn_id": source.id,
+            "feedback_source": freeze_execution_source(
+                self.db, chat_session, source.id, instance.id,
+            ),
+        }
+        if time_context is not None:
+            metadata["time_context"] = time_context
+        if client_turn_id:
+            metadata["client_turn_id"] = client_turn_id
+        message = Message(
+            tenant_id=instance.tenant_id, session_id=instance.session_id,
+            role="assistant", content=reply, metadata_json=metadata,
+        )
+        self.db.add(message)
+        self.db.flush()
+        if feedback_source(self.db, message).status != "verified":
+            raise SopExecutionConflictError("SOP 最终交付来源未通过现有反馈来源验证。")
+        chat_session.status = "active"
+        chat_session.summary = f"最近回复：{reply[:120]}"
+        chat_session.updated_at = utc_now()
+        self.db.add(chat_session)
+        payload = {
+            "message_id": message.id, "assistant_message_id": message.id, "reply": reply,
+            "execution_id": instance.id, "result_id": result.id,
+            "response_source": "runtime_control", "render_policy": "verbatim",
+        }
+        if time_context is not None:
+            payload["time_context"] = time_context
+        if not terminals:
+            events.record(instance.tenant_id, instance.session_id, "assistant_message_created", payload)
+            events.record_terminal_once(instance.tenant_id, instance.session_id, "complete", {
+                **payload, "status": "completed",
+            })
+        # 原waiting回复可能已结束同步Turn。最终业务消息供正常会话读回，不重开旧Turn；
+        # session_state_changed继续保持原会话状态投影语义，并携带实际交付身份。
+        events.record(instance.tenant_id, instance.session_id, "session_state_changed", {
+            **public_session(chat_session).model_dump(mode="json"), **payload,
+        })
+        return message
+
+    @staticmethod
+    def _user_visible_operation_result(operation: SopOperation) -> object | None:
+        """按原Operation冻结的用户schema投影实际data，缺schema失效关闭且不裁剪审计原件。"""
+
+        from app.dynamic_tasks.execution_context import project_result_for_model
+
+        view = (operation.capability_snapshot_json or {}).get("user_view")
+        schema = view.get("output_schema") if isinstance(view, Mapping) else None
+        data = (operation.result_json or {}).get("data")
+        if (not isinstance(schema, Mapping) or schema.get("type") != "object"
+                or not isinstance(data, dict)):
+            # 原已发布三视图的根schema为object；未知/缺失视图和不匹配原文均不扩张披露。
+            return None
+        return project_result_for_model(data, schema)
+
     def _resume_completed_work_item_owned(
         self,
         work_item: SopWorkItem,
@@ -738,8 +1342,10 @@ class DeterministicSopCoordinator:
         plan: RuntimePlan,
         *,
         execution_org_unit_id: str | None,
+        source: str = "work_item_resume",
+        durable_dispatch: bool = False,
     ) -> RuntimePlan:
-        """按冻结责任组织执行恢复后的工具，并持续消费结构化回执直到外部边界。"""
+        """执行后继工具；外部回执先提交派发身份，故障回滚不能抹去已发送的动作。"""
 
         current_plan = plan
         for _ in range(16):
@@ -750,12 +1356,22 @@ class DeterministicSopCoordinator:
                 arguments=current_plan.operation_arguments,
             )
             operation = self._running_operation(instance, tool_call.name)
-            if operation is not None and operation.status in {"retry_wait", "unknown"}:
+            if operation is not None and operation.status in {
+                "retry_wait",
+                "waiting_external",
+                "unknown",
+            }:
+                if operation.status == "unknown":
+                    self.store._ensure_effect_reconciliation_attention(
+                        instance,
+                        operation,
+                        actor_user_id=instance.initiator_user_id or "",
+                    )
                 return self._wait_for_operation_plan(current_plan, operation)
             started_payload = tool_call.model_dump(mode="json")
             if operation is not None:
                 started_payload["idempotency_key"] = operation.idempotency_key
-            started_payload["source"] = "work_item_resume"
+            started_payload["source"] = source
             self.db.add(
                 AgentEvent(
                     tenant_id=instance.tenant_id,
@@ -764,6 +1380,41 @@ class DeterministicSopCoordinator:
                     payload_json=started_payload,
                 )
             )
+            if durable_dispatch:
+                self.db.commit()
+                self.store.authorize_mutation(instance, "operation.resume_dispatch")
+
+            def authorize_http_dispatch() -> None:
+                """在原HTTP运输前复核同owner、当前来源及冻结工具；由原执行器提交后释放事务。"""
+
+                self.db.expire_all()
+                self.store.authorize_mutation(instance, "operation.resume_http_dispatch")
+                unavailable = self._current_runtime_actor_unavailable_code(instance)
+                if unavailable is not None:
+                    raise SopExecutionConflictError(f"SOP 后继当前来源已失效：{unavailable}。")
+                if (
+                    chat_session.tenant_id != instance.tenant_id
+                    or chat_session.id != instance.session_id
+                    or (instance.agent_id and chat_session.agent_id != instance.agent_id)
+                    or (instance.initiator_user_id
+                        and chat_session.user_id != instance.initiator_user_id)
+                ):
+                    raise SopExecutionConflictError("SOP 后继的原会话与发起人身份已失效。")
+                if operation is not None and not self.operation_capability_is_current(
+                    chat_session, operation,
+                ):
+                    raise SopExecutionConflictError("SOP 后继冻结工具合同已失效。")
+                authorization_error = ToolExecutor(self.db).authorize(
+                    instance.tenant_id, tool_call, instance.skill_id,
+                    chat_session.agent_id, chat_session.user_id,
+                    execution_org_unit_id=execution_org_unit_id,
+                    remote_idempotency_key=(
+                        operation.remote_idempotency_key if operation is not None else None
+                    ),
+                )
+                if authorization_error is not None:
+                    raise SopExecutionConflictError("SOP 后继当前工具授权已失效。")
+
             tool_result = ToolExecutor(self.db).execute(
                 instance.tenant_id,
                 tool_call,
@@ -774,10 +1425,11 @@ class DeterministicSopCoordinator:
                 remote_idempotency_key=(
                     operation.remote_idempotency_key if operation is not None else None
                 ),
+                **({"before_http_dispatch": authorize_http_dispatch} if durable_dispatch else {}),
             )
             finished_payload = tool_result.model_dump(mode="json")
             finished_payload["tool_call"] = tool_call.model_dump(mode="json")
-            finished_payload["source"] = "work_item_resume"
+            finished_payload["source"] = source
             if operation is not None:
                 finished_payload["idempotency_key"] = operation.idempotency_key
             self.db.add(
@@ -824,7 +1476,9 @@ class DeterministicSopCoordinator:
                 SopOperationAttempt.tenant_id == instance.tenant_id,
                 SopOperationAttempt.node_execution_id == execution.id,
                 SopOperation.operation_name == operation_name,
-                SopOperation.status.in_(("prepared", "running", "retry_wait", "unknown")),
+                SopOperation.status.in_(
+                    ("prepared", "running", "retry_wait", "waiting_external", "unknown")
+                ),
             )
             .order_by(SopOperation.created_at.desc())
         ).first()
@@ -1006,6 +1660,7 @@ class DeterministicSopCoordinator:
         definition,
         *,
         current_already_completed: bool = False,
+        execution_org_unit_id: str | None = None,
     ) -> RuntimePlan:
         """连续执行无副作用推进，直到等待、调用工具、完成或失败。"""
 
@@ -1149,14 +1804,47 @@ class DeterministicSopCoordinator:
                 if operation.status == "prepared":
                     self.store.start_operation(operation)
                     return plan
-                if operation.status in {"running", "retry_wait", "unknown"}:
+                if operation.status in {"running", "retry_wait", "waiting_external", "unknown"}:
                     if operation.status == "running":
                         self.store.mark_stale_running_operation_unknown(
                             operation,
                             timeout_seconds=float(get_settings().tool_timeout_seconds),
                         )
+                    elif operation.status == "unknown":
+                        self.store._ensure_effect_reconciliation_attention(
+                            instance,
+                            operation,
+                            actor_user_id=instance.initiator_user_id or "",
+                        )
                     return self._wait_for_operation_plan(plan, operation)
                 if operation.status in {"succeeded", "failed"}:
+                    authorization_error = ToolExecutor(self.db).authorize(
+                        tenant_id=instance.tenant_id,
+                        tool_call=ToolCall(
+                            name=operation.operation_name,
+                            arguments=dict(operation.request_json or {}),
+                        ),
+                        active_skill_id=instance.skill_id,
+                        agent_id=chat_session.agent_id,
+                        actor_user_id=chat_session.user_id,
+                        execution_org_unit_id=execution_org_unit_id,
+                        remote_idempotency_key=operation.remote_idempotency_key,
+                    )
+                    if authorization_error is not None:
+                        error = authorization_error.error
+                        return RuntimePlan(
+                            action=RuntimeAction.FAIL,
+                            node_id=current_execution.node_id,
+                            operation_name=operation.operation_name,
+                            error_code=(
+                                error.code if error is not None else "TOOL_AUTHORIZATION_REQUIRED"
+                            ),
+                            control_reply=(
+                                error.message
+                                if error is not None
+                                else "当前执行人无权恢复该工具操作。"
+                            ),
+                        )
                     self._restore_operation_receipt(instance, current_execution, operation)
                     if current_execution.status == "running":
                         self.store.complete_node(
@@ -1182,7 +1870,7 @@ class DeterministicSopCoordinator:
                 if operation.status == "prepared":
                     self.store.start_operation(operation)
                     return plan
-                if operation.status in {"running", "retry_wait", "unknown"}:
+                if operation.status in {"running", "retry_wait", "waiting_external", "unknown"}:
                     return self._wait_for_operation_plan(plan, operation)
                 if operation.status in {"succeeded", "failed"}:
                     self._restore_operation_receipt(instance, current_execution, operation)
@@ -1394,12 +2082,13 @@ class DeterministicSopCoordinator:
             return model_result.model_copy(
                 update={
                     "action": "reply",
-                    "reply": f"流程无法继续（{plan.error_code or 'RUNTIME_ERROR'}）。",
+                    "reply": plan.control_reply
+                    or f"流程无法继续（{plan.error_code or 'RUNTIME_ERROR'}）。",
                     "tool_call": None,
                     "next_step_id": None,
                     "is_step_completed": False,
                 }
-            )
+            ).mark_runtime_control_reply(plan.error_code or "RUNTIME_ERROR")
         return model_result
 
     def _latest_user_message_id(self, chat_session: ChatSession) -> str | None:
@@ -1415,6 +2104,55 @@ class DeterministicSopCoordinator:
             .order_by(Message.created_at.desc(), Message.id.desc())
         ).first()
         return message.id if message is not None else None
+
+    def _resolve_input_time_context(
+        self,
+        chat_session: ChatSession,
+        *,
+        source_message_id: str | None,
+        time_context: Mapping[str, object] | None,
+    ) -> tuple[dict[str, str] | None, str | None, str | None]:
+        """按 Message 或经归属校验的 ScheduledTaskRun 解析致因时间来源。"""
+
+        normalized = normalize_persisted_time_context(time_context)
+        if normalized is None:
+            return None, None, None
+        if source_message_id and normalized["source_input_id"] == source_message_id:
+            return normalized, "chat", source_message_id
+        run = self.db.get(ScheduledTaskRun, normalized["source_input_id"])
+        if run is None or not self._scheduled_run_matches_session(run, chat_session):
+            return None, None, None
+        return normalized, "schedule", run.id
+
+    @staticmethod
+    def _scheduled_run_matches_session(
+        run: ScheduledTaskRun,
+        chat_session: ChatSession,
+    ) -> bool:
+        """拒绝跨租户、跨会话、跨 Agent/用户或非活动调度 Run 伪造时间来源。"""
+
+        if run.source_kind not in {"schedule", "manual"}:
+            return False
+        if run.status not in {"queued", "running", "waiting"}:
+            return False
+        if (
+            run.tenant_id != chat_session.tenant_id
+            or run.session_id != chat_session.id
+            or not chat_session.agent_id
+            or not chat_session.user_id
+            or run.agent_id != chat_session.agent_id
+            or run.user_id != chat_session.user_id
+        ):
+            return False
+        snapshot = run.source_snapshot_json if isinstance(run.source_snapshot_json, Mapping) else {}
+        return all(
+            snapshot.get(key) == value
+            for key, value in (
+                ("tenant_id", run.tenant_id),
+                ("agent_id", run.agent_id),
+                ("initiator_user_id", run.user_id),
+            )
+        )
 
     def _bind_attachment_slots(self, instance: SopInstance, definition, *, source_message_id: str | None) -> None:
         """按发布槽位格式和顺序冻结消息附件，缺失槽位保持现有WAIT_INPUT语义。"""
@@ -1643,6 +2381,66 @@ class DeterministicSopCoordinator:
         operation = self._running_operation(instance, operation_name)
         return operation.remote_idempotency_key if operation is not None else None
 
+    def current_tool_operation(
+        self,
+        chat_session: ChatSession,
+        tool_call: ToolCall,
+    ) -> SopOperation | None:
+        """按当前节点、动作名称和严格请求指纹读取唯一 Operation。"""
+
+        instance = self._active_instance(chat_session)
+        if instance is None:
+            return None
+        execution = self._current_execution(instance, instance.current_node_id or "")
+        if execution is None:
+            return None
+        operations = self.db.exec(
+            select(SopOperation)
+            .join(
+                SopOperationAttempt,
+                SopOperationAttempt.operation_id == SopOperation.id,
+            )
+            .where(
+                SopOperation.tenant_id == instance.tenant_id,
+                SopOperation.instance_id == instance.id,
+                SopOperationAttempt.tenant_id == instance.tenant_id,
+                SopOperationAttempt.node_execution_id == execution.id,
+                SopOperation.operation_name == tool_call.name,
+            )
+            .order_by(SopOperation.created_at.desc(), SopOperation.id.desc())
+        ).all()
+        if not operations:
+            return None
+        fingerprint = self.store.request_fingerprint(tool_call.arguments)
+        exact = next(
+            (operation for operation in operations if operation.request_fingerprint == fingerprint),
+            None,
+        )
+        if exact is not None:
+            return exact
+        raise SopExecutionConflictError(
+            "当前 SOP 节点已有同名 Operation，但请求指纹不一致，拒绝复用或重新派发。"
+        )
+
+    def operation_capability_is_current(
+        self,
+        chat_session: ChatSession,
+        operation: SopOperation,
+    ) -> bool:
+        """比较 Operation 冻结能力快照与当前发布快照，防止能力漂移绕过再授权。"""
+
+        if not operation.capability_checksum:
+            return True
+        snapshot, checksum, _policy = self._operation_capability_contract(
+            operation.tenant_id,
+            operation.operation_name,
+            chat_session.agent_id,
+        )
+        return (
+            checksum == operation.capability_checksum
+            and snapshot == dict(operation.capability_snapshot_json or {})
+        )
+
     def _operation_effect_kind(self, tenant_id: str, operation_name: str) -> str:
         """优先采用已发布风险契约，无契约 SOP 仍保持旧 GET/保守写兼容。"""
 
@@ -1700,7 +2498,14 @@ class DeterministicSopCoordinator:
     def _is_ambiguous_external_failure(code: str, message: str) -> bool:
         """保守识别请求可能已到达远端但回执不确定的传输错误。"""
 
-        if code in {"TIMEOUT", "EXECUTION_ERROR", "MCP_ERROR", "MCP_EXECUTION_ERROR"}:
+        if code in {
+            "TIMEOUT",
+            "EXECUTION_ERROR",
+            "MCP_ERROR",
+            "MCP_EXECUTION_ERROR",
+            "TOOL_CALL_OUTCOME_UNKNOWN",
+            "RUNTIME_OPERATION_RECONCILIATION_REQUIRED",
+        }:
             return True
         if code != "HTTP_ERROR":
             return False
@@ -1712,6 +2517,7 @@ class DeterministicSopCoordinator:
 
         unknown = operation.status == "unknown"
         retry_wait = operation.status == "retry_wait"
+        waiting_external = operation.status == "waiting_external"
         return RuntimePlan(
             action=RuntimeAction.WAIT_OPERATION,
             node_id=plan.node_id,
@@ -1721,6 +2527,8 @@ class DeterministicSopCoordinator:
                 if unknown
                 else "RUNTIME_OPERATION_RETRY_WAIT"
                 if retry_wait
+                else "RUNTIME_OPERATION_WAITING_EXTERNAL"
+                if waiting_external
                 else "RUNTIME_OPERATION_IN_PROGRESS"
             ),
             control_reply=(
@@ -1728,6 +2536,8 @@ class DeterministicSopCoordinator:
                 if unknown
                 else "操作正在等待下一次重试，系统不会重复提交。"
                 if retry_wait
+                else "外部任务已受理，系统将查询同一任务，不会重复提交。"
+                if waiting_external
                 else "外部操作仍在处理中，系统不会重复提交。"
             ),
         )
@@ -1766,18 +2576,23 @@ class DeterministicSopCoordinator:
         self.db.add(instance)
 
     def _published_definition(self, skill: Skill):
-        """读取技能当前不可变发布版本并重新校验其规范定义 checksum。"""
+        """按服务端可见投影的精确范围读取发布身份，禁止跨员工或整体猜测。"""
 
+        branch_meta = getattr(skill, "agent_branch_meta", {})
+        scope_agent_id = branch_meta.get("agent_id") or ""
         version = self.db.exec(
             select(SkillVersion).where(
                 SkillVersion.tenant_id == skill.tenant_id,
                 SkillVersion.skill_id == skill.skill_id,
+                SkillVersion.scope_agent_id == scope_agent_id,
                 SkillVersion.version == skill.version,
                 SkillVersion.status == "published",
             )
         ).first()
         if version is None:
             raise ValueError("deterministic SOP 缺少对应的不可变发布版本")
+        if skill_content_checksum(version.content_json) != skill_content_checksum(skill.content_json):
+            raise ValueError("deterministic SOP 的活动头与精确发布快照不一致")
         definition = compile_legacy_skill_card(version.content_json)
         if (
             version.compiled_definition_checksum
@@ -1799,6 +2614,8 @@ class DeterministicSopCoordinator:
         definition,
         model_result: StepAgentResult,
         error: SopIdentityContextError,
+        *,
+        time_context: Mapping[str, object] | None = None,
     ) -> StepAgentResult:
         """把身份校验失败写入实例和节点事实，并返回稳定用户提示。"""
 
@@ -1827,7 +2644,10 @@ class DeterministicSopCoordinator:
             start_node_id=definition.start_node_id,
             agent_id=chat_session.agent_id,
             slots=sanitized_slots,
-            context={"identity": identity_error},
+            context=self._instance_context(
+                identity=identity_error,
+                time_context=time_context,
+            ),
             # 身份失败也要沿用同一条兼容边界：Agent-scoped 会话受生命周期
             # 门禁保护，历史无 Agent 会话不因新增门禁而无法收口失败事实。
             enforce_agent_lifecycle=chat_session.agent_id is not None,
@@ -1837,6 +2657,11 @@ class DeterministicSopCoordinator:
                 **(instance.context_json or {}),
                 "identity": identity_error,
             }
+            if time_context is not None:
+                instance.context_json = {
+                    **(instance.context_json or {}),
+                    "time_context": dict(time_context),
+                }
             execution = self._current_execution(
                 instance,
                 instance.current_node_id or definition.start_node_id,
@@ -1871,7 +2696,7 @@ class DeterministicSopCoordinator:
                 "handoff": False,
             }
         )
-        return result.mark_runtime_control_reply(error.code)
+        return result.mark_runtime_execution(instance.id).mark_runtime_control_reply(error.code)
 
     def _definition_for_instance(self, instance: SopInstance):
         """按实例绑定的版本 ID 读取定义，防止运行中漂移到最新版本。"""
@@ -1957,6 +2782,31 @@ class DeterministicSopCoordinator:
         }
 
     @staticmethod
+    def _instance_time_context(instance: SopInstance | None) -> dict[str, str] | None:
+        """从已持久执行实例读取并校验其致因输入时间，拒绝损坏侧带。"""
+
+        if instance is None:
+            return None
+        context = instance.context_json or {}
+        return normalize_persisted_time_context(context.get("time_context"))
+
+    @staticmethod
+    def _instance_context(
+        *,
+        identity: Mapping[str, object] | None = None,
+        time_context: Mapping[str, object] | None = None,
+    ) -> dict[str, object] | None:
+        """构造 SOP 实例初始上下文，只写入已验证的身份与输入时间事实。"""
+
+        context: dict[str, object] = {}
+        if identity:
+            context["identity"] = dict(identity)
+        normalized_time_context = normalize_persisted_time_context(time_context)
+        if normalized_time_context is not None:
+            context["time_context"] = normalized_time_context
+        return context or None
+
+    @staticmethod
     def _node_input_snapshot(instance: SopInstance) -> dict[str, object]:
         """构造同时包含业务槽位和身份来源的节点输入审计快照。"""
 
@@ -1964,6 +2814,11 @@ class DeterministicSopCoordinator:
         identity = (instance.context_json or {}).get("identity")
         if isinstance(identity, Mapping) and identity:
             snapshot["identity"] = dict(identity)
+        time_context = normalize_persisted_time_context(
+            (instance.context_json or {}).get("time_context")
+        )
+        if time_context is not None:
+            snapshot["time_context"] = time_context
         return snapshot
 
 

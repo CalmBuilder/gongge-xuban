@@ -1,5 +1,5 @@
 """
-@Time       : 2026/09/02 10:00
+@Time       : 2026/10/04
 @Author     : zhanglp8181
 @File       : executor.py
 @CallChain  : DynamicTaskAgent → VerticalAbilityToolExecutor → frozen snapshot → adapter
@@ -61,8 +61,9 @@ class VerticalAbilityToolExecutor:
         remote_idempotency_key: str | None = None,
         execution_id: str | None = None,
         is_cancelled: Callable[[], bool] | None = None,
+        before_http_dispatch: Callable[[], None] | None = None,
     ) -> ToolResult:
-        """校验能力包已冻结到指定 Execution 后分派适配器，否则委托普通工具路径。"""
+        """校验能力包冻结归属；普通工具委托时保留原HTTP发送守卫。"""
 
         definition = self.resolver.find_definition_for_capability(tool_call.name)
         instance = self.db.get(SopInstance, execution_id) if execution_id else None
@@ -84,6 +85,8 @@ class VerticalAbilityToolExecutor:
                 remote_idempotency_key=remote_idempotency_key,
                 execution_id=execution_id,
                 is_cancelled=is_cancelled,
+                **({"before_http_dispatch": before_http_dispatch}
+                   if before_http_dispatch is not None else {}),
             )
         if not execution_id:
             return self._error(tool_call.name, "VERTICAL_ABILITY_EXECUTION_REQUIRED", "内置垂直能力只能在动态 Execution 中调用。")

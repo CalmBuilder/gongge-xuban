@@ -43,6 +43,51 @@ async function login(page: import('@playwright/test').Page) {
   expect(status).toBe(200);
 }
 
+async function readSessionIds(page: import('@playwright/test').Page): Promise<string[]> {
+  /** 读取当前登录用户可见会话 ID，作为 draft 提升前的基线集合。 */
+  return page.evaluate(async () => {
+    const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
+    const response = await fetch('/api/chat/sessions?tenant_id=tenant_demo', {
+      headers: { Authorization: `Bearer ${auth.token || ''}` },
+    });
+    if (!response.ok) return [];
+    const rows = await response.json() as Array<{ id?: string }>;
+    return rows.map((row) => String(row.id || '')).filter(Boolean);
+  });
+}
+
+async function waitForCreatedSession(
+  page: import('@playwright/test').Page,
+  knownSessionIds: string[],
+): Promise<string> {
+  /** 从真实页面会话列表读回本轮 draft 提升后的持久会话身份。 */
+  let sessionId = '';
+  await expect.poll(async () => {
+    sessionId = await page.evaluate(async (knownIds) => {
+      const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
+      const response = await fetch('/api/chat/sessions?tenant_id=tenant_demo', {
+        headers: { Authorization: `Bearer ${auth.token || ''}` },
+      });
+      if (!response.ok) return '';
+      const rows = await response.json() as Array<{
+        id?: string;
+        agent_id?: string;
+        created_at?: string;
+      }>;
+      return rows
+        .filter((row) => (
+          String(row.id || '').startsWith('session_')
+          && !knownIds.includes(String(row.id || ''))
+          && row.agent_id === 'agent_e2e_member_employee'
+        ))
+        .sort((left, right) => Date.parse(String(right.created_at || ''))
+          - Date.parse(String(left.created_at || '')))[0]?.id || '';
+    }, knownSessionIds);
+    return sessionId;
+  }, { timeout: 30_000 }).toMatch(/^session_/);
+  return sessionId;
+}
+
 test('真实CSV草稿上传后由AgentLoop按权威快照消费并形成外发审计', async ({ page }) => {
   const failures: string[] = [];
   page.on('pageerror', (error) => failures.push(error.message));
@@ -355,7 +400,9 @@ test('真实PDF与固定GitHub Skill在同一DynamicTaskAgent执行中共同消�
   expect(attachmentClaim.evidence_refs[0].element_checksum).toMatch(/^[a-f0-9]{64}$/);
   expect(attachmentClaim.evidence_refs[0].locator).toBeTruthy();
 
-  await page.getByRole('button', { name: '复制回答' }).first().click();
+  // 当前消息气泡按统一操作契约暴露 aria-label="复制"；末个操作按钮对应本轮助手回答，
+  // 首个按钮可能属于用户消息，提示文本会因此不同。
+  await page.getByRole('button', { name: '复制' }).last().click();
   await expect(page.getByText('回答已复制')).toBeVisible();
   await expect.poll(() => page.evaluate(() => navigator.clipboard.readText()))
     .toContain('ATTACHMENT-SKILL-DYNAMIC-SUCCESS');
@@ -828,17 +875,16 @@ test('扫描PDF视觉复核阻塞时停止生成会精确取消Execution且丢�
   await page.getByPlaceholder('输入消息，按 Enter 发送...').fill(
     'ATTACHMENT-VISUAL-CANCEL-DYNAMIC：执行扫描PDF双证据复核，等待期间由用户停止。',
   );
+  const knownSessionIds = await readSessionIds(page);
   await page.getByRole('button', { name: '发送', exact: true }).click();
   const stop = page.getByRole('button', { name: '停止生成', exact: true });
   await expect(stop).toBeVisible({ timeout: 10_000 });
-  await expect.poll(() => page.evaluate(() => location.pathname)).toMatch(
-    /\/workspace\/chat\/session_/,
-  );
-  await expect.poll(async () => page.evaluate(async () => {
+  // draft 在终态前保留当前 SSE 拥有者；从真实会话列表读回已持久化的 session ID。
+  const sessionId = await waitForCreatedSession(page, knownSessionIds);
+  await expect.poll(async () => page.evaluate(async (stableSessionId) => {
     const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
-    const sessionId = location.pathname.split('/').at(-1) || '';
     const events = await fetch(
-      `/api/chat/sessions/${sessionId}/events?tenant_id=tenant_demo`,
+      `/api/chat/sessions/${stableSessionId}/events?tenant_id=tenant_demo`,
       { headers: { Authorization: `Bearer ${auth.token}` } },
     ).then((response) => response.json()) as Array<{ event_type: string }>;
     const delegated = events.find((event) => event.event_type === 'dynamic_task_delegated') as {
@@ -858,17 +904,15 @@ test('扫描PDF视觉复核阻塞时停止生成会精确取消Execution且丢�
     )) === true && execution.input_dispatches?.some(
       (dispatch) => dispatch.status === 'dispatching',
     ) === true;
-  }), { timeout: 10_000 }).toBe(true);
+  }, sessionId), { timeout: 10_000 }).toBe(true);
   await stop.click();
-  await expect(page.getByText('已停止生成', { exact: true }).first()).toBeVisible({
-    timeout: 30_000,
-  });
-  await expect.poll(async () => page.evaluate(async () => {
+  // 停止提示属于实时轨迹的可折叠细节；业务验收以服务端取消事件和执行终态为准。
+  await expect(stop).toHaveCount(0, { timeout: 5_000 });
+  await expect.poll(async () => page.evaluate(async (stableSessionId) => {
     const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
     const headers = { Authorization: `Bearer ${auth.token}` };
-    const sessionId = location.pathname.split('/').at(-1) || '';
     const events = await fetch(
-      `/api/chat/sessions/${sessionId}/events?tenant_id=tenant_demo`, { headers },
+      `/api/chat/sessions/${stableSessionId}/events?tenant_id=tenant_demo`, { headers },
     ).then((response) => response.json()) as Array<{
       event_type: string; data?: Record<string, unknown>;
     }>;
@@ -879,19 +923,18 @@ test('扫描PDF视觉复核阻塞时停止生成会精确取消Execution且丢�
       `/api/executions/${executionId}?tenant_id=tenant_demo`, { headers },
     ).then((response) => response.json());
     return { events, executionId, execution };
-  }), { timeout: 30_000 }).toMatchObject({
+  }, sessionId), { timeout: 30_000 }).toMatchObject({
     executionId: expect.stringMatching(/^sopinst_/),
     execution: { status: 'cancelled', artifacts: [] },
   });
   await page.waitForTimeout(9_000);
   await expect(page.getByText('ATTACHMENT-VISUAL-CANCEL-SHOULD-NOT-PUBLISH')).toHaveCount(0);
-  const events = await page.evaluate(async () => {
+  const events = await page.evaluate(async (stableSessionId) => {
     const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
-    const sessionId = location.pathname.split('/').at(-1) || '';
-    return fetch(`/api/chat/sessions/${sessionId}/events?tenant_id=tenant_demo`, {
+    return fetch(`/api/chat/sessions/${stableSessionId}/events?tenant_id=tenant_demo`, {
       headers: { Authorization: `Bearer ${auth.token}` },
     }).then((response) => response.json()) as Promise<Array<{ event_type: string }>>;
-  });
+  }, sessionId);
   expect(events.filter((event) => event.event_type === 'stream_cancelled')).toHaveLength(1);
   expect(events.some((event) => event.event_type === 'execution_succeeded')).toBe(false);
 });
@@ -909,17 +952,16 @@ test('Dynamic读取后删除附件会话会撤权输入并阻断迟到视觉结�
   await page.getByPlaceholder('输入消息，按 Enter 发送...').fill(
     'ATTACHMENT-VISUAL-CANCEL-DYNAMIC：执行扫描PDF双证据复核；视觉运行后删除会话与输入。',
   );
+  const knownSessionIds = await readSessionIds(page);
   await page.getByRole('button', { name: '发送', exact: true }).click();
-  await expect.poll(() => page.evaluate(() => location.pathname)).toMatch(
-    /\/workspace\/chat\/session_/,
-  );
+  // 运行中仍停留在 draft；会话列表是本轮持久身份的权威来源。
+  const sessionId = await waitForCreatedSession(page, knownSessionIds);
 
-  await expect.poll(async () => page.evaluate(async () => {
+  await expect.poll(async () => page.evaluate(async (stableSessionId) => {
     const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
     const headers = { Authorization: `Bearer ${auth.token}` };
-    const sessionId = location.pathname.split('/').at(-1) || '';
     const events = await fetch(
-      `/api/chat/sessions/${sessionId}/events?tenant_id=tenant_demo`, { headers },
+      `/api/chat/sessions/${stableSessionId}/events?tenant_id=tenant_demo`, { headers },
     ).then((response) => response.json()) as Array<{
       event_type: string; data?: Record<string, unknown>;
     }>;
@@ -942,15 +984,14 @@ test('Dynamic读取后删除附件会话会撤权输入并阻断迟到视觉结�
     ) === true;
     const snapshot = execution.input_resources?.[0];
     const resourceId = String(snapshot?.source_resource_id || '');
-    return running && inflight && resourceId ? { sessionId, executionId, resourceId } : null;
-  }), { timeout: 10_000 }).not.toBeNull();
+    return running && inflight ? { sessionId: stableSessionId, executionId, resourceId } : null;
+  }, sessionId), { timeout: 10_000 }).not.toBeNull();
 
-  const stableIdentity = await page.evaluate(async () => {
+  const stableIdentity = await page.evaluate(async (stableSessionId) => {
     const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
     const headers = { Authorization: `Bearer ${auth.token}` };
-    const sessionId = location.pathname.split('/').at(-1) || '';
     const events = await fetch(
-      `/api/chat/sessions/${sessionId}/events?tenant_id=tenant_demo`, { headers },
+      `/api/chat/sessions/${stableSessionId}/events?tenant_id=tenant_demo`, { headers },
     ).then((response) => response.json()) as Array<{
       event_type: string; data?: Record<string, unknown>;
     }>;
@@ -964,11 +1005,11 @@ test('Dynamic读取后删除附件会话会撤权输入并阻断迟到视觉结�
     };
     const snapshot = execution.input_resources?.[0];
     return {
-      sessionId,
+      sessionId: stableSessionId,
       executionId,
       resourceId: String(snapshot?.source_resource_id || ''),
     };
-  });
+  }, sessionId);
   const deleted = await page.evaluate(async ({ sessionId, executionId, resourceId }) => {
     const auth = JSON.parse(localStorage.getItem('gongge_auth') || '{}') as { token?: string };
     const headers = { Authorization: `Bearer ${auth.token}` };

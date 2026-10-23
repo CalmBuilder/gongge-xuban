@@ -407,6 +407,7 @@ def test_curated_gallery_seed_publishes_expense_identity_version() -> None:
             select(SkillVersion).where(
                 SkillVersion.skill_id == "skill_expense_quota_query",
                 SkillVersion.version == "2.3.0",
+                SkillVersion.scope_agent_id == "",
             )
         ).one()
         collect_node = next(
@@ -471,6 +472,7 @@ def test_curated_gallery_seed_publishes_leave_balance_deterministic_version() ->
             select(SkillVersion).where(
                 SkillVersion.skill_id == "skill_leave_balance_query",
                 SkillVersion.version == "2.2.0",
+                SkillVersion.scope_agent_id == "",
             )
         ).one()
         collect_node = next(
@@ -625,7 +627,8 @@ def test_demo_seed_publishes_participant_acceptance_slice_idempotently() -> None
         ).one()
         skill = db.exec(select(Skill).where(Skill.skill_id == "participant_approval_demo")).one()
         versions = db.exec(
-            select(SkillVersion).where(SkillVersion.skill_id == "participant_approval_demo")
+            select(SkillVersion).where(SkillVersion.skill_id == "participant_approval_demo",
+                                       SkillVersion.scope_agent_id == "")
         ).all()
 
         assert assignment.status == "active"
@@ -635,7 +638,7 @@ def test_demo_seed_publishes_participant_acceptance_slice_idempotently() -> None
 
 
 def test_demo_seed_freezes_initial_legacy_published_heads_idempotently() -> None:
-    """验证新库初始化时四个兼容 SOP 同步写入可追溯且不重复的发布快照。"""
+    """验证四个整体兼容SOP的发布快照不重复，员工scope不混入整体头统计。"""
 
     expected_skill_ids = {
         "after_sales_exchange",
@@ -647,7 +650,8 @@ def test_demo_seed_freezes_initial_legacy_published_heads_idempotently() -> None
         seed_demo_data(db)
         seed_demo_data(db)
         versions = db.exec(
-            select(SkillVersion).where(SkillVersion.skill_id.in_(expected_skill_ids))
+            select(SkillVersion).where(SkillVersion.skill_id.in_(expected_skill_ids),
+                                       SkillVersion.scope_agent_id == "")
         ).all()
         heads = db.exec(
             select(Skill).where(Skill.skill_id.in_(expected_skill_ids))

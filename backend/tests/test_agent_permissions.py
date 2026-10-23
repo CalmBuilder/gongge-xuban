@@ -1,3 +1,11 @@
+"""
+@Time       : 2026/10/20
+@Author     : zhanglp8181
+@File       : test_agent_permissions.py
+@CallChain  : pytest → Agent API/分支权限 → 记忆作用域与租户隔离
+@Description: 验证 Agent 资源、员工分支和记忆作用域的权限边界及历史消息保留。
+"""
+
 from __future__ import annotations
 
 import pytest
@@ -23,6 +31,7 @@ from app.agents.schema import (
 from app.api.agents import (
     create_agent,
     delete_agent,
+    get_overall_agent_profile,
     list_agents,
     list_chat_agents,
     remove_chat_agent_usage,
@@ -44,6 +53,7 @@ from app.db.models import (
     CodeItem,
     GeneralSkill,
     ManagementAuditLog,
+    MemoryCaptureScope,
     Message,
     ModelConfig,
     OrganizationUnit,
@@ -59,6 +69,33 @@ from app.security.permissions import (
 )
 from app.organization.reference_data import ensure_agent_category_catalog
 from app.tools.tool_schema import ToolCreateRequest, ToolUpdateRequest
+
+
+def test_overall_agent_profile_reads_only_current_tenant() -> None:
+    """整体员工读取只返回当前租户对象，并拒绝跨租户请求。"""
+
+    with _test_session() as db:
+        _owner, _other, admin = _seed_users(db)
+        overall = AgentProfile(
+            id="agent_overall_read",
+            tenant_id="tenant_demo",
+            name="整体员工",
+            is_overall=True,
+            status="active",
+        )
+        db.add(overall)
+        db.commit()
+
+        result = get_overall_agent_profile("tenant_demo", db=db, current_user=admin)
+        assert result is not None
+        assert result.id == overall.id
+        assert result.is_overall is True
+
+        db.add(Tenant(id="another_tenant", name="另一个租户"))
+        db.commit()
+        with pytest.raises(HTTPException) as tenant_error:
+            get_overall_agent_profile("another_tenant", db=db, current_user=admin)
+        assert tenant_error.value.status_code == 403
 
 
 def test_database_default_model_is_authoritative_over_demo_seed_environment(monkeypatch) -> None:
@@ -1025,6 +1062,15 @@ def test_relationship_scopes_and_remove_usage_preserve_chat_history() -> None:
         assert db.get(ChatSession, session.id) is not None
         assert db.get(Message, "message_usage_history") is not None
         assert list_agents("tenant_demo", db, owner, "used") == []
+        scope = db.exec(
+            select(MemoryCaptureScope).where(
+                MemoryCaptureScope.tenant_id == "tenant_demo",
+                MemoryCaptureScope.user_id == owner.id,
+                MemoryCaptureScope.scope_kind == "agent",
+                MemoryCaptureScope.agent_scope_key == gallery.id,
+            )
+        ).one()
+        assert scope.permission_generation == 1
 
 
 def test_manageable_scope_includes_governance_rows_without_granting_owner_edit(

@@ -7,13 +7,19 @@
 """
 
 import hashlib
-from datetime import datetime
+import importlib.util
+import json
+import re
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+from pathlib import Path
 
 import pytest
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from app.core.agent_loop import AgentLoop
+from app.core.time_context import freeze_time_context
 from app.db.demo_sop_versions import _partner_due_diligence_content
 from app.db.models import (
     AgentProfile,
@@ -27,6 +33,8 @@ from app.db.models import (
     Message,
     MessageInputBindingLink,
     MessageInputResourceLink,
+    MemoryCaptureScope,
+    ModelConfig,
     ProviderInputDispatchReceipt,
     ResourceSessionBinding,
     SelectedResourceExtraction,
@@ -35,17 +43,22 @@ from app.db.models import (
     SopInstance,
     SopNodeExecution,
     SopOperation,
+    ScheduledTaskRun,
     Tool,
     User,
 )
+from app.agents.branching import project_skill_with_branch
 from app.dynamic_tasks.capability_catalog import ToolReliabilityContract, publish_tool_contract
+from app.llm.client import LLMClient
 from app.knowledge.schema import KnowledgeSearchResponse
+from app.memory.capture import freeze_memory_source_anchor
 from app.session.session_schema import ChatTurnRequest, RouterDecision, StepAgentResult
 from app.sop_runtime.coordinator import DeterministicSopCoordinator
 from app.sop_runtime.contracts import IdempotencyScope
+from app.sop_runtime.execution_store import SopExecutionConflictError
 from app.sop_runtime.legacy_skill_card_adapter import compile_legacy_skill_card
 from app.sop_runtime.scheduler import RuntimeAction
-from app.tools.tool_schema import ToolCall, ToolResult
+from app.tools.tool_schema import ToolCall, ToolError, ToolResult
 
 
 def _test_session() -> Session:
@@ -58,6 +71,62 @@ def _test_session() -> Session:
     )
     SQLModel.metadata.create_all(engine)
     return Session(engine)
+
+
+def test_sd6a_fixture_seeds_employee_scoped_immutable_publication(monkeypatch) -> None:
+    """验证SD6A夹具沿员工分支发布链写入可执行的精确SkillVersion。"""
+
+    fixture_path = Path(__file__).resolve().parents[2] / "frontend-enterprise" / "e2e" / "sd6a_fullstack_fixture.py"
+    spec = importlib.util.spec_from_file_location("sd6a_fullstack_fixture_contract", fixture_path)
+    assert spec is not None and spec.loader is not None
+    fixture = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fixture)
+
+    from app import db as db_module
+    from app.db.models import AgentResourceBinding, AgentSkillBranch, SkillVersion
+
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    SQLModel.metadata.create_all(engine)
+    monkeypatch.setattr(db_module, "engine", engine)
+
+    fixture._seed()
+
+    with Session(engine) as db:
+        agent_id = "agent_sd6a_sop_1"
+        skill = db.exec(
+            select(Skill).where(Skill.skill_id == "sd6a_memory_check_1")
+        ).one()
+        binding = db.exec(
+            select(AgentResourceBinding).where(
+                AgentResourceBinding.agent_id == agent_id,
+                AgentResourceBinding.resource_type == "skill",
+                AgentResourceBinding.resource_id == skill.id,
+                AgentResourceBinding.status == "active",
+            )
+        ).one()
+        assert binding is not None
+        branch = db.exec(
+            select(AgentSkillBranch).where(
+                AgentSkillBranch.agent_id == agent_id,
+                AgentSkillBranch.skill_id == skill.skill_id,
+                AgentSkillBranch.status == "active",
+            )
+        ).one()
+        assert branch is not None
+        projected = project_skill_with_branch(skill, branch, "active")
+        version = db.exec(
+            select(SkillVersion).where(
+                SkillVersion.skill_id == skill.skill_id,
+                SkillVersion.scope_agent_id == agent_id,
+                SkillVersion.version == projected.version,
+                SkillVersion.status == "published",
+            )
+        ).one()
+        assert version.compiled_definition_checksum
 
 
 def _content() -> dict[str, object]:
@@ -391,6 +460,538 @@ def _seed(db: Session) -> tuple[Skill, ChatSession]:
     return skill, chat_session
 
 
+def _cross_midnight_replan_content() -> dict[str, object]:
+    """构造只收集日期与员工号的最小确定性 SOP，用于真实步骤消费者验证。"""
+
+    return {
+        "skill_id": "skill_cross_midnight_replan",
+        "name": "跨午夜改期验证",
+        "version": "1.0.0",
+        "execution_mode": "deterministic",
+        "condition_schemas": {
+            "slots": {
+                "type": "object",
+                "properties": {
+                    "target_date": {"type": "string"},
+                    "employee_id": {"type": "string"},
+                },
+            }
+        },
+        "nodes": [
+            {
+                "node_id": "collect_request",
+                "type": "collect_info",
+                "name": "收集改期请求",
+                "expected_user_info": ["target_date", "employee_id"],
+                "allowed_actions": ["ask_user", "continue_flow"],
+            },
+            {
+                "node_id": "done",
+                "type": "terminal",
+                "name": "改期结果",
+            },
+        ],
+        "edges": [{"source_node_id": "collect_request", "next_node_id": "done"}],
+        "start_node_id": "collect_request",
+        "terminal_node_ids": ["done"],
+    }
+
+
+def test_sop_wait_resume_persists_input_time_context_without_rewriting_attempt() -> None:
+    """验证 SOP 等待恢复保留原 attempt 锚点，并把新消息锚点记为恢复输入。"""
+
+    with _test_session() as db:
+        skill, chat_session = _seed(db)
+        first_context = freeze_time_context(
+            source_input_id="message_sop_first",
+            client_timezone="Asia/Shanghai",
+            anchor_at_utc=datetime(2026, 1, 2, 15, 30, tzinfo=UTC),
+        )
+        second_context = freeze_time_context(
+            source_input_id="message_sop_second",
+            client_timezone="Asia/Shanghai",
+            anchor_at_utc=datetime(2026, 1, 3, 0, 5, tzinfo=UTC),
+        )
+        db.add(
+            Message(
+                id="message_sop_first",
+                tenant_id=chat_session.tenant_id,
+                session_id=chat_session.id,
+                role="user",
+                content="查询报销额度",
+                metadata_json={"time_context": first_context},
+            )
+        )
+        db.commit()
+        coordinator = DeterministicSopCoordinator(db)
+
+        waiting = coordinator.prepare_step(
+            chat_session,
+            skill,
+            StepAgentResult(reply="请提供员工号"),
+            time_context=first_context,
+        )
+        db.commit()
+        execution = db.exec(select(SopNodeExecution)).one()
+        assert waiting.action == "ask_user"
+        assert execution.input_json["time_context"] == first_context
+
+        db.add(
+            Message(
+                id="message_sop_second",
+                tenant_id=chat_session.tenant_id,
+                session_id=chat_session.id,
+                role="user",
+                content="员工号 E001，按今天日期处理",
+                metadata_json={"time_context": second_context},
+            )
+        )
+        chat_session.slots_json = {"employee_id": "E001"}
+        db.add(chat_session)
+        db.commit()
+        resumed = coordinator.prepare_step(
+            chat_session,
+            skill,
+            StepAgentResult(slot_updates={"employee_id": "E001"}),
+            user_message="员工号 E001，按今天日期处理",
+            time_context=second_context,
+        )
+        db.commit()
+        db.refresh(execution)
+        instance = db.exec(select(SopInstance)).one()
+
+    assert resumed.tool_call is not None
+    assert instance.context_json["time_context"] == second_context
+    assert execution.input_json["time_context"] == first_context
+    assert execution.input_json["resume_time_context"] == second_context
+
+
+def test_cross_midnight_new_input_reaches_step_consumer_and_changes_product_date(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """真实步骤消费者跨午夜接收新输入后，产品日期从一月二日改为一月三日。"""
+
+    captured_requests: list[dict[str, object]] = []
+
+    class _Completions:
+        """捕获生产 LLMClient 发出的阶段请求，并按请求时间事实返回日期结果。"""
+
+        def create(self, **kwargs: object):
+            """从实际 SDK 消息中的本地时间计算下一日，不预填验收日期。"""
+
+            captured_requests.append(dict(kwargs))
+            messages_text = str(kwargs.get("messages") or "")
+            match = re.search(r"local_at[\"']\s*:\s*[\"']([^\"']+)", messages_text)
+            assert match is not None, "实际 SDK 请求缺少持久本地时间事实"
+            local_at = datetime.fromisoformat(match.group(1))
+            target_date = local_at.date() + timedelta(days=1)
+            is_new_input = "改成明天" in messages_text
+            updates = {"target_date": target_date.isoformat()}
+            if is_new_input:
+                updates["employee_id"] = "E001"
+            reply = (
+                f"实际改期结果：{target_date.isoformat()}"
+                if is_new_input
+                else "已记录明天日期，仍需员工号。"
+            )
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content=json.dumps(
+                                {
+                                    "action": "advance" if is_new_input else "ask_user",
+                                    "reply": reply,
+                                    "slot_updates": updates,
+                                    "is_step_completed": is_new_input,
+                                },
+                                ensure_ascii=False,
+                            )
+                        )
+                    )
+                ]
+            )
+
+    class _CompletionsClient:
+        """提供 OpenAI-compatible completions.create 的最小隔离对象。"""
+
+        def __init__(self) -> None:
+            self.chat = SimpleNamespace(completions=self)
+
+        def create(self, **kwargs: object):
+            """把 SDK 调用转给实际请求捕获器。"""
+
+            return _Completions().create(**kwargs)
+
+    def _llm_client_factory(config: ModelConfig) -> LLMClient:
+        """装配真实 LLMClient 的请求渲染逻辑，仅替换末端 SDK。"""
+
+        client = object.__new__(LLMClient)
+        client.client = _CompletionsClient()
+        client.model = config.model
+        client.temperature = 0.0
+        client.configured_max_output_tokens = 1024
+        client.max_output_tokens = 1024
+        client.timeout_seconds = 30.0
+        client.base_url = "https://synthetic.invalid"
+        client.thinking_mode = ""
+        client.extra_body = {}
+        return client
+
+    monkeypatch.setattr("app.core.step_agent.LLMClient", _llm_client_factory)
+
+    with _test_session() as db:
+        content = _cross_midnight_replan_content()
+        definition = compile_legacy_skill_card(content)
+        skill = Skill(
+            tenant_id="tenant_demo",
+            skill_id="skill_cross_midnight_replan",
+            version="1.0.0",
+            name="跨午夜改期验证",
+            content_json=content,
+            status="published",
+        )
+        version = SkillVersion(
+            id="skillver_cross_midnight_replan",
+            tenant_id="tenant_demo",
+            skill_id=skill.skill_id,
+            version=skill.version,
+            name=skill.name,
+            content_json=content,
+            status="published",
+            compiled_definition_checksum=definition.checksum,
+        )
+        user = User(
+            id="user_cross_midnight_replan",
+            tenant_id="tenant_demo",
+            username="cross-midnight-replan",
+            password_hash="test-only",
+        )
+        agent = AgentProfile(
+            id="agent_cross_midnight_replan",
+            tenant_id="tenant_demo",
+            name="跨午夜改期员工",
+            owner_user_id=user.id,
+            status="active",
+        )
+        session = ChatSession(
+            id="session_cross_midnight_replan",
+            tenant_id="tenant_demo",
+            user_id=user.id,
+            agent_id=agent.id,
+            active_skill_id=skill.skill_id,
+            active_step_id="collect_request",
+        )
+        model = ModelConfig(
+            id="model_cross_midnight_replan",
+            tenant_id="tenant_demo",
+            name="跨午夜隔离模型",
+            api_key_encrypted="synthetic",
+            model="synthetic-cross-midnight",
+            enabled=True,
+            is_default=True,
+        )
+        first_context = freeze_time_context(
+            source_input_id="message_cross_midnight_replan_first",
+            client_timezone="Pacific/Honolulu",
+            anchor_at_utc=datetime(2026, 1, 2, 9, 59, tzinfo=UTC),
+        )
+        second_context = freeze_time_context(
+            source_input_id="message_cross_midnight_replan_second",
+            client_timezone="Pacific/Honolulu",
+            anchor_at_utc=datetime(2026, 1, 2, 10, 5, tzinfo=UTC),
+        )
+        first_message = Message(
+            id=first_context["source_input_id"],
+            tenant_id=session.tenant_id,
+            session_id=session.id,
+            role="user",
+            content="明天执行",
+            metadata_json={"time_context": first_context},
+            created_at=datetime(2026, 1, 2, 9, 59, tzinfo=UTC),
+        )
+        db.add_all([skill, version, user, agent, session, model, first_message])
+        db.commit()
+
+        loop = AgentLoop(db)
+        first_request = ChatTurnRequest(
+            tenant_id=session.tenant_id,
+            session_id=session.id,
+            user_id=user.id,
+            agent_id=agent.id,
+            message=first_message.content,
+            client_turn_id="cross-midnight-replan-first-turn",
+        )
+        router_decision = RouterDecision(
+            decision="start_new_task",
+            target_skill_id=skill.skill_id,
+            target_step_id="collect_request",
+        )
+        first_result = loop._run_step_agent_with_context_repair(
+            first_request,
+            session,
+            skill,
+            [],
+            model,
+            router_decision,
+            conversation_context={
+                "messages": [
+                    {
+                        "id": first_message.id,
+                        "role": "user",
+                        "content": first_message.content,
+                        "time_context": first_context,
+                    }
+                ],
+                "metadata": {
+                    "current_turn_time": first_context["local_at"],
+                    "time_context": first_context,
+                },
+                "time_context": first_context,
+            },
+        )
+        db.commit()
+        first_instance = db.exec(select(SopInstance)).one()
+        first_execution = db.exec(select(SopNodeExecution)).one()
+        assert first_result.action == "ask_user"
+        assert first_instance.status == "waiting"
+        assert first_instance.slots_json["target_date"] == "2026-01-02"
+        assert first_execution.input_json["time_context"] == first_context
+
+        second_message = Message(
+            id=second_context["source_input_id"],
+            tenant_id=session.tenant_id,
+            session_id=session.id,
+            role="user",
+            content="改成明天，员工号 E001",
+            metadata_json={"time_context": second_context},
+            created_at=datetime(2026, 1, 2, 10, 5, tzinfo=UTC),
+        )
+        db.add(second_message)
+        db.commit()
+        second_request = first_request.model_copy(
+            update={
+                "message": second_message.content,
+                "client_turn_id": "cross-midnight-replan-second-turn",
+            }
+        )
+        second_result = loop._run_step_agent_with_context_repair(
+            second_request,
+            session,
+            skill,
+            [],
+            model,
+            router_decision.model_copy(update={"decision": "continue_active"}),
+            conversation_context={
+                "messages": [
+                    {
+                        "id": first_message.id,
+                        "role": "user",
+                        "content": first_message.content,
+                        "time_context": first_context,
+                    },
+                    {
+                        "id": second_message.id,
+                        "role": "user",
+                        "content": second_message.content,
+                        "time_context": second_context,
+                    }
+                ],
+                "metadata": {
+                    "current_turn_time": second_context["local_at"],
+                    "time_context": second_context,
+                },
+                "time_context": second_context,
+            },
+        )
+        db.commit()
+        db.refresh(first_instance)
+        resumed_execution = db.get(SopNodeExecution, first_execution.id)
+
+    assert second_result.action == "reply"
+    assert second_result.reply == "实际改期结果：2026-01-03"
+    assert first_instance.status == "succeeded"
+    assert first_instance.slots_json["target_date"] == "2026-01-03"
+    assert first_instance.slots_json["employee_id"] == "E001"
+    assert resumed_execution is not None
+    assert resumed_execution.input_json["time_context"] == first_context
+    assert resumed_execution.input_json["resume_time_context"] == second_context
+    assert len(captured_requests) == 2
+    first_sdk_text = str(captured_requests[0]["messages"])
+    second_sdk_text = str(captured_requests[1]["messages"])
+    assert first_context["source_input_id"] in first_sdk_text
+    assert first_context["local_at"] in first_sdk_text
+    assert second_context["source_input_id"] in second_sdk_text
+    assert second_context["local_at"] in second_sdk_text
+    assert first_instance.source_ref == first_context["source_input_id"]
+
+
+def test_sop_waiting_resume_after_fresh_runtime_session_keeps_instance_and_node(
+    tmp_path,
+) -> None:
+    """SOP 首轮实际等待后由新运行时会话恢复同一实例、版本和节点事实。"""
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'sd3-sop-recovery.db'}")
+    SQLModel.metadata.create_all(engine)
+    first_context = freeze_time_context(
+        source_input_id="message_sop_restart_first",
+        client_timezone="Pacific/Honolulu",
+        anchor_at_utc=datetime(2026, 9, 28, 9, 59, tzinfo=UTC),
+    )
+    second_context = freeze_time_context(
+        source_input_id="message_sop_restart_second",
+        client_timezone="Pacific/Honolulu",
+        anchor_at_utc=datetime(2026, 9, 28, 10, 5, tzinfo=UTC),
+    )
+    with Session(engine, expire_on_commit=False) as db:
+        skill, chat_session = _seed(db)
+        db.add(
+            Message(
+                id=first_context["source_input_id"],
+                tenant_id=chat_session.tenant_id,
+                session_id=chat_session.id,
+                role="user",
+                content="请在跨午夜前等待员工号",
+                metadata_json={"time_context": first_context},
+            )
+        )
+        db.commit()
+        waiting = DeterministicSopCoordinator(db).prepare_step(
+            chat_session,
+            skill,
+            StepAgentResult(reply="请提供员工号"),
+            time_context=first_context,
+        )
+        db.commit()
+        instance = db.exec(select(SopInstance)).one()
+        execution = db.exec(select(SopNodeExecution)).one()
+        instance_id = instance.id
+        skill_version_id = instance.skill_version_id
+        node_id = execution.node_id
+        execution_id = execution.id
+        assert waiting.action == "ask_user"
+        assert instance.status == "waiting"
+
+    with Session(engine, expire_on_commit=False) as restarted_db:
+        restarted_skill = restarted_db.exec(select(Skill)).one()
+        restarted_session = restarted_db.get(ChatSession, "session_demo")
+        assert restarted_session is not None
+        restarted_db.add(
+            Message(
+                id=second_context["source_input_id"],
+                tenant_id=restarted_session.tenant_id,
+                session_id=restarted_session.id,
+                role="user",
+                content="员工号 E001，改为午夜后的明天执行",
+                metadata_json={"time_context": second_context},
+            )
+        )
+        restarted_session.slots_json = {"employee_id": "E001"}
+        restarted_db.add(restarted_session)
+        restarted_db.commit()
+        resumed = DeterministicSopCoordinator(restarted_db).prepare_step(
+            restarted_session,
+            restarted_skill,
+            StepAgentResult(slot_updates={"employee_id": "E001"}),
+            user_message="员工号 E001，改为午夜后的明天执行",
+            time_context=second_context,
+        )
+        restarted_db.commit()
+        recovered_instance = restarted_db.get(SopInstance, instance_id)
+        recovered_execution = restarted_db.get(SopNodeExecution, execution_id)
+        all_instances = restarted_db.exec(select(SopInstance)).all()
+
+    assert resumed.tool_call is not None
+    assert recovered_instance is not None
+    assert recovered_execution is not None
+    assert len(all_instances) == 1
+    assert recovered_instance.id == instance_id
+    assert recovered_instance.skill_version_id == skill_version_id
+    assert recovered_execution.node_id == node_id
+    assert recovered_execution.input_json["time_context"] == first_context
+    assert recovered_execution.input_json["resume_time_context"] == second_context
+    engine.dispose()
+
+
+def test_sop_prepare_step_accepts_valid_scheduled_run_time_context() -> None:
+    """合法同租户调度 Run 的时间事实必须进入 SOP 实例和首个节点快照。"""
+
+    with _test_session() as db:
+        skill, chat_session = _seed(db)
+        user = User(
+            id="user_scheduled_context",
+            tenant_id=chat_session.tenant_id,
+            username="scheduled-context",
+            password_hash="test-only",
+        )
+        agent = AgentProfile(
+            id="agent_scheduled_context",
+            tenant_id=chat_session.tenant_id,
+            name="调度时间员工",
+            owner_user_id=user.id,
+        )
+        chat_session.user_id = user.id
+        chat_session.agent_id = agent.id
+        run = ScheduledTaskRun(
+            id="scheduled_run_time_context",
+            tenant_id=chat_session.tenant_id,
+            scheduled_task_id="scheduled_task_time_context",
+            agent_id=agent.id,
+            user_id=user.id,
+            session_id=chat_session.id,
+            source_kind="schedule",
+            source_ref="scheduled-source-time-context",
+            source_snapshot_json={
+                "scheduled_task_id": "scheduled_task_time_context",
+                "tenant_id": chat_session.tenant_id,
+                "agent_id": agent.id,
+                "initiator_user_id": user.id,
+            },
+            source_checksum="source-checksum-time-context",
+            scheduled_for=datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC),
+            status="running",
+        )
+        run_id = run.id
+        context = freeze_time_context(
+            source_input_id=run.id,
+            client_timezone="Asia/Shanghai",
+            anchor_at_utc=run.scheduled_for,
+            timezone_source="scheduled_task",
+        )
+        db.add_all(
+            [
+                user,
+                agent,
+                Message(
+                    id="message_scheduled_context",
+                    tenant_id=chat_session.tenant_id,
+                    session_id=chat_session.id,
+                    role="user",
+                    content="执行调度任务",
+                ),
+                run,
+                chat_session,
+            ]
+        )
+        db.commit()
+
+        result = DeterministicSopCoordinator(db).prepare_step(
+            chat_session,
+            skill,
+            StepAgentResult(reply="等待后续输入"),
+            time_context=context,
+        )
+        db.commit()
+        instance = db.exec(select(SopInstance)).one()
+        execution = db.exec(select(SopNodeExecution)).one()
+
+    assert result.action == "ask_user"
+    assert instance.source_kind == "schedule"
+    assert instance.source_ref == run_id
+    assert instance.context_json["time_context"] == context
+    assert execution.input_json["time_context"] == context
+
+
 def _seed_attachment_sop(db: Session) -> tuple[Skill, ChatSession]:
     """写入正式附件SOP、同会话权威消息Link及两份不可变Extraction。"""
 
@@ -673,6 +1274,89 @@ def test_coordinator_closes_wait_tool_and_terminal_across_turns() -> None:
     assert operation_status == "succeeded"
 
 
+def test_agent_loop_reuses_terminal_operation_receipt_without_second_dispatch() -> None:
+    """真实 AgentLoop→Coordinator 链路重试同一 Operation 时只保留一次派发。"""
+
+    with _test_session() as db:
+        skill, chat_session = _seed(db)
+        coordinator = DeterministicSopCoordinator(db)
+        coordinator.prepare_step(chat_session, skill, StepAgentResult(reply="请提供员工号"))
+        chat_session.slots_json = {"employee_id": "E001"}
+        calling = coordinator.prepare_step(
+            chat_session,
+            skill,
+            StepAgentResult(slot_updates={"employee_id": "E001"}),
+        )
+        assert calling.tool_call is not None
+        captured = {"dispatches": 0, "authorization_checks": 0}
+
+        class Executor:
+            """模拟共享 ToolExecutor 的授权与一次真实派发。"""
+
+            def authorize(self, *_args, **_kwargs):
+                """记录重试前的当前授权检查。"""
+
+                captured["authorization_checks"] += 1
+                return None
+
+            def execute(self, *_args, **_kwargs):
+                """记录唯一真实派发并返回业务回执。"""
+
+                captured["dispatches"] += 1
+                return ToolResult(
+                    tool_name="expense.quota_query",
+                    success=True,
+                    data={"remaining": 20000},
+                )
+
+        loop = AgentLoop(db)
+        loop.tool_executor = Executor()
+        request = ChatTurnRequest(
+            tenant_id="tenant_demo",
+            session_id=chat_session.id,
+            user_id="user_demo",
+            message="查询 E001 的报销额度",
+        )
+        first = loop._execute_tool_call(
+            request,
+            chat_session,
+            calling.tool_call,
+            tool_call_id="temporary-first",
+        )
+        assert first.success is True
+        operation = db.exec(select(SopOperation)).one()
+        instance = db.exec(select(SopInstance)).one()
+        with coordinator.store.owned(instance, worker_id="finish-after-dispatch"):
+            coordinator.store.finish_operation(
+                operation,
+                succeeded=True,
+                result={"remaining": 20000},
+            )
+        db.commit()
+
+        retried = None
+        for retry_number in range(3):
+            retried = loop._execute_tool_call(
+                request,
+                chat_session,
+                calling.tool_call,
+                tool_call_id=f"temporary-retry-{retry_number}",
+            )
+        assert retried is not None
+        plan = coordinator.record_tool_result(chat_session, calling.tool_call, retried)
+        db.commit()
+        db.refresh(operation)
+        db.refresh(instance)
+
+    assert captured == {"dispatches": 1, "authorization_checks": 3}
+    assert retried.success is True
+    assert retried.data["receipt_source"] == "sop_operation"
+    assert retried.data["operation_id"] == operation.id
+    assert plan is not None and plan.action is RuntimeAction.COMPLETE
+    assert operation.status == "succeeded"
+    assert instance.status == "succeeded"
+
+
 def test_formal_sop_reads_typed_attachments_without_provider_dispatch() -> None:
     """验证正式SOP按发布槽位顺序读取XLSX/CSV并以零ProviderReceipt终结。"""
 
@@ -712,6 +1396,62 @@ def test_formal_sop_reads_typed_attachments_without_provider_dispatch() -> None:
     assert renderer_jobs[0].status == "ready"
     assert renderer_jobs[0].artifact_id == artifacts[0].id
     assert artifacts[0].filename == "销售核验报告.xlsx"
+
+
+def test_waiting_sop_recovery_copies_new_attachment_slots_to_session_state() -> None:
+    """等待节点收到新消息附件后，恢复所用槽位必须同步回 ChatSession 而非停在 waiting。"""
+
+    with _test_session() as db:
+        skill, chat_session = _seed_attachment_sop(db)
+        original_links = db.exec(select(MessageInputResourceLink)).all()
+        for link in original_links:
+            db.delete(link)
+        db.commit()
+        initial_message = db.get(Message, "message_attachment_sop")
+        assert initial_message is not None
+
+        coordinator = DeterministicSopCoordinator(db)
+        first = coordinator.prepare_step(chat_session, skill, StepAgentResult())
+        db.commit()
+        assert first.action == "ask_user"
+        instance = db.exec(select(SopInstance)).one()
+        assert instance.status == "waiting"
+
+        resumed_message = Message(
+            id="message_attachment_sop_resume",
+            tenant_id=chat_session.tenant_id,
+            session_id=chat_session.id,
+            role="user",
+            content="补充销售文件并继续核验。",
+            created_at=initial_message.created_at + timedelta(seconds=1),
+        )
+        db.add(resumed_message)
+        for ordinal, link in enumerate(original_links):
+            db.add(
+                MessageInputResourceLink(
+                    id=f"message-link-sales-resume-{ordinal}",
+                    tenant_id=link.tenant_id,
+                    session_id=link.session_id,
+                    message_id=resumed_message.id,
+                    resource_binding_id=link.resource_binding_id,
+                    resource_id=link.resource_id,
+                    resource_version=link.resource_version,
+                    content_checksum=link.content_checksum,
+                    ordinal=ordinal,
+                )
+            )
+        db.commit()
+
+        resumed = coordinator.prepare_step(chat_session, skill, StepAgentResult())
+        db.commit()
+        db.refresh(chat_session)
+        db.refresh(instance)
+
+    assert resumed.is_step_completed is True
+    assert resumed.action == "reply"
+    assert instance.status == "succeeded"
+    assert chat_session.slots_json["actuals"]
+    assert chat_session.slots_json["targets"]
 
 
 def test_formal_sop_missing_required_csv_column_waits_without_execution_or_artifact() -> None:
@@ -967,6 +1707,101 @@ def test_coordinator_persists_knowledge_receipt_and_routes_without_model_control
     assert "content" not in str(operation.result_json)
 
 
+def test_agent_loop_terminal_operation_replay_revoke_fails_without_advancing() -> None:
+    """终态 Operation 复用前撤权时只返回失败，不推进节点或改写既有成功账本。"""
+
+    with _test_session() as db:
+        skill, chat_session = _seed(db)
+        coordinator = DeterministicSopCoordinator(db)
+        coordinator.prepare_step(chat_session, skill, StepAgentResult(reply="请提供员工号"))
+        chat_session.slots_json = {"employee_id": "E001"}
+        calling = coordinator.prepare_step(
+            chat_session,
+            skill,
+            StepAgentResult(slot_updates={"employee_id": "E001"}),
+        )
+        assert calling.tool_call is not None
+        state = {"revoked": False, "dispatches": 0, "authorization_checks": 0}
+
+        class Executor:
+            """模拟先有权限、后撤权的共享工具执行器。"""
+
+            def authorize(self, *_args, **_kwargs):
+                """返回当前授权状态，并记录每次回执复用前检查。"""
+
+                state["authorization_checks"] += 1
+                if state["revoked"]:
+                    return ToolResult(
+                        tool_name="expense.quota_query",
+                        success=False,
+                        error=ToolError(
+                            code="ACTOR_PERMISSION_REQUIRED",
+                            message="当前执行人已被撤销该操作权限。",
+                        ),
+                    )
+                return None
+
+            def execute(self, *_args, **_kwargs):
+                """记录首次真实派发并返回确定性查询回执。"""
+
+                state["dispatches"] += 1
+                return ToolResult(
+                    tool_name="expense.quota_query",
+                    success=True,
+                    data={"remaining": 20000},
+                )
+
+        loop = AgentLoop(db)
+        loop.tool_executor = Executor()
+        request = ChatTurnRequest(
+            tenant_id="tenant_demo",
+            session_id=chat_session.id,
+            user_id="user_demo",
+            message="查询 E001 的报销额度",
+        )
+        first = loop._execute_tool_call(
+            request,
+            chat_session,
+            calling.tool_call,
+            tool_call_id="temporary-first",
+        )
+        assert first.success is True
+        operation = db.exec(select(SopOperation)).one()
+        instance = db.exec(select(SopInstance)).one()
+        with coordinator.store.owned(instance, worker_id="finish-before-revoke"):
+            coordinator.store.finish_operation(
+                operation,
+                succeeded=True,
+                result={"remaining": 20000},
+            )
+        db.commit()
+
+        state["revoked"] = True
+        replay = loop._execute_tool_call(
+            request,
+            chat_session,
+            calling.tool_call,
+            tool_call_id="temporary-after-revoke",
+        )
+        plan = coordinator.record_tool_result(chat_session, calling.tool_call, replay)
+        db.commit()
+        db.refresh(operation)
+        db.refresh(instance)
+        execution = db.exec(select(SopNodeExecution).where(
+            SopNodeExecution.instance_id == instance.id,
+            SopNodeExecution.node_id == "query_quota",
+        )).one()
+
+    assert state == {"revoked": True, "dispatches": 1, "authorization_checks": 1}
+    assert replay.success is False
+    assert replay.error is not None and replay.error.code == "ACTOR_PERMISSION_REQUIRED"
+    assert plan is not None and plan.action is RuntimeAction.FAIL
+    assert plan.error_code == "ACTOR_PERMISSION_REQUIRED"
+    assert operation.status == "succeeded"
+    assert instance.status == "running"
+    assert execution.status == "running"
+
+
 @pytest.mark.parametrize(
     ("error_code", "error_message"),
     (
@@ -979,7 +1814,7 @@ def test_ambiguous_external_write_failure_waits_without_redispatch(
     error_code: str,
     error_message: str,
 ) -> None:
-    """验证外部写传输结果不确定时保持节点活动并标记 unknown，下一轮不会重发。"""
+    """验证外部写结果不确定时把实例和节点挂起为 waiting，下一轮不会重发。"""
 
     with _test_session() as db:
         skill, chat_session = _seed(db)
@@ -1012,8 +1847,8 @@ def test_ambiguous_external_write_failure_waits_without_redispatch(
     assert plan is not None and plan.action is RuntimeAction.WAIT_OPERATION
     assert operation.status == "unknown"
     assert operation.effect_state == "unknown"
-    assert execution.status == "running"
-    assert instance.status == "running"
+    assert execution.status == "waiting"
+    assert instance.status == "waiting"
     assert instance.effect_state == "unknown"
     assert replay.tool_call is None
     assert replay.is_runtime_control_reply() is True
@@ -1024,6 +1859,17 @@ def test_terminal_operation_receipt_is_restored_after_crash_without_adapter_call
 
     with _test_session() as db:
         skill, chat_session = _seed(db)
+        db.add(
+            Tool(
+                tenant_id=chat_session.tenant_id,
+                name="expense.quota_query",
+                display_name="查询报销额度",
+                method="GET",
+                url="https://example.invalid/quota",
+                allowed_skills_json=[skill.skill_id],
+            )
+        )
+        db.commit()
         coordinator = DeterministicSopCoordinator(db)
         coordinator.prepare_step(chat_session, skill, StepAgentResult(reply="请提供员工号"))
         chat_session.slots_json = {"employee_id": "E001"}
@@ -1054,6 +1900,98 @@ def test_terminal_operation_receipt_is_restored_after_crash_without_adapter_call
     assert recovered.is_step_completed is True
     assert operation_status == "succeeded"
     assert instance_status == "succeeded"
+
+
+def test_prepare_step_terminal_restore_rechecks_current_authorization() -> None:
+    """验证正式 prepare_step 恢复终态回执前重新授权，撤权不得推进节点。"""
+
+    with _test_session() as db:
+        skill, chat_session = _seed(db)
+        tool = Tool(
+            tenant_id=chat_session.tenant_id,
+            name="expense.quota_query",
+            display_name="查询报销额度",
+            method="GET",
+            url="https://example.invalid/quota",
+            allowed_skills_json=[skill.skill_id],
+        )
+        db.add(tool)
+        db.commit()
+        coordinator = DeterministicSopCoordinator(db)
+        coordinator.prepare_step(chat_session, skill, StepAgentResult(reply="请提供员工号"))
+        chat_session.slots_json = {"employee_id": "E001"}
+        calling = coordinator.prepare_step(
+            chat_session,
+            skill,
+            StepAgentResult(slot_updates={"employee_id": "E001"}),
+        )
+        assert calling.tool_call is not None
+        instance = db.exec(select(SopInstance)).one()
+        operation = db.exec(select(SopOperation)).one()
+        with coordinator.store.owned(instance, worker_id="terminal-restore-auth-test"):
+            coordinator.store.finish_operation(
+                operation,
+                succeeded=True,
+                result={"remaining": 20000},
+            )
+        tool.allowed_skills_json = ["skill_other"]
+        db.add(tool)
+        db.commit()
+
+        recovered = coordinator.prepare_step(chat_session, skill, StepAgentResult())
+        db.commit()
+        db.refresh(instance)
+        db.refresh(operation)
+        execution = db.exec(
+            select(SopNodeExecution).where(
+                SopNodeExecution.instance_id == instance.id,
+                SopNodeExecution.node_id == "query_quota",
+            )
+        ).one()
+
+    assert recovered.is_step_completed is False
+    assert recovered.runtime_reply_metadata()["runtime_error_code"] == "NOT_ALLOWED"
+    assert operation.status == "succeeded"
+    assert instance.status == "running"
+    assert execution.status == "running"
+
+
+def test_tool_result_request_fingerprint_cannot_settle_another_operation() -> None:
+    """同一节点同名工具的不同请求指纹不得读取或结算已有 Operation。"""
+
+    with _test_session() as db:
+        skill, chat_session = _seed(db)
+        coordinator = DeterministicSopCoordinator(db)
+        coordinator.prepare_step(chat_session, skill, StepAgentResult(reply="请提供员工号"))
+        chat_session.slots_json = {"employee_id": "E001"}
+        calling = coordinator.prepare_step(
+            chat_session,
+            skill,
+            StepAgentResult(slot_updates={"employee_id": "E001"}),
+        )
+        assert calling.tool_call is not None
+        wrong_call = ToolCall(
+            name=calling.tool_call.name,
+            arguments={"employee_id": "E002"},
+        )
+
+        with pytest.raises(SopExecutionConflictError):
+            coordinator.current_tool_operation(chat_session, wrong_call)
+
+        plan = coordinator.record_tool_result(
+            chat_session,
+            wrong_call,
+            ToolResult(
+                tool_name=wrong_call.name,
+                success=True,
+                data={"remaining": 1},
+            ),
+        )
+        operation = db.exec(select(SopOperation)).one()
+
+    assert plan is not None and plan.action is RuntimeAction.FAIL
+    assert plan.error_code == "SOP_EXECUTION_CONFLICT"
+    assert operation.status == "running"
 
 
 def test_stale_running_operation_is_recovered_as_unknown_on_next_turn() -> None:
@@ -1535,3 +2473,64 @@ def test_agent_loop_protects_active_instance_from_router_false_completion() -> N
     assert session_step_id == instance_node_id
     assert session_slots == instance_slots
     assert protection_event.payload_json["original_decision"] == "complete_task"
+
+
+def test_active_sop_does_not_restore_slots_after_memory_clear() -> None:
+    """活动 SOP 的来源清空代数变化后只能保留游标，不能恢复旧记忆槽位。"""
+
+    with _test_session() as db:
+        skill, chat_session = _seed(db)
+        user = User(
+            id="user_memory_clear_sop",
+            tenant_id=chat_session.tenant_id,
+            username="memory-clear-sop",
+            password_hash="x",
+        )
+        chat_session.user_id = user.id
+        source = Message(
+            id="message_memory_clear_sop",
+            tenant_id=chat_session.tenant_id,
+            session_id=chat_session.id,
+            role="user",
+            content="请先确认记忆。",
+        )
+        db.add_all([user, source])
+        db.flush()
+        freeze_memory_source_anchor(
+            db,
+            tenant_id=chat_session.tenant_id,
+            user_id=user.id,
+            agent_id=None,
+            message=source,
+        )
+        version = db.exec(select(SkillVersion).where(SkillVersion.skill_id == skill.skill_id)).one()
+        coordinator = DeterministicSopCoordinator(db)
+        instance, _ = coordinator.store.start_instance(
+            tenant_id=chat_session.tenant_id,
+            session_id=chat_session.id,
+            skill_id=skill.skill_id,
+            skill_version_id=version.id,
+            skill_version=version.version,
+            definition_checksum=version.compiled_definition_checksum,
+            start_node_id="collect_employee",
+            initiator_user_id=user.id,
+            source_ref=source.id,
+            slots={"employee_id": "E001"},
+            enforce_agent_lifecycle=False,
+        )
+        scope = db.exec(
+            select(MemoryCaptureScope).where(
+                MemoryCaptureScope.tenant_id == chat_session.tenant_id,
+                MemoryCaptureScope.user_id == user.id,
+                MemoryCaptureScope.scope_kind == "user",
+            )
+        ).one()
+        scope.clear_generation += 1
+        db.add(scope)
+        chat_session.slots_json = {"stale": "value"}
+        db.commit()
+        db.refresh(chat_session)
+
+        assert coordinator.synchronize_active_instance(chat_session) is not None
+        assert chat_session.active_step_id == instance.current_node_id
+        assert chat_session.slots_json == {}

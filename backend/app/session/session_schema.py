@@ -1,5 +1,5 @@
 """
-@Time       : 2026/07/22 20:30
+@Time       : 2026/10/02
 @Author     : zhanglp8181
 @File       : session_schema.py
 @CallChain  : Chat API/Agent Loop/SOP Runtime → 会话命令与响应契约
@@ -113,6 +113,7 @@ class StepAgentResult(BaseModel):
     _runtime_reply_source: str | None = PrivateAttr(default=None)
     _runtime_reply_policy: str | None = PrivateAttr(default=None)
     _runtime_reply_code: str | None = PrivateAttr(default=None)
+    _runtime_execution_id: str | None = PrivateAttr(default=None)
 
     action: Optional[
         Literal[
@@ -133,6 +134,15 @@ class StepAgentResult(BaseModel):
     next_step_id: Optional[str] = None
     is_step_completed: bool = False
     handoff: bool = False
+
+    def mark_runtime_execution(self, execution_id: str) -> StepAgentResult:
+        """仅由实际Runtime标记本轮实例；模型JSON无法设置这项私有执行身份。"""
+        self._runtime_execution_id = execution_id
+        return self
+
+    def runtime_execution_id(self) -> str | None:
+        """读取本轮实际Runtime返回的实例身份，恢复轮不按创建来源补猜。"""
+        return self._runtime_execution_id
 
     def mark_runtime_control_reply(self, code: str) -> StepAgentResult:
         """把当前回复标记为 Runtime 权威控制消息，要求响应层原样输出。"""

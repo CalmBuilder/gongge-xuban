@@ -1,5 +1,5 @@
 """
-@Time       : 2026/07/28 20:20
+@Time       : 2026/10/03
 @Author     : zhanglp8181
 @File       : test_expense_special_approval_org_scope.py
 @CallChain  : pytest → v2.1 定义 → SopWorkItemService → Coordinator 持久恢复
@@ -389,7 +389,7 @@ def _seed_representative_runtime(engine: object) -> None:
             select(Skill).where(Skill.skill_id == "expense_over_limit_approval")
         ).one()
         version = db.exec(
-            select(SkillVersion).where(
+            select(SkillVersion).where(SkillVersion.tenant_id == "tenant_demo", SkillVersion.scope_agent_id == "",
                 SkillVersion.skill_id == skill.skill_id,
                 SkillVersion.version == EXPENSE_SPECIAL_APPROVAL_ORG_SCOPE_VERSION,
             )

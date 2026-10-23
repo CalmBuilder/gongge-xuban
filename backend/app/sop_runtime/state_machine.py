@@ -114,6 +114,7 @@ OPERATION_TRANSITIONS: dict[OperationStatus, frozenset[OperationStatus]] = {
     OperationStatus.RUNNING: frozenset(
         {
             OperationStatus.RETRY_WAIT,
+            OperationStatus.WAITING_EXTERNAL,
             OperationStatus.SUCCEEDED,
             OperationStatus.FAILED,
             OperationStatus.UNKNOWN,
@@ -122,6 +123,14 @@ OPERATION_TRANSITIONS: dict[OperationStatus, frozenset[OperationStatus]] = {
     ),
     OperationStatus.RETRY_WAIT: frozenset(
         {OperationStatus.RUNNING, OperationStatus.FAILED, OperationStatus.CANCELLED}
+    ),
+    OperationStatus.WAITING_EXTERNAL: frozenset(
+        {
+            OperationStatus.SUCCEEDED,
+            OperationStatus.FAILED,
+            OperationStatus.UNKNOWN,
+            OperationStatus.CANCELLED,
+        }
     ),
     OperationStatus.UNKNOWN: frozenset({OperationStatus.SUCCEEDED, OperationStatus.FAILED}),
     OperationStatus.SUCCEEDED: frozenset(),

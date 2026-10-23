@@ -12,7 +12,7 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
 from app.api.memories import page_memories
-from app.db.models import AgentProfile, MemoryRecord, Tenant, User
+from app.db.models import AgentProfile, ChatSession, MemoryRecord, Tenant, User
 
 
 def test_page_memories_paginates_user_groups_after_agent_and_search_filters() -> None:
@@ -142,6 +142,103 @@ def test_page_memories_keeps_non_owner_scoped_to_self() -> None:
     assert [item["content"] for item in own_page.items] == ["访问者自己的记忆"]
     assert forbidden_filter.total == 0
     assert forbidden_filter.items == []
+
+
+def test_page_memories_filters_effective_scope_before_group_paging_and_ties() -> None:
+    """验证历史会话归属、结构化去重和相同时间用户组排序都先于分页。"""
+
+    with _test_session() as db:
+        owner = _seed_owner_and_agent(db)
+        db.add_all(
+            [
+                User(
+                    id="user_a",
+                    tenant_id="tenant_demo",
+                    username="alice",
+                    password_hash="hash",
+                ),
+                User(
+                    id="user_b",
+                    tenant_id="tenant_demo",
+                    username="bob",
+                    password_hash="hash",
+                ),
+                ChatSession(
+                    id="page_session_a",
+                    tenant_id="tenant_demo",
+                    user_id="user_a",
+                    agent_id="agent_owned",
+                ),
+                ChatSession(
+                    id="page_session_b",
+                    tenant_id="tenant_demo",
+                    user_id="user_b",
+                    agent_id="agent_owned",
+                ),
+            ]
+        )
+        same_time = datetime(2026, 8, 1, 10, 0)
+        db.add_all(
+            [
+                MemoryRecord(
+                    id="a_user_a",
+                    tenant_id="tenant_demo",
+                    user_id="user_a",
+                    username="alice",
+                    session_id="page_session_a",
+                    kind="profile",
+                    content="目标用户 A",
+                    metadata_json={"key": "preferred_name"},
+                    updated_at=same_time,
+                ),
+                MemoryRecord(
+                    id="duplicate_user_a",
+                    tenant_id="tenant_demo",
+                    agent_id="agent_owned",
+                    user_id="user_a",
+                    username="alice",
+                    kind="profile",
+                    content="目标用户 A 旧重复",
+                    metadata_json={"key": "preferred_name"},
+                    updated_at=same_time - timedelta(minutes=1),
+                ),
+                MemoryRecord(
+                    id="z_user_b",
+                    tenant_id="tenant_demo",
+                    user_id="user_b",
+                    username="bob",
+                    session_id="page_session_b",
+                    kind="fact",
+                    content="目标用户 B",
+                    metadata_json={},
+                    updated_at=same_time,
+                ),
+                MemoryRecord(
+                    id="new_other_agent",
+                    tenant_id="tenant_demo",
+                    agent_id="agent_other",
+                    user_id="user_c",
+                    username="carol",
+                    kind="fact",
+                    content="目标其他员工",
+                    updated_at=same_time + timedelta(minutes=5),
+                ),
+            ]
+        )
+        db.commit()
+
+        first_page = page_memories(
+            "tenant_demo", "agent_owned", None, None, "目标", 1, 1, owner, db
+        )
+        second_page = page_memories(
+            "tenant_demo", "agent_owned", None, None, "目标", 2, 1, owner, db
+        )
+
+    assert first_page.total == 2
+    assert [item["user_id"] for item in first_page.items] == ["user_a"]
+    assert [item["content"] for item in first_page.items] == ["目标用户 A"]
+    assert [item["user_id"] for item in second_page.items] == ["user_b"]
+    assert [item["content"] for item in second_page.items] == ["目标用户 B"]
 
 
 def _seed_owner_and_agent(db: Session) -> User:

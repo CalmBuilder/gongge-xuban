@@ -9,6 +9,10 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from app.db.models import Tool
 import re
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -153,3 +157,18 @@ def _normalize_key(value: str) -> str:
     """把 Schema 字段统一为可比较的下划线小写形式。"""
 
     return value.strip().lower().replace("-", "_")
+
+
+def tool_generation_payload(tool: Tool) -> dict[str, object]:
+    """构造不含端点和示例秘密的工具生成快照，供 distill/rewrite 共同使用。"""
+
+    return {
+        "id": sanitize_generation_text(tool.id),
+        "name": sanitize_generation_text(tool.name),
+        "display_name": sanitize_generation_text(tool.display_name or ""),
+        "description": sanitize_generation_text(tool.description or ""),
+        "bucket": sanitize_generation_text(tool.bucket or "未分桶"),
+        "method": tool.method,
+        "input_schema": sanitize_generation_schema(tool.input_schema or {}),
+        "output_schema": sanitize_generation_schema(tool.output_schema or {}),
+    }

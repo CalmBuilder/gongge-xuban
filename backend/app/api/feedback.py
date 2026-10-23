@@ -1,4 +1,14 @@
+"""
+@Time       : 2026/10/02
+@Author     : zhanglp8181
+@File       : feedback.py
+@CallChain  : 本人会话反馈/材料UI → 授权投影服务 → 修订与撤回短事务
+@Description: 原会话仍仅本人可读，管理者只取得明确分享的目标材料。
+"""
+
 from __future__ import annotations
+
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlmodel import Session, select
@@ -7,10 +17,65 @@ from app.api.chat import message_read, session_read
 from app.db import get_session
 from app.db.models import ChatSession, Message, MessageFeedback, User, utc_now
 from app.feedback import FEEDBACK_BUCKET_LABELS, enqueue_feedback_analysis, feedback_analysis_read, feedback_summary
+from app.feedback.materials import (
+    FeedbackMaterialRead,
+    MaterialPreviewRequest,
+    MaterialShareRequest,
+    MaterialWithdrawRequest,
+    get_material,
+    list_materials,
+    preview_material,
+    share_material,
+    withdraw_material,
+)
 from app.security.auth import get_current_user
 from app.security.tenant import ensure_tenant
 
 router = APIRouter(prefix="/api/enterprise/feedback", tags=["enterprise:feedback"])
+
+
+@router.post("/{feedback_id}/materials/preview", response_model=FeedbackMaterialRead)
+def preview_feedback_material(feedback_id: str, request: MaterialPreviewRequest,
+                              current_user: User = Depends(get_current_user),
+                              db: Session = Depends(get_session)) -> FeedbackMaterialRead:
+    """本人生成最小预览投影，生成预览不等于授权分享。"""
+    return preview_material(db, feedback_id, request, current_user)
+
+
+@router.post("/materials/{material_id}/share", response_model=FeedbackMaterialRead)
+def share_feedback_material(material_id: str, request: MaterialShareRequest,
+                            current_user: User = Depends(get_current_user),
+                            db: Session = Depends(get_session)) -> FeedbackMaterialRead:
+    """本人明确确认服务端预览摘要，在短事务提交目标授权。"""
+    return share_material(db, material_id, request, current_user)
+
+
+@router.post("/materials/{material_id}/withdraw", response_model=FeedbackMaterialRead)
+def withdraw_feedback_material(material_id: str, request: MaterialWithdrawRequest,
+                               current_user: User = Depends(get_current_user),
+                               db: Session = Depends(get_session)) -> FeedbackMaterialRead:
+    """永久撤回指定材料身份，回执不重新发送旧正文。"""
+    return withdraw_material(db, material_id, request, current_user)
+
+
+@router.get("/materials", response_model=list[FeedbackMaterialRead])
+def list_feedback_materials(tenant_id: str = Query(...),
+                            agent_id: str = Query(..., min_length=1),
+                            mode: Literal['owned', 'managed'] = Query(default='owned'),
+                            current_user: User = Depends(get_current_user),
+                            db: Session = Depends(get_session)) -> list[FeedbackMaterialRead]:
+    """明确员工范围内分别读取本人材料或有权管理的已分享材料。"""
+    _ensure_request_tenant(tenant_id, current_user)
+    return list_materials(db, current_user, agent_id, mode)
+
+
+@router.get("/materials/{material_id}", response_model=FeedbackMaterialRead)
+def get_feedback_material(material_id: str, tenant_id: str = Query(...),
+                          current_user: User = Depends(get_current_user),
+                          db: Session = Depends(get_session)) -> FeedbackMaterialRead:
+    """当前授权读取最小投影，不提升读取分享者原会话的权限。"""
+    _ensure_request_tenant(tenant_id, current_user)
+    return get_material(db, material_id, current_user)
 
 
 @router.get("/summary")
@@ -173,12 +238,17 @@ def reanalyze_feedback(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_session),
 ) -> dict:
+    """只更新分析代数，不重签本人已确认的分享快照或反馈事实修订。"""
     _ensure_request_tenant(tenant_id, current_user)
     ensure_tenant(db, tenant_id)
     row = db.get(MessageFeedback, feedback_id)
     if not row or row.tenant_id != tenant_id:
         raise HTTPException(status_code=404, detail="Feedback not found")
     _get_owned_chat_session(db, tenant_id, current_user, row.session_id)
+    from app.feedback.materials import lock_feedback
+
+    row = lock_feedback(db, tenant_id, row.id)
+    row.analysis_generation += 1
     now = utc_now()
     row.analysis_status = "pending"
     row.analysis_bucket = None

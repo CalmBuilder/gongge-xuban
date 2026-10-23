@@ -1,12 +1,21 @@
+"""
+@Time       : 2026/10/03
+@Author     : zhanglp8181
+@File       : service.py
+@CallChain  : 本人反馈/后台分析 → 精确原轮payload → 每次SDK身份守卫 → 修订CAS结算
+@Description: 内部修复及供应商重试也拒绝失效分析，保留本人归因与最终CAS。
+"""
 from __future__ import annotations
 
 import time
 from collections import Counter
 from typing import Any
 
+from sqlalchemy import update
 from sqlmodel import Session, select
 
-from app.db.models import AgentEvent, ChatSession, Message, MessageFeedback, ModelConfig, User, utc_now
+from app.db.models import ChatSession, Message, MessageFeedback, ModelConfig, User, utc_now
+from app.feedback.source import feedback_source
 from app.llm import LLMClient, LLMError
 from app.observability.spans import llm_operation
 
@@ -50,44 +59,95 @@ FEEDBACK_ANALYSIS_PROMPT = """
 """.strip()
 
 
+class _FeedbackAnalysisInvalidated(LLMError):
+    """原分析身份已失效；无供应商status/code，内部不重试，调用方安全结束。"""
+
+
 class FeedbackAnalysisService:
     def __init__(self, db: Session):
+        """绑定反馈分析短会话，不持锁跨越模型调用。"""
         self.db = db
 
     def analyze_feedback(self, feedback_id: str) -> MessageFeedback | None:
-        feedback = self.db.get(MessageFeedback, feedback_id)
+        """每次实际SDK前fresh核验原身份，事务外调用并按原revision/generation结算。"""
+        feedback = self.db.get(MessageFeedback, feedback_id, populate_existing=True)
         if not feedback:
             return None
+        identity = (feedback.id, feedback.tenant_id, feedback.revision,
+                    feedback.analysis_generation, feedback.rating)
         model_config = self._default_model_config(feedback.tenant_id)
         if not model_config:
-            return self._mark_needs_model(feedback)
-
+            analysis = {"bucket": "needs_model_analysis", "confidence": 0.0,
+                        "reason": "没有可用默认模型，无法完成自动归因。",
+                        "summary": "反馈已记录，等待配置模型后重新分析。", "evidence": [],
+                        "suggested_action": "配置默认模型后重新触发分析。"}
+            return self._settle_analysis(identity, analysis, "needs_model")
         payload = self._analysis_payload(feedback)
-        last_error: LLMError | None = None
+        client = LLMClient(model_config)
+        client.dispatch_observer = lambda: self._assert_analysis_current(identity)
+        self.db.commit()
         for attempt in range(1, FEEDBACK_ANALYSIS_MAX_ATTEMPTS + 1):
+            if not self._analysis_still_current(identity):
+                return None
             try:
                 with llm_operation("feedback.analyze", attempt=attempt):
-                    raw = LLMClient(model_config).generate_json(FEEDBACK_ANALYSIS_PROMPT, payload)
-                analysis = _normalize_analysis(raw, feedback.rating)
-                self._apply_analysis(feedback, analysis, "analyzed")
-                self.db.add(feedback)
-                self.db.commit()
-                self.db.refresh(feedback)
-                return feedback
-            except LLMError as exc:
-                last_error = exc
+                    raw = client.generate_json(FEEDBACK_ANALYSIS_PROMPT, payload)
+                return self._settle_analysis(identity, _normalize_analysis(raw, identity[4]),
+                                             "analyzed")
+            except _FeedbackAnalysisInvalidated:
+                return None
+            except LLMError:
                 if attempt < FEEDBACK_ANALYSIS_MAX_ATTEMPTS:
                     time.sleep(FEEDBACK_ANALYSIS_RETRY_DELAY_SECONDS * attempt)
+        return self._settle_analysis(identity, {
+            "bucket": "unknown", "confidence": None, "reason": "模型分析暂时失败。",
+            "summary": "反馈已记录，后台分析暂时失败，可重新分析。", "evidence": [],
+            "suggested_action": "稍后重新分析。", "error_type": "llm_error",
+            "retryable": True, "attempts": FEEDBACK_ANALYSIS_MAX_ATTEMPTS,
+        }, "failed")
 
-        if last_error is None:
-            last_error = LLMError("Unknown model analysis failure")
-        self._mark_failed(feedback, last_error, FEEDBACK_ANALYSIS_MAX_ATTEMPTS)
-        self.db.add(feedback)
+    def _assert_analysis_current(self, identity: tuple) -> None:
+        """复用SDK派发观察器；失效异常穿过内部修复/重试，交由原分析入口安全结束。"""
+        if not self._analysis_still_current(identity):
+            raise _FeedbackAnalysisInvalidated("FEEDBACK_ANALYSIS_INVALIDATED")
+
+    def _analysis_still_current(self, identity: tuple) -> bool:
+        """独立短Session核对原评分/分析身份及本人会话，不把分享撤回当本人失权。"""
+        row_id, tenant_id, revision, generation, rating = identity
+        with Session(self.db.get_bind()) as current:
+            row = current.get(MessageFeedback, row_id)
+            if (row is None or row.tenant_id != tenant_id or row.revision != revision
+                    or row.analysis_generation != generation or row.rating != rating):
+                return False
+            user = current.get(User, row.user_id)
+            chat = current.get(ChatSession, row.session_id)
+            return bool(user and user.tenant_id == tenant_id and user.membership_status == "active"
+                        and chat and chat.tenant_id == tenant_id and chat.user_id == user.id)
+
+    def _settle_analysis(self, identity: tuple, analysis: dict[str, Any],
+                         status: str) -> MessageFeedback | None:
+        """CAS只更新归因字段；评分修改、重新分析、删除使所有旧模型结果失效。"""
+        row_id, tenant_id, revision, generation, rating = identity
+        now = utc_now()
+        confidence = analysis.get("confidence")
+        changed = self.db.exec(update(MessageFeedback).where(
+            MessageFeedback.id == row_id, MessageFeedback.tenant_id == tenant_id,
+            MessageFeedback.revision == revision,
+            MessageFeedback.analysis_generation == generation,
+            MessageFeedback.rating == rating,
+        ).values(analysis_status=status, analysis_bucket=str(analysis.get("bucket") or "unknown"),
+                 analysis_reason=str(analysis.get("reason") or "")[:300],
+                 analysis_summary=str(analysis.get("summary") or "")[:500],
+                 analysis_confidence=None if confidence is None else _float_in_range(confidence, 0, 1),
+                 analysis_json=analysis, analyzed_at=now, updated_at=now)
+            .execution_options(synchronize_session=False))
         self.db.commit()
-        self.db.refresh(feedback)
-        return feedback
+        if changed.rowcount != 1:
+            return None
+        return self.db.get(MessageFeedback, row_id, populate_existing=True)
 
     def _default_model_config(self, tenant_id: str) -> ModelConfig | None:
+        """读取租户自己的启用默认模型，不回退跨租户配置。"""
         return self.db.exec(
             select(ModelConfig).where(
                 ModelConfig.tenant_id == tenant_id,
@@ -96,114 +156,25 @@ class FeedbackAnalysisService:
             )
         ).first()
 
-    def _mark_needs_model(self, feedback: MessageFeedback) -> MessageFeedback:
-        analysis = {
-            "bucket": "needs_model_analysis",
-            "confidence": 0.0,
-            "reason": "没有可用默认模型，无法完成自动归因。",
-            "summary": "反馈已记录，等待配置模型后重新分析。",
-            "evidence": [],
-            "suggested_action": "配置默认模型后重新触发分析。",
-        }
-        self._apply_analysis(feedback, analysis, "needs_model")
-        self.db.add(feedback)
-        self.db.commit()
-        self.db.refresh(feedback)
-        return feedback
-
-    def _mark_failed(self, feedback: MessageFeedback, exc: LLMError, attempts: int) -> None:
-        error_message = str(exc)[:300]
-        self._apply_analysis(
-            feedback,
-            {
-                "bucket": "unknown",
-                "confidence": None,
-                "reason": f"模型分析失败：{error_message}",
-                "summary": "反馈已记录，后台分析暂时失败，可重新分析。",
-                "evidence": [],
-                "suggested_action": "稍后重新分析。",
-                "error_type": "llm_error",
-                "retryable": True,
-                "attempts": attempts,
-            },
-            "failed",
-        )
-
-    def _apply_analysis(self, feedback: MessageFeedback, analysis: dict[str, Any], status: str) -> None:
-        feedback.analysis_status = status
-        feedback.analysis_bucket = str(analysis.get("bucket") or "unknown")
-        feedback.analysis_reason = str(analysis.get("reason") or "")[:300]
-        feedback.analysis_summary = str(analysis.get("summary") or "")[:500]
-        confidence = analysis.get("confidence")
-        feedback.analysis_confidence = None if confidence is None else _float_in_range(confidence, 0.0, 1.0)
-        feedback.analysis_json = analysis
-        feedback.analyzed_at = utc_now()
-        feedback.updated_at = utc_now()
-
     def _analysis_payload(self, feedback: MessageFeedback) -> dict[str, Any]:
+        """只读取原回复及显式原轮，不从附近消息/最新事件/当前会话猜执行事实。"""
         message = self.db.get(Message, feedback.message_id)
-        chat_session = self.db.get(ChatSession, feedback.session_id)
-        user = self.db.get(User, feedback.user_id)
-        messages = list(
-            self.db.exec(
-                select(Message)
-                .where(Message.tenant_id == feedback.tenant_id, Message.session_id == feedback.session_id)
-                .order_by(Message.created_at)
-            ).all()
-        )
-        target_index = next((index for index, item in enumerate(messages) if item.id == feedback.message_id), -1)
-        if target_index >= 0:
-            context_messages = messages[max(0, target_index - 6) : target_index + 2]
-        else:
-            context_messages = messages[-8:]
-        events = list(
-            self.db.exec(
-                select(AgentEvent)
-                .where(AgentEvent.tenant_id == feedback.tenant_id, AgentEvent.session_id == feedback.session_id)
-                .order_by(AgentEvent.created_at.desc())
-                .limit(30)
-            ).all()
-        )
+        source = feedback_source(self.db, message) if message else None
+        turn = self.db.get(Message, source.turn_id) if source and source.turn_id else None
+        snapshot = (message.metadata_json or {}).get("feedback_source") if message else None
         return {
-            "feedback": {
-                "rating": feedback.rating,
-                "message_id": feedback.message_id,
-                "updated_at": feedback.updated_at.isoformat(),
-            },
-            "session": {
-                "session_id": chat_session.id if chat_session else feedback.session_id,
-                "title": chat_session.title if chat_session else None,
-                "active_skill_id": chat_session.active_skill_id if chat_session else None,
-                "active_step_id": chat_session.active_step_id if chat_session else None,
-                "summary": chat_session.summary if chat_session else None,
-                "slots": chat_session.slots_json if chat_session else {},
-            },
-            "user": {
-                "user_id": feedback.user_id,
-                "username": user.username if user else None,
-                "display_name": user.display_name if user else None,
-            },
-            "target_message": {
-                "role": message.role if message else None,
-                "content": message.content if message else "",
-            },
-            "nearby_messages": [
-                {
-                    "id": item.id,
-                    "role": item.role,
-                    "content": item.content,
-                    "created_at": item.created_at.isoformat(),
-                }
-                for item in context_messages
-            ],
-            "recent_agent_events": [
-                {
-                    "event_type": event.event_type,
-                    "payload": event.payload_json,
-                    "created_at": event.created_at.isoformat(),
-                }
-                for event in reversed(events)
-            ],
+            "feedback": {"rating": feedback.rating, "message_id": feedback.message_id,
+                         "revision": feedback.revision},
+            "source": source.model_dump() if source else {"status": "missing"},
+            "session": {"session_id": feedback.session_id,
+                        "active_skill_id": source.skill_id if source else None,
+                        "active_step_id": None, "slots": {}},
+            "target_message": {"role": message.role if message else None,
+                               "content": message.content if message else ""},
+            "nearby_messages": [{"id": turn.id, "role": turn.role, "content": turn.content}]
+                               if turn and turn.session_id == feedback.session_id else [],
+            "recent_agent_events": [],
+            "execution_facts": snapshot if isinstance(snapshot, dict) else {},
         }
 
 

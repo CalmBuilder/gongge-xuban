@@ -492,7 +492,11 @@ class PublicationService:
         for agent in adopted_agents:
             if (agent.metadata_json or {}).get("adopted_release_id") != release.id:
                 continue
-            agent.status = "inactive"
+            if agent.status != "inactive":
+                agent.status = "inactive"
+                agent.memory_capture_generation = max(
+                    int(agent.memory_capture_generation or 1), 1
+                ) + 1
             agent.updated_at = now
             self.db.add(agent)
             bindings = self.db.exec(
@@ -1053,6 +1057,7 @@ class PublicationService:
         if agent is None:
             raise PublicationError("PUBLICATION_RESOURCE_NOT_FOUND", "agent unavailable", 404)
         metadata = dict(agent.metadata_json or {})
+        publication_changed = bool(agent.published_to_gallery) != published
         metadata["published_to_gallery"] = published
         if published:
             metadata["organization_release_id"] = release_id
@@ -1068,6 +1073,10 @@ class PublicationService:
             agent.visibility_scope = "private"
             agent.gallery_published_at = None
             agent.gallery_published_by = None
+        if publication_changed:
+            agent.memory_capture_generation = max(
+                int(agent.memory_capture_generation or 1), 1
+            ) + 1
         agent.metadata_json = metadata
         agent.updated_at = now
         self.db.add(agent)

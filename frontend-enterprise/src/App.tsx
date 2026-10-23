@@ -4,6 +4,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type CSSProperties,
 } from "react";
@@ -100,6 +101,7 @@ import {
   ENTERPRISE_AGENT_STORAGE_KEY,
   persistSharedAgentScope,
 } from "@/lib/agent-scope-storage";
+import { AgentScopeLoadEpoch } from "@/lib/agent-scope-load";
 import { cn } from "@/lib/utils";
 import {
   SELECT_TRIGGER_CLASS,
@@ -156,6 +158,7 @@ function Shell({
   const [selectedAgentId, setSelectedAgentId] = useState(
     () => window.localStorage.getItem(ENTERPRISE_AGENT_STORAGE_KEY) || "",
   );
+  const agentScopeLoadEpochRef = useRef(new AgentScopeLoadEpoch());
   const [sidebarExpanded, setSidebarExpanded] = useState(() => {
     const stored = window.localStorage.getItem(ENTERPRISE_SIDEBAR_STORAGE_KEY);
     return stored == null ? true : stored === "1";
@@ -299,6 +302,7 @@ function Shell({
 
   useEffect(() => {
     const onScopeChange = (event: Event) => {
+      agentScopeLoadEpochRef.current.advance();
       const nextAgentId =
         (event as CustomEvent<{ agentId?: string }>).detail?.agentId ||
         window.localStorage.getItem(ENTERPRISE_AGENT_STORAGE_KEY) ||
@@ -334,12 +338,14 @@ function Shell({
   }, []);
 
   function loadAgents(preferredAgentId = "") {
+    const scopeLoadEpoch = agentScopeLoadEpochRef.current.capture();
     return api
       .get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${getRequestTenantId()}`)
       .then((rows) => {
         setAgents(rows);
         const selectableRows = rows.filter((item) => canUseAgentScope(item));
         setSelectedAgentId((current) => {
+          if (!agentScopeLoadEpochRef.current.isCurrent(scopeLoadEpoch)) return current;
           const requestedAgentId = preferredAgentId || current;
           if (
             requestedAgentId &&

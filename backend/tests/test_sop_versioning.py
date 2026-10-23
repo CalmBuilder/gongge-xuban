@@ -198,6 +198,7 @@ def test_deleting_skill_head_retains_published_snapshot() -> None:
     )
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="演示租户"))
+        db.add(admin)
         db.add(skill_head)
         write_skill_version(
             db,

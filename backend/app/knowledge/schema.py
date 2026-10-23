@@ -1,9 +1,9 @@
 """
-@Time        : 2026-07-27
+@Time        : 2026/10/03
 @Author      : zhanglp8181
 @File        : schema.py
-@CallChain   : Knowledge API / AgentLoop → KnowledgeSearchRequest / KnowledgeSearchResponse
-@Description : 定义知识库管理、检索意图、证据结果和发现流程的数据契约。
+@CallChain   : Knowledge API/AgentLoop/DTA → 知识请求/证据结果/模型白名单投影
+@Description : 定义知识治理和检索数据契约，并声明内置只读知识结果的模型输出形态。
 """
 
 from __future__ import annotations
@@ -72,6 +72,7 @@ class KnowledgeBaseRead(BaseModel):
     access_scope: Literal["owner", "organization", "tenant"] = "owner"
     download_policy: Literal["allowed", "restricted"] = "restricted"
     revision: int = 1
+    content_revision: int = 1
     organization_access: list[KnowledgeBaseOrgAccessRead] = Field(default_factory=list)
     content_access_allowed: bool = True
     content_access_reason: str = "allowed"
@@ -99,11 +100,22 @@ class KnowledgeDocumentUploadRequest(BaseModel):
 
 
 class KnowledgeIngestJobRead(BaseModel):
+    """返回入库或正文修订任务的受权状态，不暴露候选正文和内部候选 ID。"""
+
     id: str
     tenant_id: str
     knowledge_base_id: str
     document_id: Optional[str] = None
     filename: str
+    job_kind: str = "legacy"
+    scope: str = "overall"
+    source_version_id: Optional[str] = None
+    expected_revision: Optional[int] = None
+    published_version_id: Optional[str] = None
+    published_document_id: Optional[str] = None
+    content_revision: Optional[int] = None
+    manifest_hash: Optional[str] = None
+    error_code: Optional[str] = None
     status: str
     stage: str
     progress: float
@@ -136,11 +148,40 @@ class KnowledgeDocumentRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class KnowledgeDocumentContentRead(BaseModel):
+    """返回当前可编辑 head 的完整规范正文及其持久版本事实。"""
+
+    document_id: str
+    lineage_id: str
+    knowledge_base_version_id: str
+    scope: str
+    head_version_id: str
+    content_revision: int
+    content_md: str
+    source_checksum: Optional[str] = None
+    source_kind: str
+
+
 class KnowledgeDocumentUpdateRequest(BaseModel):
+    """声明文档兼容字段更新或一次带 CAS 的完整正文修订意图。"""
+
     tenant_id: str
     title: Optional[str] = None
     status: Optional[Literal["ready", "processing", "failed", "archived"]] = None
     metadata: Optional[dict[str, Any]] = None
+    content_md: Optional[str] = None
+    expected_version_id: Optional[str] = None
+    expected_revision: Optional[int] = Field(default=None, ge=1)
+    client_request_id: Optional[str] = Field(default=None, min_length=1, max_length=64)
+
+
+class KnowledgeRevisionAccepted(BaseModel):
+    """表示正文已受理为持久构建任务，但尚未成为可见已发布版本。"""
+
+    job_id: str
+    status: str
+    source_version_id: str
+    expected_revision: int
 
 
 class KnowledgeBucketRead(BaseModel):
@@ -285,6 +326,74 @@ class KnowledgeSearchResponse(BaseModel):
     evidence_sufficiency: KnowledgeEvidenceSufficiency = Field(
         default_factory=KnowledgeEvidenceSufficiency
     )
+
+
+def withhold_insufficient_knowledge_candidates(value: dict[str, Any]) -> dict[str, Any]:
+    """答案模型收到的知识必须整体满足必需方面，未满足时不透传部分候选正文。"""
+
+    outcome = value.get("outcome")
+    sufficiency = value.get("evidence_sufficiency")
+    should_withhold = outcome in ("no_match", "insufficient")
+    if isinstance(sufficiency, dict):
+        should_withhold = should_withhold or (
+            sufficiency.get("required") is True and sufficiency.get("satisfied") is not True
+        )
+    if not should_withhold:
+        return value
+
+    projected = dict(value)
+    for field_name in (
+        "chunks",
+        "evidence_pack",
+        "okf_citations",
+        "selected_buckets",
+        "selected_concepts",
+        "selected_documents",
+    ):
+        if field_name in projected:
+            projected[field_name] = []
+    return projected
+
+
+def knowledge_result_output_schema() -> dict[str, Any]:
+    """声明原检索结果的业务证据白名单，供DTA冻结与旧卡片只读投影共用。
+
+    不开放trace、metadata、凭据和未知侧带，数量/深度/字符串仍由原通用投影预算约束。
+    """
+    def object_fields(strings: tuple[str, ...], **extra: Any) -> dict[str, Any]:
+        """显式列出安全字段，始终禁止未知对象属性进入模型上下文。"""
+        return {"type": "object", "additionalProperties": False,
+                "properties": {**{key: {"type": "string"} for key in strings}, **extra}}
+
+    def array(items: dict[str, Any]) -> dict[str, Any]:
+        """集合沿原通用预算投影，每项继续使用显式字段白名单。"""
+        return {"type": "array", "items": items}
+
+    strings = {"type": "string"}
+    identities = ("id", "tenant_id", "knowledge_base_id", "knowledge_base_version_id",
+                  "document_id", "bucket_id")
+    source = object_fields(("document_id", "chunk_id", "source_path", "section_path"))
+    citation = object_fields(("target", "text", "label"))
+    evidence = object_fields(("chunk_id", "document_id", "bucket_id", "source_path",
+        "section_path", "summary", "content", "excerpt", "confidence_reason", "related_group_id"),
+        related_chunk_ids=array(strings), related_chunk_index={"type": "integer"},
+        relevance_score={"type": "number"}, evidence_alignment_score={"type": "number"})
+    sufficiency = object_fields(("reason",), required={"type": "boolean"},
+        satisfied={"type": "boolean"}, evidence_count={"type": "integer"},
+        aligned_evidence_count={"type": "integer"}, required_aspects=array(strings),
+        covered_aspects=array(strings), max_alignment_score={"type": "number"},
+        alignment_threshold={"type": "number"})
+    return object_fields(("outcome",), degraded={"type": "boolean"},
+        knowledge_base_ids=array(strings), knowledge_base_version_ids=array(strings),
+        okf_citations=array(object_fields(("concept_id", "title", "label", "target"))),
+        evidence_sufficiency=sufficiency, evidence_pack=array(evidence),
+        selected_documents=array(object_fields((*identities, "title", "filename", "summary"))),
+        selected_buckets=array(object_fields((*identities, "bucket_key", "title", "summary"))),
+        selected_concepts=array(object_fields((*identities, "concept_id", "type", "title",
+            "description", "content", "content_excerpt"), source_refs=array(source),
+            citations=array(citation), links=array(citation))),
+        chunks=array(object_fields((*identities, "content", "summary", "source_ref"),
+                                  chunk_index={"type": "integer"})))
 
 
 class KnowledgeDiscoveryRead(BaseModel):

@@ -250,6 +250,7 @@ def _source_snapshot(db: Session, skill: Skill) -> SkillVersion:
         .where(
             SkillVersion.tenant_id == skill.tenant_id,
             SkillVersion.skill_id == skill.skill_id,
+            SkillVersion.scope_agent_id == "",
             SkillVersion.version == skill.version,
             SkillVersion.status == "published",
         )
@@ -463,4 +464,3 @@ def _upgrade_purchase_definition(content: dict[str, object]) -> None:
             },
         },
     }
-

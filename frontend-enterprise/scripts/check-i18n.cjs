@@ -18,6 +18,8 @@ function sourceFiles(directory) {
       if (entry.name === 'i18n') return [];
       return sourceFiles(fullPath);
     }
+    // 测试夹具中的中文是断言输入，不是用户可见文案；只扫描生产 TS/TSX，避免把测试数据当成漏译。
+    if (/\.(test|spec)\.(ts|tsx)$/.test(entry.name)) return [];
     return /\.(ts|tsx)$/.test(entry.name) ? [fullPath] : [];
   });
 }

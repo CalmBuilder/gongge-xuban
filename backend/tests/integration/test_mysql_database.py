@@ -1,5 +1,5 @@
 """
-@Time       : 2026/08/10 17:15
+@Time       : 2026/10/03
 @Author     : zhanglp8181
 @File       : test_mysql_database.py
 @CallChain  : pytest mysql 标记 → Alembic/SQLModel → 临时 MySQL 8.4 数据库
@@ -16,9 +16,10 @@ from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 from sqlalchemy.exc import IntegrityError, OperationalError
-from sqlalchemy import inspect, text
+from sqlalchemy import MetaData, Table, inspect, text
 from sqlmodel import Session, create_engine, select
 
+from app.api import organization as organization_api
 from app.api.model_configs import set_default_model_config
 from app.api.ui_config import UIConfigUpdateRequest, get_or_create_ui_config, update_enterprise_ui_config
 from app.core.conversation_context import ConversationContextSettings, build_conversation_context
@@ -31,6 +32,8 @@ from app.db.models import (
     ArtifactInputLink,
     BusinessRole,
     BusinessRolePermission,
+    CodeItem,
+    CodeSet,
     EventOutbox,
     ExecutionCommand,
     ExecutionPublication,
@@ -68,6 +71,7 @@ from app.organization.governance import (
     BUILTIN_GOVERNANCE_ROLES,
     ensure_builtin_governance_catalog,
 )
+from app.organization.units import ensure_organization_foundation
 from app.dynamic_tasks.planning import (
     ActionKind,
     CompletedProviderProposal,
@@ -2003,7 +2007,6 @@ def test_organization_unit_migration_round_trips_existing_mysql_tenant(
                 "VALUES ('tenant_m2_mysql', 'M2 MySQL', UTC_TIMESTAMP(), UTC_TIMESTAMP())"
             )
         )
-
     upgrade(mysql_database_url, "20260728_0017")
     with engine.connect() as connection:
         root = (
@@ -2049,6 +2052,53 @@ def test_organization_unit_migration_round_trips_existing_mysql_tenant(
             ).scalar_one()
             == 0
         )
+
+
+def test_mysql_organization_foundation_initialization_is_race_safe(
+    mysql_database_url: str,
+) -> None:
+    """验证两个并发请求首次读取组织树时不会因租户码表初始化重复键失败。"""
+
+    upgrade(mysql_database_url)
+    engine = create_engine(mysql_database_url, pool_pre_ping=True)
+    tenant_id = "tenant_mysql_organization_init_race"
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO tenants (id, name, created_at, updated_at) "
+                    "VALUES (:id, 'MySQL organization race', UTC_TIMESTAMP(), UTC_TIMESTAMP())"
+                ),
+                {"id": tenant_id},
+            )
+
+        barrier = threading.Barrier(2)
+
+        def initialize(worker_id: int) -> str:
+            """并发初始化同一租户并返回稳定根 ID，隔离 ORM 会话与连接。"""
+
+            with Session(engine) as db:
+                barrier.wait(timeout=10)
+                root = ensure_organization_foundation(db, tenant_id)
+                db.commit()
+                return root.id
+
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            roots = list(workers.map(initialize, (1, 2)))
+
+        assert roots[0] == roots[1]
+        with Session(engine) as observer:
+            code_set = observer.exec(
+                select(CodeSet).where(
+                    CodeSet.tenant_id == tenant_id,
+                    CodeSet.set_code == "organization_unit_type",
+                )
+            ).one()
+            assert len(observer.exec(
+                select(CodeItem).where(CodeItem.code_set_id == code_set.id)
+            ).all()) == 6
+    finally:
+        engine.dispose()
 
 
 def test_organization_assignment_migration_maps_legacy_departments_on_mysql(
@@ -2200,7 +2250,8 @@ def test_demo_seed_is_idempotent_on_mysql(mysql_database_url: str) -> None:
         ]
         expense_versions = session.exec(
             select(SkillVersion)
-            .where(SkillVersion.skill_id == "expense_over_limit_approval")
+            .where(SkillVersion.skill_id == "expense_over_limit_approval",
+                   SkillVersion.tenant_id == "tenant_demo", SkillVersion.scope_agent_id == "")
             .order_by(SkillVersion.version)
         ).all()
 
@@ -2279,11 +2330,13 @@ def test_legacy_published_snapshot_repair_is_evidence_gated_on_mysql(
         session.commit()
 
     upgrade(mysql_database_url, "20260729_0027")
+    # 历史迁移使用当时的真实表列，不能用增加新scope列后的当前ORM读取旧schema。
+    legacy_versions = Table("skill_versions", MetaData(), autoload_with=engine)
     with Session(engine) as session:
-        snapshots = session.exec(
-            select(SkillVersion)
-            .where(SkillVersion.skill_id.in_(legacy_skill_ids))
-            .order_by(SkillVersion.skill_id)
+        snapshots = session.execute(
+            select(legacy_versions)
+            .where(legacy_versions.c.skill_id.in_(legacy_skill_ids))
+            .order_by(legacy_versions.c.skill_id)
         ).all()
         first_ids = [snapshot.id for snapshot in snapshots]
 
@@ -2296,10 +2349,10 @@ def test_legacy_published_snapshot_repair_is_evidence_gated_on_mysql(
     downgrade(mysql_database_url, "20260729_0026")
     upgrade(mysql_database_url, "20260729_0027")
     with Session(engine) as session:
-        snapshots = session.exec(
-            select(SkillVersion)
-            .where(SkillVersion.skill_id.in_(legacy_skill_ids))
-            .order_by(SkillVersion.skill_id)
+        snapshots = session.execute(
+            select(legacy_versions)
+            .where(legacy_versions.c.skill_id.in_(legacy_skill_ids))
+            .order_by(legacy_versions.c.skill_id)
         ).all()
         assert [snapshot.id for snapshot in snapshots] == first_ids
 
@@ -2841,3 +2894,70 @@ def test_mysql_builtin_governance_catalog_is_safe_under_concurrent_requests(
         {(row.business_role_id, row.permission_definition_id) for row in mappings}
     )
     assert len(mappings) == sum(len(codes) for _, codes in BUILTIN_GOVERNANCE_ROLES.values())
+
+
+def test_mysql_permission_page_initialization_is_safe_under_concurrent_reads(
+    mysql_database_url: str,
+) -> None:
+    """验证新租户首次并发读取权限与角色页面不会暴露半成品权限目录。"""
+
+    upgrade(mysql_database_url)
+    engine = create_engine(mysql_database_url, pool_pre_ping=True)
+    tenant_id = "tenant_permission_page_race"
+    user_id = "user_permission_page_race"
+    try:
+        with Session(engine) as db:
+            db.add(Tenant(id=tenant_id, name="权限页面并发隔离企业"))
+            db.add(
+                User(
+                    id=user_id,
+                    tenant_id=tenant_id,
+                    username="permission_page_race",
+                    password_hash="synthetic-test-hash",
+                    role="admin",
+                )
+            )
+            db.commit()
+
+        barrier = threading.Barrier(4)
+
+        def read_page(page_kind: str) -> int:
+            """在独立事务中模拟浏览器同时读取权限目录和角色目录。"""
+
+            with Session(engine) as db:
+                user = db.get(User, user_id)
+                assert user is not None
+                barrier.wait(timeout=10)
+                if page_kind == "permissions":
+                    rows = organization_api.list_permission_definitions(
+                        tenant_id=tenant_id,
+                        q=None,
+                        category=None,
+                        status="active",
+                        current_user=user,
+                        db=db,
+                    )
+                else:
+                    rows = organization_api.list_business_roles(
+                        tenant_id=tenant_id,
+                        current_user=user,
+                        db=db,
+                    )
+                return len(rows)
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [
+                executor.submit(read_page, page_kind)
+                for page_kind in ("permissions", "roles", "permissions", "roles")
+            ]
+            result_sizes = [future.result(timeout=30) for future in futures]
+
+        assert all(size > 0 for size in result_sizes)
+        with Session(engine) as db:
+            definitions = db.exec(
+                select(PermissionDefinition).where(PermissionDefinition.tenant_id == tenant_id)
+            ).all()
+            assert len(definitions) == len({row.permission_code for row in definitions})
+            assert len(definitions) == 66
+    finally:
+        engine.dispose()

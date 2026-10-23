@@ -1,15 +1,17 @@
 """
-@Time       : 2026/07/27 14:45
+@Time       : 2026/10/03
 @Author     : zhanglp8181
 @File       : citations.py
-@CallChain  : KnowledgeService/AgentLoop → 引用提取与回复规范化 → Message metadata
-@Description: 生成、去重和重编号知识引用，并修复可唯一确认的原子引用截断。
+@CallChain  : KnowledgeService/AgentLoop/DTA → 精确物理引用提取与回复规范化 → Message metadata
+@Description: 绑定原已选物理来源，生成、去重和重编号引用，并修复可唯一确认的原子截断。
 """
 
 from __future__ import annotations
 
 import re
 from typing import Any
+
+from app.knowledge.schema import withhold_insufficient_knowledge_candidates
 
 CITATION_EXCERPT_CHAR_LIMIT = 6000
 CITATION_SUMMARY_CHAR_LIMIT = 800
@@ -157,6 +159,7 @@ def knowledge_citations_from_results(
     knowledge_results: list[dict[str, Any]],
     limit: int = 4,
 ) -> list[dict[str, Any]]:
+    """提取本轮原证据，概念优先物理ID以免跨版本逻辑键读取歧义；兼容旧无ID结果。"""
     citations: list[dict[str, Any]] = []
     seen_identities: set[str] = set()
 
@@ -182,11 +185,14 @@ def knowledge_citations_from_results(
             }
         )
 
-    for result in knowledge_results:
+    for raw_result in knowledge_results:
+        if not isinstance(raw_result, dict):
+            continue
+        result = withhold_insufficient_knowledge_candidates(raw_result)
         for concept in result.get("selected_concepts") or []:
             if not isinstance(concept, dict):
                 continue
-            concept_id = str(concept.get("concept_id") or concept.get("id") or "").strip()
+            concept_id = str(concept.get("id") or concept.get("concept_id") or "").strip()
             title = _display_title(str(concept.get("title") or concept_id or "Wiki 概念"))
             description = str(concept.get("description") or "").strip()
             content = str(concept.get("content") or concept.get("content_excerpt") or "").strip()

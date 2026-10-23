@@ -1,3 +1,13 @@
+"""
+@Time       : 2026/10/20
+@Author     : zhanglp8181
+@File       : test_step_agent_model_driven.py
+@CallChain  : pytest → StepAgent → 结构化模型输出 → 槽位/工具/知识查询归一化
+@Description: 验证模型驱动步骤对槽位、工具调用和知识查询别名的确定性适配。
+"""
+
+from __future__ import annotations
+
 from app.core.step_agent import StepAgent
 from app.db.models import ChatSession, Skill, Tool
 from app.llm.client import LLMClient
@@ -157,6 +167,36 @@ def test_step_agent_compacts_knowledge_continuation_without_duplicate_results(mo
     assert "selected_documents" not in compacted
     assert "上一轮旧知识" not in str(captured["payload"])
     assert len(compacted["retrieved_knowledge"][0]["content"]) <= 803
+
+
+def test_step_agent_normalizes_policy_query_type_alias_from_provider(monkeypatch):
+    """供应商把策略查询写成旧别名时，仍映射到冻结知识查询合同。"""
+
+    def fake_init(self, model_config):  # noqa: ANN001
+        return None
+
+    def fake_generate_json(self, system_prompt, payload):  # noqa: ANN001
+        return {
+            "knowledge_query": {
+                "query": "请查员工请假政策",
+                "query_type": "policy",
+            },
+            "is_step_completed": False,
+        }
+
+    monkeypatch.setattr(LLMClient, "__init__", fake_init)
+    monkeypatch.setattr(LLMClient, "generate_json", fake_generate_json)
+
+    result = StepAgent().run(
+        "请查员工请假政策",
+        ChatSession(id="session_test", tenant_id="tenant_demo"),
+        None,
+        [],
+        model_config=None,  # type: ignore[arg-type]
+    )
+
+    assert result.knowledge_query is not None
+    assert result.knowledge_query.query_type == "policy_check"
 
 
 def _repair_skill() -> Skill:

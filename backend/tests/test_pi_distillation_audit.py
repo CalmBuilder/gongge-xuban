@@ -187,7 +187,7 @@ def _seed_operation(
 
 
 @pytest.mark.parametrize("status", [
-    "prepared", "running", "unknown",
+    "prepared", "running", "unknown", "waiting_external",
     "retry_wait",
 ])
 def test_declared_nonterminal_operation_blocks_terminal(audit_engine: Engine, status: str) -> None:
@@ -200,7 +200,7 @@ def test_declared_nonterminal_operation_blocks_terminal(audit_engine: Engine, st
 
 
 def test_nonterminal_operation_contract_covers_declared_enum(audit_engine: Engine) -> None:
-    """活动集合必须由 OperationStatus 完整推导，新增 retry_wait 不能静默漏检。"""
+    """活动集合必须由 OperationStatus 完整推导，异步等待也不能静默漏检。"""
 
     assert NONTERMINAL_OPERATION_STATUSES == frozenset(
         {
@@ -208,6 +208,7 @@ def test_nonterminal_operation_contract_covers_declared_enum(audit_engine: Engin
             OperationStatus.RUNNING.value,
             OperationStatus.RETRY_WAIT.value,
             OperationStatus.UNKNOWN.value,
+            OperationStatus.WAITING_EXTERNAL.value,
         }
     )
 

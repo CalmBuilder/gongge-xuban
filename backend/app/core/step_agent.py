@@ -138,7 +138,7 @@ class StepAgent:
                     unified_system_prompt(), payload, **generate_kwargs
                 )
             raise_if_cancelled(is_cancelled)
-            result = StepAgentResult.model_validate(raw)
+            result = StepAgentResult.model_validate(_normalize_step_agent_payload(raw))
             if not result.action:
                 result.action = _infer_action(result, router_decision)
             return result
@@ -158,6 +158,21 @@ def _step_agent_slots(slots: dict[str, object] | None) -> dict[str, object]:
         for key, value in slots.items()
         if str(key) not in INTERNAL_SCHEDULER_SLOT_KEYS
     }
+
+
+def _normalize_step_agent_payload(raw: object) -> object:
+    """把供应商保留的策略查询旧别名收敛到当前知识查询合同。"""
+
+    if not isinstance(raw, dict):
+        return raw
+    knowledge_query = raw.get("knowledge_query")
+    if not isinstance(knowledge_query, dict) or knowledge_query.get("query_type") != "policy":
+        return raw
+    normalized = dict(raw)
+    normalized_query = dict(knowledge_query)
+    normalized_query["query_type"] = "policy_check"
+    normalized["knowledge_query"] = normalized_query
+    return normalized
 
 
 def _compact_repair_context(

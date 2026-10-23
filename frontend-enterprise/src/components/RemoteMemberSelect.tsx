@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 import { api } from '@/api/client';
 import type { MemberPage, OrganizationMember } from '@/types/organization';
@@ -35,8 +35,11 @@ export function RemoteMemberSelect({
   const [keyword, setKeyword] = useState('');
   const [members, setMembers] = useState<OrganizationMember[]>([]);
   const [error, setError] = useState('');
+  const requestSequenceRef = useRef(0);
 
   useEffect(() => {
+    const requestSequence = ++requestSequenceRef.current;
+    let disposed = false;
     const timeout = window.setTimeout(async () => {
       const params = new URLSearchParams({
         tenant_id: tenantId,
@@ -53,15 +56,21 @@ export function RemoteMemberSelect({
         const result = await api.get<MemberPage<OrganizationMember>>(
           `/api/auth/users/page?${params.toString()}`,
         );
+        // 跨数据库或重启恢复时请求返回顺序可能改变，旧响应不能覆盖新组织范围的成员事实。
+        if (disposed || requestSequence !== requestSequenceRef.current) return;
         setMembers(result.items.filter(
           (member) => Boolean(member.employee_profile_id) && member.id !== excludeUserId,
         ));
         setError('');
       } catch (requestError) {
+        if (disposed || requestSequence !== requestSequenceRef.current) return;
         setError(requestError instanceof Error ? requestError.message : '成员搜索失败');
       }
     }, keyword ? 250 : 0);
-    return () => window.clearTimeout(timeout);
+    return () => {
+      disposed = true;
+      window.clearTimeout(timeout);
+    };
   }, [excludeUserId, includeDescendants, keyword, orgUnitId, tenantId]);
 
   return (

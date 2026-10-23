@@ -51,7 +51,6 @@ from app.security.outbound import (
     is_same_origin,
     prepare_outbound_request,
 )
-from app.tools import ToolExecutor
 from app.tools.http_request import prepare_get_request
 from app.tools.mcp_client import (
     MCPClientError,
@@ -60,6 +59,7 @@ from app.tools.mcp_client import (
     normalize_transport,
 )
 from app.tools.managed_workspace import ManagedCodeWorkspaceError, ManagedCodeWorkspaceService
+from app.tools.tool_test_adapter import ToolTestExecutionAdapter
 from app.tools.tool_schema import (
     MCPDiscoverRequest,
     MCPDiscoverResponse,
@@ -72,7 +72,6 @@ from app.tools.tool_schema import (
     MCPSyncRequest,
     MCPSyncResponse,
     ToolBucketRead,
-    ToolCall,
     ToolCredentialState,
     ToolCreateRequest,
     ToolError,
@@ -506,12 +505,14 @@ def test_tool(
     ensure_current_user_tenant(request.tenant_id, current_user)
     row = _get_tool(db, request.tenant_id, tool_id)
     _ensure_tool_visible(db, request.tenant_id, row, agent_id)
-    return ToolExecutor(db).execute(
-        request.tenant_id,
-        ToolCall(name=row.name, arguments=request.arguments),
-        active_skill_id=request.active_skill_id,
-        agent_id=agent_id,
+    return ToolTestExecutionAdapter(db).execute(
+        tenant_id=request.tenant_id,
+        tool=row,
+        arguments=request.arguments,
         actor_user_id=current_user.id,
+        agent_id=agent_id,
+        submission_id=request.submission_id,
+        active_skill_id=request.active_skill_id,
         execution_org_unit_id=request.organization_unit_id,
     )
 

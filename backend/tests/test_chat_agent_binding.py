@@ -23,23 +23,47 @@ from app.api.chat import (
 )
 from app.agents.branching import ensure_private_resource_binding
 from app.core.agent_loop import AgentLoop, AgentLoopPreconditionError
+from app.core.router import Router
+from app.dynamic_tasks.agent import DynamicTaskAgent
+from app.dynamic_tasks.capability_catalog import capability_checksum
+from app.dynamic_tasks.worker import process_dynamic_task_signal
 from app.db.models import (
     AgentEvent,
     AgentProfile,
     AgentResourceBinding,
     AgentUsage,
     ChatSession,
+    ExecutionSignal,
     Message,
     ModelConfig,
     PersonaConfig,
     ScheduledTaskRun,
+    Skill,
+    SopInstance,
+    SopWorkItem,
     Tenant,
     Tool,
     User,
     utc_now,
 )
-from app.session.session_schema import ChatSessionCreateRequest, ChatTurnRequest
+from app.session.session_schema import (
+    ChatSessionCreateRequest,
+    ChatTurnRequest,
+    ChatTurnResponse,
+    RouterDecision,
+    SessionPublic,
+    StepAgentResult,
+)
+from app.sop_runtime.execution_control import ExecutionControlService
 from app.tools.tool_schema import ToolCall
+from tests.test_dynamic_task_agent import (
+    _ClarificationProposer,
+    _Executor,
+    _StartCatalog,
+    _TimeContextClarificationPlanner,
+    _model_capabilities,
+    _snapshot,
+)
 
 
 def test_existing_chat_session_cannot_switch_agent() -> None:
@@ -486,6 +510,498 @@ def test_dynamic_task_chat_turn_marks_selected_engine_metadata() -> None:
     )
 
     assert _user_message_metadata(request) == {"execution_engine": "dynamic_task"}
+
+
+def test_sync_chat_turn_reuses_persisted_input_identity_on_same_client_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同步 API 重试同一 client turn 时只允许一个 AgentLoop 输入事实。"""
+
+    with _test_session() as db:
+        user = User(
+            id="user_sync_replay",
+            tenant_id="tenant_demo",
+            username="sync-replay",
+            password_hash="x",
+        )
+        session = ChatSession(
+            id="session_sync_replay",
+            tenant_id="tenant_demo",
+            user_id=user.id,
+            agent_id="agent_demo",
+        )
+        db.add_all([user, session])
+        db.commit()
+        loop_calls: list[dict[str, str] | None] = []
+
+        def fake_handle_turn(
+            loop: AgentLoop,
+            request: ChatTurnRequest,
+            *,
+            time_context: dict[str, str] | None = None,
+        ) -> ChatTurnResponse:
+            """沿真实消息追加方法写入一轮最小完成事实，记录 AgentLoop 次数。"""
+
+            loop_calls.append(time_context)
+            message, persisted_context = loop._append_user_input_message(
+                request,
+                session.id,
+                time_context=time_context,
+            )
+            response = ChatTurnResponse(
+                reply="已完成",
+                session_id=session.id,
+                session_state=SessionPublic(
+                    session_id=session.id,
+                    tenant_id=session.tenant_id,
+                    user_id=session.user_id,
+                    agent_id=session.agent_id,
+                ),
+            )
+            db.add(
+                AgentEvent(
+                    tenant_id=session.tenant_id,
+                    session_id=session.id,
+                    event_type="user_message_received",
+                    payload_json={
+                        "message_id": message.id,
+                        "client_turn_id": request.client_turn_id,
+                        "message": request.message,
+                        "channel": request.channel,
+                        "user_id": request.user_id,
+                        "time_context": persisted_context,
+                    },
+                )
+            )
+            db.add(
+                AgentEvent(
+                    tenant_id=session.tenant_id,
+                    session_id=session.id,
+                    event_type="complete",
+                    payload_json={
+                        **response.model_dump(mode="json"),
+                        "turn_id": message.id,
+                        "user_message_id": message.id,
+                        "client_turn_id": request.client_turn_id,
+                    },
+                )
+            )
+            db.commit()
+            return response
+
+        monkeypatch.setattr(AgentLoop, "handle_turn", fake_handle_turn)
+        monkeypatch.setattr(chat_api, "_ensure_request_tenant", lambda *_args: None)
+        monkeypatch.setattr(chat_api, "ensure_tenant", lambda *_args: None)
+        monkeypatch.setattr(
+            chat_api,
+            "_ensure_chat_session_available",
+            lambda *_args: session,
+        )
+        monkeypatch.setattr(chat_api, "_bind_request_to_session_agent", lambda *_args: _args[1])
+        monkeypatch.setattr(chat_api, "_schedule_session_title_summary", lambda *_args: None)
+        request = ChatTurnRequest(
+            tenant_id=session.tenant_id,
+            session_id=session.id,
+            agent_id=session.agent_id,
+            message="同一输入",
+            client_turn_id="client_sync_replay",
+            client_timezone="Asia/Shanghai",
+        )
+
+        first = chat_api.chat_turn(request, current_user=user, db=db)
+        second = chat_api.chat_turn(request, current_user=user, db=db)
+
+        messages = db.exec(
+            select(Message).where(
+                Message.session_id == session.id,
+                Message.role == "user",
+            )
+        ).all()
+
+    assert first.reply == second.reply == "已完成"
+    assert len(loop_calls) == 1
+    assert len(messages) == 1
+    assert messages[0].metadata_json["time_context"]["source_input_id"] == messages[0].id
+
+
+def test_sync_chat_turn_replays_target_turn_after_later_turn_with_real_agent_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """真实 AgentLoop 完成 A 后再完成 B，重放 A 必须恢复 A 的持久回复而非会话最新回复。"""
+
+    with _test_session() as db:
+        tenant_id = "tenant_real_replay"
+        user = User(
+            id="user_real_replay",
+            tenant_id=tenant_id,
+            username="real-replay",
+            password_hash="x",
+        )
+        agent = AgentProfile(
+            id="agent_real_replay",
+            tenant_id=tenant_id,
+            name="真实回放员工",
+            is_overall=False,
+            status="active",
+        )
+        session = ChatSession(
+            id="session_real_replay",
+            tenant_id=tenant_id,
+            user_id=user.id,
+            agent_id=agent.id,
+        )
+        skill = Skill(
+            tenant_id=tenant_id,
+            skill_id="real_replay_skill",
+            version="1.0.0",
+            name="真实回放技能",
+            content_json={
+                "skill_id": "real_replay_skill",
+                "name": "真实回放技能",
+                "nodes": [
+                    {
+                        "node_id": "reply",
+                        "type": "response",
+                        "name": "回复",
+                        "instruction": "回复用户",
+                        "expected_user_info": [],
+                        "allowed_actions": ["answer_user"],
+                    }
+                ],
+                "start_node_id": "reply",
+                "terminal_node_ids": ["reply"],
+                "edges": [],
+            },
+            status="published",
+        )
+        model_config = ModelConfig(
+            id="model_real_replay",
+            tenant_id=tenant_id,
+            name="真实回放测试模型",
+            api_key_encrypted="",
+            model="synthetic-real-agent-loop",
+            enabled=True,
+            is_default=True,
+        )
+        db.add_all([user, agent, session, skill, model_config])
+        db.commit()
+
+        def fake_router_decide(
+            _router: Router,
+            _message: str,
+            _session: ChatSession,
+            _skills: list[Skill],
+            _model: ModelConfig,
+            *_args: object,
+            **_kwargs: object,
+        ) -> RouterDecision:
+            """只替换路由模型边界，保留真实 AgentLoop 的输入、完成和账本写入。"""
+
+            return RouterDecision(
+                decision="start_new_task",
+                target_skill_id=skill.skill_id,
+                target_step_id="reply",
+                confidence=1.0,
+            )
+
+        def fake_step_agent(
+            _loop: AgentLoop,
+            request: ChatTurnRequest,
+            *_args: object,
+            **_kwargs: object,
+        ) -> StepAgentResult:
+            """只替换步骤模型边界，使 A/B 回复可区分且不影响终态生产。"""
+
+            return StepAgentResult(action="reply", reply=f"步骤:{request.message}", is_step_completed=True)
+
+        def fake_reply(
+            _loop: AgentLoop,
+            message: str,
+            *_args: object,
+            **_kwargs: object,
+        ) -> str:
+            """模拟最终回复模型，并让两轮产品回复保持可观测差异。"""
+
+            return f"产品回复:{message}"
+
+        monkeypatch.setattr(Router, "decide", fake_router_decide)
+        monkeypatch.setattr(AgentLoop, "_get_request_model", lambda *_args, **_kwargs: model_config)
+        monkeypatch.setattr(AgentLoop, "_list_published_skills", lambda *_args: [skill])
+        monkeypatch.setattr(AgentLoop, "_list_enabled_tools", lambda *_args: [])
+        monkeypatch.setattr(AgentLoop, "_tools_with_general_skills", lambda *_args: [])
+        monkeypatch.setattr(AgentLoop, "_run_step_agent_with_context_repair", fake_step_agent)
+        monkeypatch.setattr(AgentLoop, "_generate_reply_segment", fake_reply)
+        monkeypatch.setattr(AgentLoop, "_try_handle_general_skill_after_scene_router", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(chat_api, "_ensure_request_tenant", lambda *_args: None)
+        monkeypatch.setattr(chat_api, "ensure_tenant", lambda *_args: None)
+        monkeypatch.setattr(chat_api, "_ensure_chat_session_available", lambda *_args: session)
+        monkeypatch.setattr(chat_api, "_bind_request_to_session_agent", lambda *_args: _args[1])
+        monkeypatch.setattr(chat_api, "_schedule_session_title_summary", lambda *_args: None)
+
+        def request(message: str, client_turn_id: str) -> ChatTurnRequest:
+            """构造保留稳定客户端身份的真实同步聊天请求。"""
+
+            return ChatTurnRequest(
+                tenant_id=tenant_id,
+                session_id=session.id,
+                agent_id=agent.id,
+                message=message,
+                client_turn_id=client_turn_id,
+                user_id=user.id,
+            )
+
+        first = chat_api.chat_turn(request("A", "turn-a"), current_user=user, db=db)
+        second = chat_api.chat_turn(request("B", "turn-b"), current_user=user, db=db)
+        replayed = chat_api.chat_turn(request("A", "turn-a"), current_user=user, db=db)
+
+        complete_events = db.exec(
+            select(AgentEvent).where(
+                AgentEvent.session_id == session.id,
+                AgentEvent.event_type == "complete",
+            )
+        ).all()
+
+    assert first.reply == "产品回复:A"
+    assert second.reply == "产品回复:B"
+    assert replayed.reply == "产品回复:A"
+    assert len(complete_events) == 2
+    assert all("session_id" not in (event.payload_json or {}) for event in complete_events)
+
+
+def test_sync_chat_turn_replays_final_result_after_waiting_signal_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """真实等待、Attention、Signal 完成后重试原输入必须返回最终产品结果。"""
+
+    with _test_session() as db:
+        tenant_id = "tenant_demo"
+        user = User(
+            id="user_waiting_replay",
+            tenant_id=tenant_id,
+            username="waiting-replay",
+            password_hash="x",
+        )
+        agent_profile = AgentProfile(
+            id="agent_demo",
+            tenant_id=tenant_id,
+            name="等待回放员工",
+            owner_user_id=user.id,
+            status="active",
+        )
+        model = ModelConfig(
+            id="model_waiting_replay",
+            tenant_id=tenant_id,
+            name="等待回放模型",
+            api_key_encrypted="",
+            model="synthetic-waiting-replay",
+            capability_snapshot_json=_model_capabilities(),
+            capability_checksum=capability_checksum(_model_capabilities()),
+            preflight_status="ready",
+            enabled=True,
+            is_default=True,
+        )
+        session = ChatSession(
+            id="session_waiting_replay",
+            tenant_id=tenant_id,
+            user_id=user.id,
+            agent_id=agent_profile.id,
+        )
+        db.add_all([Tenant(id=tenant_id, name="等待回放租户"), user, agent_profile, model, session])
+        db.commit()
+
+        request = ChatTurnRequest(
+            tenant_id=tenant_id,
+            user_id=user.id,
+            agent_id=agent_profile.id,
+            session_id=session.id,
+            client_turn_id="waiting-replay-turn",
+            message="生成合作方合同风险简报",
+            client_timezone="Asia/Shanghai",
+        )
+        executor = _Executor()
+        proposer = _ClarificationProposer()
+        captured: dict[str, str] = {}
+
+        class _ProbePlanner(_TimeContextClarificationPlanner):
+            """去掉聊天记忆侧带干扰、保留真实 DTA 澄清计划。"""
+
+            def create_plan(self, **kwargs):
+                """让实际计划器沿用既有受控三步计划。"""
+
+                kwargs.pop("memory_context", None)
+                return super().create_plan(**kwargs)
+
+        def make_agent(database: Session) -> DynamicTaskAgent:
+            """为聊天链装配真实 DTA 状态机和受控模型/工具边界。"""
+
+            return DynamicTaskAgent(
+                database,
+                catalog=_StartCatalog(model, _snapshot()),
+                tool_executor=executor,
+                planner=_ProbePlanner(),
+                action_proposer=proposer,
+            )
+
+        def start_dynamic(
+            loop: AgentLoop,
+            incoming: ChatTurnRequest,
+            chat_session: ChatSession,
+            selected_model: ModelConfig,
+            _route: object,
+            user_message_id: str,
+            **kwargs: object,
+        ) -> ChatTurnResponse:
+            """沿真实 start/run 和聊天等待投影建立首轮持久等待。"""
+
+            dynamic_agent = make_agent(loop.db)
+            instance, _ = dynamic_agent.start_task(
+                tenant_id=incoming.tenant_id,
+                session_id=chat_session.id,
+                agent_id=agent_profile.id,
+                initiator_user_id=user.id,
+                goal=incoming.message,
+                success_criteria=("覆盖合同证据",),
+                model_config=selected_model,
+                source_kind="chat",
+                source_ref=user_message_id,
+                conversation_context=kwargs.get("conversation_context"),
+            )
+            waiting = dynamic_agent.run_until_blocked_or_complete(
+                execution_id=instance.id,
+                model_config=selected_model,
+                worker_id="worker_waiting_replay_before",
+                actor_user_id=user.id,
+                user_message_id=user_message_id,
+            )
+            captured["instance_id"] = instance.id
+            captured["user_message_id"] = user_message_id
+            assert waiting.status == "waiting"
+            return loop._dynamic_task_response(
+                chat_session=chat_session,
+                outcome=waiting,
+                user_message_id=user_message_id,
+                client_turn_id=incoming.client_turn_id,
+            )
+
+        def ignore_side_task(*_args: object, **_kwargs: object) -> None:
+            """关闭与回放无关的标题后台任务。"""
+
+        monkeypatch.setattr(AgentLoop, "_get_request_model", lambda *_args, **_kwargs: model)
+        monkeypatch.setattr(AgentLoop, "_decide_non_sop_capability", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(AgentLoop, "_try_handle_dynamic_task", start_dynamic)
+        monkeypatch.setattr(chat_api, "_schedule_session_title_summary", ignore_side_task)
+
+        first = chat_api.chat_turn(request, current_user=user, db=db)
+        instance = db.get(SopInstance, captured["instance_id"])
+        assert instance is not None
+        attention = db.exec(select(SopWorkItem)).one()
+        assert first.reply.startswith("任务已暂停")
+
+        control = ExecutionControlService(db)
+        with control.store.owned(instance, worker_id="waiting-replay-attention"):
+            control.resolve_attention(
+                instance,
+                attention,
+                actor_user_id=user.id,
+                command_id="waiting-replay-answer",
+                command="answer",
+                expected_revision=attention.revision,
+                comment="星海科技",
+            )
+        db.commit()
+        signal = db.exec(select(ExecutionSignal)).one()
+        outcome = process_dynamic_task_signal(db, signal, agent_factory=make_agent)
+        assert outcome is not None
+        assert outcome.status == "succeeded"
+        assert instance.status == "succeeded"
+        assert outcome.message is not None
+        final_reply = outcome.message.content
+
+        replayed = chat_api.chat_turn(request, current_user=user, db=db)
+        user_messages = db.exec(
+            select(Message).where(Message.session_id == session.id, Message.role == "user")
+        ).all()
+
+    assert replayed.reply == final_reply
+    assert replayed.reply != first.reply
+    assert len(user_messages) == 1
+    assert executor.calls == 1
+
+
+def test_scheduled_detection_fallback_reuses_one_input_time_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """调度识别未生成草案时，AgentLoop 回退和后置识别仍共用原输入事实。"""
+
+    with _test_session() as db:
+        user = User(
+            id="user_scheduled_fallback",
+            tenant_id="tenant_demo",
+            username="scheduled-fallback",
+            password_hash="x",
+        )
+        session = ChatSession(
+            id="session_scheduled_fallback",
+            tenant_id="tenant_demo",
+            user_id=user.id,
+            agent_id="agent_demo",
+        )
+        db.add_all([user, session])
+        db.commit()
+        detection_contexts: list[dict[str, str] | None] = []
+
+        def fake_detection(*_args, **kwargs):
+            """记录两次生产调度识别收到的输入时间，不生成草案。"""
+
+            detection_contexts.append(kwargs.get("time_context"))
+            return None
+
+        def fake_handle_turn(
+            loop: AgentLoop,
+            request: ChatTurnRequest,
+            *,
+            time_context: dict[str, str] | None = None,
+        ) -> ChatTurnResponse:
+            """沿真实输入追加方法模拟识别失败后的 AgentLoop 回退。"""
+
+            loop._append_user_input_message(
+                request,
+                session.id,
+                time_context=time_context,
+            )
+            loop.db.commit()
+            return ChatTurnResponse(
+                reply="转普通执行",
+                session_id=session.id,
+                session_state=SessionPublic(
+                    session_id=session.id,
+                    tenant_id=session.tenant_id,
+                    user_id=session.user_id,
+                    agent_id=session.agent_id,
+                ),
+            )
+
+        monkeypatch.setattr(chat_api, "detect_scheduled_task_draft", fake_detection)
+        monkeypatch.setattr(AgentLoop, "handle_turn", fake_handle_turn)
+        monkeypatch.setattr(chat_api, "_ensure_request_tenant", lambda *_args: None)
+        monkeypatch.setattr(chat_api, "ensure_tenant", lambda *_args: None)
+        monkeypatch.setattr(chat_api, "_ensure_chat_session_available", lambda *_args: session)
+        monkeypatch.setattr(chat_api, "_bind_request_to_session_agent", lambda *_args: _args[1])
+        monkeypatch.setattr(chat_api, "_schedule_session_title_summary", lambda *_args: None)
+        request = ChatTurnRequest(
+            tenant_id=session.tenant_id,
+            session_id=session.id,
+            agent_id=session.agent_id,
+            message="明天早上提醒我",
+            interaction_mode="scheduled_task",
+            client_timezone="Pacific/Honolulu",
+        )
+
+        chat_api.chat_turn(request, current_user=user, db=db)
+
+    assert len(detection_contexts) == 2
+    assert detection_contexts[0] is not None
+    assert detection_contexts[1] == detection_contexts[0]
 
 
 def test_chat_turn_can_select_enabled_model_config() -> None:

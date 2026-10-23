@@ -111,11 +111,17 @@ class ToolError(BaseModel):
 
 
 class ToolResult(BaseModel):
+    """工具输送结果；accepted 明确表示已受理但业务效果尚未完成。"""
+
     tool_name: str
     success: bool
     data: Optional[Any] = None
     error: Optional[ToolError] = None
+    disposition: Literal["completed", "accepted", "waiting", "unknown", "failed"] = "completed"
     authorization_context: Optional[dict[str, Any]] = None
+    execution_id: Optional[str] = None
+    operation_id: Optional[str] = None
+    source_kind: Optional[Literal["tool_test"]] = None
 
 
 class ToolTestRequest(BaseModel):
@@ -123,6 +129,7 @@ class ToolTestRequest(BaseModel):
 
     tenant_id: str
     arguments: dict[str, Any] = Field(default_factory=dict)
+    submission_id: Optional[str] = Field(default=None, min_length=1, max_length=191)
     active_skill_id: Optional[str] = None
     organization_unit_id: Optional[str] = None
 

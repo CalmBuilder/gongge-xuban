@@ -1,4 +1,4 @@
-import { render, screen, within } from '@testing-library/react';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, expect, it, vi } from 'vitest';
@@ -366,4 +366,83 @@ it('一个并行扩展接口失败时保留已成功的角色数据', async () =
 
   expect((await screen.findAllByText('财务复核人')).length).toBeGreaterThan(0);
   expect(screen.getByRole('table', { name: '公司角色列表' })).toBeInTheDocument();
+});
+
+it('慢返回的旧有效权限不能覆盖身份切换后的新授权事实', async () => {
+  let resolveFirst: ((rows: unknown[]) => void) | undefined;
+  const firstResponse = new Promise<unknown[]>((resolve) => {
+    resolveFirst = resolve;
+  });
+  let grantCalls = 0;
+  const successfulGet = vi.mocked(api.get).getMockImplementation();
+  vi.mocked(api.get).mockImplementation(async (path: string) => {
+    if (path.startsWith('/api/organization/effective-permissions')) {
+      grantCalls += 1;
+      if (grantCalls === 1) return firstResponse as never;
+      return [{
+        permission_code: 'organization.manage',
+        role_code: 'governance_org_admin',
+        role_name: '新身份组织管理员',
+        source_kind: 'direct_role',
+        source_id: 'assignment-new',
+        scope_type: 'tenant',
+        scope_id: '*',
+        include_descendants: true,
+      }] as never;
+    }
+    return successfulGet?.(path) as never;
+  });
+
+  const view = render(
+    <I18nProvider>
+      <MemoryRouter initialEntries={['/enterprise/organization-roles?section=effective']}>
+        <OrganizationRolesPage currentUser={administrator} />
+      </MemoryRouter>
+    </I18nProvider>,
+  );
+  await waitFor(() => expect(grantCalls).toBe(1));
+
+  const refreshedUser = { ...administrator, id: 'administrator_refreshed' };
+  view.rerender(
+    <I18nProvider>
+      <MemoryRouter initialEntries={['/enterprise/organization-roles?section=effective']}>
+        <OrganizationRolesPage currentUser={refreshedUser} />
+      </MemoryRouter>
+    </I18nProvider>,
+  );
+
+  await waitFor(() => expect(grantCalls).toBeGreaterThan(1));
+  await waitFor(() => expect(screen.getByText('organization.manage')).toBeInTheDocument());
+  resolveFirst?.([]);
+  await waitFor(() => expect(screen.getByText('organization.manage')).toBeInTheDocument());
+});
+
+it('认证身份补齐后重新加载有效权限工作区', async () => {
+  const view = render(
+    <I18nProvider>
+      <MemoryRouter>
+        <OrganizationRolesPage />
+      </MemoryRouter>
+    </I18nProvider>,
+  );
+
+  await screen.findAllByText('财务复核人');
+  const initialGrantRequests = vi.mocked(api.get).mock.calls.filter(([path]) => (
+    typeof path === 'string' && path.startsWith('/api/organization/effective-permissions')
+  )).length;
+
+  view.rerender(
+    <I18nProvider>
+      <MemoryRouter>
+        <OrganizationRolesPage currentUser={administrator} />
+      </MemoryRouter>
+    </I18nProvider>,
+  );
+
+  await waitFor(() => {
+    const grantRequests = vi.mocked(api.get).mock.calls.filter(([path]) => (
+      typeof path === 'string' && path.startsWith('/api/organization/effective-permissions')
+    )).length;
+    expect(grantRequests).toBeGreaterThan(initialGrantRequests);
+  });
 });

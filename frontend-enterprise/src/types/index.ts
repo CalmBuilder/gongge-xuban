@@ -1,5 +1,5 @@
 /**
- * @Time       : 2026/07/22 22:18
+ * @Time       : 2026/10/03
  * @Author     : zhanglp8181
  * @File       : index.ts
  * @CallChain  : Enterprise API 响应 → 共享类型 → 页面组件
@@ -30,6 +30,15 @@ export type KnowledgeIngestJobRead = {
   knowledge_base_id: string;
   document_id?: string;
   filename: string;
+  job_kind?: string;
+  scope?: string;
+  source_version_id?: string;
+  expected_revision?: number;
+  published_version_id?: string;
+  published_document_id?: string;
+  content_revision?: number;
+  manifest_hash?: string;
+  error_code?: string;
   status: string;
   stage: string;
   progress: number;
@@ -52,6 +61,7 @@ export type KnowledgeBaseRead = {
   access_scope: 'owner' | 'organization' | 'tenant';
   download_policy: 'allowed' | 'restricted';
   revision: number;
+  content_revision: number;
   content_access_allowed?: boolean;
   content_access_reason?: string;
   organization_access: Array<{
@@ -65,6 +75,9 @@ export type KnowledgeBaseRead = {
   branch_base_version?: string;
   branch_head_version?: string;
   metadata?: Record<string, unknown>;
+  publication_id?: string | null;
+  publication_scope_agent_id?: string;
+  publication_checksum?: string | null;
   document_count: number;
   bucket_count: number;
   chunk_count: number;
@@ -87,6 +100,25 @@ export type KnowledgeDocumentRead = {
   error?: string;
   created_at: string;
   updated_at: string;
+};
+
+export type KnowledgeDocumentContentRead = {
+  document_id: string;
+  lineage_id: string;
+  knowledge_base_version_id: string;
+  scope: string;
+  head_version_id: string;
+  content_revision: number;
+  content_md: string;
+  source_checksum?: string;
+  source_kind: string;
+};
+
+export type KnowledgeRevisionAccepted = {
+  job_id: string;
+  status: string;
+  source_version_id: string;
+  expected_revision: number;
 };
 
 export type KnowledgeBucketRead = {
@@ -391,11 +423,18 @@ export type SkillRead = {
   branch_base_version?: string;
   branch_head_version?: string;
   metadata?: Record<string, unknown>;
+  publication_id?: string | null;
+  publication_scope_agent_id?: string;
+  publication_checksum?: string | null;
   created_at: string;
   updated_at: string;
 };
 
 export type SkillVersionRead = SkillRead & {
+  runtime_version_id?: string | null;
+  scope_agent_id?: string;
+  content_checksum?: string | null;
+  compiled_definition_checksum?: string | null;
   created_at: string;
 };
 
@@ -721,6 +760,29 @@ export type MemoryRead = {
 
 export type MemoryUserPageRead = {
   items: MemoryRead[];
+  total: number;
+  page: number;
+  page_size: number;
+};
+
+export type MemoryCaptureJobRead = {
+  job_id: string;
+  status: 'pending' | 'running' | 'retry_wait' | 'failed' | 'discarded' | 'succeeded' | string;
+  created_at: string;
+  finished_at?: string | null;
+  attempt_count: number;
+  max_attempts: number;
+  model_dispatch_count: number;
+  applied_count: number;
+  discarded_count: number;
+  reason_code?: 'capture_contract_changed' | 'source_changed' | 'invalid_output'
+    | 'deadline_exceeded' | 'attempts_exhausted' | 'retry_scheduled'
+    | 'processing_failed' | 'superseded' | null;
+  next_attempt_at?: string | null;
+};
+
+export type MemoryCaptureJobPageRead = {
+  items: MemoryCaptureJobRead[];
   total: number;
   page: number;
   page_size: number;

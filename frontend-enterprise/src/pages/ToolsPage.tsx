@@ -8,7 +8,7 @@
 
 import { ApiOutlined, ExperimentOutlined, ToolOutlined } from '../icons';
 import type { ReactNode } from 'react';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { Copy, FlaskConical, Users } from 'lucide-react';
 import { pinyin } from 'pinyin-pro';
@@ -43,6 +43,7 @@ import {
 import { Button as UIButton } from '@/components/ui/button';
 import { notify } from '@/components/ui/app-toast';
 import { cn } from '@/lib/utils';
+import { createClientId } from '@/lib/client-id';
 import { parseToolReliabilityContract } from '@/lib/tool-reliability';
 import {
   MENU_CONTENT_CLASS,
@@ -1055,7 +1056,7 @@ function ToolEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'edit' 
         </SectionCard>
         <div className="flex w-full flex-col gap-[20px]">
           <ToolProbeCard values={values} />
-          {isEdit && tool && <SavedToolTestCard tool={tool} />}
+        {isEdit && tool && <SavedToolTestCard tool={tool} agentId={agentId} />}
         </div>
       </div>
     </PageShell>
@@ -1238,7 +1239,7 @@ export function ToolTestPage({ currentUser, onLogout }: ToolPageProps = {}) {
             </>
           )}
         </SectionCard>
-        {tool && <SavedToolTestCard tool={tool} standalone />}
+        {tool && <SavedToolTestCard tool={tool} standalone agentId={agentId} />}
       </div>
     </PageShell>
   );
@@ -2058,15 +2059,43 @@ function ToolProbeCard({ values }: { values: ToolFormValues }) {
   );
 }
 
-function SavedToolTestCard({ tool, standalone = false }: { tool: ToolRead; standalone?: boolean }) {
+function SavedToolTestCard({
+  tool,
+  standalone = false,
+  agentId,
+}: {
+  tool: ToolRead;
+  standalone?: boolean;
+  agentId?: string;
+}) {
   const [testJson, setTestJson] = useState(() => JSON.stringify(exampleFromSchema(tool.input_schema), null, 2));
   const [testResult, setTestResult] = useState('');
   const [loading, setLoading] = useState(false);
+  const submissionIdRef = useRef<string | null>(null);
+  const submissionStorageKey = `gongge_tool_test_submission:${tool.id}`;
+  if (submissionIdRef.current === null) {
+    submissionIdRef.current = readOrCreateToolTestSubmissionId(submissionStorageKey);
+  }
 
   useEffect(() => {
-    setTestJson(JSON.stringify(exampleFromSchema(tool.input_schema), null, 2));
+    const defaultTestJson = JSON.stringify(exampleFromSchema(tool.input_schema), null, 2);
+    const storedTestJson = readToolTestArguments(submissionStorageKey);
+    const nextTestJson = storedTestJson ?? defaultTestJson;
+    setTestJson(nextTestJson);
+    if (storedTestJson === null) writeToolTestArguments(submissionStorageKey, defaultTestJson);
     setTestResult('');
-  }, [tool.id, tool.input_schema]);
+    submissionIdRef.current = readOrCreateToolTestSubmissionId(submissionStorageKey);
+  }, [submissionStorageKey, tool.input_schema]);
+
+  function rotateSubmissionId(): void {
+    const nextId = createClientId();
+    submissionIdRef.current = nextId;
+    try {
+      window.sessionStorage.setItem(submissionStorageKey, nextId);
+    } catch {
+      // 浏览器存储不可用时仍保留本次页面内的稳定身份。
+    }
+  }
 
   async function test() {
     let argumentsJson: Record<string, unknown>;
@@ -2078,10 +2107,13 @@ function SavedToolTestCard({ tool, standalone = false }: { tool: ToolRead; stand
     }
     setLoading(true);
     try {
-      const agentQuery = currentAgentQuery();
+      const agentQuery = agentId
+        ? `&agent_id=${encodeURIComponent(agentId)}`
+        : currentAgentQuery();
       const response = await api.post(`/api/enterprise/tools/${tool.id}/test${agentQuery ? `?${agentQuery.slice(1)}` : ''}`, {
         tenant_id: getRequestTenantId(),
         arguments: argumentsJson,
+        submission_id: submissionIdRef.current,
       });
       setTestResult(JSON.stringify(response, null, 2));
     } catch (error) {
@@ -2122,7 +2154,12 @@ function SavedToolTestCard({ tool, standalone = false }: { tool: ToolRead; stand
           rows={8}
           className={MONO_INPUT_CLASS}
           value={testJson}
-          onChange={(event) => setTestJson(event.target.value)}
+          onChange={(event) => {
+            rotateSubmissionId();
+            const nextTestJson = event.target.value;
+            setTestJson(nextTestJson);
+            writeToolTestArguments(submissionStorageKey, nextTestJson);
+          }}
         />
       </div>
       <div className="flex flex-col gap-[10px]">
@@ -2140,6 +2177,34 @@ function SavedToolTestCard({ tool, standalone = false }: { tool: ToolRead; stand
       </div>
     </SectionCard>
   );
+}
+
+function readOrCreateToolTestSubmissionId(storageKey: string): string {
+  try {
+    const stored = window.sessionStorage.getItem(storageKey);
+    if (stored) return stored;
+    const created = createClientId();
+    window.sessionStorage.setItem(storageKey, created);
+    return created;
+  } catch {
+    return createClientId();
+  }
+}
+
+function readToolTestArguments(storageKey: string): string | null {
+  try {
+    return window.sessionStorage.getItem(`${storageKey}:arguments`);
+  } catch {
+    return null;
+  }
+}
+
+function writeToolTestArguments(storageKey: string, value: string): void {
+  try {
+    window.sessionStorage.setItem(`${storageKey}:arguments`, value);
+  } catch {
+    // 输入恢复是 best-effort，服务端仍以提交身份和请求指纹作最终裁决。
+  }
 }
 
 async function loadBucketOptions() {

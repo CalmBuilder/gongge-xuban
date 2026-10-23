@@ -831,6 +831,7 @@ def ensure_participant_acceptance_skill(db: Session) -> None:
             select(SkillVersion).where(
                 SkillVersion.tenant_id == skill.tenant_id,
                 SkillVersion.skill_id == skill.skill_id,
+                SkillVersion.scope_agent_id == "",
                 SkillVersion.version == skill.version,
             )
         ).first()
@@ -892,6 +893,7 @@ def ensure_graph_visual_demo_knowledge_version(db: Session) -> None:
         select(SkillVersion).where(
             SkillVersion.tenant_id == skill.tenant_id,
             SkillVersion.skill_id == skill.skill_id,
+            SkillVersion.scope_agent_id == "",
             SkillVersion.version == skill.version,
         )
     ).first()
@@ -1234,6 +1236,7 @@ def ensure_partner_due_diligence_version(db: Session) -> None:
         select(SkillVersion).where(
             SkillVersion.tenant_id == skill.tenant_id,
             SkillVersion.skill_id == skill.skill_id,
+            SkillVersion.scope_agent_id == "",
             SkillVersion.version == skill.version,
         )
     ).first()
@@ -1973,6 +1976,7 @@ def ensure_expense_quota_identity_version(db: Session) -> None:
         select(SkillVersion).where(
             SkillVersion.tenant_id == skill.tenant_id,
             SkillVersion.skill_id == skill.skill_id,
+            SkillVersion.scope_agent_id == "",
             SkillVersion.version == skill.version,
         )
     ).first()
@@ -2011,6 +2015,7 @@ def ensure_leave_balance_deterministic_version(db: Session) -> None:
         select(SkillVersion).where(
             SkillVersion.tenant_id == skill.tenant_id,
             SkillVersion.skill_id == skill.skill_id,
+            SkillVersion.scope_agent_id == "",
             SkillVersion.version == skill.version,
         )
     ).first()
@@ -2050,6 +2055,7 @@ def ensure_leave_application_deterministic_version(db: Session) -> None:
         select(SkillVersion).where(
             SkillVersion.tenant_id == skill.tenant_id,
             SkillVersion.skill_id == skill.skill_id,
+            SkillVersion.scope_agent_id == "",
             SkillVersion.version == skill.version,
         )
     ).first()
@@ -2121,6 +2127,7 @@ def ensure_travel_reimbursement_deterministic_version(db: Session) -> None:
         select(SkillVersion).where(
             SkillVersion.tenant_id == skill.tenant_id,
             SkillVersion.skill_id == skill.skill_id,
+            SkillVersion.scope_agent_id == "",
             SkillVersion.version == skill.version,
         )
     ).first()
@@ -2208,6 +2215,7 @@ def ensure_seal_application_deterministic_version(db: Session) -> None:
         select(SkillVersion).where(
             SkillVersion.tenant_id == skill.tenant_id,
             SkillVersion.skill_id == skill.skill_id,
+            SkillVersion.scope_agent_id == "",
             SkillVersion.version == skill.version,
         )
     ).first()
@@ -2262,6 +2270,7 @@ def ensure_expense_special_approval_version(db: Session) -> None:
         select(SkillVersion).where(
             SkillVersion.tenant_id == skill.tenant_id,
             SkillVersion.skill_id == skill.skill_id,
+            SkillVersion.scope_agent_id == "",
             SkillVersion.version == skill.version,
         )
     ).first()
@@ -2315,6 +2324,7 @@ def ensure_expense_special_approval_org_scope_version(db: Session) -> None:
         select(SkillVersion).where(
             SkillVersion.tenant_id == skill.tenant_id,
             SkillVersion.skill_id == skill.skill_id,
+            SkillVersion.scope_agent_id == "",
             SkillVersion.version == skill.version,
         )
     ).first()
@@ -4943,6 +4953,7 @@ def ensure_overtime_compensatory_deterministic_version(db: Session) -> None:
         select(SkillVersion).where(
             SkillVersion.tenant_id == skill.tenant_id,
             SkillVersion.skill_id == skill.skill_id,
+            SkillVersion.scope_agent_id == "",
             SkillVersion.version == skill.version,
         )
     ).first()
@@ -5167,6 +5178,7 @@ def ensure_meeting_room_deterministic_version(db: Session) -> None:
         select(SkillVersion).where(
             SkillVersion.tenant_id == skill.tenant_id,
             SkillVersion.skill_id == skill.skill_id,
+            SkillVersion.scope_agent_id == "",
             SkillVersion.version == skill.version,
         )
     ).first()
@@ -5487,6 +5499,7 @@ def ensure_permission_grant_deterministic_version(db: Session) -> None:
         select(SkillVersion).where(
             SkillVersion.tenant_id == skill.tenant_id,
             SkillVersion.skill_id == skill.skill_id,
+            SkillVersion.scope_agent_id == "",
             SkillVersion.version == skill.version,
         )
     ).first()
@@ -5950,6 +5963,7 @@ def ensure_hr_certificate_deterministic_version(db: Session) -> None:
         select(SkillVersion).where(
             SkillVersion.tenant_id == skill.tenant_id,
             SkillVersion.skill_id == skill.skill_id,
+            SkillVersion.scope_agent_id == "",
             SkillVersion.version == skill.version,
         )
     ).first()
@@ -6477,6 +6491,7 @@ def ensure_clause_modification_deterministic_version(db: Session) -> None:
         select(SkillVersion).where(
             SkillVersion.tenant_id == skill.tenant_id,
             SkillVersion.skill_id == skill.skill_id,
+            SkillVersion.scope_agent_id == "",
             SkillVersion.version == skill.version,
         )
     ).first()
@@ -6742,6 +6757,7 @@ def ensure_contract_risk_review_deterministic_version(db: Session) -> None:
         select(SkillVersion).where(
             SkillVersion.tenant_id == skill.tenant_id,
             SkillVersion.skill_id == skill.skill_id,
+            SkillVersion.scope_agent_id == "",
             SkillVersion.version == skill.version,
         )
     ).first()
@@ -7211,6 +7227,7 @@ def ensure_office_supply_deterministic_version(db: Session) -> None:
         select(SkillVersion).where(
             SkillVersion.tenant_id == skill.tenant_id,
             SkillVersion.skill_id == skill.skill_id,
+            SkillVersion.scope_agent_id == "",
             SkillVersion.version == skill.version,
         )
     ).first()
@@ -7583,6 +7600,7 @@ def ensure_fault_report_lifecycle_version(db: Session) -> None:
         select(SkillVersion).where(
             SkillVersion.tenant_id == skill.tenant_id,
             SkillVersion.skill_id == skill.skill_id,
+            SkillVersion.scope_agent_id == "",
             SkillVersion.version == skill.version,
         )
     ).first()

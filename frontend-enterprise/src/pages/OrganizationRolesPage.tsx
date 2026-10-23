@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import {
   Bot,
   BriefcaseBusiness,
@@ -277,6 +277,9 @@ export default function OrganizationRolesPage({
   const [assignmentEffectiveUntil, setAssignmentEffectiveUntil] = useState('');
   const [assignmentSaving, setAssignmentSaving] = useState(false);
   const [deactivatingAssignmentId, setDeactivatingAssignmentId] = useState<string | null>(null);
+  const workspaceRequestIdRef = useRef(0);
+  const effectivePermissionRequestIdRef = useRef(0);
+  const currentUserIdentityRef = useRef(currentUser?.id || '');
   const canManageAuthorization = hasGovernancePermission(currentUser, 'authorization.manage');
 
   const loadRolePage = useCallback(async () => {
@@ -293,6 +296,8 @@ export default function OrganizationRolesPage({
   }, [rolePage]);
 
   const loadWorkspaceData = useCallback(async () => {
+    const requestId = workspaceRequestIdRef.current + 1;
+    workspaceRequestIdRef.current = requestId;
     setLoading(true);
     const [
       roleOptionResult,
@@ -301,7 +306,6 @@ export default function OrganizationRolesPage({
       permissionResult,
       categoryResult,
       assignmentResult,
-      grantResult,
     ] = await Promise.allSettled([
         api.get<BusinessRoleOption[]>(`/api/organization/business-role-options?tenant_id=${getRequestTenantId()}`),
         api.get<AgentOption[]>(`/api/enterprise/agents?tenant_id=${getRequestTenantId()}`),
@@ -309,8 +313,9 @@ export default function OrganizationRolesPage({
         api.get<PermissionDefinition[]>(`/api/organization/permission-definitions?tenant_id=${getRequestTenantId()}`),
         api.get<RoleCategoryDefinition[]>(`/api/organization/role-categories?tenant_id=${getRequestTenantId()}`),
         api.get<EmployeeRoleAssignment[]>(`/api/organization/employee-role-assignments?tenant_id=${getRequestTenantId()}`),
-        api.get<PermissionGrant[]>(`/api/organization/effective-permissions?tenant_id=${getRequestTenantId()}`),
       ]);
+    // 慢数据库下旧工作区请求可能晚返回；只允许当前代次写入授权事实。
+    if (requestId !== workspaceRequestIdRef.current) return;
     if (roleOptionResult.status === 'fulfilled') setRoleOptions(roleOptionResult.value);
     if (agentResult.status === 'fulfilled') {
       setAgents(agentResult.value.filter((agent) => agent.status === 'active' && !agent.is_overall));
@@ -319,7 +324,6 @@ export default function OrganizationRolesPage({
     if (permissionResult.status === 'fulfilled') setPermissionDefinitions(permissionResult.value);
     if (categoryResult.status === 'fulfilled') setRoleCategories(categoryResult.value);
     if (assignmentResult.status === 'fulfilled') setEmployeeAssignments(assignmentResult.value);
-    if (grantResult.status === 'fulfilled') setEffectiveGrants(grantResult.value);
     const failedCount = [
       roleOptionResult,
       agentResult,
@@ -327,11 +331,10 @@ export default function OrganizationRolesPage({
       permissionResult,
       categoryResult,
       assignmentResult,
-      grantResult,
     ].filter((result) => result.status === 'rejected').length;
     if (failedCount) notify.error(`${failedCount} 类授权数据暂时无法加载，已保留其余成功数据`);
-    setLoading(false);
-  }, []);
+    if (requestId === workspaceRequestIdRef.current) setLoading(false);
+  }, [currentUser?.id]);
 
   const refreshAll = useCallback(async () => {
     await Promise.all([loadRolePage(), loadWorkspaceData()]);
@@ -342,6 +345,12 @@ export default function OrganizationRolesPage({
   }, [loadWorkspaceData]);
 
   useEffect(() => {
+    currentUserIdentityRef.current = currentUser?.id || '';
+    effectivePermissionRequestIdRef.current += 1;
+    if (currentUser?.id) setExplanationUserId(currentUser.id);
+  }, [currentUser?.id]);
+
+  useEffect(() => {
     setLoading(true);
     void loadRolePage()
       .catch((error) => notify.error(error instanceof Error ? error.message : '角色目录加载失败'))
@@ -349,19 +358,27 @@ export default function OrganizationRolesPage({
   }, [loadRolePage]);
 
   useEffect(() => {
-    if (!explanationUserId || explanationUserId === currentUser?.id) return;
-    let cancelled = false;
-    void api.get<PermissionGrant[]>(
-      `/api/organization/effective-permissions?tenant_id=${getRequestTenantId()}`
-      + `&user_id=${encodeURIComponent(explanationUserId)}`,
-    ).then((rows) => {
-      if (!cancelled) setEffectiveGrants(rows);
+    const targetUserId = explanationUserId || currentUser?.id || '';
+    if (!targetUserId) return;
+    const requestId = effectivePermissionRequestIdRef.current + 1;
+    effectivePermissionRequestIdRef.current = requestId;
+    const query = `/api/organization/effective-permissions?tenant_id=${getRequestTenantId()}`
+      + `&user_id=${encodeURIComponent(targetUserId)}`;
+    void api.get<PermissionGrant[]>(query).then((rows) => {
+      if (
+        requestId === effectivePermissionRequestIdRef.current
+        && currentUserIdentityRef.current === currentUser?.id
+      ) {
+        setEffectiveGrants(rows);
+      }
     }).catch((error) => {
-      if (!cancelled) notify.error(error instanceof Error ? error.message : '有效权限解释加载失败');
+      if (
+        requestId === effectivePermissionRequestIdRef.current
+        && currentUserIdentityRef.current === currentUser?.id
+      ) {
+        notify.error(error instanceof Error ? error.message : '有效权限解释加载失败');
+      }
     });
-    return () => {
-      cancelled = true;
-    };
   }, [currentUser?.id, explanationUserId]);
 
   const visiblePermissions = useMemo(() => {

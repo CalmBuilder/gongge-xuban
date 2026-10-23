@@ -227,6 +227,50 @@ it('keeps governance available but disables content actions without content acce
   expect(screen.getByRole('menuitem', { name: '知识图谱检查' })).toHaveAttribute('data-disabled');
 });
 
+it('慢请求返回旧知识库列表时不会覆盖认证身份触发的新刷新', async () => {
+  let resolveFirst: ((rows: typeof knowledgeBase[]) => void) | undefined;
+  const firstResponse = new Promise<typeof knowledgeBase[]>((resolve) => {
+    resolveFirst = resolve;
+  });
+  let knowledgeBaseCalls = 0;
+  const successfulGet = client.get.getMockImplementation();
+  client.get.mockImplementation((path: string) => {
+    if (path.startsWith('/api/enterprise/knowledge-bases?')) {
+      knowledgeBaseCalls += 1;
+      if (knowledgeBaseCalls === 1) return firstResponse;
+      return Promise.resolve([{ ...knowledgeBase, id: 'kb_new', name: '新刷新事实' }]);
+    }
+    return successfulGet?.(path);
+  });
+
+  const view = renderPage();
+  await waitFor(() => expect(knowledgeBaseCalls).toBe(1));
+
+  const refreshedUser = { ...administrator, id: 'admin_refreshed' };
+  view.rerender(
+    <MemoryRouter initialEntries={['/enterprise/knowledge']}>
+      <I18nProvider>
+        <EnterpriseContextProvider
+          value={{
+            tenant: { id: 'tenant_a', name: '企业甲' },
+            member: refreshedUser,
+            is_administrator: true,
+          }}
+        >
+          <KnowledgeManagePage currentUser={refreshedUser} />
+        </EnterpriseContextProvider>
+      </I18nProvider>
+    </MemoryRouter>,
+  );
+
+  await waitFor(() => expect(screen.getAllByText('新刷新事实').length).toBeGreaterThan(0));
+  resolveFirst?.([knowledgeBase]);
+  await waitFor(() => {
+    expect(screen.getAllByText('新刷新事实').length).toBeGreaterThan(0);
+    expect(screen.queryByText('研究院制度库')).not.toBeInTheDocument();
+  });
+});
+
 function renderPage() {
   return render(
     <MemoryRouter initialEntries={['/enterprise/knowledge']}>

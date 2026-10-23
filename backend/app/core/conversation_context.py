@@ -14,6 +14,7 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from app.context_limits import DEFAULT_CONTEXT_TOKEN_BUDGET, MAX_CONTEXT_TOKEN_BUDGET
+from app.core.time_context import normalize_persisted_time_context
 
 COMPACTION_TRIGGER_RATIO = 0.70
 RECENT_ROUND_LIMIT = 6
@@ -190,27 +191,41 @@ def build_conversation_context(
 
     projected = _fit_projected_messages(projected, effective_token_budget)
     summary = _joined_existing_history(state)
+    latest_user = next(
+        (message for message in reversed(normalized) if message.get("role") == "user"),
+        None,
+    )
+    latest_time_context = (
+        latest_user.get("_time_context") if isinstance(latest_user, dict) else None
+    )
+    metadata = {
+        "token_budget": effective_token_budget,
+        "compaction_trigger_ratio": effective_settings.compaction_trigger_ratio,
+        "compaction_trigger_tokens": trigger_tokens,
+        "estimated_tokens": _messages_tokens(projected),
+        "total_messages": len(normalized),
+        "included_messages": len(projected),
+        "omitted_messages": summarized_count,
+        "compacted": bool(summary),
+        "compacted_now": compacted_now,
+        "long_term_summary": bool(state.get("long_term_summary")),
+        "medium_term_summary": bool(state.get("medium_term_summary")),
+        "recent_round_limit": effective_settings.recent_round_limit,
+        "long_summary_token_budget": effective_settings.long_summary_token_budget,
+        "medium_summary_token_budget": effective_settings.medium_summary_token_budget,
+        "current_turn_time": (
+            latest_time_context.get("local_at")
+            if isinstance(latest_time_context, dict)
+            else None
+        ),
+    }
+    if isinstance(latest_time_context, dict):
+        metadata["time_context"] = latest_time_context
     return {
         "messages": projected,
         "compacted_summary": summary,
         "context_state": state,
-        "metadata": {
-            "token_budget": effective_token_budget,
-            "compaction_trigger_ratio": effective_settings.compaction_trigger_ratio,
-            "compaction_trigger_tokens": trigger_tokens,
-            "estimated_tokens": _messages_tokens(projected),
-            "total_messages": len(normalized),
-            "included_messages": len(projected),
-            "omitted_messages": summarized_count,
-            "compacted": bool(summary),
-            "compacted_now": compacted_now,
-            "long_term_summary": bool(state.get("long_term_summary")),
-            "medium_term_summary": bool(state.get("medium_term_summary")),
-            "recent_round_limit": effective_settings.recent_round_limit,
-            "long_summary_token_budget": effective_settings.long_summary_token_budget,
-            "medium_summary_token_budget": effective_settings.medium_summary_token_budget,
-            "current_turn_time": normalized[-1].get("_created_at") if normalized else None,
-        },
+        "metadata": metadata,
     }
 
 
@@ -300,6 +315,11 @@ def _normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "_message_id": str(message.get("id") or f"context_message_{index}"),
             "_created_at": _string_time(message.get("created_at")),
         }
+        time_context = normalize_persisted_time_context(message.get("time_context"))
+        if time_context is None and isinstance(message.get("metadata"), dict):
+            time_context = normalize_persisted_time_context(message["metadata"].get("time_context"))
+        if time_context is not None:
+            normalized_message["_time_context"] = time_context
         images = message.get("images")
         if role == "user" and isinstance(images, list) and images:
             normalized_message["images"] = images

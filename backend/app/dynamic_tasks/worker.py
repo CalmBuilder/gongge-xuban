@@ -1,9 +1,9 @@
 """
-@Time       : 2026/08/10 19:20
+@Time       : 2026/10/04
 @Author     : zhanglp8181
 @File       : worker.py
 @CallChain  : scheduled worker → pending ExecutionSignal → DynamicTaskAgent durable resume
-@Description: 扫描并消费动态任务持久恢复信号，按 signal lease 与 Execution lease 处理重启和退避。
+@Description: 原signal/Execution租约驱动恢复；稳定知识来源拒绝终结，基础设施错误有界退避。
 """
 
 from __future__ import annotations
@@ -101,6 +101,7 @@ def due_dynamic_task_signals(db: Session, *, limit: int = 50) -> list[ExecutionS
                         "timer",
                         "scheduled_start",
                         "capacity_retry",
+                        "external_event",
                     )
                 ),
                 and_(
@@ -349,7 +350,7 @@ def process_dynamic_task_signal(
     *,
     agent_factory: DynamicAgentFactory = DynamicTaskAgent,
 ) -> DynamicRunOutcome | None:
-    """解析持久信号的模型与 actor，失败时退避原 signal 而不丢失唤醒。"""
+    """解析模型与actor；知识稳定拒绝在原signal消费前后均闭合，不重放业务回执。"""
 
     instance = db.get(SopInstance, signal.execution_id)
     if instance is None or instance.kind != "dynamic_task":
@@ -374,6 +375,37 @@ def process_dynamic_task_signal(
         attention = None
         actor_user_id = instance.initiator_user_id
     worker_id = f"dynamic-signal:{signal.id}:{signal.attempt_count + 1}"
+    if instance.source_kind == "tool_test" and signal.signal_type == "external_event":
+        try:
+            from app.tools.tool_test_adapter import ToolTestExecutionAdapter
+
+            return ToolTestExecutionAdapter(db).resume_external_task_signal(
+                signal_id=signal.id,
+                worker_id=worker_id,
+            )
+        except Exception as exc:
+            db.rollback()
+            db.refresh(signal)
+            db.refresh(instance)
+            if signal.status != "claimed":
+                try:
+                    ExecutionControlService(db).claim_signal(signal, worker_id=worker_id)
+                    db.commit()
+                    db.refresh(signal)
+                except Exception:
+                    db.rollback()
+                    return None
+            if signal.status == "claimed" and signal.lease_owner == worker_id:
+                store = SopExecutionStore(db)
+                with store.owned(instance, worker_id=worker_id):
+                    ExecutionControlService(db, store).retry_signal(
+                        instance,
+                        signal,
+                        worker_id=worker_id,
+                        error={"code": _stable_signal_error_code(exc)},
+                    )
+                db.commit()
+            return None
     if model is None or model.tenant_id != instance.tenant_id or not actor_user_id:
         return _retry_unprocessable_signal(
             db,
@@ -447,6 +479,12 @@ def process_dynamic_task_signal(
                 model_config=model,
                 worker_id=worker_id,
             )
+        elif signal.signal_type == "external_event":
+            outcome = agent.resume_external_task_signal(
+                signal_id=signal.id,
+                model_config=model,
+                worker_id=worker_id,
+            )
         elif attention is not None and attention.attention_kind == "reauth":
             outcome = agent.resume_reauth_signal(
                 signal_id=signal.id,
@@ -490,6 +528,16 @@ def process_dynamic_task_signal(
         db.refresh(signal)
         db.refresh(instance)
         error_code = _stable_signal_error_code(exc)
+        if (agent is not None and signal.status == "consumed" and error_code in {
+            "DYNAMIC_KNOWLEDGE_ACCESS_CHANGED", "DYNAMIC_KNOWLEDGE_ACTOR_DENIED",
+        }):
+            # 原回执已完成且signal消费已经提交，保留这些不可变事实；知识拒绝发生在
+            # 下一提案阶段，仍必须沿原所有权/闭合守卫结束Execution，不能重新领取回执。
+            agent.fail_execution(execution_id=instance.id, worker_id=f"{worker_id}:terminal",
+                                 error_code=error_code)
+            _record_chat_dynamic_outcome(db, instance, None, turn_binding=turn_binding,
+                                         error_code=error_code)
+            return None
         if (
             error_code
             in {
@@ -607,9 +655,11 @@ def _stable_signal_error_code(exc: Exception) -> str:
 
 
 def _is_terminal_signal_error(code: str) -> bool:
-    """区分不可通过相同 signal 重试修复的领域错误，未知/基础设施错误继续退避。"""
+    """知识失权等稳定领域拒绝直接终结同一signal，未知/基础设施错误继续有界退避。"""
 
     return code in {
+        "DYNAMIC_KNOWLEDGE_ACCESS_CHANGED",
+        "DYNAMIC_KNOWLEDGE_ACTOR_DENIED",
         "GENERAL_SKILL_COUNTERMANDED",
         "DYNAMIC_RESULT_REPAIR_EXHAUSTED",
         # 最终 answer 的 schema/verification 在同一执行内只允许一次有界 repair；

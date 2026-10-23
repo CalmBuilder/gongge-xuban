@@ -1,3 +1,11 @@
+"""
+@Time       : 2026/10/01
+@Author     : zhanglp8181
+@File       : stage_protocol.py
+@CallChain  : Router/Step → 统一阶段正文 → LLMClient
+@Description: 渲染已有阶段合同，Router长期事实保持完整空白语义。
+"""
+
 from __future__ import annotations
 
 import copy
@@ -5,6 +13,7 @@ import json
 from typing import Any
 
 from app import paths
+from app.memory.request_projection import format_memory_line
 
 
 UNIFIED_PROMPT_PATH = (
@@ -12,6 +21,11 @@ UNIFIED_PROMPT_PATH = (
 )
 STAGE_PROTOCOL_KEY = "_agent_stage"
 TURN_STAGE_MESSAGES_KEY = "_agent_turn_messages"
+SLOT_HINTS_CONTRACT = (
+    "object?；值只能来自本轮明确事实或实际投影的记忆，输出格式要求不是字段值。"
+    "按字段含义完整提取原值，名称不含附加说明/代码。"
+    "用户明确要求未知字段不填时省略该键；要求未知占位时只填指定占位。"
+)
 
 
 ROUTER_OUTPUT_SCHEMA: dict[str, Any] = {
@@ -24,7 +38,7 @@ ROUTER_OUTPUT_SCHEMA: dict[str, Any] = {
     "general_intent": "string?",
     "reason": "string?",
     "clarification_question": "string?",
-    "slot_hints": "object?",
+    "slot_hints": SLOT_HINTS_CONTRACT,
     "task_frames": [
         {
             "task_id": "string?",
@@ -33,7 +47,7 @@ ROUTER_OUTPUT_SCHEMA: dict[str, Any] = {
             "target_skill_id": "string",
             "target_step_id": "string?",
             "user_intent": "string?",
-            "slot_hints": "object?",
+            "slot_hints": SLOT_HINTS_CONTRACT,
         }
     ],
     "pending_tasks": [
@@ -46,7 +60,7 @@ ROUTER_OUTPUT_SCHEMA: dict[str, Any] = {
             "confidence": "number?",
             "user_intent": "string?",
             "reason": "string?",
-            "slot_hints": "object?",
+            "slot_hints": SLOT_HINTS_CONTRACT,
         }
     ],
     "task_updates": [
@@ -57,7 +71,7 @@ ROUTER_OUTPUT_SCHEMA: dict[str, Any] = {
             "target_step_id": "string?",
             "user_intent": "string?",
             "reason": "string?",
-            "slot_hints": "object?",
+            "slot_hints": SLOT_HINTS_CONTRACT,
             "remove": "boolean?",
         }
     ],
@@ -110,6 +124,13 @@ def stage_payload(
         else {}
     )
     turn_time = metadata.get("current_turn_time") if isinstance(metadata, dict) else None
+    time_context = (
+        metadata.get("time_context")
+        if isinstance(metadata, dict)
+        else None
+    )
+    if time_context is None and isinstance(conversation_context, dict):
+        time_context = conversation_context.get("time_context")
     memory_text = ""
     if phase == "Router":
         memory_text = (
@@ -124,6 +145,7 @@ def stage_payload(
             "output_contract": output_contract,
             "memory": memory_text,
             "turn_time": str(turn_time or "未提供"),
+            "time_context": dict(time_context) if isinstance(time_context, dict) else None,
         },
         "user_message": user_message,
         "conversation_context": (
@@ -161,6 +183,11 @@ def render_stage_user_message(
                 f"本轮用户输入：\n{user_message or '（空）'}",
             ]
         )
+    if isinstance(stage, dict) and isinstance(stage.get("time_context"), dict):
+        sections.append(
+            "本轮时间锚点：\n"
+            + json.dumps(stage["time_context"], ensure_ascii=False, separators=(",", ":"))
+        )
     sections.extend(
         [
             f"当前阶段：\n{stage.get('phase') or '未指定'}",
@@ -178,14 +205,17 @@ def render_stage_user_message(
 
 
 def _memory_text(items: list[dict[str, object]]) -> str:
+    """整条拼接Router事实，保留换行/缩进，不修改规范正文。"""
     lines: list[str] = []
+    seen_content: set[str] = set()
     for item in items:
         if not isinstance(item, dict):
             continue
-        content = " ".join(str(item.get("content") or "").split())
-        if not content or content in lines:
+        content = str(item.get("content") or "")
+        if not content.strip() or content in seen_content:
             continue
-        lines.append(content)
+        seen_content.add(content)
+        lines.append(format_memory_line(item))
     return "\n".join(f"- {line}" for line in lines)
 
 

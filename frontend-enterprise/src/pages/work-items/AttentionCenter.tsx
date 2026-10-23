@@ -1,9 +1,9 @@
 /**
- * @Time       : 2026/08/10 21:15
+ * @Time       : 2026/10/03
  * @Author     : zhanglp8181
  * @File       : AttentionCenter.tsx
  * @CallChain  : 待我处理中心 → Attention/Connection/Execution API → typed 决定与持久恢复
- * @Description: 展示并专用办理动态澄清和连接重授权等统一 Attention。
+ * @Description: 展示统一Attention及冻结工具参数，沿原CAS命令办理澄清、批准与重授权。
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -370,6 +370,7 @@ export default function AttentionCenter() {
           <button
             key={item.id}
             type="button"
+            data-attention-item-id={item.id}
             onClick={() => { setSelected(item); setAnswer(''); setReauthToken(''); }}
             className="group grid grid-cols-[36px_minmax(0,1fr)_auto] items-center gap-[11px] rounded-[12px] border border-[#e7eaf2] px-[12px] py-[11px] text-left transition hover:border-[#bdc9f5] hover:bg-[#fafbff] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#3157e8]/35"
           >
@@ -416,7 +417,7 @@ export default function AttentionCenter() {
                 </p>
               ) : null}
               {selected.kind === 'tool_approval' ? (
-                <div className="grid gap-[9px] rounded-[12px] border border-[#dce5ff] bg-[#fbfcff] px-[13px] py-[12px]" aria-label={isDestructiveApproval(selected) ? '待批准 destructive 操作' : isWorkspaceApproval(selected) ? '待批准受管代码操作' : '待批准外部写'}>
+                <div className="grid gap-[9px] rounded-[12px] border border-[#dce5ff] bg-[#fbfcff] px-[13px] py-[12px]" aria-label={isDestructiveApproval(selected) ? '待批准 destructive 操作' : isWorkspaceApproval(selected) ? '待批准受管代码操作' : isGenericToolApproval(selected) ? '待批准工具操作' : '待批准外部写'}>
                   {isDestructiveApproval(selected) ? (
                     <>
                       <div className="flex flex-wrap items-center justify-between gap-[10px] gg-type-caption text-[#68738d]">
@@ -438,6 +439,12 @@ export default function AttentionCenter() {
                       </div>
                       <pre className="max-h-[260px] overflow-auto whitespace-pre-wrap break-words rounded-[9px] bg-white p-[10px] gg-type-meta  text-[#283044]">{JSON.stringify(selected.payload.arguments || {}, null, 2)}</pre>
                       <p className="gg-type-caption  text-[#6a7388]">批准只绑定本次 Execution、Operation、参数、工作区与能力修订；路径、内容或工具授权变化后不会沿用。</p>
+                    </>
+                  ) : isGenericToolApproval(selected) ? (
+                    <>
+                      <code className="break-all font-mono gg-type-code">{stringPayload(selected, 'operation_name')}</code>
+                      <pre className="max-h-[260px] overflow-auto whitespace-pre-wrap break-words rounded-[9px] bg-white p-[10px] gg-type-meta text-[#283044]">{JSON.stringify(selected.payload.arguments, null, 2)}</pre>
+                      <p className="gg-type-caption text-[#6a7388]">批准仅绑定本次操作、精确参数和能力修订；派发前仍会重新校验授权。</p>
                     </>
                   ) : (
                     <>
@@ -540,8 +547,8 @@ export default function AttentionCenter() {
                 <Button variant="outline" disabled={acting} onClick={() => setSelected(null)}>关闭</Button>
                 {selected.available_commands.includes('cancel') ? <Button variant="outline" disabled={acting} onClick={() => void resolve('cancel')}>取消任务</Button> : null}
                 {selected.available_commands.includes('answer') ? <Button disabled={acting} onClick={() => void resolve('answer')} className="bg-[#3157e8] text-white hover:bg-[#244bc7]">补充并继续</Button> : null}
-                {selected.available_commands.includes('deny') ? <Button variant="outline" disabled={acting} onClick={() => void resolve('deny')}>{selected.kind === 'publication' ? '拒绝提案' : isDestructiveApproval(selected) ? '拒绝 destructive 操作' : isWorkspaceApproval(selected) ? '拒绝操作' : '拒绝发送'}</Button> : null}
-                {selected.available_commands.includes('allow_once') ? <Button disabled={acting} onClick={() => void resolve('allow_once')} className="bg-[#3157e8] text-white hover:bg-[#244bc7]">{selected.kind === 'publication' ? '批准并发布' : isDestructiveApproval(selected) ? '仅批准本次 destructive 操作' : isWorkspaceApproval(selected) ? '仅批准本次操作' : '仅批准本次发送'}</Button> : null}
+                {selected.available_commands.includes('deny') ? <Button variant="outline" disabled={acting} onClick={() => void resolve('deny')}>{selected.kind === 'publication' ? '拒绝提案' : isDestructiveApproval(selected) ? '拒绝 destructive 操作' : isWorkspaceApproval(selected) || isGenericToolApproval(selected) ? '拒绝操作' : '拒绝发送'}</Button> : null}
+                {selected.available_commands.includes('allow_once') ? <Button disabled={acting} onClick={() => void resolve('allow_once')} className="bg-[#3157e8] text-white hover:bg-[#244bc7]">{selected.kind === 'publication' ? '批准并发布' : isDestructiveApproval(selected) ? '仅批准本次 destructive 操作' : isWorkspaceApproval(selected) || isGenericToolApproval(selected) ? '仅批准本次操作' : '仅批准本次发送'}</Button> : null}
                 {selected.available_commands.includes('reject') ? <Button variant="outline" disabled={acting} onClick={() => void resolve('reject')}>拒绝组织发布</Button> : null}
                 {selected.available_commands.includes('approve') ? <Button disabled={acting} onClick={() => void resolve('approve')} className="bg-[#3157e8] text-white hover:bg-[#244bc7]">批准发布到组织广场</Button> : null}
                 {selected.available_commands.includes('confirm_not_applied') ? <Button variant="outline" disabled={acting} onClick={() => void resolve('confirm_not_applied')}>确认未送达</Button> : null}
@@ -601,6 +608,8 @@ function attentionQuestion(item: AttentionItem): string {
     ? '请核对固定目标、目标摘要、隔离 provider 与远端幂等边界，再决定是否批准本次 destructive 操作。'
     : isWorkspaceApproval(item)
     ? '请核对受管工作区、固定动作和精确参数，再决定是否批准本次代码操作。'
+    : isGenericToolApproval(item)
+    ? '请核对工具和精确参数，再决定是否批准本次操作。'
     : '请核对下方精确正文，并决定是否仅批准本次企业微信发送。';
   if (item.kind === 'publication') return '请核对完整 Skill diff、请求权限和受管 Artifact 来源，再决定是否发布到当前分身。';
   if (item.kind === 'exception') return stringPayload(item, 'instruction') || '外部效果不确定，请依据独立证据人工对账。';
@@ -633,6 +642,14 @@ function stringArrayPayload(item: AttentionItem, key: string): string[] {
   return Array.isArray(value)
     ? value.filter((entry): entry is string => typeof entry === 'string' && Boolean(entry.trim()))
     : [];
+}
+
+function isGenericToolApproval(item: AttentionItem): boolean {
+  /** 仅显式冻结工具参数进入通用展示，既有连接器和工作区继续各自的批准语义。 */
+  return !isDestructiveApproval(item) && !isWorkspaceApproval(item)
+    && Boolean(stringPayload(item, 'operation_name'))
+    && typeof item.payload.arguments === 'object' && item.payload.arguments !== null
+    && !Array.isArray(item.payload.arguments);
 }
 
 function isWorkspaceApproval(item: AttentionItem): boolean {

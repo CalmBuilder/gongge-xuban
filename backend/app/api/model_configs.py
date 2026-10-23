@@ -1,13 +1,14 @@
 """
-@Time       : 2026/07/27 15:45
+@Time       : 2026/10/14
 @Author     : zhanglp8181
 @File       : model_configs.py
-@CallChain  : FastAPI 模型配置路由 → 租户级事务锁/SQLModel → LLMClient
-@Description: 管理租户模型配置，并以原子切换和数据库约束维护唯一默认模型。
+@CallChain  : FastAPI 模型配置路由 → 租户级事务锁/SQLModel → LLMClient 目录与最小生成探测
+@Description: 管理租户模型配置，并以原子切换维护唯一默认模型；目录不含别名时以真实生成判定可用性。
 """
 
 from __future__ import annotations
 
+import json
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -29,6 +30,7 @@ from app.llm.schemas import (
     ModelConfigTestResponse,
     ModelConfigUpdateRequest,
 )
+from app.memory.capture import memory_model_contract_hash
 from app.security.auth import get_current_user, require_current_tenant
 from app.security.encryption import decrypt_secret, encrypt_secret, mask_secret
 from app.security.permissions import ensure_tenant_admin, require_tenant_admin
@@ -44,6 +46,9 @@ router = APIRouter(
     tags=["enterprise:model-configs"],
     dependencies=[Depends(get_current_user)],
 )
+
+DEEPSEEK_BALANCE_MAX_RESPONSE_BYTES = 64 * 1024
+_DEEPSEEK_BALANCE_STREAM_READ_LIMIT_BYTES = DEEPSEEK_BALANCE_MAX_RESPONSE_BYTES + 1
 
 
 def model_config_read(row: ModelConfig) -> ModelConfigRead:
@@ -129,6 +134,7 @@ def update_model_config(
     ensure_tenant_admin(request.tenant_id, current_user)
     _lock_tenant_model_configs(db, request.tenant_id)
     row = _get_model_config(db, request.tenant_id, config_id)
+    previous_contract_hash = memory_model_contract_hash(row)
     if request.is_default:
         _clear_default(db, request.tenant_id)
     for field in ("name", "provider", "base_url", "model", "temperature", "max_output_tokens", "enabled"):
@@ -143,6 +149,8 @@ def update_model_config(
         row.is_default = request.is_default
     if request.model_fields_set & {"provider", "base_url", "api_key", "model", "extra_body"}:
         _invalidate_dynamic_preflight(row)
+    if memory_model_contract_hash(row) != previous_contract_hash:
+        row.memory_capture_generation += 1
     row.updated_at = utc_now()
     db.add(row)
     _commit_model_config(db)
@@ -206,26 +214,18 @@ def test_model_config(
             checks.append(
                 ModelConnectionCheck(
                     name="模型目录",
-                    status="failed",
-                    message=f"端点可访问，但目录中不存在模型 {row.model}",
+                    status="skipped",
+                    message="目录未列出所配模型名，继续验证该配置的最小生成能力",
                 )
             )
-            return ModelConfigTestResponse(
-                success=False,
-                message="模型名称不在供应商目录中",
-                error_code="MODEL_NOT_AVAILABLE",
-                endpoint=_safe_endpoint(row.base_url),
-                model=row.model,
-                suggestion="请从供应商模型目录复制准确的模型 ID。",
-                checks=checks,
+        else:
+            checks.append(
+                ModelConnectionCheck(
+                    name="模型目录",
+                    status="passed",
+                    message=(f"认证成功，已找到模型 {row.model}" if model_ids else "认证成功"),
+                )
             )
-        checks.append(
-            ModelConnectionCheck(
-                name="模型目录",
-                status="passed",
-                message=(f"认证成功，已找到模型 {row.model}" if model_ids else "认证成功"),
-            )
-        )
     balance_failure = _deepseek_balance_failure(row, checks)
     if balance_failure is not None:
         return balance_failure
@@ -258,12 +258,19 @@ def _deepseek_balance_failure(
         return None
     secret = decrypt_secret(row.api_key_encrypted)
     try:
-        response = httpx.get(
+        with httpx.stream(
+            "GET",
             f"{endpoint.rstrip('/')}/user/balance",
-            headers={"Authorization": f"Bearer {secret}"},
+            headers={
+                "Authorization": f"Bearer {secret}",
+                "Accept-Encoding": "identity",
+            },
             timeout=15,
-        )
-        body = response.json() if response.content else {}
+        ) as response:
+            body = (
+                _read_bounded_deepseek_balance_body(response)
+                if response.status_code == 200 else None
+            )
     except (httpx.HTTPError, ValueError):
         checks.append(
             ModelConnectionCheck(name="账户状态", status="skipped", message="余额接口不可用，继续验证最小生成")
@@ -302,6 +309,30 @@ def _deepseek_balance_failure(
         suggestion="请确认充值的是这把 API Key 所属账户或项目，充值后重新测试。",
         checks=checks,
     )
+
+
+def _read_bounded_deepseek_balance_body(response: httpx.Response) -> dict[str, Any] | None:
+    """只解析identity编码且不超过64KiB的余额正文，最多再读一个探测字节。"""
+    content_encoding = response.headers.get("content-encoding", "identity").strip().lower()
+    if content_encoding not in {"", "identity"}:
+        return None
+    content_length = response.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > DEEPSEEK_BALANCE_MAX_RESPONSE_BYTES:
+                return None
+        except ValueError:
+            return None
+
+    body = bytearray()
+    for chunk in response.iter_raw(chunk_size=_DEEPSEEK_BALANCE_STREAM_READ_LIMIT_BYTES):
+        if len(chunk) > DEEPSEEK_BALANCE_MAX_RESPONSE_BYTES - len(body):
+            return None
+        body.extend(chunk)
+    if not body:
+        return {}
+    value = json.loads(body)
+    return value if isinstance(value, dict) else None
 
 
 def _deepseek_balance_summary(body: dict[str, Any]) -> str:
@@ -410,6 +441,9 @@ def preflight_dynamic_model_config(
     """验证原生 structured-output/tool-call 协议并持久化可审计能力快照。"""
 
     row = _get_model_config(db, tenant_id, config_id)
+    row = ModelConfig.model_validate(row.model_dump())
+    previous_contract_hash = memory_model_contract_hash(row)
+    db.rollback()
     if not is_supported_chat_provider(row.provider, row.base_url):
         return _record_preflight_failure(
             db,
@@ -427,11 +461,17 @@ def preflight_dynamic_model_config(
         "model": row.model,
         "provider_file_api": provider_file_profile_payload(file_profile),
     }
+    current = _preflight_write_owner(db, row)
+    if current is None:
+        return _stale_preflight_response()
+    row = current
     row.capability_snapshot_json = snapshot
     row.capability_checksum = capability_checksum(snapshot)
     row.preflight_status = "ready"
     row.preflight_error = None
     row.capability_verified_at = utc_now()
+    if memory_model_contract_hash(row) != previous_contract_hash:
+        row.memory_capture_generation += 1
     row.updated_at = utc_now()
     db.add(row)
     db.commit()
@@ -444,11 +484,39 @@ def preflight_dynamic_model_config(
     )
 
 
+def _stale_preflight_response() -> ModelCapabilityPreflightResponse:
+    """旧模型的预检失权后返回安全冲突结果，不修改当前配置或代数。"""
+
+    return ModelCapabilityPreflightResponse(
+        success=False, status="failed", message="MODEL_PREFLIGHT_CONTRACT_CHANGED"
+    )
+
+
+def _preflight_write_owner(db: Session, observed: ModelConfig) -> ModelConfig | None:
+    """在模型写入同一锁边界重读代数与合同，阻止外呼期间配置变更和 ABA。"""
+
+    _lock_tenant_model_configs(db, observed.tenant_id)
+    current = db.exec(
+        select(ModelConfig)
+        .where(ModelConfig.id == observed.id, ModelConfig.tenant_id == observed.tenant_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).first()
+    if (
+        current is None
+        or current.memory_capture_generation != observed.memory_capture_generation
+        or memory_model_contract_hash(current) != memory_model_contract_hash(observed)
+    ):
+        db.rollback()
+        return None
+    return current
+
+
 def _get_model_config(db: Session, tenant_id: str, config_id: str) -> ModelConfig:
     """按租户边界读取模型配置，不接受跨租户标识。"""
 
     ensure_tenant(db, tenant_id)
-    row = db.get(ModelConfig, config_id)
+    row = db.get(ModelConfig, config_id, populate_existing=True)
     if not row or row.tenant_id != tenant_id:
         raise HTTPException(status_code=404, detail="Model config not found")
     return row
@@ -506,11 +574,18 @@ def _record_preflight_failure(
 ) -> ModelCapabilityPreflightResponse:
     """持久化脱敏预检失败事实，且不保留部分成功的能力快照。"""
 
+    current = _preflight_write_owner(db, row)
+    if current is None:
+        return _stale_preflight_response()
+    row = current
+    previous_contract_hash = memory_model_contract_hash(row)
     row.capability_snapshot_json = {}
     row.capability_checksum = None
     row.preflight_status = "failed"
     row.preflight_error = message[:2000]
     row.capability_verified_at = None
+    if memory_model_contract_hash(row) != previous_contract_hash:
+        row.memory_capture_generation += 1
     row.updated_at = utc_now()
     db.add(row)
     db.commit()

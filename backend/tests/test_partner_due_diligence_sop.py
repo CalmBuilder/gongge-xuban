@@ -1,5 +1,5 @@
 """
-@Time       : 2026/07/27 00:00
+@Time       : 2026/10/03
 @Author     : zhanglp8181
 @File       : test_partner_due_diligence_sop.py
 @CallChain  : pytest → 合作方尽调 v2 定义/工具/种子 → Scheduler/组织授权
@@ -272,7 +272,7 @@ def test_partner_due_diligence_seed_publishes_v2_and_authorization_contract() ->
         ).one()
         versions = db.exec(
             select(SkillVersion)
-            .where(SkillVersion.skill_id == PARTNER_DUE_DILIGENCE_SKILL_ID)
+            .where(SkillVersion.tenant_id == "tenant_demo", SkillVersion.scope_agent_id == "", SkillVersion.skill_id == PARTNER_DUE_DILIGENCE_SKILL_ID)
             .order_by(SkillVersion.version)
         ).all()
         tool = db.exec(
@@ -357,7 +357,7 @@ def test_partner_due_diligence_derives_k11_version_without_overwriting_v22() -> 
             select(Skill).where(Skill.skill_id == PARTNER_DUE_DILIGENCE_SKILL_ID)
         ).one()
         current = db.exec(
-            select(SkillVersion).where(
+            select(SkillVersion).where(SkillVersion.tenant_id == "tenant_demo", SkillVersion.scope_agent_id == "",
                 SkillVersion.skill_id == PARTNER_DUE_DILIGENCE_SKILL_ID,
                 SkillVersion.version == PARTNER_DUE_DILIGENCE_VERSION,
             )
@@ -380,7 +380,7 @@ def test_partner_due_diligence_derives_k11_version_without_overwriting_v22() -> 
         db.commit()
         versions = db.exec(
             select(SkillVersion)
-            .where(SkillVersion.skill_id == PARTNER_DUE_DILIGENCE_SKILL_ID)
+            .where(SkillVersion.tenant_id == "tenant_demo", SkillVersion.scope_agent_id == "", SkillVersion.skill_id == PARTNER_DUE_DILIGENCE_SKILL_ID)
             .order_by(SkillVersion.version)
         ).all()
         db.refresh(skill)
