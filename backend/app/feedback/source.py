@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from sqlmodel import Session, select
 
 from app.db.models import ChatSession, Message, SkillVersion, SopInstance, SopOperation
+from app.sop_runtime.versioning import definition_checksum_matches_version
 
 
 class FeedbackSource(BaseModel):
@@ -85,7 +86,7 @@ def feedback_source(db: Session, message: Message) -> FeedbackSource:
     if (version is None or version.tenant_id != message.tenant_id
             or version.skill_id != instance.skill_id
             or version.version != instance.skill_version
-            or version.compiled_definition_checksum != instance.definition_checksum):
+            or not definition_checksum_matches_version(version, instance.definition_checksum)):
         return result
     if snapshot is not None and any(snapshot.get(key) != getattr(instance, key) for key in (
             'skill_id', 'skill_version_id', 'skill_version', 'definition_checksum')):

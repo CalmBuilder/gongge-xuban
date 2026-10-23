@@ -593,6 +593,9 @@ class SkillVersion(SQLModel, table=True):
     status: LabelString = Field(default="draft", index=True)
     content_checksum: OptionalVersionString = Field(default=None, index=True)
     compiled_definition_checksum: OptionalVersionString = None
+    compiled_definition_compatibility_json: dict[str, Any] | None = Field(
+        default=None, sa_column=Column(JSON)
+    )
     meta_model_version: int | None = None
     source_schema_version: int | None = None
     published_at: datetime | None = None

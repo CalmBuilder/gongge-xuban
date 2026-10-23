@@ -8,6 +8,7 @@
 
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
+from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
@@ -55,6 +56,107 @@ def _migrate_skill_version_scope(conn, tables: set[str]) -> None:
         batch.create_unique_constraint("uq_skill_version",
                                        ["tenant_id", "skill_id", "scope_agent_id", "version"])
         batch.create_index("ix_skill_versions_scope_agent_id", ["scope_agent_id"])
+
+
+def _migrate_skill_version_checksum_compatibility(conn, tables: set[str]) -> None:
+    """为 SQLite 历史发布快照登记当前编译值，保留旧实例的原校验身份。"""
+
+    if "skill_versions" not in tables:
+        return
+    inspector = inspect(conn)
+    columns = {column["name"] for column in inspector.get_columns("skill_versions")}
+    required = {"content_json", "status", "compiled_definition_checksum"}
+    if not required.issubset(columns):
+        return
+    if "compiled_definition_compatibility_json" not in columns:
+        conn.execute(
+            text(
+                "ALTER TABLE skill_versions ADD COLUMN "
+                "compiled_definition_compatibility_json JSON"
+            )
+        )
+    from app.sop_runtime import SopCompilationError, compile_legacy_skill_card
+    from app.sop_runtime.versioning import skill_content_checksum
+
+    select_columns = [
+        "id", "content_json", "compiled_definition_checksum",
+        "compiled_definition_compatibility_json",
+    ]
+    if "content_checksum" in columns:
+        select_columns.append("content_checksum")
+    rows = conn.execute(
+        text(
+            "SELECT " + ", ".join(select_columns)
+            + " FROM skill_versions WHERE status = 'published'"
+        )
+    ).mappings().all()
+    for row in rows:
+        content = row["content_json"]
+        if isinstance(content, str):
+            try:
+                content = json.loads(content)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    "SKILL_VERSION_CONTENT_JSON_INVALID: " + str(row["id"])
+                ) from exc
+        if not isinstance(content, dict):
+            raise RuntimeError("SKILL_VERSION_CONTENT_JSON_INVALID: " + str(row["id"]))
+        content_checksum = skill_content_checksum(content)
+        stored_content_checksum = row.get("content_checksum")
+        if stored_content_checksum and stored_content_checksum != content_checksum:
+            raise RuntimeError("SKILL_VERSION_CONTENT_CHECKSUM_INVALID: " + str(row["id"]))
+        try:
+            compiled = compile_legacy_skill_card(content)
+        except SopCompilationError as exc:
+            raise RuntimeError("SKILL_VERSION_COMPILATION_INVALID: " + str(row["id"])) from exc
+
+        updates: dict[str, object] = {}
+        if "content_checksum" in columns and not stored_content_checksum:
+            updates["content_checksum"] = content_checksum
+        previous_checksum = row.get("compiled_definition_checksum")
+        if not previous_checksum:
+            updates["compiled_definition_checksum"] = compiled.checksum
+        elif previous_checksum != compiled.checksum:
+            existing = row.get("compiled_definition_compatibility_json")
+            if isinstance(existing, str):
+                try:
+                    existing = json.loads(existing)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(
+                        "SKILL_VERSION_COMPATIBILITY_JSON_INVALID: " + str(row["id"])
+                    ) from exc
+            if not isinstance(existing, dict):
+                existing = {}
+            legacy_checksums = [
+                item for item in existing.get("legacy_checksums", [])
+                if isinstance(item, str) and item
+            ] if isinstance(existing.get("legacy_checksums"), list) else []
+            existing_current = existing.get("current_checksum")
+            if isinstance(existing_current, str) and existing_current:
+                if existing_current != compiled.checksum and existing_current not in legacy_checksums:
+                    legacy_checksums.append(existing_current)
+            if previous_checksum not in legacy_checksums:
+                legacy_checksums.append(previous_checksum)
+            updates["compiled_definition_compatibility_json"] = json.dumps(
+                {
+                    "contract": "published_skill_compiler_compatibility_v1",
+                    "current_checksum": compiled.checksum,
+                    "legacy_checksums": legacy_checksums,
+                    "content_checksum": content_checksum,
+                    "migration_revision": "sqlite_legacy_checksum_compatibility_v1",
+                    "reconciled_at": datetime.now(timezone.utc).isoformat(),
+                    "reason": "历史发布快照正文未变且可重新编译，仅派生编译校验值随编译器演进发生变化。",
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        if updates:
+            assignments = ", ".join(f"{key} = :{key}" for key in updates)
+            updates["id"] = row["id"]
+            conn.execute(
+                text(f"UPDATE skill_versions SET {assignments} WHERE id = :id"),
+                updates,
+            )
 
 
 def migrate_sqlite_skill_schema(engine: Engine) -> None:
@@ -305,6 +407,9 @@ def migrate_sqlite_skill_schema(engine: Engine) -> None:
             _normalize_agent_branch_rows(conn, tables)
             _seed_agent_branch_state(conn, inspector, tables)
             _sync_explicit_skill_tool_bindings(conn, tables)
+        # 该步骤必须放在所有旧表规范化和种子补齐之后，避免历史内容清洗重写后
+        # 把刚登记的兼容元数据带回旧表投影。
+        _migrate_skill_version_checksum_compatibility(conn, tables)
 
 
 def _migrate_memory_claim_budget(conn, tables: set[str]) -> None:

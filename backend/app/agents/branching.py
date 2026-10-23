@@ -38,6 +38,7 @@ from app.sop_runtime import CompiledSopDefinition, SopCompilationError, compile_
 from app.sop_runtime.versioning import (
     PublishedVersionConflictError,
     annotate_skill_publication,
+    compiled_definition_matches_version,
     skill_content_checksum,
     write_skill_version,
 )
@@ -884,7 +885,7 @@ def inherit_branch_publication(db: Session, skill: Skill, branch: AgentSkillBran
     if skill_content_checksum(source_content) != skill_content_checksum(original.content_json):
         return
     compiled_source = _compile_branch_for_publication(original.content_json)
-    if compiled_source.checksum != original.compiled_definition_checksum:
+    if not compiled_definition_matches_version(original, compiled_source.checksum):
         from fastapi import HTTPException
 
         raise HTTPException(status_code=409, detail="PUBLISHED_SKILL_CHECKSUM_INVALID")

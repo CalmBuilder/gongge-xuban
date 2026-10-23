@@ -20,6 +20,6 @@
 
 浏览器恢复的 GET job 初检和后续 stream 请求共用错误分类：稳定 `FEEDBACK_CANDIDATE_UNAVAILABLE` 清除候选正文、材料、草稿快照、差异、历史、弹窗、在途操作和 job 指针；通用 404 `Job not found` 只结束旧 job 并重新校验当前候选。候选仍有效则保留未保存编辑，权限/来源/基础明确失效才清私密状态。网络暂断、408/429 和候选短事务写冲突保留合法编辑；旧核验回包不得清除合法保存的新修订，失效后的缓冲事件不得恢复旧正文。合法已发布历史仍仅读最小安全回执。
 
-`SkillVersion` 保留原表和不可变发布 ID，唯一身份为 tenant/skill/scope/version，整体 scope 为空串。员工分支历史 ID 与 Runtime 发布 ID 各司其职；管理响应公开实际 `publication_id`、scope 与 checksum，新实例绑定该精确发布，旧实例继续冻结原 ID/定义。MySQL 执行原 Alembic `0091/0092`，SQLite 沿原桌面兼容初始化。
+`SkillVersion` 保留原表和不可变发布 ID，唯一身份为 tenant/skill/scope/version，整体 scope 为空串。员工分支历史 ID 与 Runtime 发布 ID 各司其职；管理响应公开实际 `publication_id`、scope 与 checksum，新实例绑定该精确发布，旧实例继续冻结原 ID/定义。MySQL 执行 Alembic `0091/0092/0093`；`0093` 为已发布版本编译校验值兼容迁移，保留旧发布身份并登记可验证的当前编译校验别名。SQLite 在桌面兼容初始化末尾执行同一兼容迁移。
 
 本说明描述已实现接口。SD-7 F2/F3 的验收状态以[当前进度](../../../docs/StaffDeck能力蒸馏-7adc7c8/implementation/进度.md)为准；候选或发布成功不等于真实业务改进已经验收。

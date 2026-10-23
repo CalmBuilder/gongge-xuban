@@ -21,7 +21,7 @@ def test_alembic_has_single_expected_head_and_baseline() -> None:
     config = Config(str(BACKEND_DIR / "alembic.ini"))
     script = ScriptDirectory.from_config(config)
 
-    assert script.get_heads() == ["20261002_0092"]
+    assert script.get_heads() == ["20261023_0093"]
     skill_edit_candidates = script.get_revision("20261002_0092")
     assert skill_edit_candidates.down_revision == "20261002_0091"
     skill_version_scope = script.get_revision("20261002_0091")
@@ -194,7 +194,7 @@ def test_context_summary_budget_migration_follows_current_head_without_a_branch(
     external_event_inbox = script.get_revision("20260928_0085")
     assert external_event_inbox is not None
     assert external_event_inbox.down_revision == "20260928_0084"
-    assert script.get_heads() == ["20261002_0092"]
+    assert script.get_heads() == ["20261023_0093"]
 
 
 def test_alembic_files_do_not_embed_runtime_credentials() -> None:

@@ -72,6 +72,10 @@ def test_scope_alembic_preserves_identity_and_enforces_exact_uniqueness(dialect,
             )).mappings().one())
         assert after.pop("scope_agent_id") == ""
         assert after == before
+        # 当前 ORM 已包含 0093 新增的兼容列；先完成 0091 的身份断言，
+        # 再把隔离数据库推进到当前头，避免用新模型读取尚未升级的旧表。
+        if dialect == "mysql":
+            command.upgrade(config, "head")
         with Session(engine) as db:
             ids = []
             for scope in ["alice", "bob"]:
@@ -85,6 +89,16 @@ def test_scope_alembic_preserves_identity_and_enforces_exact_uniqueness(dialect,
                 "version,name,content_json,status,created_at,updated_at) VALUES "
                 "('duplicate','tenant_demo','purchase_request','alice','1.0.0','重复','{}',"
                 "'draft',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"))
+        if dialect == "mysql":
+            # 当前头先由 0093 保护历史编译别名；先验证该门禁，再清理隔离
+            # 数据中的兼容元数据，继续验证 0091 原有的范围降级门禁。
+            with pytest.raises(RuntimeError, match="SKILL_VERSION_COMPATIBILITY_PRESENT"):
+                command.downgrade(config, "20261002_0090")
+            with engine.begin() as conn:
+                conn.execute(text(
+                    "UPDATE skill_versions "
+                    "SET compiled_definition_compatibility_json = NULL"
+                ))
         with pytest.raises(RuntimeError, match="SCOPED_SKILL_VERSIONS_PRESENT"):
             command.downgrade(config, "20261002_0090")
         assert not next(c for c in inspect(engine).get_columns("skill_versions")

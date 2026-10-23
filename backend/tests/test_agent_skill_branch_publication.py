@@ -111,3 +111,93 @@ def test_existing_active_branch_backfills_exact_published_version() -> None:
             )
         ).one()
         assert version.compiled_definition_checksum == definition.checksum
+
+
+def test_existing_branch_accepts_registered_legacy_compiler_checksum() -> None:
+    """历史正文未变但编译器升级后，登记过的旧校验值仍可同步分支。"""
+
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    SQLModel.metadata.create_all(engine)
+    content = _branch_publication_content()
+    definition = compile_legacy_skill_card(content)
+
+    with Session(engine) as db:
+        db.add(
+            AgentProfile(
+                id="agent_branch_legacy_checksum",
+                tenant_id="tenant_branch_legacy_checksum",
+                name="历史校验分支",
+                owner_user_id="user_branch_legacy_checksum",
+                status="active",
+            )
+        )
+        db.add(
+            Skill(
+                id="skill_branch_legacy_checksum_source",
+                tenant_id="tenant_branch_legacy_checksum",
+                skill_id="branch-legacy-checksum",
+                version="1.0.0",
+                name="历史校验分支",
+                content_json=content,
+                status="published",
+            )
+        )
+        db.add(
+            SkillVersion(
+                id="skill_version_branch_legacy_checksum_global",
+                tenant_id="tenant_branch_legacy_checksum",
+                skill_id="branch-legacy-checksum",
+                scope_agent_id="",
+                version="1.0.0",
+                name="历史校验分支",
+                content_json=content,
+                status="published",
+                compiled_definition_checksum="legacy-compiler-checksum",
+                compiled_definition_compatibility_json={
+                    "contract": "published_skill_compiler_compatibility_v1",
+                    "current_checksum": definition.checksum,
+                    "legacy_checksums": ["legacy-compiler-checksum"],
+                },
+            )
+        )
+        db.add(
+            AgentSkillBranch(
+                id="agent_branch_legacy_checksum_row",
+                tenant_id="tenant_branch_legacy_checksum",
+                agent_id="agent_branch_legacy_checksum",
+                skill_id="branch-legacy-checksum",
+                source_skill_id="skill_branch_legacy_checksum_source",
+                base_version="1.0.0",
+                head_version="1.0.0",
+                content_json=content,
+                status="active",
+                sync_state="synced",
+            )
+        )
+        db.commit()
+
+        skill = db.get(Skill, "skill_branch_legacy_checksum_source")
+        assert skill is not None
+        ensure_agent_skill_branch(
+            db,
+            "tenant_branch_legacy_checksum",
+            "agent_branch_legacy_checksum",
+            skill,
+        )
+        db.commit()
+
+        version = db.exec(
+            select(SkillVersion).where(
+                SkillVersion.tenant_id == "tenant_branch_legacy_checksum",
+                SkillVersion.skill_id == "branch-legacy-checksum",
+                SkillVersion.scope_agent_id == "agent_branch_legacy_checksum",
+                SkillVersion.version == "1.0.0",
+                SkillVersion.status == "published",
+            )
+        ).one()
+
+    assert version.compiled_definition_checksum == definition.checksum

@@ -74,7 +74,11 @@ from app.sop_runtime.legacy_skill_card_adapter import compile_legacy_skill_card
 from app.sop_runtime.scheduler import RuntimeAction, RuntimePlan, plan_next_action
 from app.sop_runtime.slot_values import canonicalize_slot_keys, normalize_slot_values
 from app.sop_runtime.work_items import SopWorkItemService, WorkItemError
-from app.sop_runtime.versioning import skill_content_checksum
+from app.sop_runtime.versioning import (
+    compiled_definition_matches_version,
+    definition_checksum_matches_version,
+    skill_content_checksum,
+)
 from app.tools import ToolExecutor
 from app.tools.tool_schema import ToolCall, ToolResult
 
@@ -1139,7 +1143,7 @@ class DeterministicSopCoordinator:
         if (version is None or version.tenant_id != instance.tenant_id
                 or version.skill_id != instance.skill_id
                 or version.version != instance.skill_version
-                or version.compiled_definition_checksum != instance.definition_checksum):
+                or not definition_checksum_matches_version(version, instance.definition_checksum)):
             raise SopExecutionConflictError("SOP 最终交付的冻结版本身份已失效。")
         return source, time_context
 
@@ -2594,10 +2598,7 @@ class DeterministicSopCoordinator:
         if skill_content_checksum(version.content_json) != skill_content_checksum(skill.content_json):
             raise ValueError("deterministic SOP 的活动头与精确发布快照不一致")
         definition = compile_legacy_skill_card(version.content_json)
-        if (
-            version.compiled_definition_checksum
-            and version.compiled_definition_checksum != definition.checksum
-        ):
+        if not compiled_definition_matches_version(version, definition.checksum):
             raise ValueError("deterministic SOP 的发布版本 checksum 不一致")
         if definition.diagnostics:
             raise ValueError("deterministic SOP 仍包含兼容警告，禁止进入新 Runtime")
@@ -2705,7 +2706,9 @@ class DeterministicSopCoordinator:
         if version is None or version.tenant_id != instance.tenant_id:
             raise ValueError("SOP 实例绑定的技能版本不存在")
         definition = compile_legacy_skill_card(version.content_json)
-        if definition.checksum != instance.definition_checksum:
+        if not compiled_definition_matches_version(version, definition.checksum):
+            raise ValueError("SOP 实例绑定的发布版本 checksum 不一致")
+        if not definition_checksum_matches_version(version, instance.definition_checksum):
             raise ValueError("SOP 实例绑定的定义 checksum 已漂移")
         return version, definition
 

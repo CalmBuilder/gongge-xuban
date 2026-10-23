@@ -15,7 +15,12 @@ from app.api.skills import _upsert_skill_version, delete_skill
 from app.db.models import Skill, SkillVersion, Tenant, User
 from app.skills.skill_schema import SkillCard, SkillGraphNode
 from app.sop_runtime import compile_legacy_skill_card
-from app.sop_runtime.versioning import PublishedVersionConflictError, write_skill_version
+from app.sop_runtime.versioning import (
+    PublishedVersionConflictError,
+    compiled_definition_matches_version,
+    definition_checksum_matches_version,
+    write_skill_version,
+)
 
 
 def _test_session() -> Session:
@@ -76,6 +81,34 @@ def test_repeated_publication_with_same_content_is_idempotent() -> None:
     assert len(rows) == 1
     assert rows[0].content_checksum
     assert rows[0].compiled_definition_checksum == compiled.checksum
+
+
+def test_registered_compiler_compatibility_preserves_old_instance_identity() -> None:
+    """当前编译值可用于新运行，旧实例校验值仍只接受登记的历史值。"""
+
+    card = _skill_card()
+    compiled = compile_legacy_skill_card(card)
+    version = SkillVersion(
+        tenant_id="tenant_demo",
+        skill_id=card.skill_id,
+        scope_agent_id="",
+        version=card.version,
+        name=card.name,
+        content_json=card.model_dump(),
+        status="published",
+        compiled_definition_checksum="legacy-compiler-checksum",
+        compiled_definition_compatibility_json={
+            "contract": "published_skill_compiler_compatibility_v1",
+            "current_checksum": compiled.checksum,
+            "legacy_checksums": ["legacy-compiler-checksum"],
+        },
+    )
+
+    assert compiled_definition_matches_version(version, compiled.checksum)
+    assert definition_checksum_matches_version(version, "legacy-compiler-checksum")
+    assert definition_checksum_matches_version(version, compiled.checksum)
+    assert not definition_checksum_matches_version(version, "unregistered-checksum")
+    assert not compiled_definition_matches_version(version, "unregistered-checksum")
 
 
 def test_published_version_rejects_different_content() -> None:

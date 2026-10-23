@@ -38,6 +38,47 @@ class SkillVersionWriteResult:
     idempotent: bool
 
 
+def accepted_definition_checksums(version: SkillVersion) -> frozenset[str]:
+    """返回发布版本允许的定义校验值，兼容已登记的历史编译值。"""
+
+    checksums: set[str] = set()
+    primary = version.compiled_definition_checksum
+    if isinstance(primary, str) and primary:
+        checksums.add(primary)
+    compatibility = version.compiled_definition_compatibility_json
+    if not isinstance(compatibility, dict):
+        return frozenset(checksums)
+    current = compatibility.get("current_checksum")
+    if isinstance(current, str) and current:
+        checksums.add(current)
+    legacy = compatibility.get("legacy_checksums")
+    if isinstance(legacy, list):
+        checksums.update(item for item in legacy if isinstance(item, str) and item)
+    return frozenset(checksums)
+
+
+def definition_checksum_matches_version(version: SkillVersion, checksum: str | None) -> bool:
+    """判断实例冻结校验值是否属于该发布版本的主值或已登记兼容值。"""
+
+    return bool(checksum and checksum in accepted_definition_checksums(version))
+
+
+def compiled_definition_matches_version(version: SkillVersion, checksum: str | None) -> bool:
+    """判断当前编译结果是否与发布版本一致或命中受控历史兼容记录。"""
+
+    if not checksum:
+        return False
+    if checksum == version.compiled_definition_checksum:
+        return True
+    compatibility = version.compiled_definition_compatibility_json
+    return (
+        isinstance(compatibility, dict)
+        and compatibility.get("current_checksum") == checksum
+        and isinstance(compatibility.get("legacy_checksums"), list)
+        and bool(compatibility["legacy_checksums"])
+    )
+
+
 def skill_content_checksum(content_json: dict[str, object]) -> str:
     """对完整 SkillCard JSON 计算稳定 SHA-256，检测任何已发布内容变化。"""
 

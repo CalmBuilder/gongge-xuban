@@ -25,7 +25,11 @@ from app.skills.edit_context import current_editor, editor_slot, lock_scope_agen
 from app.skills.publication import compile_skill_for_publication, publish_skill_head
 from app.skills.skill_schema import SkillCard
 from app.skills.step_ids import skill_card_with_unique_step_ids
-from app.sop_runtime.versioning import next_derived_skill_version, skill_content_checksum
+from app.sop_runtime.versioning import (
+    compiled_definition_matches_version,
+    next_derived_skill_version,
+    skill_content_checksum,
+)
 
 
 def _start(db: Session, tenant_id: str, actor: User) -> User:
@@ -64,7 +68,9 @@ def _head(db: Session, tenant_id: str, skill_id: str,
         .with_for_update().execution_options(populate_existing=True)).first()
     if (version is None or not version.compiled_definition_checksum
             or skill_content_checksum(head.content_json) != skill_content_checksum(version.content_json)
-            or compile_skill_for_publication(head.content_json).checksum != version.compiled_definition_checksum):
+            or not compiled_definition_matches_version(
+                version, compile_skill_for_publication(head.content_json).checksum
+            )):
         raise HTTPException(409, 'FEEDBACK_CANDIDATE_BASE_UNAVAILABLE')
     return head, version
 
