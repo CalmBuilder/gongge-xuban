@@ -10,6 +10,7 @@ import ast
 import importlib.util
 import re
 import subprocess
+import tomllib
 from pathlib import Path, PureWindowsPath
 
 import pytest
@@ -102,6 +103,20 @@ def test_windows_build_has_native_installation_smoke_gate() -> None:
         "WINDOWS_NATIVE_SMOKE_PASS",
     ):
         assert marker in smoke_script
+
+
+def test_sqlmodel_dependency_preserves_naive_utc_database_contract() -> None:
+    """确保打包环境不会升级到改变项目时间字段绑定语义的 SQLModel 版本。"""
+
+    pyproject = tomllib.loads((ROOT / "backend/pyproject.toml").read_text(encoding="utf-8"))
+    dependencies = pyproject["project"]["dependencies"]
+
+    sqlmodel_dependencies = [
+        dependency
+        for dependency in dependencies
+        if dependency.split(";", maxsplit=1)[0].startswith("sqlmodel")
+    ]
+    assert sqlmodel_dependencies == ["sqlmodel>=0.0.21,<0.0.45"]
 
 
 def test_windows_packaging_collects_pydantic_core_extension() -> None:

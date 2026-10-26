@@ -110,6 +110,20 @@ npm --prefix frontend-enterprise run build
 真实 API key 写进源码或安装包。遇到该堆栈时不要把密钥写入仓库，直接拉取最新代码并
 重新构建；仍失败时保留启动器 stdout/stderr 及用户日志供定位。
 
+### 启动日志提示 `Datetime values must have timezone information`
+
+如果安装器已经成功生成，但 Smoke 测试显示冻结版在健康检查前退出，并且
+`data\logs\gongge-xuban.log` 包含 `seed_demo_data`、`sqlalchemy.exc.StatementError` 和
+`Datetime values must have timezone information`，通常是构建虚拟环境解析到了 SQLModel
+0.0.45 或更高版本。该版本把普通 `datetime` 字段映射为带时区的 `UTCDateTime`，而当前项目
+的模型、迁移和 SQLite/MySQL 兼容逻辑统一使用“无 `tzinfo` 但数值代表 UTC”的存储契约。
+
+项目依赖已将 SQLModel 限制在 `>=0.0.21,<0.0.45`。构建脚本会从
+`backend/pyproject.toml` 创建独立的 `packaging\.windows-build-venv` 并重新解析依赖；修改
+依赖后必须重新执行完整的 `build_windows.ps1`，不能只重跑旧安装器的 Smoke 测试，也不要
+把 `datetime` 值或数据库文件手工改成另一种时区语义。后续若要迁移到带时区字段，必须同时
+设计 SQLite/MySQL 迁移、读写比较和全部运行时调用方的兼容改造。
+
 ### PE 架构检查误报 `t32.exe` 或 `t64.exe`
 
 `pip\_vendor\distlib` 和 setuptools 中的 `t32/t64`、`cli/gui` 是生成入口脚本的

@@ -24,7 +24,9 @@ dependencies = [
   "PyYAML>=6.0.2,<7.0.0",
   "pymysql>=1.1.0,<2.0.0",
   "requests>=2.32.0",
-  "sqlmodel>=0.0.21",
+  # 当前模型与 SQLite/MySQL 都使用无 tzinfo 的 UTC 值；SQLModel 0.0.45 起普通
+  # datetime 字段默认改为 UTCDateTime，会在绑定这些现有值时直接拒绝启动。
+  "sqlmodel>=0.0.21,<0.0.45",
   "sqlalchemy>=2.0.0,<2.1.0",
   "tzdata>=2025.2",
   "yt-dlp[default]>=2026.07.04",
